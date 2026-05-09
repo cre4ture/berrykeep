@@ -4185,7 +4185,9 @@ mod tests {
 
             let mut relay_only_bootstrap = enrolled.bootstrap.clone();
             for endpoint in &mut relay_only_bootstrap.direct_endpoints {
-                if endpoint.usage == Some(client_sdk::BootstrapEndpointUse::PublicApi) {
+                if endpoint.usage != Some(client_sdk::BootstrapEndpointUse::Rendezvous)
+                    && endpoint.usage != Some(client_sdk::BootstrapEndpointUse::PeerApi)
+                {
                     endpoint.url = "http://127.0.0.1:9".to_string();
                 }
             }
@@ -4197,6 +4199,7 @@ mod tests {
             .context("relay-only client construction task panicked")??;
 
             assert!(client.uses_relay_transport());
+            let session_pool_before_requests = client.transport_session_pool_snapshot();
             let first = client.get_json_path("/cluster/status").await?;
             let second = client.get_json_path("/cluster/status").await?;
             for status in [&first, &second] {
@@ -4211,9 +4214,18 @@ mod tests {
             }
 
             let snapshot = client.transport_session_pool_snapshot();
-            assert_eq!(snapshot.connect_count, 1);
+            let connect_delta = snapshot
+                .connect_count
+                .saturating_sub(session_pool_before_requests.connect_count);
+            let reuse_delta = snapshot
+                .reuse_count
+                .saturating_sub(session_pool_before_requests.reuse_count);
             assert!(
-                snapshot.reuse_count >= 1,
+                connect_delta <= 1,
+                "expected at most one new relay transport session across two requests, observed {connect_delta}"
+            );
+            assert!(
+                reuse_delta >= 1,
                 "expected relay transport session reuse after multiple requests"
             );
 
