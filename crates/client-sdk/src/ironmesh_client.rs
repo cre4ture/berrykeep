@@ -212,12 +212,8 @@ impl ClientTransport {
     }
 
     fn rewrite_url(&self, url: &Url) -> Result<Url> {
-        let base_url = Url::parse(self.request_base_url()).with_context(|| {
-            format!(
-                "invalid endpoint base URL: {}",
-                self.request_base_url()
-            )
-        })?;
+        let base_url = Url::parse(self.request_base_url())
+            .with_context(|| format!("invalid endpoint base URL: {}", self.request_base_url()))?;
         base_url
             .join(path_and_query(url).trim_start_matches('/'))
             .with_context(|| {
@@ -268,7 +264,10 @@ impl ClientEndpointRouter {
     fn current_endpoint(&self) -> Option<&ClientEndpoint> {
         self.active_index()
             .and_then(|index| self.endpoints.get(index))
-            .or_else(|| self.best_ranked_index().and_then(|index| self.endpoints.get(index)))
+            .or_else(|| {
+                self.best_ranked_index()
+                    .and_then(|index| self.endpoints.get(index))
+            })
             .or_else(|| self.endpoints.first())
     }
 
@@ -389,7 +388,9 @@ fn endpoint_score(
     state: &ClientEndpointState,
 ) -> f64 {
     let mut score = descriptor.bootstrap_rank as f64;
-    score += state.ewma_latency_ms.unwrap_or(CLIENT_ROUTE_UNKNOWN_LATENCY_MS);
+    score += state
+        .ewma_latency_ms
+        .unwrap_or(CLIENT_ROUTE_UNKNOWN_LATENCY_MS);
     if descriptor.path_kind == ClientEndpointPathKind::Relay {
         score += CLIENT_ROUTE_RELAY_PENALTY_MS;
     }
@@ -612,7 +613,8 @@ async fn execute_buffered_request_for_transport(
                 .with_context(|| format!("failed to execute multiplexed {} {}", method, url));
             }
 
-            let mut request = apply_headers_to_request(http.request(method.clone(), url.clone()), headers);
+            let mut request =
+                apply_headers_to_request(http.request(method.clone(), url.clone()), headers);
             if !body.is_empty() {
                 request = request.body(body.to_vec());
             }
@@ -634,16 +636,9 @@ async fn execute_buffered_request_for_transport(
         }
         ClientTransport::Relay(relay) => {
             let source = relay_source_identity_for_auth(auth)?;
-            execute_relay_multiplex_buffered_request(
-                relay,
-                source,
-                method,
-                url,
-                headers,
-                body,
-            )
-            .await
-            .with_context(|| format!("failed to relay {} {}", method, url))
+            execute_relay_multiplex_buffered_request(relay, source, method, url, headers, body)
+                .await
+                .with_context(|| format!("failed to relay {} {}", method, url))
         }
     }
 }
@@ -679,11 +674,7 @@ async fn execute_streaming_object_read_request_for_transport(
         ClientTransport::Relay(relay) => {
             let source = relay_source_identity_for_auth(auth)?;
             execute_relay_multiplex_streaming_object_read_request(
-                relay,
-                source,
-                url,
-                headers,
-                writer,
+                relay, source, url, headers, writer,
             )
             .await
             .with_context(|| format!("failed to relay streamed GET {}", url))
@@ -719,17 +710,13 @@ async fn execute_streaming_object_write_request_for_transport(
                 .with_context(|| format!("failed to execute streamed {} {}", method, url));
             }
 
-            execute_buffered_request_for_transport(transport, auth, method, url, headers, body).await
+            execute_buffered_request_for_transport(transport, auth, method, url, headers, body)
+                .await
         }
         ClientTransport::Relay(relay) => {
             let source = relay_source_identity_for_auth(auth)?;
             execute_relay_multiplex_streaming_object_write_request(
-                relay,
-                source,
-                method,
-                url,
-                headers,
-                body,
+                relay, source, method, url, headers, body,
             )
             .await
             .with_context(|| format!("failed to relay streamed {} {}", method, url))
@@ -1329,7 +1316,11 @@ impl IronMeshClient {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            anyhow!("no client transport endpoints are available for {} {}", method, url)
+            anyhow!(
+                "no client transport endpoints are available for {} {}",
+                method,
+                url
+            )
         }))
     }
 
@@ -1775,9 +1766,9 @@ impl IronMeshClient {
                 let Some(endpoint) = self.transport_router.endpoint(route_index).cloned() else {
                     continue;
                 };
-                let endpoint_url = endpoint.rewrite_url(&url).with_context(|| {
-                    format!("failed to rewrite streamed PUT {}", url)
-                });
+                let endpoint_url = endpoint
+                    .rewrite_url(&url)
+                    .with_context(|| format!("failed to rewrite streamed PUT {}", url));
                 let endpoint_url = match endpoint_url {
                     Ok(endpoint_url) => endpoint_url,
                     Err(error) => {
@@ -2032,7 +2023,12 @@ impl IronMeshClient {
         }
 
         let response = response.ok_or_else(|| {
-            last_error.unwrap_or_else(|| anyhow!("no client transport endpoints are available for streamed GET {}", url))
+            last_error.unwrap_or_else(|| {
+                anyhow!(
+                    "no client transport endpoints are available for streamed GET {}",
+                    url
+                )
+            })
         })?;
 
         tracing::info!(
@@ -5786,11 +5782,8 @@ mod tests {
             identity.clone(),
             primary_target_node_id,
         );
-        let fallback = relay_test_client(
-            &fallback_state,
-            identity.clone(),
-            fallback_target_node_id,
-        );
+        let fallback =
+            relay_test_client(&fallback_state, identity.clone(), fallback_target_node_id);
         let client = IronMeshClient::combine(vec![primary, fallback])
             .expect("combined relay client should build");
 
@@ -5860,7 +5853,10 @@ mod tests {
         assert!(primary_state.issued_ticket_count.load(Ordering::SeqCst) >= 1);
         assert!(primary_state.paired_session_count.load(Ordering::SeqCst) >= 1);
         assert_eq!(fallback_state.issued_ticket_count.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_state.paired_session_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fallback_state.paired_session_count.load(Ordering::SeqCst),
+            1
+        );
 
         primary_server.abort();
         let _ = primary_server.await;

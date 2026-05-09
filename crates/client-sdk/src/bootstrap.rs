@@ -346,7 +346,11 @@ impl ConnectionBootstrap {
             .filter(|target| target.server_base_url.is_some())
             .cloned()
             .collect::<Vec<_>>();
-        if direct_targets.is_empty() && planned_targets.iter().any(|target| target.server_base_url.is_none()) {
+        if direct_targets.is_empty()
+            && planned_targets
+                .iter()
+                .any(|target| target.server_base_url.is_none())
+        {
             bail!(
                 "bootstrap selected or permits a relay-backed client route via rendezvous, but building a relay-backed client requires enrolled client identity material"
             );

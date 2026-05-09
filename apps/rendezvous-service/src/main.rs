@@ -655,8 +655,7 @@ mod tests {
                         &transport_sdk::RelayTunnelAcceptRequest {
                             cluster_id,
                             target: transport_sdk::PeerIdentity::Node(target_node_id),
-                            session_kind:
-                                transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+                            session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
                             wait_timeout_ms: Some(15_000),
                         },
                         transport_sdk::MultiplexConfig::default(),

@@ -327,32 +327,34 @@ fn order_clients_by_startup_probe(
 ) -> Result<Vec<IronMeshClient>> {
     let worker = std::thread::Builder::new()
         .name("ironmesh-client-startup-probe".to_string())
-        .spawn(move || -> Result<Vec<(usize, IronMeshClient, Result<f64>)>> {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed to build startup probe runtime")?;
+        .spawn(
+            move || -> Result<Vec<(usize, IronMeshClient, Result<f64>)>> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to build startup probe runtime")?;
 
-            Ok(runtime.block_on(async move {
-                let mut probes = FuturesUnordered::new();
-                for (index, client) in clients.into_iter().enumerate() {
-                    probes.push(async move {
-                        let probe = if signed_probe {
-                            probe_signed_client_startup_quality(&client).await
-                        } else {
-                            probe_direct_client_startup_quality(&client).await
-                        };
-                        (index, client, probe)
-                    });
-                }
+                Ok(runtime.block_on(async move {
+                    let mut probes = FuturesUnordered::new();
+                    for (index, client) in clients.into_iter().enumerate() {
+                        probes.push(async move {
+                            let probe = if signed_probe {
+                                probe_signed_client_startup_quality(&client).await
+                            } else {
+                                probe_direct_client_startup_quality(&client).await
+                            };
+                            (index, client, probe)
+                        });
+                    }
 
-                let mut results = Vec::new();
-                while let Some(result) = probes.next().await {
-                    results.push(result);
-                }
-                results
-            }))
-        })
+                    let mut results = Vec::new();
+                    while let Some(result) = probes.next().await {
+                        results.push(result);
+                    }
+                    results
+                }))
+            },
+        )
         .context("failed to spawn startup probe worker")?;
 
     let probed = worker
@@ -613,5 +615,4 @@ mod tests {
                 .contains("requires rendezvous_client_identity_pem")
         );
     }
-
 }

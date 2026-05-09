@@ -164,8 +164,8 @@ mod tests {
 
     #[tokio::test]
     async fn connect_websocket_times_out_for_unreachable_host() {
-        let url = Url::parse("ws://192.0.2.1:81/transport/ws")
-            .expect("test websocket URL should parse");
+        let url =
+            Url::parse("ws://192.0.2.1:81/transport/ws").expect("test websocket URL should parse");
 
         let started_at = Instant::now();
         let error = match connect_websocket(&url, None, None, &[]).await {
@@ -178,7 +178,9 @@ mod tests {
             "websocket connect should fail within the timeout window"
         );
         assert!(
-            error.to_string().contains("timed out connecting websocket TCP stream")
+            error
+                .to_string()
+                .contains("timed out connecting websocket TCP stream")
                 || error
                     .to_string()
                     .contains("failed connecting websocket TCP stream"),
