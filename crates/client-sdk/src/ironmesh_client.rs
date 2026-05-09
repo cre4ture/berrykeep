@@ -20,7 +20,9 @@ use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
@@ -39,6 +41,14 @@ const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
 const DOWNLOAD_SEGMENT_SIZE_BYTES: usize = 1024 * 1024;
 const STAGED_DOWNLOAD_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
 const TRANSPORT_STREAM_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
+const CLIENT_ROUTE_UNKNOWN_LATENCY_MS: f64 = 75.0;
+const CLIENT_ROUTE_RELAY_PENALTY_MS: f64 = 25.0;
+const CLIENT_ROUTE_FAILURE_PENALTY_MS: f64 = 250.0;
+const CLIENT_ROUTE_ACTIVE_BONUS_MS: f64 = 5.0;
+const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
+const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
+const CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS: u64 = 30_000;
+const CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
 pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +65,7 @@ impl std::fmt::Display for RequestedRange {
 
 #[derive(Clone)]
 pub struct IronMeshClient {
-    transport: ClientTransport,
+    transport_router: ClientEndpointRouter,
     auth: ClientRequestAuth,
 }
 
@@ -83,11 +93,421 @@ struct ClientRelayTransport {
     session_pool: TransportSessionPool,
 }
 
+#[derive(Clone)]
+struct ClientEndpointRouter {
+    endpoints: Arc<Vec<ClientEndpoint>>,
+    active_index: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct ClientEndpoint {
+    descriptor: ClientEndpointDescriptor,
+    transport: ClientTransport,
+    state: Arc<std::sync::Mutex<ClientEndpointState>>,
+}
+
+#[derive(Debug, Clone)]
+struct ClientEndpointDescriptor {
+    path_kind: ClientEndpointPathKind,
+    locator: String,
+    bootstrap_rank: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientEndpointPathKind {
+    Direct,
+    Relay,
+}
+
+#[derive(Debug, Default)]
+struct ClientEndpointState {
+    ewma_latency_ms: Option<f64>,
+    ewma_throughput_bytes_per_sec: Option<f64>,
+    consecutive_failures: u32,
+    total_failures: u64,
+    total_successes: u64,
+    last_measurement_unix_ms: Option<u64>,
+    last_success_unix_ms: Option<u64>,
+    last_failure_unix_ms: Option<u64>,
+    circuit_open_until_unix_ms: Option<u64>,
+    background_probe_in_flight: bool,
+    last_background_probe_unix_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
 #[derive(Debug)]
 struct BufferedTransportResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
+}
+
+impl ClientTransport {
+    fn path_kind(&self) -> ClientEndpointPathKind {
+        match self {
+            Self::Direct { .. } => ClientEndpointPathKind::Direct,
+            Self::Relay(_) => ClientEndpointPathKind::Relay,
+        }
+    }
+
+    fn request_base_url(&self) -> &str {
+        match self {
+            Self::Direct {
+                server_base_url, ..
+            } => server_base_url.as_str(),
+            Self::Relay(relay) => relay.request_base_url.as_str(),
+        }
+    }
+
+    fn endpoint_locator(&self) -> String {
+        match self {
+            Self::Direct {
+                server_base_url, ..
+            } => server_base_url.clone(),
+            Self::Relay(relay) => {
+                let rendezvous_hint = relay
+                    .rendezvous
+                    .config()
+                    .rendezvous_urls
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "rendezvous".to_string());
+                format!(
+                    "relay://{}@{}",
+                    relay.target_node_id,
+                    rendezvous_hint.trim_end_matches('/')
+                )
+            }
+        }
+    }
+
+    fn direct_server_base_url(&self) -> Option<&str> {
+        match self {
+            Self::Direct {
+                server_base_url, ..
+            } => Some(server_base_url.as_str()),
+            Self::Relay(_) => None,
+        }
+    }
+
+    fn relay_target_node_id(&self) -> Option<NodeId> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::Relay(relay) => Some(relay.target_node_id),
+        }
+    }
+
+    fn rendezvous_client(&self) -> Option<RendezvousControlClient> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::Relay(relay) => Some(relay.rendezvous.clone()),
+        }
+    }
+
+    fn session_pool_snapshot(&self) -> TransportSessionPoolSnapshot {
+        match self {
+            Self::Direct { session_pool, .. } => session_pool.snapshot(),
+            Self::Relay(relay) => relay.session_pool.snapshot(),
+        }
+    }
+
+    fn rewrite_url(&self, url: &Url) -> Result<Url> {
+        let base_url = Url::parse(self.request_base_url()).with_context(|| {
+            format!(
+                "invalid endpoint base URL: {}",
+                self.request_base_url()
+            )
+        })?;
+        base_url
+            .join(path_and_query(url).trim_start_matches('/'))
+            .with_context(|| {
+                format!(
+                    "failed to rewrite request URL for endpoint {}",
+                    self.endpoint_locator()
+                )
+            })
+    }
+}
+
+impl ClientEndpoint {
+    fn new(transport: ClientTransport, bootstrap_rank: usize) -> Self {
+        Self {
+            descriptor: ClientEndpointDescriptor {
+                path_kind: transport.path_kind(),
+                locator: transport.endpoint_locator(),
+                bootstrap_rank,
+            },
+            transport,
+            state: Arc::new(std::sync::Mutex::new(ClientEndpointState::default())),
+        }
+    }
+
+    fn rewrite_url(&self, url: &Url) -> Result<Url> {
+        self.transport.rewrite_url(url)
+    }
+}
+
+impl ClientEndpointRouter {
+    fn new(endpoints: Vec<ClientEndpoint>) -> Self {
+        let initial_active = if endpoints.is_empty() { usize::MAX } else { 0 };
+        Self {
+            endpoints: Arc::new(endpoints),
+            active_index: Arc::new(AtomicUsize::new(initial_active)),
+        }
+    }
+
+    fn endpoint(&self, index: usize) -> Option<&ClientEndpoint> {
+        self.endpoints.get(index)
+    }
+
+    fn active_index(&self) -> Option<usize> {
+        let active_index = self.active_index.load(Ordering::Relaxed);
+        (active_index < self.endpoints.len()).then_some(active_index)
+    }
+
+    fn current_endpoint(&self) -> Option<&ClientEndpoint> {
+        self.active_index()
+            .and_then(|index| self.endpoints.get(index))
+            .or_else(|| self.best_ranked_index().and_then(|index| self.endpoints.get(index)))
+            .or_else(|| self.endpoints.first())
+    }
+
+    fn set_active_index(&self, index: usize) {
+        self.active_index.store(index, Ordering::Relaxed);
+    }
+
+    fn best_ranked_index(&self) -> Option<usize> {
+        self.rank_indices().into_iter().next()
+    }
+
+    fn rank_indices(&self) -> Vec<usize> {
+        let now_unix_ms = unix_ts_ms();
+        let active_index = self.active_index();
+        let mut available = Vec::new();
+        let mut cooling = Vec::new();
+
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            let state = lock_endpoint_state(&endpoint.state);
+            let score = endpoint_score(index, active_index, &endpoint.descriptor, &state);
+            if let Some(until_unix_ms) = state
+                .circuit_open_until_unix_ms
+                .filter(|until_unix_ms| *until_unix_ms > now_unix_ms)
+            {
+                cooling.push((index, until_unix_ms, score));
+            } else {
+                available.push((index, score));
+            }
+        }
+
+        available.sort_by(|left, right| compare_scores(left.1, right.1, left.0, right.0));
+        cooling.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+
+        if available.is_empty() {
+            return cooling.into_iter().map(|(index, _, _)| index).collect();
+        }
+
+        available
+            .into_iter()
+            .map(|(index, _)| index)
+            .chain(cooling.into_iter().map(|(index, _, _)| index))
+            .collect()
+    }
+
+    fn record_success(&self, index: usize, latency_ms: f64, bytes_transferred: usize) {
+        let Some(endpoint) = self.endpoints.get(index) else {
+            return;
+        };
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_success_sample(&mut state, latency_ms, bytes_transferred, false);
+        drop(state);
+        self.set_active_index(index);
+    }
+
+    fn record_failure(&self, index: usize, error: &str) {
+        let Some(endpoint) = self.endpoints.get(index) else {
+            return;
+        };
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_failure_sample(&mut state, error, false);
+    }
+
+    fn claim_background_probe_candidates(&self) -> Vec<(usize, ClientEndpoint)> {
+        if self.endpoints.len() <= 1 {
+            return Vec::new();
+        }
+
+        let now_unix_ms = unix_ts_ms();
+        let active_index = self.active_index();
+        let mut claimed = Vec::new();
+
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            if Some(index) == active_index {
+                continue;
+            }
+            let mut state = lock_endpoint_state(&endpoint.state);
+            if !background_probe_due(&state, now_unix_ms) {
+                continue;
+            }
+            state.background_probe_in_flight = true;
+            state.last_background_probe_unix_ms = Some(now_unix_ms);
+            claimed.push((index, endpoint.clone()));
+        }
+
+        claimed
+    }
+
+    fn record_background_probe_success(&self, index: usize, latency_ms: f64) {
+        let Some(endpoint) = self.endpoints.get(index) else {
+            return;
+        };
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_success_sample(&mut state, latency_ms, 0, true);
+    }
+
+    fn record_background_probe_failure(&self, index: usize, error: &str) {
+        let Some(endpoint) = self.endpoints.get(index) else {
+            return;
+        };
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_failure_sample(&mut state, error, true);
+    }
+}
+
+fn lock_endpoint_state(
+    state: &std::sync::Mutex<ClientEndpointState>,
+) -> std::sync::MutexGuard<'_, ClientEndpointState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn endpoint_score(
+    index: usize,
+    active_index: Option<usize>,
+    descriptor: &ClientEndpointDescriptor,
+    state: &ClientEndpointState,
+) -> f64 {
+    let mut score = descriptor.bootstrap_rank as f64;
+    score += state.ewma_latency_ms.unwrap_or(CLIENT_ROUTE_UNKNOWN_LATENCY_MS);
+    if descriptor.path_kind == ClientEndpointPathKind::Relay {
+        score += CLIENT_ROUTE_RELAY_PENALTY_MS;
+    }
+    score += state.consecutive_failures as f64 * CLIENT_ROUTE_FAILURE_PENALTY_MS;
+    if let Some(throughput_bytes_per_sec) = state.ewma_throughput_bytes_per_sec {
+        score -= (throughput_bytes_per_sec / 250_000.0).min(50.0);
+    }
+    if active_index == Some(index) {
+        score -= CLIENT_ROUTE_ACTIVE_BONUS_MS;
+    }
+    score
+}
+
+fn compare_scores(
+    left_score: f64,
+    right_score: f64,
+    left_index: usize,
+    right_index: usize,
+) -> std::cmp::Ordering {
+    left_score
+        .partial_cmp(&right_score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left_index.cmp(&right_index))
+}
+
+fn update_ewma(current: Option<f64>, sample: f64) -> f64 {
+    const ALPHA: f64 = 0.35;
+    match current {
+        Some(current) => current + ALPHA * (sample - current),
+        None => sample,
+    }
+}
+
+fn endpoint_failure_backoff_ms(consecutive_failures: u32) -> u64 {
+    let shift = consecutive_failures.saturating_sub(1).min(8);
+    let multiplier = 1_u64 << shift;
+    (CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS * multiplier).min(CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS)
+}
+
+fn record_endpoint_success_sample(
+    state: &mut ClientEndpointState,
+    latency_ms: f64,
+    bytes_transferred: usize,
+    background_probe: bool,
+) {
+    state.ewma_latency_ms = Some(update_ewma(state.ewma_latency_ms, latency_ms));
+    if latency_ms > 0.0 && bytes_transferred > 0 {
+        let throughput_bytes_per_sec = bytes_transferred as f64 / (latency_ms / 1000.0);
+        state.ewma_throughput_bytes_per_sec = Some(update_ewma(
+            state.ewma_throughput_bytes_per_sec,
+            throughput_bytes_per_sec,
+        ));
+    }
+    let now_unix_ms = unix_ts_ms();
+    state.consecutive_failures = 0;
+    state.total_successes = state.total_successes.saturating_add(1);
+    state.last_measurement_unix_ms = Some(now_unix_ms);
+    state.last_success_unix_ms = Some(now_unix_ms);
+    state.circuit_open_until_unix_ms = None;
+    state.last_error = None;
+    if background_probe {
+        state.background_probe_in_flight = false;
+    }
+}
+
+fn record_endpoint_failure_sample(
+    state: &mut ClientEndpointState,
+    error: &str,
+    background_probe: bool,
+) {
+    let now_unix_ms = unix_ts_ms();
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    state.total_failures = state.total_failures.saturating_add(1);
+    state.last_measurement_unix_ms = Some(now_unix_ms);
+    state.last_failure_unix_ms = Some(now_unix_ms);
+    state.circuit_open_until_unix_ms =
+        Some(now_unix_ms + endpoint_failure_backoff_ms(state.consecutive_failures));
+    state.last_error = Some(error.to_string());
+    if background_probe {
+        state.background_probe_in_flight = false;
+    }
+}
+
+fn background_probe_due(state: &ClientEndpointState, now_unix_ms: u64) -> bool {
+    if state.background_probe_in_flight {
+        return false;
+    }
+    if state
+        .circuit_open_until_unix_ms
+        .is_some_and(|until_unix_ms| until_unix_ms > now_unix_ms)
+    {
+        return false;
+    }
+    if state
+        .last_background_probe_unix_ms
+        .is_some_and(|last_probe_unix_ms| {
+            now_unix_ms.saturating_sub(last_probe_unix_ms)
+                < CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS
+        })
+    {
+        return false;
+    }
+
+    state.last_measurement_unix_ms.is_none()
+        || state.consecutive_failures > 0
+        || state
+            .last_measurement_unix_ms
+            .is_some_and(|last_measurement_unix_ms| {
+                now_unix_ms.saturating_sub(last_measurement_unix_ms)
+                    >= CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS
+            })
+}
+
+fn is_retryable_transport_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 fn header_value_for_log(headers: &HeaderMap, name: &str) -> String {
@@ -131,6 +551,230 @@ fn build_identity_request_auth_headers(
             value: signed_headers.signature_base64,
         },
     ])
+}
+
+fn request_auth_headers_for_auth(
+    auth: &ClientRequestAuth,
+    method: &Method,
+    url: &Url,
+) -> Result<Vec<RelayHttpHeader>> {
+    match auth {
+        ClientRequestAuth::None => Ok(Vec::new()),
+        ClientRequestAuth::SignedIdentity(identity) => {
+            build_identity_request_auth_headers(identity, method.as_str(), &path_and_query(url))
+        }
+    }
+}
+
+fn relay_source_identity_for_auth(auth: &ClientRequestAuth) -> Result<PeerIdentity> {
+    match auth {
+        ClientRequestAuth::SignedIdentity(identity) => Ok(PeerIdentity::Device(identity.device_id)),
+        ClientRequestAuth::None => {
+            bail!("relay-backed client transport requires signed client identity material")
+        }
+    }
+}
+
+fn apply_headers_to_request(
+    request: RequestBuilder,
+    headers: &[RelayHttpHeader],
+) -> RequestBuilder {
+    headers.iter().fold(request, |request, header| {
+        request.header(header.name.as_str(), header.value.as_str())
+    })
+}
+
+async fn execute_buffered_request_for_transport(
+    transport: &ClientTransport,
+    auth: &ClientRequestAuth,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    body: &[u8],
+) -> Result<BufferedTransportResponse> {
+    match transport {
+        ClientTransport::Direct {
+            http,
+            server_base_url,
+            session_pool,
+        } => {
+            if let ClientRequestAuth::SignedIdentity(identity) = auth {
+                return execute_direct_multiplex_buffered_request(
+                    server_base_url,
+                    session_pool,
+                    identity,
+                    method,
+                    url,
+                    headers,
+                    body,
+                )
+                .await
+                .with_context(|| format!("failed to execute multiplexed {} {}", method, url));
+            }
+
+            let mut request = apply_headers_to_request(http.request(method.clone(), url.clone()), headers);
+            if !body.is_empty() {
+                request = request.body(body.to_vec());
+            }
+            let response = request
+                .send()
+                .await
+                .with_context(|| format!("failed to execute {} {}", method, url))?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response
+                .bytes()
+                .await
+                .with_context(|| format!("failed to read response body for {} {}", method, url))?;
+            Ok(BufferedTransportResponse {
+                status,
+                headers,
+                body,
+            })
+        }
+        ClientTransport::Relay(relay) => {
+            let source = relay_source_identity_for_auth(auth)?;
+            execute_relay_multiplex_buffered_request(
+                relay,
+                source,
+                method,
+                url,
+                headers,
+                body,
+            )
+            .await
+            .with_context(|| format!("failed to relay {} {}", method, url))
+        }
+    }
+}
+
+async fn execute_streaming_object_read_request_for_transport(
+    transport: &ClientTransport,
+    auth: &ClientRequestAuth,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    writer: &mut dyn Write,
+) -> Result<StreamedTransportResponseMeta> {
+    match transport {
+        ClientTransport::Direct {
+            http,
+            server_base_url,
+            session_pool,
+        } => {
+            if let ClientRequestAuth::SignedIdentity(identity) = auth {
+                return execute_direct_multiplex_streaming_object_read_request(
+                    server_base_url,
+                    session_pool,
+                    identity,
+                    url,
+                    headers,
+                    writer,
+                )
+                .await
+                .with_context(|| format!("failed to execute streamed GET {}", url));
+            }
+
+            execute_direct_http_streaming_object_read_request(http, url, headers, writer).await
+        }
+        ClientTransport::Relay(relay) => {
+            let source = relay_source_identity_for_auth(auth)?;
+            execute_relay_multiplex_streaming_object_read_request(
+                relay,
+                source,
+                url,
+                headers,
+                writer,
+            )
+            .await
+            .with_context(|| format!("failed to relay streamed GET {}", url))
+        }
+    }
+}
+
+async fn execute_streaming_object_write_request_for_transport(
+    transport: &ClientTransport,
+    auth: &ClientRequestAuth,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    body: &[u8],
+) -> Result<BufferedTransportResponse> {
+    match transport {
+        ClientTransport::Direct {
+            server_base_url,
+            session_pool,
+            ..
+        } => {
+            if let ClientRequestAuth::SignedIdentity(identity) = auth {
+                return execute_direct_multiplex_streaming_object_write_request(
+                    server_base_url,
+                    session_pool,
+                    identity,
+                    method,
+                    url,
+                    headers,
+                    body,
+                )
+                .await
+                .with_context(|| format!("failed to execute streamed {} {}", method, url));
+            }
+
+            execute_buffered_request_for_transport(transport, auth, method, url, headers, body).await
+        }
+        ClientTransport::Relay(relay) => {
+            let source = relay_source_identity_for_auth(auth)?;
+            execute_relay_multiplex_streaming_object_write_request(
+                relay,
+                source,
+                method,
+                url,
+                headers,
+                body,
+            )
+            .await
+            .with_context(|| format!("failed to relay streamed {} {}", method, url))
+        }
+    }
+}
+
+async fn probe_endpoint_background_quality(
+    endpoint: &ClientEndpoint,
+    auth: &ClientRequestAuth,
+) -> Result<f64> {
+    let base_url = Url::parse(endpoint.transport.request_base_url()).with_context(|| {
+        format!(
+            "invalid background probe base URL for endpoint {}",
+            endpoint.descriptor.locator
+        )
+    })?;
+    let method = Method::GET;
+    let url = base_url
+        .join(normalize_client_api_path("/health").trim_start_matches('/'))
+        .with_context(|| {
+            format!(
+                "failed to build background health probe URL for endpoint {}",
+                endpoint.descriptor.locator
+            )
+        })?;
+    let headers = request_auth_headers_for_auth(auth, &method, &url)?;
+    let started_at = std::time::Instant::now();
+    let response = execute_buffered_request_for_transport(
+        &endpoint.transport,
+        auth,
+        &method,
+        &url,
+        &headers,
+        &[],
+    )
+    .await?;
+    if !response.status.is_success() {
+        bail!(
+            "background health probe returned {} from {}",
+            response.status,
+            endpoint.descriptor.locator
+        );
+    }
+    Ok(started_at.elapsed().as_secs_f64() * 1000.0)
 }
 
 fn blocking_runtime() -> Result<&'static tokio::runtime::Runtime> {
@@ -475,14 +1119,17 @@ impl IronMeshClient {
     ) -> Self {
         let server_base_url = server_base_url.into().trim_end_matches('/').to_string();
         Self {
-            transport: ClientTransport::Direct {
-                http,
-                session_pool: TransportSessionPool::new_direct(
-                    server_base_url.clone(),
-                    server_ca_pem,
-                ),
-                server_base_url,
-            },
+            transport_router: ClientEndpointRouter::new(vec![ClientEndpoint::new(
+                ClientTransport::Direct {
+                    http,
+                    session_pool: TransportSessionPool::new_direct(
+                        server_base_url.clone(),
+                        server_ca_pem,
+                    ),
+                    server_base_url,
+                },
+                0,
+            )]),
             auth: ClientRequestAuth::None,
         }
     }
@@ -495,14 +1142,51 @@ impl IronMeshClient {
         let request_base_url = request_base_url.into().trim_end_matches('/').to_string();
         let session_pool = TransportSessionPool::new_relay(rendezvous.clone(), target_node_id);
         Self {
-            transport: ClientTransport::Relay(ClientRelayTransport {
-                rendezvous,
-                request_base_url,
-                target_node_id,
-                session_pool,
-            }),
+            transport_router: ClientEndpointRouter::new(vec![ClientEndpoint::new(
+                ClientTransport::Relay(ClientRelayTransport {
+                    rendezvous,
+                    request_base_url,
+                    target_node_id,
+                    session_pool,
+                }),
+                0,
+            )]),
             auth: ClientRequestAuth::None,
         }
+    }
+
+    pub(crate) fn combine(clients: Vec<Self>) -> Result<Self> {
+        if clients.is_empty() {
+            bail!("cannot combine zero client transport endpoints");
+        }
+
+        let mut combined_auth = None;
+        let mut endpoints = Vec::with_capacity(clients.len());
+
+        for (bootstrap_rank, client) in clients.into_iter().enumerate() {
+            match (&combined_auth, &client.auth) {
+                (None, auth) => combined_auth = Some(auth.clone()),
+                (Some(ClientRequestAuth::None), ClientRequestAuth::None)
+                | (
+                    Some(ClientRequestAuth::SignedIdentity(_)),
+                    ClientRequestAuth::SignedIdentity(_),
+                ) => {}
+                _ => bail!("cannot combine client transports with incompatible auth modes"),
+            }
+
+            let transport = client
+                .transport_router
+                .endpoints
+                .first()
+                .map(|endpoint| endpoint.transport.clone())
+                .ok_or_else(|| anyhow!("cannot combine an empty client transport router"))?;
+            endpoints.push(ClientEndpoint::new(transport, bootstrap_rank));
+        }
+
+        Ok(Self {
+            transport_router: ClientEndpointRouter::new(endpoints),
+            auth: combined_auth.unwrap_or(ClientRequestAuth::None),
+        })
     }
 
     pub fn with_client_identity(mut self, identity: ClientIdentityMaterial) -> Self {
@@ -511,75 +1195,66 @@ impl IronMeshClient {
     }
 
     pub fn uses_relay_transport(&self) -> bool {
-        matches!(self.transport, ClientTransport::Relay(_))
+        self.transport_router
+            .current_endpoint()
+            .map(|endpoint| matches!(endpoint.transport, ClientTransport::Relay(_)))
+            .unwrap_or(false)
     }
 
     pub fn relay_target_node_id(&self) -> Option<NodeId> {
-        match &self.transport {
-            ClientTransport::Direct { .. } => None,
-            ClientTransport::Relay(relay) => Some(relay.target_node_id),
-        }
+        self.transport_router
+            .current_endpoint()
+            .and_then(|endpoint| endpoint.transport.relay_target_node_id())
     }
 
     pub fn direct_server_base_url(&self) -> Option<&str> {
-        match &self.transport {
-            ClientTransport::Direct {
-                server_base_url, ..
-            } => Some(server_base_url.as_str()),
-            ClientTransport::Relay(_) => None,
-        }
+        self.transport_router
+            .current_endpoint()
+            .and_then(|endpoint| endpoint.transport.direct_server_base_url())
     }
 
     pub fn rendezvous_client(&self) -> Option<RendezvousControlClient> {
-        match &self.transport {
-            ClientTransport::Direct { .. } => None,
-            ClientTransport::Relay(relay) => Some(relay.rendezvous.clone()),
-        }
+        self.transport_router
+            .current_endpoint()
+            .and_then(|endpoint| endpoint.transport.rendezvous_client())
     }
 
     pub fn transport_session_pool_snapshot(&self) -> TransportSessionPoolSnapshot {
-        match &self.transport {
-            ClientTransport::Direct { session_pool, .. } => session_pool.snapshot(),
-            ClientTransport::Relay(relay) => relay.session_pool.snapshot(),
-        }
+        self.transport_router
+            .current_endpoint()
+            .map(|endpoint| endpoint.transport.session_pool_snapshot())
+            .unwrap_or_default()
     }
 
     fn server_base_url(&self) -> &str {
-        match &self.transport {
-            ClientTransport::Direct {
-                server_base_url, ..
-            } => server_base_url.as_str(),
-            ClientTransport::Relay(relay) => relay.request_base_url.as_str(),
-        }
+        self.transport_router
+            .current_endpoint()
+            .map(|endpoint| endpoint.transport.request_base_url())
+            .expect("ironmesh client must contain at least one transport endpoint")
     }
 
     fn request_auth_headers(&self, method: &Method, url: &Url) -> Result<Vec<RelayHttpHeader>> {
-        match &self.auth {
-            ClientRequestAuth::None => Ok(Vec::new()),
-            ClientRequestAuth::SignedIdentity(identity) => {
-                build_identity_request_auth_headers(identity, method.as_str(), &path_and_query(url))
-            }
+        request_auth_headers_for_auth(&self.auth, method, url)
+    }
+
+    fn maybe_spawn_background_quality_refresh(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
         }
-    }
 
-    fn apply_headers_to_request(
-        &self,
-        request: RequestBuilder,
-        headers: &[RelayHttpHeader],
-    ) -> RequestBuilder {
-        headers.iter().fold(request, |request, header| {
-            request.header(header.name.as_str(), header.value.as_str())
-        })
-    }
-
-    fn relay_source_identity(&self) -> Result<PeerIdentity> {
-        match &self.auth {
-            ClientRequestAuth::SignedIdentity(identity) => {
-                Ok(PeerIdentity::Device(identity.device_id))
-            }
-            ClientRequestAuth::None => {
-                bail!("relay-backed client transport requires signed client identity material")
-            }
+        for (index, endpoint) in self.transport_router.claim_background_probe_candidates() {
+            let transport_router = self.transport_router.clone();
+            let auth = self.auth.clone();
+            tokio::spawn(async move {
+                match probe_endpoint_background_quality(&endpoint, &auth).await {
+                    Ok(latency_ms) => {
+                        transport_router.record_background_probe_success(index, latency_ms);
+                    }
+                    Err(error) => {
+                        transport_router.record_background_probe_failure(index, &error.to_string());
+                    }
+                }
+            });
         }
     }
 
@@ -590,65 +1265,72 @@ impl IronMeshClient {
         mut headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
     ) -> Result<BufferedTransportResponse> {
+        self.maybe_spawn_background_quality_refresh();
+
         let mut auth_headers = self.request_auth_headers(&method, &url)?;
         auth_headers.append(&mut headers);
 
-        match &self.transport {
-            ClientTransport::Direct {
-                http,
-                server_base_url,
-                session_pool,
-            } => {
-                if let ClientRequestAuth::SignedIdentity(identity) = &self.auth {
-                    return execute_direct_multiplex_buffered_request(
-                        server_base_url,
-                        session_pool,
-                        identity,
-                        &method,
-                        &url,
-                        &auth_headers,
-                        body.as_deref().unwrap_or_default(),
-                    )
-                    .await
-                    .with_context(|| format!("failed to execute multiplexed {} {}", method, url));
+        let mut last_error = None;
+        for index in self.transport_router.rank_indices() {
+            let Some(endpoint) = self.transport_router.endpoint(index).cloned() else {
+                continue;
+            };
+            let endpoint_url = endpoint
+                .rewrite_url(&url)
+                .with_context(|| format!("failed to rewrite {} {}", method, url));
+            let endpoint_url = match endpoint_url {
+                Ok(endpoint_url) => endpoint_url,
+                Err(error) => {
+                    self.transport_router
+                        .record_failure(index, &error.to_string());
+                    last_error = Some(error);
+                    continue;
                 }
-
-                let mut request = self.apply_headers_to_request(
-                    http.request(method.clone(), url.clone()),
-                    &auth_headers,
-                );
-                if let Some(body) = body {
-                    request = request.body(body);
+            };
+            let started_at = std::time::Instant::now();
+            match execute_buffered_request_for_transport(
+                &endpoint.transport,
+                &self.auth,
+                &method,
+                &endpoint_url,
+                &auth_headers,
+                body.as_deref().unwrap_or_default(),
+            )
+            .await
+            {
+                Ok(response) if is_retryable_transport_status(response.status) => {
+                    self.transport_router.record_failure(
+                        index,
+                        &format!(
+                            "retryable HTTP {} from {}",
+                            response.status, endpoint.descriptor.locator
+                        ),
+                    );
+                    last_error = Some(anyhow!(
+                        "retryable transport response {} from {}",
+                        response.status,
+                        endpoint.descriptor.locator
+                    ));
                 }
-                let response = request
-                    .send()
-                    .await
-                    .with_context(|| format!("failed to execute {} {}", method, url))?;
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body = response.bytes().await.with_context(|| {
-                    format!("failed to read response body for {} {}", method, url)
-                })?;
-                Ok(BufferedTransportResponse {
-                    status,
-                    headers,
-                    body,
-                })
-            }
-            ClientTransport::Relay(relay) => {
-                let source = self.relay_source_identity()?;
-                execute_relay_multiplex_buffered_request(
-                    relay,
-                    source,
-                    &method,
-                    &url,
-                    &auth_headers,
-                    body.as_deref().unwrap_or_default(),
-                )
-                .await
-                .with_context(|| format!("failed to relay {} {}", method, url))
+                Ok(response) => {
+                    self.transport_router.record_success(
+                        index,
+                        started_at.elapsed().as_secs_f64() * 1000.0,
+                        response.body.len(),
+                    );
+                    return Ok(response);
+                }
+                Err(error) => {
+                    self.transport_router
+                        .record_failure(index, &error.to_string());
+                    last_error = Some(error);
+                }
             }
         }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!("no client transport endpoints are available for {} {}", method, url)
+        }))
     }
 
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
@@ -1076,57 +1758,88 @@ impl IronMeshClient {
         index: usize,
         payload: Vec<u8>,
     ) -> Result<UploadSessionChunkResponse> {
+        self.maybe_spawn_background_quality_refresh();
+
         let url = self.store_upload_session_chunk_url(upload_id, index)?;
-        let response = match &self.transport {
-            ClientTransport::Direct {
-                http: _,
-                server_base_url,
-                session_pool,
-            } => {
-                if let ClientRequestAuth::SignedIdentity(identity) = &self.auth {
-                    let auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
-                    execute_direct_multiplex_streaming_object_write_request(
-                        server_base_url,
-                        session_pool,
-                        identity,
-                        &Method::PUT,
-                        &url,
-                        &auth_headers,
-                        &payload,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("failed to upload streamed chunk {index} for session={upload_id}")
-                    })?
-                } else {
-                    self.execute_buffered_request(
-                        Method::PUT,
-                        url.clone(),
-                        Vec::new(),
-                        Some(payload),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("failed to upload chunk {index} for session={upload_id}")
-                    })?
-                }
-            }
-            ClientTransport::Relay(relay) => {
-                let auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
-                let source = self.relay_source_identity()?;
-                execute_relay_multiplex_streaming_object_write_request(
-                    relay,
-                    source,
+        let response = if matches!(self.auth, ClientRequestAuth::None) {
+            self.execute_buffered_request(Method::PUT, url.clone(), Vec::new(), Some(payload))
+                .await
+                .with_context(|| {
+                    format!("failed to upload chunk {index} for session={upload_id}")
+                })?
+        } else {
+            let auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
+            let mut last_error = None;
+            let mut response = None;
+            for route_index in self.transport_router.rank_indices() {
+                let Some(endpoint) = self.transport_router.endpoint(route_index).cloned() else {
+                    continue;
+                };
+                let endpoint_url = endpoint.rewrite_url(&url).with_context(|| {
+                    format!("failed to rewrite streamed PUT {}", url)
+                });
+                let endpoint_url = match endpoint_url {
+                    Ok(endpoint_url) => endpoint_url,
+                    Err(error) => {
+                        self.transport_router
+                            .record_failure(route_index, &error.to_string());
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+                let started_at = std::time::Instant::now();
+                match execute_streaming_object_write_request_for_transport(
+                    &endpoint.transport,
+                    &self.auth,
                     &Method::PUT,
-                    &url,
+                    &endpoint_url,
                     &auth_headers,
                     &payload,
                 )
                 .await
-                .with_context(|| {
-                    format!("failed to upload streamed chunk {index} for session={upload_id}")
-                })?
+                {
+                    Ok(candidate_response)
+                        if is_retryable_transport_status(candidate_response.status) =>
+                    {
+                        self.transport_router.record_failure(
+                            route_index,
+                            &format!(
+                                "retryable HTTP {} from {}",
+                                candidate_response.status, endpoint.descriptor.locator
+                            ),
+                        );
+                        last_error = Some(anyhow!(
+                            "retryable transport response {} from {}",
+                            candidate_response.status,
+                            endpoint.descriptor.locator
+                        ));
+                    }
+                    Ok(candidate_response) => {
+                        self.transport_router.record_success(
+                            route_index,
+                            started_at.elapsed().as_secs_f64() * 1000.0,
+                            candidate_response.body.len(),
+                        );
+                        response = Some(candidate_response);
+                        break;
+                    }
+                    Err(error) => {
+                        self.transport_router
+                            .record_failure(route_index, &error.to_string());
+                        last_error = Some(error);
+                    }
+                }
             }
+
+            response.ok_or_else(|| {
+                last_error.unwrap_or_else(|| {
+                    anyhow!(
+                        "no client transport endpoints accepted streamed upload for session={} index={}",
+                        upload_id,
+                        index
+                    )
+                })
+            })?
         };
         if !response.status.is_success() {
             bail!(
@@ -1257,6 +1970,8 @@ impl IronMeshClient {
         if_range: Option<&str>,
         writer: &mut dyn Write,
     ) -> Result<StreamedTransportResponseMeta> {
+        self.maybe_spawn_background_quality_refresh();
+
         let mut url = self.store_key_url(key)?;
         append_optional_query(&mut url, "snapshot", snapshot);
         append_optional_query(&mut url, "version", version);
@@ -1271,46 +1986,54 @@ impl IronMeshClient {
         let mut auth_headers = self.request_auth_headers(&Method::GET, &url)?;
         auth_headers.append(&mut headers);
 
-        let response = match &self.transport {
-            ClientTransport::Direct {
-                http,
-                server_base_url,
-                session_pool,
-            } => {
-                if let ClientRequestAuth::SignedIdentity(identity) = &self.auth {
-                    execute_direct_multiplex_streaming_object_read_request(
-                        server_base_url,
-                        session_pool,
-                        identity,
-                        &url,
-                        &auth_headers,
-                        writer,
-                    )
-                    .await
-                    .with_context(|| format!("failed to execute streamed GET {}", url))?
-                } else {
-                    execute_direct_http_streaming_object_read_request(
-                        http,
-                        &url,
-                        &auth_headers,
-                        writer,
-                    )
-                    .await?
+        let mut last_error = None;
+        let mut response = None;
+        for index in self.transport_router.rank_indices() {
+            let Some(endpoint) = self.transport_router.endpoint(index).cloned() else {
+                continue;
+            };
+            let endpoint_url = endpoint
+                .rewrite_url(&url)
+                .with_context(|| format!("failed to rewrite streamed GET {}", url));
+            let endpoint_url = match endpoint_url {
+                Ok(endpoint_url) => endpoint_url,
+                Err(error) => {
+                    self.transport_router
+                        .record_failure(index, &error.to_string());
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let started_at = std::time::Instant::now();
+            match execute_streaming_object_read_request_for_transport(
+                &endpoint.transport,
+                &self.auth,
+                &endpoint_url,
+                &auth_headers,
+                writer,
+            )
+            .await
+            {
+                Ok(candidate_response) => {
+                    self.transport_router.record_success(
+                        index,
+                        started_at.elapsed().as_secs_f64() * 1000.0,
+                        candidate_response.bytes_written as usize,
+                    );
+                    response = Some(candidate_response);
+                    break;
+                }
+                Err(error) => {
+                    self.transport_router
+                        .record_failure(index, &error.to_string());
+                    last_error = Some(error);
                 }
             }
-            ClientTransport::Relay(relay) => {
-                let source = self.relay_source_identity()?;
-                execute_relay_multiplex_streaming_object_read_request(
-                    relay,
-                    source,
-                    &url,
-                    &auth_headers,
-                    writer,
-                )
-                .await
-                .with_context(|| format!("failed to relay streamed GET {}", url))?
-            }
-        };
+        }
+
+        let response = response.ok_or_else(|| {
+            last_error.unwrap_or_else(|| anyhow!("no client transport endpoints are available for streamed GET {}", url))
+        })?;
 
         tracing::info!(
             "client streamed object-read: key={} snapshot={} version={} range_start={} range_end={} status={} content_length={} content_range={} object_size={} etag={} accept_ranges={} bytes_written={}",
@@ -3300,6 +4023,13 @@ fn unix_ts() -> u64 {
         .as_secs()
 }
 
+fn unix_ts_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncSnapshot {
     let mut remote = Vec::with_capacity(entries.len());
 
@@ -3612,6 +4342,74 @@ mod tests {
         body: Vec<u8>,
     }
 
+    #[derive(Debug, Clone)]
+    struct DirectHttpRouteState {
+        cluster_status_hits: Arc<AtomicUsize>,
+        health_hits: Arc<AtomicUsize>,
+        response_delay_ms: u64,
+        name: String,
+    }
+
+    async fn spawn_direct_http_route_server_at(
+        bind_addr: std::net::SocketAddr,
+        response_delay_ms: u64,
+        name: &str,
+    ) -> (String, DirectHttpRouteState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        let state = DirectHttpRouteState {
+            cluster_status_hits: Arc::new(AtomicUsize::new(0)),
+            health_hits: Arc::new(AtomicUsize::new(0)),
+            response_delay_ms,
+            name: name.to_string(),
+        };
+        let router = Router::new()
+            .route(
+                "/api/v1/cluster/status",
+                get(|State(state): State<DirectHttpRouteState>| async move {
+                    state.cluster_status_hits.fetch_add(1, Ordering::SeqCst);
+                    if state.response_delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(state.response_delay_ms)).await;
+                    }
+                    Json(serde_json::json!({
+                        "status": "ok",
+                        "route": state.name,
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/health",
+                get(|State(state): State<DirectHttpRouteState>| async move {
+                    state.health_hits.fetch_add(1, Ordering::SeqCst);
+                    if state.response_delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(state.response_delay_ms)).await;
+                    }
+                    StatusCode::OK
+                }),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("direct http route server should run");
+        });
+        (format!("http://{addr}"), state, server)
+    }
+
+    async fn spawn_direct_http_route_server(
+        response_delay_ms: u64,
+        name: &str,
+    ) -> (String, DirectHttpRouteState, tokio::task::JoinHandle<()>) {
+        spawn_direct_http_route_server_at(
+            "127.0.0.1:0".parse().expect("bind addr should parse"),
+            response_delay_ms,
+            name,
+        )
+        .await
+    }
+
     #[derive(Clone)]
     struct RelayTestState {
         public_url: String,
@@ -3619,6 +4417,7 @@ mod tests {
         issued_ticket_count: Arc<AtomicUsize>,
         paired_session_count: Arc<AtomicUsize>,
         object_write_failures_remaining: Arc<AtomicUsize>,
+        response_delay_ms: u64,
         response_status: u16,
         response_headers: Vec<RelayHttpHeader>,
         response_body: Vec<u8>,
@@ -3850,6 +4649,10 @@ mod tests {
                 return;
             }
 
+            if state.response_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(state.response_delay_ms)).await;
+            }
+
             write_buffered_transport_response(
                 &mut stream,
                 &MultiplexBufferedTransportResponse {
@@ -3899,7 +4702,59 @@ mod tests {
         response_body: Vec<u8>,
         object_write_failures_remaining: usize,
     ) -> (RelayTestState, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        spawn_relay_test_server_with_delay_and_object_write_failures(
+            response_status,
+            response_headers,
+            response_body,
+            0,
+            object_write_failures_remaining,
+        )
+        .await
+    }
+
+    async fn spawn_relay_test_server_with_delay(
+        response_status: u16,
+        response_headers: Vec<RelayHttpHeader>,
+        response_body: Vec<u8>,
+        response_delay_ms: u64,
+    ) -> (RelayTestState, tokio::task::JoinHandle<()>) {
+        spawn_relay_test_server_with_delay_and_object_write_failures(
+            response_status,
+            response_headers,
+            response_body,
+            response_delay_ms,
+            0,
+        )
+        .await
+    }
+
+    async fn spawn_relay_test_server_with_delay_and_object_write_failures(
+        response_status: u16,
+        response_headers: Vec<RelayHttpHeader>,
+        response_body: Vec<u8>,
+        response_delay_ms: u64,
+        object_write_failures_remaining: usize,
+    ) -> (RelayTestState, tokio::task::JoinHandle<()>) {
+        spawn_relay_test_server_at(
+            "127.0.0.1:0".parse().expect("bind addr should parse"),
+            response_status,
+            response_headers,
+            response_body,
+            response_delay_ms,
+            object_write_failures_remaining,
+        )
+        .await
+    }
+
+    async fn spawn_relay_test_server_at(
+        bind_addr: std::net::SocketAddr,
+        response_status: u16,
+        response_headers: Vec<RelayHttpHeader>,
+        response_body: Vec<u8>,
+        response_delay_ms: u64,
+        object_write_failures_remaining: usize,
+    ) -> (RelayTestState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener addr");
@@ -3911,6 +4766,7 @@ mod tests {
             object_write_failures_remaining: Arc::new(AtomicUsize::new(
                 object_write_failures_remaining,
             )),
+            response_delay_ms,
             response_status,
             response_headers,
             response_body,
@@ -3942,6 +4798,7 @@ mod tests {
             issued_ticket_count: Arc::new(AtomicUsize::new(0)),
             paired_session_count: Arc::new(AtomicUsize::new(0)),
             object_write_failures_remaining: Arc::new(AtomicUsize::new(0)),
+            response_delay_ms: 0,
             response_status,
             response_headers,
             response_body,
@@ -4153,15 +5010,15 @@ mod tests {
         (format!("http://{addr}"), server)
     }
 
-    fn relay_test_client(
-        state: &RelayTestState,
+    fn relay_test_client_for_public_url(
+        public_url: impl Into<String>,
         identity: ClientIdentityMaterial,
         target_node_id: NodeId,
     ) -> IronMeshClient {
         let rendezvous = RendezvousControlClient::new(
             RendezvousClientConfig {
                 cluster_id: identity.cluster_id,
-                rendezvous_urls: vec![state.public_url.clone()],
+                rendezvous_urls: vec![public_url.into()],
                 heartbeat_interval_secs: 15,
             },
             None,
@@ -4178,6 +5035,14 @@ mod tests {
     ) -> IronMeshClient {
         IronMeshClient::from_direct_base_url(state.public_url.clone())
             .with_client_identity(identity)
+    }
+
+    fn relay_test_client(
+        state: &RelayTestState,
+        identity: ClientIdentityMaterial,
+        target_node_id: NodeId,
+    ) -> IronMeshClient {
+        relay_test_client_for_public_url(state.public_url.clone(), identity, target_node_id)
     }
 
     fn parse_range_header(range: &str, total_len: usize) -> (usize, usize) {
@@ -4761,6 +5626,246 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn combined_direct_transports_fail_over_to_second_endpoint() {
+        let (direct_state, server) = spawn_direct_transport_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: br#"{"status":"ok"}"#.len().to_string(),
+                },
+            ],
+            br#"{"status":"ok"}"#.to_vec(),
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-failover-test-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+
+        let failing = IronMeshClient::from_direct_base_url("http://127.0.0.1:9")
+            .with_client_identity(identity.clone());
+        let healthy = direct_transport_test_client(&direct_state, identity);
+        let client = IronMeshClient::combine(vec![failing, healthy])
+            .expect("combined direct client should build");
+
+        let first = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("first combined direct request should succeed via fallback");
+        let second = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("second combined direct request should keep using the healthy route");
+
+        assert_eq!(first["status"], "ok");
+        assert_eq!(second["status"], "ok");
+        assert_eq!(
+            client.direct_server_base_url(),
+            Some(direct_state.public_url.as_str())
+        );
+        assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_probe_reprioritizes_recovered_direct_endpoint() {
+        let reserved_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let primary_addr = reserved_listener
+            .local_addr()
+            .expect("listener should have addr");
+        drop(reserved_listener);
+
+        let primary_url = format!("http://{primary_addr}");
+        let (fallback_url, fallback_state, fallback_server) =
+            spawn_direct_http_route_server(125, "fallback").await;
+
+        let primary = IronMeshClient::from_direct_base_url(primary_url.clone());
+        let fallback = IronMeshClient::from_direct_base_url(fallback_url.clone());
+        let client = IronMeshClient::combine(vec![primary, fallback])
+            .expect("combined direct client should build");
+
+        let first = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("first request should fall back to the healthy route");
+        assert_eq!(first["route"], "fallback");
+        assert_eq!(client.direct_server_base_url(), Some(fallback_url.as_str()));
+
+        let (_primary_url, primary_state, primary_server) =
+            spawn_direct_http_route_server_at(primary_addr, 0, "primary").await;
+
+        tokio::time::sleep(Duration::from_millis(
+            CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS + 100,
+        ))
+        .await;
+
+        let second = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("second request should still use the current fallback route");
+        assert_eq!(second["route"], "fallback");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let third = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("third request should use the reprobed primary route");
+        assert_eq!(third["route"], "primary");
+        assert_eq!(client.direct_server_base_url(), Some(primary_url.as_str()));
+        assert!(primary_state.health_hits.load(Ordering::SeqCst) >= 1);
+        assert_eq!(primary_state.cluster_status_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_state.cluster_status_hits.load(Ordering::SeqCst), 2);
+
+        primary_server.abort();
+        let _ = primary_server.await;
+        fallback_server.abort();
+        let _ = fallback_server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_probe_reprioritizes_recovered_relay_endpoint() {
+        let reserved_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let primary_addr = reserved_listener
+            .local_addr()
+            .expect("listener should have addr");
+        drop(reserved_listener);
+
+        let primary_url = format!("http://{primary_addr}");
+        let fallback_body = serde_json::to_vec(&serde_json::json!({
+            "status": "ok",
+            "route": "fallback",
+        }))
+        .expect("fallback relay body should serialize");
+        let (fallback_state, fallback_server) = spawn_relay_test_server_with_delay(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: fallback_body.len().to_string(),
+                },
+            ],
+            fallback_body,
+            125,
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("relay-background-refresh-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let primary_target_node_id = NodeId::new_v4();
+        let fallback_target_node_id = NodeId::new_v4();
+        let primary = relay_test_client_for_public_url(
+            primary_url.clone(),
+            identity.clone(),
+            primary_target_node_id,
+        );
+        let fallback = relay_test_client(
+            &fallback_state,
+            identity.clone(),
+            fallback_target_node_id,
+        );
+        let client = IronMeshClient::combine(vec![primary, fallback])
+            .expect("combined relay client should build");
+
+        let first = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("first request should fall back to the healthy relay route");
+        assert_eq!(first["route"], "fallback");
+        assert_eq!(client.relay_target_node_id(), Some(fallback_target_node_id));
+        assert!(client.uses_relay_transport());
+
+        let primary_body = serde_json::to_vec(&serde_json::json!({
+            "status": "ok",
+            "route": "primary",
+        }))
+        .expect("primary relay body should serialize");
+        let (primary_state, primary_server) = spawn_relay_test_server_at(
+            primary_addr,
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: primary_body.len().to_string(),
+                },
+            ],
+            primary_body,
+            0,
+            0,
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(
+            CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS + 100,
+        ))
+        .await;
+
+        let second = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("second request should still use the fallback relay route");
+        assert_eq!(second["route"], "fallback");
+
+        let background_capture = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(captured) = primary_state.captured_request.lock().await.clone()
+                    && captured.path_and_query == "/api/v1/health"
+                {
+                    break captured;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("background probe should hit the recovered relay route");
+        assert_eq!(background_capture.path_and_query, "/api/v1/health");
+
+        let third = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("third request should use the recovered relay route");
+        assert_eq!(third["route"], "primary");
+        assert_eq!(client.relay_target_node_id(), Some(primary_target_node_id));
+        assert!(primary_state.issued_ticket_count.load(Ordering::SeqCst) >= 1);
+        assert!(primary_state.paired_session_count.load(Ordering::SeqCst) >= 1);
+        assert_eq!(fallback_state.issued_ticket_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_state.paired_session_count.load(Ordering::SeqCst), 1);
+
+        primary_server.abort();
+        let _ = primary_server.await;
+        fallback_server.abort();
+        let _ = fallback_server.await;
     }
 
     #[tokio::test]

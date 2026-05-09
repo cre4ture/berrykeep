@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Certificate;
 use reqwest::Client;
 use reqwest::ClientBuilder;
@@ -10,12 +11,17 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
+use std::time::Instant;
 use transport_sdk::{ClientIdentityMaterial, RendezvousClientConfig};
 
+use crate::latency_probe::LatencyProbeConfig;
 use crate::{IronMeshClient, PlannedConnectionBootstrapTarget};
 
 const RELAY_REQUEST_BASE_URL: &str = "https://relay.invalid/";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_PROBE_RESPONSE_BYTES: usize = 64;
+const STARTUP_PROBE_FAILURE_PENALTY_MS: f64 = 500.0;
+const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn load_root_certificate(path: &Path) -> Result<Certificate> {
     let pem = fs::read(path)
@@ -155,6 +161,76 @@ pub fn build_http_client_with_identity_from_planned_target(
     )
 }
 
+pub(crate) fn build_http_client_with_identity_from_planned_targets(
+    targets: &[PlannedConnectionBootstrapTarget],
+    identity: &ClientIdentityMaterial,
+) -> Result<IronMeshClient> {
+    let mut clients = Vec::new();
+    let mut build_errors = Vec::new();
+
+    for target in targets {
+        match build_http_client_with_identity_from_planned_target(target, identity) {
+            Ok(client) => clients.push(client),
+            Err(error) if target.relay_mode != transport_sdk::RelayMode::Required => {
+                build_errors.push(error.to_string());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if clients.is_empty() {
+        bail!(
+            "bootstrap does not contain any buildable client transport targets{}",
+            format_build_error_suffix(&build_errors)
+        );
+    }
+
+    if clients.len() == 1 {
+        return IronMeshClient::combine(clients);
+    }
+
+    let ordered = order_clients_by_startup_probe(clients, true)?;
+    IronMeshClient::combine(ordered)
+}
+
+pub(crate) fn build_http_client_from_planned_targets(
+    targets: &[PlannedConnectionBootstrapTarget],
+) -> Result<IronMeshClient> {
+    let mut clients = Vec::new();
+    let mut build_errors = Vec::new();
+
+    for target in targets {
+        let Some(server_base_url) = target.server_base_url.as_deref() else {
+            continue;
+        };
+
+        match build_http_client_from_pem(
+            target
+                .server_ca_pem
+                .as_deref()
+                .or(target.cluster_ca_pem.as_deref()),
+            server_base_url,
+        ) {
+            Ok(client) => clients.push(client),
+            Err(error) => build_errors.push(error.to_string()),
+        }
+    }
+
+    if clients.is_empty() {
+        bail!(
+            "bootstrap does not contain any buildable direct client transport targets{}",
+            format_build_error_suffix(&build_errors)
+        );
+    }
+
+    if clients.len() == 1 {
+        return IronMeshClient::combine(clients);
+    }
+
+    let ordered = order_clients_by_startup_probe(clients, false)?;
+    IronMeshClient::combine(ordered)
+}
+
 pub fn build_client_with_optional_identity_from_planned_target(
     target: &PlannedConnectionBootstrapTarget,
     identity: Option<&ClientIdentityMaterial>,
@@ -242,6 +318,122 @@ fn apply_best_effort_url_resolution_blocking(
         builder.resolve_to_addrs(&host, &addrs)
     } else {
         builder
+    }
+}
+
+fn order_clients_by_startup_probe(
+    clients: Vec<IronMeshClient>,
+    signed_probe: bool,
+) -> Result<Vec<IronMeshClient>> {
+    let worker = std::thread::Builder::new()
+        .name("ironmesh-client-startup-probe".to_string())
+        .spawn(move || -> Result<Vec<(usize, IronMeshClient, Result<f64>)>> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build startup probe runtime")?;
+
+            Ok(runtime.block_on(async move {
+                let mut probes = FuturesUnordered::new();
+                for (index, client) in clients.into_iter().enumerate() {
+                    probes.push(async move {
+                        let probe = if signed_probe {
+                            probe_signed_client_startup_quality(&client).await
+                        } else {
+                            probe_direct_client_startup_quality(&client).await
+                        };
+                        (index, client, probe)
+                    });
+                }
+
+                let mut results = Vec::new();
+                while let Some(result) = probes.next().await {
+                    results.push(result);
+                }
+                results
+            }))
+        })
+        .context("failed to spawn startup probe worker")?;
+
+    let probed = worker
+        .join()
+        .map_err(|_| anyhow!("startup probe worker panicked"))??;
+
+    let mut success = Vec::new();
+    let mut failed = Vec::new();
+    let mut probe_errors = Vec::new();
+
+    for (index, client, probe) in probed {
+        match probe {
+            Ok(score) => success.push((score, index, client)),
+            Err(error) => {
+                probe_errors.push(error.to_string());
+                failed.push((index, client));
+            }
+        }
+    }
+
+    if success.is_empty() {
+        bail!(
+            "startup connection quality probe failed for all client transport targets{}",
+            format_build_error_suffix(&probe_errors)
+        );
+    }
+
+    success.sort_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    failed.sort_by_key(|(index, _)| *index);
+
+    let mut ordered = success
+        .into_iter()
+        .map(|(_, _, client)| client)
+        .collect::<Vec<_>>();
+    ordered.extend(failed.into_iter().map(|(_, client)| client));
+    Ok(ordered)
+}
+
+async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<f64> {
+    let result = tokio::time::timeout(
+        STARTUP_PROBE_TIMEOUT,
+        client.run_latency_probe(LatencyProbeConfig {
+            sample_count: 2,
+            warmup_count: 0,
+            response_bytes: STARTUP_PROBE_RESPONSE_BYTES,
+            server_delay_ms: 0,
+            pause_between_samples_ms: 0,
+        }),
+    )
+    .await
+    .context("startup signed latency probe timed out")??;
+
+    let latency_ms = result
+        .summary
+        .avg_total_duration_ms
+        .or(result.cold_connect_duration_ms)
+        .unwrap_or_default();
+    Ok(latency_ms + result.summary.failure_count as f64 * STARTUP_PROBE_FAILURE_PENALTY_MS)
+}
+
+async fn probe_direct_client_startup_quality(client: &IronMeshClient) -> Result<f64> {
+    let started_at = Instant::now();
+    let response = tokio::time::timeout(STARTUP_PROBE_TIMEOUT, client.get_relative_path("/health"))
+        .await
+        .context("startup direct health probe timed out")??;
+    if !response.status.is_success() {
+        bail!("health probe returned {}", response.status);
+    }
+    Ok(started_at.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn format_build_error_suffix(errors: &[String]) -> String {
+    if errors.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", errors.join(" | "))
     }
 }
 
@@ -421,4 +613,5 @@ mod tests {
                 .contains("requires rendezvous_client_identity_pem")
         );
     }
+
 }

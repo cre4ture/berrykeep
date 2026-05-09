@@ -15,8 +15,8 @@ use transport_sdk::{
 };
 
 use crate::connection::{
-    build_blocking_reqwest_client_from_pem_for_url, build_http_client_from_pem,
-    build_http_client_with_identity_from_planned_target,
+    build_blocking_reqwest_client_from_pem_for_url, build_http_client_from_planned_targets,
+    build_http_client_with_identity_from_planned_targets,
 };
 use crate::device_auth::{
     DeviceEnrollmentRequest, DeviceEnrollmentResponse, enroll_device_blocking_from_pem,
@@ -333,75 +333,30 @@ impl ConnectionBootstrap {
             );
         }
 
-        let mut last_error = None;
-        for target in self.planned_targets()? {
-            if target.server_base_url.is_some() {
-                match probe_direct_http_target_blocking(&target) {
-                    Ok(true) => {
-                        return build_http_client_with_identity_from_planned_target(
-                            &target, identity,
-                        );
-                    }
-                    Ok(false) => continue,
-                    Err(err) => {
-                        last_error = Some(err);
-                        continue;
-                    }
-                }
-            }
-
-            match build_http_client_with_identity_from_planned_target(&target, identity) {
-                Ok(client) => return Ok(client),
-                Err(err) if target.relay_mode != RelayMode::Required => {
-                    last_error = Some(err);
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            anyhow!("bootstrap does not contain a reachable client transport target")
-        }))
+        let planned_targets = self.planned_targets()?;
+        build_http_client_with_identity_from_planned_targets(&planned_targets, identity)
     }
 
     pub fn build_client(&self) -> Result<IronMeshClient> {
         self.validate()?;
 
-        let mut last_error = None;
-        let mut saw_relay_target = false;
-        for target in self.planned_targets()? {
-            let Some(server_base_url) = target.server_base_url.as_deref() else {
-                saw_relay_target = true;
-                continue;
-            };
-
-            match probe_direct_http_target_blocking(&target) {
-                Ok(true) => {
-                    return build_http_client_from_pem(
-                        target
-                            .server_ca_pem
-                            .as_deref()
-                            .or(target.cluster_ca_pem.as_deref()),
-                        server_base_url,
-                    );
-                }
-                Ok(false) => continue,
-                Err(err) => {
-                    last_error = Some(err);
-                    continue;
-                }
-            }
-        }
-
-        if saw_relay_target {
+        let planned_targets = self.planned_targets()?;
+        let direct_targets = planned_targets
+            .iter()
+            .filter(|target| target.server_base_url.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        if direct_targets.is_empty() && planned_targets.iter().any(|target| target.server_base_url.is_none()) {
             bail!(
                 "bootstrap selected or permits a relay-backed client route via rendezvous, but building a relay-backed client requires enrolled client identity material"
             );
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            anyhow!("bootstrap does not contain a reachable direct client transport target")
-        }))
+        if direct_targets.is_empty() {
+            bail!("bootstrap does not contain a reachable direct client transport target");
+        }
+
+        build_http_client_from_planned_targets(&direct_targets)
     }
 
     pub fn build_client_with_optional_identity(
@@ -918,9 +873,30 @@ impl From<&BootstrapEnrollmentResult> for DeviceEnrollmentResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, routing::get};
     use transport_sdk::{
         CLIENT_BOOTSTRAP_CLAIM_VERSION, ClientBootstrapClaim, ClientBootstrapClaimTrust,
     };
+
+    async fn spawn_health_server(delay_ms: u64) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        let app = Router::new().route(
+            "/api/v1/health",
+            get(move || async move {
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                axum::http::StatusCode::OK
+            }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), server)
+    }
 
     fn sample_bootstrap() -> ConnectionBootstrap {
         ConnectionBootstrap {
@@ -1176,5 +1152,41 @@ mod tests {
             serde_json::from_value(legacy).expect("legacy response should deserialize");
 
         assert_eq!(parsed.label.as_deref(), Some("Phone"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_client_prefers_fastest_direct_endpoint_after_startup_probe() {
+        let (slow_url, slow_server) = spawn_health_server(120).await;
+        let (fast_url, fast_server) = spawn_health_server(0).await;
+
+        let mut bootstrap = sample_bootstrap();
+        bootstrap.relay_mode = RelayMode::Disabled;
+        bootstrap.rendezvous_urls.clear();
+        bootstrap.direct_endpoints = vec![
+            BootstrapEndpoint {
+                url: slow_url.clone(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(NodeId::new_v4()),
+            },
+            BootstrapEndpoint {
+                url: fast_url.clone(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(NodeId::new_v4()),
+            },
+        ];
+
+        let client = bootstrap
+            .build_client()
+            .expect("direct bootstrap client should build inside an async context");
+        let uses_relay = client.uses_relay_transport();
+        let direct_url = client.direct_server_base_url().map(str::to_string);
+
+        assert!(!uses_relay);
+        assert_eq!(direct_url.as_deref(), Some(fast_url.as_str()));
+
+        slow_server.abort();
+        let _ = slow_server.await;
+        fast_server.abort();
+        let _ = fast_server.await;
     }
 }

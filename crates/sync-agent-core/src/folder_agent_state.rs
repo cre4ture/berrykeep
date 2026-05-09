@@ -1415,6 +1415,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored_fingerprint, profile_paths.scope_fingerprint);
 
+        drop(connection);
         remove_sqlite_sidecars(&store.path);
         fs::remove_dir_all(root).unwrap();
     }

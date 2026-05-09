@@ -56,8 +56,13 @@ mod tests {
     use transport_sdk::{PresenceListResponse, RelayMode};
     use uuid::Uuid;
 
+    fn init_test_tracing() {
+        common::logging::init_compact_tracing_default("info");
+    }
+
     #[tokio::test]
     async fn relay_required_replication_flows_through_rendezvous() {
+        init_test_tracing();
         let rendezvous_bind_addr = free_bind_addr();
         let rendezvous_public_url = format!("http://{rendezvous_bind_addr}");
         let rendezvous_config = RendezvousServiceConfig {
@@ -539,6 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_client_device_flows_through_mtls_authenticated_rendezvous() {
+        init_test_tracing();
         let ca = issue_test_ca().expect("test CA should generate");
 
         let rendezvous_dir = fresh_test_dir("relay-client-device-rendezvous-mtls");
@@ -626,40 +632,6 @@ mod tests {
             )
             .expect("target rendezvous client should build");
 
-            let (relay_session, mut session) = client
-                .accept_relay_multiplex_target(
-                    &transport_sdk::RelayTunnelAcceptRequest {
-                        cluster_id,
-                        target: transport_sdk::PeerIdentity::Node(target_node_id),
-                        session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
-                        wait_timeout_ms: Some(15_000),
-                    },
-                    transport_sdk::MultiplexConfig::default(),
-                )
-                .await
-                .expect("relay tunnel accept should succeed");
-            transport_sdk::perform_transport_server_handshake(
-                &mut session,
-                transport_sdk::TransportSessionControlMessage::Ready {
-                    protocol_version: transport_sdk::TRANSPORT_PROTOCOL_VERSION,
-                    session_id: relay_session.session_id.clone(),
-                    max_concurrent_streams: transport_sdk::MultiplexConfig::default()
-                        .max_num_streams,
-                },
-            )
-            .await
-            .expect("relay transport handshake should succeed");
-            let mut stream = session
-                .accept_stream()
-                .await
-                .expect("relay transport accept should succeed")
-                .expect("relay transport request stream should exist");
-            let request = transport_sdk::read_buffered_transport_request(&mut stream)
-                .await
-                .expect("relay transport request should parse");
-            *captured_request_for_acceptor.lock().await =
-                Some((relay_session.source.clone(), request.clone()));
-
             let response_body = serde_json::to_vec(&client_sdk::StoreIndexResponse {
                 prefix: String::new(),
                 depth: 1,
@@ -676,30 +648,96 @@ mod tests {
                 }],
             })
             .expect("store index should serialize");
-            transport_sdk::write_buffered_transport_response(
-                &mut stream,
-                &transport_sdk::BufferedTransportResponse {
-                    request_id: request.request_id,
-                    status: 200,
-                    headers: vec![
-                        transport_sdk::TransportHeader {
-                            name: "content-type".to_string(),
-                            value: "application/json".to_string(),
+
+            loop {
+                let (relay_session, mut session) = client
+                    .accept_relay_multiplex_target(
+                        &transport_sdk::RelayTunnelAcceptRequest {
+                            cluster_id,
+                            target: transport_sdk::PeerIdentity::Node(target_node_id),
+                            session_kind:
+                                transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+                            wait_timeout_ms: Some(15_000),
                         },
-                        transport_sdk::TransportHeader {
-                            name: "content-length".to_string(),
-                            value: response_body.len().to_string(),
-                        },
-                    ],
-                    body: response_body,
-                },
-            )
-            .await
-            .expect("relay transport response should write");
-            session
-                .close()
+                        transport_sdk::MultiplexConfig::default(),
+                    )
+                    .await
+                    .expect("relay tunnel accept should succeed");
+                transport_sdk::perform_transport_server_handshake(
+                    &mut session,
+                    transport_sdk::TransportSessionControlMessage::Ready {
+                        protocol_version: transport_sdk::TRANSPORT_PROTOCOL_VERSION,
+                        session_id: relay_session.session_id.clone(),
+                        max_concurrent_streams: transport_sdk::MultiplexConfig::default()
+                            .max_num_streams,
+                    },
+                )
                 .await
-                .expect("relay transport session should close");
+                .expect("relay transport handshake should succeed");
+
+                while let Some(mut stream) = session
+                    .accept_stream()
+                    .await
+                    .expect("relay transport accept should succeed")
+                {
+                    let request = transport_sdk::read_buffered_transport_request(&mut stream)
+                        .await
+                        .expect("relay transport request should parse");
+
+                    if request.path.starts_with("/api/v1/diagnostics/latency?") {
+                        transport_sdk::write_buffered_transport_response(
+                            &mut stream,
+                            &transport_sdk::BufferedTransportResponse {
+                                request_id: request.request_id,
+                                status: 200,
+                                headers: vec![
+                                    transport_sdk::TransportHeader {
+                                        name: "content-type".to_string(),
+                                        value: "application/octet-stream".to_string(),
+                                    },
+                                    transport_sdk::TransportHeader {
+                                        name: "content-length".to_string(),
+                                        value: "0".to_string(),
+                                    },
+                                ],
+                                body: Vec::new(),
+                            },
+                        )
+                        .await
+                        .expect("relay latency probe response should write");
+                        continue;
+                    }
+
+                    assert_eq!(request.path, "/api/v1/store/index?depth=1");
+                    *captured_request_for_acceptor.lock().await =
+                        Some((relay_session.source.clone(), request.clone()));
+                    transport_sdk::write_buffered_transport_response(
+                        &mut stream,
+                        &transport_sdk::BufferedTransportResponse {
+                            request_id: request.request_id,
+                            status: 200,
+                            headers: vec![
+                                transport_sdk::TransportHeader {
+                                    name: "content-type".to_string(),
+                                    value: "application/json".to_string(),
+                                },
+                                transport_sdk::TransportHeader {
+                                    name: "content-length".to_string(),
+                                    value: response_body.len().to_string(),
+                                },
+                            ],
+                            body: response_body.clone(),
+                        },
+                    )
+                    .await
+                    .expect("relay transport response should write");
+                    session
+                        .close()
+                        .await
+                        .expect("relay transport session should close");
+                    return;
+                }
+            }
         });
 
         let mut identity = ClientIdentityMaterial::generate(
@@ -762,6 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_claim_redeem_flows_through_mtls_rendezvous_without_client_cert() {
+        init_test_tracing();
         let ca = issue_test_ca().expect("test CA should generate");
 
         let rendezvous_dir = fresh_test_dir("bootstrap-claim-rendezvous-mtls");

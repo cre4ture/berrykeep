@@ -868,6 +868,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored_fingerprint, profile_paths.scope_fingerprint);
 
+        drop(connection);
         let _ = fs::remove_file(PathBuf::from(format!("{}-wal", store.path().display())));
         let _ = fs::remove_file(PathBuf::from(format!("{}-shm", store.path().display())));
         fs::remove_dir_all(root).unwrap();

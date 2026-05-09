@@ -5,11 +5,14 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+
+const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -33,8 +36,9 @@ pub async fn connect_websocket(
             .with_context(|| format!("invalid websocket request header value for {name}"))?;
         request.headers_mut().insert(name, value);
     }
-    let (websocket, _response) = client_async(request, stream)
+    let (websocket, _response) = timeout(WEBSOCKET_CONNECT_TIMEOUT, client_async(request, stream))
         .await
+        .context("websocket handshake timed out")?
         .context("websocket handshake failed")?;
     Ok(websocket)
 }
@@ -66,8 +70,9 @@ async fn open_websocket_io(
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow!("websocket URL is missing a port"))?;
-    let tcp = TcpStream::connect((host, port))
+    let tcp = timeout(WEBSOCKET_CONNECT_TIMEOUT, TcpStream::connect((host, port)))
         .await
+        .with_context(|| format!("timed out connecting websocket TCP stream to {host}:{port}"))?
         .with_context(|| format!("failed connecting websocket TCP stream to {host}:{port}"))?;
 
     match url.scheme() {
@@ -75,12 +80,18 @@ async fn open_websocket_io(
         "wss" => {
             let server_name = ServerName::try_from(host.to_string())
                 .context("failed building TLS server name")?;
-            let tls_stream = TlsConnector::from(std::sync::Arc::new(build_tls_client_config(
-                server_ca_pem,
-                client_identity_pem,
-            )?))
-            .connect(server_name, tcp)
+            let tls_stream = timeout(
+                WEBSOCKET_CONNECT_TIMEOUT,
+                TlsConnector::from(std::sync::Arc::new(build_tls_client_config(
+                    server_ca_pem,
+                    client_identity_pem,
+                )?))
+                .connect(server_name, tcp),
+            )
             .await
+            .with_context(|| {
+                format!("timed out establishing TLS websocket stream to {host}:{port}")
+            })?
             .with_context(|| {
                 format!("failed establishing TLS websocket stream to {host}:{port}")
             })?;
@@ -144,4 +155,34 @@ fn parse_client_identity_pem(
     let key = PrivateKeyDer::from_pem_reader(&mut key_reader)
         .context("failed parsing websocket client private key")?;
     Ok((cert_chain, key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn connect_websocket_times_out_for_unreachable_host() {
+        let url = Url::parse("ws://192.0.2.1:81/transport/ws")
+            .expect("test websocket URL should parse");
+
+        let started_at = Instant::now();
+        let error = match connect_websocket(&url, None, None, &[]).await {
+            Ok(_) => panic!("unreachable websocket host should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(7),
+            "websocket connect should fail within the timeout window"
+        );
+        assert!(
+            error.to_string().contains("timed out connecting websocket TCP stream")
+                || error
+                    .to_string()
+                    .contains("failed connecting websocket TCP stream"),
+            "unexpected websocket error: {error:#}"
+        );
+    }
 }
