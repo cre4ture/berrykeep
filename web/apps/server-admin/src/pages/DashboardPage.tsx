@@ -599,7 +599,7 @@ export function DashboardPage() {
             </Stack>
           </Card>
         </Grid.Col>
-        <Grid.Col span={{ base: 12, xl: 7 }}>
+        <Grid.Col span={{ base: 12, xl: 12 }}>
           <Card withBorder radius="md" padding="lg">
             <Stack gap="md">
               <Group justify="space-between">
