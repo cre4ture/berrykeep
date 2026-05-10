@@ -5358,6 +5358,50 @@ fn autonomous_post_write_replication_trigger_guard_blocks_internal_writes() {
 }
 
 #[test]
+fn autonomous_post_write_replication_subjects_include_head_and_version() {
+    let subjects = super::autonomous_post_write_replication_subjects(
+        "docs/report.txt",
+        "ver-123",
+    );
+
+    assert_eq!(
+        subjects.into_iter().collect::<Vec<_>>(),
+        vec![
+            "docs/report.txt".to_string(),
+            "docs/report.txt@ver-123".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn autonomous_post_write_repair_runtime_coalesces_pending_subjects() {
+    let mut runtime = super::AutonomousPostWriteRepairRuntime::default();
+
+    assert!(runtime.enqueue([
+        "docs/a.txt".to_string(),
+        "docs/a.txt@ver-1".to_string(),
+    ]));
+    assert!(!runtime.enqueue([
+        "docs/b.txt".to_string(),
+        "docs/b.txt@ver-2".to_string(),
+        "docs/a.txt".to_string(),
+    ]));
+    assert!(runtime.active);
+    assert_eq!(
+        runtime.take_pending_subjects(),
+        Some(vec![
+            "docs/a.txt".to_string(),
+            "docs/a.txt@ver-1".to_string(),
+            "docs/b.txt".to_string(),
+            "docs/b.txt@ver-2".to_string(),
+        ])
+    );
+    assert!(runtime.active);
+    assert_eq!(runtime.take_pending_subjects(), None);
+    assert!(!runtime.active);
+}
+
+#[test]
 fn internal_replication_put_url_sets_internal_flag() {
     let url = build_internal_replication_put_url(
         "http://127.0.0.1:18080",
@@ -6871,6 +6915,9 @@ async fn build_test_state(
         startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
         repair_activity: Arc::new(Mutex::new(super::RepairActivityRuntime::default())),
+        autonomous_post_write_repair: Arc::new(Mutex::new(
+            super::AutonomousPostWriteRepairRuntime::default(),
+        )),
         data_scrub_activity: Arc::new(Mutex::new(super::DataScrubActivityRuntime::default())),
         local_availability_refresh_lock: Arc::new(Mutex::new(())),
         local_availability_refresh_notify: Arc::new(tokio::sync::Notify::new()),

@@ -230,6 +230,7 @@ struct ServerState {
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
     repair_activity: Arc<Mutex<RepairActivityRuntime>>,
+    autonomous_post_write_repair: Arc<Mutex<AutonomousPostWriteRepairRuntime>>,
     data_scrub_activity: Arc<Mutex<DataScrubActivityRuntime>>,
     local_availability_refresh_lock: Arc<Mutex<()>>,
     local_availability_refresh_notify: Arc<Notify>,
@@ -1888,6 +1889,36 @@ struct DataScrubTriggerResponse {
 #[derive(Debug, Default)]
 struct RepairExecutorState {
     attempts: HashMap<String, RepairAttemptEntry>,
+}
+
+#[derive(Debug, Default)]
+struct AutonomousPostWriteRepairRuntime {
+    active: bool,
+    pending_subjects: BTreeSet<String>,
+}
+
+impl AutonomousPostWriteRepairRuntime {
+    fn enqueue(&mut self, subjects: impl IntoIterator<Item = String>) -> bool {
+        self.pending_subjects.extend(
+            subjects
+                .into_iter()
+                .filter(|subject| !subject.trim().is_empty()),
+        );
+        if self.pending_subjects.is_empty() || self.active {
+            return false;
+        }
+        self.active = true;
+        true
+    }
+
+    fn take_pending_subjects(&mut self) -> Option<Vec<String>> {
+        if self.pending_subjects.is_empty() {
+            self.active = false;
+            return None;
+        }
+
+        Some(std::mem::take(&mut self.pending_subjects).into_iter().collect())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4264,6 +4295,9 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
         repair_activity: Arc::new(Mutex::new(RepairActivityRuntime::default())),
+        autonomous_post_write_repair: Arc::new(Mutex::new(
+            AutonomousPostWriteRepairRuntime::default(),
+        )),
         data_scrub_activity: Arc::new(Mutex::new(DataScrubActivityRuntime::default())),
         local_availability_refresh_lock: Arc::new(Mutex::new(())),
         local_availability_refresh_notify: Arc::new(Notify::new()),
@@ -8203,6 +8237,74 @@ fn should_trigger_autonomous_post_write_replication(
     autonomous_replication_on_put_enabled && !internal_replication
 }
 
+fn append_autonomous_post_write_replication_subjects(
+    subjects: &mut BTreeSet<String>,
+    key: &str,
+    version_id: &str,
+) {
+    subjects.insert(key.to_string());
+    subjects.insert(format!("{key}@{version_id}"));
+}
+
+fn autonomous_post_write_replication_subjects(key: &str, version_id: &str) -> BTreeSet<String> {
+    let mut subjects = BTreeSet::new();
+    append_autonomous_post_write_replication_subjects(&mut subjects, key, version_id);
+    subjects
+}
+
+async fn enqueue_autonomous_post_write_replication(
+    state: &ServerState,
+    subjects: BTreeSet<String>,
+) {
+    if subjects.is_empty() {
+        return;
+    }
+
+    let should_spawn = {
+        let mut runtime = state.autonomous_post_write_repair.lock().await;
+        runtime.enqueue(subjects)
+    };
+
+    if should_spawn {
+        let state_for_repair = state.clone();
+        tokio::spawn(async move {
+            run_autonomous_post_write_replication(state_for_repair).await;
+        });
+    }
+}
+
+async fn run_autonomous_post_write_replication(state: ServerState) {
+    loop {
+        let subjects = {
+            let mut runtime = state.autonomous_post_write_repair.lock().await;
+            runtime.take_pending_subjects()
+        };
+
+        let Some(subjects) = subjects else {
+            return;
+        };
+
+        let report = execute_tracked_targeted_local_replication_repair(
+            &state,
+            subjects.clone(),
+            RepairRunTrigger::AutonomousPostWrite,
+        )
+        .await;
+        if report.attempted_transfers > 0 || report.failed_transfers > 0 {
+            info!(
+                subject_count = subjects.len(),
+                attempted = report.attempted_transfers,
+                success = report.successful_transfers,
+                failed = report.failed_transfers,
+                skipped = report.skipped_items,
+                skipped_backoff = report.skipped_backoff,
+                skipped_max_retries = report.skipped_max_retries,
+                "autonomous post-write replication run"
+            );
+        }
+    }
+}
+
 fn spawn_media_metadata_warmup(state: ServerState, key: String, manifest_hash: String) {
     tokio::spawn(async move {
         let media_cache_worker = {
@@ -8618,27 +8720,11 @@ async fn put_object(
                 state.autonomous_replication_on_put_enabled,
                 query.internal_replication,
             ) {
-                let state_for_repair = state.clone();
-                tokio::spawn(async move {
-                    let report = execute_tracked_local_replication_repair(
-                        &state_for_repair,
-                        None,
-                        RepairRunTrigger::AutonomousPostWrite,
-                        None,
-                    )
-                    .await;
-                    if report.attempted_transfers > 0 || report.failed_transfers > 0 {
-                        info!(
-                            attempted = report.attempted_transfers,
-                            success = report.successful_transfers,
-                            failed = report.failed_transfers,
-                            skipped = report.skipped_items,
-                            skipped_backoff = report.skipped_backoff,
-                            skipped_max_retries = report.skipped_max_retries,
-                            "autonomous post-write replication run"
-                        );
-                    }
-                });
+                enqueue_autonomous_post_write_replication(
+                    &state,
+                    autonomous_post_write_replication_subjects(&key, outcome.version_id.as_str()),
+                )
+                .await;
             }
 
             info!(
@@ -9034,27 +9120,11 @@ async fn complete_upload_session_route(
         state.autonomous_replication_on_put_enabled,
         false,
     ) {
-        let state_for_repair = state.clone();
-        tokio::spawn(async move {
-            let report = execute_tracked_local_replication_repair(
-                &state_for_repair,
-                None,
-                RepairRunTrigger::AutonomousPostWrite,
-                None,
-            )
-            .await;
-            if report.attempted_transfers > 0 || report.failed_transfers > 0 {
-                info!(
-                    attempted = report.attempted_transfers,
-                    success = report.successful_transfers,
-                    failed = report.failed_transfers,
-                    skipped = report.skipped_items,
-                    skipped_backoff = report.skipped_backoff,
-                    skipped_max_retries = report.skipped_max_retries,
-                    "autonomous post-write replication run"
-                );
-            }
-        });
+        enqueue_autonomous_post_write_replication(
+            &state,
+            autonomous_post_write_replication_subjects(&key, outcome.version_id.as_str()),
+        )
+        .await;
     }
 
     let response = UploadSessionCompleteResponse {
@@ -9185,27 +9255,15 @@ async fn delete_object(
                 state.autonomous_replication_on_put_enabled,
                 query.internal_replication,
             ) {
-                let state_for_repair = state.clone();
-                tokio::spawn(async move {
-                    let report = execute_tracked_local_replication_repair(
-                        &state_for_repair,
-                        None,
-                        RepairRunTrigger::AutonomousPostWrite,
-                        None,
-                    )
-                    .await;
-                    if report.attempted_transfers > 0 || report.failed_transfers > 0 {
-                        info!(
-                            attempted = report.attempted_transfers,
-                            success = report.successful_transfers,
-                            failed = report.failed_transfers,
-                            skipped = report.skipped_items,
-                            skipped_backoff = report.skipped_backoff,
-                            skipped_max_retries = report.skipped_max_retries,
-                            "autonomous post-write replication run"
-                        );
-                    }
-                });
+                let mut repair_subjects = BTreeSet::new();
+                for (deleted_path, version_id) in &deleted_paths {
+                    append_autonomous_post_write_replication_subjects(
+                        &mut repair_subjects,
+                        deleted_path,
+                        version_id,
+                    );
+                }
+                enqueue_autonomous_post_write_replication(&state, repair_subjects).await;
             }
 
             info!(
