@@ -25,14 +25,21 @@ import {
   Loader,
   Modal,
   Progress,
+  Select,
   Stack,
   Table,
   Text
 } from "@mantine/core";
 import { JsonBlock, StatCard } from "@ironmesh/ui";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
+
+const DEFAULT_REPAIR_LIST_PAGE_SIZE = 20;
+const REPAIR_LIST_PAGE_SIZE_OPTIONS = [10, 20, 50, 100].map((value) => ({
+  value: String(value),
+  label: `${value} per list`
+}));
 
 export function RepairPage() {
   const queryClient = useQueryClient();
@@ -138,6 +145,49 @@ export function RepairPage() {
   const scrubRetentionLabel = scrubNodes[0]
     ? formatRetentionWindow(scrubNodes[0].retention_secs)
     : "not loaded";
+  const replicationPlanEntries = replicationPlan
+    ? replicationPlan.items
+        .map((item) => ({
+          item,
+          status: getReplicationItemStatus(item),
+          progress: getReplicationItemProgress(item)
+        }))
+        .sort(compareReplicationPlanEntries)
+    : [];
+  const [listPageSize, setListPageSize] = useState(DEFAULT_REPAIR_LIST_PAGE_SIZE);
+  const [manualRepairActionsPageIndex, setManualRepairActionsPageIndex] = useClampedPageIndex(
+    manualRepairActions.length,
+    listPageSize
+  );
+  const [repairRunsPageIndex, setRepairRunsPageIndex] = useClampedPageIndex(
+    repairHistory?.runs.length ?? 0,
+    listPageSize
+  );
+  const [replicationPlanPageIndex, setReplicationPlanPageIndex] = useClampedPageIndex(
+    replicationPlanEntries.length,
+    listPageSize
+  );
+  const [scrubNodesPageIndex, setScrubNodesPageIndex] = useClampedPageIndex(
+    scrubNodes.length,
+    listPageSize
+  );
+  const [scrubRunsPageIndex, setScrubRunsPageIndex] = useClampedPageIndex(
+    scrubRuns.length,
+    listPageSize
+  );
+  const pagedManualRepairActions = paginateItems(
+    manualRepairActions,
+    manualRepairActionsPageIndex,
+    listPageSize
+  );
+  const pagedRepairRuns = paginateItems(repairHistory?.runs ?? [], repairRunsPageIndex, listPageSize);
+  const pagedReplicationPlanEntries = paginateItems(
+    replicationPlanEntries,
+    replicationPlanPageIndex,
+    listPageSize
+  );
+  const pagedScrubNodes = paginateItems(scrubNodes, scrubNodesPageIndex, listPageSize);
+  const pagedScrubRuns = paginateItems(scrubRuns, scrubRunsPageIndex, listPageSize);
   const loading =
     repairActivityQuery.isFetching ||
     repairHistoryQuery.isFetching ||
@@ -154,15 +204,16 @@ export function RepairPage() {
     replicationPlanQuery.error,
     scrubClusterQuery.error
   ]);
-  const replicationPlanEntries = replicationPlan
-    ? replicationPlan.items
-        .map((item) => ({
-          item,
-          status: getReplicationItemStatus(item),
-          progress: getReplicationItemProgress(item)
-        }))
-        .sort(compareReplicationPlanEntries)
-    : [];
+
+  function handleListPageSizeChange(value: string | null) {
+    const nextPageSize = parseRepairListPageSize(value);
+    setListPageSize(nextPageSize);
+    setManualRepairActionsPageIndex(0);
+    setRepairRunsPageIndex(0);
+    setReplicationPlanPageIndex(0);
+    setScrubNodesPageIndex(0);
+    setScrubRunsPageIndex(0);
+  }
 
   return (
     <Stack gap="lg">
@@ -172,28 +223,38 @@ export function RepairPage() {
           state, retained repair runs, clustered scrub history, and the replication plan in one
           maintenance view instead of crowding the dashboard.
         </Text>
-        <Group>
-          <Button
-            variant="default"
-            onClick={() => void repairMutation.mutateAsync()}
-            loading={repairMutation.isPending}
-            disabled={!canInspectRepair}
-          >
-            Run cluster repair pass
-          </Button>
-          <Button
-            variant="default"
-            color="teal"
-            onClick={() => void scrubMutation.mutateAsync()}
-            loading={scrubMutation.isPending}
-            disabled={!canInspectRepair}
-          >
-            Run data scrub now
-          </Button>
-          <Button variant="light" onClick={() => void refresh()} loading={loading}>
-            Refresh
-          </Button>
-        </Group>
+        <Stack gap="xs" align="flex-end">
+          <Group>
+            <Button
+              variant="default"
+              onClick={() => void repairMutation.mutateAsync()}
+              loading={repairMutation.isPending}
+              disabled={!canInspectRepair}
+            >
+              Run cluster repair pass
+            </Button>
+            <Button
+              variant="default"
+              color="teal"
+              onClick={() => void scrubMutation.mutateAsync()}
+              loading={scrubMutation.isPending}
+              disabled={!canInspectRepair}
+            >
+              Run data scrub now
+            </Button>
+            <Button variant="light" onClick={() => void refresh()} loading={loading}>
+              Refresh
+            </Button>
+          </Group>
+          <Select
+            label="Rows per list"
+            value={String(listPageSize)}
+            data={REPAIR_LIST_PAGE_SIZE_OPTIONS}
+            allowDeselect={false}
+            onChange={handleListPageSizeChange}
+            w={160}
+          />
+        </Stack>
       </Group>
 
       {!canInspectRepair ? (
@@ -208,13 +269,20 @@ export function RepairPage() {
         <Stack gap="md">
           <Group justify="space-between" align="flex-start">
             <Text fw={700}>Manual repair actions</Text>
-            <Badge variant="light">
-              {manualRepairActionsQuery.data
-                ? `${manualRepairActions.length} available`
-                : loading
-                  ? "loading"
-                  : "not loaded"}
-            </Badge>
+            <Stack gap="xs" align="flex-end">
+              <Badge variant="light">
+                {manualRepairActionsQuery.data
+                  ? `${manualRepairActions.length} available`
+                  : loading
+                    ? "loading"
+                    : "not loaded"}
+              </Badge>
+              <TablePageControls
+                pagination={pagedManualRepairActions}
+                onPrevious={() => setManualRepairActionsPageIndex((current) => current - 1)}
+                onNext={() => setManualRepairActionsPageIndex((current) => current + 1)}
+              />
+            </Stack>
           </Group>
           {manualRepairActions.length > 0 ? (
             <Table.ScrollContainer minWidth={760}>
@@ -228,7 +296,7 @@ export function RepairPage() {
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
-                  {manualRepairActions.map((action) => {
+                  {pagedManualRepairActions.pageItems.map((action) => {
                     const actionPending =
                       manualRepairActionMutation.isPending &&
                       manualRepairActionMutation.variables?.actionId === action.id;
@@ -464,7 +532,14 @@ export function RepairPage() {
                 Each finished repair run is stored persistently for postmortem debugging until it ages out of the retention window.
               </Text>
             </Stack>
-            <Badge variant="light">{repairHistory ? `${repairHistory.runs.length} retained` : "not loaded"}</Badge>
+            <Stack gap="xs" align="flex-end">
+              <Badge variant="light">{repairHistory ? `${repairHistory.runs.length} retained` : "not loaded"}</Badge>
+              <TablePageControls
+                pagination={pagedRepairRuns}
+                onPrevious={() => setRepairRunsPageIndex((current) => current - 1)}
+                onNext={() => setRepairRunsPageIndex((current) => current + 1)}
+              />
+            </Stack>
           </Group>
           {repairHistory && repairHistory.runs.length > 0 ? (
             <Table.ScrollContainer minWidth={960}>
@@ -482,7 +557,7 @@ export function RepairPage() {
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
-                  {repairHistory.runs.map((run) => (
+                  {pagedRepairRuns.pageItems.map((run) => (
                     <Table.Tr key={run.run_id}>
                       <Table.Td>
                         <Stack gap={2}>
@@ -558,6 +633,11 @@ export function RepairPage() {
                   ? `${replicationPlanEntries.length} attention item${replicationPlanEntries.length === 1 ? "" : "s"}`
                   : "loading"}
               </Badge>
+              <TablePageControls
+                pagination={pagedReplicationPlanEntries}
+                onPrevious={() => setReplicationPlanPageIndex((current) => current - 1)}
+                onNext={() => setReplicationPlanPageIndex((current) => current + 1)}
+              />
             </Stack>
           </Group>
           {replicationPlan ? (
@@ -597,7 +677,7 @@ export function RepairPage() {
                       </Table.Tr>
                     </Table.Thead>
                     <Table.Tbody>
-                      {replicationPlanEntries.map(({ item, status, progress }) => (
+                      {pagedReplicationPlanEntries.pageItems.map(({ item, status, progress }) => (
                         <Table.Tr key={item.key}>
                           <Table.Td maw={260}>
                             <Text size="sm" fw={600} ff="monospace" style={{ wordBreak: "break-word" }}>
@@ -703,6 +783,11 @@ export function RepairPage() {
               <Badge variant="light" color={scrubNodes.length > 0 ? "teal" : "gray"}>
                 {scrubNodes.length} reachable node{scrubNodes.length === 1 ? "" : "s"}
               </Badge>
+              <TablePageControls
+                pagination={pagedScrubNodes}
+                onPrevious={() => setScrubNodesPageIndex((current) => current - 1)}
+                onNext={() => setScrubNodesPageIndex((current) => current + 1)}
+              />
             </Stack>
           </Group>
 
@@ -716,7 +801,7 @@ export function RepairPage() {
 
           {scrubNodes.length > 0 ? (
             <Grid>
-              {scrubNodes.map((node) => (
+              {pagedScrubNodes.pageItems.map((node) => (
                 <Grid.Col key={node.node_id} span={{ base: 12, md: 6, xl: 4 }}>
                   <Card withBorder radius="md" padding="md">
                     <Stack gap="sm">
@@ -807,7 +892,14 @@ export function RepairPage() {
                 be reviewed without jumping between node admin pages.
               </Text>
             </Stack>
-            <Badge variant="light">{scrubCluster ? `${scrubRuns.length} retained` : "not loaded"}</Badge>
+            <Stack gap="xs" align="flex-end">
+              <Badge variant="light">{scrubCluster ? `${scrubRuns.length} retained` : "not loaded"}</Badge>
+              <TablePageControls
+                pagination={pagedScrubRuns}
+                onPrevious={() => setScrubRunsPageIndex((current) => current - 1)}
+                onNext={() => setScrubRunsPageIndex((current) => current + 1)}
+              />
+            </Stack>
           </Group>
           {scrubRuns.length > 0 ? (
             <Table.ScrollContainer minWidth={980}>
@@ -826,7 +918,7 @@ export function RepairPage() {
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
-                  {scrubRuns.map((run) => {
+                  {pagedScrubRuns.pageItems.map((run) => {
                     const relatedRepairRuns = findRelatedRepairRuns(run, scrubAutoRepairRuns);
 
                     return <Table.Tr key={run.run_id}>
@@ -990,6 +1082,99 @@ export function RepairPage() {
           ) : null}
         </Stack>
       </Modal>
+    </Stack>
+  );
+}
+
+type PaginatedItems<T> = {
+  pageItems: T[];
+  pageIndex: number;
+  pageCount: number;
+  totalItems: number;
+  startItem: number;
+  endItem: number;
+};
+
+type TablePageControlsProps = {
+  pagination: PaginatedItems<unknown>;
+  onPrevious: () => void;
+  onNext: () => void;
+};
+
+function useClampedPageIndex(totalItems: number, pageSize: number) {
+  const [pageIndex, setPageIndex] = useState(0);
+
+  useEffect(() => {
+    setPageIndex((current) => clampPageIndex(current, totalItems, pageSize));
+  }, [pageSize, totalItems]);
+
+  return [pageIndex, setPageIndex] as const;
+}
+
+function paginateItems<T>(items: T[], pageIndex: number, pageSize: number): PaginatedItems<T> {
+  const resolvedPageSize = Math.max(1, Math.trunc(pageSize) || DEFAULT_REPAIR_LIST_PAGE_SIZE);
+  const totalItems = items.length;
+  const pageCount = totalItems === 0 ? 1 : Math.ceil(totalItems / resolvedPageSize);
+  const resolvedPageIndex = clampPageIndex(pageIndex, totalItems, resolvedPageSize);
+  const startIndex = totalItems === 0 ? 0 : resolvedPageIndex * resolvedPageSize;
+  const endIndex = Math.min(startIndex + resolvedPageSize, totalItems);
+
+  return {
+    pageItems: items.slice(startIndex, endIndex),
+    pageIndex: resolvedPageIndex,
+    pageCount,
+    totalItems,
+    startItem: totalItems === 0 ? 0 : startIndex + 1,
+    endItem: endIndex
+  };
+}
+
+function clampPageIndex(pageIndex: number, totalItems: number, pageSize: number): number {
+  const maxPageIndex = Math.max(0, Math.ceil(totalItems / Math.max(1, pageSize)) - 1);
+  return Math.min(Math.max(0, Math.trunc(pageIndex) || 0), maxPageIndex);
+}
+
+function parseRepairListPageSize(value: string | null): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_REPAIR_LIST_PAGE_SIZE;
+  }
+  return parsed;
+}
+
+function TablePageControls({ pagination, onPrevious, onNext }: TablePageControlsProps) {
+  if (pagination.totalItems === 0) {
+    return null;
+  }
+
+  return (
+    <Stack gap={4} align="flex-end">
+      <Text size="xs" c="dimmed">
+        Showing {pagination.startItem}-{pagination.endItem} of {pagination.totalItems}
+      </Text>
+      {pagination.pageCount > 1 ? (
+        <Group gap="xs">
+          <Button
+            size="xs"
+            variant="default"
+            onClick={onPrevious}
+            disabled={pagination.pageIndex === 0}
+          >
+            Prev
+          </Button>
+          <Text size="xs" c="dimmed">
+            Page {pagination.pageIndex + 1} / {pagination.pageCount}
+          </Text>
+          <Button
+            size="xs"
+            variant="default"
+            onClick={onNext}
+            disabled={pagination.pageIndex >= pagination.pageCount - 1}
+          >
+            Next
+          </Button>
+        </Group>
+      ) : null}
     </Stack>
   );
 }
