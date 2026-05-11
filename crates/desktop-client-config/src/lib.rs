@@ -9,6 +9,11 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const DESKTOP_CLIENT_CONFIG_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const DESKTOP_CLIENT_CONFIG_REVISION: &str = git_version::git_version!(
+    fallback = "unknown",
+    args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
+);
 pub const CONFIG_APP_EXE: &str = if cfg!(windows) {
     "ironmesh-config-app.exe"
 } else {

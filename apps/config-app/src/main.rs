@@ -15,12 +15,13 @@ use client_sdk::enroll_connection_input_blocking;
 #[cfg(windows)]
 use desktop_client_config::default_desktop_status_file_path;
 use desktop_client_config::{
-    ClientIdentityConfig, FolderAgentInstance, LaunchOutcome, LaunchReport, ManagedInstanceStore,
+    ClientIdentityConfig, DESKTOP_CLIENT_CONFIG_REVISION, DESKTOP_CLIENT_CONFIG_VERSION,
+    FolderAgentInstance, LaunchOutcome, LaunchReport, ManagedInstanceStore,
     OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance, PLATFORM_KIND,
     STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE,
-    ServiceRuntimeStatus, StopOutcome, default_instance_store_path, default_launch_report_path,
-    default_service_log_dir, generate_instance_id, launch_enabled_instances,
-    launch_folder_agent_instance, launch_os_integration_instance,
+    ServiceRuntimeStatus, StopOutcome, default_instance_store_path,
+    default_launch_report_path, default_service_log_dir, generate_instance_id,
+    launch_enabled_instances, launch_folder_agent_instance, launch_os_integration_instance,
     launch_report_with_updated_outcome, load_last_launch_report, migrate_legacy_state_paths,
     package_root_from_current_exe, save_launch_report, service_desktop_status_file_path,
     service_runtime_statuses, stop_service_from_report,
@@ -93,6 +94,8 @@ struct ServiceStatusTelemetry {
 #[derive(Debug, Serialize)]
 struct ConfigResponse {
     platform: &'static str,
+    desktop_config_version: &'static str,
+    desktop_config_revision: &'static str,
     supports_os_integration: bool,
     config_path: String,
     launch_report_path: String,
@@ -1245,6 +1248,8 @@ fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
     let service_statuses = service_runtime_statuses(&store, last_launch_report.as_ref());
     Ok(ConfigResponse {
         platform: PLATFORM_KIND,
+    desktop_config_version: DESKTOP_CLIENT_CONFIG_VERSION,
+    desktop_config_revision: DESKTOP_CLIENT_CONFIG_REVISION,
         supports_os_integration: OS_INTEGRATION_MANAGEMENT_SUPPORTED,
         config_path: state.instance_store_path.display().to_string(),
         launch_report_path: state.launch_report_path.display().to_string(),
@@ -1725,6 +1730,7 @@ const APP_HTML: &str = r###"<!doctype html>
               </div>
             </div>
             <dl class="meta-grid">
+              <div><dt>Desktop Config Build</dt><dd id="desktop-config-version">Loading...</dd></div>
               <div><dt>Config Store</dt><dd id="config-path">Loading...</dd></div>
               <div><dt>Launch Report</dt><dd id="launch-report-path">Loading...</dd></div>
               <div><dt>Service Logs</dt><dd id="service-log-dir">Loading...</dd></div>
@@ -2733,6 +2739,16 @@ function runtimeLabel(status) {
   return status.pid ? `Running · PID ${status.pid}` : 'Running';
 }
 
+function formatFullVersion(version, revision) {
+  if (!version && !revision) {
+    return 'unknown';
+  }
+  if (version && revision) {
+    return `${version} (${revision})`;
+  }
+  return version || revision || 'unknown';
+}
+
 function renderIdentityOptions(selectId, selectedId) {
   const target = document.getElementById(selectId);
   const options = ['<option value="">Manual or no managed identity</option>'];
@@ -2910,6 +2926,10 @@ function renderConfig(config) {
     : config.platform === 'linux'
       ? 'IronMesh Linux Config'
       : 'IronMesh Desktop Config';
+  document.getElementById('desktop-config-version').textContent = formatFullVersion(
+    config.desktop_config_version,
+    config.desktop_config_revision
+  );
   document.getElementById('config-path').textContent = config.config_path;
   document.getElementById('launch-report-path').textContent = config.launch_report_path;
   document.getElementById('service-log-dir').textContent = config.service_log_dir;
