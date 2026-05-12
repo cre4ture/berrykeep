@@ -7672,6 +7672,31 @@ async fn execute_tracked_targeted_local_replication_repair(
     report
 }
 
+async fn execute_tracked_targeted_replication_repair(
+    state: &ServerState,
+    subjects: Vec<String>,
+    trigger: RepairRunTrigger,
+) -> replication::ReplicationRepairReport {
+    let tracker =
+        begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
+    let (plan, report) = replication::execute_planned_targeted_replication_repair_inner(
+        state,
+        subjects,
+        None,
+    )
+    .await;
+    finish_repair_run_tracking(
+        state,
+        tracker,
+        RepairPlanSummary::from_plan(&plan),
+        RepairRunStatus::Completed,
+        Some(RepairRunSummary::from_local_report(&report)),
+        serialize_repair_run_report(&report),
+    )
+    .await;
+    report
+}
+
 async fn execute_tracked_cluster_replication_repair(
     state: &ServerState,
     batch_size_override: Option<usize>,
@@ -8306,7 +8331,7 @@ async fn run_autonomous_post_write_replication(state: ServerState) {
             return;
         };
 
-        let report = execute_tracked_targeted_local_replication_repair(
+        let report = execute_tracked_targeted_replication_repair(
             &state,
             subjects.clone(),
             RepairRunTrigger::AutonomousPostWrite,

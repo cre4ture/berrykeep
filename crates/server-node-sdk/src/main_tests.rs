@@ -5560,6 +5560,97 @@ run_on_main_metadata_backends!(
     replication_repair_records_max_retry_skip_details_turso
 );
 
+async fn autonomous_post_write_replication_pushes_to_missing_remote_nodes_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(2, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let placeholder_node_id = {
+        let cluster = source.cluster.lock().await;
+        cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id != source.node_id)
+            .map(|node| node.node_id)
+            .expect("expected seeded remote placeholder")
+    };
+
+    {
+        let mut cluster = source.cluster.lock().await;
+        assert!(cluster.remove_node(placeholder_node_id));
+    }
+
+    let (peer_base_url, handle) = spawn_internal_peer_api_server(target.clone()).await;
+    register_online_source_node(&source, &target, &peer_base_url).await;
+
+    let key = "autonomous-post-write-repair.bin".to_string();
+    let version_id = "ver-autonomous-post-write-head".to_string();
+    let payload = sample_large_chunked_payload();
+
+    seed_subject_version(&source, &key, &version_id, payload.clone(), Vec::new()).await;
+    {
+        let mut cluster = source.cluster.lock().await;
+        cluster.note_replica(&key, source.node_id);
+        cluster.note_replica(format!("{key}@{version_id}"), source.node_id);
+    }
+
+    {
+        let mut runtime = source.autonomous_post_write_repair.lock().await;
+        assert!(runtime.enqueue(super::autonomous_post_write_replication_subjects(
+            &key,
+            &version_id,
+        )));
+    }
+
+    super::run_autonomous_post_write_replication(source.clone()).await;
+
+    let latest_repair = repair_run_history(&source)
+        .await
+        .into_iter()
+        .next()
+        .expect("expected retained autonomous post-write repair run");
+    assert!(
+        latest_repair
+            .summary
+            .as_ref()
+            .map(|summary| summary.successful_transfers)
+            .unwrap_or(0)
+            >= 1,
+        "autonomous post-write repair should push to the missing remote node, record={latest_repair:?}"
+    );
+
+    {
+        let store = lock_store(&target, "tests.post_write.verify_remote_replication").await;
+        let replicated_version = store
+            .get_object(
+                &key,
+                None,
+                Some(&version_id),
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("versioned subject should replicate to the missing remote node");
+        assert_eq!(replicated_version.as_ref(), payload.as_slice());
+
+        let replicated_head = store
+            .get_object(&key, None, None, super::storage::ObjectReadMode::Preferred)
+            .await
+            .expect("head subject should replicate to the missing remote node");
+        assert_eq!(replicated_head.as_ref(), payload.as_slice());
+    }
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    autonomous_post_write_replication_pushes_to_missing_remote_nodes_impl,
+    autonomous_post_write_replication_pushes_to_missing_remote_nodes,
+    autonomous_post_write_replication_pushes_to_missing_remote_nodes_turso
+);
+
 async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
     backend: MainTestBackend,
 ) {

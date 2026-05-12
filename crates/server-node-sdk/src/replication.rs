@@ -144,6 +144,41 @@ pub(crate) async fn execute_replication_repair_inner(
     execute_replication_repair_plan(state, plan, nodes, batch_size_override, false).await
 }
 
+pub(crate) async fn execute_planned_targeted_replication_repair_inner(
+    state: &ServerState,
+    subjects: Vec<String>,
+    batch_size_override: Option<usize>,
+) -> (ReplicationPlan, ReplicationRepairReport) {
+    let mut subjects = subjects
+        .into_iter()
+        .filter(|subject| !subject.trim().is_empty())
+        .collect::<Vec<_>>();
+    subjects.sort();
+    subjects.dedup();
+
+    sync_availability_views_once(state).await;
+
+    let (plan, nodes) = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        (cluster.replication_plan(&subjects), cluster.list_nodes())
+    };
+    let batch_size_override = batch_size_override.or_else(|| {
+        Some(
+            plan.items
+                .iter()
+                .map(|item| item.missing_nodes.len())
+                .sum::<usize>()
+                .max(1),
+        )
+    });
+    let report =
+        execute_replication_repair_plan(state, plan.clone(), nodes, batch_size_override, false)
+            .await;
+
+    (plan, report)
+}
+
 pub(crate) async fn execute_targeted_replication_repair_inner(
     state: &ServerState,
     mut subjects: Vec<String>,
