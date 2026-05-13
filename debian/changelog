@@ -1,3 +1,13 @@
+ironmesh (1.0.11-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add a paginated admin Data Changes feed with upload, rename, copy, and
+    delete history plus client identity attribution.
+  * Cache Windows thumbnail provider clients and show the desktop client
+    config app's own version in the UI.
+  * Roll the workspace release to 1.0.11.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 13 May 2026 08:47:35 +0200
+
 ironmesh (1.0.10-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Limit media cache build concurrency to avoid file descriptor exhaustion.
