@@ -67,6 +67,43 @@ export type DataChangeEventsResponse = {
   next_cursor?: DataChangeEventsCursor | null;
 };
 
+export type ClientConnectionTransport =
+  | "http_request"
+  | "direct_transport"
+  | "relay_transport";
+
+export type ClientConnectionCursor = {
+  connected_at_unix: number;
+  connection_id: string;
+};
+
+export type ClientConnectionSummary = {
+  total: number;
+  http_requests: number;
+  direct_transport: number;
+  relay_transport: number;
+};
+
+export type ClientConnectionEntry = {
+  connection_id: string;
+  device_id: string;
+  label: string | null;
+  credential_fingerprint: string | null;
+  connection_name: string | null;
+  transport: ClientConnectionTransport;
+  connected_at_unix: number;
+  method: string | null;
+  path: string | null;
+  session_id: string | null;
+  rendezvous_url: string | null;
+};
+
+export type ClientConnectionsResponse = {
+  summary: ClientConnectionSummary;
+  entries: ClientConnectionEntry[];
+  next_cursor?: ClientConnectionCursor | null;
+};
+
 export type ClusterSummary = {
   local_node_id: string;
   total_nodes: number;

@@ -309,7 +309,9 @@ async fn authorize_direct_transport_fast_path(
         TransportExecutionScope::Public => match policy {
             DirectAuthPolicy::Client => {
                 if state.client_auth_control.require_client_auth {
-                    validate_client_auth_request(state, headers, method, raw_path).await
+                    validate_client_auth_request(state, headers, method, raw_path)
+                        .await
+                        .map(|_| ())
                 } else {
                     Ok(())
                 }
@@ -320,7 +322,9 @@ async fn authorize_direct_transport_fast_path(
                 {
                     Ok(())
                 } else {
-                    validate_client_auth_request(state, headers, method, raw_path).await
+                    validate_client_auth_request(state, headers, method, raw_path)
+                        .await
+                        .map(|_| ())
                 }
             }
         },

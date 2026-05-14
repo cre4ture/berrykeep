@@ -19,7 +19,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use axum::body::Body;
 use axum::extract::FromRequestParts;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket as AxumWebSocket};
-use axum::extract::{Path, Query, Request, State, WebSocketUpgrade};
+use axum::extract::{Extension, Path, Query, Request, State, WebSocketUpgrade};
 use axum::http::header;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -229,6 +229,7 @@ struct ServerState {
     metadata_commit_mode: MetadataCommitMode,
     autonomous_replication_on_put_enabled: bool,
     inflight_requests: Arc<AtomicUsize>,
+    client_connections: Arc<StdMutex<LiveClientConnectionRegistry>>,
     peer_heartbeat_config: PeerHeartbeatConfig,
     repair_config: RepairConfig,
     log_buffer: Arc<LogBuffer>,
@@ -246,6 +247,148 @@ struct ServerState {
     admin_sessions: Arc<Mutex<AdminSessionStore>>,
     client_auth_control: ClientAuthControl,
     client_auth_replay_cache: Arc<Mutex<ClientAuthReplayCache>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ClientConnectionTransportKind {
+    HttpRequest,
+    DirectTransport,
+    RelayTransport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ClientConnectionCursor {
+    connected_at_unix: u64,
+    connection_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ClientConnectionSummary {
+    total: usize,
+    http_requests: usize,
+    direct_transport: usize,
+    relay_transport: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ClientConnectionView {
+    connection_id: String,
+    device_id: String,
+    label: Option<String>,
+    credential_fingerprint: Option<String>,
+    connection_name: Option<String>,
+    transport: ClientConnectionTransportKind,
+    connected_at_unix: u64,
+    method: Option<String>,
+    path: Option<String>,
+    session_id: Option<String>,
+    rendezvous_url: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct LiveClientConnectionRegistry {
+    entries: HashMap<String, ClientConnectionView>,
+}
+
+impl LiveClientConnectionRegistry {
+    fn register(&mut self, entry: ClientConnectionView) {
+        self.entries.insert(entry.connection_id.clone(), entry);
+    }
+
+    fn unregister(&mut self, connection_id: &str) {
+        self.entries.remove(connection_id);
+    }
+
+    fn list(
+        &self,
+        limit: usize,
+        before: Option<&ClientConnectionCursor>,
+    ) -> ClientConnectionsResponse {
+        let summary = self.summary();
+        let mut entries = self.entries.values().cloned().collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            right
+                .connected_at_unix
+                .cmp(&left.connected_at_unix)
+                .then_with(|| right.connection_id.cmp(&left.connection_id))
+        });
+
+        if let Some(before) = before {
+            entries.retain(|entry| {
+                entry.connected_at_unix < before.connected_at_unix
+                    || (entry.connected_at_unix == before.connected_at_unix
+                        && entry.connection_id < before.connection_id)
+            });
+        }
+
+        let next_cursor = if entries.len() > limit {
+            entries.truncate(limit);
+            entries.last().map(|entry| ClientConnectionCursor {
+                connected_at_unix: entry.connected_at_unix,
+                connection_id: entry.connection_id.clone(),
+            })
+        } else {
+            None
+        };
+
+        ClientConnectionsResponse {
+            summary,
+            entries,
+            next_cursor,
+        }
+    }
+
+    fn summary(&self) -> ClientConnectionSummary {
+        let mut summary = ClientConnectionSummary {
+            total: self.entries.len(),
+            http_requests: 0,
+            direct_transport: 0,
+            relay_transport: 0,
+        };
+
+        for entry in self.entries.values() {
+            match entry.transport {
+                ClientConnectionTransportKind::HttpRequest => {
+                    summary.http_requests = summary.http_requests.saturating_add(1);
+                }
+                ClientConnectionTransportKind::DirectTransport => {
+                    summary.direct_transport = summary.direct_transport.saturating_add(1);
+                }
+                ClientConnectionTransportKind::RelayTransport => {
+                    summary.relay_transport = summary.relay_transport.saturating_add(1);
+                }
+            }
+        }
+
+        summary
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedClientIdentity {
+    device_id: String,
+    label: Option<String>,
+    credential_fingerprint: Option<String>,
+}
+
+#[derive(Debug)]
+struct TrackedClientConnection {
+    registry: Arc<StdMutex<LiveClientConnectionRegistry>>,
+    connection_id: String,
+}
+
+impl Drop for TrackedClientConnection {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.unregister(&self.connection_id);
+        }
+    }
+}
+
+struct CompletedRelaySession {
+    execution_scope: transport_service::TransportExecutionScope,
+    tracked_connection: Option<TrackedClientConnection>,
 }
 
 fn new_store_rwlock(store: PersistentStore) -> Arc<TracedRwLock<PersistentStore>> {
@@ -761,6 +904,126 @@ fn request_connection_name(headers: &HeaderMap) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn track_client_connection(
+    state: &ServerState,
+    entry: ClientConnectionView,
+) -> TrackedClientConnection {
+    let connection_id = entry.connection_id.clone();
+    if let Ok(mut registry) = state.client_connections.lock() {
+        registry.register(entry);
+    }
+    TrackedClientConnection {
+        registry: state.client_connections.clone(),
+        connection_id,
+    }
+}
+
+fn should_track_client_http_request(request: &Request) -> bool {
+    !request.uri().path().ends_with("/transport/ws")
+}
+
+fn track_client_http_request(
+    state: &ServerState,
+    identity: &AuthenticatedClientIdentity,
+    request: &Request,
+) -> Option<TrackedClientConnection> {
+    if !should_track_client_http_request(request) {
+        return None;
+    }
+
+    Some(track_client_connection(
+        state,
+        ClientConnectionView {
+            connection_id: format!("http-{}", Uuid::now_v7()),
+            device_id: identity.device_id.clone(),
+            label: identity.label.clone(),
+            credential_fingerprint: identity.credential_fingerprint.clone(),
+            connection_name: request_connection_name(request.headers()),
+            transport: ClientConnectionTransportKind::HttpRequest,
+            connected_at_unix: unix_ts(),
+            method: Some(request.method().as_str().to_string()),
+            path: Some(request_auth_path_and_query(request)),
+            session_id: None,
+            rendezvous_url: None,
+        },
+    ))
+}
+
+fn track_direct_transport_connection(
+    state: &ServerState,
+    identity: &AuthenticatedClientIdentity,
+    connection_name: Option<String>,
+    session_id: &str,
+) -> TrackedClientConnection {
+    track_client_connection(
+        state,
+        ClientConnectionView {
+            connection_id: format!("direct-{session_id}"),
+            device_id: identity.device_id.clone(),
+            label: identity.label.clone(),
+            credential_fingerprint: identity.credential_fingerprint.clone(),
+            connection_name,
+            transport: ClientConnectionTransportKind::DirectTransport,
+            connected_at_unix: unix_ts(),
+            method: None,
+            path: None,
+            session_id: Some(session_id.to_string()),
+            rendezvous_url: None,
+        },
+    )
+}
+
+fn track_relay_transport_connection(
+    state: &ServerState,
+    identity: &AuthenticatedClientIdentity,
+    connection_name: Option<String>,
+    session_id: &str,
+    endpoint_url: &str,
+) -> TrackedClientConnection {
+    track_client_connection(
+        state,
+        ClientConnectionView {
+            connection_id: format!("relay-{session_id}"),
+            device_id: identity.device_id.clone(),
+            label: identity.label.clone(),
+            credential_fingerprint: identity.credential_fingerprint.clone(),
+            connection_name,
+            transport: ClientConnectionTransportKind::RelayTransport,
+            connected_at_unix: unix_ts(),
+            method: None,
+            path: None,
+            session_id: Some(session_id.to_string()),
+            rendezvous_url: Some(endpoint_url.to_string()),
+        },
+    )
+}
+
+async fn client_identity_for_device_id(
+    state: &ServerState,
+    device_id: &str,
+) -> AuthenticatedClientIdentity {
+    let (label, credential_fingerprint) = {
+        let auth_state = state.client_credentials.lock().await;
+        auth_state
+            .credentials
+            .iter()
+            .find(|credential| credential.device_id == device_id)
+            .map(|credential| {
+                (
+                    credential.label.clone(),
+                    credential_record_fingerprint(credential),
+                )
+            })
+            .unwrap_or((None, None))
+    };
+
+    AuthenticatedClientIdentity {
+        device_id: device_id.to_string(),
+        label,
+        credential_fingerprint,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DataChangeActorContext {
     actor_kind: DataChangeActorKind,
@@ -898,7 +1161,7 @@ async fn require_internal_caller(
 
 async fn require_client_auth(
     State(state): State<ServerState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
     if !state.client_auth_control.require_client_auth {
@@ -909,7 +1172,7 @@ async fn require_client_auth(
     let request_path_and_query = request_auth_path_and_query(&request);
     let request_method = request.method().as_str().to_string();
 
-    validate_client_auth_request(
+    let identity = validate_client_auth_request(
         &state,
         &request_headers,
         &request_method,
@@ -917,12 +1180,18 @@ async fn require_client_auth(
     )
     .await?;
 
-    Ok(next.run(request).await)
+    let tracked_connection = track_client_http_request(&state, &identity, &request);
+    request.extensions_mut().insert(identity);
+
+    let response = next.run(request).await;
+    drop(tracked_connection);
+
+    Ok(response)
 }
 
 async fn require_client_or_admin_auth(
     State(state): State<ServerState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
     let request_headers = request.headers().clone();
@@ -937,7 +1206,7 @@ async fn require_client_or_admin_auth(
     let request_path_and_query = request_auth_path_and_query(&request);
     let request_method = request.method().as_str().to_string();
 
-    validate_client_auth_request(
+    let identity = validate_client_auth_request(
         &state,
         &request_headers,
         &request_method,
@@ -945,7 +1214,13 @@ async fn require_client_or_admin_auth(
     )
     .await?;
 
-    Ok(next.run(request).await)
+    let tracked_connection = track_client_http_request(&state, &identity, &request);
+    request.extensions_mut().insert(identity);
+
+    let response = next.run(request).await;
+    drop(tracked_connection);
+
+    Ok(response)
 }
 
 fn request_auth_path_and_query(request: &Request) -> String {
@@ -968,7 +1243,7 @@ async fn validate_client_auth_request(
     headers: &HeaderMap,
     request_method: &str,
     request_path_and_query: &str,
-) -> std::result::Result<(), StatusCode> {
+) -> std::result::Result<AuthenticatedClientIdentity, StatusCode> {
     let signed_headers = SignedRequestHeaders::from_header_lookup(|name| {
         headers
             .get(name)
@@ -987,7 +1262,7 @@ async fn validate_client_auth_request(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let (public_key_pem, stored_credential_fingerprint) = {
+    let (public_key_pem, stored_credential_fingerprint, label) = {
         let auth_state = state.client_credentials.lock().await;
         let Some(device) = auth_state.credentials.iter().find(|device| {
             device.revoked_at_unix.is_none() && device.device_id == signed_headers.device_id
@@ -1006,7 +1281,11 @@ async fn validate_client_auth_request(
                 .map_err(|_| StatusCode::UNAUTHORIZED)?,
             _ => return Err(StatusCode::UNAUTHORIZED),
         };
-        (public_key_pem, stored_credential_fingerprint)
+        (
+            public_key_pem,
+            stored_credential_fingerprint,
+            device.label.clone(),
+        )
     };
 
     if stored_credential_fingerprint != signed_headers.credential_fingerprint {
@@ -1026,7 +1305,11 @@ async fn validate_client_auth_request(
     }
     drop(replay_cache);
 
-    Ok(())
+    Ok(AuthenticatedClientIdentity {
+        device_id: signed_headers.device_id,
+        label,
+        credential_fingerprint: Some(stored_credential_fingerprint),
+    })
 }
 
 async fn request_has_admin_auth(state: &ServerState, headers: &HeaderMap) -> bool {
@@ -4378,6 +4661,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         metadata_commit_mode: config.metadata_commit_mode,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
         inflight_requests: Arc::new(AtomicUsize::new(0)),
+        client_connections: Arc::new(StdMutex::new(LiveClientConnectionRegistry::default())),
         peer_heartbeat_config,
         repair_config,
         log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),
@@ -4570,6 +4854,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/media/thumbnail", get(get_media_thumbnail_admin))
         .route("/auth/media/cache/clear", post(clear_media_cache_admin))
         .route("/auth/store/{key}", get(get_object_admin))
+        .route("/auth/client-connections", get(list_client_connections))
         .route(
             "/auth/rendezvous-config",
             get(get_rendezvous_config).put(update_rendezvous_config),
@@ -6076,6 +6361,7 @@ impl Sink<DirectTransportWsMessage> for DirectTransportSocketAdapter {
 
 async fn serve_direct_transport_session(
     state: ServerState,
+    client_identity: AuthenticatedClientIdentity,
     peer: PeerIdentity,
     mut session: MultiplexedSession,
 ) -> Result<()> {
@@ -6121,6 +6407,13 @@ async fn serve_direct_transport_session(
         "accepted direct transport session"
     );
 
+    let _tracked_connection = track_direct_transport_connection(
+        &state,
+        &client_identity,
+        connection_name,
+        &session_id,
+    );
+
     loop {
         let next = session
             .accept_stream()
@@ -6147,12 +6440,10 @@ async fn serve_direct_transport_session(
 
 async fn client_transport_ws(
     State(state): State<ServerState>,
+    Extension(client_identity): Extension<AuthenticatedClientIdentity>,
     websocket: WebSocketUpgrade,
-    headers: HeaderMap,
 ) -> Response {
-    let Some(device_id) =
-        request_device_id(&headers).and_then(|value| DeviceId::parse_str(&value).ok())
-    else {
+    let Ok(device_id) = DeviceId::parse_str(&client_identity.device_id) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let peer = PeerIdentity::Device(device_id);
@@ -6173,7 +6464,9 @@ async fn client_transport_ws(
                 }
             };
 
-            if let Err(err) = serve_direct_transport_session(state, peer, session).await {
+            if let Err(err) =
+                serve_direct_transport_session(state, client_identity, peer, session).await
+            {
                 warn!(error = %err, "direct transport session failed");
             }
         })
@@ -6541,7 +6834,7 @@ async fn complete_relay_multiplex_handshake(
     endpoint_url: &str,
     relay_session: &RelayTunnelSession,
     session: &mut MultiplexedSession,
-) -> Result<transport_service::TransportExecutionScope> {
+) -> Result<CompletedRelaySession> {
     let hello = perform_transport_server_handshake(
         session,
         TransportSessionControlMessage::Ready {
@@ -6598,14 +6891,31 @@ async fn complete_relay_multiplex_handshake(
         "accepted relay transport session"
     );
 
-    Ok(match &peer {
-        PeerIdentity::Device(_) => transport_service::TransportExecutionScope::Public,
-        PeerIdentity::Node(node_id) => {
-            transport_service::TransportExecutionScope::Internal(InternalCaller {
-                node_id: *node_id,
-                cluster_id: state.cluster_id,
-            })
+    let tracked_connection = match &peer {
+        PeerIdentity::Device(device_id) => {
+            let identity = client_identity_for_device_id(state, &device_id.to_string()).await;
+            Some(track_relay_transport_connection(
+                state,
+                &identity,
+                connection_name.clone(),
+                &relay_session.session_id,
+                endpoint_url,
+            ))
         }
+        PeerIdentity::Node(_) => None,
+    };
+
+    Ok(CompletedRelaySession {
+        execution_scope: match &peer {
+            PeerIdentity::Device(_) => transport_service::TransportExecutionScope::Public,
+            PeerIdentity::Node(node_id) => {
+                transport_service::TransportExecutionScope::Internal(InternalCaller {
+                    node_id: *node_id,
+                    cluster_id: state.cluster_id,
+                })
+            }
+        },
+        tracked_connection,
     })
 }
 
@@ -6615,6 +6925,7 @@ async fn serve_relay_multiplex_streams(
     relay_session: RelayTunnelSession,
     mut session: MultiplexedSession,
     execution_scope: transport_service::TransportExecutionScope,
+    _tracked_connection: Option<TrackedClientConnection>,
 ) -> Result<()> {
     loop {
         let next = session.accept_stream().await.with_context(|| {
@@ -6698,7 +7009,7 @@ fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
                             )
                             .await
                             {
-                                Ok(execution_scope) => {
+                                Ok(completed_session) => {
                                     let _ = record_rendezvous_registration_success(
                                         &state,
                                         &endpoint_url,
@@ -6709,7 +7020,8 @@ fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
                                         endpoint_url.clone(),
                                         relay_session.clone(),
                                         multiplexed,
-                                        execution_scope,
+                                        completed_session.execution_scope,
+                                        completed_session.tracked_connection,
                                     )
                                     .await
                                     {
@@ -8449,6 +8761,13 @@ struct DataChangeEventsQuery {
     actor: Option<String>,
     before_created_at_unix: Option<u64>,
     before_event_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientConnectionsQuery {
+    limit: Option<usize>,
+    before_connected_at_unix: Option<u64>,
+    before_connection_id: Option<String>,
 }
 
 fn should_trigger_autonomous_post_write_replication(
@@ -11856,6 +12175,13 @@ struct ClientCredentialView {
 struct DataChangeEventsResponse {
     entries: Vec<DataChangeEvent>,
     next_cursor: Option<DataChangeEventCursor>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientConnectionsResponse {
+    summary: ClientConnectionSummary,
+    entries: Vec<ClientConnectionView>,
+    next_cursor: Option<ClientConnectionCursor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -15560,6 +15886,52 @@ async fn list_client_credentials(
     (StatusCode::OK, Json(credentials)).into_response()
 }
 
+async fn list_client_connections(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ClientConnectionsQuery>,
+) -> impl IntoResponse {
+    let action = "auth/client-connections/list";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "limit": query.limit,
+            "before_connected_at_unix": query.before_connected_at_unix,
+            "before_connection_id": query.before_connection_id,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let before_cursor = match (
+        query.before_connected_at_unix,
+        query.before_connection_id.as_deref().map(str::trim),
+    ) {
+        (None, None) => None,
+        (Some(connected_at_unix), Some(connection_id)) if !connection_id.is_empty() => {
+            Some(ClientConnectionCursor {
+                connected_at_unix,
+                connection_id: connection_id.to_string(),
+            })
+        }
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let response_limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let response = match state.client_connections.lock() {
+        Ok(registry) => registry.list(response_limit, before_cursor.as_ref()),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
 async fn list_data_change_events(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -18059,6 +18431,83 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
     }
 
     Some((subject.to_string(), None))
+}
+
+#[cfg(test)]
+mod live_client_connection_registry_tests {
+    use super::*;
+
+    fn view(
+        connection_id: &str,
+        transport: ClientConnectionTransportKind,
+        connected_at_unix: u64,
+    ) -> ClientConnectionView {
+        ClientConnectionView {
+            connection_id: connection_id.to_string(),
+            device_id: "device-1".to_string(),
+            label: Some("Test Device".to_string()),
+            credential_fingerprint: Some("cred-1".to_string()),
+            connection_name: Some("client/test".to_string()),
+            transport,
+            connected_at_unix,
+            method: Some("GET".to_string()),
+            path: Some("/api/v1/store/index".to_string()),
+            session_id: None,
+            rendezvous_url: None,
+        }
+    }
+
+    #[test]
+    fn client_connection_registry_pages_in_descending_order() {
+        let mut registry = LiveClientConnectionRegistry::default();
+        registry.register(view(
+            "conn-c",
+            ClientConnectionTransportKind::HttpRequest,
+            30,
+        ));
+        registry.register(view(
+            "conn-b",
+            ClientConnectionTransportKind::RelayTransport,
+            30,
+        ));
+        registry.register(view(
+            "conn-a",
+            ClientConnectionTransportKind::DirectTransport,
+            20,
+        ));
+
+        let first_page = registry.list(2, None);
+        assert_eq!(first_page.summary.total, 3);
+        assert_eq!(first_page.summary.http_requests, 1);
+        assert_eq!(first_page.summary.relay_transport, 1);
+        assert_eq!(first_page.summary.direct_transport, 1);
+        assert_eq!(
+            first_page
+                .entries
+                .iter()
+                .map(|entry| entry.connection_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["conn-c", "conn-b"]
+        );
+        assert_eq!(
+            first_page.next_cursor,
+            Some(ClientConnectionCursor {
+                connected_at_unix: 30,
+                connection_id: "conn-b".to_string(),
+            })
+        );
+
+        let second_page = registry.list(2, first_page.next_cursor.as_ref());
+        assert_eq!(
+            second_page
+                .entries
+                .iter()
+                .map(|entry| entry.connection_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["conn-a"]
+        );
+        assert_eq!(second_page.next_cursor, None);
+    }
 }
 
 #[cfg(test)]

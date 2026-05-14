@@ -2099,7 +2099,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
             .expect("relay target accept should succeed");
         let endpoint_url = endpoint.url;
         let mut multiplexed = multiplexed;
-        let execution_scope = super::complete_relay_multiplex_handshake(
+        let completed_session = super::complete_relay_multiplex_handshake(
             &relay_state,
             &endpoint_url,
             &relay_session,
@@ -2112,7 +2112,8 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
             endpoint_url,
             relay_session,
             multiplexed,
-            execution_scope,
+            completed_session.execution_scope,
+            completed_session.tracked_connection,
         )
         .await
         .expect("relay multiplex session should serve");
@@ -7282,6 +7283,9 @@ async fn build_test_state(
         metadata_commit_mode: MetadataCommitMode::Local,
         autonomous_replication_on_put_enabled: false,
         inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        client_connections: Arc::new(std::sync::Mutex::new(
+            super::LiveClientConnectionRegistry::default(),
+        )),
         peer_heartbeat_config: PeerHeartbeatConfig {
             enabled: false,
             interval_secs: 15,

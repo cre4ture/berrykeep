@@ -4,6 +4,7 @@ import { RepairPage } from "../pages/RepairPage";
 import { SetupPage } from "../pages/SetupPage";
 import { BootstrapBundlesPage } from "../pages/BootstrapBundlesPage";
 import { ClientCredentialsPage } from "../pages/ClientCredentialsPage";
+import { ClientConnectionsPage } from "../pages/ClientConnectionsPage";
 import { CertificatesPage } from "../pages/CertificatesPage";
 import { ControlPlanePage } from "../pages/ControlPlanePage";
 import { DataChangesPage } from "../pages/DataChangesPage";
@@ -54,6 +55,13 @@ export const serverAdminRoutes = [
     description: "Inspect the recent node-local feed of uploaded, renamed, copied, and deleted data with client identity attribution when available.",
     icon: IconHistory,
     element: <DataChangesPage />
+  },
+  {
+    id: "client-connections",
+    label: "Connections",
+    description: "Inspect currently active client HTTP requests and accepted transport sessions with live cursor paging from the node runtime.",
+    icon: IconPlugConnected,
+    element: <ClientConnectionsPage />
   },
   {
     id: "bootstrap",

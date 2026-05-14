@@ -8,6 +8,7 @@ import type {
   AdminSessionStatus,
   BootstrapClaimIssueResponse,
   BootstrapBundle,
+  ClientConnectionsResponse,
   ClientBootstrapClaimView,
   ClientCredentialView,
   ClusterSummary,
@@ -453,6 +454,42 @@ export async function getDataChangeEvents(
 
   return fetchAdminJson<DataChangeEventsResponse>(
     `${apiV1("/auth/data-changes")}?${query.toString()}`,
+    {
+      adminTokenOverride
+    }
+  );
+}
+
+export async function getClientConnections(
+  options?: {
+    limit?: number;
+    before?: {
+      connected_at_unix: number;
+      connection_id: string;
+    } | null;
+  },
+  adminTokenOverride?: string
+): Promise<ClientConnectionsResponse> {
+  const query = new URLSearchParams();
+  const limit =
+    typeof options?.limit === "number" && Number.isFinite(options.limit)
+      ? Math.max(1, Math.min(1000, Math.trunc(options.limit)))
+      : 100;
+  query.set("limit", String(limit));
+  if (
+    options?.before &&
+    Number.isFinite(options.before.connected_at_unix) &&
+    options.before.connection_id.trim()
+  ) {
+    query.set(
+      "before_connected_at_unix",
+      String(Math.max(0, Math.trunc(options.before.connected_at_unix)))
+    );
+    query.set("before_connection_id", options.before.connection_id.trim());
+  }
+
+  return fetchAdminJson<ClientConnectionsResponse>(
+    `${apiV1("/auth/client-connections")}?${query.toString()}`,
     {
       adminTokenOverride
     }
