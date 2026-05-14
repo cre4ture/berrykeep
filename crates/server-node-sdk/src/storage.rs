@@ -1414,26 +1414,43 @@ impl MediaCacheWorker {
             && (derived.metadata.status != MediaCacheStatus::Ready
                 || derived.metadata.thumbnail.is_none())
         {
-            if derived.metadata.status == MediaCacheStatus::Incomplete {
-                let merged = promote_cached_media_metadata_to_incomplete(
-                    existing,
-                    derived.metadata.generated_at_unix,
-                    derived
-                        .metadata
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "media source is incomplete locally".to_string()),
+            let merged = merge_cached_media_metadata_without_thumbnail(existing, &derived.metadata);
+            let derived = DerivedMediaCacheArtifact {
+                metadata: merged,
+                thumbnail_payload: None,
+            };
+            let persist_started_at = Instant::now();
+            self.persist_media_cache_record(&derived).await?;
+            let persist_ms = persist_started_at.elapsed().as_millis();
+            let total_ms = ensure_started_at.elapsed().as_millis();
+            let metadata = &derived.metadata;
+            if matches!(
+                metadata.status,
+                MediaCacheStatus::Failed | MediaCacheStatus::Unsupported
+            ) {
+                warn!(
+                    manifest_hash,
+                    content_fingerprint = %content_fingerprint,
+                    include_thumbnail,
+                    status = ?metadata.status,
+                    error = metadata.error.as_deref().unwrap_or(""),
+                    "media thumbnail build failed after metadata-only cache"
                 );
-                let derived = DerivedMediaCacheArtifact {
-                    metadata: merged,
-                    thumbnail_payload: None,
-                };
-                let persist_started_at = Instant::now();
-                self.persist_media_cache_record(&derived).await?;
-                let persist_ms = persist_started_at.elapsed().as_millis();
-                let total_ms = ensure_started_at.elapsed().as_millis();
-                let metadata = &derived.metadata;
-                info!(
+            }
+            info!(
+                manifest_hash,
+                content_fingerprint = %content_fingerprint,
+                total_ms,
+                build_record_ms,
+                persist_ms,
+                include_thumbnail,
+                status = ?metadata.status,
+                has_thumbnail = metadata.thumbnail.is_some(),
+                error = metadata.error.as_deref().unwrap_or(""),
+                "media cache build finished"
+            );
+            if total_ms >= SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS {
+                warn!(
                     manifest_hash,
                     content_fingerprint = %content_fingerprint,
                     total_ms,
@@ -1443,33 +1460,10 @@ impl MediaCacheWorker {
                     status = ?metadata.status,
                     has_thumbnail = metadata.thumbnail.is_some(),
                     error = metadata.error.as_deref().unwrap_or(""),
-                    "media cache build finished"
+                    "slow media cache build"
                 );
-                if total_ms >= SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS {
-                    warn!(
-                        manifest_hash,
-                        content_fingerprint = %content_fingerprint,
-                        total_ms,
-                        build_record_ms,
-                        persist_ms,
-                        include_thumbnail,
-                        status = ?metadata.status,
-                        has_thumbnail = metadata.thumbnail.is_some(),
-                        error = metadata.error.as_deref().unwrap_or(""),
-                        "slow media cache build"
-                    );
-                }
-                return Ok(Some(metadata.clone()));
             }
-            warn!(
-                manifest_hash,
-                content_fingerprint = %content_fingerprint,
-                include_thumbnail,
-                status = ?derived.metadata.status,
-                error = derived.metadata.error.as_deref().unwrap_or(""),
-                "media thumbnail build did not produce a thumbnail; keeping existing metadata"
-            );
-            return Ok(Some(existing.clone()));
+            return Ok(Some(metadata.clone()));
         }
 
         let persist_started_at = Instant::now();
@@ -6749,13 +6743,68 @@ pub(crate) fn promote_cached_media_metadata_to_incomplete(
     generated_at_unix: u64,
     error: impl Into<String>,
 ) -> CachedMediaMetadata {
+    preserve_cached_media_metadata_status(
+        metadata,
+        MediaCacheStatus::Incomplete,
+        generated_at_unix,
+        error,
+        Some(media_cache_incomplete_retry_after_unix(generated_at_unix)),
+    )
+}
+
+fn preserve_cached_media_metadata_status(
+    metadata: &CachedMediaMetadata,
+    status: MediaCacheStatus,
+    generated_at_unix: u64,
+    error: impl Into<String>,
+    retry_after_unix: Option<u64>,
+) -> CachedMediaMetadata {
     let mut next = metadata.clone();
-    next.status = MediaCacheStatus::Incomplete;
+    next.status = status;
     next.thumbnail = None;
     next.generated_at_unix = generated_at_unix;
-    next.retry_after_unix = Some(media_cache_incomplete_retry_after_unix(generated_at_unix));
+    next.retry_after_unix = retry_after_unix;
     next.error = Some(error.into());
     next
+}
+
+fn merge_cached_media_metadata_without_thumbnail(
+    existing: &CachedMediaMetadata,
+    derived: &CachedMediaMetadata,
+) -> CachedMediaMetadata {
+    let (status, retry_after_unix, fallback_error) = match derived.status {
+        MediaCacheStatus::Incomplete => (
+            MediaCacheStatus::Incomplete,
+            Some(media_cache_incomplete_retry_after_unix(derived.generated_at_unix)),
+            "media source is incomplete locally; one or more chunks are missing or have the wrong size",
+        ),
+        MediaCacheStatus::Unsupported => (
+            MediaCacheStatus::Unsupported,
+            None,
+            "media format is not supported for thumbnail extraction",
+        ),
+        MediaCacheStatus::Failed => (
+            MediaCacheStatus::Failed,
+            None,
+            "thumbnail generation failed",
+        ),
+        MediaCacheStatus::Ready => (
+            MediaCacheStatus::Failed,
+            None,
+            "media thumbnail build finished without producing a thumbnail",
+        ),
+    };
+
+    preserve_cached_media_metadata_status(
+        existing,
+        status,
+        derived.generated_at_unix,
+        derived
+            .error
+            .clone()
+            .unwrap_or_else(|| fallback_error.to_string()),
+        retry_after_unix,
+    )
 }
 
 pub(crate) fn media_cache_retry_due(metadata: &CachedMediaMetadata, now_unix: u64) -> bool {

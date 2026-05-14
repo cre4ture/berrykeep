@@ -2882,7 +2882,9 @@ run_on_all_metadata_backends!(
 );
 
 #[cfg(unix)]
-async fn ensure_video_metadata_survives_thumbnail_failures_impl(backend: StorageTestBackend) {
+async fn ensure_video_thumbnail_failures_preserve_metadata_and_error_impl(
+    backend: StorageTestBackend,
+) {
     let (root, mut store) = backend.init_store("media-metadata-video-preserve").await;
     let tools_dir = root.join("test-video-tools");
     let (ffprobe_path, _, _) = install_fake_video_tools(&tools_dir);
@@ -2913,20 +2915,27 @@ async fn ensure_video_metadata_survives_thumbnail_failures_impl(backend: Storage
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(full.status, MediaCacheStatus::Ready);
+    assert_eq!(full.status, MediaCacheStatus::Failed);
     assert_eq!(full.media_type.as_deref(), Some("video"));
+    assert_eq!(full.mime_type.as_deref(), Some("video/mp4"));
     assert_eq!(full.width, Some(1920));
     assert_eq!(full.height, Some(1080));
     assert!(full.thumbnail.is_none());
+    assert!(
+        full.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("failed to spawn ffmpeg")
+    );
 
     let _ = fs::remove_dir_all(root).await;
 }
 
 #[cfg(unix)]
 run_on_all_metadata_backends!(
-    ensure_video_metadata_survives_thumbnail_failures_impl,
-    ensure_video_metadata_survives_thumbnail_failures,
-    ensure_video_metadata_survives_thumbnail_failures_turso
+    ensure_video_thumbnail_failures_preserve_metadata_and_error_impl,
+    ensure_video_thumbnail_failures_preserve_metadata_and_error,
+    ensure_video_thumbnail_failures_preserve_metadata_and_error_turso
 );
 
 async fn ensure_media_metadata_marks_missing_local_chunks_incomplete_impl(

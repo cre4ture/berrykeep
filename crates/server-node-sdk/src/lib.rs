@@ -10088,22 +10088,7 @@ fn build_media_index_response(
             orientation: metadata.orientation,
             taken_at_unix: metadata.taken_at_unix,
             gps: metadata.gps.as_ref().map(media_gps_response),
-            thumbnail: metadata
-                .thumbnail
-                .as_ref()
-                .map(|thumb| MediaThumbnailResponse {
-                    url: thumbnail_url.clone(),
-                    profile: thumb.profile.clone(),
-                    width: thumb.width,
-                    height: thumb.height,
-                    format: thumb.format.clone(),
-                    size_bytes: thumb.size_bytes,
-                })
-                .or_else(|| {
-                    (metadata.status == MediaCacheStatus::Ready
-                        && metadata.media_type.as_deref() == Some("image"))
-                    .then(|| placeholder_thumbnail_response(thumbnail_url.clone()))
-                }),
+            thumbnail: indexed_thumbnail_response(metadata, &thumbnail_url),
             error: metadata.error.clone(),
         },
         None => MediaIndexResponse {
@@ -10131,6 +10116,35 @@ fn placeholder_thumbnail_response(url: String) -> MediaThumbnailResponse {
         format: "jpeg".to_string(),
         size_bytes: 0,
     }
+}
+
+fn indexed_thumbnail_response(
+    metadata: &CachedMediaMetadata,
+    thumbnail_url: &str,
+) -> Option<MediaThumbnailResponse> {
+    metadata
+        .thumbnail
+        .as_ref()
+        .map(|thumb| MediaThumbnailResponse {
+            url: thumbnail_url.to_string(),
+            profile: thumb.profile.clone(),
+            width: thumb.width,
+            height: thumb.height,
+            format: thumb.format.clone(),
+            size_bytes: thumb.size_bytes,
+        })
+        .or_else(|| {
+            should_advertise_lazy_thumbnail(metadata)
+                .then(|| placeholder_thumbnail_response(thumbnail_url.to_string()))
+        })
+}
+
+fn should_advertise_lazy_thumbnail(metadata: &CachedMediaMetadata) -> bool {
+    metadata.status == MediaCacheStatus::Ready
+        && matches!(
+            metadata.media_type.as_deref(),
+            Some("image") | Some("video")
+        )
 }
 
 fn build_thumbnail_url(key: &str, snapshot: Option<&str>, thumbnail_route: &str) -> String {

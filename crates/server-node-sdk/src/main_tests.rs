@@ -5942,6 +5942,76 @@ run_on_main_metadata_backends!(
 );
 
 #[cfg(unix)]
+async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let tools_dir = locked.root_dir().join("test-video-tools");
+        let (ffprobe_path, _) = install_fake_video_tools(&tools_dir);
+        let missing_ffmpeg = locked.root_dir().join("missing-ffmpeg");
+        locked.set_media_tool_paths_for_test(ffprobe_path, missing_ffmpeg);
+        locked
+            .put_object_versioned(
+                "gallery/clip.mp4",
+                bytes::Bytes::from(sample_large_chunked_payload()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .unwrap();
+    }
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entries = payload["entries"].as_array().unwrap();
+    let media = &entries[0]["media"];
+
+    assert_eq!(entries[0]["path"], "gallery/clip.mp4");
+    assert_eq!(media["status"], "ready");
+    assert_eq!(media["media_type"], "video");
+    assert_eq!(media["mime_type"], "video/mp4");
+    assert_eq!(media["width"], 1920);
+    assert_eq!(media["height"], 1080);
+    assert!(
+        media["thumbnail"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("/media/thumbnail?key=gallery%2Fclip.mp4")
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[cfg(unix)]
+run_on_main_metadata_backends!(
+    list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl,
+    list_store_index_includes_thumbnail_url_for_metadata_only_videos,
+    list_store_index_includes_thumbnail_url_for_metadata_only_videos_turso
+);
+
+#[cfg(unix)]
 async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let put = {
