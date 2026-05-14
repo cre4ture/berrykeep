@@ -1,3 +1,15 @@
+ironmesh (1.0.12-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add an admin Connections page, a dependency diagnostics page, and
+    connection-name reporting improvements.
+  * Improve video thumbnail fallback behavior, including the unknown-duration
+    seek default.
+  * Fix Linux FUSE queued upload ordering so zero-byte truncates persist
+    reliably.
+  * Roll the workspace release to 1.0.12.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 15 May 2026 00:56:30 +0200
+
 ironmesh (1.0.11-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add a paginated admin Data Changes feed with upload, rename, copy, and
