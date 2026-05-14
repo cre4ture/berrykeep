@@ -783,6 +783,13 @@ fn build_thumbnail_client(
     sync_root_path: &Path,
     resolved: &adapter_windows_cfapi::connection_config::ResolvedConnectionConfig,
 ) -> ThumbnailProviderResult<ThumbnailClientBuild> {
+    let connection_name = format!(
+        "windows-thumbnail-provider/{}",
+        sync_root_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("sync-root")
+    );
     match load_thumbnail_client_identity(sync_root_path, &resolved.bootstrap_path) {
         Ok(identity_load) => {
             let candidate_paths = format_path_list(&identity_load.candidate_paths);
@@ -822,7 +829,10 @@ fn build_thumbnail_client(
                     identity.label.as_deref().unwrap_or("-"),
                     candidate_paths
                 ));
-                match resolved.build_client(Some(identity)) {
+                match resolved
+                    .build_client(Some(identity))
+                    .map(|client| client.with_connection_name(connection_name.clone()))
+                {
                     Ok(client) => {
                         let build = ThumbnailClientBuild {
                             client,
@@ -865,6 +875,7 @@ fn build_thumbnail_client(
 
             let client = resolved
                 .build_client(None)
+                .map(|client| client.with_connection_name(connection_name))
                 .map_err(ThumbnailProviderError::permanent)
                 .map_err(|error| {
                     error.with_context(format!(

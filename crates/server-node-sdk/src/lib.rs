@@ -752,6 +752,15 @@ fn request_device_id(headers: &HeaderMap) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn request_connection_name(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(transport_sdk::HEADER_CONNECTION_NAME)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 #[derive(Debug, Clone)]
 struct DataChangeActorContext {
     actor_kind: DataChangeActorKind,
@@ -4757,6 +4766,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
 
     let public_app = public_app
         .with_state(state.clone())
+        .layer(middleware::from_fn(log_named_client_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             track_inflight_requests,
@@ -4821,6 +4831,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .merge(build_internal_peer_api())
         .with_state(state.clone())
+        .layer(middleware::from_fn(log_named_client_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_internal_caller,
@@ -5816,6 +5827,7 @@ async fn open_relay_peer_session(
             cluster_id: state.cluster_id,
             role: TransportSessionRole::Node,
             peer: PeerIdentity::Node(state.node_id),
+            connection_name: None,
             target: Some(PeerIdentity::Node(node.node_id)),
         },
     )
@@ -6066,11 +6078,12 @@ async fn serve_direct_transport_session(
     peer: PeerIdentity,
     mut session: MultiplexedSession,
 ) -> Result<()> {
+    let session_id = format!("direct-{}", Uuid::now_v7());
     let hello = perform_transport_server_handshake(
         &mut session,
         TransportSessionControlMessage::Ready {
             protocol_version: TRANSPORT_PROTOCOL_VERSION,
-            session_id: format!("direct-{}", Uuid::now_v7()),
+            session_id: session_id.clone(),
             max_concurrent_streams: MultiplexConfig::default().max_num_streams,
         },
     )
@@ -6079,6 +6092,7 @@ async fn serve_direct_transport_session(
     let TransportSessionControlMessage::Hello {
         cluster_id,
         peer: hello_peer,
+        connection_name,
         ..
     } = hello
     else {
@@ -6098,6 +6112,13 @@ async fn serve_direct_transport_session(
             peer
         );
     }
+
+    tracing::info!(
+        peer = %peer,
+        session_id,
+        connection_name = %connection_name.as_deref().unwrap_or("-"),
+        "accepted direct transport session"
+    );
 
     loop {
         let next = session
@@ -6538,6 +6559,7 @@ async fn complete_relay_multiplex_handshake(
     let TransportSessionControlMessage::Hello {
         cluster_id,
         peer,
+        connection_name,
         target,
         ..
     } = hello
@@ -6566,6 +6588,14 @@ async fn complete_relay_multiplex_handshake(
             state.node_id
         );
     }
+
+    tracing::info!(
+        rendezvous_url = %endpoint_url,
+        session_id = %relay_session.session_id,
+        peer = %peer,
+        connection_name = %connection_name.as_deref().unwrap_or("-"),
+        "accepted relay transport session"
+    );
 
     Ok(match &peer {
         PeerIdentity::Device(_) => transport_service::TransportExecutionScope::Public,
@@ -7197,6 +7227,21 @@ async fn track_inflight_requests(
     let response = next.run(request).await;
     state.inflight_requests.fetch_sub(1, Ordering::Relaxed);
     response
+}
+
+async fn log_named_client_request(request: Request, next: Next) -> Response {
+    let connection_name = request_connection_name(request.headers());
+    let method = request.method().clone();
+    let path = request_auth_path_and_query(&request);
+    if let Some(connection_name) = connection_name.as_deref() {
+        tracing::info!(
+            connection_name,
+            method = %method,
+            path,
+            "received named client request"
+        );
+    }
+    next.run(request).await
 }
 
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
@@ -9588,7 +9633,9 @@ struct PendingDataChangeEvent {
 }
 
 async fn record_data_change_event(state: &ServerState, pending: PendingDataChangeEvent) {
-    let actor = pending.actor.unwrap_or_else(DataChangeActorContext::unknown);
+    let actor = pending
+        .actor
+        .unwrap_or_else(DataChangeActorContext::unknown);
     let event = DataChangeEvent {
         event_id: Uuid::now_v7().to_string(),
         action: pending.action,

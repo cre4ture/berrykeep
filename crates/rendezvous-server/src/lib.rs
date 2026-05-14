@@ -273,6 +273,7 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
             cluster_id: target_presence.registration.cluster_id,
             role: TransportSessionRole::Client,
             peer: source,
+            connection_name: None,
             target: Some(PeerIdentity::Node(request.target_node_id)),
         },
     )

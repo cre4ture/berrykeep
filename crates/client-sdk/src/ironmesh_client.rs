@@ -67,6 +67,7 @@ impl std::fmt::Display for RequestedRange {
 pub struct IronMeshClient {
     transport_router: ClientEndpointRouter,
     auth: ClientRequestAuth,
+    connection_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -519,6 +520,52 @@ fn header_value_for_log(headers: &HeaderMap, name: &str) -> String {
         .unwrap_or_else(|| "<none>".to_string())
 }
 
+fn normalize_connection_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut normalized = String::with_capacity(trimmed.len().min(128));
+    let mut previous_was_dash = false;
+    for ch in trimmed.chars() {
+        if normalized.len() >= 128 {
+            break;
+        }
+
+        let mapped = if ch.is_ascii_alphanumeric() {
+            previous_was_dash = false;
+            ch.to_ascii_lowercase()
+        } else if matches!(ch, '/' | '.' | '_' | '-') {
+            previous_was_dash = false;
+            ch
+        } else {
+            if previous_was_dash || normalized.is_empty() {
+                continue;
+            }
+            previous_was_dash = true;
+            '-'
+        };
+        normalized.push(mapped);
+    }
+
+    let normalized = normalized
+        .trim_matches(|ch| matches!(ch, '-' | '/' | '.' | '_'))
+        .to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn connection_name_header(connection_name: &str) -> RelayHttpHeader {
+    RelayHttpHeader {
+        name: transport_sdk::HEADER_CONNECTION_NAME.to_string(),
+        value: connection_name.to_string(),
+    }
+}
+
 fn build_identity_request_auth_headers(
     identity: &ClientIdentityMaterial,
     method: &str,
@@ -558,13 +605,18 @@ fn request_auth_headers_for_auth(
     auth: &ClientRequestAuth,
     method: &Method,
     url: &Url,
+    connection_name: Option<&str>,
 ) -> Result<Vec<RelayHttpHeader>> {
-    match auth {
+    let mut headers = match auth {
         ClientRequestAuth::None => Ok(Vec::new()),
         ClientRequestAuth::SignedIdentity(identity) => {
             build_identity_request_auth_headers(identity, method.as_str(), &path_and_query(url))
         }
+    }?;
+    if let Some(connection_name) = connection_name {
+        headers.push(connection_name_header(connection_name));
     }
+    Ok(headers)
 }
 
 fn relay_source_identity_for_auth(auth: &ClientRequestAuth) -> Result<PeerIdentity> {
@@ -588,6 +640,7 @@ fn apply_headers_to_request(
 async fn execute_buffered_request_for_transport(
     transport: &ClientTransport,
     auth: &ClientRequestAuth,
+    connection_name: Option<&str>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
@@ -604,6 +657,7 @@ async fn execute_buffered_request_for_transport(
                     server_base_url,
                     session_pool,
                     identity,
+                    connection_name,
                     method,
                     url,
                     headers,
@@ -636,9 +690,17 @@ async fn execute_buffered_request_for_transport(
         }
         ClientTransport::Relay(relay) => {
             let source = relay_source_identity_for_auth(auth)?;
-            execute_relay_multiplex_buffered_request(relay, source, method, url, headers, body)
-                .await
-                .with_context(|| format!("failed to relay {} {}", method, url))
+            execute_relay_multiplex_buffered_request(
+                relay,
+                source,
+                connection_name,
+                method,
+                url,
+                headers,
+                body,
+            )
+            .await
+            .with_context(|| format!("failed to relay {} {}", method, url))
         }
     }
 }
@@ -646,6 +708,7 @@ async fn execute_buffered_request_for_transport(
 async fn execute_streaming_object_read_request_for_transport(
     transport: &ClientTransport,
     auth: &ClientRequestAuth,
+    connection_name: Option<&str>,
     url: &Url,
     headers: &[RelayHttpHeader],
     writer: &mut dyn Write,
@@ -661,6 +724,7 @@ async fn execute_streaming_object_read_request_for_transport(
                     server_base_url,
                     session_pool,
                     identity,
+                    connection_name,
                     url,
                     headers,
                     writer,
@@ -674,7 +738,12 @@ async fn execute_streaming_object_read_request_for_transport(
         ClientTransport::Relay(relay) => {
             let source = relay_source_identity_for_auth(auth)?;
             execute_relay_multiplex_streaming_object_read_request(
-                relay, source, url, headers, writer,
+                relay,
+                source,
+                connection_name,
+                url,
+                headers,
+                writer,
             )
             .await
             .with_context(|| format!("failed to relay streamed GET {}", url))
@@ -685,6 +754,7 @@ async fn execute_streaming_object_read_request_for_transport(
 async fn execute_streaming_object_write_request_for_transport(
     transport: &ClientTransport,
     auth: &ClientRequestAuth,
+    connection_name: Option<&str>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
@@ -701,6 +771,7 @@ async fn execute_streaming_object_write_request_for_transport(
                     server_base_url,
                     session_pool,
                     identity,
+                    connection_name,
                     method,
                     url,
                     headers,
@@ -710,13 +781,27 @@ async fn execute_streaming_object_write_request_for_transport(
                 .with_context(|| format!("failed to execute streamed {} {}", method, url));
             }
 
-            execute_buffered_request_for_transport(transport, auth, method, url, headers, body)
-                .await
+            execute_buffered_request_for_transport(
+                transport,
+                auth,
+                connection_name,
+                method,
+                url,
+                headers,
+                body,
+            )
+            .await
         }
         ClientTransport::Relay(relay) => {
             let source = relay_source_identity_for_auth(auth)?;
             execute_relay_multiplex_streaming_object_write_request(
-                relay, source, method, url, headers, body,
+                relay,
+                source,
+                connection_name,
+                method,
+                url,
+                headers,
+                body,
             )
             .await
             .with_context(|| format!("failed to relay streamed {} {}", method, url))
@@ -727,6 +812,7 @@ async fn execute_streaming_object_write_request_for_transport(
 async fn probe_endpoint_background_quality(
     endpoint: &ClientEndpoint,
     auth: &ClientRequestAuth,
+    connection_name: Option<&str>,
 ) -> Result<f64> {
     let base_url = Url::parse(endpoint.transport.request_base_url()).with_context(|| {
         format!(
@@ -743,11 +829,12 @@ async fn probe_endpoint_background_quality(
                 endpoint.descriptor.locator
             )
         })?;
-    let headers = request_auth_headers_for_auth(auth, &method, &url)?;
+    let headers = request_auth_headers_for_auth(auth, &method, &url, connection_name)?;
     let started_at = std::time::Instant::now();
     let response = execute_buffered_request_for_transport(
         &endpoint.transport,
         auth,
+        connection_name,
         &method,
         &url,
         &headers,
@@ -1118,6 +1205,7 @@ impl IronMeshClient {
                 0,
             )]),
             auth: ClientRequestAuth::None,
+            connection_name: None,
         }
     }
 
@@ -1139,6 +1227,7 @@ impl IronMeshClient {
                 0,
             )]),
             auth: ClientRequestAuth::None,
+            connection_name: None,
         }
     }
 
@@ -1173,11 +1262,17 @@ impl IronMeshClient {
         Ok(Self {
             transport_router: ClientEndpointRouter::new(endpoints),
             auth: combined_auth.unwrap_or(ClientRequestAuth::None),
+            connection_name: None,
         })
     }
 
     pub fn with_client_identity(mut self, identity: ClientIdentityMaterial) -> Self {
         self.auth = ClientRequestAuth::SignedIdentity(identity);
+        self
+    }
+
+    pub fn with_connection_name(mut self, connection_name: impl Into<String>) -> Self {
+        self.connection_name = normalize_connection_name(&connection_name.into());
         self
     }
 
@@ -1221,7 +1316,7 @@ impl IronMeshClient {
     }
 
     fn request_auth_headers(&self, method: &Method, url: &Url) -> Result<Vec<RelayHttpHeader>> {
-        request_auth_headers_for_auth(&self.auth, method, url)
+        request_auth_headers_for_auth(&self.auth, method, url, self.connection_name.as_deref())
     }
 
     fn maybe_spawn_background_quality_refresh(&self) {
@@ -1232,8 +1327,15 @@ impl IronMeshClient {
         for (index, endpoint) in self.transport_router.claim_background_probe_candidates() {
             let transport_router = self.transport_router.clone();
             let auth = self.auth.clone();
+            let connection_name = self.connection_name.clone();
             tokio::spawn(async move {
-                match probe_endpoint_background_quality(&endpoint, &auth).await {
+                match probe_endpoint_background_quality(
+                    &endpoint,
+                    &auth,
+                    connection_name.as_deref(),
+                )
+                .await
+                {
                     Ok(latency_ms) => {
                         transport_router.record_background_probe_success(index, latency_ms);
                     }
@@ -1278,6 +1380,7 @@ impl IronMeshClient {
             match execute_buffered_request_for_transport(
                 &endpoint.transport,
                 &self.auth,
+                self.connection_name.as_deref(),
                 &method,
                 &endpoint_url,
                 &auth_headers,
@@ -1782,6 +1885,7 @@ impl IronMeshClient {
                 match execute_streaming_object_write_request_for_transport(
                     &endpoint.transport,
                     &self.auth,
+                    self.connection_name.as_deref(),
                     &Method::PUT,
                     &endpoint_url,
                     &auth_headers,
@@ -1999,6 +2103,7 @@ impl IronMeshClient {
             match execute_streaming_object_read_request_for_transport(
                 &endpoint.transport,
                 &self.auth,
+                self.connection_name.as_deref(),
                 &endpoint_url,
                 &auth_headers,
                 writer,
@@ -3317,13 +3422,14 @@ async fn execute_direct_multiplex_streaming_object_read_request(
     server_base_url: &str,
     session_pool: &TransportSessionPool,
     identity: &ClientIdentityMaterial,
+    connection_name: Option<&str>,
     url: &Url,
     headers: &[RelayHttpHeader],
     writer: &mut dyn Write,
 ) -> Result<StreamedTransportResponseMeta> {
     for attempt in 0..2 {
         let session = session_pool
-            .ensure_direct_session(identity)
+            .ensure_direct_session(identity, connection_name)
             .await
             .context("failed ensuring direct multiplex session")?;
         let result =
@@ -3355,6 +3461,7 @@ async fn execute_direct_multiplex_streaming_object_read_request(
 async fn execute_relay_multiplex_streaming_object_read_request(
     relay: &ClientRelayTransport,
     source: PeerIdentity,
+    connection_name: Option<&str>,
     url: &Url,
     headers: &[RelayHttpHeader],
     writer: &mut dyn Write,
@@ -3362,7 +3469,7 @@ async fn execute_relay_multiplex_streaming_object_read_request(
     for attempt in 0..2 {
         let session = relay
             .session_pool
-            .ensure_relay_session(source.clone())
+            .ensure_relay_session(source.clone(), connection_name)
             .await
             .with_context(|| {
                 format!(
@@ -3400,6 +3507,7 @@ async fn execute_direct_multiplex_streaming_object_write_request(
     server_base_url: &str,
     session_pool: &TransportSessionPool,
     identity: &ClientIdentityMaterial,
+    connection_name: Option<&str>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
@@ -3407,7 +3515,7 @@ async fn execute_direct_multiplex_streaming_object_write_request(
 ) -> Result<BufferedTransportResponse> {
     for attempt in 0..2 {
         let session = session_pool
-            .ensure_direct_session(identity)
+            .ensure_direct_session(identity, connection_name)
             .await
             .context("failed ensuring direct multiplex session")?;
         let result = execute_multiplex_streaming_object_write_request(
@@ -3444,6 +3552,7 @@ async fn execute_direct_multiplex_streaming_object_write_request(
 async fn execute_relay_multiplex_streaming_object_write_request(
     relay: &ClientRelayTransport,
     source: PeerIdentity,
+    connection_name: Option<&str>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
@@ -3452,7 +3561,7 @@ async fn execute_relay_multiplex_streaming_object_write_request(
     for attempt in 0..2 {
         let session = relay
             .session_pool
-            .ensure_relay_session(source.clone())
+            .ensure_relay_session(source.clone(), connection_name)
             .await
             .with_context(|| {
                 format!(
@@ -3495,6 +3604,7 @@ async fn execute_direct_multiplex_buffered_request(
     server_base_url: &str,
     session_pool: &TransportSessionPool,
     identity: &ClientIdentityMaterial,
+    connection_name: Option<&str>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
@@ -3505,7 +3615,7 @@ async fn execute_direct_multiplex_buffered_request(
 
     for attempt in 0..2 {
         let session = session_pool
-            .ensure_direct_session(identity)
+            .ensure_direct_session(identity, connection_name)
             .await
             .context("failed ensuring direct multiplex session")?;
         let request = BufferedTransportRequest::new(
@@ -3557,6 +3667,7 @@ async fn execute_direct_multiplex_buffered_request(
 async fn execute_relay_multiplex_buffered_request(
     relay: &ClientRelayTransport,
     source: PeerIdentity,
+    connection_name: Option<&str>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
@@ -3568,7 +3679,7 @@ async fn execute_relay_multiplex_buffered_request(
     for attempt in 0..2 {
         let session = relay
             .session_pool
-            .ensure_relay_session(source.clone())
+            .ensure_relay_session(source.clone(), connection_name)
             .await
             .with_context(|| {
                 format!(
@@ -4113,6 +4224,15 @@ mod tests {
             normalize_client_api_path("/media/thumbnail?key=gallery%2Fcat.png").as_ref(),
             "/api/v1/media/thumbnail?key=gallery%2Fcat.png"
         );
+    }
+
+    #[test]
+    fn normalize_connection_name_preserves_readable_role_segments() {
+        assert_eq!(
+            normalize_connection_name(" Windows Cfapi / Upload Worker #1 ").as_deref(),
+            Some("windows-cfapi-/-upload-worker-1")
+        );
+        assert_eq!(normalize_connection_name("   "), None);
     }
 
     #[test]

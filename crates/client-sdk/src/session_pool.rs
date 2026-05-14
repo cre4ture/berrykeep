@@ -94,6 +94,7 @@ impl TransportSessionPool {
     pub(crate) async fn ensure_direct_session(
         &self,
         identity: &ClientIdentityMaterial,
+        connection_name: Option<&str>,
     ) -> Result<Arc<MultiplexedSession>> {
         let SessionPoolTarget::Direct {
             server_base_url,
@@ -112,7 +113,7 @@ impl TransportSessionPool {
         let ws_url = websocket_url(server_base_url, "transport/ws").with_context(|| {
             format!("failed building direct transport websocket URL from {server_base_url}")
         })?;
-        let ws_headers = websocket_auth_headers(identity)?;
+        let ws_headers = websocket_auth_headers(identity, connection_name)?;
         let websocket = connect_websocket(&ws_url, server_ca_pem.as_deref(), None, &ws_headers)
             .await
             .with_context(|| format!("failed opening direct transport websocket {}", ws_url))?;
@@ -127,6 +128,7 @@ impl TransportSessionPool {
                 cluster_id: identity.cluster_id,
                 role: TransportSessionRole::Client,
                 peer: PeerIdentity::Device(identity.device_id),
+                connection_name: connection_name.map(ToString::to_string),
                 target: None,
             },
         )
@@ -145,6 +147,7 @@ impl TransportSessionPool {
     pub(crate) async fn ensure_relay_session(
         &self,
         source: PeerIdentity,
+        connection_name: Option<&str>,
     ) -> Result<Arc<MultiplexedSession>> {
         let SessionPoolTarget::Relay {
             rendezvous,
@@ -192,6 +195,7 @@ impl TransportSessionPool {
                 cluster_id: rendezvous.config().cluster_id,
                 role: relay_session_role_for_source(&source),
                 peer: source,
+                connection_name: connection_name.map(ToString::to_string),
                 target: Some(PeerIdentity::Node(*target_node_id)),
             },
         )
@@ -220,10 +224,13 @@ fn relay_session_role_for_source(source: &PeerIdentity) -> TransportSessionRole 
     }
 }
 
-fn websocket_auth_headers(identity: &ClientIdentityMaterial) -> Result<Vec<(String, String)>> {
+fn websocket_auth_headers(
+    identity: &ClientIdentityMaterial,
+    connection_name: Option<&str>,
+) -> Result<Vec<(String, String)>> {
     let signed_headers =
         build_signed_request_headers(identity, "GET", "/transport/ws", unix_ts(), None)?;
-    Ok(vec![
+    let mut headers = vec![
         (
             transport_sdk::HEADER_CLUSTER_ID.to_string(),
             signed_headers.cluster_id.to_string(),
@@ -248,7 +255,14 @@ fn websocket_auth_headers(identity: &ClientIdentityMaterial) -> Result<Vec<(Stri
             transport_sdk::HEADER_AUTH_SIGNATURE.to_string(),
             signed_headers.signature_base64,
         ),
-    ])
+    ];
+    if let Some(connection_name) = connection_name {
+        headers.push((
+            transport_sdk::HEADER_CONNECTION_NAME.to_string(),
+            connection_name.to_string(),
+        ));
+    }
+    Ok(headers)
 }
 
 fn unix_ts() -> u64 {

@@ -520,6 +520,7 @@ mod tests {
                 cluster_id: Uuid::now_v7(),
                 role: TransportSessionRole::Client,
                 peer: PeerIdentity::Device(Uuid::now_v7()),
+                connection_name: Some("transport-sdk/test-client".to_string()),
                 target: Some(PeerIdentity::Node(Uuid::now_v7())),
             },
         )

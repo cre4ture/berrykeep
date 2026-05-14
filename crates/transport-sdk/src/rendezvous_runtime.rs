@@ -782,6 +782,7 @@ mod tests {
                     cluster_id,
                     role: TransportSessionRole::Node,
                     peer: relay_session.source.clone(),
+                    connection_name: Some("transport-sdk/test-relay-source".to_string()),
                     target: Some(relay_session.target.clone()),
                 },
             )

@@ -39,6 +39,8 @@ pub enum TransportSessionControlMessage {
         role: TransportSessionRole,
         peer: PeerIdentity,
         #[serde(default)]
+        connection_name: Option<String>,
+        #[serde(default)]
         target: Option<PeerIdentity>,
     },
     Ready {
@@ -105,6 +107,7 @@ impl TransportSessionControlMessage {
             Self::Hello {
                 protocol_version,
                 cluster_id,
+                connection_name,
                 ..
             } => {
                 if *protocol_version != TRANSPORT_PROTOCOL_VERSION {
@@ -112,6 +115,13 @@ impl TransportSessionControlMessage {
                 }
                 if cluster_id.is_nil() {
                     bail!("transport hello must include a non-nil cluster_id");
+                }
+                if connection_name
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(str::is_empty)
+                {
+                    bail!("transport hello connection_name must not be blank when present");
                 }
             }
             Self::Ready {
@@ -202,6 +212,7 @@ mod tests {
             cluster_id: Uuid::now_v7(),
             role: TransportSessionRole::Client,
             peer: PeerIdentity::Device(Uuid::now_v7()),
+            connection_name: Some("windows-cfapi/uploader/photos".to_string()),
             target: Some(PeerIdentity::Node(Uuid::now_v7())),
         };
 

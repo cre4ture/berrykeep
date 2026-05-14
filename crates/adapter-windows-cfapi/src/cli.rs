@@ -46,6 +46,10 @@ const LONG_VERSION: &str = git_version::git_version!(
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
 
+fn windows_connection_name(role: &str, display_name: &str) -> String {
+    format!("windows-cfapi/{role}/{display_name}")
+}
+
 fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
     let mut ensure_directories = 0usize;
     let mut ensure_placeholders = 0usize;
@@ -367,7 +371,10 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             remote_status_thread = Some(spawn_remote_status_thread(
                 running.clone(),
                 publisher.clone(),
-                client.clone(),
+                client.clone().with_connection_name(windows_connection_name(
+                    "status",
+                    &registration.display_name,
+                )),
                 tray_status_poll_interval_ms,
             )?);
         }
@@ -412,7 +419,10 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
 
         let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
         let fetcher = RemoteSnapshotFetcher::new(
-            client.clone(),
+            client.clone().with_connection_name(windows_connection_name(
+                "snapshot",
+                &registration.display_name,
+            )),
             RemoteSnapshotScope::new(prefix.clone(), depth, None),
         );
         let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
@@ -449,11 +459,17 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let download_stage_root =
             crate::live::windows_download_stage_root_for_sync_root(&registration.root_path)?;
         let hydrator = Box::new(ServerNodeHydrator::with_client(
-            client.clone(),
+            client.clone().with_connection_name(windows_connection_name(
+                "hydrator",
+                &registration.display_name,
+            )),
             download_stage_root.clone(),
         ));
         let uploader = Arc::new(ServerNodeHydrator::with_client(
-            client.clone(),
+            client.clone().with_connection_name(windows_connection_name(
+                "uploader",
+                &registration.display_name,
+            )),
             download_stage_root,
         ));
         let connection_guard = connect_sync_root(
