@@ -218,11 +218,6 @@ jobs:
         working-directory: apps/android-app
         run: ./gradlew --no-daemon :app:assembleRelease
 
-      - name: Build Android unsigned release APK for verification
-        if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 == '' }}
-        working-directory: apps/android-app
-        run: ./gradlew --no-daemon :app:assembleRelease
-
       - name: Upload Android release APK for performance testing
         if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
         uses: actions/upload-artifact@v4
