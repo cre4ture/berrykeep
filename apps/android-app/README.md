@@ -33,6 +33,17 @@ Prerequisites for native bridge builds:
 - `cargo-ndk` installed (`cargo install cargo-ndk`)
 - Android NDK available in the Android SDK setup
 
+## Internal release signing
+
+`assembleRelease` uses a dedicated internal release key when these environment variables are set:
+
+- `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE`
+- `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD`
+- `IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS`
+- `IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD`
+
+In GitHub Actions, store the keystore itself as base64 in `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64`, decode it to a file, then export `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE` for Gradle before running `:app:assembleRelease`.
+
 ## Local server notes
 
 For Android emulator, use:
