@@ -21,9 +21,10 @@ import {
 } from "@mantine/core";
 import { useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
-import { formatUnixTs } from "../lib/format";
+import { formatRelativeUnixTs, formatUnixTs } from "../lib/format";
 
 const CLIENT_CONNECTION_POLL_INTERVAL_MS = 3_000;
+const RELATIVE_TIME_REFRESH_INTERVAL_MS = 1_000;
 const LIMIT_OPTIONS = ["25", "50", "100", "200"].map((value) => ({
   value,
   label: `${value} active connections`
@@ -45,6 +46,7 @@ export function ClientConnectionsPage() {
   const [limit, setLimit] = useState("100");
   const [pageCursor, setPageCursor] = useState<ClientConnectionCursor | null>(null);
   const [cursorHistory, setCursorHistory] = useState<Array<ClientConnectionCursor | null>>([]);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const resolvedLimit = clampLimit(limit);
   const pageIndex = cursorHistory.length;
 
@@ -52,6 +54,20 @@ export function ClientConnectionsPage() {
     setPageCursor(null);
     setCursorHistory([]);
   }, [normalizedAdminTokenOverride, resolvedLimit]);
+
+  useEffect(() => {
+    if (!canInspectConnections) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, RELATIVE_TIME_REFRESH_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [canInspectConnections]);
 
   const connectionsQuery = useQuery({
     queryKey: [
@@ -187,6 +203,7 @@ export function ClientConnectionsPage() {
             <Table.Thead>
               <Table.Tr>
                 <Table.Th>Connected</Table.Th>
+                <Table.Th>Last Activity</Table.Th>
                 <Table.Th>Transport</Table.Th>
                 <Table.Th>Device</Table.Th>
                 <Table.Th>Connection Name</Table.Th>
@@ -198,7 +215,10 @@ export function ClientConnectionsPage() {
               {entries.map((entry) => (
                 <Table.Tr key={entry.connection_id}>
                   <Table.Td>
-                    <Text size="sm">{formatUnixTs(entry.connected_at_unix)}</Text>
+                    <TimestampCell unixTs={entry.connected_at_unix} nowMs={nowMs} />
+                  </Table.Td>
+                  <Table.Td>
+                    <TimestampCell unixTs={entry.last_activity_at_unix} nowMs={nowMs} />
                   </Table.Td>
                   <Table.Td>
                     <Badge color={transportBadgeColor(entry.transport)} variant="light">
@@ -242,6 +262,28 @@ function clampLimit(value: string): number {
     return 100;
   }
   return Math.max(1, Math.min(1000, parsed));
+}
+
+function TimestampCell({
+  unixTs,
+  nowMs
+}: {
+  unixTs: number | null | undefined;
+  nowMs: number;
+}) {
+  const absolute = formatUnixTs(unixTs);
+  if (absolute === "unknown") {
+    return <Text size="sm">{absolute}</Text>;
+  }
+
+  return (
+    <Stack gap={2}>
+      <Text size="sm">{absolute}</Text>
+      <Text size="xs" c="dimmed">
+        {formatRelativeUnixTs(unixTs, nowMs)}
+      </Text>
+    </Stack>
+  );
 }
 
 function transportLabel(transport: ClientConnectionTransport): string {

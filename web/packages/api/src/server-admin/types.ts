@@ -92,6 +92,7 @@ export type ClientConnectionEntry = {
   connection_name: string | null;
   transport: ClientConnectionTransport;
   connected_at_unix: number;
+  last_activity_at_unix: number;
   method: string | null;
   path: string | null;
   session_id: string | null;

@@ -280,6 +280,7 @@ struct ClientConnectionView {
     connection_name: Option<String>,
     transport: ClientConnectionTransportKind,
     connected_at_unix: u64,
+    last_activity_at_unix: u64,
     method: Option<String>,
     path: Option<String>,
     session_id: Option<String>,
@@ -294,6 +295,12 @@ struct LiveClientConnectionRegistry {
 impl LiveClientConnectionRegistry {
     fn register(&mut self, entry: ClientConnectionView) {
         self.entries.insert(entry.connection_id.clone(), entry);
+    }
+
+    fn touch(&mut self, connection_id: &str, activity_at_unix: u64) {
+        if let Some(entry) = self.entries.get_mut(connection_id) {
+            entry.last_activity_at_unix = entry.last_activity_at_unix.max(activity_at_unix);
+        }
     }
 
     fn unregister(&mut self, connection_id: &str) {
@@ -376,6 +383,14 @@ struct AuthenticatedClientIdentity {
 struct TrackedClientConnection {
     registry: Arc<StdMutex<LiveClientConnectionRegistry>>,
     connection_id: String,
+}
+
+impl TrackedClientConnection {
+    fn touch(&self) {
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.touch(&self.connection_id, unix_ts());
+        }
+    }
 }
 
 impl Drop for TrackedClientConnection {
@@ -931,6 +946,8 @@ fn track_client_http_request(
         return None;
     }
 
+    let connected_at_unix = unix_ts();
+
     Some(track_client_connection(
         state,
         ClientConnectionView {
@@ -940,7 +957,8 @@ fn track_client_http_request(
             credential_fingerprint: identity.credential_fingerprint.clone(),
             connection_name: request_connection_name(request.headers()),
             transport: ClientConnectionTransportKind::HttpRequest,
-            connected_at_unix: unix_ts(),
+            connected_at_unix,
+            last_activity_at_unix: connected_at_unix,
             method: Some(request.method().as_str().to_string()),
             path: Some(request_auth_path_and_query(request)),
             session_id: None,
@@ -955,6 +973,8 @@ fn track_direct_transport_connection(
     connection_name: Option<String>,
     session_id: &str,
 ) -> TrackedClientConnection {
+    let connected_at_unix = unix_ts();
+
     track_client_connection(
         state,
         ClientConnectionView {
@@ -964,7 +984,8 @@ fn track_direct_transport_connection(
             credential_fingerprint: identity.credential_fingerprint.clone(),
             connection_name,
             transport: ClientConnectionTransportKind::DirectTransport,
-            connected_at_unix: unix_ts(),
+            connected_at_unix,
+            last_activity_at_unix: connected_at_unix,
             method: None,
             path: None,
             session_id: Some(session_id.to_string()),
@@ -980,6 +1001,8 @@ fn track_relay_transport_connection(
     session_id: &str,
     endpoint_url: &str,
 ) -> TrackedClientConnection {
+    let connected_at_unix = unix_ts();
+
     track_client_connection(
         state,
         ClientConnectionView {
@@ -989,7 +1012,8 @@ fn track_relay_transport_connection(
             credential_fingerprint: identity.credential_fingerprint.clone(),
             connection_name,
             transport: ClientConnectionTransportKind::RelayTransport,
-            connected_at_unix: unix_ts(),
+            connected_at_unix,
+            last_activity_at_unix: connected_at_unix,
             method: None,
             path: None,
             session_id: Some(session_id.to_string()),
@@ -6407,7 +6431,7 @@ async fn serve_direct_transport_session(
         "accepted direct transport session"
     );
 
-    let _tracked_connection =
+    let tracked_connection =
         track_direct_transport_connection(&state, &client_identity, connection_name, &session_id);
 
     loop {
@@ -6418,6 +6442,8 @@ async fn serve_direct_transport_session(
         let Some(stream) = next else {
             return Ok(());
         };
+
+        tracked_connection.touch();
 
         let state = state.clone();
         tokio::spawn(async move {
@@ -6921,7 +6947,7 @@ async fn serve_relay_multiplex_streams(
     relay_session: RelayTunnelSession,
     mut session: MultiplexedSession,
     execution_scope: transport_service::TransportExecutionScope,
-    _tracked_connection: Option<TrackedClientConnection>,
+    tracked_connection: Option<TrackedClientConnection>,
 ) -> Result<()> {
     loop {
         let next = session.accept_stream().await.with_context(|| {
@@ -6933,6 +6959,10 @@ async fn serve_relay_multiplex_streams(
         let Some(stream) = next else {
             return Ok(());
         };
+
+        if let Some(tracked_connection) = tracked_connection.as_ref() {
+            tracked_connection.touch();
+        }
 
         let state = state.clone();
         let session_id = relay_session.session_id.clone();
@@ -18446,6 +18476,7 @@ mod live_client_connection_registry_tests {
             connection_name: Some("client/test".to_string()),
             transport,
             connected_at_unix,
+            last_activity_at_unix: connected_at_unix,
             method: Some("GET".to_string()),
             path: Some("/api/v1/store/index".to_string()),
             session_id: None,
@@ -18503,6 +18534,25 @@ mod live_client_connection_registry_tests {
             vec!["conn-a"]
         );
         assert_eq!(second_page.next_cursor, None);
+    }
+
+    #[test]
+    fn client_connection_registry_tracks_last_activity_updates() {
+        let mut registry = LiveClientConnectionRegistry::default();
+        registry.register(view(
+            "conn-a",
+            ClientConnectionTransportKind::DirectTransport,
+            20,
+        ));
+
+        registry.touch("conn-a", 10);
+        registry.touch("missing", 999);
+        registry.touch("conn-a", 45);
+
+        let listed = registry.list(10, None);
+        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.entries[0].connected_at_unix, 20);
+        assert_eq!(listed.entries[0].last_activity_at_unix, 45);
     }
 }
 
