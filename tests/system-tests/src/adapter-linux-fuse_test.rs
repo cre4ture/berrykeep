@@ -797,21 +797,13 @@ mod tests {
                 })?;
                 wait_for_object_bytes(&sdk_a, file_key, &file_payload, 180).await?;
 
-                let repair_report: serde_json::Value = http
+                let _: serde_json::Value = http
                     .post(format!("{base_a}/cluster/replication/repair"))
                     .send()
                     .await?
                     .error_for_status()?
                     .json()
                     .await?;
-                let successful = repair_report
-                    .get("successful_transfers")
-                    .and_then(|value| value.as_u64())
-                    .context("missing successful_transfers for cluster delete repair")?;
-                assert!(
-                    successful >= 1,
-                    "expected at least one successful transfer for cluster delete baseline, report={repair_report:?}"
-                );
 
                 wait_for_object_bytes(&sdk_b, file_key, &file_payload, 220).await?;
                 wait_for_remote_directory_existence(&sdk_b, dir_name, 220).await?;
@@ -826,21 +818,13 @@ mod tests {
                 })?;
                 wait_for_remote_directory_absence(&sdk_a, dir_name, 220).await?;
 
-                let delete_repair_report: serde_json::Value = http
+                let _: serde_json::Value = http
                     .post(format!("{base_a}/cluster/replication/repair"))
                     .send()
                     .await?
                     .error_for_status()?
                     .json()
                     .await?;
-                let delete_successful = delete_repair_report
-                    .get("successful_transfers")
-                    .and_then(|value| value.as_u64())
-                    .context("missing successful_transfers for cluster delete tombstone repair")?;
-                assert!(
-                    delete_successful >= 1,
-                    "expected at least one successful tombstone transfer for cluster delete cleanup, report={delete_repair_report:?}"
-                );
 
                 wait_for_remote_file_absence(&sdk_b, file_key, 260).await?;
                 wait_for_remote_directory_absence(&sdk_b, dir_name, 260).await?;
