@@ -36,6 +36,10 @@ cargo +stable test --workspace
 cargo +stable llvm-cov --workspace --all-features --summary-only \
 	--ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/(background-launcher|config-app|folder-agent|os-integration)/|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/|crates/client-sdk/src/content_addressed_client_cache.rs|crates/desktop-client-config/src/lib.rs|crates/desktop-status/|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)|crates/sync-agent-core/src/folder_agent_(conflicts|runtime|startup|state|ui)\.rs|crates/web-ui-backend/' \
 	--fail-under-lines 70
+cd web && pnpm test:e2e:client-ui
+cd web && pnpm test:e2e:server-admin
+cd web && pnpm test:e2e:server-admin-rust
+cd web && pnpm test:e2e:server-admin-setup-rust
 cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
 ```
 
@@ -49,6 +53,7 @@ Useful per-lane shortcuts:
 
 - `just ci-stable`
 - `just coverage`
+- `just ci-web-smoke`
 - `just test-system-nightly`
 
 ## Nightly lane fails, stable lanes pass

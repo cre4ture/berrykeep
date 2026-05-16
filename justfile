@@ -23,6 +23,24 @@ coverage:
         --ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/(ironmesh-folder-agent|os-integration|ironmesh-config-app|ironmesh-background-launcher)/src/main.rs|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/|crates/desktop-client-config/src/lib.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)|crates/sync-agent-core/src/folder_agent_ui.rs|crates/web-ui-backend/src/lib.rs' \
         --fail-under-lines 70
 
+web-test-e2e-client:
+    cd web && pnpm test:e2e:client-ui
+
+web-test-e2e-server-admin:
+    cd web && pnpm test:e2e:server-admin
+
+web-test-e2e-server-admin-rust:
+    cd web && pnpm test:e2e:server-admin-rust
+
+web-test-e2e-server-admin-setup-rust:
+    cd web && pnpm test:e2e:server-admin-setup-rust
+
+ci-web-smoke:
+    just web-test-e2e-client
+    just web-test-e2e-server-admin
+    just web-test-e2e-server-admin-rust
+    just web-test-e2e-server-admin-setup-rust
+
 audit:
     cargo audit
 
@@ -44,6 +62,7 @@ ci-stable:
 ci-required:
     just ci-stable
     just coverage
+    just ci-web-smoke
     just test-system-nightly
 
 web-install:
