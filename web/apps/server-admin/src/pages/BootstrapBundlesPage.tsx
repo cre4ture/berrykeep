@@ -416,7 +416,7 @@ export function BootstrapBundlesPage() {
               </Text>
               {bootstrapClaim ? (
                 <Stack gap="xs">
-                  <Text fw={600}>Scan the compact claim with the ironmesh Android app</Text>
+                  <Text fw={600}>Scan the compact claim with the ironmesh Android app (use Bright theme for best scanning experience)</Text>
                   {bootstrapBundleQrDataUrl ? (
                     <div
                       style={{
