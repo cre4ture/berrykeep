@@ -1020,6 +1020,11 @@ mod tests {
             prefix: String::new(),
             depth: 1,
             entry_count: entries.len(),
+            total_entry_count: entries.len(),
+            offset: 0,
+            limit: None,
+            has_more: false,
+            media_summary: Default::default(),
             entries,
         };
         (StatusCode::OK, Json(response)).into_response()

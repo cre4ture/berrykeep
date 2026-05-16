@@ -2062,14 +2062,12 @@ impl IronMeshClient {
         let mut result = serde_json::from_slice::<StoreIndexResponse>(&response.body)
             .context("failed to parse /store/index response");
 
-        if let Ok(ref mut response) = result {
-            if options.synthesize_missing_folder_markers
-                && matches!(options.view, Some(StoreIndexView::Tree))
-            {
-                ensure_missing_folder_markers(&mut response.entries);
-                response.entry_count = response.entries.len();
-                response.total_entry_count = response.total_entry_count.max(response.entry_count);
-            }
+        if let Ok(ref mut response) = result
+            && options.synthesize_missing_folder_markers
+        {
+            ensure_missing_folder_markers(&mut response.entries);
+            response.entry_count = response.entries.len();
+            response.total_entry_count = response.total_entry_count.max(response.entry_count);
         }
 
         result

@@ -636,6 +636,11 @@ mod tests {
                 prefix: String::new(),
                 depth: 1,
                 entry_count: 1,
+                total_entry_count: 1,
+                offset: 0,
+                limit: None,
+                has_more: false,
+                media_summary: client_sdk::StoreIndexMediaSummary::default(),
                 entries: vec![client_sdk::StoreIndexEntry {
                     path: "readme.txt".to_string(),
                     entry_type: "key".to_string(),
