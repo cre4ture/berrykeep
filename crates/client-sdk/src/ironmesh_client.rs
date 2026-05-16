@@ -1116,6 +1116,16 @@ pub struct StoreIndexResponse {
     #[serde(default)]
     pub entry_count: usize,
     #[serde(default)]
+    pub total_entry_count: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub media_summary: StoreIndexMediaSummary,
+    #[serde(default)]
     pub entries: Vec<StoreIndexEntry>,
 }
 
@@ -1171,6 +1181,77 @@ impl StoreIndexView {
         match self {
             Self::Raw => "raw",
             Self::Tree => "tree",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreIndexSortOrder {
+    PathAsc,
+    CapturedDesc,
+}
+
+impl StoreIndexSortOrder {
+    fn as_query_value(self) -> &'static str {
+        match self {
+            Self::PathAsc => "path_asc",
+            Self::CapturedDesc => "captured_desc",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreIndexMediaFilter {
+    All,
+    Image,
+    Video,
+}
+
+impl StoreIndexMediaFilter {
+    fn as_query_value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Image => "image",
+            Self::Video => "video",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StoreIndexMediaSummary {
+    #[serde(default)]
+    pub ready_count: usize,
+    #[serde(default)]
+    pub pending_count: usize,
+    #[serde(default)]
+    pub incomplete_count: usize,
+    #[serde(default)]
+    pub image_count: usize,
+    #[serde(default)]
+    pub video_count: usize,
+    #[serde(default)]
+    pub geotagged_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoreIndexRequestOptions {
+    pub view: Option<StoreIndexView>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+    pub sort: Option<StoreIndexSortOrder>,
+    pub media_filter: Option<StoreIndexMediaFilter>,
+    pub synthesize_missing_folder_markers: bool,
+}
+
+impl Default for StoreIndexRequestOptions {
+    fn default() -> Self {
+        Self {
+            view: None,
+            offset: None,
+            limit: None,
+            sort: None,
+            media_filter: None,
+            synthesize_missing_folder_markers: true,
         }
     }
 }
@@ -1911,7 +1992,7 @@ impl IronMeshClient {
         depth: usize,
         snapshot: Option<&str>,
     ) -> Result<StoreIndexResponse> {
-        self.store_index_with_view(prefix, depth, snapshot, None)
+        self.store_index_with_options(prefix, depth, snapshot, StoreIndexRequestOptions::default())
             .await
     }
 
@@ -1922,14 +2003,49 @@ impl IronMeshClient {
         snapshot: Option<&str>,
         view: Option<StoreIndexView>,
     ) -> Result<StoreIndexResponse> {
+        self.store_index_with_options(
+            prefix,
+            depth,
+            snapshot,
+            StoreIndexRequestOptions {
+                view,
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn store_index_with_options(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: StoreIndexRequestOptions,
+    ) -> Result<StoreIndexResponse> {
         let mut url = self.store_index_url()?;
         url.query_pairs_mut()
             .append_pair("depth", &depth.max(1).to_string());
         append_optional_query(&mut url, "prefix", prefix);
         append_optional_query(&mut url, "snapshot", snapshot);
-        if let Some(view) = view {
+        if let Some(view) = options.view {
             url.query_pairs_mut()
                 .append_pair("view", view.as_query_value());
+        }
+        if let Some(offset) = options.offset {
+            url.query_pairs_mut()
+                .append_pair("offset", &offset.to_string());
+        }
+        if let Some(limit) = options.limit {
+            url.query_pairs_mut()
+                .append_pair("limit", &limit.max(1).to_string());
+        }
+        if let Some(sort) = options.sort {
+            url.query_pairs_mut()
+                .append_pair("sort", sort.as_query_value());
+        }
+        if let Some(media_filter) = options.media_filter {
+            url.query_pairs_mut()
+                .append_pair("media_filter", media_filter.as_query_value());
         }
 
         let response = self
@@ -1947,8 +2063,13 @@ impl IronMeshClient {
             .context("failed to parse /store/index response");
 
         if let Ok(ref mut response) = result {
-            ensure_missing_folder_markers(&mut response.entries);
-            response.entry_count = response.entries.len();
+            if options.synthesize_missing_folder_markers
+                && matches!(options.view, Some(StoreIndexView::Tree))
+            {
+                ensure_missing_folder_markers(&mut response.entries);
+                response.entry_count = response.entries.len();
+                response.total_entry_count = response.total_entry_count.max(response.entry_count);
+            }
         }
 
         result
@@ -1960,7 +2081,12 @@ impl IronMeshClient {
         depth: usize,
         snapshot: Option<&str>,
     ) -> Result<StoreIndexResponse> {
-        self.store_index_with_view_blocking(prefix, depth, snapshot, None)
+        self.store_index_with_options_blocking(
+            prefix,
+            depth,
+            snapshot,
+            StoreIndexRequestOptions::default(),
+        )
     }
 
     pub fn store_index_with_view_blocking(
@@ -1970,8 +2096,26 @@ impl IronMeshClient {
         snapshot: Option<&str>,
         view: Option<StoreIndexView>,
     ) -> Result<StoreIndexResponse> {
+        self.store_index_with_options_blocking(
+            prefix,
+            depth,
+            snapshot,
+            StoreIndexRequestOptions {
+                view,
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+    }
+
+    pub fn store_index_with_options_blocking(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: StoreIndexRequestOptions,
+    ) -> Result<StoreIndexResponse> {
         let runtime = blocking_runtime()?;
-        runtime.block_on(self.store_index_with_view(prefix, depth, snapshot, view))
+        runtime.block_on(self.store_index_with_options(prefix, depth, snapshot, options))
     }
 
     pub async fn wait_for_store_index_change(
@@ -5582,6 +5726,11 @@ mod tests {
                         prefix: String::new(),
                         depth: 1,
                         entry_count: 1,
+                        total_entry_count: 1,
+                        offset: 0,
+                        limit: None,
+                        has_more: false,
+                        media_summary: StoreIndexMediaSummary::default(),
                         entries: vec![StoreIndexEntry {
                             path: "docs/readme.txt".to_string(),
                             entry_type: "key".to_string(),
@@ -5602,6 +5751,11 @@ mod tests {
                 prefix: String::new(),
                 depth: 1,
                 entry_count: 1,
+                total_entry_count: 1,
+                offset: 0,
+                limit: None,
+                has_more: false,
+                media_summary: StoreIndexMediaSummary::default(),
                 entries: vec![StoreIndexEntry {
                     path: "docs/readme.txt".to_string(),
                     entry_type: "key".to_string(),
@@ -6146,6 +6300,11 @@ mod tests {
                         prefix: String::new(),
                         depth: 1,
                         entry_count: 1,
+                        total_entry_count: 1,
+                        offset: 0,
+                        limit: None,
+                        has_more: false,
+                        media_summary: StoreIndexMediaSummary::default(),
                         entries: vec![StoreIndexEntry {
                             path: "docs/readme.txt".to_string(),
                             entry_type: "key".to_string(),
@@ -6166,6 +6325,11 @@ mod tests {
                 prefix: String::new(),
                 depth: 1,
                 entry_count: 1,
+                total_entry_count: 1,
+                offset: 0,
+                limit: None,
+                has_more: false,
+                media_summary: StoreIndexMediaSummary::default(),
                 entries: vec![StoreIndexEntry {
                     path: "docs/readme.txt".to_string(),
                     entry_type: "key".to_string(),

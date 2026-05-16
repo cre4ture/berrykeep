@@ -26,6 +26,15 @@ export type StoreIndexMedia = {
   error?: string | null;
 };
 
+export type StoreIndexMediaSummary = {
+  ready_count: number;
+  pending_count: number;
+  incomplete_count: number;
+  image_count: number;
+  video_count: number;
+  geotagged_count: number;
+};
+
 export type StoreIndexEntry = {
   path: string;
   entry_type: string;
@@ -41,7 +50,24 @@ export type StoreIndexResponse = {
   prefix: string;
   depth: number;
   entry_count: number;
+  total_entry_count: number;
+  offset: number;
+  limit?: number | null;
+  has_more: boolean;
+  media_summary: StoreIndexMediaSummary;
   entries: StoreIndexEntry[];
 };
 
 export type StoreListView = "raw" | "tree";
+
+export type StoreListSortOrder = "captured_desc" | "path_asc";
+
+export type StoreListMediaFilter = "all" | "image" | "video";
+
+export type StoreListRequestOptions = {
+  view?: StoreListView;
+  offset?: number;
+  limit?: number;
+  sort?: StoreListSortOrder;
+  mediaFilter?: StoreListMediaFilter;
+};

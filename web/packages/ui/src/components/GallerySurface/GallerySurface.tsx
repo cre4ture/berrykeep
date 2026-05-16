@@ -61,6 +61,19 @@ const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
 const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
 const GALLERY_MAP_FULLSCREEN_HISTORY_KEY = "ironmesh.gallery.map_fullscreen";
 const MAX_WORLD_MAP_THUMBNAIL_MARKERS = 120;
+const GALLERY_VIRTUAL_PAGE_ROW_COUNT = 8;
+const GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS = 1;
+const GALLERY_VIRTUAL_PAGE_KEEP_RADIUS = 2;
+const GALLERY_VIRTUAL_PAGE_ROOT_MARGIN = "900px 0px";
+
+const EMPTY_GALLERY_MEDIA_SUMMARY: GalleryMediaSummary = {
+  ready_count: 0,
+  pending_count: 0,
+  incomplete_count: 0,
+  image_count: 0,
+  video_count: 0,
+  geotagged_count: 0
+};
 
 export type GallerySnapshot = {
   id: string;
@@ -92,8 +105,22 @@ export type GalleryPayload = {
   prefix: string;
   depth: number;
   entry_count: number;
+  total_entry_count?: number;
+  offset?: number;
+  limit?: number | null;
+  has_more?: boolean;
+  media_summary?: GalleryMediaSummary | null;
   entries: GalleryEntry[];
   [key: string]: unknown;
+};
+
+export type GalleryMediaSummary = {
+  ready_count: number;
+  pending_count: number;
+  incomplete_count: number;
+  image_count: number;
+  video_count: number;
+  geotagged_count: number;
 };
 
 export type GalleryPreviewRequest = {
@@ -120,13 +147,54 @@ type GalleryNavigationItem = {
   targetPrefix: string;
 };
 
+export type GalleryLoadEntriesOptions = {
+  view?: "raw" | "tree";
+  offset?: number;
+  limit?: number;
+  sort?: GallerySortOrder;
+  mediaFilter?: GalleryMediaFilter;
+};
+
+type GalleryLoadedScope = {
+  prefix: string;
+  depth: number;
+  snapshotId: string | null;
+};
+
+type GallerySelection = {
+  source: "grid" | "map";
+  index: number;
+  path: string;
+};
+
+type GalleryGridPageState = {
+  status: "loading" | "ready" | "error";
+  entries: GalleryEntry[];
+  error?: string | null;
+};
+
+type GalleryGridCollection = {
+  prefix: string;
+  depth: number;
+  snapshotId: string | null;
+  totalEntryCount: number;
+  mediaSummary: GalleryMediaSummary;
+  pageSize: number;
+  pageCount: number;
+};
+
 type GallerySurfaceProps = {
   intro?: string;
   previewHint: string;
   basemaps?: GalleryBasemapConfig[] | null;
   allowedMediaKinds?: GalleryMediaKind[];
   loadSnapshots: () => Promise<GallerySnapshot[]>;
-  loadEntries: (prefix: string, depth: number, snapshotId: string | null) => Promise<GalleryPayload>;
+  loadEntries: (
+    prefix: string,
+    depth: number,
+    snapshotId: string | null,
+    options?: GalleryLoadEntriesOptions
+  ) => Promise<GalleryPayload>;
   getMediaRequests: (entry: GalleryEntry, snapshotId: string | null) => GalleryMediaRequests;
 };
 
@@ -149,8 +217,14 @@ export function GallerySurface({
   const [activeMapProjection, setActiveMapProjection] = useState(loadStoredMapProjection);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<GallerySnapshot[]>([]);
-  const [entriesPayload, setEntriesPayload] = useState<GalleryPayload | null>(null);
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [loadedScope, setLoadedScope] = useState<GalleryLoadedScope | null>(null);
+  const [navigationPayload, setNavigationPayload] = useState<GalleryPayload | null>(null);
+  const [mapPayload, setMapPayload] = useState<GalleryPayload | null>(null);
+  const [gridCollection, setGridCollection] = useState<GalleryGridCollection | null>(null);
+  const [gridPages, setGridPages] = useState<Record<number, GalleryGridPageState>>({});
+  const [gridPageHeights, setGridPageHeights] = useState<Record<number, number>>({});
+  const [gridActivePageIndex, setGridActivePageIndex] = useState(0);
+  const [selection, setSelection] = useState<GallerySelection | null>(null);
   const [sortOrder, setSortOrder] = useState<GallerySortOrder>("captured_desc");
   const [mediaFilter, setMediaFilter] = useState<GalleryMediaFilter>(
     allowedMediaKinds && allowedMediaKinds.length > 1 ? "all" : allowedMediaKinds?.[0] ?? "image"
@@ -158,6 +232,10 @@ export function GallerySurface({
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [debugPayloadOpened, setDebugPayloadOpened] = useState(false);
+  const loadedScopeRef = useRef<GalleryLoadedScope | null>(null);
+  const gridCollectionRef = useRef<GalleryGridCollection | null>(null);
+  const gridPagesRef = useRef<Record<number, GalleryGridPageState>>({});
+  const galleryRequestVersionRef = useRef(0);
 
   useEffect(() => {
     void refreshSnapshots();
@@ -166,6 +244,18 @@ export function GallerySurface({
   useEffect(() => {
     void refreshEntries();
   }, [loadEntries]);
+
+  useEffect(() => {
+    loadedScopeRef.current = loadedScope;
+  }, [loadedScope]);
+
+  useEffect(() => {
+    gridCollectionRef.current = gridCollection;
+  }, [gridCollection]);
+
+  useEffect(() => {
+    gridPagesRef.current = gridPages;
+  }, [gridPages]);
 
   useEffect(() => {
     persistThumbnailsPerRow(thumbnailsPerRow);
@@ -183,51 +273,6 @@ export function GallerySurface({
     persistMapProjection(activeMapProjection);
   }, [activeMapProjection]);
 
-  const enabledMediaKinds: GalleryMediaKind[] = allowedMediaKinds?.length
-    ? [...allowedMediaKinds]
-    : ["image"];
-  const allMediaEntries = sortGalleryEntries(
-    (entriesPayload?.entries ?? []).filter((entry) =>
-      isGalleryMediaEntry(entry, enabledMediaKinds as GalleryMediaKind[])
-    ),
-    sortOrder
-  );
-  const mediaEntries = allMediaEntries.filter((entry) =>
-    matchesGalleryMediaFilter(galleryMediaKind(entry), mediaFilter)
-  );
-  const geotaggedEntries = mediaEntries.filter(hasGalleryGpsCoordinates);
-  const availableBasemaps = basemaps ?? [];
-  const activeBasemap =
-    availableBasemaps.find((candidate) => candidate.id === activeBasemapId) ??
-    availableBasemaps[0] ??
-    null;
-  const currentGalleryPrefix = normalizeGalleryPrefix(entriesPayload?.prefix ?? prefix);
-  const navigationItems = buildGalleryNavigationItems(
-    entriesPayload?.entries ?? [],
-    currentGalleryPrefix
-  );
-  const readyCount = mediaEntries.filter((entry) => entry.media?.status === "ready").length;
-  const pendingCount = mediaEntries.filter((entry) => entry.media?.status === "pending").length;
-  const incompleteCount = mediaEntries.filter((entry) => entry.media?.status === "incomplete").length;
-  const imageCount = mediaEntries.filter((entry) => galleryMediaKind(entry) === "image").length;
-  const videoCount = mediaEntries.filter((entry) => galleryMediaKind(entry) === "video").length;
-  const hiddenOnMapCount = mediaEntries.length - geotaggedEntries.length;
-  const selectedIndex = selectedPath
-    ? mediaEntries.findIndex((entry) => entry.path === selectedPath)
-    : -1;
-  const selectedEntry = selectedIndex >= 0 ? mediaEntries[selectedIndex] ?? null : null;
-  const selectedMediaKind = selectedEntry ? galleryMediaKind(selectedEntry) : null;
-  const selectedMediaRequests = selectedEntry
-    ? getMediaRequests(selectedEntry, snapshotId)
-    : null;
-  const selectedMissingThumbnailInfo = selectedEntry
-    ? galleryMissingThumbnailInfo(selectedEntry)
-    : null;
-  const selectedMediaError = selectedEntry?.media?.error ?? null;
-  const selectedMediaViewerKey =
-    selectedEntry && selectedMediaRequests
-      ? `${selectedEntry.path}::${requestSignature(selectedMediaRequests.thumbnail)}::${requestSignature(selectedMediaRequests.original)}`
-      : null;
   const compactGalleryGrid = galleryGridWidth > 0 && galleryGridWidth < 540;
   const galleryGridGap = showMetadata ? (compactGalleryGrid ? 8 : 10) : 0;
   const galleryGridColumns = resolveGalleryGridColumns(
@@ -242,18 +287,142 @@ export function GallerySurface({
   const galleryCardContentGap = compactGalleryGrid ? 4 : 6;
   const galleryNavigationIconSize = compactGalleryGrid ? 46 : 54;
   const galleryNavigationGlyphSize = compactGalleryGrid ? 24 : 28;
+  const galleryVirtualPageSize = resolveGalleryVirtualPageSize(galleryGridColumns);
+  const enabledMediaKinds: GalleryMediaKind[] = allowedMediaKinds?.length
+    ? [...allowedMediaKinds]
+    : ["image"];
+  const requestedServerMediaFilter = resolveServerGalleryMediaFilter(
+    enabledMediaKinds,
+    mediaFilter
+  );
+  const availableBasemaps = basemaps ?? [];
+  const activeBasemap =
+    availableBasemaps.find((candidate) => candidate.id === activeBasemapId) ??
+    availableBasemaps[0] ??
+    null;
+  const currentGalleryPrefix = normalizeGalleryPrefix(
+    navigationPayload?.prefix ?? loadedScope?.prefix ?? prefix
+  );
+  const navigationItems = buildGalleryNavigationItems(
+    navigationPayload?.entries ?? [],
+    currentGalleryPrefix
+  );
+  const mapMediaEntries = mapPayload?.entries ?? [];
+  const geotaggedEntries = mapMediaEntries.filter(hasGalleryGpsCoordinates);
+  const activeMediaSummary =
+    viewMode === "map"
+      ? galleryPayloadMediaSummary(mapPayload)
+      : gridCollection?.mediaSummary ?? EMPTY_GALLERY_MEDIA_SUMMARY;
+  const totalMediaCount =
+    viewMode === "map"
+      ? galleryPayloadTotalEntryCount(mapPayload)
+      : gridCollection?.totalEntryCount ?? 0;
+  const readyCount = activeMediaSummary.ready_count;
+  const pendingCount = activeMediaSummary.pending_count;
+  const incompleteCount = activeMediaSummary.incomplete_count;
+  const imageCount = activeMediaSummary.image_count;
+  const videoCount = activeMediaSummary.video_count;
+  const hiddenOnMapCount = Math.max(0, totalMediaCount - activeMediaSummary.geotagged_count);
+  const selectedIndex = selection?.index ?? -1;
+  const selectedEntry =
+    selection?.source === "map"
+      ? mapMediaEntries[selectedIndex] ?? null
+      : getGalleryGridEntryAtIndex(gridPages, gridCollection, selectedIndex);
+  const selectedTotalCount = selection?.source === "map" ? mapMediaEntries.length : totalMediaCount;
+  const selectedMediaKind = selectedEntry ? galleryMediaKind(selectedEntry) : null;
+  const activeSnapshotId = loadedScope?.snapshotId ?? snapshotId;
+  const selectedMediaRequests = selectedEntry
+    ? getMediaRequests(selectedEntry, activeSnapshotId)
+    : null;
+  const selectedMissingThumbnailInfo = selectedEntry
+    ? galleryMissingThumbnailInfo(selectedEntry)
+    : null;
+  const selectedMediaError = selectedEntry?.media?.error ?? null;
+  const selectedMediaViewerKey =
+    selectedEntry && selectedMediaRequests
+      ? `${selectedEntry.path}::${requestSignature(selectedMediaRequests.thumbnail)}::${requestSignature(selectedMediaRequests.original)}`
+      : null;
   const canNavigatePrevious = selectedIndex > 0;
-  const canNavigateNext = selectedIndex >= 0 && selectedIndex < mediaEntries.length - 1;
+  const canNavigateNext = selectedIndex >= 0 && selectedIndex < selectedTotalCount - 1;
 
   useEffect(() => {
     persistBasemapId(activeBasemap?.id ?? "");
   }, [activeBasemap?.id]);
 
   useEffect(() => {
-    if (selectedPath && selectedIndex === -1) {
-      setSelectedPath(null);
+    if (!selection) {
+      return;
     }
-  }, [selectedIndex, selectedPath]);
+
+    if (selection.source === "map") {
+      if (selection.index < 0 || selection.index >= mapMediaEntries.length) {
+        setSelection(null);
+      }
+      return;
+    }
+
+    if (!gridCollection || selection.index < 0 || selection.index >= gridCollection.totalEntryCount) {
+      setSelection(null);
+      return;
+    }
+
+    void ensureGridPageLoaded(pageIndexForGalleryEntry(selection.index, gridCollection.pageSize));
+  }, [gridCollection, mapMediaEntries.length, selection]);
+
+  useEffect(() => {
+    if (viewMode !== "grid" || !gridCollection || gridCollection.pageCount === 0) {
+      return;
+    }
+
+    const anchorPageIndex =
+      selection?.source === "grid"
+        ? pageIndexForGalleryEntry(selection.index, gridCollection.pageSize)
+        : gridActivePageIndex;
+    const preloadStart = Math.max(0, anchorPageIndex - GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS);
+    const preloadEnd = Math.min(
+      gridCollection.pageCount - 1,
+      anchorPageIndex + GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS
+    );
+    const keepStart = Math.max(0, anchorPageIndex - GALLERY_VIRTUAL_PAGE_KEEP_RADIUS);
+    const keepEnd = Math.min(
+      gridCollection.pageCount - 1,
+      anchorPageIndex + GALLERY_VIRTUAL_PAGE_KEEP_RADIUS
+    );
+
+    for (let pageIndex = preloadStart; pageIndex <= preloadEnd; pageIndex += 1) {
+      void ensureGridPageLoaded(pageIndex);
+    }
+
+    setGridPages((current) => {
+      const nextEntries = Object.entries(current);
+      let changed = false;
+      const next: Record<number, GalleryGridPageState> = {};
+      for (const [key, value] of nextEntries) {
+        const pageIndex = Number(key);
+        if (
+          pageIndex >= keepStart &&
+          pageIndex <= keepEnd
+        ) {
+          next[pageIndex] = value;
+          continue;
+        }
+        if (value.status === "loading") {
+          next[pageIndex] = value;
+          continue;
+        }
+        changed = true;
+      }
+      return changed ? next : current;
+    });
+  }, [gridActivePageIndex, gridCollection, selection, viewMode]);
+
+  useEffect(() => {
+    if (!loadedScopeRef.current) {
+      return;
+    }
+
+    void reloadAppliedEntries();
+  }, [galleryVirtualPageSize, mediaFilter, sortOrder, viewMode]);
 
   useEffect(() => {
     if (selectedIndex < 0) {
@@ -263,18 +432,18 @@ export function GallerySurface({
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "ArrowLeft" && canNavigatePrevious) {
         event.preventDefault();
-        setSelectedPath(mediaEntries[selectedIndex - 1]?.path ?? null);
+        void showRelativeEntry(-1);
       }
 
       if (event.key === "ArrowRight" && canNavigateNext) {
         event.preventDefault();
-        setSelectedPath(mediaEntries[selectedIndex + 1]?.path ?? null);
+        void showRelativeEntry(1);
       }
     }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canNavigateNext, canNavigatePrevious, mediaEntries, selectedIndex]);
+  }, [canNavigateNext, canNavigatePrevious, selectedIndex, selection, totalMediaCount]);
 
   async function refreshSnapshots() {
     setLoading("snapshots");
@@ -293,36 +462,461 @@ export function GallerySurface({
   }
 
   async function refreshEntries(nextPrefix?: string, nextSnapshotId?: string | null) {
+    const targetScope: GalleryLoadedScope = {
+      prefix: (nextPrefix ?? prefix).trim(),
+      depth,
+      snapshotId: nextSnapshotId === undefined ? snapshotId : nextSnapshotId
+    };
+    await loadGalleryScope(targetScope, typeof nextPrefix === "string");
+  }
+
+  async function reloadAppliedEntries() {
+    const scope = loadedScopeRef.current;
+    if (!scope) {
+      return;
+    }
+
+    await loadGalleryScope(scope, false);
+  }
+
+  async function loadGalleryScope(targetScope: GalleryLoadedScope, syncPrefixInput: boolean) {
+    const requestVersion = galleryRequestVersionRef.current + 1;
+    galleryRequestVersionRef.current = requestVersion;
     setLoading("entries");
     setError(null);
-    const targetPrefix = nextPrefix ?? prefix;
-    const targetSnapshot = nextSnapshotId === undefined ? snapshotId : nextSnapshotId;
+    setSelection(null);
+    setNavigationPayload(null);
+    setMapPayload(null);
+    setGridCollection(null);
+    setGridPages({});
+    setGridPageHeights({});
+    setGridActivePageIndex(0);
+
     try {
-      const payload = await loadEntries(targetPrefix.trim(), depth, targetSnapshot);
-      setEntriesPayload(payload);
-      if (typeof nextPrefix === "string") {
-        setPrefix(nextPrefix);
+      const navigationPromise = loadEntries(targetScope.prefix, 1, targetScope.snapshotId, {
+        view: "tree"
+      });
+
+      if (viewMode === "map") {
+        const [navigation, mediaPayload] = await Promise.all([
+          navigationPromise,
+          loadEntries(targetScope.prefix, targetScope.depth, targetScope.snapshotId, {
+            view: "tree",
+            sort: sortOrder,
+            mediaFilter: requestedServerMediaFilter
+          })
+        ]);
+
+        if (requestVersion !== galleryRequestVersionRef.current) {
+          return;
+        }
+
+        setNavigationPayload(navigation);
+        setMapPayload(mediaPayload);
+        loadedScopeRef.current = targetScope;
+        setLoadedScope(targetScope);
+        if (syncPrefixInput) {
+          setPrefix(targetScope.prefix);
+        }
+        return;
+      }
+
+      const [navigation, firstPagePayload] = await Promise.all([
+        navigationPromise,
+        loadEntries(targetScope.prefix, targetScope.depth, targetScope.snapshotId, {
+          view: "tree",
+          sort: sortOrder,
+          mediaFilter: requestedServerMediaFilter,
+          offset: 0,
+          limit: galleryVirtualPageSize
+        })
+      ]);
+
+      if (requestVersion !== galleryRequestVersionRef.current) {
+        return;
+      }
+
+      const totalEntryCount = galleryPayloadTotalEntryCount(firstPagePayload);
+      const nextCollection: GalleryGridCollection = {
+        prefix: firstPagePayload.prefix,
+        depth: firstPagePayload.depth,
+        snapshotId: targetScope.snapshotId,
+        totalEntryCount,
+        mediaSummary: galleryPayloadMediaSummary(firstPagePayload),
+        pageSize: galleryVirtualPageSize,
+        pageCount: totalEntryCount > 0 ? Math.ceil(totalEntryCount / galleryVirtualPageSize) : 0
+      };
+
+      setNavigationPayload(navigation);
+      setGridCollection(nextCollection);
+      setGridPages({
+        0: {
+          status: "ready",
+          entries: firstPagePayload.entries,
+          error: null
+        }
+      });
+      loadedScopeRef.current = targetScope;
+      setLoadedScope(targetScope);
+      if (syncPrefixInput) {
+        setPrefix(targetScope.prefix);
       }
     } catch (nextError) {
-      setError(
-        nextError instanceof Error ? nextError.message : "Failed to load gallery entries"
-      );
+      if (requestVersion === galleryRequestVersionRef.current) {
+        setError(
+          nextError instanceof Error ? nextError.message : "Failed to load gallery entries"
+        );
+      }
     } finally {
-      setLoading(null);
+      if (requestVersion === galleryRequestVersionRef.current) {
+        setLoading(null);
+      }
     }
   }
 
-  function showRelativeEntry(delta: -1 | 1) {
-    if (selectedIndex < 0) {
+  async function ensureGridPageLoaded(pageIndex: number): Promise<GalleryGridPageState | null> {
+    const scope = loadedScopeRef.current;
+    const collection = gridCollectionRef.current;
+    if (!scope || !collection || pageIndex < 0 || pageIndex >= collection.pageCount) {
+      return null;
+    }
+
+    const existing = gridPagesRef.current[pageIndex];
+    if (existing?.status === "ready") {
+      return existing;
+    }
+    if (existing?.status === "loading") {
+      return existing;
+    }
+
+    setGridPages((current) => ({
+      ...current,
+      [pageIndex]: {
+        status: "loading",
+        entries: current[pageIndex]?.entries ?? [],
+        error: null
+      }
+    }));
+
+    const requestVersion = galleryRequestVersionRef.current;
+
+    try {
+      const payload = await loadEntries(scope.prefix, scope.depth, scope.snapshotId, {
+        view: "tree",
+        sort: sortOrder,
+        mediaFilter: requestedServerMediaFilter,
+        offset: pageIndex * collection.pageSize,
+        limit: collection.pageSize
+      });
+
+      if (requestVersion !== galleryRequestVersionRef.current) {
+        return null;
+      }
+
+      const totalEntryCount = galleryPayloadTotalEntryCount(payload);
+      const nextCollection: GalleryGridCollection = {
+        prefix: payload.prefix,
+        depth: payload.depth,
+        snapshotId: scope.snapshotId,
+        totalEntryCount,
+        mediaSummary: galleryPayloadMediaSummary(payload),
+        pageSize: collection.pageSize,
+        pageCount: totalEntryCount > 0 ? Math.ceil(totalEntryCount / collection.pageSize) : 0
+      };
+      setGridCollection(nextCollection);
+      const nextPage: GalleryGridPageState = {
+        status: "ready",
+        entries: payload.entries,
+        error: null
+      };
+      setGridPages((current) => ({
+        ...current,
+        [pageIndex]: nextPage
+      }));
+      return nextPage;
+    } catch (nextError) {
+      if (requestVersion !== galleryRequestVersionRef.current) {
+        return null;
+      }
+
+      const nextPage: GalleryGridPageState = {
+        status: "error",
+        entries: [],
+        error: nextError instanceof Error ? nextError.message : "Failed to load gallery page"
+      };
+      setGridPages((current) => ({
+        ...current,
+        [pageIndex]: nextPage
+      }));
+      return nextPage;
+    }
+  }
+
+  function handleGridPageMeasured(pageIndex: number, height: number) {
+    setGridPageHeights((current) => {
+      if (current[pageIndex] === height) {
+        return current;
+      }
+
+      return {
+        ...current,
+        [pageIndex]: height
+      };
+    });
+  }
+
+  async function showRelativeEntry(delta: -1 | 1) {
+    if (!selection) {
       return;
     }
 
-    const nextIndex = selectedIndex + delta;
-    if (nextIndex < 0 || nextIndex >= mediaEntries.length) {
+    const nextIndex = selection.index + delta;
+    if (nextIndex < 0 || nextIndex >= selectedTotalCount) {
       return;
     }
 
-    setSelectedPath(mediaEntries[nextIndex]?.path ?? null);
+    if (selection.source === "map") {
+      const nextEntry = mapMediaEntries[nextIndex] ?? null;
+      if (nextEntry) {
+        setSelection({
+          source: "map",
+          index: nextIndex,
+          path: nextEntry.path
+        });
+      }
+      return;
+    }
+
+    if (!gridCollection) {
+      return;
+    }
+
+    const pageIndex = pageIndexForGalleryEntry(nextIndex, gridCollection.pageSize);
+    const page = await ensureGridPageLoaded(pageIndex);
+    const nextEntry =
+      page?.entries[galleryEntryWithinPage(nextIndex, gridCollection.pageSize)] ??
+      getGalleryGridEntryAtIndex(gridPagesRef.current, gridCollectionRef.current, nextIndex);
+    if (nextEntry) {
+      setSelection({
+        source: "grid",
+        index: nextIndex,
+        path: nextEntry.path
+      });
+    }
+  }
+
+  const galleryGridStyle = {
+    display: "grid",
+    gridTemplateColumns: `repeat(${galleryGridColumns}, minmax(0, 1fr))`,
+    gap: galleryGridGap,
+    alignItems: "start"
+  } as const;
+
+  const galleryDebugValue =
+    viewMode === "map"
+      ? mapPayload ?? {
+          message: "No gallery payload loaded yet."
+        }
+      : gridCollection
+        ? {
+            navigation: navigationPayload,
+            collection: gridCollection,
+            pages: Object.entries(gridPages)
+              .sort(([left], [right]) => Number(left) - Number(right))
+              .map(([pageIndex, page]) => ({
+                pageIndex: Number(pageIndex),
+                status: page.status,
+                entry_count: page.entries.length,
+                error: page.error ?? null,
+                entries: page.entries
+              }))
+          }
+        : {
+            message: "No gallery payload loaded yet."
+          };
+
+  function renderNavigationCard(item: GalleryNavigationItem) {
+    if (showMetadata) {
+      return (
+        <Card
+          key={item.key}
+          data-gallery-card="true"
+          withBorder
+          radius={galleryCardRadius}
+          padding={galleryCardPadding}
+          style={{
+            cursor: "pointer",
+            minWidth: 0,
+            overflow: "hidden",
+            borderWidth: galleryCardBorderWidth
+          }}
+          onClick={() => void refreshEntries(item.targetPrefix)}
+        >
+          <Card.Section>
+            <AspectRatio ratio={1}>
+              <Center style={{ height: "100%", background: "var(--mantine-color-blue-0)" }}>
+                <Stack gap="xs" align="center">
+                  <ThemeIcon
+                    size={galleryNavigationIconSize}
+                    radius="xl"
+                    variant="light"
+                    color="blue"
+                  >
+                    {item.kind === "up" ? (
+                      <IconArrowUp size={galleryNavigationGlyphSize} />
+                    ) : (
+                      <IconFolder size={galleryNavigationGlyphSize} />
+                    )}
+                  </ThemeIcon>
+                  <Text fw={700} ta="center" lineClamp={2}>
+                    {item.label}
+                  </Text>
+                </Stack>
+              </Center>
+            </AspectRatio>
+          </Card.Section>
+
+          <Stack data-gallery-card-metadata="true" gap={galleryCardContentGap} mt={galleryCardPadding}>
+            <Badge color="blue" variant="light">
+              {item.kind === "up" ? "navigation" : "folder"}
+            </Badge>
+            <Text size="sm" c="dimmed" lineClamp={3}>
+              {item.description}
+            </Text>
+          </Stack>
+        </Card>
+      );
+    }
+
+    return (
+      <div
+        key={item.key}
+        data-gallery-card="true"
+        style={{ cursor: "pointer", minWidth: 0, overflow: "hidden", lineHeight: 0 }}
+        onClick={() => void refreshEntries(item.targetPrefix)}
+      >
+        <AspectRatio ratio={1} style={{ display: "block", lineHeight: 0 }}>
+          <Center style={{ height: "100%", background: "var(--mantine-color-blue-0)" }}>
+            <Stack gap="xs" align="center">
+              <ThemeIcon size={galleryNavigationIconSize} radius="xl" variant="light" color="blue">
+                {item.kind === "up" ? (
+                  <IconArrowUp size={galleryNavigationGlyphSize} />
+                ) : (
+                  <IconFolder size={galleryNavigationGlyphSize} />
+                )}
+              </ThemeIcon>
+              <Text fw={700} ta="center" lineClamp={2}>
+                {item.label}
+              </Text>
+            </Stack>
+          </Center>
+        </AspectRatio>
+      </div>
+    );
+  }
+
+  function renderMediaCard(entry: GalleryEntry, entryIndex: number) {
+    const mediaRequests = getMediaRequests(entry, activeSnapshotId);
+    const mediaKind = galleryMediaKind(entry) ?? "image";
+    const missingThumbnailInfo = galleryMissingThumbnailInfo(entry);
+
+    if (showMetadata) {
+      return (
+        <Card
+          key={entry.path}
+          data-gallery-card="true"
+          withBorder
+          radius={galleryCardRadius}
+          padding={galleryCardPadding}
+          style={{
+            cursor: "pointer",
+            minWidth: 0,
+            overflow: "hidden",
+            borderWidth: galleryCardBorderWidth
+          }}
+          onClick={() =>
+            setSelection({
+              source: "grid",
+              index: entryIndex,
+              path: entry.path
+            })
+          }
+        >
+          <Card.Section>
+            <AspectRatio ratio={1}>
+              <GalleryGridPreview
+                kind={mediaKind}
+                request={mediaRequests.thumbnail ?? null}
+                alt={entry.path}
+                missingThumbnailInfo={missingThumbnailInfo}
+              />
+            </AspectRatio>
+          </Card.Section>
+
+          <Stack data-gallery-card-metadata="true" gap={galleryCardContentGap} mt={galleryCardPadding}>
+            <Group justify="space-between" align="flex-start" wrap="nowrap">
+              <Text fw={700} lineClamp={1}>
+                {fileName(entry.path)}
+              </Text>
+              <Badge color={mediaStatusColor(entry.media?.status)} variant="light">
+                {entry.media?.status ?? "uncached"}
+              </Badge>
+            </Group>
+            <Code
+              style={{
+                display: "block",
+                whiteSpace: "normal",
+                overflowWrap: "anywhere",
+                wordBreak: "break-word"
+              }}
+            >
+              {entry.path}
+            </Code>
+            <Group gap={galleryCardContentGap}>
+              <Badge color={mediaKind === "video" ? "violet" : "blue"} variant="dot">
+                {mediaKind === "video" ? "movie" : "photo"}
+              </Badge>
+              {entry.media?.width && entry.media?.height ? (
+                <Badge variant="dot">
+                  {entry.media.width} x {entry.media.height}
+                </Badge>
+              ) : null}
+              {entry.media?.mime_type ? <Badge variant="dot">{entry.media.mime_type}</Badge> : null}
+              {entry.media?.gps ? <Badge color="grape" variant="dot">GPS</Badge> : null}
+            </Group>
+            {entry.media?.taken_at_unix ? (
+              <Text size="sm" c="dimmed">
+                Captured {formatTakenAt(entry.media.taken_at_unix)}
+              </Text>
+            ) : null}
+          </Stack>
+        </Card>
+      );
+    }
+
+    return (
+      <div
+        key={entry.path}
+        data-gallery-card="true"
+        style={{ cursor: "pointer", minWidth: 0, overflow: "hidden", lineHeight: 0 }}
+        onClick={() =>
+          setSelection({
+            source: "grid",
+            index: entryIndex,
+            path: entry.path
+          })
+        }
+      >
+        <AspectRatio ratio={1} style={{ display: "block", lineHeight: 0 }}>
+          <GalleryGridPreview
+            kind={mediaKind}
+            request={mediaRequests.thumbnail ?? null}
+            alt={entry.path}
+            missingThumbnailInfo={missingThumbnailInfo}
+          />
+        </AspectRatio>
+      </div>
+    );
   }
 
   return (
@@ -478,7 +1072,7 @@ export function GallerySurface({
               </Group>
               <Group gap="xs">
                 <Badge variant="light">
-                  {mediaEntries.length} {mediaEntries.length === 1 ? "item" : "items"}
+                  {totalMediaCount} {totalMediaCount === 1 ? "item" : "items"}
                 </Badge>
                 {imageCount > 0 ? (
                   <Badge color="blue" variant="light">
@@ -491,7 +1085,7 @@ export function GallerySurface({
                   </Badge>
                 ) : null}
                 <Badge color="grape" variant="light">
-                  {geotaggedEntries.length} geo-tagged
+                  {activeMediaSummary.geotagged_count} geo-tagged
                 </Badge>
                 <Badge color="blue" variant="light">
                   {navigationItems.filter((item) => item.kind === "prefix").length} folders
@@ -542,8 +1136,8 @@ export function GallerySurface({
                   <Stack gap="xs" align="center">
                     <Text fw={700}>No geo-tagged media in view</Text>
                     <Text c="dimmed" ta="center">
-                      The current gallery scope has {mediaEntries.length} media
-                      {mediaEntries.length === 1 ? " item" : " items"}, but none with GPS
+                      The current gallery scope has {totalMediaCount} media
+                      {totalMediaCount === 1 ? " item" : " items"}, but none with GPS
                       coordinates yet.
                     </Text>
                   </Stack>
@@ -557,13 +1151,22 @@ export function GallerySurface({
                   onSelectProjection={setActiveMapProjection}
                   entries={geotaggedEntries}
                   hiddenOnMapCount={hiddenOnMapCount}
-                  selectedPath={selectedPath}
-                  getMarkerRequest={(entry) => getMediaRequests(entry, snapshotId).thumbnail ?? null}
-                  onSelectPath={setSelectedPath}
+                  selectedPath={selection?.path ?? null}
+                  getMarkerRequest={(entry) => getMediaRequests(entry, activeSnapshotId).thumbnail ?? null}
+                  onSelectPath={(path) => {
+                    const nextIndex = mapMediaEntries.findIndex((entry) => entry.path === path);
+                    if (nextIndex >= 0) {
+                      setSelection({
+                        source: "map",
+                        index: nextIndex,
+                        path
+                      });
+                    }
+                  }}
                 />
               )}
             </Stack>
-          ) : mediaEntries.length === 0 && navigationItems.length === 0 ? (
+          ) : totalMediaCount === 0 && navigationItems.length === 0 ? (
             <Card withBorder radius="md" padding="xl">
               <Stack gap="xs" align="center">
                 <Text fw={700}>No media objects in view</Text>
@@ -574,178 +1177,66 @@ export function GallerySurface({
               </Stack>
             </Card>
           ) : (
-            <div
-              ref={galleryGridRef}
-              data-gallery-grid="true"
-              style={{
-                display: "grid",
-                gridTemplateColumns: `repeat(${galleryGridColumns}, minmax(0, 1fr))`,
-                gap: galleryGridGap,
-                alignItems: "start"
-              }}
-            >
-              {navigationItems.map((item) => (
-                showMetadata ? (
-                  <Card
-                    key={item.key}
-                    data-gallery-card="true"
-                    withBorder={showMetadata}
-                    radius={galleryCardRadius}
-                    padding={galleryCardPadding}
-                    style={{
-                      cursor: "pointer",
-                      minWidth: 0,
-                      overflow: "hidden",
-                      borderWidth: galleryCardBorderWidth
-                    }}
-                    onClick={() => void refreshEntries(item.targetPrefix)}
-                  >
-                    <Card.Section>
-                      <AspectRatio ratio={1}>
-                        <Center style={{ height: "100%", background: "var(--mantine-color-blue-0)" }}>
-                          <Stack gap="xs" align="center">
-                            <ThemeIcon size={galleryNavigationIconSize} radius="xl" variant="light" color="blue">
-                              {item.kind === "up" ? (
-                                <IconArrowUp size={galleryNavigationGlyphSize} />
-                              ) : (
-                                <IconFolder size={galleryNavigationGlyphSize} />
-                              )}
-                            </ThemeIcon>
-                            <Text fw={700} ta="center" lineClamp={2}>
-                              {item.label}
-                            </Text>
-                          </Stack>
-                        </Center>
-                      </AspectRatio>
-                    </Card.Section>
+            <Stack gap={galleryGridGap > 0 ? galleryGridGap : 8}>
+              <div ref={galleryGridRef} data-gallery-grid="true" style={galleryGridStyle}>
+                {navigationItems.map((item) => renderNavigationCard(item))}
+              </div>
+              {gridCollection
+                ? Array.from({ length: gridCollection.pageCount }, (_, pageIndex) => {
+                    const page = gridPages[pageIndex];
+                    const expectedEntryCount = resolveGalleryVirtualPageEntryCount(
+                      pageIndex,
+                      gridCollection.totalEntryCount,
+                      gridCollection.pageSize
+                    );
+                    const pageMinHeight =
+                      gridPageHeights[pageIndex] ??
+                      resolveGalleryVirtualPageEstimatedHeight(
+                        galleryGridWidth,
+                        galleryGridColumns,
+                        galleryGridGap,
+                        showMetadata,
+                        expectedEntryCount
+                      );
+                    const pageOffset = pageIndex * gridCollection.pageSize;
 
-                    <Stack data-gallery-card-metadata="true" gap={galleryCardContentGap} mt={galleryCardPadding}>
-                      <Badge color="blue" variant="light">
-                        {item.kind === "up" ? "navigation" : "folder"}
-                      </Badge>
-                      <Text size="sm" c="dimmed" lineClamp={3}>
-                        {item.description}
-                      </Text>
-                    </Stack>
-                  </Card>
-                ) : (
-                  <div
-                    key={item.key}
-                    data-gallery-card="true"
-                    style={{ cursor: "pointer", minWidth: 0, overflow: "hidden", lineHeight: 0 }}
-                    onClick={() => void refreshEntries(item.targetPrefix)}
-                  >
-                    <AspectRatio ratio={1} style={{ display: "block", lineHeight: 0 }}>
-                      <Center style={{ height: "100%", background: "var(--mantine-color-blue-0)" }}>
-                        <Stack gap="xs" align="center">
-                          <ThemeIcon size={galleryNavigationIconSize} radius="xl" variant="light" color="blue">
-                            {item.kind === "up" ? (
-                              <IconArrowUp size={galleryNavigationGlyphSize} />
-                            ) : (
-                              <IconFolder size={galleryNavigationGlyphSize} />
+                    return (
+                      <GalleryVirtualPageSlot
+                        key={`gallery-page:${pageIndex}`}
+                        index={pageIndex}
+                        minHeight={pageMinHeight}
+                        measure={page?.status === "ready"}
+                        onVisible={setGridActivePageIndex}
+                        onMeasured={handleGridPageMeasured}
+                      >
+                        {page?.status === "ready" ? (
+                          <div data-gallery-grid="true" style={galleryGridStyle}>
+                            {page.entries.map((entry, entryOffset) =>
+                              renderMediaCard(entry, pageOffset + entryOffset)
                             )}
-                          </ThemeIcon>
-                          <Text fw={700} ta="center" lineClamp={2}>
-                            {item.label}
-                          </Text>
-                        </Stack>
-                      </Center>
-                    </AspectRatio>
-                  </div>
-                )
-              ))}
-
-              {mediaEntries.map((entry) => {
-                const mediaRequests = getMediaRequests(entry, snapshotId);
-                const mediaKind = galleryMediaKind(entry) ?? "image";
-                const missingThumbnailInfo = galleryMissingThumbnailInfo(entry);
-                return (
-                  showMetadata ? (
-                    <Card
-                      key={entry.path}
-                      data-gallery-card="true"
-                      withBorder={showMetadata}
-                      radius={galleryCardRadius}
-                      padding={galleryCardPadding}
-                      style={{
-                        cursor: "pointer",
-                        minWidth: 0,
-                        overflow: "hidden",
-                        borderWidth: galleryCardBorderWidth
-                      }}
-                      onClick={() => setSelectedPath(entry.path)}
-                    >
-                      <Card.Section>
-                        <AspectRatio ratio={1}>
-                          <GalleryGridPreview
-                            kind={mediaKind}
-                            request={mediaRequests.thumbnail ?? null}
-                            alt={entry.path}
-                            missingThumbnailInfo={missingThumbnailInfo}
-                          />
-                        </AspectRatio>
-                      </Card.Section>
-
-                      <Stack data-gallery-card-metadata="true" gap={galleryCardContentGap} mt={galleryCardPadding}>
-                        <Group justify="space-between" align="flex-start" wrap="nowrap">
-                          <Text fw={700} lineClamp={1}>
-                            {fileName(entry.path)}
-                          </Text>
-                          <Badge color={mediaStatusColor(entry.media?.status)} variant="light">
-                            {entry.media?.status ?? "uncached"}
-                          </Badge>
-                        </Group>
-                        <Code
-                          style={{
-                            display: "block",
-                            whiteSpace: "normal",
-                            overflowWrap: "anywhere",
-                            wordBreak: "break-word"
-                          }}
-                        >
-                          {entry.path}
-                        </Code>
-                        <Group gap={galleryCardContentGap}>
-                          <Badge color={mediaKind === "video" ? "violet" : "blue"} variant="dot">
-                            {mediaKind === "video" ? "movie" : "photo"}
-                          </Badge>
-                          {entry.media?.width && entry.media?.height ? (
-                            <Badge variant="dot">
-                              {entry.media.width} x {entry.media.height}
-                            </Badge>
-                          ) : null}
-                          {entry.media?.mime_type ? (
-                            <Badge variant="dot">{entry.media.mime_type}</Badge>
-                          ) : null}
-                          {entry.media?.gps ? <Badge color="grape" variant="dot">GPS</Badge> : null}
-                        </Group>
-                        {entry.media?.taken_at_unix ? (
-                          <Text size="sm" c="dimmed">
-                            Captured {formatTakenAt(entry.media.taken_at_unix)}
-                          </Text>
-                        ) : null}
-                      </Stack>
-                    </Card>
-                  ) : (
-                    <div
-                      key={entry.path}
-                      data-gallery-card="true"
-                      style={{ cursor: "pointer", minWidth: 0, overflow: "hidden", lineHeight: 0 }}
-                      onClick={() => setSelectedPath(entry.path)}
-                    >
-                      <AspectRatio ratio={1} style={{ display: "block", lineHeight: 0 }}>
-                        <GalleryGridPreview
-                          kind={mediaKind}
-                          request={mediaRequests.thumbnail ?? null}
-                          alt={entry.path}
-                          missingThumbnailInfo={missingThumbnailInfo}
-                        />
-                      </AspectRatio>
-                    </div>
-                  )
-                );
-              })}
-            </div>
+                          </div>
+                        ) : page?.status === "error" ? (
+                          <Card withBorder radius="md" padding="lg">
+                            <Stack gap="sm" align="center">
+                              <Text fw={700}>Failed to load gallery page</Text>
+                              <Text size="sm" c="dimmed" ta="center">
+                                {page.error ?? "The requested page did not load."}
+                              </Text>
+                              <Button variant="default" onClick={() => void ensureGridPageLoaded(pageIndex)}>
+                                Retry page
+                              </Button>
+                            </Stack>
+                          </Card>
+                        ) : (
+                          <Center style={{ minHeight: pageMinHeight }}>
+                            <Loader size="sm" color="gray" />
+                          </Center>
+                        )}
+                      </GalleryVirtualPageSlot>
+                    );
+                  })
+                : null}
+            </Stack>
           )}
         </Grid.Col>
       </Grid>
@@ -756,21 +1247,15 @@ export function GallerySurface({
         title="Gallery debug JSON"
         size="xl"
       >
-        <JsonBlock
-          value={
-            entriesPayload ?? {
-              message: "No gallery payload loaded yet."
-            }
-          }
-        />
+        <JsonBlock value={galleryDebugValue} />
       </Modal>
 
       <Modal
         opened={selectedEntry !== null}
-        onClose={() => setSelectedPath(null)}
+        onClose={() => setSelection(null)}
         title={
           selectedEntry
-            ? `${fileName(selectedEntry.path)} (${selectedIndex + 1} of ${mediaEntries.length})`
+            ? `${fileName(selectedEntry.path)} (${selectedIndex + 1} of ${selectedTotalCount})`
             : "Media preview"
         }
         fullScreen
@@ -809,7 +1294,7 @@ export function GallerySurface({
             </div>
             <Group gap="xs">
               <Badge variant="light">
-                {selectedIndex + 1} / {mediaEntries.length}
+                {selectedIndex + 1} / {selectedTotalCount}
               </Badge>
               <Badge color={selectedMediaKind === "video" ? "violet" : "blue"} variant="light">
                 {selectedMediaKind === "video" ? "movie" : "photo"}
@@ -846,6 +1331,193 @@ export function GallerySurface({
       </Modal>
     </Stack>
   );
+}
+
+type GalleryVirtualPageSlotProps = {
+  index: number;
+  minHeight: number;
+  measure: boolean;
+  onVisible: (index: number) => void;
+  onMeasured: (index: number, height: number) => void;
+  children: ReactNode;
+};
+
+function GalleryVirtualPageSlot({
+  index,
+  minHeight,
+  measure,
+  onVisible,
+  onMeasured,
+  children
+}: GalleryVirtualPageSlotProps) {
+  const slotRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const element = slotRef.current;
+    if (!element) {
+      return;
+    }
+
+    if (typeof IntersectionObserver === "undefined") {
+      onVisible(index);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          onVisible(index);
+        }
+      },
+      { rootMargin: GALLERY_VIRTUAL_PAGE_ROOT_MARGIN }
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [index, onVisible]);
+
+  useEffect(() => {
+    if (!measure) {
+      return;
+    }
+
+    const element = slotRef.current;
+    if (!element) {
+      return;
+    }
+
+    if (typeof ResizeObserver === "undefined") {
+      const nextHeight = element.getBoundingClientRect().height;
+      if (nextHeight > 0) {
+        onMeasured(index, nextHeight);
+      }
+      return;
+    }
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry || entry.contentRect.height <= 0) {
+        return;
+      }
+      onMeasured(index, entry.contentRect.height);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [index, measure, onMeasured, children]);
+
+  return (
+    <div ref={slotRef} style={{ minHeight }}>
+      {children}
+    </div>
+  );
+}
+
+function resolveServerGalleryMediaFilter(
+  allowedKinds: GalleryMediaKind[],
+  filter: GalleryMediaFilter
+): GalleryMediaFilter {
+  if (allowedKinds.length === 1) {
+    return allowedKinds[0] ?? "image";
+  }
+
+  return filter;
+}
+
+function normalizeGalleryMediaSummary(
+  summary?: Partial<GalleryMediaSummary> | null
+): GalleryMediaSummary {
+  return {
+    ready_count:
+      typeof summary?.ready_count === "number" ? summary.ready_count : EMPTY_GALLERY_MEDIA_SUMMARY.ready_count,
+    pending_count:
+      typeof summary?.pending_count === "number" ? summary.pending_count : EMPTY_GALLERY_MEDIA_SUMMARY.pending_count,
+    incomplete_count:
+      typeof summary?.incomplete_count === "number"
+        ? summary.incomplete_count
+        : EMPTY_GALLERY_MEDIA_SUMMARY.incomplete_count,
+    image_count:
+      typeof summary?.image_count === "number" ? summary.image_count : EMPTY_GALLERY_MEDIA_SUMMARY.image_count,
+    video_count:
+      typeof summary?.video_count === "number" ? summary.video_count : EMPTY_GALLERY_MEDIA_SUMMARY.video_count,
+    geotagged_count:
+      typeof summary?.geotagged_count === "number"
+        ? summary.geotagged_count
+        : EMPTY_GALLERY_MEDIA_SUMMARY.geotagged_count
+  };
+}
+
+function galleryPayloadMediaSummary(payload: GalleryPayload | null): GalleryMediaSummary {
+  return normalizeGalleryMediaSummary(payload?.media_summary);
+}
+
+function galleryPayloadTotalEntryCount(payload: GalleryPayload | null): number {
+  if (!payload) {
+    return 0;
+  }
+
+  if (typeof payload.total_entry_count === "number") {
+    return payload.total_entry_count;
+  }
+
+  return payload.entry_count ?? payload.entries.length;
+}
+
+function resolveGalleryVirtualPageSize(columns: number): number {
+  const safeColumns = Math.max(1, columns);
+  return safeColumns * GALLERY_VIRTUAL_PAGE_ROW_COUNT;
+}
+
+function pageIndexForGalleryEntry(index: number, pageSize: number): number {
+  const safePageSize = Math.max(1, pageSize);
+  return Math.floor(index / safePageSize);
+}
+
+function galleryEntryWithinPage(index: number, pageSize: number): number {
+  const safePageSize = Math.max(1, pageSize);
+  return index % safePageSize;
+}
+
+function getGalleryGridEntryAtIndex(
+  gridPages: Record<number, GalleryGridPageState>,
+  collection: GalleryGridCollection | null,
+  index: number
+): GalleryEntry | null {
+  if (!collection || index < 0 || index >= collection.totalEntryCount) {
+    return null;
+  }
+
+  const page = gridPages[pageIndexForGalleryEntry(index, collection.pageSize)];
+  if (!page || page.status !== "ready") {
+    return null;
+  }
+
+  return page.entries[galleryEntryWithinPage(index, collection.pageSize)] ?? null;
+}
+
+function resolveGalleryVirtualPageEntryCount(
+  pageIndex: number,
+  totalEntryCount: number,
+  pageSize: number
+): number {
+  const safePageSize = Math.max(1, pageSize);
+  const offset = pageIndex * safePageSize;
+  return Math.max(0, Math.min(safePageSize, totalEntryCount - offset));
+}
+
+function resolveGalleryVirtualPageEstimatedHeight(
+  gridWidth: number,
+  columns: number,
+  gap: number,
+  showMetadata: boolean,
+  entryCount: number
+): number {
+  const safeColumns = Math.max(1, columns);
+  const safeEntryCount = Math.max(1, entryCount);
+  const rowCount = Math.max(1, Math.ceil(safeEntryCount / safeColumns));
+  const usableWidth =
+    gridWidth > 0 ? Math.max(0, gridWidth - gap * Math.max(0, safeColumns - 1)) : 0;
+  const cardWidth = usableWidth > 0 ? usableWidth / safeColumns : showMetadata ? 180 : 140;
+  const cardHeight = Math.max(showMetadata ? 220 : 140, cardWidth + (showMetadata ? 124 : 0));
+  return rowCount * cardHeight + Math.max(0, rowCount - 1) * gap;
 }
 
 type GalleryMapPanelProps = {
@@ -1907,22 +2579,6 @@ function galleryMediaKind(entry: GalleryEntry): GalleryMediaKind | null {
   return null;
 }
 
-function isGalleryMediaEntry(entry: GalleryEntry, allowedKinds: GalleryMediaKind[]): boolean {
-  const kind = galleryMediaKind(entry);
-  return kind !== null && allowedKinds.includes(kind);
-}
-
-function matchesGalleryMediaFilter(
-  kind: GalleryMediaKind | null,
-  filter: GalleryMediaFilter
-): boolean {
-  if (kind === null) {
-    return false;
-  }
-
-  return filter === "all" ? true : kind === filter;
-}
-
 function isGalleryPrefixEntry(entry: GalleryEntry): boolean {
   return entry.entry_type === "prefix" || entry.path.endsWith("/");
 }
@@ -1936,21 +2592,6 @@ function hasGalleryGpsCoordinates(entry: GalleryEntry): boolean {
     typeof longitude === "number" &&
     Number.isFinite(longitude)
   );
-}
-
-function sortGalleryEntries(entries: GalleryEntry[], sortOrder: GallerySortOrder): GalleryEntry[] {
-  return [...entries].sort((left, right) => {
-    if (sortOrder === "path_asc") {
-      return left.path.localeCompare(right.path);
-    }
-
-    const leftTakenAt = left.media?.taken_at_unix ?? 0;
-    const rightTakenAt = right.media?.taken_at_unix ?? 0;
-    if (leftTakenAt !== rightTakenAt) {
-      return rightTakenAt - leftTakenAt;
-    }
-    return left.path.localeCompare(right.path);
-  });
 }
 
 function mediaStatusColor(status?: string | null): string {

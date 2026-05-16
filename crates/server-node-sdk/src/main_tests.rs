@@ -5847,6 +5847,10 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
             }),
         )
         .await,
@@ -5910,6 +5914,10 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
             }),
         )
         .await,
@@ -5978,6 +5986,10 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
             }),
         )
         .await,
@@ -6042,6 +6054,10 @@ async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
             }),
         )
         .await,
@@ -6106,6 +6122,10 @@ async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTest
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
             }),
         )
         .await,
@@ -6143,6 +6163,106 @@ run_on_main_metadata_backends!(
     list_store_index_skips_invalid_manifest_metadata,
     list_store_index_skips_invalid_manifest_metadata_turso
 );
+
+#[test]
+fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
+    let mut entries = vec![
+        super::StoreIndexEntry {
+            path: "gallery/older.jpg".to_string(),
+            entry_type: "key".to_string(),
+            version: None,
+            content_hash: None,
+            size_bytes: None,
+            modified_at_unix: None,
+            content_fingerprint: None,
+            media: Some(super::MediaIndexResponse {
+                status: "ready".to_string(),
+                content_fingerprint: "older".to_string(),
+                media_type: Some("image".to_string()),
+                mime_type: Some("image/jpeg".to_string()),
+                width: None,
+                height: None,
+                orientation: None,
+                taken_at_unix: Some(50),
+                gps: None,
+                thumbnail: None,
+                error: None,
+            }),
+        },
+        super::StoreIndexEntry {
+            path: "gallery/newer.jpg".to_string(),
+            entry_type: "key".to_string(),
+            version: None,
+            content_hash: None,
+            size_bytes: None,
+            modified_at_unix: None,
+            content_fingerprint: None,
+            media: Some(super::MediaIndexResponse {
+                status: "ready".to_string(),
+                content_fingerprint: "newer".to_string(),
+                media_type: Some("image".to_string()),
+                mime_type: Some("image/jpeg".to_string()),
+                width: None,
+                height: None,
+                orientation: None,
+                taken_at_unix: Some(100),
+                gps: Some(super::MediaGpsResponse {
+                    latitude: 1.0,
+                    longitude: 2.0,
+                }),
+                thumbnail: None,
+                error: None,
+            }),
+        },
+        super::StoreIndexEntry {
+            path: "gallery/clip.mp4".to_string(),
+            entry_type: "key".to_string(),
+            version: None,
+            content_hash: None,
+            size_bytes: None,
+            modified_at_unix: None,
+            content_fingerprint: None,
+            media: Some(super::MediaIndexResponse {
+                status: "pending".to_string(),
+                content_fingerprint: "clip".to_string(),
+                media_type: Some("video".to_string()),
+                mime_type: Some("video/mp4".to_string()),
+                width: None,
+                height: None,
+                orientation: None,
+                taken_at_unix: Some(75),
+                gps: None,
+                thumbnail: None,
+                error: None,
+            }),
+        },
+        super::StoreIndexEntry {
+            path: "gallery/subdir/".to_string(),
+            entry_type: "prefix".to_string(),
+            version: None,
+            content_hash: None,
+            size_bytes: None,
+            modified_at_unix: None,
+            content_fingerprint: None,
+            media: None,
+        },
+    ];
+
+    entries.retain(|entry| {
+        super::matches_store_index_media_filter(entry, super::StoreIndexMediaFilter::All)
+    });
+    super::sort_store_index_entries(&mut entries, super::StoreIndexSortOrder::CapturedDesc);
+    let summary = super::summarize_store_index_entries(&entries);
+    let page = entries.into_iter().skip(1).take(1).collect::<Vec<_>>();
+
+    assert_eq!(summary.image_count, 2);
+    assert_eq!(summary.video_count, 1);
+    assert_eq!(summary.ready_count, 2);
+    assert_eq!(summary.pending_count, 1);
+    assert_eq!(summary.geotagged_count, 1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].path, "gallery/clip.mp4");
+}
 
 async fn metadata_import_makes_store_index_visible_without_marking_local_replica_impl(
     backend: MainTestBackend,
@@ -6201,6 +6321,10 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
             }),
         )
         .await,
@@ -6636,6 +6760,10 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
             }),
         )
         .await,

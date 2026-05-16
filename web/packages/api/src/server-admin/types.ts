@@ -1,5 +1,13 @@
 import type { VersionGraphResponse } from "../client-ui/types";
-import type { StoreIndexEntry, StoreIndexResponse, StoreListView } from "../shared/store-index";
+import type {
+  StoreIndexEntry,
+  StoreIndexMediaSummary,
+  StoreIndexResponse,
+  StoreListMediaFilter,
+  StoreListRequestOptions,
+  StoreListSortOrder,
+  StoreListView
+} from "../shared/store-index";
 
 export type AdminSessionStatus = {
   login_required: boolean;
@@ -28,7 +36,13 @@ export type AdminStoreGetResponse = {
 
 export type AdminVersionGraphResponse = VersionGraphResponse;
 
-export type { StoreListView };
+export type {
+  StoreIndexMediaSummary,
+  StoreListMediaFilter,
+  StoreListRequestOptions,
+  StoreListSortOrder,
+  StoreListView
+};
 
 export type DataChangeAction = "upload" | "rename" | "copy" | "delete";
 

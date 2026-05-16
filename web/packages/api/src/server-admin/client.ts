@@ -37,6 +37,7 @@ import type {
   ServerHealthResponse,
   StorageStatsCurrentResponse,
   StorageStatsSample,
+  StoreListRequestOptions,
   StoreListView,
   SetupStatus,
   SetupTransitionResponse
@@ -112,8 +113,9 @@ export async function listAdminStoreEntries(
   depth = 1,
   snapshot?: string | null,
   adminTokenOverride?: string,
-  view: StoreListView = "tree"
+  options: StoreListRequestOptions = {}
 ): Promise<AdminStoreListResponse> {
+  const view: StoreListView = options.view ?? "tree";
   const query = new URLSearchParams({
     depth: String(Math.max(1, depth))
   });
@@ -124,6 +126,18 @@ export async function listAdminStoreEntries(
     query.set("snapshot", snapshot.trim());
   }
   query.set("view", view);
+  if (typeof options.offset === "number" && Number.isFinite(options.offset) && options.offset >= 0) {
+    query.set("offset", String(Math.floor(options.offset)));
+  }
+  if (typeof options.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
+    query.set("limit", String(Math.max(1, Math.floor(options.limit))));
+  }
+  if (options.sort) {
+    query.set("sort", options.sort);
+  }
+  if (options.mediaFilter) {
+    query.set("media_filter", options.mediaFilter);
+  }
   return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
     adminTokenOverride
   });

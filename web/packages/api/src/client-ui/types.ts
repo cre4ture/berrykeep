@@ -1,4 +1,12 @@
-import type { StoreIndexEntry, StoreIndexResponse, StoreListView } from "../shared/store-index";
+import type {
+  StoreIndexEntry,
+  StoreIndexMediaSummary,
+  StoreIndexResponse,
+  StoreListMediaFilter,
+  StoreListRequestOptions,
+  StoreListSortOrder,
+  StoreListView
+} from "../shared/store-index";
 
 export type JsonObject = Record<string, unknown>;
 
@@ -169,7 +177,13 @@ export type StoreEntry = StoreIndexEntry;
 
 export type StoreListResponse = StoreIndexResponse;
 
-export type { StoreListView };
+export type {
+  StoreIndexMediaSummary,
+  StoreListMediaFilter,
+  StoreListRequestOptions,
+  StoreListSortOrder,
+  StoreListView
+};
 
 export type SnapshotSummary = {
   id: string;

@@ -6,6 +6,7 @@ import type {
   JsonObject,
   SnapshotSummary,
   StoreGetResponse,
+  StoreListRequestOptions,
   StoreListResponse,
   StoreListView,
   StorePutResponse,
@@ -106,8 +107,9 @@ export async function listStoreEntries(
   prefix?: string,
   depth = 1,
   snapshot?: string | null,
-  view: StoreListView = "tree"
+  options: StoreListRequestOptions = {}
 ): Promise<StoreListResponse> {
+  const view: StoreListView = options.view ?? "tree";
   const query = new URLSearchParams({
     depth: String(Math.max(1, depth))
   });
@@ -118,6 +120,18 @@ export async function listStoreEntries(
     query.set("snapshot", snapshot.trim());
   }
   query.set("view", view);
+  if (typeof options.offset === "number" && Number.isFinite(options.offset) && options.offset >= 0) {
+    query.set("offset", String(Math.floor(options.offset)));
+  }
+  if (typeof options.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
+    query.set("limit", String(Math.max(1, Math.floor(options.limit))));
+  }
+  if (options.sort) {
+    query.set("sort", options.sort);
+  }
+  if (options.mediaFilter) {
+    query.set("media_filter", options.mediaFilter);
+  }
   return fetchJson<StoreListResponse>(`${apiV1("/store/list")}?${query.toString()}`);
 }
 

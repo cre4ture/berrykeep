@@ -719,6 +719,11 @@ mod tests {
                 prefix: String::new(),
                 depth: 1,
                 entry_count: 0,
+                total_entry_count: 0,
+                offset: 0,
+                limit: None,
+                has_more: false,
+                media_summary: crate::ironmesh_client::StoreIndexMediaSummary::default(),
                 entries: Vec::new(),
             })
         }
@@ -774,6 +779,11 @@ mod tests {
                 prefix: String::new(),
                 depth: 1,
                 entry_count: 1,
+                total_entry_count: 1,
+                offset: 0,
+                limit: None,
+                has_more: false,
+                media_summary: crate::ironmesh_client::StoreIndexMediaSummary::default(),
                 entries: vec![crate::ironmesh_client::StoreIndexEntry {
                     path: "docs/readme.txt".to_string(),
                     entry_type: "key".to_string(),

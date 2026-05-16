@@ -4,6 +4,7 @@ import {
   PageHeader,
   type GalleryBasemapConfig,
   type GalleryEntry,
+  type GalleryLoadEntriesOptions,
   type GalleryMediaRequests
 } from "@ironmesh/ui";
 import { useCallback } from "react";
@@ -52,8 +53,12 @@ const CLIENT_GALLERY_BASEMAPS: GalleryBasemapConfig[] = [
 export function GalleryPage() {
   const loadSnapshots = useCallback(() => listSnapshots(), []);
   const loadEntries = useCallback(
-    (prefix: string, depth: number, snapshotId: string | null) =>
-      listStoreEntries(prefix, depth, snapshotId),
+    (
+      prefix: string,
+      depth: number,
+      snapshotId: string | null,
+      options?: GalleryLoadEntriesOptions
+    ) => listStoreEntries(prefix, depth, snapshotId, options),
     []
   );
   const getMediaRequests = useCallback(

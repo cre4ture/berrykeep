@@ -3,6 +3,7 @@ import {
   GallerySurface,
   type GalleryBasemapConfig,
   type GalleryEntry,
+  type GalleryLoadEntriesOptions,
   type GalleryMediaRequests
 } from "@ironmesh/ui";
 import { useCallback } from "react";
@@ -61,8 +62,12 @@ export function GalleryPage() {
     [adminTokenOverride]
   );
   const loadEntries = useCallback(
-    (prefix: string, depth: number, snapshotId: string | null) =>
-      listAdminStoreEntries(prefix, depth, snapshotId, adminTokenOverride),
+    (
+      prefix: string,
+      depth: number,
+      snapshotId: string | null,
+      options?: GalleryLoadEntriesOptions
+    ) => listAdminStoreEntries(prefix, depth, snapshotId, adminTokenOverride, options),
     [adminTokenOverride]
   );
   const getMediaRequests = useCallback(

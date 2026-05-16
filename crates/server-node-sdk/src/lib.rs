@@ -8627,6 +8627,10 @@ struct StoreIndexQuery {
     depth: Option<usize>,
     snapshot: Option<String>,
     view: Option<StoreIndexView>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    sort: Option<StoreIndexSortOrder>,
+    media_filter: Option<StoreIndexMediaFilter>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -8634,6 +8638,21 @@ struct StoreIndexQuery {
 enum StoreIndexView {
     Raw,
     Tree,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StoreIndexSortOrder {
+    PathAsc,
+    CapturedDesc,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StoreIndexMediaFilter {
+    All,
+    Image,
+    Video,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8719,11 +8738,27 @@ struct StoreIndexEntry {
     media: Option<MediaIndexResponse>,
 }
 
+#[derive(Debug, Default, Serialize)]
+struct StoreIndexMediaSummary {
+    ready_count: usize,
+    pending_count: usize,
+    incomplete_count: usize,
+    image_count: usize,
+    video_count: usize,
+    geotagged_count: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct StoreIndexResponse {
     prefix: String,
     depth: usize,
     entry_count: usize,
+    total_entry_count: usize,
+    offset: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
+    has_more: bool,
+    media_summary: StoreIndexMediaSummary,
     entries: Vec<StoreIndexEntry>,
 }
 
@@ -10085,6 +10120,10 @@ async fn list_store_index_admin(
             "depth": query.depth,
             "snapshot": query.snapshot.clone(),
             "view": query.view,
+            "offset": query.offset,
+            "limit": query.limit,
+            "sort": query.sort,
+            "media_filter": query.media_filter,
         }),
     )
     .await
@@ -10307,12 +10346,37 @@ async fn list_store_index_response(
         entries = collapse_store_index_entries_for_tree_view(entries);
     }
 
+    if let Some(media_filter) = query.media_filter {
+        entries.retain(|entry| matches_store_index_media_filter(entry, media_filter));
+    }
+
+    if let Some(sort) = query.sort {
+        sort_store_index_entries(&mut entries, sort);
+    }
+
+    let total_entry_count = entries.len();
+    let media_summary = summarize_store_index_entries(&entries);
+    let offset = query.offset.unwrap_or(0).min(total_entry_count);
+    let limit = query.limit.map(|value| value.max(1));
+    let has_more = limit
+        .map(|value| offset.saturating_add(value) < total_entry_count)
+        .unwrap_or(false);
+    entries = match limit {
+        Some(value) => entries.into_iter().skip(offset).take(value).collect(),
+        None => entries.into_iter().skip(offset).collect(),
+    };
+
     let mut response = (
         StatusCode::OK,
         Json(StoreIndexResponse {
             prefix,
             depth,
             entry_count: entries.len(),
+            total_entry_count,
+            offset,
+            limit,
+            has_more,
+            media_summary,
             entries,
         }),
     )
@@ -10353,6 +10417,125 @@ fn collapse_store_index_entries_for_tree_view(
     }
 
     collapsed.into_values().collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreIndexMediaKind {
+    Image,
+    Video,
+}
+
+fn store_index_entry_media_kind(entry: &StoreIndexEntry) -> Option<StoreIndexMediaKind> {
+    if entry.entry_type != "key" {
+        return None;
+    }
+
+    if entry
+        .media
+        .as_ref()
+        .and_then(|media| media.mime_type.as_deref())
+        .is_some_and(|mime| mime.starts_with("image/"))
+    {
+        return Some(StoreIndexMediaKind::Image);
+    }
+
+    if entry
+        .media
+        .as_ref()
+        .and_then(|media| media.mime_type.as_deref())
+        .is_some_and(|mime| mime.starts_with("video/"))
+    {
+        return Some(StoreIndexMediaKind::Video);
+    }
+
+    if entry
+        .media
+        .as_ref()
+        .and_then(|media| media.media_type.as_deref())
+        == Some("image")
+    {
+        return Some(StoreIndexMediaKind::Image);
+    }
+
+    if entry
+        .media
+        .as_ref()
+        .and_then(|media| media.media_type.as_deref())
+        == Some("video")
+    {
+        return Some(StoreIndexMediaKind::Video);
+    }
+
+    match media_type_for_path(&entry.path) {
+        Some("image") => Some(StoreIndexMediaKind::Image),
+        Some("video") => Some(StoreIndexMediaKind::Video),
+        _ => None,
+    }
+}
+
+fn matches_store_index_media_filter(
+    entry: &StoreIndexEntry,
+    filter: StoreIndexMediaFilter,
+) -> bool {
+    let kind = store_index_entry_media_kind(entry);
+    match filter {
+        StoreIndexMediaFilter::All => kind.is_some(),
+        StoreIndexMediaFilter::Image => kind == Some(StoreIndexMediaKind::Image),
+        StoreIndexMediaFilter::Video => kind == Some(StoreIndexMediaKind::Video),
+    }
+}
+
+fn sort_store_index_entries(entries: &mut [StoreIndexEntry], sort: StoreIndexSortOrder) {
+    entries.sort_by(|left, right| match sort {
+        StoreIndexSortOrder::PathAsc => left.path.cmp(&right.path),
+        StoreIndexSortOrder::CapturedDesc => {
+            let left_taken_at = left
+                .media
+                .as_ref()
+                .and_then(|media| media.taken_at_unix)
+                .unwrap_or(0);
+            let right_taken_at = right
+                .media
+                .as_ref()
+                .and_then(|media| media.taken_at_unix)
+                .unwrap_or(0);
+            right_taken_at
+                .cmp(&left_taken_at)
+                .then_with(|| left.path.cmp(&right.path))
+        }
+    });
+}
+
+fn summarize_store_index_entries(entries: &[StoreIndexEntry]) -> StoreIndexMediaSummary {
+    let mut summary = StoreIndexMediaSummary::default();
+
+    for entry in entries {
+        match store_index_entry_media_kind(entry) {
+            Some(StoreIndexMediaKind::Image) => summary.image_count += 1,
+            Some(StoreIndexMediaKind::Video) => summary.video_count += 1,
+            None => {}
+        }
+
+        if let Some(media) = entry.media.as_ref() {
+            match media.status.as_str() {
+                "ready" => summary.ready_count += 1,
+                "pending" => summary.pending_count += 1,
+                "incomplete" => summary.incomplete_count += 1,
+                _ => {}
+            }
+        }
+
+        if entry
+            .media
+            .as_ref()
+            .and_then(|media| media.gps.as_ref())
+            .is_some_and(|gps| gps.latitude.is_finite() && gps.longitude.is_finite())
+        {
+            summary.geotagged_count += 1;
+        }
+    }
+
+    summary
 }
 
 async fn wait_for_store_index_change(

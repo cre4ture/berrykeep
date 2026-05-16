@@ -25,7 +25,7 @@ export function ExplorerPage({ queueFilesToPrefix, onOpenStore }: ExplorerPagePr
       depth: number,
       snapshotId: string | null,
       view: "raw" | "tree" = "tree"
-    ) => listStoreEntries(prefix, depth, snapshotId, view),
+    ) => listStoreEntries(prefix, depth, snapshotId, { view }),
     []
   );
   const readValue = useCallback(

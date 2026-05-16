@@ -24,7 +24,7 @@ export function ExplorerPage() {
       depth: number,
       snapshotId: string | null,
       view: "raw" | "tree" = "tree"
-    ) => listAdminStoreEntries(prefix, depth, snapshotId, adminTokenOverride, view),
+    ) => listAdminStoreEntries(prefix, depth, snapshotId, adminTokenOverride, { view }),
     [adminTokenOverride]
   );
   const readValue = useCallback(

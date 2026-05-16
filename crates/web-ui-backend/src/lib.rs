@@ -13,7 +13,8 @@ use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
     IronMeshClient, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult, RelayMode,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
-    RendezvousEndpointStatus, RequestedRange, StoreIndexView, UploadMode,
+    RendezvousEndpointStatus, RequestedRange, StoreIndexMediaFilter,
+    StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView, UploadMode,
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     ironmesh_client::DownloadRangeRequest,
@@ -421,6 +422,10 @@ struct WebStoreListQuery {
     depth: Option<usize>,
     snapshot: Option<String>,
     view: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    sort: Option<String>,
+    media_filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1963,13 +1968,49 @@ async fn web_store_list(
         }
     };
 
+    let sort = match query.sort.as_deref() {
+        None => None,
+        Some("path_asc") => Some(StoreIndexSortOrder::PathAsc),
+        Some("captured_desc") => Some(StoreIndexSortOrder::CapturedDesc),
+        Some(other) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported store list sort: {other}"),
+            );
+        }
+    };
+
+    let media_filter = match query.media_filter.as_deref() {
+        None => None,
+        Some("all") => Some(StoreIndexMediaFilter::All),
+        Some("image") => Some(StoreIndexMediaFilter::Image),
+        Some("video") => Some(StoreIndexMediaFilter::Video),
+        Some(other) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported store list media filter: {other}"),
+            );
+        }
+    };
+
     match current_sdk(&state)
         .await
-        .store_index_with_view(
+        .store_index_with_options(
             query.prefix.as_deref(),
             query.depth.unwrap_or(1).max(1),
             query.snapshot.as_deref(),
-            view,
+            StoreIndexRequestOptions {
+                view,
+                offset: query.offset,
+                limit: query.limit,
+                sort,
+                media_filter,
+                synthesize_missing_folder_markers: matches!(view, Some(StoreIndexView::Tree))
+                    && query.offset.is_none()
+                    && query.limit.is_none()
+                    && sort.is_none()
+                    && media_filter.is_none(),
+            },
         )
         .await
     {
