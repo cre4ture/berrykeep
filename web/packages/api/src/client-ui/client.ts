@@ -397,6 +397,26 @@ export async function getVersionGraph(key: string): Promise<VersionGraphResponse
   );
 }
 
+export async function restoreStoreVersion(
+  key: string,
+  versionId: string,
+  targetPath: string
+): Promise<JsonObject | null> {
+  return fetchJson<JsonObject | null>(
+    `${apiV1("/versions")}/${encodeURIComponent(key)}/restore/${encodeURIComponent(versionId)}`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        to_path: targetPath,
+        overwrite: false
+      })
+    }
+  );
+}
+
 async function readJsonResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));

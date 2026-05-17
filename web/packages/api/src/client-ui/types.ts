@@ -195,5 +195,6 @@ export type VersionSummary = {
 
 export type VersionGraphResponse = {
   key?: string;
+  preferred_head_version_id?: string | null;
   versions: VersionSummary[];
 } & JsonObject;

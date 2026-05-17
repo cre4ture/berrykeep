@@ -295,6 +295,10 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/health", get(web_health))
         .route("/snapshots", get(web_snapshots))
         .route("/versions", get(web_versions))
+        .route(
+            "/versions/{key}/restore/{version_id}",
+            post(web_version_restore),
+        )
         .route("/cluster/status", get(web_cluster_status))
         .route("/cluster/nodes", get(web_cluster_nodes))
         .route("/cluster/replication/plan", get(web_replication_plan))
@@ -341,6 +345,10 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/health", get(web_health))
         .route("/api/snapshots", get(web_snapshots))
         .route("/api/versions", get(web_versions))
+        .route(
+            "/api/versions/{key}/restore/{version_id}",
+            post(web_version_restore),
+        )
         .route("/api/cluster/status", get(web_cluster_status))
         .route("/api/cluster/nodes", get(web_cluster_nodes))
         .route("/api/cluster/replication/plan", get(web_replication_plan))
@@ -464,6 +472,12 @@ struct WebStoreRestoreRequest {
     target_path: String,
     #[serde(default)]
     recursive: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebVersionRestoreRequest {
+    #[serde(alias = "target_path")]
+    to_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1520,6 +1534,33 @@ async fn web_versions(
         .await
     {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
+async fn web_version_restore(
+    State(state): State<WebState>,
+    Path((key, version_id)): Path<(String, String)>,
+    Json(request): Json<WebVersionRestoreRequest>,
+) -> impl IntoResponse {
+    if key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
+    }
+    if version_id.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "version_id must not be empty");
+    }
+
+    let target_path = normalize_store_restore_path(&request.to_path, false);
+    if target_path.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "target_path must not be empty");
+    }
+
+    match current_client(&state)
+        .await
+        .restore_version_path(key, version_id, target_path, false)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }

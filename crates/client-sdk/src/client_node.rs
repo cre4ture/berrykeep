@@ -196,6 +196,23 @@ impl ClientNode {
         self.client.list_versions(key).await
     }
 
+    pub async fn restore_version_path(
+        &self,
+        key: impl Into<String>,
+        version_id: impl Into<String>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+    ) -> Result<()> {
+        let key = key.into();
+        let version_id = version_id.into();
+        let to_path = to_path.into();
+        self.client
+            .restore_version_path(key, version_id, to_path.clone(), overwrite)
+            .await?;
+        self.cache.write().await.remove(&to_path);
+        Ok(())
+    }
+
     pub async fn head_object(
         &self,
         key: impl AsRef<str>,

@@ -22,7 +22,8 @@ use crate::{
     list_store_index_response, list_tombstone_archives, list_versions, list_versions_response,
     placement_for_key, put_object, reconcile_from_node, redeem_client_bootstrap_claim,
     rename_object_path, replication, replication_plan, request_has_admin_auth, require_client_auth,
-    require_client_or_admin_auth, require_internal_caller, restore_snapshot_path, run_cleanup,
+    require_client_or_admin_auth, require_internal_caller, restore_snapshot_path,
+    restore_version_path, run_cleanup,
     run_tombstone_archive_purge, run_tombstone_archive_restore, run_tombstone_compaction,
     start_upload_session, storage_stats_current, storage_stats_history,
     transport_headers_from_response, trigger_replication_audit, upload_session_chunk,
@@ -276,7 +277,10 @@ async fn try_execute_direct_transport_request(
                 return Ok(Some(response));
             }
             let key = decode_route_tail(path, "/versions/")?;
-            Some(list_versions_response(state, &key).await)
+            Some(
+                list_versions_response(state, &key, crate::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE)
+                    .await,
+            )
         }
         _ => None,
     };
@@ -480,6 +484,10 @@ fn build_public_transport_router(state: ServerState) -> Router {
             "/versions/{key}/confirm/{version_id}",
             post(confirm_version),
         )
+        .route(
+            "/versions/{key}/restore/{version_id}",
+            post(restore_version_path),
+        )
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -637,6 +645,10 @@ fn build_internal_transport_router(state: ServerState) -> Router {
         .route(
             "/versions/{key}/confirm/{version_id}",
             post(confirm_version),
+        )
+        .route(
+            "/versions/{key}/restore/{version_id}",
+            post(restore_version_path),
         )
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .merge(build_internal_peer_api())

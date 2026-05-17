@@ -1318,6 +1318,12 @@ struct SnapshotRestoreRequest {
     overwrite: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct VersionRestoreRequest {
+    to_path: String,
+    overwrite: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotRestoreResponse {
     pub snapshot_id: String,
@@ -1974,6 +1980,57 @@ impl IronMeshClient {
                 .context("failed to parse /versions response"),
             StatusCode::NOT_FOUND => Ok(None),
             status => Err(anyhow!("versions lookup failed for {key}: {status}")),
+        }
+    }
+
+    pub async fn restore_version_path(
+        &self,
+        key: impl Into<String>,
+        version_id: impl Into<String>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+    ) -> Result<()> {
+        let key = key.into();
+        let version_id = version_id.into();
+        let to_path = to_path.into();
+        let url = self.store_version_restore_url(&key, &version_id)?;
+        let payload = serde_json::to_vec(&VersionRestoreRequest {
+            to_path: to_path.clone(),
+            overwrite,
+        })
+        .context("failed to encode version restore request")?;
+
+        let response = self
+            .execute_buffered_request(
+                Method::POST,
+                url,
+                vec![json_content_type_header()],
+                Some(payload),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to restore version {} for {} -> {}",
+                    version_id, key, to_path
+                )
+            })?;
+
+        match response.status {
+            StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::NOT_FOUND => bail!(
+                "version restore source not found for {}@{}",
+                key,
+                version_id
+            ),
+            StatusCode::CONFLICT => {
+                bail!("version restore target path already exists: {to_path}")
+            }
+            status => Err(anyhow!(
+                "version restore failed for {}@{} -> {}: {status}",
+                key,
+                version_id,
+                to_path
+            )),
         }
     }
 
@@ -3432,6 +3489,22 @@ impl IronMeshClient {
                 .map_err(|_| anyhow!("server URL cannot be a base"))?;
             segments.push("versions");
             segments.push(key);
+        }
+
+        Ok(url)
+    }
+
+    fn store_version_restore_url(&self, key: &str, version_id: &str) -> Result<Url> {
+        let mut url = self.client_api_base_url()?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("versions");
+            segments.push(key);
+            segments.push("restore");
+            segments.push(version_id);
         }
 
         Ok(url)

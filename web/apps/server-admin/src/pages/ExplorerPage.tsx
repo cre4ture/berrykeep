@@ -6,6 +6,7 @@ import {
   listAdminSnapshots,
   listAdminStoreEntries,
   renameAdminStorePath,
+  restoreAdminStoreVersion,
   restoreAdminStorePathFromSnapshot
 } from "@ironmesh/api";
 import { ExplorerSurface } from "@ironmesh/ui";
@@ -52,6 +53,8 @@ export function ExplorerPage() {
         deletePath: (path) => deleteAdminStorePath(path, adminTokenOverride),
         renamePath: (fromPath, toPath) =>
           renameAdminStorePath(fromPath, toPath, false, adminTokenOverride),
+        restoreVersion: (key, versionId, targetPath) =>
+          restoreAdminStoreVersion(key, versionId, targetPath, adminTokenOverride),
         restoreSnapshotPath: (snapshotId, sourcePath, targetPath, recursive) =>
           restoreAdminStorePathFromSnapshot(
             snapshotId,

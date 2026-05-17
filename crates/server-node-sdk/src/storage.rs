@@ -117,6 +117,8 @@ struct FileVersionIndex {
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionRecordSummary {
     pub version_id: String,
+    #[serde(skip_serializing)]
+    pub manifest_hash: String,
     pub logical_path: Option<String>,
     pub parent_version_ids: Vec<String>,
     pub state: VersionConsistencyState,
@@ -3663,6 +3665,7 @@ impl PersistentStore {
             .values()
             .map(|record| VersionRecordSummary {
                 version_id: record.version_id.clone(),
+                manifest_hash: record.manifest_hash.clone(),
                 logical_path: record.logical_path.clone(),
                 parent_version_ids: record.parent_version_ids.clone(),
                 state: record.state.clone(),
@@ -6216,21 +6219,14 @@ impl PersistentStore {
             .await
     }
 
-    async fn restore_snapshot_object_path_inner(
+    async fn restore_object_path_from_source(
         &mut self,
-        snapshot_state: &SnapshotObjectState,
+        source: SnapshotRestoreSource,
         source_path: &str,
         target_path: &str,
         create_snapshot: bool,
         overwrite: bool,
     ) -> Result<PathMutationResult> {
-        let Some(source) = self
-            .snapshot_restore_source(snapshot_state, source_path)
-            .await?
-        else {
-            return Ok(PathMutationResult::SourceMissing);
-        };
-
         if source_path != target_path && self.current_state.object_ids.contains_key(target_path) {
             if !overwrite {
                 return Ok(PathMutationResult::TargetExists);
@@ -6321,6 +6317,31 @@ impl PersistentStore {
         Ok(PathMutationResult::Applied)
     }
 
+    async fn restore_snapshot_object_path_inner(
+        &mut self,
+        snapshot_state: &SnapshotObjectState,
+        source_path: &str,
+        target_path: &str,
+        create_snapshot: bool,
+        overwrite: bool,
+    ) -> Result<PathMutationResult> {
+        let Some(source) = self
+            .snapshot_restore_source(snapshot_state, source_path)
+            .await?
+        else {
+            return Ok(PathMutationResult::SourceMissing);
+        };
+
+        self.restore_object_path_from_source(
+            source,
+            source_path,
+            target_path,
+            create_snapshot,
+            overwrite,
+        )
+        .await
+    }
+
     async fn snapshot_restore_source(
         &self,
         snapshot_state: &SnapshotObjectState,
@@ -6376,6 +6397,56 @@ impl PersistentStore {
                 .map(|record| record.state.clone())
                 .unwrap_or(VersionConsistencyState::Confirmed),
         }))
+    }
+
+    async fn version_restore_source(
+        &self,
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<SnapshotRestoreSource>> {
+        let Some(source_object_id) = self.object_id_for_key(source_path) else {
+            return Ok(None);
+        };
+
+        let Some(index) = self
+            .load_version_index_by_object_id(&source_object_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let Some(record) = index.versions.get(version_id) else {
+            return Ok(None);
+        };
+
+        if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        Ok(Some(SnapshotRestoreSource {
+            manifest_hash: record.manifest_hash.clone(),
+            object_id: Some(source_object_id),
+            version_id: Some(record.version_id.clone()),
+            state: record.state.clone(),
+        }))
+    }
+
+    pub async fn restore_version_path(
+        &mut self,
+        source_path: &str,
+        version_id: &str,
+        target_path: &str,
+        overwrite: bool,
+    ) -> Result<PathMutationResult> {
+        let Some(source) = self
+            .version_restore_source(source_path, version_id)
+            .await?
+        else {
+            return Ok(PathMutationResult::SourceMissing);
+        };
+
+        self.restore_object_path_from_source(source, source_path, target_path, true, overwrite)
+            .await
     }
 
     async fn resolve_object_id_for_key_history(&self, key: &str) -> Result<Option<String>> {

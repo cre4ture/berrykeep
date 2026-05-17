@@ -9,6 +9,7 @@ import {
   NumberInput,
   Select,
   Stack,
+  Switch,
   Table,
   Text,
   TextInput,
@@ -61,17 +62,27 @@ export type ExplorerValueResponse = {
   preview_size_bytes?: number | null;
 } & Record<string, unknown>;
 
+export type ExplorerVersionEntry = {
+  version_id: string;
+  entry_type?: string;
+  size_bytes?: number | null;
+  modified_at_unix?: number | null;
+  created_at_unix?: number | null;
+  content_fingerprint?: string | null;
+  media?: Record<string, unknown> | null;
+} & Record<string, unknown>;
+
 export type ExplorerVersionGraph = {
   key?: string;
-  versions: Array<{
-    version_id: string;
-  } & Record<string, unknown>>;
+  preferred_head_version_id?: string | null;
+  versions: ExplorerVersionEntry[];
 } & Record<string, unknown>;
 
 export type ExplorerMutationConfig = {
   createFolderMarker?: (markerKey: string) => Promise<unknown>;
   deletePath?: (path: string) => Promise<unknown>;
   renamePath?: (fromPath: string, toPath: string) => Promise<unknown>;
+  restoreVersion?: (key: string, versionId: string, targetPath: string) => Promise<unknown>;
   restoreSnapshotPath?: (
     snapshotId: string,
     sourcePath: string,
@@ -149,6 +160,7 @@ export function ExplorerSurface({
   const [error, setError] = useState<string | null>(null);
   const [sortField, setSortField] = useState<ExplorerSortField>("path");
   const [sortDirection, setSortDirection] = useState<ExplorerSortDirection>("asc");
+  const [showThumbnails, setShowThumbnails] = useState(false);
   const quickUploadInputRef = useRef<HTMLInputElement | null>(null);
   const canCreateFolder = snapshotId == null && mutations?.createFolderMarker != null;
   const canDeleteCurrentStore = snapshotId == null && mutations?.deletePath != null;
@@ -156,6 +168,7 @@ export function ExplorerSurface({
   const hasCurrentDataActions =
     snapshotId == null &&
     (canCreateFolder || canDeleteCurrentStore || canRenameCurrentStore || quickUpload != null);
+  const canRestoreVersion = snapshotId == null && mutations?.restoreVersion != null;
   const canRestoreSnapshot = snapshotId != null && mutations?.restoreSnapshotPath != null;
 
   const sortedEntries = useMemo(() => {
@@ -521,26 +534,44 @@ export function ExplorerSurface({
     }
   }
 
-  async function loadVersionGraph() {
+  async function loadVersionGraph(nextKey?: string) {
     if (!loadVersions) {
       setError("Version history is not available on this surface.");
       return;
     }
-    if (!versionKey.trim()) {
+    const targetKey = (nextKey ?? versionKey).trim();
+    if (!targetKey) {
       setError("Enter a key to load version history.");
       return;
     }
 
     setLoading("versions");
     setError(null);
+    setVersionKey(targetKey);
     try {
-      const payload = await loadVersions(versionKey.trim());
+      const payload = await loadVersions(targetKey);
       setVersionsPayload(payload);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed loading versions");
     } finally {
       setLoading(null);
     }
+  }
+
+  async function showEntryHistory(entry: ExplorerEntry) {
+    if (!loadVersions) {
+      setError("Version history is not available on this surface.");
+      return;
+    }
+
+    const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+    const targetKey = normalizeExplorerPath(entry.path, isPrefix);
+    if (!targetKey) {
+      setError("Path must not be empty.");
+      return;
+    }
+
+    await loadVersionGraph(targetKey);
   }
 
   async function readVersion(versionId: string) {
@@ -556,6 +587,58 @@ export function ExplorerSurface({
       setSelectedPayload(payload);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed reading version");
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  async function restoreVersion(version: ExplorerVersionEntry) {
+    const sourceKey = (versionsPayload?.key ?? versionKey).trim();
+    if (!canRestoreVersion || !mutations?.restoreVersion) {
+      setError("Version restore is not available on this surface.");
+      return;
+    }
+    if (!sourceKey) {
+      setError("Enter a key before restoring a version.");
+      return;
+    }
+
+    const requestedTargetPath =
+      typeof window === "undefined"
+        ? sourceKey
+        : window.prompt(
+            `Restore version "${version.version_id}" into current data at path:`,
+            sourceKey
+          );
+    if (requestedTargetPath == null) {
+      return;
+    }
+
+    const targetPath = normalizeExplorerPath(requestedTargetPath, false);
+    if (!targetPath) {
+      setError("Target path must not be empty.");
+      return;
+    }
+    if (targetPath.endsWith("/")) {
+      setError("Target path for a version restore must not end with '/'.");
+      return;
+    }
+
+    setLoading(`restore-version:${version.version_id}`);
+    setError(null);
+    try {
+      const response = await mutations.restoreVersion(sourceKey, version.version_id, targetPath);
+      setSelectedPayload({
+        action: "restored_version",
+        key: sourceKey,
+        version_id: version.version_id,
+        target_path: targetPath,
+        response
+      });
+      await refreshEntries();
+      await loadVersionGraph(sourceKey);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed restoring version");
     } finally {
       setLoading(null);
     }
@@ -577,6 +660,8 @@ export function ExplorerSurface({
     : hasCurrentDataActions
       ? currentDataHint
       : readOnlyHint;
+  const currentVersionId = versionsPayload?.preferred_head_version_id?.trim() || null;
+  const versionEntries = versionsPayload?.versions ?? [];
 
   return (
     <Stack gap="lg">
@@ -645,14 +730,21 @@ export function ExplorerSurface({
                   />
                 </Grid.Col>
               </Grid>
-              <Group gap="sm">
-                <Button onClick={() => void refreshEntries()}>Load entries</Button>
-                <Button variant="default" onClick={() => void refreshEntries(parentPrefix(prefix))}>
-                  Up one prefix
-                </Button>
-                <Button variant="subtle" onClick={() => void refreshEntries("")}>
-                  Root
-                </Button>
+              <Group justify="space-between" align="center">
+                <Group gap="sm">
+                  <Button onClick={() => void refreshEntries()}>Load entries</Button>
+                  <Button variant="default" onClick={() => void refreshEntries(parentPrefix(prefix))}>
+                    Up one prefix
+                  </Button>
+                  <Button variant="subtle" onClick={() => void refreshEntries("")}>
+                    Root
+                  </Button>
+                </Group>
+                <Switch
+                  label="Show thumbnails"
+                  checked={showThumbnails}
+                  onChange={(event) => setShowThumbnails(event.currentTarget.checked)}
+                />
               </Group>
               {canCreateFolder || quickUpload ? (
                 <Grid>
@@ -719,6 +811,7 @@ export function ExplorerSurface({
                 <Table striped highlightOnHover withTableBorder>
                   <Table.Thead>
                     <Table.Tr>
+                      {showThumbnails ? <Table.Th>Thumb</Table.Th> : null}
                       <Table.Th>
                         {renderExplorerHeader("Path", "path", sortField, sortDirection, toggleSort)}
                       </Table.Th>
@@ -744,8 +837,17 @@ export function ExplorerSurface({
                     {sortedEntries.map((entry) => {
                       const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
                       const displayPath = explorerDisplayPath(entry, prefix);
+                      const historyTargetKey = normalizeExplorerPath(entry.path, isPrefix);
                       return (
                         <Table.Tr key={entry.path}>
+                          {showThumbnails ? (
+                            <Table.Td>
+                              <ExplorerThumbnailCell
+                                url={thumbnailUrlForExplorerMedia(entry.media)}
+                                alt={`Thumbnail for ${displayPath}`}
+                              />
+                            </Table.Td>
+                          ) : null}
                           <Table.Td>
                             <Code>{displayPath}</Code>
                           </Table.Td>
@@ -758,6 +860,16 @@ export function ExplorerSurface({
                                 <Button size="xs" variant="light" onClick={() => void readEntry(entry)}>
                                   Open
                                 </Button>
+                                {loadVersions ? (
+                                  <Button
+                                    size="xs"
+                                    variant="default"
+                                    loading={loading === "versions" && versionKey === historyTargetKey}
+                                    onClick={() => void showEntryHistory(entry)}
+                                  >
+                                    History
+                                  </Button>
+                                ) : null}
                                 {canRestoreSnapshot ? (
                                   <Button
                                     size="xs"
@@ -812,6 +924,16 @@ export function ExplorerSurface({
                                 {getDownloadUrl ? (
                                   <Button size="xs" variant="default" onClick={() => downloadEntry(entry)}>
                                     Download
+                                  </Button>
+                                ) : null}
+                                {loadVersions ? (
+                                  <Button
+                                    size="xs"
+                                    variant="default"
+                                    loading={loading === "versions" && versionKey === historyTargetKey}
+                                    onClick={() => void showEntryHistory(entry)}
+                                  >
+                                    History
                                   </Button>
                                 ) : null}
                                 {canRestoreSnapshot ? (
@@ -885,33 +1007,72 @@ export function ExplorerSurface({
                     label="Key"
                     value={versionKey}
                     onChange={(event) => setVersionKey(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void loadVersionGraph();
+                      }
+                    }}
                     placeholder="docs/readme.txt"
                   />
                   <Button loading={loading === "versions"} onClick={() => void loadVersionGraph()}>
                     Load versions
                   </Button>
-                  <Table.ScrollContainer minWidth={520}>
+                  <Table.ScrollContainer minWidth={720}>
                     <Table striped highlightOnHover withTableBorder>
                       <Table.Thead>
                         <Table.Tr>
+                          {showThumbnails ? <Table.Th>Thumb</Table.Th> : null}
                           <Table.Th>Version ID</Table.Th>
+                          <Table.Th>Type</Table.Th>
+                          <Table.Th>Size</Table.Th>
+                          <Table.Th>Modified</Table.Th>
                           <Table.Th>Action</Table.Th>
                         </Table.Tr>
                       </Table.Thead>
                       <Table.Tbody>
-                        {(versionsPayload?.versions ?? []).map((version) => (
+                        {versionEntries.map((version) => (
                           <Table.Tr key={version.version_id}>
+                            {showThumbnails ? (
+                              <Table.Td>
+                                <ExplorerThumbnailCell
+                                  url={thumbnailUrlForExplorerMedia(version.media)}
+                                  alt={`Thumbnail for version ${version.version_id}`}
+                                />
+                              </Table.Td>
+                            ) : null}
                             <Table.Td>
                               <Code>{version.version_id}</Code>
                             </Table.Td>
+                            <Table.Td>{normalizeExplorerVersionType(version)}</Table.Td>
+                            <Table.Td>{formatExplorerSize(version.size_bytes)}</Table.Td>
                             <Table.Td>
-                              <Button
-                                size="xs"
-                                variant="light"
-                                onClick={() => void readVersion(version.version_id)}
-                              >
-                                Read
-                              </Button>
+                              {formatExplorerModifiedAt(
+                                version.modified_at_unix ?? version.created_at_unix
+                              )}
+                            </Table.Td>
+                            <Table.Td>
+                              <Group gap="xs" wrap="nowrap">
+                                <Button
+                                  size="xs"
+                                  variant="light"
+                                  onClick={() => void readVersion(version.version_id)}
+                                >
+                                  Read
+                                </Button>
+                                {canRestoreVersion &&
+                                currentVersionId != null &&
+                                version.version_id !== currentVersionId ? (
+                                  <Button
+                                    size="xs"
+                                    variant="default"
+                                    loading={loading === `restore-version:${version.version_id}`}
+                                    onClick={() => void restoreVersion(version)}
+                                  >
+                                    Restore
+                                  </Button>
+                                ) : null}
+                              </Group>
                             </Table.Td>
                           </Table.Tr>
                         ))}
@@ -1071,6 +1232,13 @@ function normalizeExplorerType(entry: ExplorerEntry): string {
   return entry.entry_type === "prefix" || entry.path.endsWith("/") ? "prefix" : entry.entry_type;
 }
 
+function normalizeExplorerVersionType(version: ExplorerVersionEntry): string {
+  if (typeof version.entry_type === "string" && version.entry_type.trim()) {
+    return version.entry_type.trim();
+  }
+  return "key";
+}
+
 function formatExplorerModifiedAt(value: number | null | undefined): string {
   if (!value) {
     return "—";
@@ -1095,6 +1263,51 @@ function formatExplorerSize(value: number | null | undefined): string {
   }
   const rounded = size >= 10 ? size.toFixed(0) : size.toFixed(1);
   return `${rounded} ${units[unitIndex]}`;
+}
+
+function thumbnailUrlForExplorerMedia(media: Record<string, unknown> | null | undefined): string | null {
+  if (!media || typeof media !== "object") {
+    return null;
+  }
+
+  const thumbnail = media.thumbnail;
+  if (!thumbnail || typeof thumbnail !== "object") {
+    return null;
+  }
+
+  const url = (thumbnail as Record<string, unknown>).url;
+  return typeof url === "string" && url.trim() ? url : null;
+}
+
+function ExplorerThumbnailCell({ url, alt }: { url: string | null; alt: string }) {
+  return (
+    <div
+      style={{
+        width: 52,
+        height: 52,
+        borderRadius: 8,
+        overflow: "hidden",
+        background: "var(--mantine-color-gray-0)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center"
+      }}
+    >
+      {url ? (
+        <img
+          src={url}
+          alt={alt}
+          loading="lazy"
+          decoding="async"
+          style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+        />
+      ) : (
+        <Text size="xs" c="dimmed">
+          —
+        </Text>
+      )}
+    </div>
+  );
 }
 
 function parentPrefix(path: string): string {

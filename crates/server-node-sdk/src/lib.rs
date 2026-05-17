@@ -179,7 +179,8 @@ use storage::{
     DataScrubReport, HostDependencyReport, HostDependencyStatus, MediaCacheLookup,
     MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle,
     ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
-    PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
+    PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions,
+    ReconcileVersionEntry, RepairAttemptRecord,
     ReplicationChunkInfo, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
     TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
     promote_cached_media_metadata_to_incomplete,
@@ -4840,6 +4841,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/versions/{key}/confirm/{version_id}",
             post(confirm_version),
         )
+        .route(
+            "/versions/{key}/restore/{version_id}",
+            post(restore_version_path),
+        )
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -4874,6 +4879,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/store/index", get(list_store_index_admin))
         .route("/auth/data-changes", get(list_data_change_events))
         .route("/auth/versions/{key}", get(list_versions_admin))
+        .route(
+            "/auth/versions/{key}/restore/{version_id}",
+            post(restore_version_path),
+        )
         .route("/auth/store/delete", post(delete_object_by_query_admin))
         .route("/auth/store/rename", post(rename_object_path_admin))
         .route("/auth/store/restore", post(restore_snapshot_path))
@@ -8765,6 +8774,42 @@ struct StoreIndexResponse {
     entries: Vec<StoreIndexEntry>,
 }
 
+#[derive(Debug, Serialize)]
+struct VersionRecordResponse {
+    version_id: String,
+    entry_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_path: Option<String>,
+    parent_version_ids: Vec<String>,
+    state: VersionConsistencyState,
+    created_at_unix: u64,
+    modified_at_unix: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copied_from_object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copied_from_version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copied_from_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media: Option<MediaIndexResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct VersionGraphResponse {
+    key: String,
+    object_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_head_version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_head_reason: Option<PreferredHeadReason>,
+    head_version_ids: Vec<String>,
+    versions: Vec<VersionRecordResponse>,
+}
+
 type StoreIndexSnapshotScan = (
     Vec<String>,
     HashMap<String, String>,
@@ -8813,6 +8858,14 @@ struct SnapshotRestoreRequest {
     to_path: String,
     #[serde(default)]
     recursive: bool,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionRestoreRequest {
+    #[serde(alias = "target_path")]
+    to_path: String,
     #[serde(default)]
     overwrite: bool,
 }
@@ -9333,6 +9386,85 @@ async fn restore_snapshot_path(
                 total_elapsed_ms = started.elapsed().as_millis(),
                 error = %err,
                 "failed to restore snapshot path"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn restore_version_path(
+    State(state): State<ServerState>,
+    Path((key, version_id)): Path<(String, String)>,
+    Json(request): Json<VersionRestoreRequest>,
+) -> Response {
+    if key.trim().is_empty() || version_id.trim().is_empty() || request.to_path.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let started = Instant::now();
+    info!(
+        key = %key,
+        version_id = %version_id,
+        to_path = %request.to_path,
+        overwrite = request.overwrite,
+        "version restore request start"
+    );
+    let mut store = lock_store(&state, "store_path.restore_version").await;
+    let store_lock_wait_ms = store.waited_ms();
+    let store_started = Instant::now();
+    match store
+        .restore_version_path(&key, &version_id, &request.to_path, request.overwrite)
+        .await
+    {
+        Ok(PathMutationResult::Applied) => {
+            info!(
+                key = %key,
+                version_id = %version_id,
+                to_path = %request.to_path,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "version restore applied; publishing namespace change"
+            );
+            drop(store);
+            publish_namespace_change(&state);
+            request_local_availability_refresh(&state);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(PathMutationResult::SourceMissing) => {
+            info!(
+                key = %key,
+                version_id = %version_id,
+                to_path = %request.to_path,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "version restore source missing"
+            );
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Ok(PathMutationResult::TargetExists) => {
+            info!(
+                key = %key,
+                version_id = %version_id,
+                conflict_path = %request.to_path,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "version restore target exists"
+            );
+            StatusCode::CONFLICT.into_response()
+        }
+        Err(err) => {
+            tracing::error!(
+                key = %key,
+                version_id = %version_id,
+                to_path = %request.to_path,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                error = %err,
+                "failed to restore version path"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -10302,6 +10434,7 @@ async fn list_store_index_response(
                 entry.media = Some(build_media_index_response(
                     &entry.path,
                     query.snapshot.as_deref(),
+                    None,
                     &lookup,
                     thumbnail_route,
                 ));
@@ -10603,10 +10736,11 @@ async fn wait_for_store_index_change(
 fn build_media_index_response(
     key: &str,
     snapshot: Option<&str>,
+    version: Option<&str>,
     lookup: &MediaCacheLookup,
     thumbnail_route: &str,
 ) -> MediaIndexResponse {
-    let thumbnail_url = build_thumbnail_url(key, snapshot, thumbnail_route);
+    let thumbnail_url = build_thumbnail_url(key, snapshot, version, thumbnail_route);
     let pending_media_type = media_type_for_path(key).unwrap_or("image");
     match lookup.metadata.as_ref() {
         Some(metadata) => MediaIndexResponse {
@@ -10678,16 +10812,25 @@ fn should_advertise_lazy_thumbnail(metadata: &CachedMediaMetadata) -> bool {
         )
 }
 
-fn build_thumbnail_url(key: &str, snapshot: Option<&str>, thumbnail_route: &str) -> String {
+fn build_thumbnail_url(
+    key: &str,
+    snapshot: Option<&str>,
+    version: Option<&str>,
+    thumbnail_route: &str,
+) -> String {
     let encoded_key = utf8_percent_encode(key, QUERY_COMPONENT_ENCODE_SET).to_string();
-    match snapshot {
-        Some(snapshot_id) => {
-            let encoded_snapshot =
-                utf8_percent_encode(snapshot_id, QUERY_COMPONENT_ENCODE_SET).to_string();
-            format!("{thumbnail_route}?key={encoded_key}&snapshot={encoded_snapshot}")
-        }
-        None => format!("{thumbnail_route}?key={encoded_key}"),
+    let mut query = vec![format!("key={encoded_key}")];
+    if let Some(snapshot_id) = snapshot {
+        let encoded_snapshot =
+            utf8_percent_encode(snapshot_id, QUERY_COMPONENT_ENCODE_SET).to_string();
+        query.push(format!("snapshot={encoded_snapshot}"));
     }
+    if let Some(version_id) = version {
+        let encoded_version =
+            utf8_percent_encode(version_id, QUERY_COMPONENT_ENCODE_SET).to_string();
+        query.push(format!("version={encoded_version}"));
+    }
+    format!("{thumbnail_route}?{}", query.join("&"))
 }
 
 fn media_cache_status_label(status: &MediaCacheStatus) -> &'static str {
@@ -12087,6 +12230,7 @@ async fn retry_media_cache_response(
         Json(build_media_index_response(
             &query.key,
             query.snapshot.as_deref(),
+            query.version.as_deref(),
             &lookup,
             thumbnail_route,
         )),
@@ -12107,7 +12251,7 @@ async fn list_versions(
     State(state): State<ServerState>,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    list_versions_response(&state, &key).await
+    list_versions_response(&state, &key, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await
 }
 
 async fn list_versions_admin(
@@ -12131,13 +12275,116 @@ async fn list_versions_admin(
         return status.into_response();
     }
 
-    list_versions_response(&state, &key).await
+    list_versions_response(&state, &key, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
 }
 
-async fn list_versions_response(state: &ServerState, key: &str) -> Response {
+async fn list_versions_response(
+    state: &ServerState,
+    key: &str,
+    thumbnail_route: &str,
+) -> Response {
     let store = read_store(state, "versions.list").await;
     match store.list_versions(key).await {
-        Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
+        Ok(Some(summary)) => {
+            let mut versions = Vec::with_capacity(summary.versions.len());
+            for version in summary.versions {
+                let is_tombstone = version.manifest_hash == TOMBSTONE_MANIFEST_HASH;
+                let version_path = version
+                    .logical_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                    .unwrap_or(key);
+                let mut size_bytes = None;
+                let mut content_fingerprint = None;
+                let mut media = None;
+
+                if !is_tombstone {
+                    match store
+                        .describe_object(
+                            key,
+                            None,
+                            Some(&version.version_id),
+                            ObjectReadMode::Preferred,
+                        )
+                        .await
+                    {
+                        Ok(descriptor) => {
+                            size_bytes = Some(descriptor.total_size_bytes as u64);
+                        }
+                        Err(err) => {
+                            warn!(
+                                key = %key,
+                                version_id = %version.version_id,
+                                error = %err,
+                                "failed to compute version size"
+                            );
+                        }
+                    }
+
+                    match store
+                        .store_index_inspector()
+                        .lookup_media_cache(&version.manifest_hash)
+                        .await
+                    {
+                        Ok(Some(lookup)) => {
+                            content_fingerprint = Some(lookup.content_fingerprint.clone());
+                            if looks_like_media_path(version_path) {
+                                media = Some(build_media_index_response(
+                                    key,
+                                    None,
+                                    Some(&version.version_id),
+                                    &lookup,
+                                    thumbnail_route,
+                                ));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!(
+                                key = %key,
+                                version_id = %version.version_id,
+                                manifest_hash = %version.manifest_hash,
+                                error = %err,
+                                "failed to read cached media metadata for version history"
+                            );
+                        }
+                    }
+                }
+
+                versions.push(VersionRecordResponse {
+                    version_id: version.version_id,
+                    entry_type: if is_tombstone {
+                        "tombstone".to_string()
+                    } else {
+                        "key".to_string()
+                    },
+                    logical_path: version.logical_path,
+                    parent_version_ids: version.parent_version_ids,
+                    state: version.state,
+                    created_at_unix: version.created_at_unix,
+                    modified_at_unix: version.created_at_unix,
+                    copied_from_object_id: version.copied_from_object_id,
+                    copied_from_version_id: version.copied_from_version_id,
+                    copied_from_path: version.copied_from_path,
+                    size_bytes,
+                    content_fingerprint,
+                    media,
+                });
+            }
+
+            (
+                StatusCode::OK,
+                Json(VersionGraphResponse {
+                    key: summary.key,
+                    object_id: summary.object_id,
+                    preferred_head_version_id: summary.preferred_head_version_id,
+                    preferred_head_reason: summary.preferred_head_reason,
+                    head_version_ids: summary.head_version_ids,
+                    versions,
+                }),
+            )
+                .into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
             tracing::error!(key = %key, error = %err, "failed to list versions");

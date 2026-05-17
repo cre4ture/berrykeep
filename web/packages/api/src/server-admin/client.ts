@@ -215,6 +215,25 @@ export async function getAdminVersionGraph(
   );
 }
 
+export async function restoreAdminStoreVersion(
+  key: string,
+  versionId: string,
+  targetPath: string,
+  adminTokenOverride?: string
+): Promise<Record<string, unknown> | null> {
+  return fetchAdminJson<Record<string, unknown> | null>(
+    `${apiV1("/auth/versions")}/${encodeURIComponent(key)}/restore/${encodeURIComponent(versionId)}`,
+    {
+      method: "POST",
+      body: {
+        to_path: targetPath,
+        overwrite: false
+      },
+      adminTokenOverride
+    }
+  );
+}
+
 export async function deleteAdminStorePath(
   path: string,
   adminTokenOverride?: string

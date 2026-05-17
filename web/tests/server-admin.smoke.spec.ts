@@ -223,6 +223,63 @@ test("server-admin explorer restores snapshot entries", async ({ page }) => {
   await expect(page.getByRole("cell", { name: "restored/readme-restored.txt" })).toBeVisible();
 });
 
+test("server-admin explorer loads version history with thumbnails", async ({ page }) => {
+  const mockState = await installServerAdminMocks(page);
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Explorer", { exact: true }).click();
+  await page
+    .getByRole("row", { name: /gallery\/cat\.png/ })
+    .getByRole("button", { name: "History" })
+    .click();
+
+  await expect(page.getByLabel("Key")).toHaveValue("gallery/cat.png");
+  const versionHistoryTable = page.getByRole("table").nth(1);
+  await expect(versionHistoryTable.getByRole("cell", { name: "version-cat-001" })).toBeVisible();
+  await expect(versionHistoryTable.getByRole("row", { name: /version-cat-001/ })).toContainText("3.0 MB");
+  await expect(
+    versionHistoryTable.getByRole("row", { name: /version-cat-001/ }).getByRole("button", { name: "Restore" })
+  ).toHaveCount(0);
+  page.once("dialog", (dialog) => {
+    void dialog.accept("restored/gallery-cat-copy.png");
+  });
+  await versionHistoryTable
+    .getByRole("row", { name: /version-cat-000/ })
+    .getByRole("button", { name: "Restore" })
+    .click();
+  await expect
+    .poll(() => mockState.requestedPaths().includes(apiV1("/auth/versions/gallery%2Fcat.png/restore/version-cat-000")))
+    .toBe(true);
+  await expect
+    .poll(() =>
+      mockState.restoredVersions().some(
+        (entry) =>
+          entry.key === "gallery/cat.png" &&
+          entry.versionId === "version-cat-000" &&
+          entry.targetPath === "restored/gallery-cat-copy.png"
+      )
+    )
+    .toBe(true);
+  await expect(page.getByText('"target_path": "restored/gallery-cat-copy.png"')).toBeVisible();
+  await expect
+    .poll(() => mockState.requestedPaths().includes(apiV1("/auth/versions/gallery%2Fcat.png")))
+    .toBe(true);
+
+  await page.getByText("Show thumbnails", { exact: true }).click();
+  await expect(page.getByAltText("Thumbnail for gallery/cat.png")).toBeVisible();
+  await expect(page.getByAltText("Thumbnail for version version-cat-001")).toBeVisible();
+  await expect.poll(() => mockState.requestedPaths().includes(apiV1("/auth/media/thumbnail"))).toBe(
+    true
+  );
+});
+
 test("server-admin provisioning can target a selected rendezvous service", async ({ page }) => {
   await installServerAdminMocks(page);
 
@@ -557,6 +614,8 @@ async function installServerAdminMocks(
   };
   const galleryEntries = options?.galleryEntries ?? createDefaultAdminGalleryEntries();
   const requestedPaths = new Set<string>();
+  const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
+  const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -613,6 +672,29 @@ async function installServerAdminMocks(
     if (pathname === apiV1("/auth/store/index") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
       return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
+    }
+
+    if (pathname.startsWith(apiV1("/auth/versions/")) && method === "GET") {
+      const key = decodeURIComponent(pathname.slice(`${apiV1("/auth/versions/")}`.length));
+      return json(route, buildAdminVersionGraphResponse(key, currentVersionByKey.get(key) ?? null));
+    }
+
+    if (
+      pathname.startsWith(`${apiV1("/auth/versions")}/`) &&
+      pathname.includes("/restore/") &&
+      method === "POST"
+    ) {
+      const versionPrefix = `${apiV1("/auth/versions")}/`;
+      const [encodedKey, encodedVersionId] = pathname.slice(versionPrefix.length).split("/restore/");
+      const key = decodeURIComponent(encodedKey ?? "");
+      const versionId = decodeURIComponent(encodedVersionId ?? "");
+      const body = route.request().postDataJSON() as {
+        to_path: string;
+        overwrite?: boolean;
+      };
+      restoredVersions.push({ key, versionId, targetPath: body.to_path });
+      await route.fulfill({ status: 204, body: "" });
+      return;
     }
 
     if (pathname === apiV1("/auth/store/restore") && method === "POST") {
@@ -1223,7 +1305,8 @@ async function installServerAdminMocks(
   });
 
   return {
-    requestedPaths: () => Array.from(requestedPaths)
+    requestedPaths: () => Array.from(requestedPaths),
+    restoredVersions: () => restoredVersions.slice()
   };
 }
 
@@ -1270,6 +1353,78 @@ function buildAdminStoreIndexResponse(
     has_more: offset + pagedEntries.length < totalEntryCount,
     media_summary: summarizeAdminMediaEntries(filteredEntries),
     entries: pagedEntries
+  };
+}
+
+function buildAdminVersionGraphResponse(key: string, preferredHeadVersionId: string | null) {
+  if (key === "gallery/cat.png") {
+    return {
+      key,
+      preferred_head_version_id: preferredHeadVersionId,
+      versions: [
+        {
+          version_id: "version-cat-001",
+          entry_type: "key",
+          size_bytes: 3_145_728,
+          modified_at_unix: 1_712_345_678,
+          created_at_unix: 1_712_345_678,
+          media: {
+            status: "ready",
+            media_type: "image",
+            mime_type: "image/png",
+            thumbnail: {
+              url: `${apiV1("/auth/media/thumbnail")}?key=gallery%2Fcat.png&version=version-cat-001`,
+              profile: "grid",
+              width: 256,
+              height: 192,
+              format: "jpeg",
+              size_bytes: 1234
+            }
+          }
+        },
+        {
+          version_id: "version-cat-000",
+          entry_type: "key",
+          size_bytes: 3_145_728,
+          modified_at_unix: 1_712_300_000,
+          created_at_unix: 1_712_300_000,
+          media: {
+            status: "ready",
+            media_type: "image",
+            mime_type: "image/png",
+            thumbnail: {
+              url: `${apiV1("/auth/media/thumbnail")}?key=gallery%2Fcat.png&version=version-cat-000`,
+              profile: "grid",
+              width: 256,
+              height: 192,
+              format: "jpeg",
+              size_bytes: 1234
+            }
+          }
+        }
+      ]
+    };
+  }
+
+  return {
+    key,
+    preferred_head_version_id: preferredHeadVersionId,
+    versions: [
+      {
+        version_id: "version-001",
+        entry_type: "key",
+        size_bytes: 23,
+        modified_at_unix: 1_712_345_600,
+        created_at_unix: 1_712_345_600
+      },
+      {
+        version_id: "version-000",
+        entry_type: "key",
+        size_bytes: 21,
+        modified_at_unix: 1_712_300_000,
+        created_at_unix: 1_712_300_000
+      }
+    ]
   };
 }
 

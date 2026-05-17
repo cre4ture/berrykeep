@@ -7,6 +7,7 @@ import {
   listStoreEntries,
   putStoreValue,
   renameStorePath,
+  restoreStoreVersion,
   restoreStorePathFromSnapshot
 } from "@ironmesh/api";
 import { ExplorerSurface, PageHeader } from "@ironmesh/ui";
@@ -62,6 +63,8 @@ export function ExplorerPage({ queueFilesToPrefix, onOpenStore }: ExplorerPagePr
           createFolderMarker: (markerKey) => putStoreValue(markerKey, ""),
           deletePath: deleteStoreValue,
           renamePath: (fromPath, toPath) => renameStorePath(fromPath, toPath),
+          restoreVersion: (key, versionId, targetPath) =>
+            restoreStoreVersion(key, versionId, targetPath),
           restoreSnapshotPath: restoreStorePathFromSnapshot
         }}
         quickUpload={{
