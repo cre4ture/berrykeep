@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -33,6 +34,11 @@ pub const FOLDER_AGENT_EXE: &str = if cfg!(windows) {
     "ironmesh-folder-agent.exe"
 } else {
     "ironmesh-folder-agent"
+};
+pub const CLIENT_CLI_EXE: &str = if cfg!(windows) {
+    "ironmesh.exe"
+} else {
+    "ironmesh"
 };
 pub const STARTUP_TASK_ID: &str = "IronmeshBackgroundLauncher";
 pub const PLATFORM_KIND: &str = env::consts::OS;
@@ -72,6 +78,8 @@ pub struct ManagedInstanceStore {
     #[serde(default)]
     pub client_identities: Vec<ClientIdentityConfig>,
     #[serde(default)]
+    pub client_cli_instances: Vec<ClientCliInstance>,
+    #[serde(default)]
     pub os_integration_instances: Vec<OsIntegrationInstance>,
     #[serde(default)]
     pub folder_agent_instances: Vec<FolderAgentInstance>,
@@ -82,6 +90,7 @@ impl Default for ManagedInstanceStore {
         Self {
             version: MANAGED_INSTANCE_STORE_VERSION,
             client_identities: Vec::new(),
+            client_cli_instances: Vec::new(),
             os_integration_instances: Vec::new(),
             folder_agent_instances: Vec::new(),
         }
@@ -154,6 +163,19 @@ impl ManagedInstanceStore {
         self.sort();
     }
 
+    pub fn upsert_client_cli(&mut self, instance: ClientCliInstance) {
+        if let Some(existing) = self
+            .client_cli_instances
+            .iter_mut()
+            .find(|candidate| candidate.id == instance.id)
+        {
+            *existing = instance;
+        } else {
+            self.client_cli_instances.push(instance);
+        }
+        self.sort();
+    }
+
     pub fn upsert_folder_agent(&mut self, instance: FolderAgentInstance) {
         if let Some(existing) = self
             .folder_agent_instances
@@ -187,6 +209,12 @@ impl ManagedInstanceStore {
         initial_len != self.os_integration_instances.len()
     }
 
+    pub fn remove_client_cli(&mut self, id: &str) -> bool {
+        let initial_len = self.client_cli_instances.len();
+        self.client_cli_instances.retain(|candidate| candidate.id != id);
+        initial_len != self.client_cli_instances.len()
+    }
+
     pub fn remove_folder_agent(&mut self, id: &str) -> bool {
         let initial_len = self.folder_agent_instances.len();
         self.folder_agent_instances
@@ -196,6 +224,12 @@ impl ManagedInstanceStore {
 
     fn sort(&mut self) {
         self.client_identities.sort_by(|left, right| {
+            left.label
+                .to_ascii_lowercase()
+                .cmp(&right.label.to_ascii_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        self.client_cli_instances.sort_by(|left, right| {
             left.label
                 .to_ascii_lowercase()
                 .cmp(&right.label.to_ascii_lowercase())
@@ -576,6 +610,73 @@ impl FolderAgentInstance {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientCliInstance {
+    pub id: String,
+    pub label: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_ca_pem_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_identity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_identity_file: Option<String>,
+}
+
+impl ClientCliInstance {
+    pub fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() {
+            bail!("client-cli instance id must not be empty");
+        }
+        if self.label.trim().is_empty() {
+            bail!("client-cli instance label must not be empty");
+        }
+        if let Some(bind) = self.bind.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        {
+            bind.parse::<SocketAddr>().with_context(|| {
+                format!("client-cli bind address '{}' must be a valid host:port", bind)
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn command_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+
+        push_optional_arg(
+            &mut args,
+            "--server-base-url",
+            self.server_base_url.as_deref(),
+        );
+        push_optional_arg(
+            &mut args,
+            "--bootstrap-file",
+            self.bootstrap_file.as_deref(),
+        );
+        push_optional_arg(
+            &mut args,
+            "--server-ca-pem-file",
+            self.server_ca_pem_file.as_deref(),
+        );
+        push_optional_arg(
+            &mut args,
+            "--client-identity-file",
+            self.client_identity_file.as_deref(),
+        );
+        args.push("serve-web".to_string());
+        push_optional_arg(&mut args, "--bind", self.bind.as_deref());
+
+        args
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LaunchReport {
     #[serde(default = "launch_report_version")]
@@ -772,6 +873,21 @@ pub fn launch_enabled_instances(store: &ManagedInstanceStore, package_root: &Pat
     let launched_at_unix_ms = unix_ts_ms();
     let service_log_dir = default_service_log_dir();
 
+    for instance in &store.client_cli_instances {
+        if !instance.enabled {
+            continue;
+        }
+        outcomes.push(spawn_instance(
+            "client-cli",
+            &instance.id,
+            &instance.label,
+            service_executable_candidates(package_root, CLIENT_CLI_EXE),
+            instance.command_args(),
+            &service_log_dir,
+            launched_at_unix_ms,
+        ));
+    }
+
     for instance in &store.os_integration_instances {
         if !instance.enabled {
             continue;
@@ -863,6 +979,18 @@ pub fn launch_os_integration_instance(
     }
 }
 
+pub fn launch_client_cli_instance(instance: &ClientCliInstance, package_root: &Path) -> LaunchOutcome {
+    spawn_instance(
+        "client-cli",
+        &instance.id,
+        &instance.label,
+        service_executable_candidates(package_root, CLIENT_CLI_EXE),
+        instance.command_args(),
+        &default_service_log_dir(),
+        unix_ts_ms(),
+    )
+}
+
 pub fn launch_folder_agent_instance(
     instance: &FolderAgentInstance,
     package_root: &Path,
@@ -927,6 +1055,14 @@ pub fn service_runtime_statuses(
     report: Option<&LaunchReport>,
 ) -> Vec<ServiceRuntimeStatus> {
     let mut statuses = Vec::new();
+
+    for instance in &store.client_cli_instances {
+        statuses.push(service_runtime_status(
+            "client-cli",
+            &instance.id,
+            report.and_then(|report| last_launch_outcome(report, "client-cli", &instance.id)),
+        ));
+    }
 
     for instance in &store.os_integration_instances {
         statuses.push(service_runtime_status(
@@ -1550,6 +1686,17 @@ mod tests {
     fn managed_instance_store_roundtrip_persists_version() {
         let path = temp_path("instance-store-roundtrip");
         let store = ManagedInstanceStore {
+            client_cli_instances: vec![ClientCliInstance {
+                id: "client-1".to_string(),
+                label: "Client UI".to_string(),
+                enabled: true,
+                bind: Some("127.0.0.1:8081".to_string()),
+                server_base_url: Some("https://node.example".to_string()),
+                bootstrap_file: Some("/tmp/client.bootstrap.json".to_string()),
+                server_ca_pem_file: Some("/tmp/server-ca.pem".to_string()),
+                client_identity_id: Some("identity-1".to_string()),
+                client_identity_file: Some("/tmp/client-identity.json".to_string()),
+            }],
             os_integration_instances: vec![OsIntegrationInstance {
                 id: "os-1".to_string(),
                 label: "Docs".to_string(),
@@ -1580,8 +1727,11 @@ mod tests {
         let loaded = ManagedInstanceStore::load_or_default(&path).expect("store should load");
 
         assert_eq!(loaded.version, MANAGED_INSTANCE_STORE_VERSION);
+    assert_eq!(loaded.client_cli_instances.len(), 1);
         assert_eq!(loaded.os_integration_instances.len(), 1);
         assert!(loaded.folder_agent_instances.is_empty());
+    assert_eq!(loaded.client_cli_instances[0].id, "client-1");
+    assert_eq!(loaded.client_cli_instances[0].label, "Client UI");
         assert_eq!(loaded.os_integration_instances[0].id, "os-1");
         assert_eq!(loaded.os_integration_instances[0].label, "Docs");
 

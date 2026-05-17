@@ -15,16 +15,17 @@ use client_sdk::enroll_connection_input_blocking;
 #[cfg(windows)]
 use desktop_client_config::default_desktop_status_file_path;
 use desktop_client_config::{
-    ClientIdentityConfig, DESKTOP_CLIENT_CONFIG_REVISION, DESKTOP_CLIENT_CONFIG_VERSION,
-    FolderAgentInstance, LaunchOutcome, LaunchReport, ManagedInstanceStore,
-    OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance, PLATFORM_KIND,
-    STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE,
-    ServiceRuntimeStatus, StopOutcome, default_instance_store_path, default_launch_report_path,
-    default_service_log_dir, generate_instance_id, launch_enabled_instances,
-    launch_folder_agent_instance, launch_os_integration_instance,
-    launch_report_with_updated_outcome, load_last_launch_report, migrate_legacy_state_paths,
-    package_root_from_current_exe, save_launch_report, service_desktop_status_file_path,
-    service_runtime_statuses, stop_service_from_report,
+  ClientCliInstance, ClientIdentityConfig, DESKTOP_CLIENT_CONFIG_REVISION,
+  DESKTOP_CLIENT_CONFIG_VERSION, FolderAgentInstance, LaunchOutcome, LaunchReport,
+  ManagedInstanceStore, OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance,
+  PLATFORM_KIND, STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE,
+  STARTUP_INTEGRATION_VALUE, ServiceRuntimeStatus, StopOutcome,
+  default_instance_store_path, default_launch_report_path, default_service_log_dir,
+  generate_instance_id, launch_client_cli_instance, launch_enabled_instances,
+  launch_folder_agent_instance, launch_os_integration_instance,
+  launch_report_with_updated_outcome, load_last_launch_report, migrate_legacy_state_paths,
+  package_root_from_current_exe, save_launch_report, service_desktop_status_file_path,
+  service_runtime_statuses, stop_service_from_report,
 };
 use desktop_status::{
     DesktopServiceStatus, DesktopStatusDocument, GNOME_EXTENSION_UUID, StatusFacet, StatusSnapshot,
@@ -366,6 +367,58 @@ impl UpsertFolderAgentInstanceRequest {
     }
 }
 
+    #[derive(Debug, Deserialize)]
+    struct UpsertClientCliInstanceRequest {
+      id: Option<String>,
+      label: String,
+      #[serde(default = "default_enabled")]
+      enabled: bool,
+      bind: Option<String>,
+      server_base_url: Option<String>,
+      bootstrap_file: Option<String>,
+      #[serde(default)]
+      client_identity_id: Option<String>,
+      client_identity_file: Option<String>,
+      server_ca_pem_file: Option<String>,
+    }
+
+    impl UpsertClientCliInstanceRequest {
+      fn into_instance(self, store: &ManagedInstanceStore) -> Result<ClientCliInstance, ApiError> {
+        let client_identity_id = normalize_optional_string(self.client_identity_id);
+        let managed_identity = resolve_client_identity(store, client_identity_id.as_deref())?;
+        let bootstrap_file = managed_identity
+          .map(|identity| identity.bootstrap_file.clone())
+          .or_else(|| normalize_optional_string(self.bootstrap_file));
+        let server_base_url = if managed_identity.is_some() {
+          None
+        } else {
+          normalize_optional_string(self.server_base_url)
+        };
+        let client_identity_file = managed_identity
+          .map(|identity| identity.client_identity_file.clone())
+          .or_else(|| normalize_optional_string(self.client_identity_file));
+        let server_ca_pem_file = managed_identity
+          .and_then(|identity| identity.server_ca_pem_file.clone())
+          .or_else(|| normalize_optional_string(self.server_ca_pem_file));
+        let instance = ClientCliInstance {
+          id: normalize_optional_string(self.id)
+            .unwrap_or_else(|| generate_instance_id("client-cli")),
+          label: required_field("client service label", self.label)?,
+          enabled: self.enabled,
+          bind: normalize_optional_string(self.bind),
+          server_base_url,
+          bootstrap_file,
+          server_ca_pem_file,
+          client_identity_id,
+          client_identity_file,
+        };
+        instance
+          .validate()
+          .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        Ok(instance)
+      }
+    }
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -427,6 +480,7 @@ async fn main() -> Result<()> {
         .route("/app.js", get(app_js))
         .route("/api/config", get(get_config))
         .route("/api/client-identities", post(upsert_client_identity))
+        .route("/api/client-cli-instances", post(upsert_client_cli_instance))
         .route(
             "/api/os-integration-instances",
             post(upsert_os_integration_instance),
@@ -446,6 +500,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/client-identities/{id}",
             delete(delete_client_identity),
+        )
+        .route(
+          "/api/client-cli-instances/{id}",
+          delete(delete_client_cli_instance),
         )
         .route(
             "/api/services/{kind}/{id}/start",
@@ -648,6 +706,16 @@ fn merged_service_statuses(
     service_documents: &[ServiceStatusTelemetry],
 ) -> Vec<DesktopServiceStatus> {
     let mut services = Vec::new();
+  for instance in &store.client_cli_instances {
+    services.push(merged_service_status(
+      "client-cli",
+      &instance.id,
+      &instance.label,
+      instance.enabled,
+      runtime_statuses,
+      service_documents,
+    ));
+  }
     for instance in &store.os_integration_instances {
         services.push(merged_service_status(
             "os-integration",
@@ -1036,6 +1104,22 @@ async fn upsert_client_identity(
     }))
 }
 
+    async fn upsert_client_cli_instance(
+      State(state): State<AppState>,
+      Json(request): Json<UpsertClientCliInstanceRequest>,
+    ) -> Result<Json<ConfigResponse>, ApiError> {
+      let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+        .map_err(ApiError::internal)?;
+      let instance = request.into_instance(&store)?;
+      store.upsert_client_cli(instance);
+      store
+        .save(&state.instance_store_path)
+        .map_err(ApiError::internal)?;
+      Ok(Json(
+        load_config_response(&state).map_err(ApiError::internal)?,
+      ))
+    }
+
 async fn upsert_os_integration_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertOsIntegrationInstanceRequest>,
@@ -1109,6 +1193,26 @@ async fn delete_os_integration_instance(
         load_config_response(&state).map_err(ApiError::internal)?,
     ))
 }
+
+  async fn delete_client_cli_instance(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+  ) -> Result<Json<ConfigResponse>, ApiError> {
+    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+      .map_err(ApiError::internal)?;
+    if !store.remove_client_cli(&id) {
+      return Err(ApiError::bad_request(format!(
+        "client-cli instance '{}' was not found",
+        id
+      )));
+    }
+    store
+      .save(&state.instance_store_path)
+      .map_err(ApiError::internal)?;
+    Ok(Json(
+      load_config_response(&state).map_err(ApiError::internal)?,
+    ))
+  }
 
 async fn delete_folder_agent_instance(
     AxumPath(id): AxumPath<String>,
@@ -1274,6 +1378,7 @@ fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
 
 fn normalize_service_kind(kind: &str) -> Result<&'static str, ApiError> {
     match kind.trim() {
+    "client" | "client-cli" => Ok("client-cli"),
         "os" | "os-integration" => Ok("os-integration"),
         "folder" | "folder-agent" => Ok("folder-agent"),
         other => Err(ApiError::bad_request(format!(
@@ -1288,6 +1393,10 @@ fn ensure_service_instance_exists(
     id: &str,
 ) -> Result<(), ApiError> {
     let exists = match kind {
+    "client-cli" => store
+      .client_cli_instances
+      .iter()
+      .any(|candidate| candidate.id == id),
         "os-integration" => store
             .os_integration_instances
             .iter()
@@ -1314,6 +1423,12 @@ fn launch_configured_service(
     package_root: &Path,
 ) -> Result<LaunchOutcome, ApiError> {
     match kind {
+    "client-cli" => store
+      .client_cli_instances
+      .iter()
+      .find(|candidate| candidate.id == id)
+      .map(|instance| launch_client_cli_instance(instance, package_root))
+      .ok_or_else(|| ApiError::bad_request(format!("{kind} instance '{id}' was not found"))),
         "os-integration" => store
             .os_integration_instances
             .iter()
@@ -1692,6 +1807,10 @@ const APP_HTML: &str = r###"<!doctype html>
             <span class="nav-title">Client Identities</span>
             <span class="nav-description">Enroll and manage reusable device identities for sync profiles.</span>
           </a>
+          <a class="shell-nav-link" href="#client-panel">
+            <span class="nav-title">Client Services</span>
+            <span class="nav-description">Configure background ironmesh serve-web instances and their local bind addresses.</span>
+          </a>
           <a id="os-nav-link" class="shell-nav-link" href="#os-panel">
             <span id="os-nav-title" class="nav-title">OS Integration</span>
             <span id="os-nav-description" class="nav-description">Configure platform-specific filesystem integration instances.</span>
@@ -1719,6 +1838,10 @@ const APP_HTML: &str = r###"<!doctype html>
               <div class="summary-chip">
                 <span class="summary-label">Client Identities</span>
                 <strong id="identity-count">0</strong>
+              </div>
+              <div class="summary-chip">
+                <span class="summary-label">Client Services</span>
+                <strong id="client-instance-count">0</strong>
               </div>
               <div id="os-summary-chip" class="summary-chip">
                 <span id="os-summary-label" class="summary-label">OS Integration</span>
@@ -1777,6 +1900,62 @@ const APP_HTML: &str = r###"<!doctype html>
                 </span>
               </label>
               <button type="submit">Save Client Identity</button>
+            </form>
+          </section>
+
+          <section id="client-panel" class="panel panel-split">
+            <div class="panel-column">
+              <div class="panel-header">
+                <div>
+                  <h2>Client Services</h2>
+                  <p>Each entry runs one background ironmesh serve-web instance with its own local bind address and connection settings.</p>
+                </div>
+                <button id="clear-client-form" class="secondary">New Instance</button>
+              </div>
+              <div id="client-instance-list" class="instance-list"></div>
+            </div>
+            <form id="client-form" class="instance-form panel-form">
+              <h3>Configure Client Service</h3>
+              <p class="panel-note">Leave the connection fields empty to start the local client service disconnected and configure it later from the served UI.</p>
+              <input type="hidden" id="client-id" />
+              <label>
+                <span class="field-label">Instance Name</span>
+                <span class="field-help">Used only inside this config app so you can tell local client services apart.</span>
+                <input id="client-label" required />
+              </label>
+              <label class="checkbox checkbox-field">
+                <input type="checkbox" id="client-enabled" checked />
+                <span class="checkbox-copy">
+                  <span class="field-label">Start automatically after login</span>
+                  <span class="field-help">The launcher will try to restart this local client service when platform startup integration is available.</span>
+                </span>
+              </label>
+              <label>
+                <span class="field-label">Bind Address</span>
+                <span class="field-help">Optional local host and port for the service, for example 127.0.0.1:8081. Leave empty to use the CLI default.</span>
+                <input id="client-bind" placeholder="127.0.0.1:8081" />
+              </label>
+              <div class="form-section">
+                <h4>Connection</h4>
+                <label>
+                  <span class="field-label">Server Base URL</span>
+                  <span class="field-help">Optional explicit server-node base URL when not relying solely on bootstrap material.</span>
+                  <input id="client-server-base-url" placeholder="https://node.example" />
+                </label>
+                <label>
+                  <span class="field-label">Initial Setup File</span>
+                  <span class="field-help">Optional bootstrap JSON file used for live connection bootstrap and persisted updates.</span>
+                  <input id="client-bootstrap-file" />
+                </label>
+                <label>
+                  <span class="field-label">Managed Client Identity</span>
+                  <span class="field-help">Select a saved identity to use its bootstrap, client identity, and CA files.</span>
+                  <select id="client-client-identity-id"></select>
+                </label>
+                <input type="hidden" id="client-client-identity-file" />
+                <input type="hidden" id="client-server-ca-pem-file" />
+              </div>
+              <button type="submit">Save Client Service</button>
             </form>
           </section>
 
@@ -2321,7 +2500,7 @@ button.secondary {
 
 .page-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
   min-width: 320px;
 }
@@ -2782,7 +2961,19 @@ function resolveProfileIdentityId(instance) {
 
 function applySelectedIdentityToProfile(kind) {
   const identity = findClientIdentity(document.getElementById(`${kind}-client-identity-id`).value);
-  if (!identity) return;
+  if (!identity) {
+    if (kind === 'os') {
+      document.getElementById('os-client-identity-file').value = '';
+      document.getElementById('os-server-ca-path').value = '';
+    } else if (kind === 'folder') {
+      document.getElementById('folder-client-identity-file').value = '';
+      document.getElementById('folder-server-ca-pem-file').value = '';
+    } else if (kind === 'client') {
+      document.getElementById('client-client-identity-file').value = '';
+      document.getElementById('client-server-ca-pem-file').value = '';
+    }
+    return;
+  }
   document.getElementById(`${kind}-bootstrap-file`).value = identity.bootstrap_file || '';
   if (kind === 'os') {
     document.getElementById('os-client-identity-file').value = identity.client_identity_file || '';
@@ -2791,6 +2982,10 @@ function applySelectedIdentityToProfile(kind) {
   } else if (kind === 'folder') {
     document.getElementById('folder-client-identity-file').value = identity.client_identity_file || '';
     document.getElementById('folder-server-ca-pem-file').value = identity.server_ca_pem_file || '';
+  } else if (kind === 'client') {
+    document.getElementById('client-client-identity-file').value = identity.client_identity_file || '';
+    document.getElementById('client-server-ca-pem-file').value = identity.server_ca_pem_file || '';
+    document.getElementById('client-server-base-url').value = '';
   }
 }
 
@@ -2819,7 +3014,11 @@ function renderClientIdentityCard(identity) {
 }
 
 function renderInstanceCard(instance, kind, onEdit, onDelete) {
-  const serviceKind = kind === 'os' ? 'os-integration' : 'folder-agent';
+  const serviceKind = kind === 'os'
+    ? 'os-integration'
+    : kind === 'client'
+      ? 'client-cli'
+      : 'folder-agent';
   const runtime = serviceStatusFor(serviceKind, instance.id);
   const running = !!runtime?.running;
   const encodedId = encodeURIComponent(instance.id);
@@ -2840,6 +3039,12 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
           ['Initial Setup File', instance.bootstrap_file || ''],
           ['Client Identity', identityLabelForProfile(instance)],
           ['Remote Folder Prefix', instance.prefix || ''],
+        ]
+    : kind === 'client'
+      ? [
+          ['Bind Address', instance.bind || '127.0.0.1:8081'],
+          ['Connection Source', instance.bootstrap_file || instance.server_base_url || 'Starts disconnected'],
+          ['Client Identity', identityLabelForProfile(instance)],
         ]
     : [
         ['Folder to Sync', instance.root_dir],
@@ -2949,10 +3154,12 @@ function renderConfig(config) {
   document.getElementById('startup-integration-value').textContent = config.startup_integration_value;
   document.getElementById('startup-integration-note').textContent = config.startup_integration_note;
   document.getElementById('identity-count').textContent = String(config.store.client_identities.length);
+  document.getElementById('client-instance-count').textContent = String(config.store.client_cli_instances.length);
   document.getElementById('os-instance-count').textContent = String(config.store.os_integration_instances.length);
   document.getElementById('folder-instance-count').textContent = String(config.store.folder_agent_instances.length);
   renderLaunchReport(config.last_launch_report);
   applyOsPlatformUi(config.platform);
+  renderIdentityOptions('client-client-identity-id', document.getElementById('client-client-identity-id')?.value || '');
   renderIdentityOptions('os-client-identity-id', document.getElementById('os-client-identity-id')?.value || '');
   renderIdentityOptions('folder-client-identity-id', document.getElementById('folder-client-identity-id')?.value || '');
 
@@ -2960,6 +3167,11 @@ function renderConfig(config) {
   identityTarget.innerHTML = config.store.client_identities.length
     ? config.store.client_identities.map(renderClientIdentityCard).join('')
     : '<p class="empty">No client identities configured yet.</p>';
+
+  const clientTarget = document.getElementById('client-instance-list');
+  clientTarget.innerHTML = config.store.client_cli_instances.length
+    ? config.store.client_cli_instances.map((instance) => renderInstanceCard(instance, 'client', 'editClientServiceInstance', 'deleteClientServiceInstance')).join('')
+    : '<p class="empty">No client services configured yet.</p>';
 
   const supportsOsIntegration = !!config.supports_os_integration;
   document.getElementById('os-nav-link').hidden = !supportsOsIntegration;
@@ -2991,6 +3203,18 @@ function clearIdentityForm() {
   document.getElementById('identity-id').value = '';
   document.getElementById('identity-bootstrap-content').value = '';
   document.getElementById('identity-enroll').checked = true;
+}
+
+function clearClientForm() {
+  document.getElementById('client-id').value = '';
+  document.getElementById('client-label').value = '';
+  document.getElementById('client-enabled').checked = true;
+  document.getElementById('client-bind').value = '';
+  document.getElementById('client-server-base-url').value = '';
+  document.getElementById('client-bootstrap-file').value = '';
+  renderIdentityOptions('client-client-identity-id', '');
+  document.getElementById('client-client-identity-file').value = '';
+  document.getElementById('client-server-ca-pem-file').value = '';
 }
 
 function clearOsForm() {
@@ -3037,6 +3261,10 @@ function findOsInstance(id) {
   return currentConfig?.store?.os_integration_instances?.find((instance) => instance.id === id);
 }
 
+function findClientServiceInstance(id) {
+  return currentConfig?.store?.client_cli_instances?.find((instance) => instance.id === id);
+}
+
 function findFolderInstance(id) {
   return currentConfig?.store?.folder_agent_instances?.find((instance) => instance.id === id);
 }
@@ -3047,6 +3275,20 @@ window.editClientIdentity = function(encodedId) {
   document.getElementById('identity-id').value = identity.id;
   document.getElementById('identity-bootstrap-content').value = '';
   document.getElementById('identity-enroll').checked = false;
+};
+
+window.editClientServiceInstance = function(encodedId) {
+  const instance = findClientServiceInstance(decodeURIComponent(encodedId));
+  if (!instance) return;
+  document.getElementById('client-id').value = instance.id;
+  document.getElementById('client-label').value = instance.label;
+  document.getElementById('client-enabled').checked = !!instance.enabled;
+  document.getElementById('client-bind').value = instance.bind || '';
+  document.getElementById('client-server-base-url').value = instance.server_base_url || '';
+  document.getElementById('client-bootstrap-file').value = instance.bootstrap_file || '';
+  renderIdentityOptions('client-client-identity-id', resolveProfileIdentityId(instance));
+  document.getElementById('client-client-identity-file').value = instance.client_identity_file || '';
+  document.getElementById('client-server-ca-pem-file').value = instance.server_ca_pem_file || '';
 };
 
 window.editOsInstance = function(encodedId) {
@@ -3102,6 +3344,15 @@ window.deleteClientIdentity = async function(encodedId) {
   showStatus(`Deleted client identity ${id}.`);
 };
 
+window.deleteClientServiceInstance = async function(encodedId) {
+  const id = decodeURIComponent(encodedId);
+  if (!confirm(`Delete client service ${id}?`)) return;
+  const payload = await fetchJson(`/api/client-cli-instances/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  renderConfig(payload);
+  clearClientForm();
+  showStatus(`Deleted client service ${id}.`);
+};
+
 window.deleteOsInstance = async function(encodedId) {
   const id = decodeURIComponent(encodedId);
   if (!confirm(`Delete os-integration instance ${id}?`)) return;
@@ -3151,6 +3402,29 @@ async function submitIdentityForm(event) {
   renderConfig(response.config);
   clearIdentityForm();
   showStatus(response.enrollment ? response.enrollment : 'Saved client identity.');
+}
+
+async function submitClientForm(event) {
+  event.preventDefault();
+  const payload = {
+    id: document.getElementById('client-id').value || null,
+    label: document.getElementById('client-label').value,
+    enabled: document.getElementById('client-enabled').checked,
+    bind: document.getElementById('client-bind').value,
+    server_base_url: document.getElementById('client-server-base-url').value,
+    bootstrap_file: document.getElementById('client-bootstrap-file').value,
+    client_identity_id: document.getElementById('client-client-identity-id').value,
+    client_identity_file: document.getElementById('client-client-identity-file').value,
+    server_ca_pem_file: document.getElementById('client-server-ca-pem-file').value,
+  };
+  const config = await fetchJson('/api/client-cli-instances', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  renderConfig(config);
+  clearClientForm();
+  showStatus('Saved client service.');
 }
 
 async function submitOsForm(event) {
@@ -3246,6 +3520,9 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('identity-form').addEventListener('submit', (event) => {
     submitIdentityForm(event).catch((error) => showStatus({ error: error.message }));
   });
+  document.getElementById('client-form').addEventListener('submit', (event) => {
+    submitClientForm(event).catch((error) => showStatus({ error: error.message }));
+  });
   document.getElementById('os-form').addEventListener('submit', (event) => {
     submitOsForm(event).catch((error) => showStatus({ error: error.message }));
   });
@@ -3262,8 +3539,12 @@ window.addEventListener('DOMContentLoaded', async () => {
     shutdownApp().catch((error) => showStatus({ error: error.message }));
   });
   document.getElementById('clear-identity-form').addEventListener('click', clearIdentityForm);
+  document.getElementById('clear-client-form').addEventListener('click', clearClientForm);
   document.getElementById('clear-os-form').addEventListener('click', clearOsForm);
   document.getElementById('clear-folder-form').addEventListener('click', clearFolderForm);
+  document.getElementById('client-client-identity-id').addEventListener('change', () => {
+    applySelectedIdentityToProfile('client');
+  });
   document.getElementById('os-client-identity-id').addEventListener('change', () => {
     applySelectedIdentityToProfile('os');
   });
@@ -3271,6 +3552,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     applySelectedIdentityToProfile('folder');
   });
   clearIdentityForm();
+  clearClientForm();
   clearOsForm();
   clearFolderForm();
   try {
