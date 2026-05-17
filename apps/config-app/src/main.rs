@@ -3,19 +3,19 @@
 #[cfg(windows)]
 mod windows_tray;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use client_sdk::enroll_connection_input_blocking;
 #[cfg(windows)]
 use desktop_client_config::default_desktop_status_file_path;
 use desktop_client_config::{
-  ClientCliInstance, ClientIdentityConfig, DESKTOP_CLIENT_CONFIG_REVISION,
+  ClientCliInstance, ClientIdentityConfig, CONFIG_APP_EXE, DESKTOP_CLIENT_CONFIG_REVISION,
   DESKTOP_CLIENT_CONFIG_VERSION, FolderAgentInstance, LaunchOutcome, LaunchReport,
   ManagedInstanceStore, OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance,
   PLATFORM_KIND, STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE,
@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
@@ -59,6 +59,8 @@ struct Cli {
     no_desktop_status: bool,
     #[arg(long, global = true)]
     desktop_status_file: Option<PathBuf>,
+    #[arg(long, default_value_t = false, hide = true)]
+    skip_initial_service_launch: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -68,6 +70,11 @@ enum Command {
         #[command(subcommand)]
         command: GnomeCommand,
     },
+  #[command(hide = true)]
+  Internal {
+    #[command(subcommand)]
+    command: InternalCommand,
+  },
 }
 
 #[derive(Debug, Subcommand)]
@@ -78,12 +85,75 @@ enum GnomeCommand {
     PrintStatusPath,
 }
 
+#[derive(Debug, Subcommand)]
+enum InternalCommand {
+  #[command(name = "wait-and-relaunch-background", hide = true)]
+  WaitAndRelaunchBackground(WaitAndRelaunchBackgroundArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct WaitAndRelaunchBackgroundArgs {
+  #[arg(long)]
+  wait_for_pid: u32,
+  #[arg(long)]
+  bind: String,
+  #[arg(long, default_value_t = false)]
+  no_desktop_status: bool,
+  #[arg(long)]
+  desktop_status_file: Option<PathBuf>,
+  #[arg(long, default_value_t = 30_000)]
+  timeout_ms: u64,
+}
+
 #[derive(Clone)]
 struct AppState {
     instance_store_path: PathBuf,
     launch_report_path: PathBuf,
     package_root: PathBuf,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct BackgroundRestartConfig {
+  bind: String,
+  no_desktop_status: bool,
+  desktop_status_file: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl BackgroundRestartConfig {
+  fn from_cli(cli: &Cli) -> Self {
+    Self {
+      bind: cli.bind.clone(),
+      no_desktop_status: cli.no_desktop_status,
+      desktop_status_file: cli.desktop_status_file.clone(),
+    }
+  }
+
+  fn command_args(&self) -> Vec<String> {
+    let mut args = vec![
+      "--bind".to_string(),
+      self.bind.clone(),
+      "--background".to_string(),
+      "--skip-initial-service-launch".to_string(),
+    ];
+    if self.no_desktop_status {
+      args.push("--no-desktop-status".to_string());
+    }
+    if let Some(path) = self.desktop_status_file.as_ref() {
+      args.push("--desktop-status-file".to_string());
+      args.push(path.display().to_string());
+    }
+    args
+  }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExecutableIdentity {
+  device_id: u64,
+  inode: u64,
 }
 
 struct ServiceStatusTelemetry {
@@ -465,7 +535,7 @@ async fn main() -> Result<()> {
         shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
     };
 
-    if cli.background || cli.launch_enabled_on_start {
+    if (cli.background || cli.launch_enabled_on_start) && !cli.skip_initial_service_launch {
         let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
             .context("failed loading managed instances before launch")?;
         let report = launch_enabled_instances(&store, &state.package_root);
@@ -533,6 +603,11 @@ async fn main() -> Result<()> {
         let _ = open_browser(&local_url);
     }
 
+    #[cfg(target_os = "linux")]
+    if cli.background {
+        spawn_linux_package_handoff_task(state.clone(), BackgroundRestartConfig::from_cli(&cli));
+    }
+
     let _tray_handle;
     if !cli.no_desktop_status
         && let Some(status_file) = resolve_desktop_status_file(&cli)
@@ -579,7 +654,23 @@ async fn main() -> Result<()> {
 fn run_command(cli: &Cli, command: &Command) -> Result<()> {
     match command {
         Command::Gnome { command } => run_gnome_command(cli, command),
+    Command::Internal { command } => run_internal_command(command),
     }
+}
+
+fn run_internal_command(command: &InternalCommand) -> Result<()> {
+  #[cfg(not(target_os = "linux"))]
+  {
+    let _ = command;
+    bail!("internal handoff commands are only supported on Linux")
+  }
+
+  #[cfg(target_os = "linux")]
+  {
+    match command {
+      InternalCommand::WaitAndRelaunchBackground(args) => wait_and_relaunch_background(args),
+    }
+  }
 }
 
 fn run_gnome_command(cli: &Cli, command: &GnomeCommand) -> Result<()> {
@@ -607,6 +698,71 @@ fn run_gnome_command(cli: &Cli, command: &GnomeCommand) -> Result<()> {
         }
     }
 }
+
+    #[cfg(target_os = "linux")]
+    fn wait_and_relaunch_background(args: &WaitAndRelaunchBackgroundArgs) -> Result<()> {
+      wait_for_pid_exit(args.wait_for_pid, Duration::from_millis(args.timeout_ms))?;
+      let restart_config = BackgroundRestartConfig {
+        bind: args.bind.clone(),
+        no_desktop_status: args.no_desktop_status,
+        desktop_status_file: args.desktop_status_file.clone(),
+      };
+      let package_root = package_root_from_current_exe()?;
+      spawn_background_config_app_process(
+        &package_root.join(CONFIG_APP_EXE),
+        &restart_config.command_args(),
+      )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_pid_exit(pid: u32, timeout: Duration) -> Result<()> {
+      let started_at = std::time::Instant::now();
+      while started_at.elapsed() < timeout {
+        if !linux_process_exists(pid) {
+          return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+      }
+      if linux_process_exists(pid) {
+        bail!("process {pid} did not exit within {:?}", timeout);
+      }
+      Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_process_exists(pid: u32) -> bool {
+      Path::new("/proc").join(pid.to_string()).exists()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_background_config_app_process(
+      executable_path: &Path,
+      command_args: &[String],
+    ) -> Result<()> {
+      let mut command = ProcessCommand::new(executable_path);
+      command
+        .args(command_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+      let mut child = command.spawn().with_context(|| {
+        format!(
+          "failed spawning background config app {}",
+          executable_path.display()
+        )
+      })?;
+      std::thread::sleep(Duration::from_millis(500));
+      if let Some(status) = child.try_wait().with_context(|| {
+        format!(
+          "failed checking background config app {}",
+          executable_path.display()
+        )
+      })? {
+        bail!("background config app exited immediately with {status}");
+      }
+      Ok(())
+    }
 
 fn resolve_desktop_status_file(cli: &Cli) -> Option<PathBuf> {
     if let Some(path) = cli.desktop_status_file.clone() {
@@ -1346,12 +1502,143 @@ async fn launch_enabled_now(State(state): State<AppState>) -> Result<Json<Launch
 }
 
 async fn shutdown_app(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut shutdown_tx = state.shutdown_tx.lock().await;
-    if let Some(sender) = shutdown_tx.take() {
-        let _ = sender.send(());
-    }
+  request_shutdown(&state).await;
 
     Ok(Json(json!({ "status": "shutting_down" })))
+}
+
+async fn request_shutdown(state: &AppState) {
+  let mut shutdown_tx = state.shutdown_tx.lock().await;
+  if let Some(sender) = shutdown_tx.take() {
+    let _ = sender.send(());
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_linux_package_handoff_task(state: AppState, restart_config: BackgroundRestartConfig) {
+    let config_app_path = state.package_root.join(CONFIG_APP_EXE);
+    let self_pid = std::process::id();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            match process_executable_replaced(self_pid, &config_app_path) {
+                Ok(true) => match spawn_background_handoff_helper(
+                    &config_app_path,
+                    &restart_config,
+                    self_pid,
+                ) {
+                    Ok(()) => {
+                        eprintln!(
+                            "config-app: detected package upgrade, scheduling background handoff from {}",
+                            config_app_path.display()
+                        );
+                        request_shutdown(&state).await;
+                        return;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "config-app: detected package upgrade but failed starting background handoff helper {}: {error:#}",
+                            config_app_path.display()
+                        );
+                    }
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "config-app: failed checking executable replacement for {}: {error:#}",
+                        config_app_path.display()
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_background_handoff_helper(
+  executable_path: &Path,
+  restart_config: &BackgroundRestartConfig,
+  wait_for_pid: u32,
+) -> Result<()> {
+  let mut args = vec![
+    "internal".to_string(),
+    "wait-and-relaunch-background".to_string(),
+    "--wait-for-pid".to_string(),
+    wait_for_pid.to_string(),
+    "--bind".to_string(),
+    restart_config.bind.clone(),
+  ];
+  if restart_config.no_desktop_status {
+    args.push("--no-desktop-status".to_string());
+  }
+  if let Some(path) = restart_config.desktop_status_file.as_ref() {
+    args.push("--desktop-status-file".to_string());
+    args.push(path.display().to_string());
+  }
+  args.push("--timeout-ms".to_string());
+  args.push("30000".to_string());
+
+  spawn_detached_process_checked(executable_path, &args, "background handoff helper")
+}
+
+#[cfg(target_os = "linux")]
+fn process_executable_replaced(pid: u32, executable_path: &Path) -> Result<bool> {
+  if !linux_process_exists(pid) {
+    return Ok(false);
+  }
+
+  let running_identity = match process_executable_identity(pid) {
+    Ok(identity) => identity,
+    Err(_error) if !linux_process_exists(pid) => return Ok(false),
+    Err(error) => return Err(error),
+  };
+  let packaged_identity = executable_identity_for_path(executable_path)?;
+  Ok(running_identity != packaged_identity)
+}
+
+#[cfg(target_os = "linux")]
+fn process_executable_identity(pid: u32) -> Result<ExecutableIdentity> {
+  executable_identity_for_path(&Path::new("/proc").join(pid.to_string()).join("exe"))
+    .with_context(|| format!("failed reading executable metadata for pid {pid}"))
+}
+
+#[cfg(target_os = "linux")]
+fn executable_identity_for_path(path: &Path) -> Result<ExecutableIdentity> {
+  use std::os::unix::fs::MetadataExt;
+
+  let metadata = std::fs::metadata(path)
+    .with_context(|| format!("failed reading executable metadata {}", path.display()))?;
+  Ok(ExecutableIdentity {
+    device_id: metadata.dev(),
+    inode: metadata.ino(),
+  })
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_detached_process_checked(
+  executable_path: &Path,
+  command_args: &[String],
+  process_label: &str,
+) -> Result<()> {
+  let mut command = ProcessCommand::new(executable_path);
+  command
+    .args(command_args)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+  let mut child = command.spawn().with_context(|| {
+    format!("failed spawning {process_label} {}", executable_path.display())
+  })?;
+  std::thread::sleep(Duration::from_millis(500));
+  if let Some(status) = child.try_wait().with_context(|| {
+    format!("failed checking {process_label} {}", executable_path.display())
+  })? {
+    bail!("{process_label} exited immediately with {status}");
+  }
+  Ok(())
 }
 
 fn load_config_response(state: &AppState) -> Result<ConfigResponse> {

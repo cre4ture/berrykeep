@@ -48,6 +48,7 @@ Pass or fail rule:
 - Each command must exit `0`.
 - `coverage` must stay at or above the `--fail-under-lines 70` floor.
 - `unit-tests` already excludes `tests/system-tests` implicitly because the workspace root excludes that crate; nightly system coverage belongs only to the `system-tests` lane.
+- On Linux, `unit-tests` now also covers the packaged config-app handoff regression through `apps/config-app/tests/package_handoff.rs`, because that integration test is part of the normal `cargo test --workspace` run on `ubuntu-latest`.
 
 Useful per-lane shortcuts:
 
