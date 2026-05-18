@@ -239,12 +239,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     "aria-current",
     "true"
   );
-  await page.getByRole("button", { name: "Next item" }).click();
-  await expect(page.getByRole("button", { name: "gallery/clip.mp4", exact: true })).toHaveAttribute(
-    "aria-current",
-    "true"
-  );
-  await expect(page.locator("video")).toBeVisible();
+  await expect(page.getByRole("button", { name: "gallery/clip.mp4", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Next item" })).toBeDisabled();
   await page.keyboard.press("Escape");
   await page.goBack();
   await expect(page.getByRole("button", { name: "Fullscreen map" })).toBeVisible();

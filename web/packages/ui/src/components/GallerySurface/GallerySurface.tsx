@@ -166,11 +166,20 @@ type GalleryLoadedScope = {
   snapshotId: string | null;
 };
 
-type GallerySelection = {
-  source: "grid" | "map";
+type GalleryGridSelection = {
+  source: "grid";
   index: number;
   path: string;
 };
+
+type GalleryMapSelection = {
+  source: "map";
+  index: number;
+  path: string;
+  visiblePaths: string[];
+};
+
+type GallerySelection = GalleryGridSelection | GalleryMapSelection;
 
 type GalleryGridPageState = {
   status: "loading" | "ready" | "error";
@@ -322,6 +331,10 @@ export function GallerySurface({
     currentGalleryPrefix
   );
   const mapMediaEntries = mapPayload?.entries ?? [];
+  const mapMediaEntriesByPath = useMemo(
+    () => new Map(mapMediaEntries.map((entry) => [entry.path, entry] as const)),
+    [mapMediaEntries]
+  );
   const geotaggedEntries = mapMediaEntries.filter(hasGalleryGpsCoordinates);
   const activeMediaSummary =
     viewMode === "map"
@@ -338,11 +351,20 @@ export function GallerySurface({
   const videoCount = activeMediaSummary.video_count;
   const hiddenOnMapCount = Math.max(0, totalMediaCount - activeMediaSummary.geotagged_count);
   const selectedIndex = selection?.index ?? -1;
+  const selectedMapPaths =
+    selection?.source === "map"
+      ? resolveGalleryMapSelectionPaths(
+          selection.visiblePaths,
+          selection.path,
+          mapMediaEntriesByPath
+        )
+      : [];
   const selectedEntry =
     selection?.source === "map"
-      ? mapMediaEntries[selectedIndex] ?? null
+      ? mapMediaEntriesByPath.get(selectedMapPaths[selectedIndex] ?? "") ?? null
       : getGalleryGridEntryAtIndex(gridPages, gridCollection, selectedIndex);
-  const selectedTotalCount = selection?.source === "map" ? mapMediaEntries.length : totalMediaCount;
+  const selectedTotalCount =
+    selection?.source === "map" ? selectedMapPaths.length : totalMediaCount;
   const activeSnapshotId = loadedScope?.snapshotId ?? snapshotId;
   const selectedMediaItem = useMemo(
     () => buildGalleryLightboxItem(selectedEntry, activeSnapshotId, getMediaRequests),
@@ -373,8 +395,20 @@ export function GallerySurface({
     }
 
     if (selection.source === "map") {
-      if (selection.index < 0 || selection.index >= mapMediaEntries.length) {
+      const currentPath = selectedMapPaths[selection.index] ?? null;
+      if (selection.index < 0 || selection.index >= selectedMapPaths.length || !currentPath) {
         setSelection(null);
+      } else if (currentPath !== selection.path) {
+        const nextIndex = selectedMapPaths.indexOf(selection.path);
+        if (nextIndex < 0) {
+          setSelection(null);
+          return;
+        }
+
+        setSelection({
+          ...selection,
+          index: nextIndex
+        });
       }
       return;
     }
@@ -385,7 +419,7 @@ export function GallerySurface({
     }
 
     void ensureGridPageLoaded(pageIndexForGalleryEntry(selection.index, gridCollection.pageSize));
-  }, [gridCollection, mapMediaEntries.length, selection]);
+  }, [gridCollection, selectedMapPaths, selection]);
 
   useEffect(() => {
     if (viewMode !== "grid" || !gridCollection || gridCollection.pageCount === 0) {
@@ -751,12 +785,14 @@ export function GallerySurface({
     }
 
     if (selection.source === "map") {
-      const nextEntry = mapMediaEntries[nextIndex] ?? null;
+      const nextPath = selectedMapPaths[nextIndex] ?? null;
+      const nextEntry = nextPath ? mapMediaEntriesByPath.get(nextPath) ?? null : null;
       if (nextEntry) {
         setSelection({
           source: "map",
           index: nextIndex,
-          path: nextEntry.path
+          path: nextEntry.path,
+          visiblePaths: selection.visiblePaths
         });
       }
       return;
@@ -790,7 +826,8 @@ export function GallerySurface({
 
   function getSelectedMediaItemAtIndex(index: number): MediaLightboxItem | null {
     if (selection?.source === "map") {
-      const entry = mapMediaEntries[index] ?? null;
+      const path = selectedMapPaths[index] ?? null;
+      const entry = path ? mapMediaEntriesByPath.get(path) ?? null : null;
       return buildGalleryLightboxItem(entry, activeSnapshotId, getMediaRequests);
     }
 
@@ -1246,13 +1283,19 @@ export function GallerySurface({
                   hiddenOnMapCount={hiddenOnMapCount}
                   selectedPath={selection?.path ?? null}
                   getMarkerRequest={(entry) => getMediaRequests(entry, activeSnapshotId).thumbnail ?? null}
-                  onSelectPath={(path) => {
-                    const nextIndex = mapMediaEntries.findIndex((entry) => entry.path === path);
+                  onSelectPath={(path, visiblePaths) => {
+                    const nextVisiblePaths = buildGalleryMapSelectionScope(
+                      mapMediaEntries,
+                      visiblePaths,
+                      path
+                    );
+                    const nextIndex = nextVisiblePaths.indexOf(path);
                     if (nextIndex >= 0) {
                       setSelection({
                         source: "map",
                         index: nextIndex,
-                        path
+                        path,
+                        visiblePaths: nextVisiblePaths
                       });
                     }
                   }}
@@ -1590,6 +1633,47 @@ function formatGalleryClusterCount(count: number): string {
   return `${Math.floor(count / 100) / 10}k`;
 }
 
+function buildGalleryMapSelectionScope(
+  entries: GalleryEntry[],
+  visiblePaths: string[],
+  selectedPath: string
+): string[] {
+  const visiblePathSet = new Set(visiblePaths);
+  const scopedPaths = entries
+    .map((entry) => entry.path)
+    .filter((path) => visiblePathSet.has(path));
+
+  if (scopedPaths.includes(selectedPath)) {
+    return scopedPaths;
+  }
+
+  return entries.some((entry) => entry.path === selectedPath) ? [selectedPath] : [];
+}
+
+function resolveGalleryMapSelectionPaths(
+  visiblePaths: string[],
+  selectedPath: string,
+  entriesByPath: ReadonlyMap<string, GalleryEntry>
+): string[] {
+  const nextPaths: string[] = [];
+  const seen = new Set<string>();
+
+  for (const path of visiblePaths) {
+    if (seen.has(path) || !entriesByPath.has(path)) {
+      continue;
+    }
+
+    seen.add(path);
+    nextPaths.push(path);
+  }
+
+  if (nextPaths.includes(selectedPath)) {
+    return nextPaths;
+  }
+
+  return entriesByPath.has(selectedPath) ? [selectedPath] : [];
+}
+
 type GalleryMapPanelProps = {
   basemaps: GalleryBasemapConfig[];
   activeBasemap: GalleryBasemapConfig | null;
@@ -1600,7 +1684,7 @@ type GalleryMapPanelProps = {
   hiddenOnMapCount: number;
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
-  onSelectPath: (path: string) => void;
+  onSelectPath: (path: string, visiblePaths: string[]) => void;
 };
 
 function GalleryMapPanel({
@@ -1742,7 +1826,7 @@ type GalleryWorldMapProps = {
   isFullscreen: boolean;
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
-  onSelectPath: (path: string) => void;
+  onSelectPath: (path: string, visiblePaths: string[]) => void;
   onToggleFullscreen: () => void;
 };
 
@@ -1787,6 +1871,7 @@ function GalleryWorldMap({
       ),
     [mapViewportHeight, mapViewportWidth, worldMapMarkerPoints]
   );
+  const visiblePaths = useMemo(() => entries.map((entry) => entry.path), [entries]);
   const suppressMarkerThumbnails =
     worldMapMarkerClusters.length > MAX_WORLD_MAP_THUMBNAIL_MARKERS;
   const clusteredMarkerCount = worldMapMarkerClusters.filter(
@@ -1908,7 +1993,7 @@ function GalleryWorldMap({
               left={cluster.x}
               top={cluster.y}
               selected={selected}
-              onClick={() => onSelectPath(point.item.path)}
+              onClick={() => onSelectPath(point.item.path, visiblePaths)}
             />
           );
         }
@@ -2042,7 +2127,7 @@ function GalleryWorldMap({
                   fullWidth
                   onClick={() => {
                     setClusterDialogEntries(null);
-                    onSelectPath(entry.path);
+                    onSelectPath(entry.path, visiblePaths);
                   }}
                 >
                   {entry.path}

@@ -92,7 +92,7 @@ type GalleryBasemapMapProps = {
   isFullscreen: boolean;
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest | null;
-  onSelectPath: (path: string) => void;
+  onSelectPath: (path: string, visiblePaths: string[]) => void;
   onToggleFullscreen: () => void;
   fallback: ReactNode;
 };
@@ -448,6 +448,30 @@ export function GalleryBasemapMap({
   const map = mapRef.current;
   const mapWidth = map?.getContainer().clientWidth ?? 0;
   const mapHeight = map?.getContainer().clientHeight ?? 0;
+  const visibleSelectionPaths = useMemo(
+    () =>
+      mapReady && map
+        ? entries.flatMap((entry) => {
+            const gps = entry.media?.gps;
+            if (!gps) {
+              return [];
+            }
+
+            const projected = map.project([gps.longitude, gps.latitude]);
+            if (
+              projected.x < 0 ||
+              projected.y < 0 ||
+              projected.x > mapWidth ||
+              projected.y > mapHeight
+            ) {
+              return [];
+            }
+
+            return [entry.path];
+          })
+        : entries.map((entry) => entry.path),
+    [entries, map, mapHeight, mapReady, mapWidth, viewportVersion]
+  );
   const visibleMarkerPoints = useMemo(
     () =>
       mapReady && map
@@ -499,7 +523,7 @@ export function GalleryBasemapMap({
     if (cluster.points.length <= 1) {
       const point = cluster.points[0];
       if (point) {
-        onSelectPath(point.item.path);
+        onSelectPath(point.item.path, visibleSelectionPaths);
       }
       return;
     }
@@ -594,7 +618,7 @@ export function GalleryBasemapMap({
                   left={cluster.x}
                   top={cluster.y}
                   selected={selected}
-                  onClick={() => onSelectPath(point.item.path)}
+                  onClick={() => onSelectPath(point.item.path, visibleSelectionPaths)}
                 />
               );
             }
@@ -725,7 +749,7 @@ export function GalleryBasemapMap({
                   fullWidth
                   onClick={() => {
                     setClusterDialogEntries(null);
-                    onSelectPath(entry.path);
+                    onSelectPath(entry.path, visibleSelectionPaths);
                   }}
                 >
                   {entry.path}
