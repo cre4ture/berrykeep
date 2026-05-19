@@ -16,7 +16,14 @@ import {
   IconPlayerPlay,
   IconVideo
 } from "@tabler/icons-react";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode
+} from "react";
 
 export type MediaPreviewRequest = {
   url: string;
@@ -73,6 +80,37 @@ type MediaThumbnailPreviewProps = {
 const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"];
 const videoExtensions = [".m4v", ".mkv", ".mov", ".mp4", ".ogv", ".webm"];
 const LIGHTBOX_STRIP_RADIUS = 3;
+const MEDIA_IMAGE_ZOOM_MIN_SCALE = 1;
+const MEDIA_IMAGE_ZOOM_MAX_SCALE = 6;
+const MEDIA_IMAGE_WHEEL_ZOOM_SENSITIVITY = 0.0018;
+
+type MediaSourceDimensions = {
+  width: number;
+  height: number;
+};
+
+type MediaLightboxZoomState = {
+  scale: number;
+  offsetX: number;
+  offsetY: number;
+};
+
+type MediaLightboxPointerDragState = {
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  startOffsetX: number;
+  startOffsetY: number;
+};
+
+type MediaLightboxWheelLikeEvent = {
+  ctrlKey: boolean;
+  deltaY: number;
+  clientX: number;
+  clientY: number;
+  preventDefault: () => void;
+  stopPropagation: () => void;
+};
 
 export function MediaLightboxModal({
   opened,
@@ -451,8 +489,19 @@ function MediaLightboxImage({
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   const [originalFailed, setOriginalFailed] = useState(false);
   const [originalLoaded, setOriginalLoaded] = useState(false);
+  const [sourceDimensions, setSourceDimensions] = useState<MediaSourceDimensions | null>(() =>
+    resolveMediaSourceDimensions(item.width, item.height)
+  );
+  const [zoomState, setZoomState] = useState<MediaLightboxZoomState>({
+    scale: MEDIA_IMAGE_ZOOM_MIN_SCALE,
+    offsetX: 0,
+    offsetY: 0
+  });
+  const [isDragging, setIsDragging] = useState(false);
   const thumbnailSignature = mediaPreviewRequestSignature(thumbnailRequest);
   const originalSignature = mediaPreviewRequestSignature(originalRequest);
+  const interactiveRef = useRef<HTMLDivElement | null>(null);
+  const pointerDragRef = useRef<MediaLightboxPointerDragState | null>(null);
 
   useEffect(() => {
     setThumbnailFailed(false);
@@ -461,6 +510,14 @@ function MediaLightboxImage({
   useEffect(() => {
     setOriginalFailed(false);
     setOriginalLoaded(false);
+    setSourceDimensions(resolveMediaSourceDimensions(item.width, item.height));
+    setZoomState({
+      scale: MEDIA_IMAGE_ZOOM_MIN_SCALE,
+      offsetX: 0,
+      offsetY: 0
+    });
+    setIsDragging(false);
+    pointerDragRef.current = null;
   }, [originalSignature]);
 
   const thumbnailVisible = Boolean(thumbnail.resolvedSrc) && !thumbnail.failed && !thumbnailFailed;
@@ -475,6 +532,166 @@ function MediaLightboxImage({
         color: "yellow"
       }
     : item.missingThumbnailInfo;
+  const imageTransform = `translate(${zoomState.offsetX}px, ${zoomState.offsetY}px) scale(${zoomState.scale})`;
+
+  function measureZoomMetrics() {
+    const container = interactiveRef.current;
+    if (!container) {
+      return null;
+    }
+
+    const rect = container.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return null;
+    }
+
+    const resolvedSourceWidth = sourceDimensions?.width ?? item.width ?? rect.width;
+    const resolvedSourceHeight = sourceDimensions?.height ?? item.height ?? rect.height;
+    const containedSize = resolveContainedMediaSize(
+      rect.width,
+      rect.height,
+      resolvedSourceWidth,
+      resolvedSourceHeight
+    );
+
+    return { rect, containedSize };
+  }
+
+  function clampZoomTransform(scale: number, offsetX: number, offsetY: number) {
+    if (scale <= MEDIA_IMAGE_ZOOM_MIN_SCALE) {
+      return {
+        scale: MEDIA_IMAGE_ZOOM_MIN_SCALE,
+        offsetX: 0,
+        offsetY: 0
+      };
+    }
+
+    const metrics = measureZoomMetrics();
+    if (!metrics) {
+      return { scale, offsetX, offsetY };
+    }
+
+    const maxOffsetX = Math.max(
+      0,
+      (metrics.containedSize.width * scale - metrics.rect.width) / 2
+    );
+    const maxOffsetY = Math.max(
+      0,
+      (metrics.containedSize.height * scale - metrics.rect.height) / 2
+    );
+
+    return {
+      scale,
+      offsetX: clamp(offsetX, -maxOffsetX, maxOffsetX),
+      offsetY: clamp(offsetY, -maxOffsetY, maxOffsetY)
+    };
+  }
+
+  function updateSourceDimensions(width: number, height: number) {
+    if (width <= 0 || height <= 0) {
+      return;
+    }
+
+    setSourceDimensions((current) => {
+      if (current?.width === width && current.height === height) {
+        return current;
+      }
+      return { width, height };
+    });
+  }
+
+  function handleZoomWheel(event: MediaLightboxWheelLikeEvent) {
+    if (!event.ctrlKey) {
+      return;
+    }
+
+    const metrics = measureZoomMetrics();
+    if (!metrics) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const currentScale = zoomState.scale;
+    const nextScale = clamp(
+      currentScale * Math.exp(-event.deltaY * MEDIA_IMAGE_WHEEL_ZOOM_SENSITIVITY),
+      MEDIA_IMAGE_ZOOM_MIN_SCALE,
+      MEDIA_IMAGE_ZOOM_MAX_SCALE
+    );
+
+    if (Math.abs(nextScale - currentScale) < 0.001) {
+      return;
+    }
+
+    const pointX = event.clientX - metrics.rect.left - metrics.rect.width / 2;
+    const pointY = event.clientY - metrics.rect.top - metrics.rect.height / 2;
+    const scaleRatio = nextScale / currentScale;
+    const nextOffsetX = pointX - (pointX - zoomState.offsetX) * scaleRatio;
+    const nextOffsetY = pointY - (pointY - zoomState.offsetY) * scaleRatio;
+
+    setZoomState(clampZoomTransform(nextScale, nextOffsetX, nextOffsetY));
+  }
+
+  useEffect(() => {
+    const interactive = interactiveRef.current;
+    if (!interactive) {
+      return;
+    }
+
+    function handleNativeWheel(event: WheelEvent) {
+      handleZoomWheel(event);
+    }
+
+    interactive.addEventListener("wheel", handleNativeWheel, { passive: false });
+    return () => interactive.removeEventListener("wheel", handleNativeWheel);
+  }, [handleZoomWheel]);
+
+  function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.pointerType !== "mouse" || event.button !== 0 || zoomState.scale <= 1) {
+      return;
+    }
+
+    pointerDragRef.current = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startOffsetX: zoomState.offsetX,
+      startOffsetY: zoomState.offsetY
+    };
+    setIsDragging(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+
+  function handlePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const pointerDrag = pointerDragRef.current;
+    if (!pointerDrag || pointerDrag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    event.preventDefault();
+    setZoomState(
+      clampZoomTransform(
+        zoomState.scale,
+        pointerDrag.startOffsetX + (event.clientX - pointerDrag.startClientX),
+        pointerDrag.startOffsetY + (event.clientY - pointerDrag.startClientY)
+      )
+    );
+  }
+
+  function endPointerDrag(target: HTMLDivElement, pointerId: number) {
+    const pointerDrag = pointerDragRef.current;
+    if (!pointerDrag || pointerDrag.pointerId !== pointerId) {
+      return;
+    }
+
+    pointerDragRef.current = null;
+    setIsDragging(false);
+    if (target.hasPointerCapture(pointerId)) {
+      target.releasePointerCapture(pointerId);
+    }
+  }
 
   return (
     <MediaLightboxFrame
@@ -484,59 +701,102 @@ function MediaLightboxImage({
       onNavigatePrevious={onNavigatePrevious}
       onNavigateNext={onNavigateNext}
     >
-      {thumbnailVisible ? (
-        <img
-          src={thumbnail.resolvedSrc ?? undefined}
-          alt={item.alt}
-          loading="eager"
-          decoding="async"
-          onError={() => setThumbnailFailed(true)}
-          style={{
-            position: "absolute",
-            inset: 0,
-            width: "100%",
-            height: "100%",
-            objectFit: "contain",
-            filter: originalPending ? "none" : "blur(0px)",
-            background: "var(--mantine-color-dark-9)"
-          }}
-        />
-      ) : (
-        <div
-          style={{
-            position: "absolute",
-            inset: 0
-          }}
-        >
-          <MediaThumbnailPlaceholder
-            kind="image"
-            info={thumbnailNotice}
-            showLoader={originalPending && !originalVisible}
-            fullHeight
+      <div
+        ref={interactiveRef}
+        data-media-zoom-surface="true"
+        data-media-zoom-scale={zoomState.scale.toFixed(2)}
+        title="Hold Ctrl and scroll to zoom this image"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={(event) => endPointerDrag(event.currentTarget, event.pointerId)}
+        onPointerCancel={(event) => endPointerDrag(event.currentTarget, event.pointerId)}
+        style={{
+          position: "absolute",
+          inset: 0,
+          overflow: "hidden",
+          userSelect: "none",
+          cursor:
+            zoomState.scale > MEDIA_IMAGE_ZOOM_MIN_SCALE
+              ? isDragging
+                ? "grabbing"
+                : "grab"
+              : "zoom-in"
+        }}
+      >
+        {thumbnailVisible ? (
+          <img
+            src={thumbnail.resolvedSrc ?? undefined}
+            alt={item.alt}
+            loading="eager"
+            decoding="async"
+            draggable={false}
+            onLoad={(event) =>
+              updateSourceDimensions(
+                event.currentTarget.naturalWidth,
+                event.currentTarget.naturalHeight
+              )
+            }
+            onError={() => setThumbnailFailed(true)}
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              objectFit: "contain",
+              filter: originalPending ? "none" : "blur(0px)",
+              background: "var(--mantine-color-dark-9)",
+              transform: imageTransform,
+              transformOrigin: "center center"
+            }}
           />
-        </div>
-      )}
+        ) : (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              transform: imageTransform,
+              transformOrigin: "center center"
+            }}
+          >
+            <MediaThumbnailPlaceholder
+              kind="image"
+              info={thumbnailNotice}
+              showLoader={originalPending && !originalVisible}
+              fullHeight
+            />
+          </div>
+        )}
 
-      {originalVisible ? (
-        <img
-          src={original.resolvedSrc ?? undefined}
-          alt={item.alt}
-          loading="eager"
-          decoding="async"
-          onLoad={() => setOriginalLoaded(true)}
-          onError={() => setOriginalFailed(true)}
-          style={{
-            position: "absolute",
-            inset: 0,
-            width: "100%",
-            height: "100%",
-            objectFit: "contain",
-            opacity: originalLoaded ? 1 : 0,
-            transition: "opacity 180ms ease",
-            background: "transparent"
-          }}
-        />
-      ) : null}
+        {originalVisible ? (
+          <img
+            src={original.resolvedSrc ?? undefined}
+            alt={item.alt}
+            loading="eager"
+            decoding="async"
+            draggable={false}
+            onLoad={(event) => {
+              setOriginalLoaded(true);
+              updateSourceDimensions(
+                event.currentTarget.naturalWidth,
+                event.currentTarget.naturalHeight
+              );
+            }}
+            onError={() => setOriginalFailed(true)}
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              objectFit: "contain",
+              opacity: originalLoaded ? 1 : 0,
+              transition: "opacity 180ms ease",
+              background: "transparent",
+              transform: imageTransform,
+              transformOrigin: "center center"
+            }}
+          />
+        ) : null}
+      </div>
 
       {originalPending ? (
         <div
@@ -1002,6 +1262,46 @@ function buildLightboxStripIndexes(centerIndex: number, totalCount: number, radi
 
 function formatTakenAt(value: number): string {
   return new Date(value * 1000).toLocaleString();
+}
+
+function resolveMediaSourceDimensions(
+  width?: number | null,
+  height?: number | null
+): MediaSourceDimensions | null {
+  if (!width || !height || width <= 0 || height <= 0) {
+    return null;
+  }
+
+  return { width, height };
+}
+
+function resolveContainedMediaSize(
+  containerWidth: number,
+  containerHeight: number,
+  sourceWidth: number,
+  sourceHeight: number
+) {
+  if (
+    containerWidth <= 0 ||
+    containerHeight <= 0 ||
+    sourceWidth <= 0 ||
+    sourceHeight <= 0
+  ) {
+    return { width: containerWidth, height: containerHeight };
+  }
+
+  const widthRatio = containerWidth / sourceWidth;
+  const heightRatio = containerHeight / sourceHeight;
+  const scale = Math.min(widthRatio, heightRatio);
+
+  return {
+    width: sourceWidth * scale,
+    height: sourceHeight * scale
+  };
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(Math.max(value, minimum), maximum);
 }
 
 function isTextInputTarget(target: EventTarget | null): boolean {

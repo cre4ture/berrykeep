@@ -1,11 +1,27 @@
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 
 const API_V1_PREFIX = "/api/v1";
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
+}
+
+async function dispatchCtrlWheel(locator: Locator, deltaY: number): Promise<void> {
+  await locator.evaluate((element, wheelDelta) => {
+    const rect = element.getBoundingClientRect();
+    element.dispatchEvent(
+      new WheelEvent("wheel", {
+        bubbles: true,
+        cancelable: true,
+        ctrlKey: true,
+        deltaY: wheelDelta,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2
+      })
+    );
+  }, deltaY);
 }
 
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
@@ -143,9 +159,22 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.keyboard.press("Escape");
   await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
   await expect(mediaViewerDialog.getByRole("button", { name: "Start slideshow" })).toBeVisible();
+  const mediaViewerZoomSurface = page.locator('[data-media-zoom-surface="true"]').first();
+  await expect(mediaViewerZoomSurface).toHaveAttribute("data-media-zoom-scale", "1.00");
+  await dispatchCtrlWheel(mediaViewerZoomSurface, -240);
+  await expect
+    .poll(async () => Number(await mediaViewerZoomSurface.getAttribute("data-media-zoom-scale") ?? "1"))
+    .toBeGreaterThan(1);
+  const slideshowEntryScale = Number(
+    (await mediaViewerZoomSurface.getAttribute("data-media-zoom-scale")) ?? "1"
+  );
   await mediaViewerDialog.getByRole("button", { name: "Start slideshow" }).click();
   await expect(page.getByLabel("Media viewer thumbnails")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Next item" })).toHaveCount(0);
+  await dispatchCtrlWheel(mediaViewerZoomSurface, -120);
+  await expect
+    .poll(async () => Number(await mediaViewerZoomSurface.getAttribute("data-media-zoom-scale") ?? "1"))
+    .toBeGreaterThan(slideshowEntryScale);
   await page.keyboard.press("ArrowRight");
   await page.keyboard.press("Escape");
   await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
