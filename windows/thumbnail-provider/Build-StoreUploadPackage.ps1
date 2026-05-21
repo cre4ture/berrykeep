@@ -371,18 +371,20 @@ if (-not $SkipSigning) {
     }
 }
 
-Write-Step 'Building windows-thumbnail-provider, os-integration, ironmesh-folder-agent, ironmesh-background-launcher, and ironmesh-config-app (release)'
+Write-Step 'Building windows-thumbnail-provider, cli-client, os-integration, ironmesh-folder-agent, ironmesh-background-launcher, and ironmesh-config-app (release)'
 $env:CARGO_TARGET_DIR = $cargoTargetDir
-Invoke-NativeChecked -FilePath 'cargo' -Arguments @('build', '-p', 'windows-thumbnail-provider', '-p', 'os-integration', '-p', 'ironmesh-folder-agent', '-p', 'ironmesh-background-launcher', '-p', 'ironmesh-config-app', '--release')
+Invoke-NativeChecked -FilePath 'cargo' -Arguments @('build', '-p', 'windows-thumbnail-provider', '-p', 'cli-client', '-p', 'os-integration', '-p', 'ironmesh-folder-agent', '-p', 'ironmesh-background-launcher', '-p', 'ironmesh-config-app', '--release')
 
 $releaseDir = Join-Path $cargoTargetDir 'release'
 $dllPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'windows_thumbnail_provider.dll' -FallbackPatterns @('windows_thumbnail_provider-*.dll')
+$clientCliPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh.exe' -FallbackPatterns @('ironmesh-*.exe')
 $exePath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-os-integration.exe' -FallbackPatterns @('ironmesh_os_integration-*.exe', 'ironmesh-os-integration-*.exe')
 $folderAgentPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-folder-agent.exe' -FallbackPatterns @('ironmesh_folder_agent-*.exe', 'ironmesh-folder-agent-*.exe')
 $backgroundLauncherPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-background-launcher.exe' -FallbackPatterns @('ironmesh_background_launcher-*.exe', 'ironmesh-background-launcher-*.exe')
 $configAppPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-config-app.exe' -FallbackPatterns @('ironmesh_config_app-*.exe', 'ironmesh-config-app-*.exe')
 $pdbCandidates = @(
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'windows_thumbnail_provider.pdb' -FallbackPatterns @('windows_thumbnail_provider-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh.pdb' -FallbackPatterns @('ironmesh-*.pdb')
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-os-integration.pdb' -FallbackPatterns @('ironmesh_os_integration-*.pdb', 'ironmesh-os-integration-*.pdb')
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-folder-agent.pdb' -FallbackPatterns @('ironmesh_folder_agent-*.pdb', 'ironmesh-folder-agent-*.pdb')
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-background-launcher.pdb' -FallbackPatterns @('ironmesh_background_launcher-*.pdb', 'ironmesh-background-launcher-*.pdb')
@@ -391,6 +393,9 @@ $pdbCandidates = @(
 
 if (-not $dllPath -or -not (Test-Path -LiteralPath $dllPath)) {
     throw "Expected DLL not found: $dllPath"
+}
+if (-not $clientCliPath -or -not (Test-Path -LiteralPath $clientCliPath)) {
+    throw "Expected client CLI EXE not found: $clientCliPath"
 }
 if (-not $exePath -or -not (Test-Path -LiteralPath $exePath)) {
     throw "Expected EXE not found: $exePath"
@@ -408,6 +413,7 @@ if (-not $configAppPath -or -not (Test-Path -LiteralPath $configAppPath)) {
 Write-Step 'Staging Store package contents'
 Save-StagedManifest -SourcePath $manifestPath -DestinationPath (Join-Path $stagePath 'AppxManifest.xml') -Version $resolvedVersion
 Copy-Item $dllPath (Join-Path $stagePath 'windows_thumbnail_provider.dll')
+Copy-Item $clientCliPath (Join-Path $stagePath 'ironmesh.exe')
 Copy-Item $exePath (Join-Path $stagePath 'ironmesh-os-integration.exe')
 Copy-Item $folderAgentPath (Join-Path $stagePath 'ironmesh-folder-agent.exe')
 Copy-Item $backgroundLauncherPath (Join-Path $stagePath 'ironmesh-background-launcher.exe')

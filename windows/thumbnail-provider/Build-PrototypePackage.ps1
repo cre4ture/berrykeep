@@ -298,6 +298,7 @@ New-Item -ItemType Directory -Force -Path $stagePath | Out-Null
 $cargoArgs = @(
     "build",
     "-p", "windows-thumbnail-provider",
+    "-p", "cli-client",
     "-p", "os-integration",
     "-p", "ironmesh-folder-agent",
     "-p", "ironmesh-background-launcher",
@@ -307,7 +308,7 @@ if ($Configuration -eq "release") {
     $cargoArgs += "--release"
 }
 
-Write-Step "Building windows-thumbnail-provider, os-integration, ironmesh-folder-agent, ironmesh-background-launcher, and ironmesh-config-app ($Configuration)"
+Write-Step "Building windows-thumbnail-provider, cli-client, os-integration, ironmesh-folder-agent, ironmesh-background-launcher, and ironmesh-config-app ($Configuration)"
 if ($PackageVersion) {
     Write-Step "Using explicit package version $resolvedPackageVersion"
 } else {
@@ -318,6 +319,7 @@ Invoke-NativeChecked -FilePath "cargo" -Arguments $cargoArgs
 
 $targetDir = if ($Configuration -eq "release") { "release" } else { "debug" }
 $dllPath = Join-Path $cargoTargetDir "$targetDir\\windows_thumbnail_provider.dll"
+$clientCliPath = Join-Path $cargoTargetDir "$targetDir\\ironmesh.exe"
 $exePath = Join-Path $cargoTargetDir "$targetDir\\ironmesh-os-integration.exe"
 $folderAgentPath = Join-Path $cargoTargetDir "$targetDir\\ironmesh-folder-agent.exe"
 $backgroundLauncherPath = Join-Path $cargoTargetDir "$targetDir\ironmesh-background-launcher.exe"
@@ -325,6 +327,9 @@ $configAppPath = Join-Path $cargoTargetDir "$targetDir\ironmesh-config-app.exe"
 
 if (-not (Test-Path $dllPath)) {
     throw "Expected DLL not found: $dllPath"
+}
+if (-not (Test-Path $clientCliPath)) {
+    throw "Expected client CLI EXE not found: $clientCliPath"
 }
 if (-not (Test-Path $exePath)) {
     throw "Expected EXE not found: $exePath"
@@ -342,6 +347,7 @@ if (-not (Test-Path $configAppPath)) {
 Write-Step "Staging package contents under $stagePath"
 Save-StagedManifest -SourcePath $manifestPath -DestinationPath (Join-Path $stagePath "AppxManifest.xml") -Version $resolvedPackageVersion
 Copy-Item $dllPath (Join-Path $stagePath "windows_thumbnail_provider.dll")
+Copy-Item $clientCliPath (Join-Path $stagePath "ironmesh.exe")
 Copy-Item $exePath (Join-Path $stagePath "ironmesh-os-integration.exe")
 Copy-Item $folderAgentPath (Join-Path $stagePath "ironmesh-folder-agent.exe")
 Copy-Item $backgroundLauncherPath (Join-Path $stagePath "ironmesh-background-launcher.exe")

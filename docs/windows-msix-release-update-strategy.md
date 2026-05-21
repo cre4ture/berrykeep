@@ -78,6 +78,8 @@ For this repo, the manifest should now carry the exact Partner Center identity v
 
 The production package should include at least:
 
+- `ironmesh.exe`
+  - packaged local client-service host for background `serve-web` instances created from the config app.
 - `ironmesh-config-app.exe`
   - visible packaged configuration UI and first-run entry point for Windows users.
 - `ironmesh-background-launcher.exe`
@@ -94,6 +96,7 @@ The intended user flow is:
 
 - install the package from Microsoft Store,
 - open the packaged configuration app first,
+- optionally define one or more local `ironmesh serve-web` client services,
 - define one or more `ironmesh-os-integration.exe` and `ironmesh-folder-agent.exe` instances,
 - let the packaged background launcher restart enabled instances after login.
 

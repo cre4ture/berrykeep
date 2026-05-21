@@ -175,5 +175,27 @@
         </uap3:Extension>
       </Extensions>
     </Application>
+    <Application
+      Id="IronmeshCliClient"
+      Executable="ironmesh.exe"
+      EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="IronMesh CLI Client"
+        Description="Packaged local client service host for IronMesh"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\StoreLogo.png"
+        Square44x44Logo="Assets\SmallLogo.png"
+        AppListEntry="none" />
+      <Extensions>
+        <uap3:Extension
+          Category="windows.appExecutionAlias"
+          Executable="ironmesh.exe"
+          EntryPoint="Windows.FullTrustApplication">
+          <uap3:AppExecutionAlias>
+            <desktop:ExecutionAlias Alias="ironmesh.exe" />
+          </uap3:AppExecutionAlias>
+        </uap3:Extension>
+      </Extensions>
+    </Application>
   </Applications>
 </Package>

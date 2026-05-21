@@ -36,6 +36,7 @@ This must stay aligned with:
 The prototype package root should contain at least:
 
 - `AppxManifest.xml`
+- `ironmesh.exe`
 - `ironmesh-config-app.exe`
 - `ironmesh-background-launcher.exe`
 - `windows_thumbnail_provider.dll`
@@ -44,7 +45,7 @@ The prototype package root should contain at least:
 - `Assets/SmallLogo.png`
 - `Assets/StoreLogo.png`
 
-The manifest now exposes the packaged `ironmesh-config-app.exe` as the visible user-facing entry point, registers `ironmesh-background-launcher.exe` as the login-time startup task, and keeps `ironmesh-os-integration.exe` plus `ironmesh-folder-agent.exe` as hidden packaged full-trust entry points.
+The manifest now exposes the packaged `ironmesh-config-app.exe` as the visible user-facing entry point, registers `ironmesh-background-launcher.exe` as the login-time startup task, and keeps `ironmesh.exe`, `ironmesh-os-integration.exe`, plus `ironmesh-folder-agent.exe` as hidden packaged full-trust entry points.
 
 For normal packaged-client testing, start IronMesh through the packaged config app and define instances there first. The direct `ironmesh-os-integration.exe serve ...` flow below remains useful when you need low-level CFAPI or thumbnail-provider verification.
 
@@ -104,11 +105,12 @@ Typical usage:
 The helper will:
 
 - build `windows-thumbnail-provider`
+- build `cli-client`
 - build `os-integration`
 - build `ironmesh-folder-agent`
 - build `ironmesh-background-launcher`
 - build `ironmesh-config-app`
-- stage `AppxManifest.xml`, `Assets`, `windows_thumbnail_provider.dll`, `ironmesh-os-integration.exe`, `ironmesh-folder-agent.exe`, `ironmesh-background-launcher.exe`, and `ironmesh-config-app.exe`
+- stage `AppxManifest.xml`, `Assets`, `windows_thumbnail_provider.dll`, `ironmesh.exe`, `ironmesh-os-integration.exe`, `ironmesh-folder-agent.exe`, `ironmesh-background-launcher.exe`, and `ironmesh-config-app.exe`
 - if the Windows SDK tools are installed, also:
   - create/reuse a self-signed developer certificate
   - generate an `.msix`
@@ -140,7 +142,7 @@ Typical usage:
 
 The helper will:
 
-- build `windows-thumbnail-provider`, `os-integration`, `ironmesh-folder-agent`, `ironmesh-background-launcher`, and `ironmesh-config-app` in release mode
+- build `windows-thumbnail-provider`, `cli-client`, `os-integration`, `ironmesh-folder-agent`, `ironmesh-background-launcher`, and `ironmesh-config-app` in release mode
 - stage the Store manifest, assets, DLL, and EXEs
 - create an `.msix`
 - sign the `.msix` with a local self-signed certificate matching the Store publisher by default
