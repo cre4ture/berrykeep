@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -35,6 +35,9 @@ const BACKEND_REVISION: &str = git_version::git_version!(
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
 const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
+const WEB_LATENCY_PROBE_TIMEOUT_MIN_MS: u64 = 8_000;
+const WEB_LATENCY_PROBE_TIMEOUT_CONNECT_SLACK_MS: u64 = 3_000;
+const WEB_LATENCY_PROBE_TIMEOUT_PER_REQUEST_SLACK_MS: u64 = 3_000;
 const WEB_API_V1_PREFIX: &str = "/api/v1";
 
 mod mbtiles;
@@ -625,6 +628,23 @@ struct WebLatencyProbeResponse {
     comparison: Option<LatencyProbeComparison>,
 }
 
+struct WebLatencyProbeTask {
+    path_id: String,
+    label: String,
+    transport_mode: String,
+    uses_current_runtime: bool,
+    target: Option<String>,
+    client: IronMeshClient,
+}
+
+enum PendingWebLatencyProbeEntry {
+    Ready(WebLatencyProbeTargetResult),
+    Running {
+        fallback: WebLatencyProbeTargetResult,
+        handle: tokio::task::JoinHandle<WebLatencyProbeTargetResult>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ErrorResponseBody {
     error: String,
@@ -691,74 +711,143 @@ fn web_latency_target_description(client: &IronMeshClient) -> Option<String> {
         .map(|url| url.trim_end_matches('/').to_string())
 }
 
-async fn probe_web_latency_client(
-    path_id: &str,
-    label: String,
-    transport_mode: String,
-    uses_current_runtime: bool,
-    target: Option<String>,
-    client: &IronMeshClient,
-    config: &LatencyProbeConfig,
-) -> WebLatencyProbeTargetResult {
-    match client.run_latency_probe(config.clone()).await {
-        Ok(result) => WebLatencyProbeTargetResult {
-            path_id: path_id.to_string(),
-            label,
-            transport_mode,
-            uses_current_runtime,
-            target,
-            result: Some(result),
-            error: None,
-        },
-        Err(error) => WebLatencyProbeTargetResult {
-            path_id: path_id.to_string(),
-            label,
-            transport_mode,
-            uses_current_runtime,
-            target,
+impl WebLatencyProbeTask {
+    fn empty_result(&self) -> WebLatencyProbeTargetResult {
+        WebLatencyProbeTargetResult {
+            path_id: self.path_id.clone(),
+            label: self.label.clone(),
+            transport_mode: self.transport_mode.clone(),
+            uses_current_runtime: self.uses_current_runtime,
+            target: self.target.clone(),
             result: None,
-            error: Some(error.to_string()),
-        },
+            error: None,
+        }
+    }
+
+    fn into_result(
+        self,
+        result: Option<LatencyProbeResult>,
+        error: Option<String>,
+    ) -> WebLatencyProbeTargetResult {
+        WebLatencyProbeTargetResult {
+            path_id: self.path_id,
+            label: self.label,
+            transport_mode: self.transport_mode,
+            uses_current_runtime: self.uses_current_runtime,
+            target: self.target,
+            result,
+            error,
+        }
     }
 }
 
-async fn probe_web_relay_latency_targets(
+fn web_latency_probe_timeout(config: &LatencyProbeConfig) -> Duration {
+    let total_requests = config.sample_count.saturating_add(config.warmup_count) as u64;
+    let per_request_budget_ms = config
+        .server_delay_ms
+        .saturating_add(config.pause_between_samples_ms)
+        .saturating_add(WEB_LATENCY_PROBE_TIMEOUT_PER_REQUEST_SLACK_MS);
+    let total_budget_ms = WEB_LATENCY_PROBE_TIMEOUT_CONNECT_SLACK_MS
+        .saturating_add(total_requests.saturating_mul(per_request_budget_ms));
+    Duration::from_millis(total_budget_ms.max(WEB_LATENCY_PROBE_TIMEOUT_MIN_MS))
+}
+
+fn web_latency_probe_timeout_error(timeout: Duration) -> String {
+    format!(
+        "latency probe exceeded the per-path time budget after {:.1} s; skipped this path",
+        timeout.as_secs_f64()
+    )
+}
+
+fn spawn_web_latency_probe_task(
+    task: WebLatencyProbeTask,
+    config: &LatencyProbeConfig,
+) -> PendingWebLatencyProbeEntry {
+    let fallback = task.empty_result();
+    let config = config.clone();
+    let handle = tokio::spawn(async move { probe_web_latency_client(task, config).await });
+    PendingWebLatencyProbeEntry::Running { fallback, handle }
+}
+
+async fn collect_web_latency_probe_entries(
+    entries: Vec<PendingWebLatencyProbeEntry>,
+) -> Vec<WebLatencyProbeTargetResult> {
+    let mut results = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        match entry {
+            PendingWebLatencyProbeEntry::Ready(result) => results.push(result),
+            PendingWebLatencyProbeEntry::Running {
+                mut fallback,
+                handle,
+            } => match handle.await {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    fallback.error = Some(format!(
+                        "latency probe task terminated unexpectedly: {error}"
+                    ));
+                    results.push(fallback);
+                }
+            },
+        }
+    }
+
+    results
+}
+
+async fn probe_web_latency_client(
+    task: WebLatencyProbeTask,
+    config: LatencyProbeConfig,
+) -> WebLatencyProbeTargetResult {
+    let timeout = web_latency_probe_timeout(&config);
+    match tokio::time::timeout(timeout, task.client.run_latency_probe(config)).await {
+        Ok(Ok(result)) => task.into_result(Some(result), None),
+        Ok(Err(error)) => task.into_result(None, Some(error.to_string())),
+        Err(_) => task.into_result(None, Some(web_latency_probe_timeout_error(timeout))),
+    }
+}
+
+fn push_web_relay_latency_probe_entries(
+    entries: &mut Vec<PendingWebLatencyProbeEntry>,
     current_client: &IronMeshClient,
     diagnostic_targets: &ConnectionBootstrapDiagnosticTargets,
     identity: Option<&ClientIdentityMaterial>,
     config: &LatencyProbeConfig,
     include_current_runtime_if_relay: bool,
-) -> Vec<WebLatencyProbeTargetResult> {
-    let mut results = Vec::new();
+) {
+    let starting_len = entries.len();
 
     if include_current_runtime_if_relay && current_client.uses_relay_transport() {
-        results.push(
-            probe_web_latency_client(
-                "relay-current",
-                "Relay path (current runtime)".to_string(),
-                "relay".to_string(),
-                true,
-                web_latency_target_description(current_client),
-                current_client,
-                config,
-            )
-            .await,
-        );
+        entries.push(spawn_web_latency_probe_task(
+            WebLatencyProbeTask {
+                path_id: "relay-current".to_string(),
+                label: "Relay path (current runtime)".to_string(),
+                transport_mode: "relay".to_string(),
+                uses_current_runtime: true,
+                target: web_latency_target_description(current_client),
+                client: current_client.clone(),
+            },
+            config,
+        ));
     }
 
     if diagnostic_targets.relay.is_empty() {
-        if results.is_empty() {
-            results.push(WebLatencyProbeTargetResult {
-                path_id: "relay".to_string(),
-                label: "Relay path".to_string(),
-                transport_mode: "relay".to_string(),
-                uses_current_runtime: false,
-                target: None,
-                result: None,
-                error: Some("no relay bootstrap target is available for diagnostics".to_string()),
-            });
+        if entries.len() == starting_len {
+            entries.push(PendingWebLatencyProbeEntry::Ready(
+                WebLatencyProbeTargetResult {
+                    path_id: "relay".to_string(),
+                    label: "Relay path".to_string(),
+                    transport_mode: "relay".to_string(),
+                    uses_current_runtime: false,
+                    target: None,
+                    result: None,
+                    error: Some(
+                        "no relay bootstrap target is available for diagnostics".to_string(),
+                    ),
+                },
+            ));
         }
-        return results;
+        return;
     }
 
     for (index, target) in diagnostic_targets.relay.iter().enumerate() {
@@ -775,35 +864,34 @@ async fn probe_web_relay_latency_targets(
 
         match build_client_with_optional_identity_from_planned_target(target, identity) {
             Ok(client) => {
-                results.push(
-                    probe_web_latency_client(
-                        &path_id,
+                entries.push(spawn_web_latency_probe_task(
+                    WebLatencyProbeTask {
+                        path_id,
                         label,
-                        "relay".to_string(),
-                        false,
-                        target_description,
-                        &client,
-                        config,
-                    )
-                    .await,
-                );
+                        transport_mode: "relay".to_string(),
+                        uses_current_runtime: false,
+                        target: target_description,
+                        client,
+                    },
+                    config,
+                ));
             }
             Err(error) => {
-                results.push(WebLatencyProbeTargetResult {
-                    path_id,
-                    label,
-                    transport_mode: "relay".to_string(),
-                    uses_current_runtime: false,
-                    target: target_description
-                        .or_else(|| target.target_node_id.map(|node_id| node_id.to_string())),
-                    result: None,
-                    error: Some(error.to_string()),
-                });
+                entries.push(PendingWebLatencyProbeEntry::Ready(
+                    WebLatencyProbeTargetResult {
+                        path_id,
+                        label,
+                        transport_mode: "relay".to_string(),
+                        uses_current_runtime: false,
+                        target: target_description
+                            .or_else(|| target.target_node_id.map(|node_id| node_id.to_string())),
+                        result: None,
+                        error: Some(error.to_string()),
+                    },
+                ));
             }
         }
     }
-
-    results
 }
 
 fn dedup_web_latency_targets(targets: &mut Vec<WebLatencyProbeTargetResult>) {
@@ -2649,63 +2737,62 @@ async fn web_latency_test(
         )
     };
 
-    let mut targets = vec![
-        probe_web_latency_client(
-            "current",
-            "Current runtime path".to_string(),
-            if current_client.uses_relay_transport() {
+    let mut entries = vec![spawn_web_latency_probe_task(
+        WebLatencyProbeTask {
+            path_id: "current".to_string(),
+            label: "Current runtime path".to_string(),
+            transport_mode: if current_client.uses_relay_transport() {
                 "relay".to_string()
             } else {
                 "direct".to_string()
             },
-            true,
-            web_latency_target_description(&current_client),
-            &current_client,
-            &config,
-        )
-        .await,
-    ];
+            uses_current_runtime: true,
+            target: web_latency_target_description(&current_client),
+            client: current_client.clone(),
+        },
+        &config,
+    )];
 
     if current_client.uses_relay_transport()
         && let Some(target) = diagnostic_targets.direct.as_ref()
     {
         match build_client_with_optional_identity_from_planned_target(target, identity.as_ref()) {
             Ok(client) => {
-                targets.push(
-                    probe_web_latency_client(
-                        "direct",
-                        "Direct bootstrap path".to_string(),
-                        "direct".to_string(),
-                        false,
-                        target.server_base_url.clone(),
-                        &client,
-                        &config,
-                    )
-                    .await,
-                );
+                entries.push(spawn_web_latency_probe_task(
+                    WebLatencyProbeTask {
+                        path_id: "direct".to_string(),
+                        label: "Direct bootstrap path".to_string(),
+                        transport_mode: "direct".to_string(),
+                        uses_current_runtime: false,
+                        target: target.server_base_url.clone(),
+                        client,
+                    },
+                    &config,
+                ));
             }
-            Err(error) => targets.push(WebLatencyProbeTargetResult {
-                path_id: "direct".to_string(),
-                label: "Direct bootstrap path".to_string(),
-                transport_mode: "direct".to_string(),
-                uses_current_runtime: false,
-                target: target.server_base_url.clone(),
-                result: None,
-                error: Some(error.to_string()),
-            }),
+            Err(error) => entries.push(PendingWebLatencyProbeEntry::Ready(
+                WebLatencyProbeTargetResult {
+                    path_id: "direct".to_string(),
+                    label: "Direct bootstrap path".to_string(),
+                    transport_mode: "direct".to_string(),
+                    uses_current_runtime: false,
+                    target: target.server_base_url.clone(),
+                    result: None,
+                    error: Some(error.to_string()),
+                },
+            )),
         }
     }
 
-    targets.extend(
-        probe_web_relay_latency_targets(
-            &current_client,
-            &diagnostic_targets,
-            identity.as_ref(),
-            &config,
-            true,
-        )
-        .await,
+    push_web_relay_latency_probe_entries(
+        &mut entries,
+        &current_client,
+        &diagnostic_targets,
+        identity.as_ref(),
+        &config,
+        true,
     );
+    let mut targets = collect_web_latency_probe_entries(entries).await;
     dedup_web_latency_targets(&mut targets);
 
     let comparison = select_web_direct_and_relay_results(&targets)
@@ -2788,9 +2875,13 @@ async fn web_update_rendezvous(
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorResponseBody, error_response, normalize_store_restore_path};
+    use super::{
+        ErrorResponseBody, error_response, normalize_store_restore_path, web_latency_probe_timeout,
+    };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
+    use client_sdk::LatencyProbeConfig;
+    use std::time::Duration;
 
     #[test]
     fn normalize_store_restore_path_distinguishes_files_and_prefixes() {
@@ -2807,6 +2898,32 @@ mod tests {
             "docs/archive/"
         );
         assert_eq!(normalize_store_restore_path("   ", false), "");
+    }
+
+    #[test]
+    fn web_latency_probe_timeout_applies_floor_for_short_probes() {
+        let timeout = web_latency_probe_timeout(&LatencyProbeConfig {
+            sample_count: 1,
+            warmup_count: 0,
+            response_bytes: 1024,
+            server_delay_ms: 0,
+            pause_between_samples_ms: 0,
+        });
+
+        assert_eq!(timeout, Duration::from_millis(8_000));
+    }
+
+    #[test]
+    fn web_latency_probe_timeout_scales_with_requested_probe_work() {
+        let timeout = web_latency_probe_timeout(&LatencyProbeConfig {
+            sample_count: 6,
+            warmup_count: 1,
+            response_bytes: 1024,
+            server_delay_ms: 500,
+            pause_between_samples_ms: 125,
+        });
+
+        assert_eq!(timeout, Duration::from_millis(28_375));
     }
 
     #[tokio::test]
