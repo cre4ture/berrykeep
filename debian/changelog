@@ -1,3 +1,16 @@
+ironmesh (1.0.16-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Expose live repair progress tails in the admin Repair page and deepen
+    replication repair logging.
+  * Add automatic latency feature tests, polish the latency page, and close
+    the shared gallery grid pagination gap.
+  * Add a copy-to-clipboard action for JSON blocks and fix missing
+    ironmesh.exe packaging in the Windows MSIX manifests.
+  * Stabilize Turso media-cache cleanup under CI coverage and roll the
+    workspace release to 1.0.16.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 22 May 2026 22:29:57 +0200
+
 ironmesh (1.0.15-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add admin explorer move, rename, and restore actions plus a right-side
