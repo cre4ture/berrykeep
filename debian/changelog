@@ -1,3 +1,14 @@
+ironmesh (1.0.17-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Preserve replication repair lineage across nodes and stop replayed
+    tombstones from re-deleting repaired content.
+  * Add manual cleanup for duplicate delete-recreate loop metadata and
+    tighten repair-related regression coverage.
+  * Fix the bootstrap setup handoff race in the shared admin UI flow and
+    stabilize the partial-download crash recovery system test.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 24 May 2026 10:57:05 +0200
+
 ironmesh (1.0.16-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Expose live repair progress tails in the admin Repair page and deepen
