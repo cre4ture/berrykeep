@@ -3901,7 +3901,7 @@ impl PersistentStore {
                     candidate_groups
                         .entry((candidate.key.clone(), signature_key))
                         .or_default()
-                        .push(candidate);
+                        .push(*candidate);
                 }
                 DeleteRecreateLoopCleanupCandidateOutcome::UnresolvedPath => {
                     report.skipped_indexes_without_resolved_path = report
@@ -7092,7 +7092,7 @@ impl PersistentStore {
         head_version_ids.sort();
 
         Ok(DeleteRecreateLoopCleanupCandidateOutcome::Candidate(
-            DeleteRecreateLoopCleanupCandidate {
+            Box::new(DeleteRecreateLoopCleanupCandidate {
                 key: key.clone(),
                 object_id: index.object_id.clone(),
                 bound_current: self.current_state.object_ids.get(&key) == Some(&index.object_id),
@@ -7102,7 +7102,7 @@ impl PersistentStore {
                     versions: normalized_versions,
                 },
                 index,
-            },
+            }),
         ))
     }
 
@@ -7134,6 +7134,22 @@ impl PersistentStore {
 
         if let Some(source_object_id) = bundle.object_id.clone() {
             if !bundle.selected_is_preferred_head {
+                if let Some(version_id) = bundle.version_id.as_deref()
+                    && let Some(object_id) = self
+                        .resolve_object_id_for_key_version(key, version_id)
+                        .await?
+                {
+                    return Ok(ReplicationImportLineageChoice::existing(object_id));
+                }
+
+                if let Some(object_id) = self.object_id_for_key(key) {
+                    return Ok(ReplicationImportLineageChoice::existing(object_id));
+                }
+
+                if let Some(object_id) = self.resolve_object_id_for_key_history(key).await? {
+                    return Ok(ReplicationImportLineageChoice::existing(object_id));
+                }
+
                 return Ok(ReplicationImportLineageChoice::existing(source_object_id));
             }
 
@@ -7513,7 +7529,7 @@ fn empty_version_index(object_id: &str) -> FileVersionIndex {
 }
 
 enum DeleteRecreateLoopCleanupCandidateOutcome {
-    Candidate(DeleteRecreateLoopCleanupCandidate),
+    Candidate(Box<DeleteRecreateLoopCleanupCandidate>),
     UnresolvedPath,
     MultiplePaths,
     NoDeleteRecreateLoop,

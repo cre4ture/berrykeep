@@ -9,7 +9,7 @@ use rand::RngCore;
 use rcgen::BasicConstraints;
 use sha2::Sha256;
 use std::net::Ipv4Addr;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, OwnedPermit};
 
 const SETUP_STATE_VERSION: u32 = 1;
 const MANAGED_SIGNER_BACKUP_VERSION: u32 = 1;
@@ -18,6 +18,7 @@ const MANAGED_SIGNER_BACKUP_SALT_LEN: usize = 16;
 const MANAGED_SIGNER_BACKUP_NONCE_LEN: usize = 12;
 const MANAGED_SIGNER_BACKUP_KEY_LEN: usize = 32;
 const MANAGED_SIGNER_BACKUP_PBKDF2_ROUNDS: u32 = 600_000;
+const SETUP_RUNTIME_TRANSITION_DELAY_MS: u64 = 100;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -85,6 +86,15 @@ struct SetupServerState {
 #[derive(Debug)]
 struct SetupCompletion {
     config: ServerNodeConfig,
+}
+
+fn spawn_setup_runtime_transition(permit: OwnedPermit<SetupCompletion>, config: ServerNodeConfig) {
+    tokio::spawn(async move {
+        // Let the setup handler finish writing its JSON response before the
+        // supervisor tears the bootstrap server down and swaps into runtime.
+        tokio::time::sleep(Duration::from_millis(SETUP_RUNTIME_TRANSITION_DELAY_MS)).await;
+        permit.send(SetupCompletion { config });
+    });
 }
 
 struct SelfManagedClusterArtifacts {
@@ -623,18 +633,17 @@ async fn start_new_cluster(
     apply_managed_signer_paths(&state.config.data_dir, &mut config);
     apply_managed_rendezvous_config(&state.config.data_dir, &managed_snapshot, &mut config);
     config.admin_password_hash = Some(hash_token(&request.admin_password));
-    if state
-        .completion_tx
-        .send(SetupCompletion { config })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "failed scheduling runtime transition" })),
-        )
-            .into_response();
-    }
+    let completion_permit = match state.completion_tx.clone().reserve_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed scheduling runtime transition" })),
+            )
+                .into_response();
+        }
+    };
+    spawn_setup_runtime_transition(completion_permit, config);
 
     (
         StatusCode::CREATED,
@@ -818,18 +827,17 @@ async fn import_node_enrollment_package(
     apply_managed_signer_paths(&state.config.data_dir, &mut config);
     apply_managed_rendezvous_config(&state.config.data_dir, &managed_snapshot, &mut config);
     config.admin_password_hash = Some(hash_token(&request.admin_password));
-    if state
-        .completion_tx
-        .send(SetupCompletion { config })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "failed scheduling runtime transition" })),
-        )
-            .into_response();
-    }
+    let completion_permit = match state.completion_tx.clone().reserve_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed scheduling runtime transition" })),
+            )
+                .into_response();
+        }
+    };
+    spawn_setup_runtime_transition(completion_permit, config);
 
     (
         StatusCode::CREATED,
@@ -1892,6 +1900,33 @@ mod tests {
             restored.managed_rendezvous_public_url.as_deref(),
             Some("https://node-a.local:9443")
         );
+    }
+
+    #[tokio::test]
+    async fn setup_runtime_transition_is_deferred_long_enough_for_response_flush() {
+        let dir = temp_dir("deferred-setup-transition");
+        let config = test_cluster_config_without_internal_tls(
+            dir.join("data"),
+            "127.0.0.1:28080".parse::<SocketAddr>().unwrap(),
+        );
+        let expected_bind_addr = config.bind_addr;
+        let (tx, mut rx) = mpsc::channel(1);
+        let permit = tx.reserve_owned().await.unwrap();
+
+        spawn_setup_runtime_transition(permit, config);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .is_err(),
+            "runtime transition should not fire immediately"
+        );
+
+        let completion = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("runtime transition should arrive after delay")
+            .expect("runtime transition channel should stay open");
+        assert_eq!(completion.config.bind_addr, expected_bind_addr);
     }
 
     #[test]
