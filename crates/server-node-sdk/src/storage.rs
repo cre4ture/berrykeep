@@ -639,9 +639,23 @@ pub struct ReplicationManifestPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationExportBundle {
     pub key: String,
+    #[serde(default)]
+    pub object_id: Option<String>,
     pub version_id: Option<String>,
+    #[serde(default)]
+    pub logical_path: Option<String>,
     pub parent_version_ids: Vec<String>,
     pub state: VersionConsistencyState,
+    #[serde(default)]
+    pub created_at_unix: Option<u64>,
+    #[serde(default)]
+    pub copied_from_object_id: Option<String>,
+    #[serde(default)]
+    pub copied_from_version_id: Option<String>,
+    #[serde(default)]
+    pub copied_from_path: Option<String>,
+    #[serde(default)]
+    pub selected_is_preferred_head: bool,
     pub manifest_hash: String,
     pub manifest_bytes: Vec<u8>,
     pub manifest: ReplicationManifestPayload,
@@ -3849,79 +3863,118 @@ impl PersistentStore {
         } else {
             self.object_id_for_key(key)
         };
-        let (selected_version_id, parent_version_ids, state, manifest_hash) =
-            if let Some(version_id) = version_id {
-                let Some(object_id) = object_id.as_ref() else {
-                    return Ok(None);
-                };
+        let (
+            selected_version_id,
+            selected_logical_path,
+            parent_version_ids,
+            state,
+            created_at_unix,
+            copied_from_object_id,
+            copied_from_version_id,
+            copied_from_path,
+            manifest_hash,
+            selected_is_preferred_head,
+        ) = if let Some(version_id) = version_id {
+            let Some(object_id) = object_id.as_ref() else {
+                return Ok(None);
+            };
 
-                let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
-                    return Ok(None);
-                };
+            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
+                return Ok(None);
+            };
 
-                let Some(record) = index.versions.get(version_id) else {
-                    return Ok(None);
-                };
+            let Some(record) = index.versions.get(version_id) else {
+                return Ok(None);
+            };
 
-                (
-                    Some(record.version_id.clone()),
-                    record.parent_version_ids.clone(),
-                    record.state.clone(),
-                    record.manifest_hash.clone(),
-                )
-            } else {
-                match object_id {
-                    Some(object_id) => {
-                        match self.load_version_index_by_object_id(&object_id).await? {
-                            Some(index) => {
-                                let Some(record) = version_record_for_read_mode(&index, read_mode)
-                                else {
-                                    return Ok(None);
-                                };
+            (
+                Some(record.version_id.clone()),
+                record.logical_path.clone(),
+                record.parent_version_ids.clone(),
+                record.state.clone(),
+                Some(record.created_at_unix),
+                record.copied_from_object_id.clone(),
+                record.copied_from_version_id.clone(),
+                record.copied_from_path.clone(),
+                record.manifest_hash.clone(),
+                index.preferred_head_version_id.as_deref() == Some(record.version_id.as_str()),
+            )
+        } else {
+            match object_id {
+                Some(ref object_id) => {
+                    match self.load_version_index_by_object_id(object_id).await? {
+                        Some(index) => {
+                            let Some(record) = version_record_for_read_mode(&index, read_mode)
+                            else {
+                                return Ok(None);
+                            };
 
-                                (
-                                    Some(record.version_id.clone()),
-                                    record.parent_version_ids.clone(),
-                                    record.state.clone(),
-                                    record.manifest_hash.clone(),
-                                )
-                            }
-                            None => {
-                                let Some(manifest_hash) =
-                                    self.current_state.objects.get(key).cloned()
-                                else {
-                                    return Ok(None);
-                                };
-                                (
-                                    None,
-                                    Vec::new(),
-                                    VersionConsistencyState::Confirmed,
-                                    manifest_hash,
-                                )
-                            }
+                            (
+                                Some(record.version_id.clone()),
+                                record.logical_path.clone(),
+                                record.parent_version_ids.clone(),
+                                record.state.clone(),
+                                Some(record.created_at_unix),
+                                record.copied_from_object_id.clone(),
+                                record.copied_from_version_id.clone(),
+                                record.copied_from_path.clone(),
+                                record.manifest_hash.clone(),
+                                true,
+                            )
+                        }
+                        None => {
+                            let Some(manifest_hash) = self.current_state.objects.get(key).cloned()
+                            else {
+                                return Ok(None);
+                            };
+                            (
+                                None,
+                                Some(key.to_string()),
+                                Vec::new(),
+                                VersionConsistencyState::Confirmed,
+                                None,
+                                None,
+                                None,
+                                None,
+                                manifest_hash,
+                                true,
+                            )
                         }
                     }
-                    None => {
-                        let Some(manifest_hash) = self.current_state.objects.get(key).cloned()
-                        else {
-                            return Ok(None);
-                        };
-                        (
-                            None,
-                            Vec::new(),
-                            VersionConsistencyState::Confirmed,
-                            manifest_hash,
-                        )
-                    }
                 }
-            };
+                None => {
+                    let Some(manifest_hash) = self.current_state.objects.get(key).cloned() else {
+                        return Ok(None);
+                    };
+                    (
+                        None,
+                        Some(key.to_string()),
+                        Vec::new(),
+                        VersionConsistencyState::Confirmed,
+                        None,
+                        None,
+                        None,
+                        None,
+                        manifest_hash,
+                        true,
+                    )
+                }
+            }
+        };
 
         if manifest_hash == TOMBSTONE_MANIFEST_HASH {
             return Ok(Some(ReplicationExportBundle {
                 key: key.to_string(),
+                object_id,
                 version_id: selected_version_id,
+                logical_path: selected_logical_path,
                 parent_version_ids,
                 state,
+                created_at_unix,
+                copied_from_object_id,
+                copied_from_version_id,
+                copied_from_path,
+                selected_is_preferred_head,
                 manifest_hash,
                 manifest_bytes: Vec::new(),
                 manifest: ReplicationManifestPayload {
@@ -3943,9 +3996,16 @@ impl PersistentStore {
 
         Ok(Some(ReplicationExportBundle {
             key: key.to_string(),
+            object_id,
             version_id: selected_version_id,
+            logical_path: selected_logical_path,
             parent_version_ids,
             state,
+            created_at_unix,
+            copied_from_object_id,
+            copied_from_version_id,
+            copied_from_path,
+            selected_is_preferred_head,
             manifest_hash,
             manifest_bytes,
             manifest: ReplicationManifestPayload {
@@ -4155,6 +4215,7 @@ impl PersistentStore {
         self.chunk_ingestor.ingest_chunk_auto(payload).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn import_replica_manifest(
         &mut self,
         key: &str,
@@ -4452,6 +4513,164 @@ impl PersistentStore {
         }
 
         Ok(changed)
+    }
+
+    pub async fn import_replication_bundle(
+        &mut self,
+        bundle: &ReplicationExportBundle,
+    ) -> Result<String> {
+        let key = bundle
+            .logical_path
+            .as_deref()
+            .unwrap_or(bundle.key.as_str());
+        let resolved_version_id = bundle.version_id.clone().unwrap_or_else(|| {
+            if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                format!("rep-{}-tombstone", unix_ts_nanos())
+            } else {
+                format!("rep-{}-{}", unix_ts_nanos(), &bundle.manifest_hash[..12])
+            }
+        });
+        let source_created_at_unix = bundle.created_at_unix.unwrap_or_else(unix_ts);
+
+        if bundle.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            let computed_manifest_hash = hash_hex(&bundle.manifest_bytes);
+            if computed_manifest_hash != bundle.manifest_hash {
+                bail!(
+                    "manifest hash mismatch: expected={} actual={computed_manifest_hash}",
+                    bundle.manifest_hash
+                );
+            }
+
+            let manifest = serde_json::from_slice::<ObjectManifest>(&bundle.manifest_bytes)
+                .context("invalid replication manifest payload")?;
+
+            if manifest.key != key {
+                bail!(
+                    "replication manifest key mismatch: expected={key} actual={}",
+                    manifest.key
+                );
+            }
+
+            for chunk in &manifest.chunks {
+                let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+                if !fs::try_exists(&chunk_path).await? {
+                    bail!("manifest references missing chunk hash={}", chunk.hash);
+                }
+
+                let metadata = fs::metadata(&chunk_path).await?;
+                if metadata.len() != chunk.size_bytes as u64 {
+                    bail!(
+                        "manifest chunk size mismatch hash={} expected={} actual={}",
+                        chunk.hash,
+                        chunk.size_bytes,
+                        metadata.len()
+                    );
+                }
+            }
+
+            let manifest_path = self
+                .manifests_dir
+                .join(format!("{}.json", bundle.manifest_hash));
+            let manifest_needs_write = match fs::read(&manifest_path).await {
+                Ok(existing_payload) => existing_payload != bundle.manifest_bytes,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => true,
+            };
+            if manifest_needs_write {
+                write_atomic_overwrite(&manifest_path, &bundle.manifest_bytes).await?;
+            }
+            self.mark_manifest_locally_owned(&bundle.manifest_hash)
+                .await?;
+        }
+
+        let lineage_choice = self
+            .choose_replication_bundle_object_id(
+                bundle,
+                key,
+                &resolved_version_id,
+                source_created_at_unix,
+            )
+            .await?;
+        let object_id = lineage_choice.object_id.clone();
+        let created_at_unix = if lineage_choice.conflict_recreated
+            && bundle.manifest_hash != TOMBSTONE_MANIFEST_HASH
+        {
+            source_created_at_unix.max(unix_ts()).saturating_add(1)
+        } else {
+            source_created_at_unix
+        };
+        let mut index = self
+            .load_version_index_by_object_id(&object_id)
+            .await?
+            .unwrap_or_else(|| empty_version_index(&object_id));
+
+        let record = FileVersionRecord {
+            version_id: resolved_version_id.clone(),
+            object_id: object_id.clone(),
+            manifest_hash: bundle.manifest_hash.clone(),
+            logical_path: Some(key.to_string()),
+            parent_version_ids: bundle.parent_version_ids.clone(),
+            state: bundle.state.clone(),
+            created_at_unix,
+            copied_from_object_id: bundle.copied_from_object_id.clone(),
+            copied_from_version_id: bundle.copied_from_version_id.clone(),
+            copied_from_path: bundle.copied_from_path.clone(),
+        };
+
+        self.prune_conflicting_replication_bundle_versions(key, &record)
+            .await?;
+
+        if let Some(existing) = index.versions.get(&resolved_version_id) {
+            if !replication_bundle_record_matches(existing, &record) {
+                index.versions.insert(resolved_version_id.clone(), record);
+                index.head_version_ids = recompute_head_version_ids(&index);
+                index.preferred_head_version_id = choose_preferred_head(&index);
+                self.persist_version_index_by_object_id(&object_id, &index)
+                    .await?;
+                self.sync_current_state_for_key_from_index(key, &index)?;
+                if bundle.selected_is_preferred_head
+                    && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH
+                {
+                    self.apply_selected_replica_tombstone_current_state(key, bundle)
+                        .await?;
+                } else if bundle.selected_is_preferred_head {
+                    self.promote_current_state_for_key_from_index(key, &index)?;
+                }
+                self.persist_current_state().await?;
+                self.create_snapshot().await?;
+                return Ok(resolved_version_id);
+            }
+
+            self.sync_current_state_for_key_from_index(key, &index)?;
+            if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH
+            {
+                self.apply_selected_replica_tombstone_current_state(key, bundle)
+                    .await?;
+            } else if bundle.selected_is_preferred_head {
+                self.promote_current_state_for_key_from_index(key, &index)?;
+            }
+            self.persist_current_state().await?;
+            self.create_snapshot().await?;
+            return Ok(resolved_version_id);
+        }
+
+        index.versions.insert(resolved_version_id.clone(), record);
+        index.head_version_ids = recompute_head_version_ids(&index);
+        index.preferred_head_version_id = choose_preferred_head(&index);
+
+        self.persist_version_index_by_object_id(&object_id, &index)
+            .await?;
+        self.sync_current_state_for_key_from_index(key, &index)?;
+        if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            self.apply_selected_replica_tombstone_current_state(key, bundle)
+                .await?;
+        } else if bundle.selected_is_preferred_head {
+            self.promote_current_state_for_key_from_index(key, &index)?;
+        }
+        self.persist_current_state().await?;
+        self.create_snapshot().await?;
+
+        Ok(resolved_version_id)
     }
 
     pub async fn drop_replica_subject(
@@ -6186,32 +6405,85 @@ impl PersistentStore {
         key: &str,
         index: &FileVersionIndex,
     ) -> Result<()> {
+        let current_object_id = self.current_state.object_ids.get(key).cloned();
         let Some(preferred_head) = &index.preferred_head_version_id else {
-            self.current_state.objects.remove(key);
-            self.current_state.object_ids.remove(key);
+            if current_object_id.as_deref() == Some(index.object_id.as_str()) {
+                self.current_state.objects.remove(key);
+                self.current_state.object_ids.remove(key);
+            }
             return Ok(());
         };
 
-        let manifest_hash = index
-            .versions
-            .get(preferred_head)
-            .map(|record| record.manifest_hash.clone())
-            .with_context(|| {
-                format!("preferred head {preferred_head} missing in index for key={key}")
-            })?;
+        let preferred_record = index.versions.get(preferred_head).with_context(|| {
+            format!("preferred head {preferred_head} missing in index for key={key}")
+        })?;
 
-        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            self.current_state.objects.remove(key);
-            self.current_state.object_ids.remove(key);
+        if preferred_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            if current_object_id.as_deref() == Some(index.object_id.as_str()) {
+                self.current_state.objects.remove(key);
+                self.current_state.object_ids.remove(key);
+            }
+            return Ok(());
+        }
+
+        if current_object_id.is_none()
+            || current_object_id.as_deref() == Some(index.object_id.as_str())
+        {
+            self.current_state
+                .objects
+                .insert(key.to_string(), preferred_record.manifest_hash.clone());
+            self.current_state
+                .object_ids
+                .insert(key.to_string(), index.object_id.clone());
+        }
+        Ok(())
+    }
+
+    fn promote_current_state_for_key_from_index(
+        &mut self,
+        key: &str,
+        index: &FileVersionIndex,
+    ) -> Result<()> {
+        let Some(preferred_head) = &index.preferred_head_version_id else {
+            return Ok(());
+        };
+        let preferred_record = index.versions.get(preferred_head).with_context(|| {
+            format!("preferred head {preferred_head} missing in index for key={key}")
+        })?;
+        if preferred_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
             return Ok(());
         }
 
         self.current_state
             .objects
-            .insert(key.to_string(), manifest_hash);
+            .insert(key.to_string(), preferred_record.manifest_hash.clone());
         self.current_state
             .object_ids
             .insert(key.to_string(), index.object_id.clone());
+        Ok(())
+    }
+
+    async fn apply_selected_replica_tombstone_current_state(
+        &mut self,
+        key: &str,
+        bundle: &ReplicationExportBundle,
+    ) -> Result<()> {
+        let Some(current_object_id) = self.current_state.object_ids.get(key).cloned() else {
+            return Ok(());
+        };
+
+        let same_lineage = bundle.object_id.as_deref() == Some(current_object_id.as_str());
+        let copied_from_current = bundle.copied_from_object_id.as_deref()
+            == Some(current_object_id.as_str())
+            && bundle.copied_from_path.as_deref() == Some(key);
+        let tombstone_supersedes_current = self
+            .replica_tombstone_supersedes_current_key(key, &current_object_id, bundle)
+            .await?;
+
+        if same_lineage || copied_from_current || tombstone_supersedes_current {
+            self.current_state.objects.remove(key);
+            self.current_state.object_ids.remove(key);
+        }
         Ok(())
     }
 
@@ -6493,6 +6765,184 @@ impl PersistentStore {
         Ok(None)
     }
 
+    async fn choose_replication_bundle_object_id(
+        &self,
+        bundle: &ReplicationExportBundle,
+        key: &str,
+        resolved_version_id: &str,
+        created_at_unix: u64,
+    ) -> Result<ReplicationImportLineageChoice> {
+        if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            if let Some(object_id) = bundle.object_id.clone() {
+                return Ok(ReplicationImportLineageChoice::existing(object_id));
+            }
+            if let Some(version_id) = bundle.version_id.as_deref()
+                && let Some(object_id) = self
+                    .resolve_object_id_for_key_version(key, version_id)
+                    .await?
+            {
+                return Ok(ReplicationImportLineageChoice::existing(object_id));
+            }
+            if let Some(object_id) = self.resolve_object_id_for_key_history(key).await? {
+                return Ok(ReplicationImportLineageChoice::existing(object_id));
+            }
+            return Ok(ReplicationImportLineageChoice::existing(
+                generate_object_id(),
+            ));
+        }
+
+        if let Some(source_object_id) = bundle.object_id.clone() {
+            if !bundle.selected_is_preferred_head {
+                return Ok(ReplicationImportLineageChoice::existing(source_object_id));
+            }
+
+            if let Some(index) = self
+                .load_version_index_by_object_id(&source_object_id)
+                .await?
+            {
+                let preferred_head = index
+                    .preferred_head_version_id
+                    .as_ref()
+                    .and_then(|version_id| index.versions.get(version_id));
+                let preferred_is_tombstone = preferred_head
+                    .map(|record| record.manifest_hash == TOMBSTONE_MANIFEST_HASH)
+                    .unwrap_or(false);
+                if preferred_is_tombstone
+                    && index.preferred_head_version_id.as_deref() != Some(resolved_version_id)
+                {
+                    return Ok(ReplicationImportLineageChoice::conflict_recreated(
+                        generate_object_id(),
+                    ));
+                }
+            }
+
+            return Ok(ReplicationImportLineageChoice::existing(source_object_id));
+        }
+
+        if let Some(current_object_id) = self.object_id_for_key(key)
+            && let Some(index) = self
+                .load_version_index_by_object_id(&current_object_id)
+                .await?
+            && let Some(existing) = index.versions.get(resolved_version_id)
+        {
+            let expected = FileVersionRecord {
+                version_id: resolved_version_id.to_string(),
+                object_id: current_object_id.clone(),
+                manifest_hash: bundle.manifest_hash.clone(),
+                logical_path: Some(key.to_string()),
+                parent_version_ids: bundle.parent_version_ids.clone(),
+                state: bundle.state.clone(),
+                created_at_unix,
+                copied_from_object_id: bundle.copied_from_object_id.clone(),
+                copied_from_version_id: bundle.copied_from_version_id.clone(),
+                copied_from_path: bundle.copied_from_path.clone(),
+            };
+            if replication_bundle_record_matches(existing, &expected) {
+                return Ok(ReplicationImportLineageChoice::existing(current_object_id));
+            }
+        }
+
+        if let Some(version_id) = bundle.version_id.as_deref()
+            && let Some(object_id) = self
+                .resolve_object_id_for_key_version(key, version_id)
+                .await?
+        {
+            return Ok(ReplicationImportLineageChoice::existing(object_id));
+        }
+
+        if let Some(object_id) = self.object_id_for_key(key) {
+            return Ok(ReplicationImportLineageChoice::existing(object_id));
+        }
+
+        if !bundle.selected_is_preferred_head
+            && let Some(object_id) = self.resolve_object_id_for_key_history(key).await?
+        {
+            return Ok(ReplicationImportLineageChoice::existing(object_id));
+        }
+
+        Ok(ReplicationImportLineageChoice::existing(
+            generate_object_id(),
+        ))
+    }
+
+    async fn prune_conflicting_replication_bundle_versions(
+        &mut self,
+        key: &str,
+        keep_record: &FileVersionRecord,
+    ) -> Result<()> {
+        let mut indexes = self.load_all_version_indexes().await?;
+
+        for mut index in indexes.drain(..) {
+            let Some(existing) = index.versions.get(&keep_record.version_id).cloned() else {
+                continue;
+            };
+            if existing.logical_path.as_deref() != Some(key) {
+                continue;
+            }
+            if index.object_id == keep_record.object_id
+                && replication_bundle_record_matches(&existing, keep_record)
+            {
+                continue;
+            }
+
+            index.versions.remove(&keep_record.version_id);
+            index.head_version_ids = recompute_head_version_ids(&index);
+            index.preferred_head_version_id = choose_preferred_head(&index);
+
+            if index.versions.is_empty() {
+                self.delete_version_index_by_object_id(&index.object_id)
+                    .await?;
+                if self.current_state.object_ids.get(key) == Some(&index.object_id) {
+                    self.current_state.objects.remove(key);
+                    self.current_state.object_ids.remove(key);
+                }
+                continue;
+            }
+
+            self.persist_version_index_by_object_id(&index.object_id, &index)
+                .await?;
+            self.sync_current_state_for_key_from_index(key, &index)?;
+        }
+
+        Ok(())
+    }
+
+    async fn replica_tombstone_supersedes_current_key(
+        &self,
+        key: &str,
+        current_object_id: &str,
+        bundle: &ReplicationExportBundle,
+    ) -> Result<bool> {
+        let Some(index) = self
+            .load_version_index_by_object_id(current_object_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let Some(current_head_id) = index.preferred_head_version_id.as_ref() else {
+            return Ok(false);
+        };
+        let Some(current_record) = index.versions.get(current_head_id) else {
+            return Ok(false);
+        };
+        if current_record.logical_path.as_deref() != Some(key)
+            || current_record.manifest_hash == TOMBSTONE_MANIFEST_HASH
+        {
+            return Ok(false);
+        }
+
+        let tombstone_order = replica_version_order_key(
+            bundle.version_id.as_deref(),
+            bundle.created_at_unix.unwrap_or_default(),
+        );
+        let current_order = replica_version_order_key(
+            Some(current_record.version_id.as_str()),
+            current_record.created_at_unix,
+        );
+
+        Ok(tombstone_order > current_order)
+    }
+
     async fn resolve_key_for_version_index(
         &self,
         index: &FileVersionIndex,
@@ -6719,6 +7169,56 @@ fn empty_version_index(object_id: &str) -> FileVersionIndex {
         head_version_ids: Vec::new(),
         preferred_head_version_id: None,
     }
+}
+
+fn replication_bundle_record_matches(
+    existing: &FileVersionRecord,
+    expected: &FileVersionRecord,
+) -> bool {
+    existing.version_id == expected.version_id
+        && existing.object_id == expected.object_id
+        && existing.manifest_hash == expected.manifest_hash
+        && existing.logical_path == expected.logical_path
+        && existing.parent_version_ids == expected.parent_version_ids
+        && existing.state == expected.state
+        && existing.created_at_unix == expected.created_at_unix
+        && existing.copied_from_object_id == expected.copied_from_object_id
+        && existing.copied_from_version_id == expected.copied_from_version_id
+        && existing.copied_from_path == expected.copied_from_path
+}
+
+struct ReplicationImportLineageChoice {
+    object_id: String,
+    conflict_recreated: bool,
+}
+
+impl ReplicationImportLineageChoice {
+    fn existing(object_id: String) -> Self {
+        Self {
+            object_id,
+            conflict_recreated: false,
+        }
+    }
+
+    fn conflict_recreated(object_id: String) -> Self {
+        Self {
+            object_id,
+            conflict_recreated: true,
+        }
+    }
+}
+
+fn replica_version_order_key(version_id: Option<&str>, created_at_unix: u64) -> (u64, u128) {
+    let version_nanos = version_id
+        .and_then(parse_replica_version_nanos)
+        .unwrap_or_else(|| u128::from(created_at_unix).saturating_mul(1_000_000_000));
+    (created_at_unix, version_nanos)
+}
+
+fn parse_replica_version_nanos(version_id: &str) -> Option<u128> {
+    let (_, suffix) = version_id.split_once('-')?;
+    let timestamp = suffix.split('-').next()?;
+    timestamp.parse::<u128>().ok()
 }
 
 fn content_fingerprint_from_manifest(manifest: &ObjectManifest) -> String {

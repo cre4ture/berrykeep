@@ -3,7 +3,8 @@ use super::{
     ServerNodeConfig, ServerState, StartupRepairStatus, await_repair_busy_threshold,
     build_rendezvous_presence_registration, build_store_index_entries, cluster, constant_time_eq,
     jittered_backoff_secs, lock_store, new_store_rwlock, node_descriptor_from_presence_entry,
-    plan_peer_transport, read_store, replication::build_internal_replication_put_url,
+    plan_peer_transport, read_store,
+    replication::{build_replication_bundle_push_path, build_replication_export_path},
     resolve_peer_base_url, run_startup_replication_repair_once,
     should_trigger_autonomous_post_write_replication, token_matches,
 };
@@ -5398,17 +5399,14 @@ fn autonomous_post_write_repair_runtime_coalesces_pending_subjects() {
 }
 
 #[test]
-fn internal_replication_put_url_sets_internal_flag() {
-    let url = build_internal_replication_put_url(
-        "http://127.0.0.1:18080",
-        "hello",
-        "confirmed",
-        Some("ver-123"),
-    );
-    assert!(url.contains("/store/hello?"));
-    assert!(url.contains("state=confirmed"));
-    assert!(url.contains("version_id=ver-123"));
-    assert!(url.contains("internal_replication=true"));
+fn replication_peer_routes_use_v2_paths() {
+    let export_url = build_replication_export_path("hello", Some("ver-123"));
+    assert!(export_url.starts_with("/cluster/v2/replication/export?"));
+    assert!(export_url.contains("key=hello"));
+    assert!(export_url.contains("version_id=ver-123"));
+
+    let push_url = build_replication_bundle_push_path();
+    assert_eq!(push_url, "/cluster/v2/replication/push/bundle");
 }
 
 async fn repair_busy_threshold_returns_immediately_when_disabled_impl(backend: MainTestBackend) {
@@ -6411,7 +6409,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
     let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new()
         .route(
-            "/cluster/replication/chunk/{hash}",
+            "/cluster/v2/replication/chunk/{hash}",
             get(super::get_replication_chunk),
         )
         .with_state(source.clone());
@@ -6573,7 +6571,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
     let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new()
         .route(
-            "/cluster/replication/chunk/{hash}",
+            "/cluster/v2/replication/chunk/{hash}",
             get(super::get_replication_chunk),
         )
         .with_state(source.clone());

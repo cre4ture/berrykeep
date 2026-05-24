@@ -1716,6 +1716,458 @@ run_on_all_metadata_backends!(
     export_replication_bundle_supports_tombstone_versions_turso
 );
 
+async fn import_replication_bundle_preserves_source_object_id_for_repaired_key_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend.init_store("replica-import-source-object-id").await;
+    let (target_root, mut target) = backend.init_store("replica-import-target-object-id").await;
+
+    let source_put = source
+        .put_object_versioned(
+            "docs/conflict.txt",
+            Bytes::from_static(b"source-payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let source_bundle = source
+        .export_replication_bundle(
+            "docs/conflict.txt",
+            Some(&source_put.version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("expected source replication bundle");
+    let source_object_id = source_bundle
+        .object_id
+        .clone()
+        .expect("source replication bundle should include object id");
+
+    for chunk in &source_bundle.manifest.chunks {
+        let payload = source
+            .read_chunk_payload(&chunk.hash)
+            .await
+            .unwrap()
+            .unwrap();
+        target
+            .ingest_chunk(&chunk.hash, payload.as_ref())
+            .await
+            .unwrap();
+    }
+    target
+        .import_replication_bundle(&source_bundle)
+        .await
+        .unwrap();
+
+    let versions = target
+        .list_versions("docs/conflict.txt")
+        .await
+        .unwrap()
+        .expect("repaired key should be current on target");
+    assert_eq!(versions.object_id, source_object_id);
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    import_replication_bundle_preserves_source_object_id_for_repaired_key_impl,
+    import_replication_bundle_preserves_source_object_id_for_repaired_key,
+    import_replication_bundle_preserves_source_object_id_for_repaired_key_turso
+);
+
+async fn replayed_replica_tombstone_does_not_remove_repaired_key_impl(backend: StorageTestBackend) {
+    let (source_root, mut source) = backend.init_store("replica-repair-loop-source").await;
+    let (target_root, mut target) = backend.init_store("replica-repair-loop-target").await;
+
+    let source_put = source
+        .put_object_versioned(
+            "docs/conflict.txt",
+            Bytes::from_static(b"source-payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let source_bundle = source
+        .export_replication_bundle(
+            "docs/conflict.txt",
+            Some(&source_put.version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("expected source replication bundle");
+
+    for chunk in &source_bundle.manifest.chunks {
+        let payload = source
+            .read_chunk_payload(&chunk.hash)
+            .await
+            .unwrap()
+            .unwrap();
+        target
+            .ingest_chunk(&chunk.hash, payload.as_ref())
+            .await
+            .unwrap();
+    }
+    target
+        .import_replication_bundle(&source_bundle)
+        .await
+        .unwrap();
+
+    let tombstone_version_id = target
+        .tombstone_object(
+            "docs/conflict.txt",
+            PutOptions {
+                parent_version_ids: vec![source_put.version_id.clone()],
+                explicit_version_id: Some("tomb-replayed-repair".to_string()),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let tombstone_bundle = target
+        .export_replication_bundle(
+            "docs/conflict.txt",
+            Some(&tombstone_version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("expected tombstone replication bundle");
+
+    for chunk in &source_bundle.manifest.chunks {
+        let payload = source
+            .read_chunk_payload(&chunk.hash)
+            .await
+            .unwrap()
+            .unwrap();
+        target
+            .ingest_chunk(&chunk.hash, payload.as_ref())
+            .await
+            .unwrap();
+    }
+    target
+        .import_replication_bundle(&source_bundle)
+        .await
+        .unwrap();
+    target
+        .import_replication_bundle(&tombstone_bundle)
+        .await
+        .unwrap();
+
+    let versions = target
+        .list_versions("docs/conflict.txt")
+        .await
+        .unwrap()
+        .expect("replayed historical tombstone should not remove repaired key");
+    assert_eq!(
+        versions.preferred_head_version_id,
+        Some(source_put.version_id),
+        "replayed tombstone should leave repaired live version current"
+    );
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    replayed_replica_tombstone_does_not_remove_repaired_key_impl,
+    replayed_replica_tombstone_does_not_remove_repaired_key,
+    replayed_replica_tombstone_does_not_remove_repaired_key_turso
+);
+
+async fn import_replication_bundle_replaces_conflicting_same_version_history_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend.init_store("replica-replace-conflict-source").await;
+    let (target_root, mut target) = backend.init_store("replica-replace-conflict-target").await;
+
+    let key = "docs/conflict.txt";
+    let version_id = "ver-shared-repair".to_string();
+    let payload = Bytes::from_static(b"shared-payload");
+
+    source
+        .put_object_versioned(
+            key,
+            payload.clone(),
+            PutOptions {
+                explicit_version_id: Some(version_id.clone()),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    target
+        .put_object_versioned(
+            key,
+            payload.clone(),
+            PutOptions {
+                explicit_version_id: Some(version_id.clone()),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    target
+        .replace_manifest_bytes_for_subject_for_test(key, Some(&version_id), br#"{not-valid-json"#)
+        .await
+        .unwrap();
+
+    let source_bundle = source
+        .export_replication_bundle(key, Some(&version_id), ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .expect("expected source replication bundle");
+    let source_object_id = source_bundle
+        .object_id
+        .clone()
+        .expect("source replication bundle should include object id");
+
+    for chunk in &source_bundle.manifest.chunks {
+        let payload = source
+            .read_chunk_payload(&chunk.hash)
+            .await
+            .unwrap()
+            .unwrap();
+        target
+            .ingest_chunk(&chunk.hash, payload.as_ref())
+            .await
+            .unwrap();
+    }
+
+    target
+        .import_replication_bundle(&source_bundle)
+        .await
+        .unwrap();
+
+    let versions = target
+        .list_versions(key)
+        .await
+        .unwrap()
+        .expect("authoritative repair should keep key current");
+    assert_eq!(versions.object_id, source_object_id);
+
+    let duplicate_count = target
+        .load_all_version_indexes()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|index| {
+            index
+                .versions
+                .get(&version_id)
+                .is_some_and(|record| record.logical_path.as_deref() == Some(key))
+        })
+        .count();
+    assert_eq!(
+        duplicate_count, 1,
+        "authoritative repair should leave exactly one version lineage for the repaired subject"
+    );
+
+    let scrub_report = target.run_data_scrub().await.unwrap();
+    assert_eq!(
+        scrub_report.issue_count, 0,
+        "authoritative repair should clear stale conflicting scrub issues"
+    );
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    import_replication_bundle_replaces_conflicting_same_version_history_impl,
+    import_replication_bundle_replaces_conflicting_same_version_history,
+    import_replication_bundle_replaces_conflicting_same_version_history_turso
+);
+
+async fn authoritative_replica_repair_keeps_delete_tombstones_effective_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend.init_store("replica-delete-source").await;
+    let (target_root, mut target) = backend.init_store("replica-delete-target").await;
+
+    let key = "cluster-delete/target.txt";
+    let version_id = "ver-shared-delete".to_string();
+    let payload = Bytes::from_static(b"cluster-delete-payload");
+
+    source
+        .put_object_versioned(
+            key,
+            payload.clone(),
+            PutOptions {
+                explicit_version_id: Some(version_id.clone()),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    target
+        .put_object_versioned(
+            key,
+            payload,
+            PutOptions {
+                explicit_version_id: Some(version_id.clone()),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let live_bundle = source
+        .export_replication_bundle(key, Some(&version_id), ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .expect("expected live replication bundle");
+    let source_object_id = live_bundle
+        .object_id
+        .clone()
+        .expect("live replication bundle should include object id");
+
+    for chunk in &live_bundle.manifest.chunks {
+        let payload = source
+            .read_chunk_payload(&chunk.hash)
+            .await
+            .unwrap()
+            .unwrap();
+        target
+            .ingest_chunk(&chunk.hash, payload.as_ref())
+            .await
+            .unwrap();
+    }
+    target
+        .import_replication_bundle(&live_bundle)
+        .await
+        .unwrap();
+
+    let current_versions = target
+        .list_versions(key)
+        .await
+        .unwrap()
+        .expect("live repair should keep key current");
+    assert_eq!(current_versions.object_id, source_object_id);
+
+    let tombstone_version_id = source
+        .tombstone_object(
+            key,
+            PutOptions {
+                parent_version_ids: vec![version_id.clone()],
+                explicit_version_id: Some("tomb-shared-delete".to_string()),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let tombstone_bundle = source
+        .export_replication_bundle(key, Some(&tombstone_version_id), ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .expect("expected tombstone replication bundle");
+
+    target
+        .import_replication_bundle(&tombstone_bundle)
+        .await
+        .unwrap();
+
+    assert!(
+        target.list_versions(key).await.unwrap().is_none(),
+        "delete tombstone should remove the repaired key once the live lineage matches the source"
+    );
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    authoritative_replica_repair_keeps_delete_tombstones_effective_impl,
+    authoritative_replica_repair_keeps_delete_tombstones_effective,
+    authoritative_replica_repair_keeps_delete_tombstones_effective_turso
+);
+
+async fn import_replication_bundles_keep_nested_file_current_with_directory_marker_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend.init_store("replica-dir-file-source").await;
+    let (target_root, mut target) = backend.init_store("replica-dir-file-target").await;
+
+    let dir_key = "repair-delete-dir/";
+    let file_key = "repair-delete-dir/target.txt";
+    let file_payload = Bytes::from_static(b"repair-delete-payload");
+
+    let dir_put = source
+        .put_object_versioned(dir_key, Bytes::new(), PutOptions::default())
+        .await
+        .unwrap();
+    let file_put = source
+        .put_object_versioned(file_key, file_payload.clone(), PutOptions::default())
+        .await
+        .unwrap();
+
+    let bundles = vec![
+        source
+            .export_replication_bundle(
+                dir_key,
+                Some(&dir_put.version_id),
+                ObjectReadMode::Preferred,
+            )
+            .await
+            .unwrap()
+            .expect("expected directory version bundle"),
+        source
+            .export_replication_bundle(
+                file_key,
+                Some(&file_put.version_id),
+                ObjectReadMode::Preferred,
+            )
+            .await
+            .unwrap()
+            .expect("expected file version bundle"),
+        source
+            .export_replication_bundle(dir_key, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .expect("expected directory current bundle"),
+        source
+            .export_replication_bundle(file_key, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .expect("expected file current bundle"),
+    ];
+
+    for bundle in &bundles {
+        for chunk in &bundle.manifest.chunks {
+            let payload = source
+                .read_chunk_payload(&chunk.hash)
+                .await
+                .unwrap()
+                .unwrap();
+            target
+                .ingest_chunk(&chunk.hash, payload.as_ref())
+                .await
+                .unwrap();
+        }
+        target.import_replication_bundle(bundle).await.unwrap();
+    }
+
+    let restored = target
+        .get_object(file_key, None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("nested file should remain current after directory marker replication");
+    assert_eq!(restored, file_payload);
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    import_replication_bundles_keep_nested_file_current_with_directory_marker_impl,
+    import_replication_bundles_keep_nested_file_current_with_directory_marker,
+    import_replication_bundles_keep_nested_file_current_with_directory_marker_turso
+);
+
 async fn rename_preserves_object_id_and_history_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("rename-preserves-object-id").await;
 

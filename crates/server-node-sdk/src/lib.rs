@@ -182,9 +182,10 @@ use storage::{
     MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle,
     ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
     PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions, ReconcileVersionEntry,
-    RepairAttemptRecord, ReplicationChunkInfo, SnapshotRestoreMutationResult, StorageStatsSample,
-    StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState,
-    media_cache_retry_due, promote_cached_media_metadata_to_incomplete,
+    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
+    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
+    UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
+    promote_cached_media_metadata_to_incomplete,
 };
 
 tokio::task_local! {
@@ -6013,21 +6014,21 @@ pub(crate) fn build_internal_peer_api() -> Router<ServerState> {
         )
         .route(PEER_MEDIA_ARTIFACT_ROUTE, get(get_peer_media_artifact))
         .route(
-            "/cluster/replication/export",
+            "/cluster/v2/replication/export",
             get(export_replication_bundle),
         )
         .route("/cluster/metadata/export", get(export_metadata_bundle))
         .route(
-            "/cluster/replication/chunk/{hash}",
+            "/cluster/v2/replication/chunk/{hash}",
             get(get_replication_chunk),
         )
         .route(
-            "/cluster/replication/push/chunk/{hash}",
+            "/cluster/v2/replication/push/chunk/{hash}",
             post(push_replication_chunk),
         )
         .route(
-            "/cluster/replication/push/manifest",
-            post(push_replication_manifest),
+            "/cluster/v2/replication/push/bundle",
+            post(push_replication_bundle),
         )
         .route("/cluster/replication/drop", post(drop_replication_subject))
         .route(
@@ -11636,7 +11637,7 @@ async fn hydrate_missing_chunks_for_range(
 
     for chunk in missing_chunks {
         let mut fetched = false;
-        let chunk_path = format!("/cluster/replication/chunk/{}", chunk.hash);
+        let chunk_path = format!("/cluster/v2/replication/chunk/{}", chunk.hash);
 
         for source in &sources {
             let response = match execute_peer_request(
@@ -18410,16 +18411,6 @@ async fn execute_replication_cleanup(
         .into_response()
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct ReplicationManifestPushQuery {
-    key: String,
-    version_id: Option<String>,
-    #[serde(default)]
-    parent_version_ids_json: Option<String>,
-    state: VersionConsistencyState,
-    manifest_hash: String,
-}
-
 #[derive(Debug, Serialize)]
 struct ReplicationChunkPushReport {
     stored: bool,
@@ -18438,7 +18429,7 @@ struct MetadataExportQuery {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ReplicationManifestPushReport {
+struct ReplicationBundlePushReport {
     version_id: String,
 }
 
@@ -18538,47 +18529,25 @@ async fn push_replication_chunk(
     }
 }
 
-async fn push_replication_manifest(
+async fn push_replication_bundle(
     State(state): State<ServerState>,
-    Query(query): Query<ReplicationManifestPushQuery>,
-    payload: Bytes,
+    Json(bundle): Json<ReplicationExportBundle>,
 ) -> impl IntoResponse {
-    let parent_version_ids = match query.parent_version_ids_json.as_deref() {
-        Some(raw) => match serde_json::from_str::<Vec<String>>(raw) {
-            Ok(parent_version_ids) => parent_version_ids,
-            Err(err) => {
-                tracing::warn!(
-                    key = %query.key,
-                    version_id = ?query.version_id,
-                    error = %err,
-                    "failed decoding replication manifest parent_version_ids"
-                );
-                return StatusCode::BAD_REQUEST.into_response();
-            }
-        },
-        None => Vec::new(),
-    };
-
+    let logical_key = bundle
+        .logical_path
+        .clone()
+        .unwrap_or_else(|| bundle.key.clone());
     let import_result = {
         let mut store = lock_store(&state, "replication.import_manifest").await;
-        store
-            .import_replica_manifest(
-                &query.key,
-                query.version_id.as_deref(),
-                &parent_version_ids,
-                query.state,
-                &query.manifest_hash,
-                &payload,
-            )
-            .await
+        store.import_replication_bundle(&bundle).await
     };
 
     match import_result {
         Ok(version_id) => {
             publish_namespace_change(&state);
             let mut cluster = state.cluster.lock().await;
-            cluster.note_replica(&query.key, state.node_id);
-            cluster.note_replica(format!("{}@{}", query.key, version_id), state.node_id);
+            cluster.note_replica(&logical_key, state.node_id);
+            cluster.note_replica(format!("{}@{}", logical_key, version_id), state.node_id);
             drop(cluster);
 
             if let Err(err) = persist_cluster_replicas_state(&state).await {
@@ -18590,16 +18559,16 @@ async fn push_replication_manifest(
 
             (
                 StatusCode::OK,
-                Json(ReplicationManifestPushReport { version_id }),
+                Json(ReplicationBundlePushReport { version_id }),
             )
                 .into_response()
         }
         Err(err) => {
             tracing::warn!(
-                key = %query.key,
-                version_id = ?query.version_id,
+                key = %logical_key,
+                version_id = ?bundle.version_id,
                 error = %err,
-                "failed to import replication manifest"
+                "failed to import replication bundle"
             );
             StatusCode::BAD_REQUEST.into_response()
         }

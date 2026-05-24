@@ -797,7 +797,7 @@ mod tests {
                 })?;
                 wait_for_object_bytes(&sdk_a, file_key, &file_payload, 180).await?;
 
-                let _: serde_json::Value = http
+                let initial_report: serde_json::Value = http
                     .post(format!("{base_a}/cluster/replication/repair"))
                     .send()
                     .await?
@@ -818,7 +818,7 @@ mod tests {
                 })?;
                 wait_for_remote_directory_absence(&sdk_a, dir_name, 220).await?;
 
-                let _: serde_json::Value = http
+                let delete_report: serde_json::Value = http
                     .post(format!("{base_a}/cluster/replication/repair"))
                     .send()
                     .await?
@@ -826,7 +826,19 @@ mod tests {
                     .json()
                     .await?;
 
-                wait_for_remote_file_absence(&sdk_b, file_key, 260).await?;
+                if let Err(err) = wait_for_remote_file_absence(&sdk_b, file_key, 260).await {
+                    let versions_b = http
+                        .get(format!("{base_b}/versions/{file_key}"))
+                        .send()
+                        .await?
+                        .json::<serde_json::Value>()
+                        .await
+                        .unwrap_or(serde_json::Value::Null);
+                    let index_b = sdk_b.store_index(None, 64, None).await.ok();
+                    bail!(
+                        "{err}; initial_report={initial_report:?} delete_report={delete_report:?} versions_b={versions_b:?} index_b={index_b:?}"
+                    );
+                }
                 wait_for_remote_directory_absence(&sdk_b, dir_name, 260).await?;
 
                 Ok::<(), anyhow::Error>(())

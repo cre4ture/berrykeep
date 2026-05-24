@@ -3439,6 +3439,11 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .context("missing preferred_head_version_id on source")?
                 .to_string();
+            let source_object_id = versions_a
+                .get("object_id")
+                .and_then(|v| v.as_str())
+                .context("missing object_id on source")?
+                .to_string();
 
             let repair_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
@@ -3483,6 +3488,14 @@ mod tests {
             assert!(
                 contains_source_version,
                 "expected target node to contain replicated source version id"
+            );
+            let target_object_id = versions_b
+                .get("object_id")
+                .and_then(|v| v.as_str())
+                .context("missing object_id on target")?;
+            assert_eq!(
+                target_object_id, source_object_id,
+                "expected repair to preserve source object id on target"
             );
 
             Ok::<(), anyhow::Error>(())
@@ -3599,6 +3612,117 @@ mod tests {
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&client_a.client_dir);
         let _ = fs::remove_dir_all(&client_b.client_dir);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn manual_replication_repair_propagates_delete_tombstone_to_target() -> Result<()> {
+        let bind_a = "127.0.0.1:19178";
+        let bind_b = "127.0.0.1:19179";
+
+        let node_id_a = "00000000-0000-0000-0000-000000000aa1";
+        let node_id_b = "00000000-0000-0000-0000-000000000ab2";
+
+        let data_a = fresh_data_dir("repair-delete-a");
+        let data_b = fresh_data_dir("repair-delete-b");
+
+        let extra_env = [
+            ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
+            ("IRONMESH_STARTUP_REPAIR_ENABLED", "false"),
+            ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
+        ];
+
+        let mut node_a =
+            start_open_server_with_env(bind_a, &data_a, node_id_a, 2, &extra_env).await?;
+        let mut node_b =
+            start_open_server_with_env(bind_b, &data_b, node_id_b, 2, &extra_env).await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let sdk_a = IronMeshClient::from_direct_base_url(&base_a);
+        let sdk_b = IronMeshClient::from_direct_base_url(&base_b);
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
+            register_node(&http, &base_b, node_id_a, &base_a, "dc-a", "rack-1").await?;
+            wait_for_online_nodes(&http, &base_a, 2, 120).await?;
+            wait_for_online_nodes(&http, &base_b, 2, 120).await?;
+
+            let dir_key = "repair-delete-dir/";
+            let key = "repair-delete-dir/target.txt";
+            let payload = b"repair-delete-payload".to_vec();
+
+            sdk_a.put(dir_key, Bytes::new()).await?;
+            sdk_a.put_large_aware(key, Bytes::from(payload.clone())).await?;
+
+            let initial_report: serde_json::Value = http
+                .post(format!("{base_a}/cluster/replication/repair"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let start = Instant::now();
+            let mut replicated = false;
+            while start.elapsed() < Duration::from_secs(30) {
+                match sdk_b.get(key).await {
+                    Ok(body) if body.as_ref() == payload.as_slice() => {
+                        replicated = true;
+                        break;
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            if !replicated {
+                let response = http.get(format!("{base_b}/store/{key}")).send().await?;
+                let response_status = response.status();
+                let response_body = response.text().await?;
+                let versions_b: serde_json::Value = http
+                    .get(format!("{base_b}/versions/{key}"))
+                    .send()
+                    .await?
+                    .json()
+                    .await
+                    .unwrap_or(serde_json::Value::Null);
+                let index_b = sdk_b.store_index(None, 64, None).await.ok();
+                bail!(
+                    "initial repair did not replicate nested file; status={response_status} body={response_body:?} versions_b={versions_b:?} index_b={index_b:?} initial_report={initial_report:?}"
+                );
+            }
+
+            sdk_a.delete_path(key).await?;
+            sdk_a.delete_path(dir_key).await?;
+
+            let delete_report: serde_json::Value = http
+                .post(format!("{base_a}/cluster/replication/repair"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                let response = sdk_b.get(key).await;
+                if response.is_err() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+
+            bail!(
+                "remote target still readable after delete repair; initial_report={initial_report:?} delete_report={delete_report:?}"
+            );
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
 
         result
     }

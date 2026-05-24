@@ -1,5 +1,4 @@
 use super::*;
-use bytes::BytesMut;
 use std::collections::BTreeSet;
 use storage::{ReplicationExportBundle, TOMBSTONE_MANIFEST_HASH};
 
@@ -2239,7 +2238,7 @@ async fn pull_bundle_from_source(
                 state,
                 source_node,
                 reqwest::Method::GET,
-                &format!("/cluster/replication/chunk/{}", chunk.hash),
+                &format!("/cluster/v2/replication/chunk/{}", chunk.hash),
                 Vec::new(),
                 Vec::new(),
             )
@@ -2274,19 +2273,7 @@ async fn pull_bundle_from_source(
         })),
     );
     let mut store = lock_store(state, "replication_pull.import_manifest").await;
-    let _ = store
-        .drop_replica_subject(&bundle.key, bundle.version_id.as_deref())
-        .await?;
-    let imported_version_id = store
-        .import_replica_manifest(
-            &bundle.key,
-            bundle.version_id.as_deref(),
-            &bundle.parent_version_ids,
-            bundle.state,
-            &bundle.manifest_hash,
-            &bundle.manifest_bytes,
-        )
-        .await?;
+    let imported_version_id = store.import_replication_bundle(&bundle).await?;
     info!(
         repair_run_id,
         source_node_id = %source_node.node_id,
@@ -2384,70 +2371,7 @@ async fn replicate_bundle_to_target(
         })),
     );
 
-    if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-        let state_query = match bundle.state {
-            VersionConsistencyState::Confirmed => "confirmed",
-            VersionConsistencyState::Provisional => "provisional",
-        };
-
-        let delete_path = build_internal_replication_delete_path(
-            &bundle.key,
-            state_query,
-            bundle.version_id.as_deref(),
-        );
-        let response = execute_peer_request(
-            state,
-            target_node,
-            reqwest::Method::POST,
-            &delete_path,
-            Vec::new(),
-            Vec::new(),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to push tombstone key={} version_id={:?} to target={}",
-                bundle.key, bundle.version_id, target_node.node_id
-            )
-        })?;
-        if !response.is_success() {
-            bail!(
-                "tombstone replication target {} returned HTTP {}",
-                target_node.node_id,
-                response.status
-            );
-        }
-
-        info!(
-            repair_run_id,
-            target_node_id = %target_node.node_id,
-            key = %bundle.key,
-            version_id = ?bundle.version_id,
-            elapsed_ms = transfer_started.elapsed().as_millis(),
-            "replication repair tombstone push completed"
-        );
-        push_repair_log_entry(
-            detailed_log,
-            state.node_id,
-            "target_tombstone_push_completed",
-            "finished tombstone replication to target node",
-            Some(subject),
-            Some(bundle.key.clone()),
-            bundle.version_id.clone(),
-            Some(state.node_id),
-            Some(target_node.node_id),
-            Some(serde_json::json!({
-                "elapsed_ms": transfer_started.elapsed().as_millis(),
-            })),
-        );
-
-        return bundle
-            .version_id
-            .clone()
-            .context("tombstone replication bundle missing version id");
-    }
-
-    if bundle.version_id.is_some() {
+    if bundle.manifest_hash != TOMBSTONE_MANIFEST_HASH {
         for (chunk_offset, chunk) in bundle.manifest.chunks.iter().enumerate() {
             let chunk_index = chunk_offset + 1;
             if should_log_repair_chunk_progress(chunk_index, chunk_count) {
@@ -2490,7 +2414,7 @@ async fn replicate_bundle_to_target(
                 state,
                 target_node,
                 reqwest::Method::POST,
-                &format!("/cluster/replication/push/chunk/{}", chunk.hash),
+                &format!("/cluster/v2/replication/push/chunk/{}", chunk.hash),
                 vec![RelayHttpHeader {
                     name: "content-type".to_string(),
                     value: "application/octet-stream".to_string(),
@@ -2512,110 +2436,23 @@ async fn replicate_bundle_to_target(
                 );
             }
         }
-    } else {
-        let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
-
-        for chunk in &bundle.manifest.chunks {
-            let payload = {
-                let guard = read_store(state, "replication_push.read_chunk_inline").await;
-                guard
-                    .read_chunk_payload(&chunk.hash)
-                    .await?
-                    .with_context(|| format!("missing local chunk {}", chunk.hash))?
-            };
-
-            assembled.extend_from_slice(&payload);
-        }
-
-        info!(
-            repair_run_id,
-            target_node_id = %target_node.node_id,
-            key = %bundle.key,
-            version_id = ?bundle.version_id,
-            chunk_count,
-            total_size_bytes = bundle.manifest.total_size_bytes,
-            "replication repair assembled inline object for target push"
-        );
-        push_repair_log_entry(
-            detailed_log,
-            state.node_id,
-            "target_inline_object_assembled",
-            "assembled inline object payload for target node",
-            Some(subject.clone()),
-            Some(bundle.key.clone()),
-            bundle.version_id.clone(),
-            Some(state.node_id),
-            Some(target_node.node_id),
-            Some(serde_json::json!({
-                "chunk_count": chunk_count,
-                "total_size_bytes": bundle.manifest.total_size_bytes,
-            })),
-        );
-
-        let state_query = match bundle.state {
-            VersionConsistencyState::Confirmed => "confirmed",
-            VersionConsistencyState::Provisional => "provisional",
-        };
-
-        let put_url = build_internal_replication_put_url(
-            "",
-            &bundle.key,
-            state_query,
-            bundle.version_id.as_deref(),
-        );
-        let response = execute_peer_request(
-            state,
-            target_node,
-            reqwest::Method::PUT,
-            &put_url,
-            vec![RelayHttpHeader {
-                name: "content-type".to_string(),
-                value: "application/octet-stream".to_string(),
-            }],
-            assembled.freeze().to_vec(),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to push assembled object key={} version_id={:?} to target={}",
-                bundle.key, bundle.version_id, target_node.node_id
-            )
-        })?;
-        if !response.is_success() {
-            bail!(
-                "assembled object replication target {} returned HTTP {}",
-                target_node.node_id,
-                response.status
-            );
-        }
     }
 
-    let parent_version_ids_json = if bundle.parent_version_ids.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&bundle.parent_version_ids)?)
-    };
-    let manifest_path = build_replication_manifest_push_path(
-        &bundle.key,
-        &bundle.manifest_hash,
-        bundle.state.clone(),
-        bundle.version_id.as_deref(),
-        parent_version_ids_json.as_deref(),
-    );
+    let bundle_path = build_replication_bundle_push_path();
     info!(
         repair_run_id,
         target_node_id = %target_node.node_id,
         key = %bundle.key,
         version_id = ?bundle.version_id,
         manifest_hash = %bundle.manifest_hash,
-        path = %manifest_path,
-        "replication repair target push manifest starting"
+        path = %bundle_path,
+        "replication repair target push bundle starting"
     );
     push_repair_log_entry(
         detailed_log,
         state.node_id,
-        "target_manifest_push_started",
-        "pushing replica manifest to target node",
+        "target_bundle_push_started",
+        "pushing replica bundle to target node",
         Some(subject.clone()),
         Some(bundle.key.clone()),
         bundle.version_id.clone(),
@@ -2623,36 +2460,36 @@ async fn replicate_bundle_to_target(
         Some(target_node.node_id),
         Some(serde_json::json!({
             "manifest_hash": bundle.manifest_hash.clone(),
-            "path": manifest_path.clone(),
+            "path": bundle_path.clone(),
         })),
     );
     let response = execute_peer_request(
         state,
         target_node,
         reqwest::Method::POST,
-        &manifest_path,
+        &bundle_path,
         vec![RelayHttpHeader {
             name: "content-type".to_string(),
-            value: "application/octet-stream".to_string(),
+            value: "application/json".to_string(),
         }],
-        bundle.manifest_bytes.clone(),
+        serde_json::to_vec(bundle)?,
     )
     .await
     .with_context(|| {
         format!(
-            "failed to push manifest key={} version_id={:?} manifest_hash={} to target={}",
+            "failed to push replica bundle key={} version_id={:?} manifest_hash={} to target={}",
             bundle.key, bundle.version_id, bundle.manifest_hash, target_node.node_id
         )
     })?;
     if !response.is_success() {
         bail!(
-            "manifest replication target {} returned HTTP {}",
+            "replication bundle target {} returned HTTP {}",
             target_node.node_id,
             response.status
         );
     }
 
-    let report = response.json::<ReplicationManifestPushReport>()?;
+    let report = response.json::<ReplicationBundlePushReport>()?;
     info!(
         repair_run_id,
         target_node_id = %target_node.node_id,
@@ -2682,94 +2519,22 @@ async fn replicate_bundle_to_target(
     Ok(report.version_id)
 }
 
-pub(crate) fn build_internal_replication_put_url(
-    target_base_url: &str,
-    key: &str,
-    state_query: &str,
-    version_id: Option<&str>,
-) -> String {
-    let state_query = encode_query_value(state_query);
+pub(crate) fn build_replication_export_path(key: &str, version_id: Option<&str>) -> String {
     match version_id {
         Some(version_id) => format!(
-            "{target_base_url}/store/{key}?state={state_query}&version_id={}&internal_replication=true",
-            encode_query_value(version_id)
-        ),
-        None => {
-            format!("{target_base_url}/store/{key}?state={state_query}&internal_replication=true")
-        }
-    }
-}
-
-fn build_replication_export_path(key: &str, version_id: Option<&str>) -> String {
-    match version_id {
-        Some(version_id) => format!(
-            "/cluster/replication/export?key={}&version_id={}",
+            "/cluster/v2/replication/export?key={}&version_id={}",
             encode_query_value(key),
             encode_query_value(version_id)
         ),
         None => format!(
-            "/cluster/replication/export?key={}",
+            "/cluster/v2/replication/export?key={}",
             encode_query_value(key)
         ),
     }
 }
 
-fn build_internal_replication_delete_path(
-    key: &str,
-    state_query: &str,
-    version_id: Option<&str>,
-) -> String {
-    let mut path = format!(
-        "/store/delete?key={}&state={}&internal_replication=true",
-        encode_query_value(key),
-        encode_query_value(state_query)
-    );
-    if let Some(version_id) = version_id {
-        path.push_str("&version_id=");
-        path.push_str(&encode_query_value(version_id));
-    }
-    path
-}
-
-fn build_replication_manifest_push_path(
-    key: &str,
-    manifest_hash: &str,
-    state: VersionConsistencyState,
-    version_id: Option<&str>,
-    parent_version_ids_json: Option<&str>,
-) -> String {
-    let mut path = format!(
-        "/cluster/replication/push/manifest?key={}&manifest_hash={}&state={}",
-        encode_query_value(key),
-        encode_query_value(manifest_hash),
-        encode_query_value(match state {
-            VersionConsistencyState::Confirmed => "confirmed",
-            VersionConsistencyState::Provisional => "provisional",
-        })
-    );
-    let suffix = build_manifest_push_query_suffix(version_id, parent_version_ids_json);
-    if !suffix.is_empty() {
-        path.push('&');
-        path.push_str(&suffix);
-    }
-    path
-}
-
-fn build_manifest_push_query_suffix(
-    version_id: Option<&str>,
-    parent_version_ids_json: Option<&str>,
-) -> String {
-    let mut segments = Vec::new();
-    if let Some(version_id) = version_id {
-        segments.push(format!("version_id={}", encode_query_value(version_id)));
-    }
-    if let Some(parent_version_ids_json) = parent_version_ids_json {
-        segments.push(format!(
-            "parent_version_ids_json={}",
-            encode_query_value(parent_version_ids_json)
-        ));
-    }
-    segments.join("&")
+pub(crate) fn build_replication_bundle_push_path() -> String {
+    "/cluster/v2/replication/push/bundle".to_string()
 }
 
 fn encode_query_value(value: &str) -> String {
