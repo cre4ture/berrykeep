@@ -19,6 +19,7 @@
     "maplibre-gl": "^5.21.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "recharts": "^3.8.1",
     "sql.js-httpvfs": "^0.8.12"
   }
 }

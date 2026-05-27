@@ -8,3 +8,4 @@ export * from "./components/GallerySurface/GallerySurface";
 export * from "./components/IronmeshBrand/IronmeshBrand";
 export * from "./components/ColorSchemeControl/ColorSchemeControl";
 export * from "./components/NavigationShell/NavigationShell";
+export * from "./components/ZoomableTimeSeriesChart/ZoomableTimeSeriesChart";

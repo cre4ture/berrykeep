@@ -44,6 +44,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
   await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Collected at (UTC)" })).toBeVisible();
   await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Storage used (bytes)" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom in on storage history chart" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom out of storage history chart" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Reset storage history chart zoom" })).toBeVisible();
   await expect(page.getByRole("button", { name: "30d", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "All", exact: true })).toBeVisible();
   await expect(page.getByRole("columnheader", { name: "Chunk Store" })).toBeVisible();
@@ -87,6 +90,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
       .locator('svg[aria-label="Metadata space history chart"] text')
       .filter({ hasText: "Metadata used (bytes)" })
   ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom in on metadata history chart" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom out of metadata history chart" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Reset metadata history chart zoom" })).toBeVisible();
   await expect(page.getByText("SQLite metadata DB", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Manifest store", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Media cache", { exact: true }).first()).toBeVisible();

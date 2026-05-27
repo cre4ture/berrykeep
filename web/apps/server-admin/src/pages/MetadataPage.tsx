@@ -6,7 +6,11 @@ import {
   type MetadataDbLogicalDistribution,
   type StorageStatsSample
 } from "@ironmesh/api";
-import { StatCard } from "@ironmesh/ui";
+import {
+  StatCard,
+  ZoomableTimeSeriesChart,
+  formatTimeSeriesChartTimestamp
+} from "@ironmesh/ui";
 import {
   Alert,
   Badge,
@@ -27,7 +31,6 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
-  ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
@@ -396,17 +399,6 @@ export function MetadataPage() {
           ) : null}
 
           <MetadataHistoryChart samples={chartSamples} />
-
-          <Group gap="md">
-            {METADATA_CHART_SERIES.map((series) => (
-              <Badge key={series.key} color={series.badgeColor} variant="light">
-                {series.label}
-              </Badge>
-            ))}
-            <Badge color="pink" variant="light">
-              Total metadata
-            </Badge>
-          </Group>
         </Stack>
       </Card>
 
@@ -672,31 +664,29 @@ function MetadataHistoryChart({ samples }: { samples: StorageStatsSample[] }) {
   }
 
   const yMax = Math.max(1, ...chartPoints.map((point) => point.totalMetadataBytes));
-  const timeSpanSeconds = Math.max(
-    0,
-    (chartPoints[chartPoints.length - 1]?.collectedAtUnix ?? 0) -
-      (chartPoints[0]?.collectedAtUnix ?? 0)
-  );
-  const xDomain =
-    chartPoints.length === 1
-      ? [
-          chartPoints[0].collectedAtMs - 60_000,
-          chartPoints[0].collectedAtMs + 60_000
-        ]
-      : undefined;
 
   return (
-    <Box
-      style={{
-        width: "100%",
-        height: "20rem",
-        minHeight: "20rem",
-        borderRadius: "var(--mantine-radius-md)",
-        background: "#0f172a",
-        padding: "0.75rem 0.5rem 0.25rem"
-      }}
-    >
-      <ResponsiveContainer width="100%" height="100%">
+    <ZoomableTimeSeriesChart
+      points={chartPoints}
+      height="20rem"
+      minHeight="20rem"
+      legend={
+        <Group gap="md">
+          {METADATA_CHART_SERIES.map((series) => (
+            <Badge key={series.key} color={series.badgeColor} variant="light">
+              {series.label}
+            </Badge>
+          ))}
+          <Badge color="pink" variant="light">
+            Total metadata
+          </Badge>
+        </Group>
+      }
+      emptyState={<Text c="dimmed">No storage stats samples collected yet.</Text>}
+      zoomInAriaLabel="Zoom in on metadata history chart"
+      zoomOutAriaLabel="Zoom out of metadata history chart"
+      resetZoomAriaLabel="Reset metadata history chart zoom"
+      renderChart={({ xDomain, visibleTimeSpanSeconds, brush }) => (
         <AreaChart
           data={chartPoints}
           margin={{ top: 8, right: 20, bottom: 18, left: 8 }}
@@ -726,8 +716,12 @@ function MetadataHistoryChart({ samples }: { samples: StorageStatsSample[] }) {
             type="number"
             scale="time"
             domain={xDomain}
+            allowDataOverflow
             tickFormatter={(value) =>
-              formatChartTimestamp(Math.floor(Number(value) / 1000), timeSpanSeconds)
+              formatTimeSeriesChartTimestamp(
+                Math.floor(Number(value) / 1000),
+                visibleTimeSpanSeconds
+              )
             }
             tick={{ fill: "#cbd5e1", fontSize: "0.72rem" }}
             tickLine={{ stroke: "#475569" }}
@@ -803,9 +797,10 @@ function MetadataHistoryChart({ samples }: { samples: StorageStatsSample[] }) {
             strokeWidth={2.2}
             isAnimationActive={false}
           />
+          {brush}
         </AreaChart>
-      </ResponsiveContainer>
-    </Box>
+      )}
+    />
   );
 }
 

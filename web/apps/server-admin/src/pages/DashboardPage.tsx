@@ -30,16 +30,17 @@ import {
   Text,
   Tooltip as MantineTooltip
 } from "@mantine/core";
-import { StatCard } from "@ironmesh/ui";
+import {
+  StatCard,
+  ZoomableTimeSeriesChart,
+  formatTimeSeriesChartTimestamp
+} from "@ironmesh/ui";
 import { useDisclosure } from "@mantine/hooks";
-import { IconZoomIn, IconZoomOut, IconZoomReset } from "@tabler/icons-react";
 import { useCallback, useMemo, useState } from "react";
 import {
-  Brush,
   CartesianGrid,
   Line,
   LineChart,
-  ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
@@ -77,11 +78,6 @@ type StorageStatsChartPoint = {
   chunkStoreBytes: number;
   metadataFootprintBytes: number;
   latestSnapshotUniqueChunkBytes: number;
-};
-
-type StorageStatsBrushRange = {
-  startIndex: number;
-  endIndex: number;
 };
 
 const STORAGE_CHART_SERIES: Array<{
@@ -884,7 +880,6 @@ function describeDashboardRepairSummary(
 }
 
 function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {
-  const [brushRange, setBrushRange] = useState<StorageStatsBrushRange | null>(null);
   const chartPoints: StorageStatsChartPoint[] = useMemo(
     () =>
       samples.map((sample) => ({
@@ -902,164 +897,17 @@ function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {
     return <Text c="dimmed">No storage stats samples collected yet.</Text>;
   }
 
-  const timeSpanSeconds = Math.max(
-    0,
-    (chartPoints[chartPoints.length - 1]?.collectedAtUnix ?? 0) -
-      (chartPoints[0]?.collectedAtUnix ?? 0)
-  );
   const yMax = Math.max(
     1,
     ...chartPoints.flatMap((point) =>
       STORAGE_CHART_SERIES.map((series) => point[series.key])
     )
   );
-  const resolvedBrushRange = resolveStorageStatsBrushRange(brushRange, chartPoints.length);
-  const xDomain = buildStorageStatsXDomain(chartPoints, resolvedBrushRange);
-  const xAxisTimeSpanSeconds = Math.max(0, Math.floor((xDomain[1] - xDomain[0]) / 1000));
-  const zoomed =
-    resolvedBrushRange.startIndex > 0 ||
-    resolvedBrushRange.endIndex < chartPoints.length - 1;
-  const canZoom = chartPoints.length > 2;
-  const visiblePointCount =
-    resolvedBrushRange.endIndex - resolvedBrushRange.startIndex + 1;
-  const handleBrushChange = (nextRange: Partial<StorageStatsBrushRange>) => {
-    const nextBrushRange = resolveStorageStatsBrushRange(nextRange, chartPoints.length);
-    const nextZoomed =
-      nextBrushRange.startIndex > 0 ||
-      nextBrushRange.endIndex < chartPoints.length - 1;
-    if (zoomed && !nextZoomed) {
-      return;
-    }
-
-    setBrushRange(nextBrushRange);
-  };
-
-  const setZoomWindow = (visibleRatio: number) => {
-    if (!canZoom) {
-      return;
-    }
-
-    const nextVisiblePointCount = Math.min(
-      chartPoints.length,
-      Math.max(2, Math.round(visiblePointCount * visibleRatio))
-    );
-    if (nextVisiblePointCount === visiblePointCount) {
-      return;
-    }
-
-    const centerIndex = (resolvedBrushRange.startIndex + resolvedBrushRange.endIndex) / 2;
-    const nextStartIndex = clampStorageStatsBrushStart(
-      Math.round(centerIndex - (nextVisiblePointCount - 1) / 2),
-      nextVisiblePointCount,
-      chartPoints.length
-    );
-
-    setBrushRange({
-      startIndex: nextStartIndex,
-      endIndex: nextStartIndex + nextVisiblePointCount - 1
-    });
-  };
 
   return (
-    <Stack gap="xs">
-      <Box
-        style={{
-          width: "100%",
-          height: "19rem",
-          minHeight: "19rem",
-          borderRadius: "var(--mantine-radius-md)",
-          background: "#0f172a",
-          padding: "0.75rem 0.5rem 0.25rem"
-        }}
-      >
-        <ResponsiveContainer width="100%" height="100%">
-          <LineChart
-            data={chartPoints}
-            margin={{ top: 8, right: 20, bottom: 18, left: 8 }}
-            accessibilityLayer
-            role="img"
-            title="Storage stats history"
-            desc="Chunk store, metadata footprint, and latest snapshot unique bytes by sample time."
-            {...({ "aria-label": "Storage stats history chart" } as { "aria-label": string })}
-          >
-            <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" vertical={false} />
-            <XAxis
-              dataKey="collectedAtMs"
-              type="number"
-              scale="time"
-              domain={xDomain}
-              allowDataOverflow
-              tickFormatter={(value) =>
-                formatChartTimestamp(Math.floor(Number(value) / 1000), xAxisTimeSpanSeconds)
-              }
-              tick={{ fill: "#cbd5e1", fontSize: "0.72rem" }}
-              tickLine={{ stroke: "#475569" }}
-              axisLine={{ stroke: "#334155" }}
-              minTickGap={24}
-              label={{
-                value: "Collected at (UTC)",
-                position: "insideBottom",
-                offset: -8,
-                fill: "#e2e8f0",
-                fontSize: "0.75rem",
-                fontWeight: 600
-              }}
-            />
-            <YAxis
-              width={78}
-              domain={[0, yMax]}
-              allowDecimals={false}
-              tickFormatter={(value) => formatBytes(Number(value))}
-              tick={{ fill: "#cbd5e1", fontSize: "0.72rem" }}
-              tickLine={{ stroke: "#475569" }}
-              axisLine={{ stroke: "#334155" }}
-              label={{
-                value: "Storage used (bytes)",
-                angle: -90,
-                position: "insideLeft",
-                fill: "#e2e8f0",
-                fontSize: "0.75rem",
-                fontWeight: 600
-              }}
-            />
-            <Tooltip
-              content={StorageStatsTooltip}
-              cursor={{ stroke: "#94a3b8", strokeDasharray: "4 4" }}
-              isAnimationActive={false}
-            />
-            {STORAGE_CHART_SERIES.map((series) => (
-              <Line
-                key={series.key}
-                type="linear"
-                dataKey={series.key}
-                name={series.label}
-                stroke={series.color}
-                strokeWidth={2.5}
-                dot={chartPoints.length === 1 ? { r: 3, strokeWidth: 2 } : false}
-                activeDot={{ r: 5, strokeWidth: 0 }}
-                isAnimationActive={false}
-              />
-            ))}
-            {chartPoints.length > 1 ? (
-              <Brush
-                dataKey="collectedAtMs"
-                height={28}
-                travellerWidth={8}
-                startIndex={resolvedBrushRange.startIndex}
-                endIndex={resolvedBrushRange.endIndex}
-                onChange={handleBrushChange}
-                stroke="#64748b"
-                fill="#111827"
-                fontSize="0.65rem"
-                tickFormatter={(value) =>
-                  formatChartTimestamp(Math.floor(Number(value) / 1000), timeSpanSeconds)
-                }
-              />
-            ) : null}
-          </LineChart>
-        </ResponsiveContainer>
-      </Box>
-      <Group justify="space-between" gap="xs">
+    <ZoomableTimeSeriesChart
+      points={chartPoints}
+      legend={
         <Group gap="md">
           {STORAGE_CHART_SERIES.map((series) => (
             <Badge key={series.key} color={series.badgeColor} variant="light">
@@ -1067,43 +915,86 @@ function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {
             </Badge>
           ))}
         </Group>
-        <Group gap={4}>
-          <MantineTooltip label="Zoom in">
-            <ActionIcon
-              aria-label="Zoom in on storage history chart"
-              disabled={!canZoom || visiblePointCount <= 2}
-              size="sm"
-              variant="default"
-              onClick={() => setZoomWindow(0.5)}
-            >
-              <IconZoomIn size={16} />
-            </ActionIcon>
-          </MantineTooltip>
-          <MantineTooltip label="Zoom out">
-            <ActionIcon
-              aria-label="Zoom out of storage history chart"
-              disabled={!canZoom || !zoomed}
-              size="sm"
-              variant="default"
-              onClick={() => setZoomWindow(2)}
-            >
-              <IconZoomOut size={16} />
-            </ActionIcon>
-          </MantineTooltip>
-          <MantineTooltip label="Reset zoom">
-            <ActionIcon
-              aria-label="Reset storage history chart zoom"
-              disabled={!zoomed}
-              size="sm"
-              variant="default"
-              onClick={() => setBrushRange(null)}
-            >
-              <IconZoomReset size={16} />
-            </ActionIcon>
-          </MantineTooltip>
-        </Group>
-      </Group>
-    </Stack>
+      }
+      emptyState={<Text c="dimmed">No storage stats samples collected yet.</Text>}
+      zoomInAriaLabel="Zoom in on storage history chart"
+      zoomOutAriaLabel="Zoom out of storage history chart"
+      resetZoomAriaLabel="Reset storage history chart zoom"
+      renderChart={({ xDomain, visibleTimeSpanSeconds, brush }) => (
+        <LineChart
+          data={chartPoints}
+          margin={{ top: 8, right: 20, bottom: 18, left: 8 }}
+          accessibilityLayer
+          role="img"
+          title="Storage stats history"
+          desc="Chunk store, metadata footprint, and latest snapshot unique bytes by sample time."
+          {...({ "aria-label": "Storage stats history chart" } as { "aria-label": string })}
+        >
+          <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" vertical={false} />
+          <XAxis
+            dataKey="collectedAtMs"
+            type="number"
+            scale="time"
+            domain={xDomain}
+            allowDataOverflow
+            tickFormatter={(value) =>
+              formatTimeSeriesChartTimestamp(
+                Math.floor(Number(value) / 1000),
+                visibleTimeSpanSeconds
+              )
+            }
+            tick={{ fill: "#cbd5e1", fontSize: "0.72rem" }}
+            tickLine={{ stroke: "#475569" }}
+            axisLine={{ stroke: "#334155" }}
+            minTickGap={24}
+            label={{
+              value: "Collected at (UTC)",
+              position: "insideBottom",
+              offset: -8,
+              fill: "#e2e8f0",
+              fontSize: "0.75rem",
+              fontWeight: 600
+            }}
+          />
+          <YAxis
+            width={78}
+            domain={[0, yMax]}
+            allowDecimals={false}
+            tickFormatter={(value) => formatBytes(Number(value))}
+            tick={{ fill: "#cbd5e1", fontSize: "0.72rem" }}
+            tickLine={{ stroke: "#475569" }}
+            axisLine={{ stroke: "#334155" }}
+            label={{
+              value: "Storage used (bytes)",
+              angle: -90,
+              position: "insideLeft",
+              fill: "#e2e8f0",
+              fontSize: "0.75rem",
+              fontWeight: 600
+            }}
+          />
+          <Tooltip
+            content={StorageStatsTooltip}
+            cursor={{ stroke: "#94a3b8", strokeDasharray: "4 4" }}
+            isAnimationActive={false}
+          />
+          {STORAGE_CHART_SERIES.map((series) => (
+            <Line
+              key={series.key}
+              type="linear"
+              dataKey={series.key}
+              name={series.label}
+              stroke={series.color}
+              strokeWidth={2.5}
+              dot={chartPoints.length === 1 ? { r: 3, strokeWidth: 2 } : false}
+              activeDot={{ r: 5, strokeWidth: 0 }}
+              isAnimationActive={false}
+            />
+          ))}
+          {brush}
+        </LineChart>
+      )}
+    />
   );
 }
 
@@ -1158,66 +1049,6 @@ function StorageStatsTooltip({
       </Stack>
     </Box>
   );
-}
-
-function resolveStorageStatsBrushRange(
-  range: Partial<StorageStatsBrushRange> | null | undefined,
-  pointCount: number
-): StorageStatsBrushRange {
-  const lastIndex = Math.max(0, pointCount - 1);
-  const rawStartIndex = Number.isFinite(range?.startIndex) ? Number(range?.startIndex) : 0;
-  const rawEndIndex = Number.isFinite(range?.endIndex) ? Number(range?.endIndex) : lastIndex;
-  const startIndex = Math.max(0, Math.min(Math.floor(rawStartIndex), lastIndex));
-  const endIndex = Math.max(startIndex, Math.min(Math.floor(rawEndIndex), lastIndex));
-
-  return { startIndex, endIndex };
-}
-
-function clampStorageStatsBrushStart(
-  startIndex: number,
-  visiblePointCount: number,
-  pointCount: number
-): number {
-  const maxStartIndex = Math.max(0, pointCount - visiblePointCount);
-  return Math.max(0, Math.min(startIndex, maxStartIndex));
-}
-
-function buildStorageStatsXDomain(
-  chartPoints: StorageStatsChartPoint[],
-  brushRange: StorageStatsBrushRange
-): [number, number] {
-  const firstPointMs = chartPoints[0]?.collectedAtMs ?? 0;
-  if (chartPoints.length <= 1) {
-    return [firstPointMs - 60_000, firstPointMs + 60_000];
-  }
-
-  const startMs = chartPoints[brushRange.startIndex]?.collectedAtMs ?? firstPointMs;
-  const endMs =
-    chartPoints[brushRange.endIndex]?.collectedAtMs ??
-    chartPoints[chartPoints.length - 1].collectedAtMs;
-
-  if (startMs === endMs) {
-    return [startMs - 60_000, endMs + 60_000];
-  }
-
-  return [startMs, endMs];
-}
-
-function formatChartTimestamp(unixTs: number | null | undefined, timeSpanSeconds: number): string {
-  if (!unixTs || !Number.isFinite(unixTs) || unixTs <= 0) {
-    return "unknown";
-  }
-  const iso = new Date(unixTs * 1000).toISOString();
-  if (timeSpanSeconds >= 365 * 24 * 60 * 60) {
-    return iso.slice(0, 10);
-  }
-  if (timeSpanSeconds >= 30 * 24 * 60 * 60) {
-    return iso.slice(5, 10);
-  }
-  if (timeSpanSeconds >= 86_400) {
-    return iso.slice(5, 16).replace("T", " ");
-  }
-  return iso.slice(11, 16);
 }
 
 function storageHistoryRequestForRange(rangeKey: StorageHistoryRangeKey): {
