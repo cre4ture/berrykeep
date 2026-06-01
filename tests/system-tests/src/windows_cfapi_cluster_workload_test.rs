@@ -3,17 +3,16 @@
 #[cfg(test)]
 mod tests {
     use crate::framework::{
-        ChildGuard, TEST_ADMIN_TOKEN, fresh_data_dir,
-        internal_base_url_from_public_bind,
-        issue_bootstrap_bundle_and_enroll_client, register_node,
-        mtls_client_from_data_dir,
+        fresh_data_dir, internal_base_url_from_public_bind,
+        issue_bootstrap_bundle_and_enroll_client, mtls_client_from_data_dir, register_node,
         start_authenticated_server_with_env_options, stop_server, wait_for_online_nodes,
+        ChildGuard, TEST_ADMIN_TOKEN,
     };
     use crate::framework_win::start_cfapi_adapter_with_bootstrap;
-    use anyhow::{Context, Result, bail};
+    use anyhow::{bail, Context, Result};
     use blake3::Hash;
-    use client_sdk::IronMeshClient;
     use client_sdk::ironmesh_client::StoreIndexRequestOptions;
+    use client_sdk::IronMeshClient;
     use reqwest::Client;
     use std::collections::BTreeSet;
     use std::fs::{self, File};
@@ -23,10 +22,12 @@ mod tests {
     use tokio::time::sleep;
     use uuid::Uuid;
 
-    const DEFAULT_FILE_COUNT: usize = 2_000;
+    const DEFAULT_FILE_COUNT: usize = 4_000;
     const DEFAULT_MIN_BYTES: usize = 1 * 1024 * 1024;
     const DEFAULT_MAX_BYTES: usize = 5 * 1024 * 1024;
     const DEFAULT_SAMPLE_VERIFY_COUNT: usize = 24;
+    const DEFAULT_SUBDIR_COUNT: usize = 80;
+    const DEFAULT_MAX_DIR_DEPTH: usize = 4;
     const STORE_INDEX_PAGE_SIZE: usize = 256;
     const IO_BUFFER_BYTES: usize = 256 * 1024;
     const UPLOAD_TIMEOUT: Duration = Duration::from_secs(45 * 60);
@@ -38,25 +39,29 @@ mod tests {
         min_bytes: usize,
         max_bytes: usize,
         sample_verify_count: usize,
+        subdir_count: usize,
+        max_dir_depth: usize,
     }
 
     impl WorkloadConfig {
         fn from_env() -> Result<Self> {
-            let file_count = read_env_usize(
-                "IRONMESH_WINDOWS_CFAPI_LOAD_FILE_COUNT",
-                DEFAULT_FILE_COUNT,
-            )?;
-            let min_bytes = read_env_usize(
-                "IRONMESH_WINDOWS_CFAPI_LOAD_MIN_BYTES",
-                DEFAULT_MIN_BYTES,
-            )?;
-            let max_bytes = read_env_usize(
-                "IRONMESH_WINDOWS_CFAPI_LOAD_MAX_BYTES",
-                DEFAULT_MAX_BYTES,
-            )?;
+            let file_count =
+                read_env_usize("IRONMESH_WINDOWS_CFAPI_LOAD_FILE_COUNT", DEFAULT_FILE_COUNT)?;
+            let min_bytes =
+                read_env_usize("IRONMESH_WINDOWS_CFAPI_LOAD_MIN_BYTES", DEFAULT_MIN_BYTES)?;
+            let max_bytes =
+                read_env_usize("IRONMESH_WINDOWS_CFAPI_LOAD_MAX_BYTES", DEFAULT_MAX_BYTES)?;
             let sample_verify_count = read_env_usize(
                 "IRONMESH_WINDOWS_CFAPI_LOAD_VERIFY_SAMPLE_COUNT",
                 DEFAULT_SAMPLE_VERIFY_COUNT,
+            )?;
+            let subdir_count = read_env_usize(
+                "IRONMESH_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT",
+                DEFAULT_SUBDIR_COUNT,
+            )?;
+            let max_dir_depth = read_env_usize(
+                "IRONMESH_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH",
+                DEFAULT_MAX_DIR_DEPTH,
             )?;
 
             if min_bytes == 0 {
@@ -68,12 +73,25 @@ mod tests {
             if file_count == 0 {
                 bail!("IRONMESH_WINDOWS_CFAPI_LOAD_FILE_COUNT must be greater than zero");
             }
+            if subdir_count == 0 {
+                bail!("IRONMESH_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT must be greater than zero");
+            }
+            if max_dir_depth == 0 {
+                bail!("IRONMESH_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH must be greater than zero");
+            }
+            if subdir_count > file_count {
+                bail!(
+                    "IRONMESH_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT must be <= FILE_COUNT so each subdir can receive at least one file"
+                );
+            }
 
             Ok(Self {
                 file_count,
                 min_bytes,
                 max_bytes,
                 sample_verify_count: sample_verify_count.max(1),
+                subdir_count,
+                max_dir_depth,
             })
         }
 
@@ -84,7 +102,8 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct FileSpec {
-        path: String,
+        relative_path: PathBuf,
+        store_path: String,
         size_bytes: usize,
         content_hash: Hash,
     }
@@ -135,6 +154,21 @@ mod tests {
         }
     }
 
+    fn normalized_store_path(relative_path: &Path) -> Result<String> {
+        let components = relative_path
+            .iter()
+            .map(|component| {
+                component.to_str().with_context(|| {
+                    format!(
+                        "relative path {} contains a non-utf8 component",
+                        relative_path.display()
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(components.join("/"))
+    }
+
     fn read_env_usize(name: &str, default: usize) -> Result<usize> {
         match std::env::var(name) {
             Ok(value) => value
@@ -153,6 +187,31 @@ mod tests {
 
     fn file_seed_for_index(index: usize) -> u64 {
         0xD1B5_4A32_D192_ED03u64 ^ ((index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    }
+
+    fn build_directory_layout(config: &WorkloadConfig) -> Vec<PathBuf> {
+        let mut rng = XorShift64::new(0x8D51_AA23_7F34_9C17);
+        let mut directories: Vec<PathBuf> = Vec::with_capacity(config.subdir_count);
+        let mut by_depth = vec![Vec::<usize>::new(); config.max_dir_depth + 1];
+
+        for dir_index in 0..config.subdir_count {
+            let desired_depth = if dir_index < config.max_dir_depth {
+                dir_index + 1
+            } else {
+                1 + (rng.next_u64() as usize % config.max_dir_depth)
+            };
+            let parent_path = if desired_depth == 1 || by_depth[desired_depth - 1].is_empty() {
+                PathBuf::new()
+            } else {
+                let candidates = &by_depth[desired_depth - 1];
+                directories[candidates[rng.next_u64() as usize % candidates.len()]].clone()
+            };
+            let path = parent_path.join(format!("dir-{dir_index:03}"));
+            by_depth[desired_depth].push(directories.len());
+            directories.push(path);
+        }
+
+        directories
     }
 
     fn fill_pseudorandom(buffer: &mut [u8], rng: &mut XorShift64) {
@@ -430,7 +489,9 @@ mod tests {
             }
 
             if started.elapsed() >= timeout {
-                let subjects = local_available_subjects(http, base_url).await.unwrap_or_default();
+                let subjects = local_available_subjects(http, base_url)
+                    .await
+                    .unwrap_or_default();
                 let missing = expected_paths
                     .iter()
                     .filter(|path| !subjects.contains(*path))
@@ -541,14 +602,14 @@ mod tests {
     ) -> Result<()> {
         for (index, spec) in sample_specs.iter().enumerate() {
             let bytes = sdk
-                .get(&spec.path)
+                .get(&spec.store_path)
                 .await
-                .with_context(|| format!("[{label}] failed to fetch {}", spec.path))?;
+                .with_context(|| format!("[{label}] failed to fetch {}", spec.store_path))?;
             let hash = blake3::hash(bytes.as_ref());
             if bytes.len() != spec.size_bytes {
                 bail!(
                     "[{label}] size mismatch for {}: expected={} actual={}",
-                    spec.path,
+                    spec.store_path,
                     spec.size_bytes,
                     bytes.len()
                 );
@@ -556,7 +617,7 @@ mod tests {
             if hash != spec.content_hash {
                 bail!(
                     "[{label}] hash mismatch for {}: expected={} actual={}",
-                    spec.path,
+                    spec.store_path,
                     spec.content_hash.to_hex(),
                     hash.to_hex()
                 );
@@ -574,23 +635,77 @@ mod tests {
         Ok(())
     }
 
-    fn create_copy_workload(
-        config: &WorkloadConfig,
-        source_dir: &Path,
-        sync_root: &Path,
-    ) -> Result<Vec<FileSpec>> {
+    fn stage_workload(config: &WorkloadConfig, source_dir: &Path) -> Result<Vec<FileSpec>> {
         fs::create_dir_all(source_dir)
             .with_context(|| format!("failed to create {}", source_dir.display()))?;
         let mut specs = Vec::with_capacity(config.file_count);
+        let directory_layout = build_directory_layout(config);
+        let mut directory_rng = XorShift64::new(0x61C8_A1D4_08E7_395B);
         let mut total_bytes = 0usize;
 
         for index in 0..config.file_count {
             let file_name = format!("load-{index:05}.bin");
-            let staged_path = source_dir.join(&file_name);
-            let target_path = sync_root.join(&file_name);
+            let directory_index = if index < directory_layout.len() {
+                index
+            } else {
+                directory_rng.next_u64() as usize % directory_layout.len()
+            };
+            let relative_path = directory_layout[directory_index].join(file_name);
+            let staged_path = source_dir.join(&relative_path);
+            let staged_parent = staged_path.parent().with_context(|| {
+                format!(
+                    "staged path {} is unexpectedly missing a parent directory",
+                    staged_path.display()
+                )
+            })?;
+            fs::create_dir_all(staged_parent).with_context(|| {
+                format!(
+                    "failed to create staged directory {}",
+                    staged_parent.display()
+                )
+            })?;
             let size_bytes = file_size_for_index(config, index);
             let seed = file_seed_for_index(index);
             let content_hash = write_random_file(&staged_path, size_bytes, seed)?;
+            let store_path = normalized_store_path(&relative_path)?;
+
+            specs.push(FileSpec {
+                relative_path,
+                store_path,
+                size_bytes,
+                content_hash,
+            });
+            total_bytes = total_bytes.saturating_add(size_bytes);
+
+            if (index + 1) % 100 == 0 || index + 1 == config.file_count {
+                eprintln!(
+                    "[workload] staged {}/{} files in source tree across {} subdirs (logical {:.2} GiB)",
+                    index + 1,
+                    config.file_count,
+                    config.subdir_count,
+                    total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+            }
+        }
+
+        Ok(specs)
+    }
+
+    fn copy_staged_workload_into_sync_root(
+        file_specs: &[FileSpec],
+        source_dir: &Path,
+        sync_root: &Path,
+    ) -> Result<()> {
+        let mut total_bytes = 0usize;
+
+        for (index, spec) in file_specs.iter().enumerate() {
+            let staged_path = source_dir.join(&spec.relative_path);
+            let target_path = sync_root.join(&spec.relative_path);
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create sync-root directory {}", parent.display())
+                })?;
+            }
 
             let copied = fs::copy(&staged_path, &target_path).with_context(|| {
                 format!(
@@ -599,36 +714,26 @@ mod tests {
                     target_path.display()
                 )
             })?;
-            fs::remove_file(&staged_path).with_context(|| {
-                format!("failed to remove staged file {}", staged_path.display())
-            })?;
-
-            if copied as usize != size_bytes {
+            if copied as usize != spec.size_bytes {
                 bail!(
                     "copy size mismatch for {}: expected={} copied={copied}",
                     target_path.display(),
-                    size_bytes
+                    spec.size_bytes
                 );
             }
 
-            specs.push(FileSpec {
-                path: file_name,
-                size_bytes,
-                content_hash,
-            });
-            total_bytes = total_bytes.saturating_add(size_bytes);
-
-            if (index + 1) % 100 == 0 || index + 1 == config.file_count {
+            total_bytes = total_bytes.saturating_add(spec.size_bytes);
+            if (index + 1) % 100 == 0 || index + 1 == file_specs.len() {
                 eprintln!(
-                    "[workload] copied {}/{} files into CFAPI root (logical {:.2} GiB)",
+                    "[workload] copied {}/{} staged files into CFAPI root (logical {:.2} GiB)",
                     index + 1,
-                    config.file_count,
+                    file_specs.len(),
                     total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
                 );
             }
         }
 
-        Ok(specs)
+        Ok(())
     }
 
     #[tokio::test]
@@ -670,11 +775,13 @@ mod tests {
 
         let workload_result = async {
             eprintln!(
-                "[cluster] starting workload: files={} min_bytes={} max_bytes={} average_bytes={}",
+                "[cluster] starting workload: files={} min_bytes={} max_bytes={} average_bytes={} subdirs={} max_depth={}",
                 config.file_count,
                 config.min_bytes,
                 config.max_bytes,
-                config.average_bytes()
+                config.average_bytes(),
+                config.subdir_count,
+                config.max_dir_depth
             );
 
             register_full_mesh(
@@ -697,10 +804,11 @@ mod tests {
             )
             .await?;
 
-            let file_specs = create_copy_workload(&config, &source_dir, &sync_root)?;
+            let file_specs = stage_workload(&config, &source_dir)?;
+            copy_staged_workload_into_sync_root(&file_specs, &source_dir, &sync_root)?;
             let expected_paths = file_specs
                 .iter()
-                .map(|spec| spec.path.clone())
+                .map(|spec| spec.store_path.clone())
                 .collect::<BTreeSet<_>>();
 
             eprintln!(

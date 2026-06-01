@@ -1,8 +1,10 @@
 param(
-    [int]$FileCount = 2000,
+    [int]$FileCount = 4000,
     [int]$MinSizeMiB = 1,
     [int]$MaxSizeMiB = 5,
     [int]$VerifySampleCount = 24,
+    [int]$SubdirCount = 80,
+    [int]$MaxDirDepth = 4,
     [switch]$SkipBuild
 )
 
@@ -17,6 +19,15 @@ if ($MaxSizeMiB -lt $MinSizeMiB) {
 if ($FileCount -le 0) {
     throw "FileCount must be greater than zero."
 }
+if ($SubdirCount -le 0) {
+    throw "SubdirCount must be greater than zero."
+}
+if ($MaxDirDepth -le 0) {
+    throw "MaxDirDepth must be greater than zero."
+}
+if ($SubdirCount -gt $FileCount) {
+    throw "SubdirCount must be less than or equal to FileCount."
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
@@ -24,12 +35,16 @@ $env:IRONMESH_WINDOWS_CFAPI_LOAD_FILE_COUNT = [string]$FileCount
 $env:IRONMESH_WINDOWS_CFAPI_LOAD_MIN_BYTES = [string]($MinSizeMiB * 1MB)
 $env:IRONMESH_WINDOWS_CFAPI_LOAD_MAX_BYTES = [string]($MaxSizeMiB * 1MB)
 $env:IRONMESH_WINDOWS_CFAPI_LOAD_VERIFY_SAMPLE_COUNT = [string]$VerifySampleCount
+$env:IRONMESH_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT = [string]$SubdirCount
+$env:IRONMESH_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH = [string]$MaxDirDepth
 
 Write-Host "Running Windows CFAPI cluster workload"
 Write-Host "  files          : $FileCount"
 Write-Host "  size range MiB : $MinSizeMiB - $MaxSizeMiB"
 Write-Host "  average MiB    : $([math]::Round(($MinSizeMiB + $MaxSizeMiB) / 2, 2))"
 Write-Host "  sample checks  : $VerifySampleCount"
+Write-Host "  subdirs        : $SubdirCount"
+Write-Host "  max dir depth  : $MaxDirDepth"
 
 Push-Location $repoRoot
 try {
