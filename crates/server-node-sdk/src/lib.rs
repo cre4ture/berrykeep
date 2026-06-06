@@ -138,6 +138,12 @@ const RENDEZVOUS_RELAY_ACCEPT_IDLE_LOOP_DELAY_MS: u64 = 50;
 const RENDEZVOUS_RELAY_ACCEPT_INITIAL_RETRY_MS: u64 = 250;
 const RENDEZVOUS_RELAY_ACCEPT_MAX_RETRY_SECS: u64 = 30;
 const EMBEDDED_RENDEZVOUS_RESTART_INITIAL_DELAY_SECS: u64 = 1;
+
+fn ensure_rustls_crypto_provider_installed() {
+    // Rustls 0.23 requires a process-wide provider selection when multiple
+    // crypto backends are present through transitive features.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
 const EMBEDDED_RENDEZVOUS_RESTART_MAX_DELAY_SECS: u64 = 30;
 const EMBEDDED_RENDEZVOUS_STABLE_UPTIME_RESET_SECS: u64 = 60;
 const DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS: u64 = 30;
@@ -197,22 +203,47 @@ struct ServerState {
     data_dir: PathBuf,
     cluster_id: ClusterId,
     node_id: NodeId,
-    storage_stats_history_retention_secs: u64,
-    data_scrub_enabled: bool,
-    data_scrub_interval_secs: u64,
-    data_scrub_history_retention_secs: u64,
-    repair_run_history_retention_secs: u64,
-    map_perf_logging_enabled: bool,
-    map_glyphs_root: Option<PathBuf>,
-    mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
     store: Arc<TracedRwLock<PersistentStore>>,
-    upload_chunk_ingestor: ChunkIngestor,
     cluster: Arc<Mutex<ClusterService>>,
-    client_credentials: Arc<Mutex<ClientCredentialState>>,
-    bootstrap_claims: BootstrapClaimBroker,
+    storage: ServerStorageRuntime,
+    access: ServerAccessRuntime,
+    network: ServerNetworkRuntime,
+    maintenance: ServerMaintenanceRuntime,
+    metadata_commit_mode: MetadataCommitMode,
+    autonomous_replication_on_put_enabled: bool,
+    peer_heartbeat_config: PeerHeartbeatConfig,
+    repair_config: RepairConfig,
+    log_buffer: Arc<LogBuffer>,
+}
+
+#[derive(Clone)]
+struct ServerStorageRuntime {
+    upload_chunk_ingestor: ChunkIngestor,
     upload_sessions: Arc<TracedRwLock<UploadSessionStore>>,
     upload_sessions_dirty: Arc<AtomicUsize>,
     upload_sessions_persist_notify: Arc<Notify>,
+    storage_stats_history_retention_secs: u64,
+    storage_stats_runtime: Arc<Mutex<StorageStatsRuntime>>,
+    namespace_change_sequence: Arc<AtomicU64>,
+    namespace_change_tx: watch::Sender<u64>,
+    map_perf_logging_enabled: bool,
+    map_glyphs_root: Option<PathBuf>,
+    mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
+}
+
+#[derive(Clone)]
+struct ServerAccessRuntime {
+    client_credentials: Arc<Mutex<ClientCredentialState>>,
+    bootstrap_claims: BootstrapClaimBroker,
+    client_connections: Arc<StdMutex<LiveClientConnectionRegistry>>,
+    admin_control: AdminControl,
+    admin_sessions: Arc<Mutex<AdminSessionStore>>,
+    client_auth_control: ClientAuthControl,
+    client_auth_replay_cache: Arc<Mutex<ClientAuthReplayCache>>,
+}
+
+#[derive(Clone)]
+struct ServerNetworkRuntime {
     public_ca_pem: Option<String>,
     public_ca_key_pem: Option<String>,
     cluster_ca_pem: Option<String>,
@@ -234,27 +265,22 @@ struct ServerState {
     node_enrollment_auto_renew_state: Arc<Mutex<NodeEnrollmentAutoRenewState>>,
     outbound_clients: Arc<RwLock<OutboundClients>>,
     peer_relay_sessions: PeerRelaySessionPool,
-    metadata_commit_mode: MetadataCommitMode,
-    autonomous_replication_on_put_enabled: bool,
+}
+
+#[derive(Clone)]
+struct ServerMaintenanceRuntime {
     inflight_requests: Arc<AtomicUsize>,
-    client_connections: Arc<StdMutex<LiveClientConnectionRegistry>>,
-    peer_heartbeat_config: PeerHeartbeatConfig,
-    repair_config: RepairConfig,
-    log_buffer: Arc<LogBuffer>,
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
     repair_activity: Arc<Mutex<RepairActivityRuntime>>,
     autonomous_post_write_repair: Arc<Mutex<AutonomousPostWriteRepairRuntime>>,
+    data_scrub_enabled: bool,
+    data_scrub_interval_secs: u64,
+    data_scrub_history_retention_secs: u64,
     data_scrub_activity: Arc<Mutex<DataScrubActivityRuntime>>,
+    repair_run_history_retention_secs: u64,
     local_availability_refresh_lock: Arc<Mutex<()>>,
     local_availability_refresh_notify: Arc<Notify>,
-    storage_stats_runtime: Arc<Mutex<StorageStatsRuntime>>,
-    namespace_change_sequence: Arc<AtomicU64>,
-    namespace_change_tx: watch::Sender<u64>,
-    admin_control: AdminControl,
-    admin_sessions: Arc<Mutex<AdminSessionStore>>,
-    client_auth_control: ClientAuthControl,
-    client_auth_replay_cache: Arc<Mutex<ClientAuthReplayCache>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -456,7 +482,7 @@ async fn write_upload_sessions<'a>(
     state: &'a ServerState,
     operation: &'static str,
 ) -> TracedRwLockWriteGuard<'a, UploadSessionStore> {
-    state.upload_sessions.write(operation).await
+    state.storage.upload_sessions.write(operation).await
 }
 
 #[cfg(test)]
@@ -464,7 +490,7 @@ async fn read_upload_sessions<'a>(
     state: &'a ServerState,
     operation: &'static str,
 ) -> TracedRwLockReadGuard<'a, UploadSessionStore> {
-    state.upload_sessions.read(operation).await
+    state.storage.upload_sessions.read(operation).await
 }
 
 fn log_server_startup_phase_begin(phase: &'static str, startup_started_at: Instant) -> Instant {
@@ -497,7 +523,10 @@ fn log_server_startup_phase_end(
 }
 
 fn request_local_availability_refresh(state: &ServerState) {
-    state.local_availability_refresh_notify.notify_one();
+    state
+        .maintenance
+        .local_availability_refresh_notify
+        .notify_one();
 }
 
 async fn run_local_availability_refresh(
@@ -546,7 +575,11 @@ fn spawn_local_availability_refresher(state: ServerState, startup_started_at: In
         run_local_availability_refresh(&state, "startup", Some(startup_started_at)).await;
 
         loop {
-            state.local_availability_refresh_notify.notified().await;
+            state
+                .maintenance
+                .local_availability_refresh_notify
+                .notified()
+                .await;
             run_local_availability_refresh(&state, "queued", None).await;
         }
     });
@@ -643,10 +676,11 @@ struct InternalTlsRuntime {
 
 pub(crate) fn publish_namespace_change(state: &ServerState) {
     let sequence = state
+        .storage
         .namespace_change_sequence
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
-    let _ = state.namespace_change_tx.send(sequence);
+    let _ = state.storage.namespace_change_tx.send(sequence);
 }
 
 #[derive(Debug, Clone)]
@@ -811,8 +845,11 @@ async fn persist_upload_session_store(store: &UploadSessionStore) -> Result<()> 
 }
 
 fn mark_upload_session_store_dirty(state: &ServerState) {
-    state.upload_sessions_dirty.fetch_add(1, Ordering::SeqCst);
-    state.upload_sessions_persist_notify.notify_one();
+    state
+        .storage
+        .upload_sessions_dirty
+        .fetch_add(1, Ordering::SeqCst);
+    state.storage.upload_sessions_persist_notify.notify_one();
 }
 
 async fn persist_upload_session_store_after_mutation(state: &ServerState, context: &'static str) {
@@ -832,19 +869,24 @@ async fn persist_upload_session_store_now(state: &ServerState) -> Result<()> {
 
 fn spawn_upload_session_store_persister(state: ServerState) {
     tokio::spawn(async move {
-        let mut persisted_generation = state.upload_sessions_dirty.load(Ordering::SeqCst);
+        let mut persisted_generation = state.storage.upload_sessions_dirty.load(Ordering::SeqCst);
 
         loop {
-            state.upload_sessions_persist_notify.notified().await;
+            state
+                .storage
+                .upload_sessions_persist_notify
+                .notified()
+                .await;
 
             loop {
-                let observed_generation = state.upload_sessions_dirty.load(Ordering::SeqCst);
+                let observed_generation =
+                    state.storage.upload_sessions_dirty.load(Ordering::SeqCst);
                 if observed_generation == persisted_generation {
                     break;
                 }
 
                 tokio::time::sleep(Duration::from_secs(UPLOAD_SESSION_PERSIST_COALESCE_SECS)).await;
-                let target_generation = state.upload_sessions_dirty.load(Ordering::SeqCst);
+                let target_generation = state.storage.upload_sessions_dirty.load(Ordering::SeqCst);
                 if target_generation == persisted_generation {
                     break;
                 }
@@ -932,11 +974,11 @@ fn track_client_connection(
     entry: ClientConnectionView,
 ) -> TrackedClientConnection {
     let connection_id = entry.connection_id.clone();
-    if let Ok(mut registry) = state.client_connections.lock() {
+    if let Ok(mut registry) = state.access.client_connections.lock() {
         registry.register(entry);
     }
     TrackedClientConnection {
-        registry: state.client_connections.clone(),
+        registry: state.access.client_connections.clone(),
         connection_id,
     }
 }
@@ -1035,7 +1077,7 @@ async fn client_identity_for_device_id(
     device_id: &str,
 ) -> AuthenticatedClientIdentity {
     let (label, credential_fingerprint) = {
-        let auth_state = state.client_credentials.lock().await;
+        let auth_state = state.access.client_credentials.lock().await;
         auth_state
             .credentials
             .iter()
@@ -1093,7 +1135,7 @@ async fn data_change_actor_from_client_device_id(
     };
 
     let (actor_label, actor_credential_fingerprint) = {
-        let auth_state = state.client_credentials.lock().await;
+        let auth_state = state.access.client_credentials.lock().await;
         auth_state
             .credentials
             .iter()
@@ -1196,7 +1238,7 @@ async fn require_client_auth(
     mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
-    if !state.client_auth_control.require_client_auth {
+    if !state.access.client_auth_control.require_client_auth {
         return Ok(next.run(request).await);
     }
 
@@ -1231,7 +1273,7 @@ async fn require_client_or_admin_auth(
         return Ok(next.run(request).await);
     }
 
-    if !state.client_auth_control.require_client_auth {
+    if !state.access.client_auth_control.require_client_auth {
         return Ok(next.run(request).await);
     }
 
@@ -1295,7 +1337,7 @@ async fn validate_client_auth_request(
     }
 
     let (public_key_pem, stored_credential_fingerprint, label) = {
-        let auth_state = state.client_credentials.lock().await;
+        let auth_state = state.access.client_credentials.lock().await;
         let Some(device) = auth_state.credentials.iter().find(|device| {
             device.revoked_at_unix.is_none() && device.device_id == signed_headers.device_id
         }) else {
@@ -1331,7 +1373,7 @@ async fn validate_client_auth_request(
     )
     .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    let mut replay_cache = state.client_auth_replay_cache.lock().await;
+    let mut replay_cache = state.access.client_auth_replay_cache.lock().await;
     if !replay_cache.remember(&signed_headers.device_id, &signed_headers.nonce, now) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -1346,6 +1388,7 @@ async fn validate_client_auth_request(
 
 async fn request_has_admin_auth(state: &ServerState, headers: &HeaderMap) -> bool {
     state
+        .access
         .admin_control
         .admin_token
         .as_deref()
@@ -1362,7 +1405,8 @@ async fn request_has_admin_auth(state: &ServerState, headers: &HeaderMap) -> boo
 }
 
 fn admin_auth_configured(state: &ServerState) -> bool {
-    state.admin_control.admin_password_hash.is_some() || state.admin_control.admin_token.is_some()
+    state.access.admin_control.admin_password_hash.is_some()
+        || state.access.admin_control.admin_token.is_some()
 }
 
 fn hash_token(token: &str) -> String {
@@ -1398,13 +1442,13 @@ fn text_fingerprint(value: &str) -> String {
 }
 
 fn validate_rendezvous_client_identity_issuance(state: &ServerState) -> Result<()> {
-    if !state.rendezvous_mtls_required {
+    if !state.network.rendezvous_mtls_required {
         return Ok(());
     }
-    if state.cluster_ca_pem.as_deref().is_none() {
+    if state.network.cluster_ca_pem.as_deref().is_none() {
         bail!("rendezvous mTLS client identity issuance requires cluster_ca_pem");
     }
-    if state.internal_ca_key_pem.as_deref().is_none() {
+    if state.network.internal_ca_key_pem.as_deref().is_none() {
         bail!("rendezvous mTLS client identity issuance requires internal_ca_key_pem");
     }
     Ok(())
@@ -1426,18 +1470,22 @@ fn issue_client_rendezvous_identity_pem(
     device_id: &str,
     expires_at_unix: Option<u64>,
 ) -> Result<Option<String>> {
-    if !state.rendezvous_mtls_required {
+    if !state.network.rendezvous_mtls_required {
         return Ok(None);
     }
 
     validate_rendezvous_client_identity_issuance(state)?;
 
-    let ca_cert_pem = state.cluster_ca_pem.as_deref().ok_or_else(|| {
+    let ca_cert_pem = state.network.cluster_ca_pem.as_deref().ok_or_else(|| {
         anyhow!("rendezvous mTLS client identity issuance requires cluster_ca_pem")
     })?;
-    let ca_key_pem = state.internal_ca_key_pem.as_deref().ok_or_else(|| {
-        anyhow!("rendezvous mTLS client identity issuance requires internal_ca_key_pem")
-    })?;
+    let ca_key_pem = state
+        .network
+        .internal_ca_key_pem
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!("rendezvous mTLS client identity issuance requires internal_ca_key_pem")
+        })?;
 
     let issuer_key =
         KeyPair::from_pem(ca_key_pem).context("failed to parse rendezvous client CA key PEM")?;
@@ -2906,11 +2954,18 @@ fn node_certificate_restart_required(
 
 #[cfg(test)]
 async fn current_internal_http(state: &ServerState) -> reqwest::Client {
-    state.outbound_clients.read().await.internal_http.clone()
+    state
+        .network
+        .outbound_clients
+        .read()
+        .await
+        .internal_http
+        .clone()
 }
 
 async fn current_rendezvous_control(state: &ServerState) -> Option<RendezvousControlClient> {
     state
+        .network
         .outbound_clients
         .read()
         .await
@@ -2923,6 +2978,7 @@ async fn cached_peer_relay_session(
     node_id: NodeId,
 ) -> Option<CachedPeerRelaySession> {
     state
+        .network
         .peer_relay_sessions
         .sessions
         .lock()
@@ -2933,6 +2989,7 @@ async fn cached_peer_relay_session(
 
 async fn invalidate_peer_relay_session(state: &ServerState, node_id: NodeId) {
     let removed = state
+        .network
         .peer_relay_sessions
         .sessions
         .lock()
@@ -2949,7 +3006,7 @@ async fn invalidate_peer_relay_session(state: &ServerState, node_id: NodeId) {
 
 async fn clear_peer_relay_sessions(state: &ServerState) {
     let cleared = {
-        let mut sessions = state.peer_relay_sessions.sessions.lock().await;
+        let mut sessions = state.network.peer_relay_sessions.sessions.lock().await;
         let cleared = sessions.len();
         sessions.clear();
         cleared
@@ -2963,12 +3020,13 @@ async fn clear_peer_relay_sessions(state: &ServerState) {
 }
 
 async fn replace_outbound_clients(state: &ServerState, outbound_clients: OutboundClients) {
-    *state.outbound_clients.write().await = outbound_clients;
+    *state.network.outbound_clients.write().await = outbound_clients;
     clear_peer_relay_sessions(state).await;
 }
 
 async fn current_rendezvous_endpoint_clients(state: &ServerState) -> Vec<RendezvousEndpointClient> {
     state
+        .network
         .outbound_clients
         .read()
         .await
@@ -2978,6 +3036,7 @@ async fn current_rendezvous_endpoint_clients(state: &ServerState) -> Vec<Rendezv
 
 fn current_rendezvous_urls(state: &ServerState) -> Vec<String> {
     state
+        .network
         .rendezvous_urls
         .lock()
         .expect("rendezvous URL mutex poisoned")
@@ -2986,6 +3045,7 @@ fn current_rendezvous_urls(state: &ServerState) -> Vec<String> {
 
 fn replace_rendezvous_urls(state: &ServerState, urls: Vec<String>) {
     *state
+        .network
         .rendezvous_urls
         .lock()
         .expect("rendezvous URL mutex poisoned") = urls;
@@ -2994,7 +3054,7 @@ fn replace_rendezvous_urls(state: &ServerState, urls: Vec<String>) {
 async fn sync_rendezvous_registration_state(state: &ServerState) {
     let urls = current_rendezvous_urls(state);
     let desired = urls.iter().cloned().collect::<HashSet<_>>();
-    let mut registration_state = state.rendezvous_registration_state.lock().await;
+    let mut registration_state = state.network.rendezvous_registration_state.lock().await;
     registration_state.retain(|url, _| desired.contains(url));
     for url in urls {
         registration_state.entry(url).or_default();
@@ -3003,7 +3063,7 @@ async fn sync_rendezvous_registration_state(state: &ServerState) {
 
 async fn record_rendezvous_registration_success(state: &ServerState, url: &str) -> bool {
     let now = unix_ts();
-    let mut registration_state = state.rendezvous_registration_state.lock().await;
+    let mut registration_state = state.network.rendezvous_registration_state.lock().await;
     let entry = registration_state.entry(url.to_string()).or_default();
     let recovered = entry.consecutive_failures > 0;
     entry.last_attempt_unix = Some(now);
@@ -3019,7 +3079,7 @@ async fn record_rendezvous_registration_failure(
     error: &str,
 ) -> u64 {
     let now = unix_ts();
-    let mut registration_state = state.rendezvous_registration_state.lock().await;
+    let mut registration_state = state.network.rendezvous_registration_state.lock().await;
     let entry = registration_state.entry(url.to_string()).or_default();
     entry.last_attempt_unix = Some(now);
     entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
@@ -3048,7 +3108,7 @@ async fn rendezvous_registration_views(
     state: &ServerState,
 ) -> Vec<RendezvousEndpointRegistrationView> {
     let urls = current_rendezvous_urls(state);
-    let registration_state = state.rendezvous_registration_state.lock().await;
+    let registration_state = state.network.rendezvous_registration_state.lock().await;
     urls.into_iter()
         .map(|url| {
             let runtime = registration_state.get(&url).cloned().unwrap_or_default();
@@ -3076,6 +3136,7 @@ fn current_editable_rendezvous_urls(state: &ServerState) -> Vec<String> {
     let urls = normalize_rendezvous_url_list(&current_rendezvous_urls(state))
         .unwrap_or_else(|_| current_rendezvous_urls(state));
     match state
+        .network
         .managed_rendezvous_public_url
         .as_deref()
         .and_then(|url| canonicalize_rendezvous_url(url).ok())
@@ -3089,7 +3150,7 @@ async fn connected_rendezvous_registration_urls(
     state: &ServerState,
     candidate_urls: &[String],
 ) -> Vec<String> {
-    let registration_state = state.rendezvous_registration_state.lock().await;
+    let registration_state = state.network.rendezvous_registration_state.lock().await;
     candidate_urls
         .iter()
         .filter(|url| {
@@ -3105,26 +3166,28 @@ fn current_bootstrap_trust_roots(state: &ServerState) -> Result<BootstrapTrustRo
     // Enrollment packages are the supported production lifecycle source for trust roots.
     // Direct env/file CA wiring remains useful for development/testing or short-lived
     // manually managed setups, where restart-after-change is acceptable.
-    if let Some(path) = state.node_enrollment_path.as_ref() {
+    if let Some(path) = state.network.node_enrollment_path.as_ref() {
         return Ok(NodeEnrollmentPackage::from_path(path)?
             .bootstrap
             .trust_roots);
     }
 
     Ok(BootstrapTrustRoots {
-        cluster_ca_pem: state.cluster_ca_pem.clone(),
-        public_api_ca_pem: state.public_ca_pem.clone(),
+        cluster_ca_pem: state.network.cluster_ca_pem.clone(),
+        public_api_ca_pem: state.network.public_ca_pem.clone(),
         rendezvous_ca_pem: state
+            .network
             .rendezvous_ca_pem
             .clone()
-            .or_else(|| state.public_ca_pem.clone())
-            .or_else(|| state.cluster_ca_pem.clone()),
+            .or_else(|| state.network.public_ca_pem.clone())
+            .or_else(|| state.network.cluster_ca_pem.clone()),
     })
 }
 
 fn load_live_trust_material(state: &ServerState) -> Result<LiveTrustMaterial> {
     let bootstrap_trust_roots = current_bootstrap_trust_roots(state)?;
     let cluster_ca_pem = state
+        .network
         .internal_tls_runtime
         .as_ref()
         .map(|tls| {
@@ -3137,13 +3200,13 @@ fn load_live_trust_material(state: &ServerState) -> Result<LiveTrustMaterial> {
         })
         .transpose()?
         .or(bootstrap_trust_roots.cluster_ca_pem.clone())
-        .or(state.cluster_ca_pem.clone());
+        .or(state.network.cluster_ca_pem.clone());
     let public_ca_pem = bootstrap_trust_roots
         .public_api_ca_pem
         .clone()
-        .or(state.public_ca_pem.clone());
-    let internal_ca_key_pem = state.internal_ca_key_pem.clone();
-    let public_ca_key_pem = state.public_ca_key_pem.clone().or_else(|| {
+        .or(state.network.public_ca_pem.clone());
+    let internal_ca_key_pem = state.network.internal_ca_key_pem.clone();
+    let public_ca_key_pem = state.network.public_ca_key_pem.clone().or_else(|| {
         if public_ca_pem.is_none() || public_ca_pem == cluster_ca_pem {
             internal_ca_key_pem.clone()
         } else {
@@ -3153,7 +3216,7 @@ fn load_live_trust_material(state: &ServerState) -> Result<LiveTrustMaterial> {
     let rendezvous_ca_pem = bootstrap_trust_roots
         .rendezvous_ca_pem
         .clone()
-        .or(state.rendezvous_ca_pem.clone())
+        .or(state.network.rendezvous_ca_pem.clone())
         .or_else(|| public_ca_pem.clone())
         .or_else(|| cluster_ca_pem.clone());
 
@@ -3217,7 +3280,7 @@ fn build_outbound_clients_with_urls(
 ) -> Result<OutboundClients> {
     let trust_material = load_live_trust_material(state)?;
     #[cfg(test)]
-    let internal_http = if let Some(internal_tls) = state.internal_tls_runtime.as_ref() {
+    let internal_http = if let Some(internal_tls) = state.network.internal_tls_runtime.as_ref() {
         build_internal_mtls_http_client(
             &internal_tls.ca_cert_path,
             &internal_tls.cert_path,
@@ -3228,8 +3291,9 @@ fn build_outbound_clients_with_urls(
     };
 
     let (rendezvous_control, rendezvous_controls) =
-        if state.rendezvous_registration_enabled && !rendezvous_urls.is_empty() {
+        if state.network.rendezvous_registration_enabled && !rendezvous_urls.is_empty() {
             let rendezvous_client_identity_pem = state
+                .network
                 .internal_tls_runtime
                 .as_ref()
                 .map(|tls| build_identity_pem_from_paths(&tls.cert_path, &tls.key_path))
@@ -3273,7 +3337,7 @@ async fn reload_live_tls_from_disk(state: &ServerState) -> Result<()> {
     let mut loaded_internal_tls_fingerprint = None;
     let mut reload_errors = Vec::new();
 
-    if let Some(public_tls) = state.public_tls_runtime.as_ref() {
+    if let Some(public_tls) = state.network.public_tls_runtime.as_ref() {
         match public_tls
             .config
             .reload_from_pem_file(&public_tls.cert_path, &public_tls.key_path)
@@ -3304,7 +3368,7 @@ async fn reload_live_tls_from_disk(state: &ServerState) -> Result<()> {
         }
     }
 
-    if let Some(internal_tls) = state.internal_tls_runtime.as_ref() {
+    if let Some(internal_tls) = state.network.internal_tls_runtime.as_ref() {
         match build_internal_mtls_server_config(
             &internal_tls.ca_cert_path,
             &internal_tls.cert_path,
@@ -3339,7 +3403,7 @@ async fn reload_live_tls_from_disk(state: &ServerState) -> Result<()> {
     }
 
     {
-        let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+        let mut renewal_state = state.network.node_enrollment_auto_renew_state.lock().await;
         if let Some(fingerprint) = loaded_public_tls_fingerprint {
             renewal_state.loaded_public_tls_fingerprint = Some(fingerprint);
         }
@@ -4133,10 +4197,7 @@ pub async fn run_from_env() -> Result<()> {
         .with(LogCaptureLayer::new(log_buffer.clone()))
         .init();
 
-    // Rustls 0.23 requires explicitly selecting a process-wide CryptoProvider when multiple
-    // providers are enabled via transitive features (e.g. reqwest brings `ring`, axum-server may
-    // bring `aws-lc-rs`). Installing once avoids startup panics.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    ensure_rustls_crypto_provider_installed();
     match setup::load_startup_mode_from_env()? {
         setup::StartupMode::Runtime(config) => run_inner(config, Some(log_buffer)).await,
         setup::StartupMode::Setup(config) => setup::run_setup_mode(config, log_buffer).await,
@@ -4347,7 +4408,7 @@ async fn shutdown_signal() {
 }
 
 async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>) -> Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    ensure_rustls_crypto_provider_installed();
     config.validate_public_listener_security()?;
 
     let public_tls_runtime = match config.public_tls.as_ref() {
@@ -4727,86 +4788,134 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         data_dir: config.data_dir.clone(),
         cluster_id: config.cluster_id,
         node_id: config.node_id,
-        storage_stats_history_retention_secs,
-        data_scrub_enabled,
-        data_scrub_interval_secs,
-        data_scrub_history_retention_secs,
-        repair_run_history_retention_secs,
-        map_perf_logging_enabled,
-        map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
-        mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
         store,
-        upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(cluster)),
-        client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
-        bootstrap_claims: BootstrapClaimBroker::new(),
-        upload_sessions: new_upload_sessions_rwlock(upload_session_store),
-        upload_sessions_dirty: Arc::new(AtomicUsize::new(0)),
-        upload_sessions_persist_notify: Arc::new(Notify::new()),
-        public_ca_pem,
-        public_ca_key_pem,
-        cluster_ca_pem,
-        internal_ca_key_pem,
-        public_tls_runtime,
-        internal_tls_runtime,
-        rendezvous_ca_pem,
-        rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls)),
-        rendezvous_registration_enabled: config.rendezvous_registration_enabled,
-        rendezvous_mtls_required: config.rendezvous_mtls_required,
-        managed_rendezvous_public_url: config
-            .managed_rendezvous
-            .as_ref()
-            .map(|managed| managed.public_url.clone()),
-        rendezvous_registration_state,
-        relay_mode: config.relay_mode,
-        enrollment_issuer_url: config.enrollment_issuer_url.clone(),
-        node_enrollment_path: config.node_enrollment_path.clone(),
-        node_enrollment_auto_renew_enabled: config.node_enrollment_auto_renew_enabled,
-        node_enrollment_auto_renew_check_secs: config.node_enrollment_auto_renew_check_secs,
-        node_enrollment_auto_renew_state: Arc::new(Mutex::new(NodeEnrollmentAutoRenewState {
-            loaded_public_tls_fingerprint: tls_status.public_tls.certificate_fingerprint.clone(),
-            loaded_internal_tls_fingerprint: tls_status
-                .internal_tls
-                .certificate_fingerprint
-                .clone(),
-            ..NodeEnrollmentAutoRenewState::default()
-        })),
-        outbound_clients: Arc::new(RwLock::new(OutboundClients {
-            #[cfg(test)]
-            internal_http,
-            rendezvous_control,
-            rendezvous_controls,
-        })),
-        peer_relay_sessions: PeerRelaySessionPool::default(),
+        storage: ServerStorageRuntime {
+            upload_chunk_ingestor,
+            upload_sessions: new_upload_sessions_rwlock(upload_session_store),
+            upload_sessions_dirty: Arc::new(AtomicUsize::new(0)),
+            upload_sessions_persist_notify: Arc::new(Notify::new()),
+            storage_stats_history_retention_secs,
+            storage_stats_runtime: Arc::new(Mutex::new(StorageStatsRuntime::default())),
+            namespace_change_sequence: Arc::new(AtomicU64::new(0)),
+            namespace_change_tx: watch::channel(0).0,
+            map_perf_logging_enabled,
+            map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
+            mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
+        },
+        access: ServerAccessRuntime {
+            client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
+            bootstrap_claims: BootstrapClaimBroker::new(),
+            client_connections: Arc::new(StdMutex::new(LiveClientConnectionRegistry::default())),
+            admin_control,
+            admin_sessions: Arc::new(Mutex::new(AdminSessionStore::default())),
+            client_auth_control,
+            client_auth_replay_cache: Arc::new(Mutex::new(ClientAuthReplayCache::default())),
+        },
+        network: ServerNetworkRuntime {
+            public_ca_pem,
+            public_ca_key_pem,
+            cluster_ca_pem,
+            internal_ca_key_pem,
+            public_tls_runtime,
+            internal_tls_runtime,
+            rendezvous_ca_pem,
+            rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls)),
+            rendezvous_registration_enabled: config.rendezvous_registration_enabled,
+            rendezvous_mtls_required: config.rendezvous_mtls_required,
+            managed_rendezvous_public_url: config
+                .managed_rendezvous
+                .as_ref()
+                .map(|managed| managed.public_url.clone()),
+            rendezvous_registration_state,
+            relay_mode: config.relay_mode,
+            enrollment_issuer_url: config.enrollment_issuer_url.clone(),
+            node_enrollment_path: config.node_enrollment_path.clone(),
+            node_enrollment_auto_renew_enabled: config.node_enrollment_auto_renew_enabled,
+            node_enrollment_auto_renew_check_secs: config.node_enrollment_auto_renew_check_secs,
+            node_enrollment_auto_renew_state: Arc::new(Mutex::new(NodeEnrollmentAutoRenewState {
+                loaded_public_tls_fingerprint: tls_status
+                    .public_tls
+                    .certificate_fingerprint
+                    .clone(),
+                loaded_internal_tls_fingerprint: tls_status
+                    .internal_tls
+                    .certificate_fingerprint
+                    .clone(),
+                ..NodeEnrollmentAutoRenewState::default()
+            })),
+            outbound_clients: Arc::new(RwLock::new(OutboundClients {
+                #[cfg(test)]
+                internal_http,
+                rendezvous_control,
+                rendezvous_controls,
+            })),
+            peer_relay_sessions: PeerRelaySessionPool::default(),
+        },
+        maintenance: ServerMaintenanceRuntime {
+            inflight_requests: Arc::new(AtomicUsize::new(0)),
+            startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
+            repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+            repair_activity: Arc::new(Mutex::new(RepairActivityRuntime::default())),
+            autonomous_post_write_repair: Arc::new(Mutex::new(
+                AutonomousPostWriteRepairRuntime::default(),
+            )),
+            data_scrub_enabled,
+            data_scrub_interval_secs,
+            data_scrub_history_retention_secs,
+            data_scrub_activity: Arc::new(Mutex::new(DataScrubActivityRuntime::default())),
+            repair_run_history_retention_secs,
+            local_availability_refresh_lock: Arc::new(Mutex::new(())),
+            local_availability_refresh_notify: Arc::new(Notify::new()),
+        },
         metadata_commit_mode: config.metadata_commit_mode,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
-        inflight_requests: Arc::new(AtomicUsize::new(0)),
-        client_connections: Arc::new(StdMutex::new(LiveClientConnectionRegistry::default())),
         peer_heartbeat_config,
         repair_config,
         log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),
-        startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
-        repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
-        repair_activity: Arc::new(Mutex::new(RepairActivityRuntime::default())),
-        autonomous_post_write_repair: Arc::new(Mutex::new(
-            AutonomousPostWriteRepairRuntime::default(),
-        )),
-        data_scrub_activity: Arc::new(Mutex::new(DataScrubActivityRuntime::default())),
-        local_availability_refresh_lock: Arc::new(Mutex::new(())),
-        local_availability_refresh_notify: Arc::new(Notify::new()),
-        storage_stats_runtime: Arc::new(Mutex::new(StorageStatsRuntime::default())),
-        namespace_change_sequence: Arc::new(AtomicU64::new(0)),
-        namespace_change_tx: watch::channel(0).0,
-        admin_control,
-        admin_sessions: Arc::new(Mutex::new(AdminSessionStore::default())),
-        client_auth_control,
-        client_auth_replay_cache: Arc::new(Mutex::new(ClientAuthReplayCache::default())),
     };
 
+    let internal_peer_url = config
+        .internal_tls
+        .as_ref()
+        .and_then(|tls| tls.internal_url.clone());
+    start_background_runtimes(
+        &state,
+        &config,
+        &public_url,
+        internal_peer_url.as_deref(),
+        startup_phase_anchor,
+    )
+    .await;
+
+    let build_http_routers_phase_started_at =
+        log_server_startup_phase_begin("build_http_routers", startup_phase_anchor);
+    let apps = build_server_apps(&state);
+    log_server_startup_phase_end(
+        "build_http_routers",
+        startup_phase_anchor,
+        build_http_routers_phase_started_at,
+    );
+
+    run_server_listeners(config, state, apps).await
+}
+
+struct ServerApps {
+    public_app: Router,
+    internal_app: Router,
+}
+
+async fn start_background_runtimes(
+    state: &ServerState,
+    config: &ServerNodeConfig,
+    public_url: &str,
+    internal_peer_url: Option<&str>,
+    startup_phase_anchor: Instant,
+) {
     spawn_upload_session_store_persister(state.clone());
     let refresh_local_node_storage_phase_started_at =
         log_server_startup_phase_begin("refresh_local_node_storage", startup_phase_anchor);
-    refresh_local_node_storage(&state).await;
+    refresh_local_node_storage(state).await;
     log_server_startup_phase_end(
         "refresh_local_node_storage",
         startup_phase_anchor,
@@ -4825,7 +4934,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     let load_repair_attempts_phase_started_at =
         log_server_startup_phase_begin("load_repair_attempts", startup_phase_anchor);
     let persisted_attempts = {
-        let store = read_store(&state, "server.init.load_repair_attempts").await;
+        let store = read_store(state, "server.init.load_repair_attempts").await;
         match store.load_repair_attempts().await {
             Ok(attempts) => attempts,
             Err(err) => {
@@ -4841,7 +4950,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     );
 
     {
-        let mut repair_state = state.repair_state.lock().await;
+        let mut repair_state = state.maintenance.repair_state.lock().await;
         repair_state.attempts = persisted_attempts
             .into_iter()
             .map(|(key, record)| {
@@ -4856,20 +4965,17 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             .collect();
     }
 
-    if state.rendezvous_registration_enabled {
+    if state.network.rendezvous_registration_enabled {
         spawn_rendezvous_peer_discovery(state.clone(), config.replica_view_sync_interval_secs);
         spawn_rendezvous_presence_heartbeat(
             state.clone(),
-            Some(public_url.clone()),
-            config
-                .internal_tls
-                .as_ref()
-                .and_then(|tls| tls.internal_url.clone()),
+            Some(public_url.to_string()),
+            internal_peer_url.map(str::to_string),
             config.public_peer_api_enabled,
             config.peer_heartbeat_interval_secs,
         );
 
-        if state.relay_mode != RelayMode::Disabled {
+        if state.network.relay_mode != RelayMode::Disabled {
             spawn_rendezvous_relay_multiplex_agent(state.clone());
         }
     }
@@ -4882,8 +4988,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             state.repair_config.startup_repair_delay_secs,
         );
     }
-    if peer_heartbeat_config.enabled {
-        spawn_peer_heartbeat_emitter(state.clone(), peer_heartbeat_config.interval_secs);
+    if state.peer_heartbeat_config.enabled {
+        spawn_peer_heartbeat_emitter(state.clone(), state.peer_heartbeat_config.interval_secs);
     }
 
     if config.node_enrollment_auto_renew_enabled {
@@ -4893,9 +4999,9 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             config.node_enrollment_auto_renew_check_secs,
         );
     }
+}
 
-    let build_http_routers_phase_started_at =
-        log_server_startup_phase_begin("build_http_routers", startup_phase_anchor);
+fn build_server_apps(state: &ServerState) -> ServerApps {
     let public_client_api = Router::new()
         .route("/transport/ws", get(client_transport_ws))
         .route("/diagnostics/latency", get(latency_diagnostic))
@@ -5183,9 +5289,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/ui/app.js", get(ui::app_js))
         .merge(public_logs_api)
         .nest(PUBLIC_API_V1_PREFIX, public_api_v1)
-        .merge(legacy_public_api);
-
-    let public_app = public_app
+        .merge(legacy_public_api)
         .with_state(state.clone())
         .layer(middleware::from_fn(log_named_client_request))
         .layer(middleware::from_fn_with_state(
@@ -5257,12 +5361,22 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             state.clone(),
             require_internal_caller,
         ));
-    log_server_startup_phase_end(
-        "build_http_routers",
-        startup_phase_anchor,
-        build_http_routers_phase_started_at,
-    );
 
+    ServerApps {
+        public_app,
+        internal_app,
+    }
+}
+
+async fn run_server_listeners(
+    config: ServerNodeConfig,
+    state: ServerState,
+    apps: ServerApps,
+) -> Result<()> {
+    let ServerApps {
+        public_app,
+        internal_app,
+    } = apps;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut internal_server_handle = None;
     let mut internal_server_task = None;
@@ -5271,6 +5385,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     if let Some(internal_tls) = config.internal_tls.as_ref() {
         let internal_bind_addr = internal_tls.bind_addr;
         let internal_tls = state
+            .network
             .internal_tls_runtime
             .as_ref()
             .map(|runtime| runtime.config.clone())
@@ -5314,6 +5429,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     let mut public_server_handle = None;
     let mut public_server_task = if config.public_tls.is_some() {
         let tls_config = state
+            .network
             .public_tls_runtime
             .as_ref()
             .map(|runtime| runtime.config.clone())
@@ -5427,7 +5543,7 @@ async fn refresh_local_node_storage(state: &ServerState) {
 
 async fn refresh_storage_stats_once(state: &ServerState) {
     {
-        let mut runtime = state.storage_stats_runtime.lock().await;
+        let mut runtime = state.storage.storage_stats_runtime.lock().await;
         runtime.collecting = true;
         runtime.last_attempt_unix = Some(unix_ts());
     }
@@ -5458,14 +5574,14 @@ async fn refresh_storage_stats_once(state: &ServerState) {
                 } else {
                     let retention_cutoff = sample
                         .collected_at_unix
-                        .saturating_sub(state.storage_stats_history_retention_secs);
+                        .saturating_sub(state.storage.storage_stats_history_retention_secs);
                     storage_stats_collector
                         .prune_storage_stats_history_before(retention_cutoff)
                         .await
                 }
             };
 
-            let mut runtime = state.storage_stats_runtime.lock().await;
+            let mut runtime = state.storage.storage_stats_runtime.lock().await;
             runtime.collecting = false;
             match persist_result {
                 Ok(()) => {
@@ -5486,7 +5602,7 @@ async fn refresh_storage_stats_once(state: &ServerState) {
             }
         }
         Err(err) => {
-            let mut runtime = state.storage_stats_runtime.lock().await;
+            let mut runtime = state.storage.storage_stats_runtime.lock().await;
             runtime.collecting = false;
             runtime.last_error = Some(err.to_string());
             tracing::warn!(error = %err, "failed to collect storage stats sample");
@@ -5500,7 +5616,7 @@ fn spawn_storage_stats_refresher(state: ServerState) {
 
         let mut ticker =
             tokio::time::interval(Duration::from_secs(STORAGE_STATS_REFRESH_INTERVAL_SECS));
-        let mut namespace_changes = state.namespace_change_tx.subscribe();
+        let mut namespace_changes = state.storage.namespace_change_tx.subscribe();
 
         loop {
             tokio::select! {
@@ -5532,13 +5648,14 @@ fn spawn_storage_stats_refresher(state: ServerState) {
 }
 
 fn spawn_data_scrubber(state: ServerState) {
-    if !state.data_scrub_enabled {
+    if !state.maintenance.data_scrub_enabled {
         return;
     }
 
     tokio::spawn(async move {
-        let mut ticker =
-            tokio::time::interval(Duration::from_secs(state.data_scrub_interval_secs.max(1)));
+        let mut ticker = tokio::time::interval(Duration::from_secs(
+            state.maintenance.data_scrub_interval_secs.max(1),
+        ));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
 
@@ -5549,14 +5666,14 @@ fn spawn_data_scrubber(state: ServerState) {
                 if let Some(active_run) = result.active_run.as_ref() {
                     info!(
                         run_id = %active_run.run_id,
-                        interval_secs = state.data_scrub_interval_secs,
+                        interval_secs = state.maintenance.data_scrub_interval_secs,
                         "scheduled data scrub queued"
                     );
                 }
             } else if let Some(active_run) = result.active_run.as_ref() {
                 info!(
                     run_id = %active_run.run_id,
-                    interval_secs = state.data_scrub_interval_secs,
+                    interval_secs = state.maintenance.data_scrub_interval_secs,
                     "scheduled data scrub skipped because a run is already active"
                 );
             }
@@ -5723,7 +5840,7 @@ fn build_rendezvous_presence_registration(
     if !direct_candidates.is_empty() {
         capabilities.push(TransportCapability::DirectHttps);
     }
-    if state.relay_mode != RelayMode::Disabled {
+    if state.network.relay_mode != RelayMode::Disabled {
         capabilities.push(TransportCapability::RelayTunnel);
     }
 
@@ -5739,7 +5856,7 @@ fn build_rendezvous_presence_registration(
         capacity_bytes: local_descriptor.map(|descriptor| descriptor.capacity_bytes),
         free_bytes: local_descriptor.map(|descriptor| descriptor.free_bytes),
         capabilities,
-        relay_mode: state.relay_mode,
+        relay_mode: state.network.relay_mode,
         connected_at_unix: unix_ts(),
     }
 }
@@ -5904,8 +6021,11 @@ fn node_descriptor_from_presence_entry(
 fn peer_transport_client(state: &ServerState) -> Result<PeerTransportClient> {
     PeerTransportClient::new(PeerTransportClientConfig {
         cluster_id: state.cluster_id,
-        prefer_direct: !matches!(state.relay_mode, RelayMode::Preferred | RelayMode::Required),
-        allow_relay: state.relay_mode != RelayMode::Disabled,
+        prefer_direct: !matches!(
+            state.network.relay_mode,
+            RelayMode::Preferred | RelayMode::Required
+        ),
+        allow_relay: state.network.relay_mode != RelayMode::Disabled,
     })
 }
 
@@ -5916,7 +6036,7 @@ fn peer_connection_candidates(
     let mut candidates = Vec::new();
     let mut seen_endpoints = BTreeSet::new();
 
-    if state.relay_mode != RelayMode::Required && !node.relay_required() {
+    if state.network.relay_mode != RelayMode::Required && !node.relay_required() {
         push_ranked_peer_candidate(
             &mut candidates,
             &mut seen_endpoints,
@@ -5924,7 +6044,7 @@ fn peer_connection_candidates(
             Some(1),
         );
     }
-    if state.relay_mode != RelayMode::Disabled && node.relay_capable() {
+    if state.network.relay_mode != RelayMode::Disabled && node.relay_capable() {
         for relay_url in current_rendezvous_urls(state) {
             let Some(endpoint) = normalize_optional_url(Some(relay_url.as_str())) else {
                 continue;
@@ -6002,7 +6122,7 @@ fn build_direct_peer_http_client(
     state: &ServerState,
     node: &NodeDescriptor,
 ) -> Result<reqwest::Client> {
-    if let Some(internal_tls) = state.internal_tls_runtime.as_ref() {
+    if let Some(internal_tls) = state.network.internal_tls_runtime.as_ref() {
         build_internal_mtls_http_client_for_expected_peer(
             &internal_tls.ca_cert_path,
             &internal_tls.cert_path,
@@ -6283,7 +6403,7 @@ async fn ensure_relay_peer_session(
         relay_session: established.relay_session,
     };
 
-    let mut sessions = state.peer_relay_sessions.sessions.lock().await;
+    let mut sessions = state.network.peer_relay_sessions.sessions.lock().await;
     if let Some(existing) = sessions.get(&node.node_id).cloned() {
         drop(sessions);
         if let Ok(unused_session) = Arc::try_unwrap(cached.session)
@@ -7639,7 +7759,7 @@ fn spawn_node_enrollment_auto_renew(
         loop {
             ticker.tick().await;
             {
-                let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+                let mut renewal_state = state.network.node_enrollment_auto_renew_state.lock().await;
                 renewal_state.last_attempt_unix = Some(unix_ts());
             }
 
@@ -7648,28 +7768,31 @@ fn spawn_node_enrollment_auto_renew(
                     Ok(()) => {
                         {
                             let mut renewal_state =
-                                state.node_enrollment_auto_renew_state.lock().await;
+                                state.network.node_enrollment_auto_renew_state.lock().await;
                             renewal_state.last_success_unix = Some(unix_ts());
                             renewal_state.last_error = None;
                         }
                         info!(
-                            enrollment_path = ?state.node_enrollment_path.as_ref().map(|path| path.display().to_string()),
+                            enrollment_path = ?state.network.node_enrollment_path.as_ref().map(|path| path.display().to_string()),
                             "node enrollment auto-renew reloaded live TLS material"
                         );
                     }
                     Err(err) => {
                         warn!(error = %err, "node enrollment auto-renew reloaded package but failed to apply live TLS reload");
-                        let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+                        let mut renewal_state =
+                            state.network.node_enrollment_auto_renew_state.lock().await;
                         renewal_state.last_error = Some(err.to_string());
                     }
                 },
                 Ok(false) => {
-                    let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+                    let mut renewal_state =
+                        state.network.node_enrollment_auto_renew_state.lock().await;
                     renewal_state.last_error = None;
                 }
                 Err(err) => {
                     warn!(error = %err, "node enrollment auto-renew failed");
-                    let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+                    let mut renewal_state =
+                        state.network.node_enrollment_auto_renew_state.lock().await;
                     renewal_state.last_error = Some(err.to_string());
                 }
             }
@@ -7694,9 +7817,15 @@ async fn track_inflight_requests(
     request: Request,
     next: Next,
 ) -> Response {
-    state.inflight_requests.fetch_add(1, Ordering::Relaxed);
+    state
+        .maintenance
+        .inflight_requests
+        .fetch_add(1, Ordering::Relaxed);
     let response = next.run(request).await;
-    state.inflight_requests.fetch_sub(1, Ordering::Relaxed);
+    state
+        .maintenance
+        .inflight_requests
+        .fetch_sub(1, Ordering::Relaxed);
     response
 }
 
@@ -7747,7 +7876,11 @@ async fn cached_local_cluster_available_subjects(state: &ServerState) -> Vec<Str
 }
 
 async fn refresh_local_availability_view_once(state: &ServerState) -> usize {
-    let _refresh_guard = state.local_availability_refresh_lock.lock().await;
+    let _refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
     let local_subjects = recompute_local_cluster_available_subjects(state).await;
     let subject_count = local_subjects.len();
     let replicas_changed = {
@@ -7774,7 +7907,7 @@ async fn await_repair_busy_threshold(state: &ServerState) {
     let wait_duration = Duration::from_millis(state.repair_config.busy_wait_millis.max(10));
 
     loop {
-        let inflight = state.inflight_requests.load(Ordering::Relaxed);
+        let inflight = state.maintenance.inflight_requests.load(Ordering::Relaxed);
         if inflight <= threshold {
             break;
         }
@@ -7836,7 +7969,7 @@ async fn begin_repair_run_tracking(
     let live_log = Arc::new(StdMutex::new(RepairActiveRunLiveState::default()));
 
     {
-        let mut activity = state.repair_activity.lock().await;
+        let mut activity = state.maintenance.repair_activity.lock().await;
         activity.active_runs.push(RepairActiveRunRuntime {
             run_id: run_id.clone(),
             scope,
@@ -7878,7 +8011,7 @@ async fn persist_repair_run_record_with_retention(state: &ServerState, record: &
 
     let retention_cutoff = record
         .finished_at_unix
-        .saturating_sub(state.repair_run_history_retention_secs);
+        .saturating_sub(state.maintenance.repair_run_history_retention_secs);
     if let Err(err) = store
         .prune_repair_run_history_before(retention_cutoff)
         .await
@@ -7901,7 +8034,7 @@ async fn finish_repair_run_tracking(
     report: Option<serde_json::Value>,
 ) -> RepairRunRecord {
     {
-        let mut activity = state.repair_activity.lock().await;
+        let mut activity = state.maintenance.repair_activity.lock().await;
         activity
             .active_runs
             .retain(|active_run| active_run.run_id != tracker.run_id);
@@ -7944,8 +8077,8 @@ async fn local_repair_activity_payload(
     state: &ServerState,
 ) -> Result<RepairActivityStatusResponse> {
     let latest_run = latest_repair_run_record(state).await?;
-    let startup_status = *state.startup_repair_status.lock().await;
-    let activity = state.repair_activity.lock().await;
+    let startup_status = *state.maintenance.startup_repair_status.lock().await;
+    let activity = state.maintenance.repair_activity.lock().await;
     Ok(RepairActivityStatusResponse {
         state: current_repair_activity_state(&activity.active_runs, startup_status),
         startup_status,
@@ -8008,7 +8141,7 @@ async fn persist_data_scrub_run_record_with_retention(
 
     let retention_cutoff = record
         .finished_at_unix
-        .saturating_sub(state.data_scrub_history_retention_secs);
+        .saturating_sub(state.maintenance.data_scrub_history_retention_secs);
     if let Err(err) = store
         .prune_data_scrub_run_history_before(retention_cutoff)
         .await
@@ -8030,7 +8163,7 @@ async fn finish_data_scrub_run_tracking(
     last_error: Option<String>,
 ) -> DataScrubRunRecord {
     {
-        let mut activity = state.data_scrub_activity.lock().await;
+        let mut activity = state.maintenance.data_scrub_activity.lock().await;
         activity
             .active_runs
             .retain(|active_run| active_run.run_id != tracker.run_id);
@@ -8203,7 +8336,7 @@ async fn start_local_data_scrub(
     trigger: DataScrubRunTrigger,
 ) -> DataScrubTriggerNodeResult {
     let active_or_new = {
-        let mut activity = state.data_scrub_activity.lock().await;
+        let mut activity = state.maintenance.data_scrub_activity.lock().await;
         if let Some(active_run) = activity.active_runs.first().cloned() {
             return DataScrubTriggerNodeResult {
                 node_id: state.node_id,
@@ -8382,7 +8515,7 @@ async fn execute_tracked_cluster_replication_repair(
 fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
     tokio::spawn(async move {
         {
-            let mut status = state.startup_repair_status.lock().await;
+            let mut status = state.maintenance.startup_repair_status.lock().await;
             *status = StartupRepairStatus::Running;
         }
 
@@ -8401,7 +8534,7 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
 
         if plan.items.is_empty() {
             {
-                let mut status = state.startup_repair_status.lock().await;
+                let mut status = state.maintenance.startup_repair_status.lock().await;
                 *status = StartupRepairStatus::SkippedNoGaps;
             }
             finish_repair_run_tracking(
@@ -8430,7 +8563,7 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
         })
         .await;
         {
-            let mut status = state.startup_repair_status.lock().await;
+            let mut status = state.maintenance.startup_repair_status.lock().await;
             *status = StartupRepairStatus::Completed;
         }
         finish_repair_run_tracking(
@@ -8672,17 +8805,24 @@ async fn node_certificate_status(
         Err(status) => return status.into_response(),
     };
 
-    let auto_renew_state = state.node_enrollment_auto_renew_state.lock().await.clone();
+    let auto_renew_state = state
+        .network
+        .node_enrollment_auto_renew_state
+        .lock()
+        .await
+        .clone();
     let auto_renew = NodeCertificateAutoRenewStatusView {
-        enabled: state.node_enrollment_auto_renew_enabled,
+        enabled: state.network.node_enrollment_auto_renew_enabled,
         enrollment_path: state
+            .network
             .node_enrollment_path
             .as_ref()
             .map(|path| path.display().to_string()),
-        issuer_url: state.enrollment_issuer_url.clone(),
+        issuer_url: state.network.enrollment_issuer_url.clone(),
         check_interval_secs: state
+            .network
             .node_enrollment_auto_renew_enabled
-            .then_some(state.node_enrollment_auto_renew_check_secs),
+            .then_some(state.network.node_enrollment_auto_renew_check_secs),
         last_attempt_unix: auto_renew_state.last_attempt_unix,
         last_success_unix: auto_renew_state.last_success_unix,
         last_error: auto_renew_state.last_error.clone(),
@@ -8690,18 +8830,22 @@ async fn node_certificate_status(
     };
     let mut status = collect_node_certificate_status(
         state
+            .network
             .public_tls_runtime
             .as_ref()
             .map(|tls| tls.cert_path.as_path()),
         state
+            .network
             .public_tls_runtime
             .as_ref()
             .and_then(|tls| tls.metadata_path.as_deref()),
         state
+            .network
             .internal_tls_runtime
             .as_ref()
             .map(|tls| tls.cert_path.as_path()),
         state
+            .network
             .internal_tls_runtime
             .as_ref()
             .and_then(|tls| tls.metadata_path.as_deref()),
@@ -9114,7 +9258,7 @@ async fn enqueue_autonomous_post_write_replication(
     }
 
     let should_spawn = {
-        let mut runtime = state.autonomous_post_write_repair.lock().await;
+        let mut runtime = state.maintenance.autonomous_post_write_repair.lock().await;
         runtime.enqueue(subjects)
     };
 
@@ -9129,7 +9273,7 @@ async fn enqueue_autonomous_post_write_replication(
 async fn run_autonomous_post_write_replication(state: ServerState) {
     loop {
         let subjects = {
-            let mut runtime = state.autonomous_post_write_repair.lock().await;
+            let mut runtime = state.maintenance.autonomous_post_write_repair.lock().await;
             runtime.take_pending_subjects()
         };
 
@@ -9931,6 +10075,7 @@ async fn upload_session_chunk_response(
 
     let store_ingest_started_at = Instant::now();
     let (hash, stored) = match state
+        .storage
         .upload_chunk_ingestor
         .ingest_chunk_auto(&payload)
         .await
@@ -10740,7 +10885,10 @@ async fn list_store_index_response(
         }),
     )
         .into_response();
-    let change_sequence = state.namespace_change_sequence.load(Ordering::SeqCst);
+    let change_sequence = state
+        .storage
+        .namespace_change_sequence
+        .load(Ordering::SeqCst);
     if let Ok(header_value) = HeaderValue::from_str(&change_sequence.to_string()) {
         response
             .headers_mut()
@@ -10925,7 +11073,10 @@ async fn wait_for_store_index_change(
     let since = query.since.unwrap_or(0);
     let timeout_ms = query.timeout_ms.unwrap_or(25_000).clamp(250, 60_000);
 
-    let current = state.namespace_change_sequence.load(Ordering::SeqCst);
+    let current = state
+        .storage
+        .namespace_change_sequence
+        .load(Ordering::SeqCst);
     if current > since {
         return (
             StatusCode::OK,
@@ -10937,7 +11088,7 @@ async fn wait_for_store_index_change(
             .into_response();
     }
 
-    let mut receiver = state.namespace_change_tx.subscribe();
+    let mut receiver = state.storage.namespace_change_tx.subscribe();
     if *receiver.borrow() > since {
         return (
             StatusCode::OK,
@@ -10952,7 +11103,10 @@ async fn wait_for_store_index_change(
     let waited = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
         loop {
             if receiver.changed().await.is_err() {
-                return state.namespace_change_sequence.load(Ordering::SeqCst);
+                return state
+                    .storage
+                    .namespace_change_sequence
+                    .load(Ordering::SeqCst);
             }
             let sequence = *receiver.borrow_and_update();
             if sequence > since {
@@ -10964,7 +11118,10 @@ async fn wait_for_store_index_change(
 
     let sequence = match waited {
         Ok(sequence) => sequence,
-        Err(_) => state.namespace_change_sequence.load(Ordering::SeqCst),
+        Err(_) => state
+            .storage
+            .namespace_change_sequence
+            .load(Ordering::SeqCst),
     };
 
     (
@@ -13182,7 +13339,7 @@ struct NodeCertificateAutoRenewStatusView {
 
 async fn persist_client_credential_state(state: &ServerState) -> Result<()> {
     let snapshot = {
-        let auth = state.client_credentials.lock().await;
+        let auth = state.access.client_credentials.lock().await;
         auth.clone()
     };
     let store = lock_store(state, "client_credentials.persist").await;
@@ -13439,7 +13596,7 @@ async fn import_client_credential_records_from_peer(
     credentials: Vec<ClientCredentialReplicationRecord>,
 ) -> Result<ClientCredentialImportResponse> {
     let response = {
-        let mut auth_state = state.client_credentials.lock().await;
+        let mut auth_state = state.access.client_credentials.lock().await;
         apply_client_credential_import_records(&mut auth_state, credentials)
     };
 
@@ -13726,7 +13883,7 @@ async fn record_client_bootstrap_claim(
     record: ClientBootstrapClaimRecord,
 ) -> Result<()> {
     {
-        let mut auth_state = state.client_credentials.lock().await;
+        let mut auth_state = state.access.client_credentials.lock().await;
         let now = unix_ts();
         prune_client_bootstrap_claim_records(&mut auth_state.bootstrap_claims, now);
         auth_state.bootstrap_claims.push(record);
@@ -13744,7 +13901,7 @@ async fn mark_client_bootstrap_claim_redeemed(
     let claim_secret_hash = hash_token(claim_token);
     let mut changed = false;
     {
-        let mut auth_state = state.client_credentials.lock().await;
+        let mut auth_state = state.access.client_credentials.lock().await;
         if let Some(record) = auth_state
             .bootstrap_claims
             .iter_mut()
@@ -13843,7 +14000,7 @@ fn bootstrap_trust_roots(
 }
 
 fn bootstrap_rendezvous_urls(state: &ServerState) -> std::result::Result<Vec<String>, StatusCode> {
-    Ok(if state.rendezvous_registration_enabled {
+    Ok(if state.network.rendezvous_registration_enabled {
         normalize_rendezvous_url_list(&current_rendezvous_urls(state))
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     } else {
@@ -13883,7 +14040,7 @@ async fn issue_client_bootstrap_impl(
                 .then_with(|| left.node_id.cmp(&right.node_id))
         });
         endpoints.dedup_by(|left, right| left.url == right.url && left.node_id == right.node_id);
-        if state.client_auth_control.require_client_auth {
+        if state.access.client_auth_control.require_client_auth {
             // TODO: remove after syncing client credentials across nodes is implemented
             let local_endpoints = endpoints
                 .iter()
@@ -13901,9 +14058,9 @@ async fn issue_client_bootstrap_impl(
         version: 1,
         cluster_id: state.cluster_id,
         rendezvous_urls,
-        rendezvous_mtls_required: state.rendezvous_mtls_required,
+        rendezvous_mtls_required: state.network.rendezvous_mtls_required,
         direct_endpoints: endpoints,
-        relay_mode: state.relay_mode,
+        relay_mode: state.network.relay_mode,
         trust_roots: bootstrap_trust_roots(state).map_err(|status| {
             (
                 status,
@@ -14010,6 +14167,7 @@ fn build_bootstrap_claim_rendezvous_client(
         )
     })?;
     let rendezvous_client_identity_pem = state
+        .network
         .internal_tls_runtime
         .as_ref()
         .map(|tls| build_identity_pem_from_paths(&tls.cert_path, &tls.key_path))
@@ -14154,6 +14312,7 @@ async fn store_client_bootstrap_claim(
         bootstrap: bootstrap.clone(),
     };
     state
+        .access
         .bootstrap_claims
         .publish(publish_request)
         .await
@@ -14299,14 +14458,14 @@ fn build_issued_node_bootstrap(
         internal_url: internal_url.clone(),
         internal_tls: request.internal_tls,
         rendezvous_urls,
-        rendezvous_mtls_required: state.rendezvous_mtls_required,
+        rendezvous_mtls_required: state.network.rendezvous_mtls_required,
         direct_endpoints: build_bootstrap_direct_endpoints(
             public_url.as_deref(),
             internal_url.as_deref(),
             false,
             node_id,
         ),
-        relay_mode: state.relay_mode,
+        relay_mode: state.network.relay_mode,
         trust_roots: bootstrap_trust_roots(state)?,
         enrollment_issuer_url,
     };
@@ -14426,12 +14585,12 @@ fn issue_internal_node_tls_material_for_identity(
     let ca_cert_pem = trust_material
         .cluster_ca_pem
         .as_deref()
-        .or(state.cluster_ca_pem.as_deref())
+        .or(state.network.cluster_ca_pem.as_deref())
         .ok_or(StatusCode::PRECONDITION_FAILED)?;
     let ca_key_pem = trust_material
         .internal_ca_key_pem
         .as_deref()
-        .or(state.internal_ca_key_pem.as_deref())
+        .or(state.network.internal_ca_key_pem.as_deref())
         .ok_or(StatusCode::PRECONDITION_FAILED)?;
 
     let issuer_key =
@@ -14494,15 +14653,15 @@ fn issue_public_node_tls_material_with_subject_alt_names(
         .public_ca_pem
         .as_deref()
         .or(trust_material.cluster_ca_pem.as_deref())
-        .or(state.public_ca_pem.as_deref())
-        .or(state.cluster_ca_pem.as_deref())
+        .or(state.network.public_ca_pem.as_deref())
+        .or(state.network.cluster_ca_pem.as_deref())
         .ok_or(StatusCode::PRECONDITION_FAILED)?;
     let ca_key_pem = trust_material
         .public_ca_key_pem
         .as_deref()
         .or(trust_material.internal_ca_key_pem.as_deref())
-        .or(state.public_ca_key_pem.as_deref())
-        .or(state.internal_ca_key_pem.as_deref())
+        .or(state.network.public_ca_key_pem.as_deref())
+        .or(state.network.internal_ca_key_pem.as_deref())
         .ok_or(StatusCode::PRECONDITION_FAILED)?;
 
     let issuer_key =
@@ -15192,9 +15351,9 @@ async fn export_managed_signer_backup_handler(
     let Some(ca_cert_pem) = trust_material
         .cluster_ca_pem
         .as_deref()
-        .or(state.cluster_ca_pem.as_deref())
+        .or(state.network.cluster_ca_pem.as_deref())
         .or(trust_material.public_ca_pem.as_deref())
-        .or(state.public_ca_pem.as_deref())
+        .or(state.network.public_ca_pem.as_deref())
     else {
         append_admin_audit(
             &state,
@@ -15216,9 +15375,9 @@ async fn export_managed_signer_backup_handler(
     let Some(ca_key_pem) = trust_material
         .internal_ca_key_pem
         .as_deref()
-        .or(state.internal_ca_key_pem.as_deref())
+        .or(state.network.internal_ca_key_pem.as_deref())
         .or(trust_material.public_ca_key_pem.as_deref())
-        .or(state.public_ca_key_pem.as_deref())
+        .or(state.network.public_ca_key_pem.as_deref())
     else {
         append_admin_audit(
             &state,
@@ -15464,9 +15623,9 @@ async fn export_managed_rendezvous_failover_handler(
     let Some(ca_cert_pem) = trust_material
         .cluster_ca_pem
         .as_deref()
-        .or(state.cluster_ca_pem.as_deref())
+        .or(state.network.cluster_ca_pem.as_deref())
         .or(trust_material.public_ca_pem.as_deref())
-        .or(state.public_ca_pem.as_deref())
+        .or(state.network.public_ca_pem.as_deref())
     else {
         append_admin_audit(
             &state,
@@ -15488,9 +15647,9 @@ async fn export_managed_rendezvous_failover_handler(
     let Some(ca_key_pem) = trust_material
         .internal_ca_key_pem
         .as_deref()
-        .or(state.internal_ca_key_pem.as_deref())
+        .or(state.network.internal_ca_key_pem.as_deref())
         .or(trust_material.public_ca_key_pem.as_deref())
-        .or(state.public_ca_key_pem.as_deref())
+        .or(state.network.public_ca_key_pem.as_deref())
     else {
         append_admin_audit(
             &state,
@@ -15842,9 +16001,9 @@ async fn export_managed_control_plane_promotion_handler(
     let Some(ca_cert_pem) = trust_material
         .cluster_ca_pem
         .as_deref()
-        .or(state.cluster_ca_pem.as_deref())
+        .or(state.network.cluster_ca_pem.as_deref())
         .or(trust_material.public_ca_pem.as_deref())
-        .or(state.public_ca_pem.as_deref())
+        .or(state.network.public_ca_pem.as_deref())
     else {
         append_admin_audit(
             &state,
@@ -15866,9 +16025,9 @@ async fn export_managed_control_plane_promotion_handler(
     let Some(ca_key_pem) = trust_material
         .internal_ca_key_pem
         .as_deref()
-        .or(state.internal_ca_key_pem.as_deref())
+        .or(state.network.internal_ca_key_pem.as_deref())
         .or(trust_material.public_ca_key_pem.as_deref())
-        .or(state.public_ca_key_pem.as_deref())
+        .or(state.network.public_ca_key_pem.as_deref())
     else {
         append_admin_audit(
             &state,
@@ -16365,7 +16524,7 @@ async fn issue_pairing_token_impl(
     };
 
     {
-        let mut auth_state = state.client_credentials.lock().await;
+        let mut auth_state = state.access.client_credentials.lock().await;
         auth_state
             .pairing_authorizations
             .retain(|token| token.used_at_unix.is_none() && token.expires_at_unix > now);
@@ -16461,7 +16620,7 @@ async fn enroll_client_device_impl(
         ),
         (StatusCode, String),
     > = {
-        let mut auth_state = state.client_credentials.lock().await;
+        let mut auth_state = state.access.client_credentials.lock().await;
         auth_state
             .pairing_authorizations
             .retain(|token| token.used_at_unix.is_none() && token.expires_at_unix > now);
@@ -16589,7 +16748,7 @@ async fn export_client_credentials(
     }
 
     let credentials = {
-        let auth_state = state.client_credentials.lock().await;
+        let auth_state = state.access.client_credentials.lock().await;
         client_credential_export_records(&auth_state.credentials)
     };
 
@@ -16678,7 +16837,12 @@ async fn redeem_client_bootstrap_claim(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
     let claim_token = request.claim_token.clone();
-    let claim = match state.bootstrap_claims.take_for_redeem(&claim_token).await {
+    let claim = match state
+        .access
+        .bootstrap_claims
+        .take_for_redeem(&claim_token)
+        .await
+    {
         Ok(claim) => claim,
         Err(_) => {
             return (
@@ -16691,7 +16855,11 @@ async fn redeem_client_bootstrap_claim(
 
     if claim.target_node_id != state.node_id {
         let claim_target_node_id = claim.target_node_id;
-        state.bootstrap_claims.restore(&claim_token, claim).await;
+        state
+            .access
+            .bootstrap_claims
+            .restore(&claim_token, claim)
+            .await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
@@ -16710,7 +16878,11 @@ async fn redeem_client_bootstrap_claim(
     {
         Some(pairing_token) => pairing_token,
         None => {
-            state.bootstrap_claims.restore(&claim_token, claim).await;
+            state
+                .access
+                .bootstrap_claims
+                .restore(&claim_token, claim)
+                .await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bootstrap claim is missing a pairing token".to_string(),
@@ -16745,7 +16917,11 @@ async fn redeem_client_bootstrap_claim(
                 expires_at_unix: enrolled.expires_at_unix,
             };
             if let Err(err) = response.validate() {
-                state.bootstrap_claims.restore(&claim_token, claim).await;
+                state
+                    .access
+                    .bootstrap_claims
+                    .restore(&claim_token, claim)
+                    .await;
                 return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
             }
             let used_at_unix = response.created_at_unix.unwrap_or_else(unix_ts);
@@ -16768,7 +16944,11 @@ async fn redeem_client_bootstrap_claim(
         }
         Err((status, error)) => {
             if status.is_server_error() {
-                state.bootstrap_claims.restore(&claim_token, claim).await;
+                state
+                    .access
+                    .bootstrap_claims
+                    .restore(&claim_token, claim)
+                    .await;
             }
             (status, Json(json!({ "error": error }))).into_response()
         }
@@ -16787,7 +16967,7 @@ async fn list_client_credentials(
     };
 
     let credentials = {
-        let auth_state = state.client_credentials.lock().await;
+        let auth_state = state.access.client_credentials.lock().await;
         auth_state
             .credentials
             .iter()
@@ -16866,7 +17046,7 @@ async fn list_client_connections(
     };
 
     let response_limit = query.limit.unwrap_or(100).clamp(1, 1000);
-    let response = match state.client_connections.lock() {
+    let response = match state.access.client_connections.lock() {
         Ok(registry) => registry.list(response_limit, before_cursor.as_ref()),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -16976,7 +17156,7 @@ async fn list_client_bootstrap_claims(
 
     let now = unix_ts();
     let mut claims = {
-        let auth_state = state.client_credentials.lock().await;
+        let auth_state = state.access.client_credentials.lock().await;
         auth_state
             .bootstrap_claims
             .iter()
@@ -17016,7 +17196,7 @@ async fn list_client_bootstrap_claims(
 }
 
 fn rendezvous_config_persistence_source(state: &ServerState) -> RendezvousConfigPersistenceSource {
-    if state.node_enrollment_path.is_some() {
+    if state.network.node_enrollment_path.is_some() {
         RendezvousConfigPersistenceSource::NodeEnrollment
     } else {
         RendezvousConfigPersistenceSource::RuntimeOnly
@@ -17032,12 +17212,12 @@ async fn build_rendezvous_config_view(
     RendezvousConfigView {
         effective_urls,
         editable_urls: current_editable_rendezvous_urls(state),
-        managed_embedded_url: state.managed_rendezvous_public_url.clone(),
-        registration_enabled: state.rendezvous_registration_enabled,
+        managed_embedded_url: state.network.managed_rendezvous_public_url.clone(),
+        registration_enabled: state.network.rendezvous_registration_enabled,
         registration_interval_secs: state.peer_heartbeat_config.interval_secs.max(5),
         disconnected_retry_interval_secs: RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS,
         endpoint_registrations: rendezvous_registration_views(state).await,
-        mtls_required: state.rendezvous_mtls_required,
+        mtls_required: state.network.rendezvous_mtls_required,
         persistence_source: rendezvous_config_persistence_source(state),
         persisted,
     }
@@ -17075,7 +17255,7 @@ fn build_effective_rendezvous_urls(
     let mut effective_urls = Vec::new();
     let mut seen = HashSet::new();
 
-    if let Some(managed_url) = state.managed_rendezvous_public_url.as_deref() {
+    if let Some(managed_url) = state.network.managed_rendezvous_public_url.as_deref() {
         let canonical = canonicalize_rendezvous_url(managed_url)?;
         seen.insert(canonical.clone());
         effective_urls.push(canonical);
@@ -17094,7 +17274,7 @@ fn persist_rendezvous_urls_if_possible(
     state: &ServerState,
     effective_urls: &[String],
 ) -> Result<bool> {
-    let Some(path) = state.node_enrollment_path.as_ref() else {
+    let Some(path) = state.network.node_enrollment_path.as_ref() else {
         return Ok(false);
     };
 
@@ -17115,7 +17295,8 @@ async fn get_rendezvous_config(
         Err(status) => return status.into_response(),
     };
 
-    let view = build_rendezvous_config_view(&state, state.node_enrollment_path.is_some()).await;
+    let view =
+        build_rendezvous_config_view(&state, state.network.node_enrollment_path.is_some()).await;
     append_admin_audit(
         &state,
         action,
@@ -17279,7 +17460,7 @@ async fn revoke_client_credential(
 
     let now = unix_ts();
     let replication_record = {
-        let mut auth_state = state.client_credentials.lock().await;
+        let mut auth_state = state.access.client_credentials.lock().await;
         let Some(device) = auth_state
             .credentials
             .iter_mut()
@@ -17356,7 +17537,7 @@ async fn storage_stats_current(State(state): State<ServerState>) -> impl IntoRes
         }
     };
 
-    let runtime = state.storage_stats_runtime.lock().await.clone();
+    let runtime = state.storage.storage_stats_runtime.lock().await.clone();
     (
         StatusCode::OK,
         Json(StorageStatsCurrentResponse {
@@ -17508,12 +17689,18 @@ async fn local_data_scrub_activity_payload(
     state: &ServerState,
 ) -> Result<DataScrubActivityStatusResponse> {
     let latest_run = latest_data_scrub_run_record(state).await?;
-    let active_runs = state.data_scrub_activity.lock().await.active_runs.clone();
+    let active_runs = state
+        .maintenance
+        .data_scrub_activity
+        .lock()
+        .await
+        .active_runs
+        .clone();
     Ok(DataScrubActivityStatusResponse {
         state: current_data_scrub_activity_state(&active_runs),
-        enabled: state.data_scrub_enabled,
-        interval_secs: state.data_scrub_interval_secs,
-        retention_secs: state.data_scrub_history_retention_secs,
+        enabled: state.maintenance.data_scrub_enabled,
+        interval_secs: state.maintenance.data_scrub_interval_secs,
+        retention_secs: state.maintenance.data_scrub_history_retention_secs,
         active_runs,
         latest_run,
     })
@@ -17526,7 +17713,7 @@ async fn local_data_scrub_history_payload(
 ) -> Result<DataScrubHistoryResponse> {
     let runs = load_data_scrub_history_runs(state, limit, since_unix).await?;
     Ok(DataScrubHistoryResponse {
-        retention_secs: state.data_scrub_history_retention_secs,
+        retention_secs: state.maintenance.data_scrub_history_retention_secs,
         runs,
     })
 }
@@ -18167,7 +18354,7 @@ async fn repair_history(
     (
         StatusCode::OK,
         Json(RepairHistoryResponse {
-            retention_secs: state.repair_run_history_retention_secs,
+            retention_secs: state.maintenance.repair_run_history_retention_secs,
             runs,
         }),
     )
@@ -18845,7 +19032,7 @@ async fn push_replication_bundle(
 
 async fn persist_repair_state(state: &ServerState) -> Result<()> {
     let attempts = {
-        let repair_state = state.repair_state.lock().await;
+        let repair_state = state.maintenance.repair_state.lock().await;
         repair_state
             .attempts
             .iter()
@@ -18880,6 +19067,7 @@ async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
 
 #[cfg(test)]
 fn build_http_client_from_optional_pem(server_ca_pem: Option<&str>) -> Result<reqwest::Client> {
+    ensure_rustls_crypto_provider_installed();
     let builder = reqwest::Client::builder();
     let builder = if let Some(server_ca_pem) = server_ca_pem {
         builder.add_root_certificate(
@@ -18969,6 +19157,7 @@ fn build_internal_mtls_http_client_with_expected_peer(
     key_path: &PathBuf,
     expected_peer: Option<(NodeId, ClusterId)>,
 ) -> Result<reqwest::Client> {
+    ensure_rustls_crypto_provider_installed();
     let roots = load_root_cert_store_from_pem_path(ca_path)?;
     let identity_pem = build_identity_pem_from_paths(cert_path, key_path)?;
     let (cert_chain, key) = parse_client_identity_pem(&identity_pem)?;
@@ -19003,6 +19192,7 @@ fn build_internal_mtls_server_config(
     use std::fs::File;
     use std::io::BufReader;
 
+    ensure_rustls_crypto_provider_installed();
     let mut ca_reader = BufReader::new(
         File::open(ca_path).with_context(|| format!("failed reading {}", ca_path.display()))?,
     );
@@ -19111,7 +19301,7 @@ fn parse_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 
 async fn current_admin_session_expiry(state: &ServerState, headers: &HeaderMap) -> Option<u64> {
     let session_id = parse_cookie_value(headers, &admin_session_cookie_name(state))?;
-    let mut sessions = state.admin_sessions.lock().await;
+    let mut sessions = state.access.admin_sessions.lock().await;
     sessions.is_valid(&session_id, unix_ts())
 }
 
@@ -19181,6 +19371,7 @@ async fn get_admin_session_status(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let token_valid = state
+        .access
         .admin_control
         .admin_token
         .as_deref()
@@ -19202,7 +19393,7 @@ async fn get_admin_session_status(
             login_required: true,
             authenticated,
             session_expires_at_unix,
-            token_override_enabled: state.admin_control.admin_token.is_some(),
+            token_override_enabled: state.access.admin_control.admin_token.is_some(),
         }),
     )
 }
@@ -19214,7 +19405,7 @@ async fn login_admin_session(
 ) -> impl IntoResponse {
     let action = "auth/admin/login";
     let request_meta = admin_request_metadata(&headers);
-    let Some(expected_hash) = state.admin_control.admin_password_hash.as_deref() else {
+    let Some(expected_hash) = state.access.admin_control.admin_password_hash.as_deref() else {
         append_admin_audit(
             &state,
             action,
@@ -19253,14 +19444,14 @@ async fn login_admin_session(
     }
 
     let (session_id, session_expires_at_unix) = {
-        let mut sessions = state.admin_sessions.lock().await;
+        let mut sessions = state.access.admin_sessions.lock().await;
         sessions.create_session(unix_ts())
     };
     let cookie_name = admin_session_cookie_name(&state);
     let cookie = match build_admin_session_cookie(
         &cookie_name,
         &session_id,
-        state.public_tls_runtime.is_some(),
+        state.network.public_tls_runtime.is_some(),
         ADMIN_SESSION_TTL_SECS,
     ) {
         Ok(cookie) => cookie,
@@ -19308,7 +19499,7 @@ async fn login_admin_session(
             login_required: true,
             authenticated: true,
             session_expires_at_unix: Some(session_expires_at_unix),
-            token_override_enabled: state.admin_control.admin_token.is_some(),
+            token_override_enabled: state.access.admin_control.admin_token.is_some(),
         }),
     )
         .into_response()
@@ -19321,12 +19512,14 @@ async fn logout_admin_session(
     let cookie_name = admin_session_cookie_name(&state);
     let session_id = parse_cookie_value(&headers, &cookie_name);
     if let Some(session_id) = session_id.as_deref() {
-        let mut sessions = state.admin_sessions.lock().await;
+        let mut sessions = state.access.admin_sessions.lock().await;
         sessions.revoke(session_id);
     }
 
-    let cookie = match clear_admin_session_cookie(&cookie_name, state.public_tls_runtime.is_some())
-    {
+    let cookie = match clear_admin_session_cookie(
+        &cookie_name,
+        state.network.public_tls_runtime.is_some(),
+    ) {
         Ok(cookie) => cookie,
         Err(err) => {
             return (
@@ -19344,7 +19537,7 @@ async fn logout_admin_session(
             login_required: true,
             authenticated: false,
             session_expires_at_unix: None,
-            token_override_enabled: state.admin_control.admin_token.is_some(),
+            token_override_enabled: state.access.admin_control.admin_token.is_some(),
         }),
     )
         .into_response()
@@ -19374,6 +19567,7 @@ async fn authorize_admin_request(
         return Err(StatusCode::PRECONDITION_FAILED);
     }
     let token_valid = state
+        .access
         .admin_control
         .admin_token
         .as_deref()

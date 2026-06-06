@@ -92,7 +92,7 @@ pub(crate) async fn mbtiles_metadata(
     };
     let metadata = source.metadata();
 
-    if state.map_perf_logging_enabled {
+    if state.storage.map_perf_logging_enabled {
         info!(
             manifest_key = %manifest_key,
             minzoom = metadata.minzoom.unwrap_or_default(),
@@ -252,7 +252,7 @@ pub(crate) async fn logical_file(
         Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     };
 
-    if state.map_perf_logging_enabled {
+    if state.storage.map_perf_logging_enabled {
         info!(
             manifest_key = %manifest_key,
             method = %method,
@@ -300,7 +300,7 @@ pub(crate) async fn xyz_tile(
         Ok(Err(_)) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
 
-    if state.map_perf_logging_enabled {
+    if state.storage.map_perf_logging_enabled {
         info!(
             manifest_key = %manifest_key,
             z,
@@ -350,7 +350,7 @@ pub(crate) async fn vector_tile(
         Ok(Err(_)) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
 
-    if state.map_perf_logging_enabled {
+    if state.storage.map_perf_logging_enabled {
         info!(
             manifest_key = %manifest_key,
             z,
@@ -380,7 +380,7 @@ pub(crate) async fn font_range(
     State(state): State<ServerState>,
     Path((fontstack, range)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let Some(glyphs_root) = state.map_glyphs_root.clone() else {
+    let Some(glyphs_root) = state.storage.map_glyphs_root.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -701,7 +701,7 @@ async fn load_split_logical_file_manifest(
         }
     }
 
-    if state.map_perf_logging_enabled {
+    if state.storage.map_perf_logging_enabled {
         info!(
             manifest_key = %manifest_key,
             parts = manifest.parts.len(),
@@ -724,13 +724,14 @@ async fn get_or_create_mbtiles_source(
 ) -> Result<Arc<LogicalMbtilesSource>> {
     let started = Instant::now();
     if let Some(source) = state
+        .storage
         .mbtiles_sources
         .read()
         .await
         .get(manifest_key)
         .cloned()
     {
-        if state.map_perf_logging_enabled {
+        if state.storage.map_perf_logging_enabled {
             info!(
                 manifest_key = %manifest_key,
                 cache = "hit",
@@ -744,7 +745,7 @@ async fn get_or_create_mbtiles_source(
     let loaded_manifest = load_split_logical_file_manifest(state, manifest_key).await?;
     let handle = tokio::runtime::Handle::current();
     let manifest_key_owned = manifest_key.to_string();
-    let perf_logging_enabled = state.map_perf_logging_enabled;
+    let perf_logging_enabled = state.storage.map_perf_logging_enabled;
     let source = tokio::task::spawn_blocking({
         let store = state.store.clone();
         move || {
@@ -761,9 +762,9 @@ async fn get_or_create_mbtiles_source(
     .context("MBTiles source construction task join failed")??;
     let source = Arc::new(source);
 
-    let mut sources = state.mbtiles_sources.write().await;
+    let mut sources = state.storage.mbtiles_sources.write().await;
     if let Some(existing) = sources.get(manifest_key) {
-        if state.map_perf_logging_enabled {
+        if state.storage.map_perf_logging_enabled {
             info!(
                 manifest_key = %manifest_key,
                 cache = "race-hit",
@@ -774,7 +775,7 @@ async fn get_or_create_mbtiles_source(
         return Ok(existing.clone());
     }
     sources.insert(manifest_key.to_string(), source.clone());
-    if state.map_perf_logging_enabled {
+    if state.storage.map_perf_logging_enabled {
         info!(
             manifest_key = %manifest_key,
             cache = "miss",

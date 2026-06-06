@@ -47,6 +47,10 @@ audit:
 deny:
     cargo deny --exclude system-tests check advisories licenses sources bans
 
+test-all:
+    just test-stable
+    just test-system-nightly
+
 test-system-nightly:
     cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
 

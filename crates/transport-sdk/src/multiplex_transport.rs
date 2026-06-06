@@ -511,6 +511,8 @@ mod tests {
             )
             .await
             .expect("response should write");
+            drop(stream);
+            server.close().await.expect("server session should close");
         });
 
         perform_transport_client_handshake(

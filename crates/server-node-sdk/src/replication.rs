@@ -410,7 +410,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
 
         let transfer_key = format!("{subject}|{}", state.node_id);
         {
-            let repair_state = state.repair_state.lock().await;
+            let repair_state = state.maintenance.repair_state.lock().await;
             if let Some(previous) = repair_state.attempts.get(&transfer_key) {
                 if previous.attempts > max_attempts {
                     skipped_max_retries += 1;
@@ -555,7 +555,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
                         successful_transfers += 1;
                         publish_namespace_change(state);
 
-                        let mut repair_state = state.repair_state.lock().await;
+                        let mut repair_state = state.maintenance.repair_state.lock().await;
                         repair_state.attempts.remove(&transfer_key);
                         drop(repair_state);
                         repair_state_dirty = true;
@@ -616,7 +616,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
                             })),
                         );
 
-                        let mut repair_state = state.repair_state.lock().await;
+                        let mut repair_state = state.maintenance.repair_state.lock().await;
                         let entry = repair_state.attempts.entry(transfer_key).or_insert(
                             RepairAttemptEntry {
                                 attempts: 0,
@@ -659,7 +659,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
                     })),
                 );
 
-                let mut repair_state = state.repair_state.lock().await;
+                let mut repair_state = state.maintenance.repair_state.lock().await;
                 let entry =
                     repair_state
                         .attempts
@@ -1009,7 +1009,7 @@ async fn execute_replication_repair_plan(
             let transfer_key = format!("{}|{}", item.key, state.node_id);
 
             {
-                let repair_state = state.repair_state.lock().await;
+                let repair_state = state.maintenance.repair_state.lock().await;
                 if let Some(previous) = repair_state.attempts.get(&transfer_key) {
                     if previous.attempts > max_attempts {
                         skipped_max_retries += 1;
@@ -1168,7 +1168,7 @@ async fn execute_replication_repair_plan(
                             })),
                         );
 
-                        let mut repair_state = state.repair_state.lock().await;
+                        let mut repair_state = state.maintenance.repair_state.lock().await;
                         let entry = repair_state.attempts.entry(transfer_key).or_insert(
                             RepairAttemptEntry {
                                 attempts: 0,
@@ -1215,7 +1215,7 @@ async fn execute_replication_repair_plan(
                     drop(cluster);
                     replicas_state_dirty = true;
 
-                    let mut repair_state = state.repair_state.lock().await;
+                    let mut repair_state = state.maintenance.repair_state.lock().await;
                     repair_state.attempts.remove(&transfer_key);
                     drop(repair_state);
                     repair_state_dirty = true;
@@ -1262,7 +1262,7 @@ async fn execute_replication_repair_plan(
                         })),
                     );
 
-                    let mut repair_state = state.repair_state.lock().await;
+                    let mut repair_state = state.maintenance.repair_state.lock().await;
                     let entry =
                         repair_state
                             .attempts
@@ -1364,7 +1364,7 @@ async fn execute_replication_repair_plan(
             let transfer_key = format!("{}|{}", item.key, target);
 
             {
-                let repair_state = state.repair_state.lock().await;
+                let repair_state = state.maintenance.repair_state.lock().await;
                 if let Some(previous) = repair_state.attempts.get(&transfer_key) {
                     if previous.attempts > max_attempts {
                         skipped_max_retries += 1;
@@ -1527,7 +1527,7 @@ async fn execute_replication_repair_plan(
                     drop(cluster);
                     replicas_state_dirty = true;
 
-                    let mut repair_state = state.repair_state.lock().await;
+                    let mut repair_state = state.maintenance.repair_state.lock().await;
                     repair_state.attempts.remove(&transfer_key);
                     drop(repair_state);
                     repair_state_dirty = true;
@@ -1561,7 +1561,7 @@ async fn execute_replication_repair_plan(
                         })),
                     );
 
-                    let mut repair_state = state.repair_state.lock().await;
+                    let mut repair_state = state.maintenance.repair_state.lock().await;
                     let entry =
                         repair_state
                             .attempts

@@ -346,9 +346,9 @@ fn install_internal_tls_for_test_config(
         direct_endpoints: Vec::new(),
         relay_mode: config.relay_mode,
         trust_roots: transport_sdk::BootstrapTrustRoots {
-            cluster_ca_pem: signer_state.cluster_ca_pem.clone(),
-            public_api_ca_pem: signer_state.public_ca_pem.clone(),
-            rendezvous_ca_pem: signer_state.rendezvous_ca_pem.clone(),
+            cluster_ca_pem: signer_state.network.cluster_ca_pem.clone(),
+            public_api_ca_pem: signer_state.network.public_ca_pem.clone(),
+            rendezvous_ca_pem: signer_state.network.rendezvous_ca_pem.clone(),
         },
         enrollment_issuer_url: config.enrollment_issuer_url.clone(),
     };
@@ -836,7 +836,7 @@ run_on_main_metadata_backends!(
 
 async fn admin_authorization_requires_token_when_configured_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let headers = HeaderMap::new();
 
     let result = super::authorize_admin_request(
@@ -863,7 +863,7 @@ async fn admin_authorization_requires_explicit_approval_for_destructive_action_i
     backend: MainTestBackend,
 ) {
     let mut state = build_test_state(1, false, backend).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
 
@@ -892,8 +892,8 @@ run_on_main_metadata_backends!(
 
 async fn public_logs_route_requires_client_or_admin_auth_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
-    state.client_auth_control.require_client_auth = true;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.client_auth_control.require_client_auth = true;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
 
     let app = Router::new()
         .route("/logs", get(super::ui::list_logs))
@@ -985,7 +985,7 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     let device_id = Uuid::now_v7().to_string();
     let now = super::unix_ts();
     {
-        let mut auth = state.client_credentials.lock().await;
+        let mut auth = state.access.client_credentials.lock().await;
         auth.pairing_authorizations
             .push(super::PairingAuthorizationRecord {
                 token_id: "pair-1".to_string(),
@@ -1025,7 +1025,7 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     assert_eq!(enrolled["device_id"], device_id);
     assert!(enrolled["credential_pem"].as_str().is_some());
 
-    let auth = state.client_credentials.lock().await;
+    let auth = state.access.client_credentials.lock().await;
     assert_eq!(auth.credentials.len(), 1);
     assert_eq!(auth.credentials[0].device_id, device_id);
     assert!(auth.pairing_authorizations[0].used_at_unix.is_some());
@@ -1147,7 +1147,7 @@ async fn import_client_credentials_upserts_idempotently_impl(backend: MainTestBa
     assert_eq!(unchanged.imported, 0);
     assert_eq!(unchanged.unchanged, 1);
 
-    let auth = state.client_credentials.lock().await;
+    let auth = state.access.client_credentials.lock().await;
     assert_eq!(auth.credentials.len(), 1);
     let stored = &auth.credentials[0];
     assert_eq!(stored.device_id, "device-sync");
@@ -1172,7 +1172,7 @@ async fn import_client_credentials_rejects_conflicting_device_impl(backend: Main
     let state = build_test_state(1, false, backend).await;
     let source_node_id = NodeId::new_v4();
     {
-        let mut auth = state.client_credentials.lock().await;
+        let mut auth = state.access.client_credentials.lock().await;
         auth.credentials.push(super::ClientCredentialRecord {
             device_id: "device-conflict".to_string(),
             label: Some("Original".to_string()),
@@ -1210,7 +1210,7 @@ async fn import_client_credentials_rejects_conflicting_device_impl(backend: Main
     assert_eq!(report.imported, 0);
     assert_eq!(report.conflicted, 1);
 
-    let auth = state.client_credentials.lock().await;
+    let auth = state.access.client_credentials.lock().await;
     assert_eq!(auth.credentials.len(), 1);
     let stored = &auth.credentials[0];
     assert_eq!(stored.label.as_deref(), Some("Original"));
@@ -1235,7 +1235,7 @@ async fn export_client_credentials_omits_issued_credential_pem_impl(backend: Mai
     let expected_fingerprint =
         transport_sdk::credential_fingerprint(issued_credential_pem).unwrap();
     {
-        let mut auth = state.client_credentials.lock().await;
+        let mut auth = state.access.client_credentials.lock().await;
         auth.credentials.push(super::ClientCredentialRecord {
             device_id: "device-export".to_string(),
             label: Some("Tablet".to_string()),
@@ -1284,13 +1284,13 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let device_id = Uuid::now_v7().to_string();
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem);
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
-    state.rendezvous_mtls_required = true;
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.rendezvous_mtls_required = true;
 
     let now = super::unix_ts();
     {
-        let mut auth = state.client_credentials.lock().await;
+        let mut auth = state.access.client_credentials.lock().await;
         auth.pairing_authorizations
             .push(super::PairingAuthorizationRecord {
                 token_id: "pair-2".to_string(),
@@ -1342,8 +1342,8 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
 #[tokio::test]
 async fn enroll_client_device_returns_json_error_when_rendezvous_mtls_signing_is_unavailable() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.cluster_ca_pem = Some("cluster-ca".to_string());
-    state.rendezvous_mtls_required = true;
+    state.network.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.network.rendezvous_mtls_required = true;
 
     let response = super::enroll_client_device(
         State(state.clone()),
@@ -1375,14 +1375,14 @@ async fn enroll_client_device_returns_json_error_when_rendezvous_mtls_signing_is
 #[tokio::test]
 async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
-    state.public_ca_pem = Some("public-ca".to_string());
-    state.cluster_ca_pem = Some("cluster-ca".to_string());
-    state.internal_ca_key_pem = Some("cluster-key".to_string());
-    state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
-    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
-    state.rendezvous_registration_enabled = true;
-    state.rendezvous_mtls_required = true;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    state.network.public_ca_pem = Some("public-ca".to_string());
+    state.network.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.network.internal_ca_key_pem = Some("cluster-key".to_string());
+    state.network.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
+    *state.network.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = true;
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -1449,16 +1449,16 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
 #[tokio::test]
 async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_node() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, _) = generate_test_internal_ca();
     let (rendezvous_ca_pem, _) = generate_test_internal_ca();
-    state.public_ca_pem = Some(public_ca_pem.clone());
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
-    state.rendezvous_ca_pem = Some(rendezvous_ca_pem.clone());
-    state.rendezvous_registration_enabled = true;
-    state.rendezvous_mtls_required = true;
+    state.network.public_ca_pem = Some(public_ca_pem.clone());
+    state.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.rendezvous_ca_pem = Some(rendezvous_ca_pem.clone());
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = true;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1466,7 +1466,7 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
     let rendezvous_addr = listener.local_addr().expect("mock rendezvous addr");
     let rendezvous_url = format!("http://{rendezvous_addr}");
     let canonical_rendezvous_url = format!("{rendezvous_url}/");
-    *state.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
+    *state.network.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
     let rendezvous_server = tokio::spawn(async move {
         axum::serve(
             listener,
@@ -1485,7 +1485,7 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
         Duration::from_secs(5),
     )
     .await;
-    *state.rendezvous_registration_state.lock().await = HashMap::from([(
+    *state.network.rendezvous_registration_state.lock().await = HashMap::from([(
         canonical_rendezvous_url.clone(),
         super::RendezvousEndpointRegistrationRuntime {
             last_attempt_unix: Some(10),
@@ -1570,6 +1570,7 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
     assert!(issued.bootstrap_bundle.pairing_token.is_some());
 
     let stored_claim = state
+        .access
         .bootstrap_claims
         .take_for_redeem(&issued.bootstrap_claim.claim_token)
         .await
@@ -1597,16 +1598,16 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
 #[tokio::test]
 async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, _) = generate_test_internal_ca();
     let (rendezvous_ca_pem, _) = generate_test_internal_ca();
-    state.public_ca_pem = Some(public_ca_pem.clone());
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
-    state.rendezvous_ca_pem = Some(rendezvous_ca_pem.clone());
-    state.rendezvous_registration_enabled = true;
-    state.rendezvous_mtls_required = true;
+    state.network.public_ca_pem = Some(public_ca_pem.clone());
+    state.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.rendezvous_ca_pem = Some(rendezvous_ca_pem.clone());
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = true;
 
     let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1658,9 +1659,9 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
     )
     .await;
 
-    *state.rendezvous_urls.lock().unwrap() =
+    *state.network.rendezvous_urls.lock().unwrap() =
         vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
-    *state.rendezvous_registration_state.lock().await = HashMap::from([
+    *state.network.rendezvous_registration_state.lock().await = HashMap::from([
         (
             canonical_rendezvous_url_a.clone(),
             super::RendezvousEndpointRegistrationRuntime {
@@ -1713,6 +1714,7 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
     );
     assert_eq!(issued.bootstrap_claim.target_node_id, state.node_id);
     let stored_claim = state
+        .access
         .bootstrap_claims
         .take_for_redeem(&issued.bootstrap_claim.claim_token)
         .await
@@ -1729,16 +1731,16 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
 #[tokio::test]
 async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healthy() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, _) = generate_test_internal_ca();
     let (rendezvous_ca_pem, _) = generate_test_internal_ca();
-    state.public_ca_pem = Some(public_ca_pem.clone());
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
-    state.rendezvous_ca_pem = Some(rendezvous_ca_pem.clone());
-    state.rendezvous_registration_enabled = true;
-    state.rendezvous_mtls_required = true;
+    state.network.public_ca_pem = Some(public_ca_pem.clone());
+    state.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.rendezvous_ca_pem = Some(rendezvous_ca_pem.clone());
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = true;
 
     let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1790,9 +1792,9 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
     )
     .await;
 
-    *state.rendezvous_urls.lock().unwrap() =
+    *state.network.rendezvous_urls.lock().unwrap() =
         vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
-    *state.rendezvous_registration_state.lock().await = HashMap::from([
+    *state.network.rendezvous_registration_state.lock().await = HashMap::from([
         (
             canonical_rendezvous_url_a.clone(),
             super::RendezvousEndpointRegistrationRuntime {
@@ -1848,6 +1850,7 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
     );
     assert_eq!(issued.bootstrap_claim.target_node_id, state.node_id);
     let stored_claim = state
+        .access
         .bootstrap_claims
         .take_for_redeem(&issued.bootstrap_claim.claim_token)
         .await
@@ -1864,11 +1867,11 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
 #[tokio::test]
 async fn issue_bootstrap_claim_returns_json_error_when_rendezvous_is_unavailable() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, _) = generate_test_internal_ca();
     let (public_ca_pem, _) = generate_test_internal_ca();
-    state.public_ca_pem = Some(public_ca_pem);
-    state.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.public_ca_pem = Some(public_ca_pem);
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -1899,9 +1902,9 @@ async fn issue_bootstrap_claim_returns_json_error_when_rendezvous_is_unavailable
 #[tokio::test]
 async fn issue_pairing_token_returns_json_error_when_rendezvous_mtls_signing_is_unavailable() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
-    state.cluster_ca_pem = Some("cluster-ca".to_string());
-    state.rendezvous_mtls_required = true;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    state.network.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.network.rendezvous_mtls_required = true;
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -1934,9 +1937,9 @@ async fn issue_pairing_token_returns_json_error_when_rendezvous_mtls_signing_is_
 #[tokio::test]
 async fn issue_bootstrap_claim_returns_json_error_when_rendezvous_mtls_signing_is_unavailable() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
-    state.cluster_ca_pem = Some("cluster-ca".to_string());
-    state.rendezvous_mtls_required = true;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    state.network.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.network.rendezvous_mtls_required = true;
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -1969,7 +1972,7 @@ async fn issue_bootstrap_claim_returns_json_error_when_rendezvous_mtls_signing_i
 #[tokio::test]
 async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.rendezvous_registration_enabled = true;
+    state.network.rendezvous_registration_enabled = true;
     let now = super::unix_ts();
     let claim_token = "claim-secret";
     let pairing_token = "pair-secret";
@@ -1978,7 +1981,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
     let canonical_rendezvous_url = format!("{rendezvous_url}/");
 
     {
-        let mut auth = state.client_credentials.lock().await;
+        let mut auth = state.access.client_credentials.lock().await;
         auth.pairing_authorizations
             .push(super::PairingAuthorizationRecord {
                 token_id: "pair-claim-1".to_string(),
@@ -2004,6 +2007,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
     }
 
     state
+        .access
         .bootstrap_claims
         .publish(transport_sdk::ClientBootstrapClaimPublishRequest {
             cluster_id: state.cluster_id,
@@ -2059,7 +2063,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
     )
     .await;
 
-    *state.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
+    *state.network.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
     configure_test_relay_outbound_clients(&state, &rendezvous_url).await;
 
     let local_descriptor = {
@@ -2154,7 +2158,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
     assert_eq!(redeemed.label.as_deref(), Some("Tablet"));
     assert_eq!(redeemed.bootstrap.pairing_token, None);
     {
-        let auth = state.client_credentials.lock().await;
+        let auth = state.access.client_credentials.lock().await;
         let claim = auth
             .bootstrap_claims
             .iter()
@@ -2180,7 +2184,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
 #[tokio::test]
 async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_multiple_endpoints() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.relay_mode = super::RelayMode::Required;
+    state.network.relay_mode = super::RelayMode::Required;
 
     let bind_addr_a = free_bind_addr();
     let rendezvous_url_a = format!("http://{bind_addr_a}");
@@ -2243,7 +2247,7 @@ async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_mul
     )
     .await;
 
-    *state.rendezvous_urls.lock().unwrap() =
+    *state.network.rendezvous_urls.lock().unwrap() =
         vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
     configure_test_relay_outbound_clients_for_urls(
         &state,
@@ -2414,14 +2418,14 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
 #[tokio::test]
 async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
-    state.public_ca_pem = Some("public-ca".to_string());
-    state.cluster_ca_pem = Some("cluster-ca".to_string());
-    state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
-    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
-    state.rendezvous_registration_enabled = true;
-    state.rendezvous_mtls_required = true;
-    state.relay_mode = transport_sdk::RelayMode::Required;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    state.network.public_ca_pem = Some("public-ca".to_string());
+    state.network.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.network.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
+    *state.network.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = true;
+    state.network.relay_mode = transport_sdk::RelayMode::Required;
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -2524,8 +2528,8 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
 async fn internal_node_tls_material_uses_identity_only_sans() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem);
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
 
     let bootstrap = transport_sdk::NodeBootstrap {
         version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
@@ -2620,17 +2624,17 @@ async fn internal_node_tls_material_uses_identity_only_sans() {
 #[tokio::test]
 async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, public_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
-    state.public_ca_pem = Some(public_ca_pem.clone());
-    state.public_ca_key_pem = Some(public_ca_key_pem);
-    state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
-    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
-    state.rendezvous_registration_enabled = true;
-    state.rendezvous_mtls_required = true;
+    state.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.public_ca_pem = Some(public_ca_pem.clone());
+    state.network.public_ca_key_pem = Some(public_ca_key_pem);
+    state.network.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
+    *state.network.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = true;
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -2723,11 +2727,11 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
 #[tokio::test]
 async fn issue_node_enrollment_from_join_request_returns_enrollment_package() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.public_ca_pem = Some(cluster_ca_pem);
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.network.public_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -2786,10 +2790,10 @@ async fn issue_node_enrollment_from_join_request_returns_enrollment_package() {
 #[tokio::test]
 async fn export_managed_signer_backup_returns_encrypted_backup() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem);
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -2818,7 +2822,8 @@ async fn export_managed_signer_backup_returns_encrypted_backup() {
 #[tokio::test]
 async fn admin_password_login_creates_session_cookie() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_password_hash = Some(super::hash_token("super-secret-password"));
+    state.access.admin_control.admin_password_hash =
+        Some(super::hash_token("super-secret-password"));
 
     let response = super::login_admin_session(
         State(state.clone()),
@@ -2866,7 +2871,8 @@ async fn admin_session_status_stays_locked_when_admin_auth_is_unconfigured() {
 #[tokio::test]
 async fn admin_session_cookie_authorizes_admin_request() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_password_hash = Some(super::hash_token("super-secret-password"));
+    state.access.admin_control.admin_password_hash =
+        Some(super::hash_token("super-secret-password"));
 
     let login_response = super::login_admin_session(
         State(state.clone()),
@@ -2900,8 +2906,10 @@ async fn admin_session_cookie_authorizes_admin_request() {
 async fn admin_session_cookies_are_isolated_per_node() {
     let mut node_a = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let mut node_b = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    node_a.admin_control.admin_password_hash = Some(super::hash_token("super-secret-password"));
-    node_b.admin_control.admin_password_hash = Some(super::hash_token("super-secret-password"));
+    node_a.access.admin_control.admin_password_hash =
+        Some(super::hash_token("super-secret-password"));
+    node_b.access.admin_control.admin_password_hash =
+        Some(super::hash_token("super-secret-password"));
 
     let login_a = super::login_admin_session(
         State(node_a.clone()),
@@ -2975,10 +2983,10 @@ async fn admin_session_cookies_are_isolated_per_node() {
 #[tokio::test]
 async fn import_managed_signer_backup_persists_signer_material_and_requires_restart() {
     let mut exporter = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    exporter.admin_control.admin_token = Some("admin-secret".to_string());
+    exporter.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
-    exporter.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    exporter.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+    exporter.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    exporter.network.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
     let backup = super::setup::export_managed_signer_backup(
         exporter.cluster_id,
         exporter.node_id,
@@ -2990,7 +2998,7 @@ async fn import_managed_signer_backup_persists_signer_material_and_requires_rest
 
     let mut importer = build_test_state(1, false, MainTestBackend::Sqlite).await;
     importer.cluster_id = exporter.cluster_id;
-    importer.admin_control.admin_token = Some("admin-secret".to_string());
+    importer.access.admin_control.admin_token = Some("admin-secret".to_string());
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -3040,10 +3048,10 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, public_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem);
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
-    state.public_ca_pem = Some(public_ca_pem.clone());
-    state.public_ca_key_pem = Some(public_ca_key_pem);
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.public_ca_pem = Some(public_ca_pem.clone());
+    state.network.public_ca_key_pem = Some(public_ca_key_pem);
 
     let root = fresh_test_dir("node-enrollment-config");
     let package_path = root.join("node-enrollment.json");
@@ -3075,8 +3083,8 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
         direct_endpoints: Vec::new(),
         relay_mode: transport_sdk::RelayMode::Fallback,
         trust_roots: transport_sdk::BootstrapTrustRoots {
-            cluster_ca_pem: state.cluster_ca_pem.clone(),
-            public_api_ca_pem: state.public_ca_pem.clone(),
+            cluster_ca_pem: state.network.cluster_ca_pem.clone(),
+            public_api_ca_pem: state.network.public_ca_pem.clone(),
             rendezvous_ca_pem: None,
         },
         enrollment_issuer_url: Some("https://issuer.example".to_string()),
@@ -3140,10 +3148,10 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, public_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem);
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
-    state.public_ca_pem = Some(public_ca_pem.clone());
-    state.public_ca_key_pem = Some(public_ca_key_pem);
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.public_ca_pem = Some(public_ca_pem.clone());
+    state.network.public_ca_key_pem = Some(public_ca_key_pem);
 
     let root = fresh_test_dir("node-enrollment-startup");
     let package_path = root.join("node-enrollment.json");
@@ -3182,8 +3190,8 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
         }],
         relay_mode: transport_sdk::RelayMode::Fallback,
         trust_roots: transport_sdk::BootstrapTrustRoots {
-            cluster_ca_pem: state.cluster_ca_pem.clone(),
-            public_api_ca_pem: state.public_ca_pem.clone(),
+            cluster_ca_pem: state.network.cluster_ca_pem.clone(),
+            public_api_ca_pem: state.network.public_ca_pem.clone(),
             rendezvous_ca_pem: None,
         },
         enrollment_issuer_url: Some("https://issuer.example".to_string()),
@@ -3239,15 +3247,15 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
 #[tokio::test]
 async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, public_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem);
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
-    state.public_ca_pem = Some(public_ca_pem);
-    state.public_ca_key_pem = Some(public_ca_key_pem);
-    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
-    state.rendezvous_registration_enabled = true;
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.public_ca_pem = Some(public_ca_pem);
+    state.network.public_ca_key_pem = Some(public_ca_key_pem);
+    *state.network.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
+    state.network.rendezvous_registration_enabled = true;
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -3388,10 +3396,10 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
 #[tokio::test]
 async fn renew_node_enrollment_rejects_invalid_current_public_certificate() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem);
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -3459,10 +3467,10 @@ async fn renew_node_enrollment_rejects_invalid_current_public_certificate() {
 #[tokio::test]
 async fn renew_node_enrollment_rejects_node_missing_from_cluster_membership() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem);
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -3532,8 +3540,8 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
 
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+    state.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
 
     let mut issuer_config = test_cluster_config_without_internal_tls(&issuer_dir, issuer_bind_addr);
     issuer_config.cluster_id = state.cluster_id;
@@ -3622,9 +3630,9 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     .unwrap()
     .certificate_fingerprint;
 
-    state.enrollment_issuer_url = config.enrollment_issuer_url.clone();
-    state.node_enrollment_path = Some(package_path.clone());
-    state.node_enrollment_auto_renew_enabled = true;
+    state.network.enrollment_issuer_url = config.enrollment_issuer_url.clone();
+    state.network.node_enrollment_path = Some(package_path.clone());
+    state.network.node_enrollment_auto_renew_enabled = true;
     register_cluster_node(
         &state,
         issuer_node_id,
@@ -3642,7 +3650,7 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
             .and_then(|tls| tls.internal_url.as_deref()),
     )
     .await;
-    state.public_tls_runtime = Some(super::PublicTlsRuntime {
+    state.network.public_tls_runtime = Some(super::PublicTlsRuntime {
         config: axum_server::tls_rustls::RustlsConfig::from_pem_file(
             &config.public_tls.as_ref().unwrap().cert_path,
             &config.public_tls.as_ref().unwrap().key_path,
@@ -3653,7 +3661,7 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
         key_path: config.public_tls.as_ref().unwrap().key_path.clone(),
         metadata_path: config.public_tls.as_ref().unwrap().metadata_path.clone(),
     });
-    state.internal_tls_runtime = Some(super::InternalTlsRuntime {
+    state.network.internal_tls_runtime = Some(super::InternalTlsRuntime {
         config: super::build_internal_mtls_rustls_config(
             &config.internal_tls.as_ref().unwrap().ca_cert_path,
             &config.internal_tls.as_ref().unwrap().cert_path,
@@ -3666,17 +3674,19 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
         metadata_path: config.internal_tls.as_ref().unwrap().metadata_path.clone(),
     });
     {
-        let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+        let mut renewal_state = state.network.node_enrollment_auto_renew_state.lock().await;
         renewal_state.loaded_public_tls_fingerprint = Some(loaded_public_fingerprint.clone());
         renewal_state.loaded_internal_tls_fingerprint = Some(loaded_internal_fingerprint.clone());
     }
     let public_config_before = state
+        .network
         .public_tls_runtime
         .as_ref()
         .unwrap()
         .config
         .get_inner();
     let internal_config_before = state
+        .network
         .internal_tls_runtime
         .as_ref()
         .unwrap()
@@ -3732,6 +3742,7 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     assert!(!Arc::ptr_eq(
         &public_config_before,
         &state
+            .network
             .public_tls_runtime
             .as_ref()
             .unwrap()
@@ -3741,6 +3752,7 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     assert!(!Arc::ptr_eq(
         &internal_config_before,
         &state
+            .network
             .internal_tls_runtime
             .as_ref()
             .unwrap()
@@ -3748,21 +3760,30 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
             .get_inner()
     ));
 
-    let auto_renew_state = state.node_enrollment_auto_renew_state.lock().await.clone();
+    let auto_renew_state = state
+        .network
+        .node_enrollment_auto_renew_state
+        .lock()
+        .await
+        .clone();
     let status = super::collect_node_certificate_status(
         state
+            .network
             .public_tls_runtime
             .as_ref()
             .map(|tls| tls.cert_path.as_path()),
         state
+            .network
             .public_tls_runtime
             .as_ref()
             .and_then(|tls| tls.metadata_path.as_deref()),
         state
+            .network
             .internal_tls_runtime
             .as_ref()
             .map(|tls| tls.cert_path.as_path()),
         state
+            .network
             .internal_tls_runtime
             .as_ref()
             .and_then(|tls| tls.metadata_path.as_deref()),
@@ -3819,8 +3840,8 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
 
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+    state.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
 
     let mut issuer_config = test_cluster_config_without_internal_tls(&issuer_dir, issuer_bind_addr);
     issuer_config.cluster_id = state.cluster_id;
@@ -4107,9 +4128,9 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
 
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
-    state.rendezvous_ca_pem = Some(cluster_ca_pem.clone());
+    state.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+    state.network.rendezvous_ca_pem = Some(cluster_ca_pem.clone());
 
     let mut issuer_config = test_cluster_config_without_internal_tls(&issuer_dir, issuer_bind_addr);
     issuer_config.cluster_id = state.cluster_id;
@@ -4299,11 +4320,11 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     })
     .await;
 
-    state.enrollment_issuer_url = config.enrollment_issuer_url.clone();
-    state.node_enrollment_path = Some(package_path.clone());
-    *state.rendezvous_urls.lock().unwrap() = vec![format!("https://{capture_bind_addr}")];
-    state.rendezvous_registration_enabled = true;
-    state.internal_tls_runtime = Some(super::InternalTlsRuntime {
+    state.network.enrollment_issuer_url = config.enrollment_issuer_url.clone();
+    state.network.node_enrollment_path = Some(package_path.clone());
+    *state.network.rendezvous_urls.lock().unwrap() = vec![format!("https://{capture_bind_addr}")];
+    state.network.rendezvous_registration_enabled = true;
+    state.network.internal_tls_runtime = Some(super::InternalTlsRuntime {
         config: super::build_internal_mtls_rustls_config(
             &internal_tls.ca_cert_path,
             &internal_tls.cert_path,
@@ -4316,7 +4337,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
         metadata_path: internal_tls.metadata_path.clone(),
     });
     {
-        let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+        let mut renewal_state = state.network.node_enrollment_auto_renew_state.lock().await;
         renewal_state.loaded_internal_tls_fingerprint = Some(initial_internal_fingerprint.clone());
     }
     {
@@ -4421,8 +4442,8 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let rendezvous_url = format!("https://{bind_addr}");
     let internal_bind_addr = free_bind_addr();
-    *state.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
-    state.rendezvous_registration_enabled = true;
+    *state.network.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
+    state.network.rendezvous_registration_enabled = true;
 
     transport_sdk::NodeEnrollmentPackage {
         bootstrap: transport_sdk::NodeBootstrap {
@@ -4460,7 +4481,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
     }
     .write_to_path(&package_path)
     .unwrap();
-    state.node_enrollment_path = Some(package_path.clone());
+    state.network.node_enrollment_path = Some(package_path.clone());
 
     let mut rendezvous_handle = spawn_https_rendezvous_server(bind_addr, &cert1_path, &key1_path);
     wait_for_condition(
@@ -4567,8 +4588,8 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
 async fn collect_node_certificate_status_reports_renewal_due_from_sidecar_metadata() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
-    state.cluster_ca_pem = Some(cluster_ca_pem);
-    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
 
     let root = fresh_test_dir("node-cert-status");
     let package_path = root.join("node-enrollment.json");
@@ -4597,7 +4618,7 @@ async fn collect_node_certificate_status_reports_renewal_due_from_sidecar_metada
         direct_endpoints: Vec::new(),
         relay_mode: transport_sdk::RelayMode::Fallback,
         trust_roots: transport_sdk::BootstrapTrustRoots {
-            cluster_ca_pem: state.cluster_ca_pem.clone(),
+            cluster_ca_pem: state.network.cluster_ca_pem.clone(),
             public_api_ca_pem: None,
             rendezvous_ca_pem: None,
         },
@@ -4656,7 +4677,7 @@ async fn client_auth_middleware_requires_valid_signature_when_enabled_impl(
     backend: MainTestBackend,
 ) {
     let mut state = build_test_state(1, false, backend).await;
-    state.client_auth_control.require_client_auth = true;
+    state.access.client_auth_control.require_client_auth = true;
     let mut identity =
         transport_sdk::ClientIdentityMaterial::generate(state.cluster_id, None, None).unwrap();
     let credential_pem = super::generate_client_credential_pem(
@@ -4668,7 +4689,7 @@ async fn client_auth_middleware_requires_valid_signature_when_enabled_impl(
     );
     identity.credential_pem = Some(credential_pem.clone());
     {
-        let mut auth = state.client_credentials.lock().await;
+        let mut auth = state.access.client_credentials.lock().await;
         auth.credentials.push(super::ClientCredentialRecord {
             device_id: identity.device_id.to_string(),
             label: Some("Pixel".to_string()),
@@ -4758,7 +4779,7 @@ run_on_main_metadata_backends!(
 
 async fn client_auth_middleware_rejects_replayed_nonce_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
-    state.client_auth_control.require_client_auth = true;
+    state.access.client_auth_control.require_client_auth = true;
     let mut identity =
         transport_sdk::ClientIdentityMaterial::generate(state.cluster_id, None, None).unwrap();
     let credential_pem = super::generate_client_credential_pem(
@@ -4770,7 +4791,7 @@ async fn client_auth_middleware_rejects_replayed_nonce_impl(backend: MainTestBac
     );
     identity.credential_pem = Some(credential_pem.clone());
     {
-        let mut auth = state.client_credentials.lock().await;
+        let mut auth = state.access.client_credentials.lock().await;
         auth.credentials.push(super::ClientCredentialRecord {
             device_id: identity.device_id.to_string(),
             label: None,
@@ -4852,8 +4873,8 @@ async fn cluster_info_middleware_accepts_admin_auth_and_rejects_anonymous_impl(
     backend: MainTestBackend,
 ) {
     let mut state = build_test_state(1, false, backend).await;
-    state.client_auth_control.require_client_auth = true;
-    state.admin_control.admin_token = Some("cluster-admin-secret".to_string());
+    state.access.client_auth_control.require_client_auth = true;
+    state.access.admin_control.admin_token = Some("cluster-admin-secret".to_string());
 
     let app = Router::new()
         .route("/cluster/status", get(|| async { StatusCode::OK }))
@@ -4898,9 +4919,9 @@ run_on_main_metadata_backends!(
 
 async fn list_client_credentials_returns_fingerprint_metadata_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     {
-        let mut auth = state.client_credentials.lock().await;
+        let mut auth = state.access.client_credentials.lock().await;
         auth.credentials.push(super::ClientCredentialRecord {
             device_id: "device-list".to_string(),
             label: Some("Surface".to_string()),
@@ -4952,10 +4973,10 @@ run_on_main_metadata_backends!(
 
 async fn list_client_bootstrap_claims_returns_recent_claim_status_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let now = super::unix_ts();
     {
-        let mut auth = state.client_credentials.lock().await;
+        let mut auth = state.access.client_credentials.lock().await;
         auth.bootstrap_claims
             .push(super::ClientBootstrapClaimRecord {
                 claim_id: "claim-pending".to_string(),
@@ -5059,9 +5080,9 @@ async fn revoke_client_credential_persists_reason_and_admin_metadata_impl(
     backend: MainTestBackend,
 ) {
     let mut state = build_test_state(1, false, backend).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     {
-        let mut auth = state.client_credentials.lock().await;
+        let mut auth = state.access.client_credentials.lock().await;
         auth.credentials.push(super::ClientCredentialRecord {
             device_id: "device-revoke".to_string(),
             label: Some("Laptop".to_string()),
@@ -5094,7 +5115,7 @@ async fn revoke_client_credential_persists_reason_and_admin_metadata_impl(
     .into_response();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let auth = state.client_credentials.lock().await;
+    let auth = state.access.client_credentials.lock().await;
     let revoked = auth
         .credentials
         .iter()
@@ -5231,7 +5252,7 @@ run_on_main_metadata_backends!(
 
 async fn multiplex_transport_public_fast_path_requires_client_auth_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
-    state.client_auth_control.require_client_auth = true;
+    state.access.client_auth_control.require_client_auth = true;
 
     let request = transport_sdk::BufferedTransportRequest::new(
         transport_sdk::TransportStreamKind::Rpc,
@@ -5559,6 +5580,7 @@ async fn repair_busy_threshold_returns_immediately_when_disabled_impl(backend: M
     let mut state = build_test_state(1, false, backend).await;
     state.repair_config.busy_throttle_enabled = false;
     state
+        .maintenance
         .inflight_requests
         .store(1_000, std::sync::atomic::Ordering::Relaxed);
     let start = Instant::now();
@@ -5581,10 +5603,11 @@ async fn repair_busy_threshold_waits_until_load_drops_impl(backend: MainTestBack
     state.repair_config.busy_inflight_threshold = 1;
     state.repair_config.busy_wait_millis = 5;
     state
+        .maintenance
         .inflight_requests
         .store(5, std::sync::atomic::Ordering::Relaxed);
 
-    let inflight_requests_for_release = Arc::clone(&state.inflight_requests);
+    let inflight_requests_for_release = Arc::clone(&state.maintenance.inflight_requests);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(20)).await;
         inflight_requests_for_release.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -5666,7 +5689,7 @@ async fn replication_repair_records_max_retry_skip_details_impl(backend: MainTes
     );
 
     {
-        let mut repair_state = state.repair_state.lock().await;
+        let mut repair_state = state.maintenance.repair_state.lock().await;
         for (subject, target_node_id) in &expected_skips {
             repair_state.attempts.insert(
                 format!("{subject}|{target_node_id}"),
@@ -5754,7 +5777,7 @@ async fn autonomous_post_write_replication_pushes_to_missing_remote_nodes_impl(
     }
 
     {
-        let mut runtime = source.autonomous_post_write_repair.lock().await;
+        let mut runtime = source.maintenance.autonomous_post_write_repair.lock().await;
         assert!(
             runtime.enqueue(super::autonomous_post_write_replication_subjects(
                 &key,
@@ -6961,7 +6984,7 @@ run_on_main_metadata_backends!(
 
 async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let put = {
         let mut locked = lock_store(&state, "tests.state.store").await;
         locked
@@ -7019,7 +7042,7 @@ run_on_main_metadata_backends!(
 
 async fn get_media_thumbnail_admin_requires_auth_and_serves_image_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let put = {
         let mut locked = lock_store(&state, "tests.state.store").await;
         locked
@@ -7413,7 +7436,7 @@ async fn clear_media_cache_admin_requires_auth_and_clears_cached_media_impl(
     backend: MainTestBackend,
 ) {
     let mut state = build_test_state(1, false, backend).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let (manifest_hash, thumb_path) = {
         let mut locked = lock_store(&state, "tests.state.store").await;
         let put = locked
@@ -7527,7 +7550,7 @@ run_on_main_metadata_backends!(
 
 async fn get_object_admin_returns_bytes_with_admin_token_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let payload = bytes::Bytes::from(sample_png_bytes());
     {
         let mut locked = lock_store(&state, "tests.state.store").await;
@@ -7752,65 +7775,91 @@ async fn build_test_state(
         data_dir: root.clone(),
         cluster_id: uuid::Uuid::now_v7(),
         node_id: local_node_id,
-        storage_stats_history_retention_secs: super::STORAGE_STATS_HISTORY_RETENTION_SECS,
-        data_scrub_enabled: true,
-        data_scrub_interval_secs: super::DATA_SCRUB_INTERVAL_SECS,
-        data_scrub_history_retention_secs: super::DATA_SCRUB_HISTORY_RETENTION_SECS,
-        repair_run_history_retention_secs: super::REPAIR_RUN_HISTORY_RETENTION_SECS,
-        map_perf_logging_enabled: false,
-        map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
-        mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<
-            String,
-            Arc<super::web_maps::LogicalMbtilesSource>,
-        >::new())),
         store: store.clone(),
-        upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(service)),
-        client_credentials: Arc::new(Mutex::new(super::storage::ClientCredentialState::default())),
-        bootstrap_claims: transport_sdk::BootstrapClaimBroker::new(),
-        upload_sessions: super::new_upload_sessions_rwlock(super::UploadSessionStore {
-            path: root.join("state").join("upload_sessions.json"),
-            sessions: HashMap::new(),
-        }),
-        upload_sessions_dirty: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        upload_sessions_persist_notify: Arc::new(tokio::sync::Notify::new()),
-        public_ca_pem: None,
-        public_ca_key_pem: None,
-        cluster_ca_pem: None,
-        internal_ca_key_pem: None,
-        public_tls_runtime: None,
-        internal_tls_runtime: None,
-        rendezvous_ca_pem: None,
-        rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
-            "http://127.0.0.1:39080".to_string(),
-        ])),
-        rendezvous_registration_enabled: false,
-        rendezvous_mtls_required: false,
-        managed_rendezvous_public_url: None,
-        rendezvous_registration_state: Arc::new(Mutex::new(HashMap::from([(
-            "http://127.0.0.1:39080".to_string(),
-            super::RendezvousEndpointRegistrationRuntime::default(),
-        )]))),
-        relay_mode: super::RelayMode::Fallback,
-        enrollment_issuer_url: None,
-        node_enrollment_path: None,
-        node_enrollment_auto_renew_enabled: false,
-        node_enrollment_auto_renew_check_secs: 300,
-        node_enrollment_auto_renew_state: Arc::new(Mutex::new(
-            super::NodeEnrollmentAutoRenewState::default(),
-        )),
-        outbound_clients: Arc::new(tokio::sync::RwLock::new(super::OutboundClients {
-            internal_http: reqwest::Client::new(),
-            rendezvous_control: None,
-            rendezvous_controls: Vec::new(),
-        })),
-        peer_relay_sessions: super::PeerRelaySessionPool::default(),
+        storage: super::ServerStorageRuntime {
+            upload_chunk_ingestor,
+            upload_sessions: super::new_upload_sessions_rwlock(super::UploadSessionStore {
+                path: root.join("state").join("upload_sessions.json"),
+                sessions: HashMap::new(),
+            }),
+            upload_sessions_dirty: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            upload_sessions_persist_notify: Arc::new(tokio::sync::Notify::new()),
+            storage_stats_history_retention_secs: super::STORAGE_STATS_HISTORY_RETENTION_SECS,
+            storage_stats_runtime: Arc::new(Mutex::new(super::StorageStatsRuntime::default())),
+            namespace_change_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            namespace_change_tx,
+            map_perf_logging_enabled: false,
+            map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
+            mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<
+                String,
+                Arc<super::web_maps::LogicalMbtilesSource>,
+            >::new())),
+        },
+        access: super::ServerAccessRuntime {
+            client_credentials: Arc::new(Mutex::new(
+                super::storage::ClientCredentialState::default(),
+            )),
+            bootstrap_claims: transport_sdk::BootstrapClaimBroker::new(),
+            client_connections: Arc::new(std::sync::Mutex::new(
+                super::LiveClientConnectionRegistry::default(),
+            )),
+            admin_control: AdminControl::default(),
+            admin_sessions: Arc::new(Mutex::new(super::AdminSessionStore::default())),
+            client_auth_control: super::ClientAuthControl::default(),
+            client_auth_replay_cache: Arc::new(Mutex::new(super::ClientAuthReplayCache::default())),
+        },
+        network: super::ServerNetworkRuntime {
+            public_ca_pem: None,
+            public_ca_key_pem: None,
+            cluster_ca_pem: None,
+            internal_ca_key_pem: None,
+            public_tls_runtime: None,
+            internal_tls_runtime: None,
+            rendezvous_ca_pem: None,
+            rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
+                "http://127.0.0.1:39080".to_string(),
+            ])),
+            rendezvous_registration_enabled: false,
+            rendezvous_mtls_required: false,
+            managed_rendezvous_public_url: None,
+            rendezvous_registration_state: Arc::new(Mutex::new(HashMap::from([(
+                "http://127.0.0.1:39080".to_string(),
+                super::RendezvousEndpointRegistrationRuntime::default(),
+            )]))),
+            relay_mode: super::RelayMode::Fallback,
+            enrollment_issuer_url: None,
+            node_enrollment_path: None,
+            node_enrollment_auto_renew_enabled: false,
+            node_enrollment_auto_renew_check_secs: 300,
+            node_enrollment_auto_renew_state: Arc::new(Mutex::new(
+                super::NodeEnrollmentAutoRenewState::default(),
+            )),
+            outbound_clients: Arc::new(tokio::sync::RwLock::new(super::OutboundClients {
+                internal_http: reqwest::Client::new(),
+                rendezvous_control: None,
+                rendezvous_controls: Vec::new(),
+            })),
+            peer_relay_sessions: super::PeerRelaySessionPool::default(),
+        },
+        maintenance: super::ServerMaintenanceRuntime {
+            inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
+            repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+            repair_activity: Arc::new(Mutex::new(super::RepairActivityRuntime::default())),
+            autonomous_post_write_repair: Arc::new(Mutex::new(
+                super::AutonomousPostWriteRepairRuntime::default(),
+            )),
+            data_scrub_enabled: true,
+            data_scrub_interval_secs: super::DATA_SCRUB_INTERVAL_SECS,
+            data_scrub_history_retention_secs: super::DATA_SCRUB_HISTORY_RETENTION_SECS,
+            data_scrub_activity: Arc::new(Mutex::new(super::DataScrubActivityRuntime::default())),
+            repair_run_history_retention_secs: super::REPAIR_RUN_HISTORY_RETENTION_SECS,
+            local_availability_refresh_lock: Arc::new(Mutex::new(())),
+            local_availability_refresh_notify: Arc::new(tokio::sync::Notify::new()),
+        },
         metadata_commit_mode: MetadataCommitMode::Local,
         autonomous_replication_on_put_enabled: false,
-        inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        client_connections: Arc::new(std::sync::Mutex::new(
-            super::LiveClientConnectionRegistry::default(),
-        )),
         peer_heartbeat_config: PeerHeartbeatConfig {
             enabled: false,
             interval_secs: 15,
@@ -7827,22 +7876,6 @@ async fn build_test_state(
             busy_wait_millis: 100,
         },
         log_buffer: Arc::new(super::LogBuffer::new(64)),
-        startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
-        repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
-        repair_activity: Arc::new(Mutex::new(super::RepairActivityRuntime::default())),
-        autonomous_post_write_repair: Arc::new(Mutex::new(
-            super::AutonomousPostWriteRepairRuntime::default(),
-        )),
-        data_scrub_activity: Arc::new(Mutex::new(super::DataScrubActivityRuntime::default())),
-        local_availability_refresh_lock: Arc::new(Mutex::new(())),
-        local_availability_refresh_notify: Arc::new(tokio::sync::Notify::new()),
-        storage_stats_runtime: Arc::new(Mutex::new(super::StorageStatsRuntime::default())),
-        namespace_change_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        namespace_change_tx,
-        admin_control: AdminControl::default(),
-        admin_sessions: Arc::new(Mutex::new(super::AdminSessionStore::default())),
-        client_auth_control: super::ClientAuthControl::default(),
-        client_auth_replay_cache: Arc::new(Mutex::new(super::ClientAuthReplayCache::default())),
     };
 
     if seed_gap {
@@ -7941,7 +7974,10 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
         .get(&upload_id)
         .expect("persisted upload session should remain present");
     assert!(persisted_session.received_chunks[0].is_some());
-    assert_eq!(state.upload_sessions_dirty.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        state.storage.upload_sessions_dirty.load(Ordering::SeqCst),
+        0
+    );
 }
 
 async fn data_scrub_activity_and_history_do_not_wait_on_active_scrub_impl(
@@ -8073,7 +8109,15 @@ async fn repair_activity_payload_includes_live_log_for_active_run_impl(backend: 
         None,
     )
     .await;
-    assert!(state.repair_activity.lock().await.active_runs.is_empty());
+    assert!(
+        state
+            .maintenance
+            .repair_activity
+            .lock()
+            .await
+            .active_runs
+            .is_empty()
+    );
 
     cleanup_test_state(&state).await;
 }
@@ -8908,7 +8952,7 @@ async fn resolve_peer_base_url_prefers_internal_url() {
 #[tokio::test]
 async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.relay_mode = super::RelayMode::Disabled;
+    state.network.relay_mode = super::RelayMode::Disabled;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         reachability: cluster::NodeReachability::default(),
@@ -8935,7 +8979,7 @@ async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
 #[tokio::test]
 async fn resolve_peer_base_url_rejects_public_api_only_candidate() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.relay_mode = super::RelayMode::Disabled;
+    state.network.relay_mode = super::RelayMode::Disabled;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         reachability: cluster::NodeReachability {
@@ -8970,7 +9014,7 @@ async fn resolve_peer_base_url_rejects_public_api_only_candidate() {
 #[tokio::test]
 async fn manual_repair_action_handlers_list_and_run_dry_run() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
 
@@ -9130,7 +9174,15 @@ async fn tracked_local_replication_repair_persists_history_impl(backend: MainTes
         }),
         "expected repair_run_finished event in retained repair report: {detailed_log:?}"
     );
-    assert!(state.repair_activity.lock().await.active_runs.is_empty());
+    assert!(
+        state
+            .maintenance
+            .repair_activity
+            .lock()
+            .await
+            .active_runs
+            .is_empty()
+    );
 
     cleanup_test_state(&state).await;
 }
@@ -9167,7 +9219,7 @@ async fn cluster_replication_repair_report_includes_skipped_details_impl(backend
     );
 
     {
-        let mut repair_state = state.repair_state.lock().await;
+        let mut repair_state = state.maintenance.repair_state.lock().await;
         for (subject, target_node_id) in &expected_skips {
             repair_state.attempts.insert(
                 format!("{subject}|{target_node_id}"),
@@ -9333,7 +9385,7 @@ async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() 
 #[tokio::test]
 async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.relay_mode = super::RelayMode::Required;
+    state.network.relay_mode = super::RelayMode::Required;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         reachability: cluster::NodeReachability {
@@ -9371,7 +9423,7 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
 #[tokio::test]
 async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.relay_mode = super::RelayMode::Required;
+    state.network.relay_mode = super::RelayMode::Required;
 
     let remote_node = {
         let mut cluster = state.cluster.lock().await;
@@ -9408,7 +9460,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
 
     let relay_bind_addr = free_bind_addr();
     let relay_base_url = format!("http://{relay_bind_addr}");
-    *state.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
+    *state.network.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
     let expected_target = transport_sdk::PeerIdentity::Node(remote_node.node_id);
     configure_test_relay_outbound_clients(&state, &relay_base_url).await;
     let (observed_paths, issued_ticket_count, paired_session_count, relay_handle) =
@@ -9518,7 +9570,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
 #[tokio::test]
 async fn execute_peer_request_reuses_warm_relay_session() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.relay_mode = super::RelayMode::Required;
+    state.network.relay_mode = super::RelayMode::Required;
 
     let remote_node = {
         let mut cluster = state.cluster.lock().await;
@@ -9547,7 +9599,7 @@ async fn execute_peer_request_reuses_warm_relay_session() {
 
     let relay_bind_addr = free_bind_addr();
     let relay_base_url = format!("http://{relay_bind_addr}");
-    *state.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
+    *state.network.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
     configure_test_relay_outbound_clients(&state, &relay_base_url).await;
 
     let (observed_paths, issued_ticket_count, paired_session_count, relay_handle) =
@@ -9599,7 +9651,7 @@ async fn execute_peer_request_reuses_warm_relay_session() {
 #[tokio::test]
 async fn execute_peer_request_reconnects_after_relay_session_closes() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.relay_mode = super::RelayMode::Required;
+    state.network.relay_mode = super::RelayMode::Required;
 
     let remote_node = {
         let mut cluster = state.cluster.lock().await;
@@ -9628,7 +9680,7 @@ async fn execute_peer_request_reconnects_after_relay_session_closes() {
 
     let relay_bind_addr = free_bind_addr();
     let relay_base_url = format!("http://{relay_bind_addr}");
-    *state.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
+    *state.network.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
     configure_test_relay_outbound_clients(&state, &relay_base_url).await;
 
     let (observed_paths, issued_ticket_count, paired_session_count, relay_handle) =
@@ -10056,7 +10108,7 @@ async fn serve_cleanup_relay_tunnel_socket(
 #[tokio::test]
 async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.rendezvous_registration_enabled = true;
+    state.network.rendezvous_registration_enabled = true;
     state.peer_heartbeat_config = PeerHeartbeatConfig {
         enabled: false,
         interval_secs: 30,
@@ -10066,9 +10118,9 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
     let bind_addr_b = free_bind_addr();
     let rendezvous_url_a = format!("http://{bind_addr_a}");
     let rendezvous_url_b = format!("http://{bind_addr_b}");
-    *state.rendezvous_urls.lock().unwrap() =
+    *state.network.rendezvous_urls.lock().unwrap() =
         vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
-    *state.rendezvous_registration_state.lock().await = HashMap::from([
+    *state.network.rendezvous_registration_state.lock().await = HashMap::from([
         (
             rendezvous_url_a.clone(),
             super::RendezvousEndpointRegistrationRuntime::default(),
@@ -10178,7 +10230,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
     .await;
 
     {
-        let registration_state = state.rendezvous_registration_state.lock().await;
+        let registration_state = state.network.rendezvous_registration_state.lock().await;
         let endpoint_b = registration_state
             .get(&rendezvous_url_b)
             .expect("endpoint B state should exist");
@@ -10233,7 +10285,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                     return false;
                 }
 
-                let registration_state = state.rendezvous_registration_state.lock().await;
+                let registration_state = state.network.rendezvous_registration_state.lock().await;
                 registration_state
                     .get(&rendezvous_url_a)
                     .is_some_and(|entry| {
@@ -10261,7 +10313,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
 #[tokio::test]
 async fn rendezvous_config_view_includes_endpoint_registration_state() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.rendezvous_registration_enabled = true;
+    state.network.rendezvous_registration_enabled = true;
     state.peer_heartbeat_config = PeerHeartbeatConfig {
         enabled: false,
         interval_secs: 17,
@@ -10269,9 +10321,9 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
 
     let rendezvous_url_a = "https://rendezvous-a.example:9443/".to_string();
     let rendezvous_url_b = "https://rendezvous-b.example:9443/".to_string();
-    *state.rendezvous_urls.lock().unwrap() =
+    *state.network.rendezvous_urls.lock().unwrap() =
         vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
-    *state.rendezvous_registration_state.lock().await = HashMap::from([
+    *state.network.rendezvous_registration_state.lock().await = HashMap::from([
         (
             rendezvous_url_a.clone(),
             super::RendezvousEndpointRegistrationRuntime {

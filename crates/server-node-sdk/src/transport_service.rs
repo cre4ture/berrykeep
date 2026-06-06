@@ -311,7 +311,7 @@ async fn authorize_direct_transport_fast_path(
         TransportExecutionScope::Internal(_) => Ok(()),
         TransportExecutionScope::Public => match policy {
             DirectAuthPolicy::Client => {
-                if state.client_auth_control.require_client_auth {
+                if state.access.client_auth_control.require_client_auth {
                     validate_client_auth_request(state, headers, method, raw_path)
                         .await
                         .map(|_| ())
@@ -321,7 +321,7 @@ async fn authorize_direct_transport_fast_path(
             }
             DirectAuthPolicy::ClientOrAdmin => {
                 if request_has_admin_auth(state, headers).await
-                    || !state.client_auth_control.require_client_auth
+                    || !state.access.client_auth_control.require_client_auth
                 {
                     Ok(())
                 } else {
