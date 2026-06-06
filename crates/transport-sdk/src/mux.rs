@@ -197,10 +197,21 @@ impl MultiplexedSession {
     }
 }
 
+impl Drop for MultiplexedSession {
+    fn drop(&mut self) {
+        if let Some(driver) = self.driver.take() {
+            // Dropped sessions should tear down their underlying transport instead of leaving
+            // the yamux driver detached and the socket alive in the background.
+            driver.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+    use std::time::Duration;
     use tokio::io::duplex;
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -267,6 +278,37 @@ mod tests {
 
         client.close().await.expect("client session should close");
         server.close().await.expect("server session should close");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_closes_the_peer_transport() {
+        let (left, right) = duplex(64 * 1024);
+        let client =
+            MultiplexedSession::spawn(left.compat(), MultiplexMode::Client, Default::default())
+                .expect("client session should spawn");
+        let mut server =
+            MultiplexedSession::spawn(right.compat(), MultiplexMode::Server, Default::default())
+                .expect("server session should spawn");
+
+        drop(client);
+
+        let closed = tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server should observe the dropped peer promptly");
+
+        match closed {
+            Ok(None) => {}
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("broken pipe")
+                        || error
+                            .to_string()
+                            .contains("multiplexed inbound stream driver failed"),
+                    "unexpected peer-close error: {error:#}"
+                );
+            }
+            Ok(Some(_)) => panic!("peer drop should not leave the multiplex session open"),
+        }
     }
 
     #[test]

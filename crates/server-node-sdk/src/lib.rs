@@ -7093,147 +7093,168 @@ async fn serve_relay_multiplex_streams(
     }
 }
 
+fn spawn_rendezvous_relay_multiplex_session_task(
+    state: ServerState,
+    endpoint_url: String,
+    relay_session: RelayTunnelSession,
+    multiplexed: MultiplexedSession,
+) {
+    tokio::spawn(async move {
+        let mut multiplexed = multiplexed;
+        match complete_relay_multiplex_handshake(
+            &state,
+            &endpoint_url,
+            &relay_session,
+            &mut multiplexed,
+        )
+        .await
+        {
+            Ok(completed_session) => {
+                let _ = record_rendezvous_registration_success(&state, &endpoint_url).await;
+                if let Err(err) = serve_relay_multiplex_streams(
+                    state,
+                    endpoint_url.clone(),
+                    relay_session.clone(),
+                    multiplexed,
+                    completed_session.execution_scope,
+                    completed_session.tracked_connection,
+                )
+                .await
+                {
+                    warn!(
+                        error = %err,
+                        rendezvous_url = %endpoint_url,
+                        session_id = %relay_session.session_id,
+                        "multiplex relay session failed"
+                    );
+                }
+            }
+            Err(err) => {
+                let error_text = err.to_string();
+                let failures =
+                    record_rendezvous_registration_failure(&state, &endpoint_url, &error_text)
+                        .await;
+                warn!(
+                    error = %err,
+                    rendezvous_url = %endpoint_url,
+                    session_id = %relay_session.session_id,
+                    consecutive_failures = failures,
+                    "multiplex relay session failed before handshake"
+                );
+            }
+        }
+    });
+}
+
+fn spawn_rendezvous_relay_multiplex_accept_task(
+    state: ServerState,
+    endpoint: RendezvousEndpointClient,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let cluster_id = state.cluster_id;
+        let node_id = state.node_id;
+
+        loop {
+            let result = endpoint
+                .control
+                .accept_relay_multiplex_target(
+                    &RelayTunnelAcceptRequest {
+                        cluster_id,
+                        target: PeerIdentity::Node(node_id),
+                        session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                        wait_timeout_ms: Some(15_000),
+                    },
+                    MultiplexConfig::default(),
+                )
+                .await;
+
+            match result {
+                Ok((relay_session, multiplexed)) => {
+                    spawn_rendezvous_relay_multiplex_session_task(
+                        state.clone(),
+                        endpoint.url.clone(),
+                        relay_session,
+                        multiplexed,
+                    );
+                }
+                Err(err) => {
+                    if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(&err.to_string())
+                    {
+                        tracing::debug!(
+                            error = %err,
+                            rendezvous_url = %endpoint.url,
+                            "multiplex relay accept timed out without a source connection"
+                        );
+                        continue;
+                    }
+
+                    let error_text = err.to_string();
+                    let failures =
+                        record_rendezvous_registration_failure(&state, &endpoint.url, &error_text)
+                            .await;
+                    let retry_delay = rendezvous_relay_accept_retry_delay(failures);
+                    if should_log_rendezvous_failure(failures) {
+                        warn!(
+                            error = %err,
+                            rendezvous_url = %endpoint.url,
+                            consecutive_failures = failures,
+                            next_retry_ms = retry_delay.as_millis(),
+                            "multiplex relay accept failed"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %err,
+                            rendezvous_url = %endpoint.url,
+                            consecutive_failures = failures,
+                            next_retry_ms = retry_delay.as_millis(),
+                            "multiplex relay accept failed"
+                        );
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                }
+            }
+        }
+    })
+}
+
 fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
     tokio::spawn(async move {
+        let mut accept_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+
         loop {
             let clients = current_rendezvous_endpoint_clients(&state).await;
             if clients.is_empty() {
+                for (_, handle) in accept_tasks.drain() {
+                    handle.abort();
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
 
-            let cluster_id = state.cluster_id;
-            let node_id = state.node_id;
-            let mut accepts = tokio::task::JoinSet::new();
-            for endpoint in clients {
-                accepts.spawn(async move {
-                    let result = endpoint
-                        .control
-                        .accept_relay_multiplex_target(
-                            &RelayTunnelAcceptRequest {
-                                cluster_id,
-                                target: PeerIdentity::Node(node_id),
-                                session_kind: RelayTunnelSessionKind::MultiplexTransport,
-                                wait_timeout_ms: Some(15_000),
-                            },
-                            MultiplexConfig::default(),
-                        )
-                        .await;
-                    (endpoint, result)
-                });
-            }
+            let active_urls = clients
+                .iter()
+                .map(|endpoint| endpoint.url.clone())
+                .collect::<HashSet<_>>();
 
-            let mut handled_session = false;
-            let mut retry_delay = Duration::from_millis(RENDEZVOUS_RELAY_ACCEPT_IDLE_LOOP_DELAY_MS);
-            while let Some(result) = accepts.join_next().await {
-                let Ok((endpoint, result)) = result else {
-                    continue;
-                };
-                match result {
-                    Ok((relay_session, multiplexed)) => {
-                        handled_session = true;
-                        accepts.abort_all();
-
-                        let state = state.clone();
-                        let endpoint_url = endpoint.url.clone();
-                        tokio::spawn(async move {
-                            let mut multiplexed = multiplexed;
-                            match complete_relay_multiplex_handshake(
-                                &state,
-                                &endpoint_url,
-                                &relay_session,
-                                &mut multiplexed,
-                            )
-                            .await
-                            {
-                                Ok(completed_session) => {
-                                    let _ = record_rendezvous_registration_success(
-                                        &state,
-                                        &endpoint_url,
-                                    )
-                                    .await;
-                                    if let Err(err) = serve_relay_multiplex_streams(
-                                        state,
-                                        endpoint_url.clone(),
-                                        relay_session.clone(),
-                                        multiplexed,
-                                        completed_session.execution_scope,
-                                        completed_session.tracked_connection,
-                                    )
-                                    .await
-                                    {
-                                        warn!(
-                                            error = %err,
-                                            rendezvous_url = %endpoint_url,
-                                            session_id = %relay_session.session_id,
-                                            "multiplex relay session failed"
-                                        );
-                                    }
-                                }
-                                Err(err) => {
-                                    let error_text = err.to_string();
-                                    let failures = record_rendezvous_registration_failure(
-                                        &state,
-                                        &endpoint_url,
-                                        &error_text,
-                                    )
-                                    .await;
-                                    warn!(
-                                        error = %err,
-                                        rendezvous_url = %endpoint_url,
-                                        session_id = %relay_session.session_id,
-                                        consecutive_failures = failures,
-                                        "multiplex relay session failed before handshake"
-                                    );
-                                }
-                            }
-                        });
-                        break;
-                    }
-                    Err(err) => {
-                        if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(
-                            &err.to_string(),
-                        ) {
-                            tracing::debug!(
-                                error = %err,
-                                rendezvous_url = %endpoint.url,
-                                "multiplex relay accept timed out without a source connection"
-                            );
-                        } else {
-                            let error_text = err.to_string();
-                            let failures = record_rendezvous_registration_failure(
-                                &state,
-                                &endpoint.url,
-                                &error_text,
-                            )
-                            .await;
-                            let next_retry_delay = rendezvous_relay_accept_retry_delay(failures);
-                            retry_delay = retry_delay.max(next_retry_delay);
-                            if should_log_rendezvous_failure(failures) {
-                                warn!(
-                                    error = %err,
-                                    rendezvous_url = %endpoint.url,
-                                    consecutive_failures = failures,
-                                    next_retry_ms = next_retry_delay.as_millis(),
-                                    "multiplex relay accept failed"
-                                );
-                            } else {
-                                tracing::debug!(
-                                    error = %err,
-                                    rendezvous_url = %endpoint.url,
-                                    consecutive_failures = failures,
-                                    next_retry_ms = next_retry_delay.as_millis(),
-                                    "multiplex relay accept failed"
-                                );
-                            }
-                        }
-                    }
+            accept_tasks.retain(|url, handle| {
+                let keep = active_urls.contains(url) && !handle.is_finished();
+                if !keep {
+                    handle.abort();
                 }
+                keep
+            });
+
+            for endpoint in clients {
+                if accept_tasks.contains_key(&endpoint.url) {
+                    continue;
+                }
+                accept_tasks.insert(
+                    endpoint.url.clone(),
+                    spawn_rendezvous_relay_multiplex_accept_task(state.clone(), endpoint),
+                );
             }
 
-            if !handled_session {
-                tokio::time::sleep(retry_delay).await;
-            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 }

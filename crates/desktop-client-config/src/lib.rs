@@ -5,7 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1353,6 +1353,11 @@ fn spawn_instance(
         match command.spawn() {
             Ok(child) => {
                 let pid = child.id();
+                spawn_background_child_reaper(
+                    child,
+                    format!("{instance_kind}:{id}"),
+                    log_handle.as_ref(),
+                );
                 if let Some(file) = log_handle.as_mut() {
                     let _ = writeln!(file, "spawned pid={pid} executable={}", executable);
                     let _ = file.flush();
@@ -1413,6 +1418,45 @@ fn configure_background_service_command(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn configure_background_service_command(_command: &mut Command) {}
+
+fn spawn_background_child_reaper(
+    mut child: Child,
+    child_label: String,
+    log_file: Option<&fs::File>,
+) {
+    let log_file = log_file.and_then(|file| file.try_clone().ok());
+    thread::spawn(move || {
+        let wait_result = child.wait();
+        if let Some(mut file) = log_file {
+            match wait_result {
+                Ok(status) => {
+                    let _ = writeln!(
+                        file,
+                        "reaped child pid={} label={} status={status}",
+                        child.id(),
+                        child_label
+                    );
+                    let _ = file.flush();
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        file,
+                        "failed reaping child pid={} label={} error={error}",
+                        child.id(),
+                        child_label
+                    );
+                    let _ = file.flush();
+                }
+            }
+        } else if let Err(error) = wait_result {
+            eprintln!(
+                "desktop-client-config: failed reaping background child pid={} label={}: {error}",
+                child.id(),
+                child_label
+            );
+        }
+    });
+}
 
 fn service_log_stdio_pair(file: Option<&fs::File>) -> Result<(Stdio, Stdio), String> {
     let Some(file) = file else {
@@ -1682,6 +1726,8 @@ fn validate_launch_report_version(report: &LaunchReport, path: &Path) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::process::{Command, Stdio};
 
     fn temp_path(prefix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -2070,5 +2116,31 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_child_reaper_collects_exited_process() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("short-lived child should spawn");
+        let pid = child.id();
+
+        spawn_background_child_reaper(child, "test-child".to_string(), None);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !Path::new("/proc").join(pid.to_string()).exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        panic!("child pid {pid} was not reaped within the timeout window");
     }
 }

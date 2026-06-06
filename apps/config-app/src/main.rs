@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
@@ -763,6 +763,7 @@ fn spawn_background_config_app_process(
     })? {
         bail!("background config app exited immediately with {status}");
     }
+    spawn_background_child_reaper(child, "background config app".to_string());
     Ok(())
 }
 
@@ -1646,7 +1647,17 @@ fn spawn_detached_process_checked(
     })? {
         bail!("{process_label} exited immediately with {status}");
     }
+    spawn_background_child_reaper(child, process_label.to_string());
     Ok(())
+}
+
+fn spawn_background_child_reaper(mut child: Child, process_label: String) {
+    std::thread::spawn(move || {
+        let pid = child.id();
+        if let Err(error) = child.wait() {
+            eprintln!("config-app: failed reaping {process_label} child pid={pid}: {error}");
+        }
+    });
 }
 
 fn load_config_response(state: &AppState) -> Result<ConfigResponse> {

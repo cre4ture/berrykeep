@@ -14,6 +14,7 @@ const MAX_LATENCY_PROBE_WARMUP_SAMPLES: usize = 16;
 const MAX_LATENCY_PROBE_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_LATENCY_PROBE_SERVER_DELAY_MS: u64 = 5_000;
 const MAX_LATENCY_PROBE_PAUSE_MS: u64 = 5_000;
+const LATENCY_PROBE_REQUEST_TIMEOUT_SLACK_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyProbeConfig {
@@ -171,6 +172,8 @@ impl IronMeshClient {
             "{LATENCY_PROBE_ROUTE}?response_bytes={}&server_delay_ms={}",
             config.response_bytes, config.server_delay_ms
         );
+        let uses_relay_transport = self.uses_relay_transport();
+        let request_timeout = latency_probe_request_timeout(&config);
 
         let session_pool_before = self.transport_session_pool_snapshot();
         let mut cold_connect_duration_ms = None;
@@ -183,63 +186,88 @@ impl IronMeshClient {
 
             let started_unix_ms = unix_ts_ms();
             let started_at = Instant::now();
-            let sample = match self.get_relative_path(&request_path).await {
-                Ok(response) => {
-                    let total_duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
-                    let server_duration_ms = parse_header_f64(
-                        &response.headers,
-                        LATENCY_PROBE_HEADER_SERVER_DURATION_MS,
-                    );
-                    let transport_overhead_ms =
-                        server_duration_ms.map(|duration| (total_duration_ms - duration).max(0.0));
-                    let response_bytes =
-                        parse_header_usize(&response.headers, LATENCY_PROBE_HEADER_RESPONSE_BYTES)
-                            .unwrap_or(response.body.len());
-                    let throughput_bytes_per_sec = if total_duration_ms > 0.0 {
-                        Some(response.body.len() as f64 / (total_duration_ms / 1000.0))
-                    } else {
-                        None
-                    };
-                    let successful = response.status.is_success();
+            let sample =
+                match tokio::time::timeout(request_timeout, self.get_relative_path(&request_path))
+                    .await
+                {
+                    Ok(Ok(response)) => {
+                        let total_duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+                        let server_duration_ms = parse_header_f64(
+                            &response.headers,
+                            LATENCY_PROBE_HEADER_SERVER_DURATION_MS,
+                        );
+                        let transport_overhead_ms = server_duration_ms
+                            .map(|duration| (total_duration_ms - duration).max(0.0));
+                        let response_bytes = parse_header_usize(
+                            &response.headers,
+                            LATENCY_PROBE_HEADER_RESPONSE_BYTES,
+                        )
+                        .unwrap_or(response.body.len());
+                        let throughput_bytes_per_sec = if total_duration_ms > 0.0 {
+                            Some(response.body.len() as f64 / (total_duration_ms / 1000.0))
+                        } else {
+                            None
+                        };
+                        let successful = response.status.is_success();
 
-                    LatencyProbeSample {
+                        LatencyProbeSample {
+                            index: request_index.saturating_sub(config.warmup_count),
+                            started_unix_ms,
+                            successful,
+                            status_code: Some(response.status.as_u16()),
+                            total_duration_ms,
+                            server_duration_ms,
+                            transport_overhead_ms,
+                            response_bytes,
+                            throughput_bytes_per_sec,
+                            node_id: parse_header_string(
+                                &response.headers,
+                                LATENCY_PROBE_HEADER_NODE_ID,
+                            ),
+                            error: (!successful).then(|| {
+                                let body = String::from_utf8_lossy(response.body.as_ref());
+                                if body.trim().is_empty() {
+                                    format!("probe returned HTTP {}", response.status)
+                                } else {
+                                    format!(
+                                        "probe returned HTTP {}: {}",
+                                        response.status,
+                                        body.trim()
+                                    )
+                                }
+                            }),
+                        }
+                    }
+                    Ok(Err(error)) => LatencyProbeSample {
                         index: request_index.saturating_sub(config.warmup_count),
                         started_unix_ms,
-                        successful,
-                        status_code: Some(response.status.as_u16()),
-                        total_duration_ms,
-                        server_duration_ms,
-                        transport_overhead_ms,
-                        response_bytes,
-                        throughput_bytes_per_sec,
-                        node_id: parse_header_string(
-                            &response.headers,
-                            LATENCY_PROBE_HEADER_NODE_ID,
-                        ),
-                        error: (!successful).then(|| {
-                            let body = String::from_utf8_lossy(response.body.as_ref());
-                            if body.trim().is_empty() {
-                                format!("probe returned HTTP {}", response.status)
-                            } else {
-                                format!("probe returned HTTP {}: {}", response.status, body.trim())
-                            }
-                        }),
-                    }
-                }
-                Err(error) => LatencyProbeSample {
-                    index: request_index.saturating_sub(config.warmup_count),
-                    started_unix_ms,
-                    successful: false,
-                    status_code: None,
-                    total_duration_ms: started_at.elapsed().as_secs_f64() * 1000.0,
-                    server_duration_ms: None,
-                    transport_overhead_ms: None,
-                    response_bytes: 0,
-                    throughput_bytes_per_sec: None,
-                    node_id: None,
-                    error: Some(error.to_string()),
-                },
-            };
+                        successful: false,
+                        status_code: None,
+                        total_duration_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+                        server_duration_ms: None,
+                        transport_overhead_ms: None,
+                        response_bytes: 0,
+                        throughput_bytes_per_sec: None,
+                        node_id: None,
+                        error: Some(error.to_string()),
+                    },
+                    Err(_) => LatencyProbeSample {
+                        index: request_index.saturating_sub(config.warmup_count),
+                        started_unix_ms,
+                        successful: false,
+                        status_code: None,
+                        total_duration_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+                        server_duration_ms: None,
+                        transport_overhead_ms: None,
+                        response_bytes: 0,
+                        throughput_bytes_per_sec: None,
+                        node_id: None,
+                        error: Some(latency_probe_request_timeout_error(
+                            request_timeout,
+                            uses_relay_transport,
+                        )),
+                    },
+                };
 
             if request_index == 0 {
                 let session_pool_after_first = self.transport_session_pool_snapshot();
@@ -385,6 +413,10 @@ fn summarize_latency_probe(
     let mut observations = Vec::new();
 
     if successful_samples.is_empty() {
+        let mut observations = vec!["All latency probe samples failed.".to_string()];
+        if let Some(error) = first_probe_error(samples) {
+            observations.push(format!("Example failure: {error}"));
+        }
         return LatencyProbeSummary {
             requested_samples,
             success_count: 0,
@@ -399,7 +431,7 @@ fn summarize_latency_probe(
             p95_transport_overhead_ms: None,
             avg_throughput_bytes_per_sec: None,
             assessment: LatencyProbeAssessment::Degraded,
-            observations: vec!["All latency probe samples failed.".to_string()],
+            observations,
         };
     }
 
@@ -416,6 +448,9 @@ fn summarize_latency_probe(
         observations.push(format!(
             "{failure_count} of {requested_samples} latency probe samples failed."
         ));
+        if let Some(error) = first_probe_error(samples) {
+            observations.push(format!("Example failure: {error}"));
+        }
     }
 
     if let Some(overhead_ms) = avg_transport_overhead_ms {
@@ -534,6 +569,32 @@ fn average(values: &[f64]) -> Option<f64> {
     Some(values.iter().sum::<f64>() / values.len() as f64)
 }
 
+fn latency_probe_request_timeout(config: &LatencyProbeConfig) -> Duration {
+    Duration::from_millis(
+        config
+            .server_delay_ms
+            .saturating_add(LATENCY_PROBE_REQUEST_TIMEOUT_SLACK_MS),
+    )
+}
+
+fn latency_probe_request_timeout_error(timeout: Duration, uses_relay_transport: bool) -> String {
+    if uses_relay_transport {
+        format!(
+            "latency probe request timed out after {:.1} s while using relay transport; this usually means relay pairing never completed or the rendezvous/relay endpoint is unresponsive",
+            timeout.as_secs_f64()
+        )
+    } else {
+        format!(
+            "latency probe request timed out after {:.1} s before the server returned a response",
+            timeout.as_secs_f64()
+        )
+    }
+}
+
+fn first_probe_error(samples: &[LatencyProbeSample]) -> Option<&str> {
+    samples.iter().find_map(|sample| sample.error.as_deref())
+}
+
 fn unix_ts_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -600,6 +661,32 @@ mod tests {
         (format!("http://{addr}"), server)
     }
 
+    async fn spawn_slow_probe_server(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    LATENCY_PROBE_ROUTE,
+                    get(move || async move {
+                        tokio::time::sleep(delay).await;
+                        diagnostics_route(Query(ProbeQuery {
+                            response_bytes: Some(32),
+                            server_delay_ms: Some(0),
+                        }))
+                        .await
+                    }),
+                ),
+            )
+            .await
+            .expect("slow probe server should run");
+        });
+        (format!("http://{addr}"), server)
+    }
+
     #[test]
     fn latency_probe_config_rejects_invalid_values() {
         let error = LatencyProbeConfig {
@@ -640,6 +727,47 @@ mod tests {
                 .samples
                 .iter()
                 .all(|sample| sample.response_bytes == 32 && sample.successful)
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn latency_probe_times_out_slow_requests_and_reports_error() {
+        let (base_url, server) = spawn_slow_probe_server(Duration::from_secs(5)).await;
+        let client = IronMeshClient::from_direct_base_url(base_url);
+
+        let started_at = Instant::now();
+        let result = client
+            .run_latency_probe(LatencyProbeConfig {
+                sample_count: 1,
+                warmup_count: 0,
+                response_bytes: 32,
+                server_delay_ms: 0,
+                pause_between_samples_ms: 0,
+            })
+            .await
+            .expect("latency probe should still return a result after a timeout");
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "probe should fail fast instead of waiting for the slow server"
+        );
+        assert_eq!(result.summary.success_count, 0);
+        assert_eq!(result.summary.failure_count, 1);
+        assert!(
+            result.samples[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out after 3.0 s"))
+        );
+        assert!(
+            result
+                .summary
+                .observations
+                .iter()
+                .any(|entry| entry.contains("Example failure"))
         );
 
         server.abort();
@@ -750,5 +878,11 @@ mod tests {
                 .any(|entry| entry.contains("Cold session setup took 64.0 ms"))
         );
         assert_eq!(summary.assessment, LatencyProbeAssessment::Warn);
+    }
+
+    #[test]
+    fn latency_probe_relay_timeout_error_mentions_pairing() {
+        let message = latency_probe_request_timeout_error(Duration::from_secs(3), true);
+        assert!(message.contains("relay pairing"));
     }
 }

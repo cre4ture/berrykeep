@@ -2178,6 +2178,138 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
 }
 
 #[tokio::test]
+async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_multiple_endpoints() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.relay_mode = super::RelayMode::Required;
+
+    let bind_addr_a = free_bind_addr();
+    let rendezvous_url_a = format!("http://{bind_addr_a}");
+    let canonical_rendezvous_url_a = format!("{rendezvous_url_a}/");
+    let rendezvous_state_a =
+        rendezvous_server::RendezvousAppState::new(rendezvous_server::RendezvousServerConfig {
+            bind_addr: bind_addr_a,
+            public_url: canonical_rendezvous_url_a.clone(),
+            relay_public_urls: vec![canonical_rendezvous_url_a.clone()],
+            mtls: None,
+        });
+    let listener_a = tokio::net::TcpListener::bind(bind_addr_a)
+        .await
+        .expect("rendezvous listener A should bind");
+    let rendezvous_server_state_a = rendezvous_state_a.clone();
+    let rendezvous_handle_a = tokio::spawn(async move {
+        axum::serve(
+            listener_a,
+            rendezvous_server::build_router(rendezvous_server_state_a),
+        )
+        .await
+        .expect("rendezvous server A should serve");
+    });
+
+    let bind_addr_b = free_bind_addr();
+    let rendezvous_url_b = format!("http://{bind_addr_b}");
+    let canonical_rendezvous_url_b = format!("{rendezvous_url_b}/");
+    let rendezvous_state_b =
+        rendezvous_server::RendezvousAppState::new(rendezvous_server::RendezvousServerConfig {
+            bind_addr: bind_addr_b,
+            public_url: canonical_rendezvous_url_b.clone(),
+            relay_public_urls: vec![canonical_rendezvous_url_b.clone()],
+            mtls: None,
+        });
+    let listener_b = tokio::net::TcpListener::bind(bind_addr_b)
+        .await
+        .expect("rendezvous listener B should bind");
+    let rendezvous_server_state_b = rendezvous_state_b.clone();
+    let rendezvous_handle_b = tokio::spawn(async move {
+        axum::serve(
+            listener_b,
+            rendezvous_server::build_router(rendezvous_server_state_b),
+        )
+        .await
+        .expect("rendezvous server B should serve");
+    });
+
+    wait_for_http_status(
+        &reqwest::Client::new(),
+        &format!("{rendezvous_url_a}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_http_status(
+        &reqwest::Client::new(),
+        &format!("{rendezvous_url_b}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    *state.rendezvous_urls.lock().unwrap() =
+        vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
+    configure_test_relay_outbound_clients_for_urls(
+        &state,
+        &[rendezvous_url_a.clone(), rendezvous_url_b.clone()],
+    )
+    .await;
+    super::spawn_rendezvous_relay_multiplex_agent(state.clone());
+
+    for round in 0..6 {
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let cluster_id = state.cluster_id;
+        let target_node_id = state.node_id;
+
+        let barrier_a = barrier.clone();
+        let rendezvous_url_a = rendezvous_url_a.clone();
+        let task_a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            relay_health_check_via_rendezvous(
+                &rendezvous_url_a,
+                cluster_id,
+                target_node_id,
+                transport_sdk::PeerIdentity::Device(Uuid::now_v7()),
+            )
+            .await
+        });
+
+        let barrier_b = barrier.clone();
+        let rendezvous_url_b = rendezvous_url_b.clone();
+        let task_b = tokio::spawn(async move {
+            barrier_b.wait().await;
+            relay_health_check_via_rendezvous(
+                &rendezvous_url_b,
+                cluster_id,
+                target_node_id,
+                transport_sdk::PeerIdentity::Device(Uuid::now_v7()),
+            )
+            .await
+        });
+
+        barrier.wait().await;
+
+        let (result_a, result_b) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), task_a),
+            tokio::time::timeout(Duration::from_secs(5), task_b),
+        );
+        let status_a = result_a
+            .expect("relay request via rendezvous A should finish in time")
+            .expect("relay request via rendezvous A should join")
+            .expect("relay request via rendezvous A should succeed");
+        let status_b = result_b
+            .expect("relay request via rendezvous B should finish in time")
+            .expect("relay request via rendezvous B should join")
+            .expect("relay request via rendezvous B should succeed");
+
+        assert_eq!(status_a, StatusCode::OK, "round {round} via rendezvous A");
+        assert_eq!(status_b, StatusCode::OK, "round {round} via rendezvous B");
+    }
+
+    rendezvous_handle_a.abort();
+    let _ = rendezvous_handle_a.await;
+    rendezvous_handle_b.abort();
+    let _ = rendezvous_handle_b.await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn server_node_config_loads_from_node_bootstrap_file() {
     let root = fresh_test_dir("node-bootstrap-config");
     let bootstrap_path = root.join("node-bootstrap.json");
@@ -9549,29 +9681,103 @@ async fn execute_peer_request_reconnects_after_relay_session_closes() {
     cleanup_test_state(&state).await;
 }
 
+async fn configure_test_relay_outbound_clients_for_urls(
+    state: &ServerState,
+    relay_base_urls: &[String],
+) {
+    let (rendezvous_control, rendezvous_controls) =
+        super::build_rendezvous_control_clients(state.cluster_id, relay_base_urls, 15, None, None)
+            .expect("rendezvous client should build");
+    super::replace_outbound_clients(
+        state,
+        super::OutboundClients {
+            internal_http: reqwest::Client::new(),
+            rendezvous_control,
+            rendezvous_controls,
+        },
+    )
+    .await;
+}
+
 async fn configure_test_relay_outbound_clients(state: &ServerState, relay_base_url: &str) {
-    let rendezvous_client = transport_sdk::RendezvousControlClient::new(
+    configure_test_relay_outbound_clients_for_urls(state, &[relay_base_url.to_string()]).await;
+}
+
+async fn relay_health_check_via_rendezvous(
+    rendezvous_url: &str,
+    cluster_id: ClusterId,
+    target_node_id: NodeId,
+    source: transport_sdk::PeerIdentity,
+) -> Result<StatusCode, String> {
+    let rendezvous = transport_sdk::RendezvousControlClient::new(
         transport_sdk::RendezvousClientConfig {
-            cluster_id: state.cluster_id,
-            rendezvous_urls: vec![relay_base_url.to_string()],
+            cluster_id,
+            rendezvous_urls: vec![rendezvous_url.to_string()],
             heartbeat_interval_secs: 15,
         },
         None,
         None,
     )
-    .expect("rendezvous client should build");
-    super::replace_outbound_clients(
-        state,
-        super::OutboundClients {
-            internal_http: reqwest::Client::new(),
-            rendezvous_control: Some(rendezvous_client.clone()),
-            rendezvous_controls: vec![super::RendezvousEndpointClient {
-                url: relay_base_url.to_string(),
-                control: rendezvous_client,
-            }],
+    .map_err(|err| format!("failed building rendezvous client for {rendezvous_url}: {err}"))?;
+    let ticket = rendezvous
+        .issue_relay_ticket(&transport_sdk::RelayTicketRequest {
+            cluster_id,
+            source: source.clone(),
+            target: transport_sdk::PeerIdentity::Node(target_node_id),
+            session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+            requested_expires_in_secs: Some(10),
+        })
+        .await
+        .map_err(|err| format!("failed issuing relay ticket via {rendezvous_url}: {err}"))?;
+    let (_relay_session, session) = rendezvous
+        .connect_relay_multiplex_source(&ticket, transport_sdk::MultiplexConfig::default())
+        .await
+        .map_err(|err| format!("failed opening relay session via {rendezvous_url}: {err}"))?;
+    transport_sdk::perform_transport_client_handshake(
+        &session,
+        transport_sdk::TransportSessionControlMessage::Hello {
+            protocol_version: transport_sdk::TRANSPORT_PROTOCOL_VERSION,
+            cluster_id,
+            role: transport_sdk::TransportSessionRole::Client,
+            peer: source,
+            connection_name: None,
+            target: Some(transport_sdk::PeerIdentity::Node(target_node_id)),
         },
     )
-    .await;
+    .await
+    .map_err(|err| format!("failed completing relay handshake via {rendezvous_url}: {err}"))?;
+
+    let request = transport_sdk::BufferedTransportRequest::new(
+        transport_sdk::TransportStreamKind::Rpc,
+        "GET",
+        "/health",
+        Vec::new(),
+        Vec::new(),
+    );
+    let response = async {
+        let mut stream = session
+            .open_stream()
+            .await
+            .map_err(|err| format!("failed opening relay stream via {rendezvous_url}: {err}"))?;
+        transport_sdk::write_buffered_transport_request(&mut stream, &request)
+            .await
+            .map_err(|err| format!("failed writing relay request via {rendezvous_url}: {err}"))?;
+        transport_sdk::read_buffered_transport_response(&mut stream)
+            .await
+            .map_err(|err| format!("failed reading relay response via {rendezvous_url}: {err}"))
+    }
+    .await?;
+    let _ = session.close().await;
+
+    let status = StatusCode::from_u16(response.status)
+        .map_err(|err| format!("invalid relay response status via {rendezvous_url}: {err}"))?;
+    if status != StatusCode::OK {
+        return Err(format!(
+            "unexpected relay health status via {rendezvous_url}: {status}"
+        ));
+    }
+
+    Ok(status)
 }
 
 async fn spawn_cleanup_relay_stub(
