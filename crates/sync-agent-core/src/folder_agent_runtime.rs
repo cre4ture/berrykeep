@@ -2092,23 +2092,32 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                 changed_local_paths.insert(path);
             }
 
+            // Directories first: ensures type transitions (file→directory) complete
+            // before any file download, so a transient download error cannot prevent
+            // directory creation for an unrelated path.
+            for path in &changed_local_paths {
+                let path = path.as_str();
+                if let Some((EntryKind::Directory, _)) = entry_kinds.get(path) {
+                    outcome.changed_path_count += 1;
+                    outcome.ensured_directory_count += 1;
+                    backend.ensure_local_directory(options, path)?;
+                    if let Some(store) = state_store
+                        && let Some(entry_state) = backend.local_entry_state(options, path)?
+                    {
+                        store
+                            .upsert_baseline_entry(path, &entry_state)
+                            .with_context(|| {
+                                format!("failed to persist baseline directory entry for {path}")
+                            })?;
+                    }
+                }
+            }
+
             for path in changed_local_paths {
                 let path = path.as_str();
-
                 match entry_kinds.get(path) {
                     Some((EntryKind::Directory, _)) => {
-                        outcome.changed_path_count += 1;
-                        outcome.ensured_directory_count += 1;
-                        backend.ensure_local_directory(options, path)?;
-                        if let Some(store) = state_store
-                            && let Some(entry_state) = backend.local_entry_state(options, path)?
-                        {
-                            store
-                                .upsert_baseline_entry(path, &entry_state)
-                                .with_context(|| {
-                                    format!("failed to persist baseline directory entry for {path}")
-                                })?;
-                        }
+                        // Already handled above.
                     }
                     Some((EntryKind::File, remote_key)) => {
                         outcome.changed_path_count += 1;

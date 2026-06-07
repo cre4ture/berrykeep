@@ -6676,7 +6676,10 @@ mod tests {
             Some("fallback" | "primary")
         ));
 
-        let background_capture = tokio::time::timeout(Duration::from_secs(5), async {
+        // Allow up to 10s: the probe fires immediately on success, but if it fails
+        // transiently the min-interval (5000ms) gates the retry, leaving only a
+        // narrow window before the test would time out at 5s.
+        let background_capture = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(captured) = primary_state.captured_request.lock().await.clone()
                     && captured.path_and_query == "/api/v1/health"
