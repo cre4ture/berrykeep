@@ -1863,14 +1863,15 @@ impl PersistentStore {
     }
 
     pub(crate) fn data_scrubber(&self) -> DataScrubber {
-        DataScrubber::new(
+        let scrubber = DataScrubber::new(
             self.current_state.clone(),
             self.manifests_dir.clone(),
             self.chunks_dir.clone(),
             self.metadata_store.clone(),
-            #[cfg(test)]
-            self.data_scrub_run_test_hook.clone(),
-        )
+        );
+        #[cfg(test)]
+        let scrubber = scrubber.with_run_test_hook(self.data_scrub_run_test_hook.clone());
+        scrubber
     }
 
     pub(crate) fn cluster_replicas_persister(&self) -> ClusterReplicasPersister {

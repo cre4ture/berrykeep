@@ -149,7 +149,6 @@ impl DataScrubber {
         manifests_dir: PathBuf,
         chunks_dir: PathBuf,
         metadata_store: Arc<dyn MetadataStore>,
-        #[cfg(test)] run_test_hook: Option<DataScrubRunTestHook>,
     ) -> Self {
         Self {
             current_state,
@@ -157,8 +156,14 @@ impl DataScrubber {
             chunks_dir,
             metadata_store,
             #[cfg(test)]
-            run_test_hook,
+            run_test_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_run_test_hook(mut self, hook: Option<DataScrubRunTestHook>) -> Self {
+        self.run_test_hook = hook;
+        self
     }
 
     #[cfg(test)]
