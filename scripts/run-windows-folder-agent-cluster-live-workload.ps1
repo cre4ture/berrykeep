@@ -5,7 +5,6 @@ param(
     [int]$VerifySampleCount = 24,
     [int]$SubdirCount = 80,
     [int]$MaxDirDepth = 4,
-    [int]$CloseUploadConcurrency = 8,
     [int]$UploadTimeoutMinutes = 150,
     [int]$ReplicationTimeoutMinutes = 60,
     [bool]$HoldOnFailure = $true,
@@ -36,9 +35,6 @@ if ($MaxDirDepth -le 0) {
 if ($SubdirCount -gt $FileCount) {
     throw "SubdirCount must be less than or equal to FileCount."
 }
-if ($CloseUploadConcurrency -le 0) {
-    throw "CloseUploadConcurrency must be greater than zero."
-}
 if ($UploadTimeoutMinutes -le 0) {
     throw "UploadTimeoutMinutes must be greater than zero."
 }
@@ -47,7 +43,7 @@ if ($ReplicationTimeoutMinutes -le 0) {
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$liveRootBase = Join-Path $repoRoot "target\tmp\windows-cfapi-live"
+$liveRootBase = Join-Path $repoRoot "target\tmp\windows-folder-agent-live"
 if ([string]::IsNullOrWhiteSpace($RunRoot)) {
     $runId = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss"), ([guid]::NewGuid().ToString("N").Substring(0, 8))
     $RunRoot = Join-Path $liveRootBase $runId
@@ -70,7 +66,7 @@ function Resolve-DriverExecutable {
     )
 
     foreach ($searchRoot in $searchRoots) {
-        $directCandidate = Join-Path $searchRoot "windows_cfapi_cluster_workload_driver.exe"
+        $directCandidate = Join-Path $searchRoot "windows_folder_agent_cluster_workload_driver.exe"
         if (Test-Path -LiteralPath $directCandidate) {
             return Get-Item -LiteralPath $directCandidate
         }
@@ -83,7 +79,7 @@ function Resolve-DriverExecutable {
 
         Get-ChildItem `
             -Path $searchRoot `
-            -Filter "windows_cfapi_cluster_workload_driver*.exe" `
+            -Filter "windows_folder_agent_cluster_workload_driver*.exe" `
             -File `
             -Recurse `
             -ErrorAction SilentlyContinue
@@ -100,8 +96,8 @@ if (-not $SkipBuild) {
     Push-Location $repoRoot
     try {
         cargo build -p server-node --bin ironmesh-server-node
-        cargo build -p os-integration --bin ironmesh-os-integration
-        cargo build --manifest-path tests\system-tests\Cargo.toml --bin windows_cfapi_cluster_workload_driver
+        cargo build -p ironmesh-folder-agent --bin ironmesh-folder-agent
+        cargo build --manifest-path tests\system-tests\Cargo.toml --bin windows_folder_agent_cluster_workload_driver
     }
     finally {
         Pop-Location
@@ -128,22 +124,21 @@ if (Test-Path -LiteralPath $cleanupSignalPath) {
 }
 
 $inner = @(
-    "set `"IRONMESH_WINDOWS_CFAPI_LOAD_FILE_COUNT=$FileCount`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LOAD_MIN_BYTES=$($MinSizeMiB * 1MB)`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LOAD_MAX_BYTES=$($MaxSizeMiB * 1MB)`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LOAD_VERIFY_SAMPLE_COUNT=$VerifySampleCount`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT=$SubdirCount`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH=$MaxDirDepth`"",
-    "set `"IRONMESH_CFAPI_CLOSE_UPLOAD_MAX_CONCURRENCY=$CloseUploadConcurrency`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_UPLOAD_TIMEOUT_SECS=$($UploadTimeoutMinutes * 60)`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_REPLICATION_TIMEOUT_SECS=$($ReplicationTimeoutMinutes * 60)`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LIVE_MANIFEST_PATH=$manifestPath`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LIVE_CONTINUE_SIGNAL_PATH=$continueSignalPath`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LIVE_CLEANUP_SIGNAL_PATH=$cleanupSignalPath`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LIVE_HOLD_AFTER_COPY=$($HoldAfterCopy.IsPresent.ToString().ToLowerInvariant())`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LIVE_HOLD_AFTER_UPLOAD=$($HoldAfterUpload.IsPresent.ToString().ToLowerInvariant())`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LIVE_HOLD_AFTER_REPLICATION=$($HoldAfterReplication.IsPresent.ToString().ToLowerInvariant())`"",
-    "set `"IRONMESH_WINDOWS_CFAPI_LIVE_HOLD_ON_FAILURE=$($HoldOnFailure.ToString().ToLowerInvariant())`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_FILE_COUNT=$FileCount`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MIN_BYTES=$($MinSizeMiB * 1MB)`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_BYTES=$($MaxSizeMiB * 1MB)`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_VERIFY_SAMPLE_COUNT=$VerifySampleCount`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_SUBDIR_COUNT=$SubdirCount`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_DIR_DEPTH=$MaxDirDepth`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_UPLOAD_TIMEOUT_SECS=$($UploadTimeoutMinutes * 60)`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_REPLICATION_TIMEOUT_SECS=$($ReplicationTimeoutMinutes * 60)`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_MANIFEST_PATH=$manifestPath`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_CONTINUE_SIGNAL_PATH=$continueSignalPath`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_CLEANUP_SIGNAL_PATH=$cleanupSignalPath`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_COPY=$($HoldAfterCopy.IsPresent.ToString().ToLowerInvariant())`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_UPLOAD=$($HoldAfterUpload.IsPresent.ToString().ToLowerInvariant())`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_REPLICATION=$($HoldAfterReplication.IsPresent.ToString().ToLowerInvariant())`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_ON_FAILURE=$($HoldOnFailure.ToString().ToLowerInvariant())`"",
     "`"$driverExe`" > `"$driverLogPath`" 2>&1"
 ) -join " && "
 
