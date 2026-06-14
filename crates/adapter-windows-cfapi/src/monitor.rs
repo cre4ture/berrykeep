@@ -227,6 +227,24 @@ fn should_schedule_placeholder_hydration(
             .is_some_and(|previous| previous != placeholder_state)
 }
 
+fn should_skip_clean_placeholder_content_upload(
+    previous_entry: Option<&SeenEntry>,
+    entry: &SeenEntry,
+) -> bool {
+    let Some(previous_entry) = previous_entry else {
+        return false;
+    };
+    let Some(placeholder_state) = entry.placeholder_state else {
+        return false;
+    };
+    if placeholder_state.modified_data_size != 0 {
+        return false;
+    }
+
+    previous_entry.placeholder_state.is_some()
+        || previous_entry.local_file_identity == entry.local_file_identity
+}
+
 pub struct SyncRootMonitor {
     name: String,
     sync_root: PathBuf,
@@ -721,6 +739,16 @@ impl SyncRootMonitor {
             if path.exists() {
                 let was_placeholder = path_is_placeholder(path);
                 if was_placeholder {
+                    if should_skip_clean_placeholder_content_upload(previous_entry, entry) {
+                        tracing::info!(
+                            "{}: skipping upload for clean placeholder {} after metadata-only change snapshot={} raw_state={}",
+                            self.name,
+                            rel_path,
+                            entry.to_log_string(),
+                            describe_path_state(path)
+                        );
+                        return;
+                    }
                     tracing::info!(
                         "{}: uploading placeholder-backed file {} after local change detection",
                         self.name,
@@ -1945,6 +1973,107 @@ mod tests {
         assert!(
             should_schedule_placeholder_hydration(Some(&previous), &current, current_partial),
             "partial hydration progress should allow one more explicit hydrate pass",
+        );
+    }
+
+    #[test]
+    fn monitor_skips_upload_for_existing_clean_placeholder_state_changes() {
+        let previous = SeenEntry {
+            is_dir: false,
+            file_attributes: FILE_ATTRIBUTE_UNPINNED,
+            local_file_identity: Some(LocalFileIdentity {
+                volume_serial_number: 7,
+                file_index: 11,
+            }),
+            placeholder_identity_path: Some("movies/example.mp4".to_string()),
+            placeholder_state: Some(PlaceholderSnapshot {
+                on_disk_data_size: 4096,
+                modified_data_size: 0,
+                in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+                pin_state: CF_PIN_STATE_UNPINNED,
+                is_partial: false,
+            }),
+            provider_hydration_active: false,
+        };
+        let current = SeenEntry {
+            placeholder_state: Some(PlaceholderSnapshot {
+                on_disk_data_size: 0,
+                ..previous.placeholder_state.expect("placeholder snapshot")
+            }),
+            ..previous.clone()
+        };
+
+        assert!(
+            should_skip_clean_placeholder_content_upload(Some(&previous), &current),
+            "clean placeholder state transitions should not trigger a content upload",
+        );
+    }
+
+    #[test]
+    fn monitor_keeps_dirty_placeholder_uploads_enabled() {
+        let previous = SeenEntry {
+            is_dir: false,
+            file_attributes: FILE_ATTRIBUTE_UNPINNED,
+            local_file_identity: Some(LocalFileIdentity {
+                volume_serial_number: 7,
+                file_index: 11,
+            }),
+            placeholder_identity_path: Some("movies/example.mp4".to_string()),
+            placeholder_state: Some(PlaceholderSnapshot {
+                on_disk_data_size: 4096,
+                modified_data_size: 0,
+                in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+                pin_state: CF_PIN_STATE_UNPINNED,
+                is_partial: false,
+            }),
+            provider_hydration_active: false,
+        };
+        let current = SeenEntry {
+            placeholder_state: Some(PlaceholderSnapshot {
+                modified_data_size: 512,
+                ..previous.placeholder_state.expect("placeholder snapshot")
+            }),
+            ..previous.clone()
+        };
+
+        assert!(
+            !should_skip_clean_placeholder_content_upload(Some(&previous), &current),
+            "dirty placeholders must still be eligible for upload",
+        );
+    }
+
+    #[test]
+    fn monitor_skips_upload_after_materialized_file_converts_to_clean_placeholder() {
+        let file_identity = Some(LocalFileIdentity {
+            volume_serial_number: 7,
+            file_index: 11,
+        });
+        let previous = SeenEntry {
+            is_dir: false,
+            file_attributes: 0,
+            local_file_identity: file_identity,
+            placeholder_identity_path: None,
+            placeholder_state: None,
+            provider_hydration_active: false,
+        };
+        let current = SeenEntry {
+            is_dir: false,
+            file_attributes: FILE_ATTRIBUTE_UNPINNED,
+            local_file_identity: file_identity,
+            placeholder_identity_path: Some("movies/example.mp4".to_string()),
+            placeholder_state: Some(PlaceholderSnapshot {
+                on_disk_data_size: 0,
+                modified_data_size: 0,
+                in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+                pin_state: CF_PIN_STATE_UNPINNED,
+                is_partial: false,
+            }),
+            provider_hydration_active: false,
+        };
+
+        assert!(
+            should_skip_clean_placeholder_content_upload(Some(&previous), &current),
+            "post-upload placeholder conversion should not cause a second upload",
         );
     }
 }
