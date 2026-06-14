@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Commit"
+  short_description: "Cut an Ironmesh release commit and tag"
+  default_prompt: "Use $release-commit to prepare and publish the next Ironmesh release commit and tag."
