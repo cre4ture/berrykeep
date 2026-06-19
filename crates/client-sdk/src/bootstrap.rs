@@ -20,6 +20,7 @@ use crate::connection::{
 };
 use crate::device_auth::{
     DeviceEnrollmentRequest, DeviceEnrollmentResponse, enroll_device_blocking_from_pem,
+    renew_rendezvous_identity,
 };
 use crate::ironmesh_client::{CLIENT_API_V1_PREFIX, IronMeshClient, normalize_server_base_url};
 
@@ -337,6 +338,83 @@ impl ConnectionBootstrap {
         build_http_client_with_identity_from_planned_targets(&planned_targets, identity)
     }
 
+    /// Like [`build_client_with_identity`] but automatically renews the rendezvous client
+    /// certificate when it is expired or expiring soon.  If renewal succeeds the updated PEM is
+    /// written back into `identity.rendezvous_client_identity_pem`; the caller is responsible for
+    /// persisting the change.  Renewal failures are logged as warnings and do not prevent the
+    /// client from being built.
+    pub fn build_client_with_identity_renewing(
+        &self,
+        identity: &mut ClientIdentityMaterial,
+    ) -> Result<IronMeshClient> {
+        self.validate()?;
+        identity.validate()?;
+        if identity.cluster_id != self.cluster_id {
+            bail!(
+                "client identity cluster_id {} does not match bootstrap cluster_id {}",
+                identity.cluster_id,
+                self.cluster_id
+            );
+        }
+
+        let planned_targets = self.planned_targets()?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let needs_renewal = identity
+            .rendezvous_client_identity_pem
+            .as_deref()
+            .is_some_and(|pem| {
+                transport_sdk::rendezvous_client_identity_needs_renewal_at(pem.as_bytes(), now)
+            });
+
+        if needs_renewal {
+            // If the cert is already past its expiry the relay connection itself fails mTLS, so
+            // we must reach the cluster via a direct target.  If the cert is merely approaching
+            // expiry the relay is still usable, so we can renew through any available target.
+            let already_expired =
+                identity
+                    .rendezvous_client_identity_pem
+                    .as_deref()
+                    .is_some_and(|pem| {
+                        transport_sdk::rendezvous_client_identity_is_expired_at(pem.as_bytes(), now)
+                    });
+
+            let renewal_targets: Vec<_> = if already_expired {
+                planned_targets
+                    .iter()
+                    .filter(|t| t.server_base_url.is_some())
+                    .cloned()
+                    .collect()
+            } else {
+                planned_targets.clone()
+            };
+
+            if renewal_targets.is_empty() {
+                tracing::warn!(
+                    "rendezvous identity needs renewal but no usable targets are available"
+                );
+            } else {
+                match try_renew_rendezvous_identity(&renewal_targets, identity) {
+                    Ok(new_pem) => {
+                        identity.rendezvous_client_identity_pem = Some(new_pem);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "rendezvous identity renewal failed, continuing with existing certificate"
+                        );
+                    }
+                }
+            }
+        }
+
+        build_http_client_with_identity_from_planned_targets(&planned_targets, identity)
+    }
+
     pub fn build_client(&self) -> Result<IronMeshClient> {
         self.validate()?;
 
@@ -615,6 +693,28 @@ impl ConnectionBootstrap {
     }
 }
 
+fn try_renew_rendezvous_identity(
+    targets: &[PlannedConnectionBootstrapTarget],
+    identity: &ClientIdentityMaterial,
+) -> Result<String> {
+    let renewal_client =
+        build_http_client_with_identity_from_planned_targets(targets, identity)
+            .context("failed to build client for rendezvous identity renewal")?;
+    let worker = std::thread::Builder::new()
+        .name("ironmesh-rendezvous-renewal".to_string())
+        .spawn(move || -> Result<String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build renewal runtime")?;
+            runtime.block_on(renew_rendezvous_identity(&renewal_client))
+        })
+        .context("failed to spawn rendezvous renewal worker")?;
+    worker
+        .join()
+        .map_err(|_| anyhow!("rendezvous renewal worker panicked"))?
+}
+
 pub fn enroll_connection_input_blocking(
     raw_input: &str,
     device_id_override: Option<&str>,
@@ -881,6 +981,55 @@ mod tests {
     use transport_sdk::{
         CLIENT_BOOTSTRAP_CLAIM_VERSION, ClientBootstrapClaim, ClientBootstrapClaimTrust,
     };
+
+    // cert+key for an already-expired rendezvous identity (not_after = 2026-04-20)
+    const EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIB3DCCAYKgAwIBAgITK3r0r5jwkdN+susWXewPKMOgPDAKBggqhkjOPQQDAjBA\n",
+        "MT4wPAYDVQQDDDVpcm9ubWVzaC1jbHVzdGVyLTAxOWQwMmViLWFiMzktNzIyMC05\n",
+        "MTFhLWMwZWFmY2IzODI0OTAeFw0yNjAzMjExMzA5MzRaFw0yNjA0MjAxMzA5MzRa\n",
+        "MD8xPTA7BgNVBAMMNGlyb25tZXNoLWRldmljZS0wMTlkMTA4My1lYTIzLTdiZjEt\n",
+        "YjVjYi0xZDVmY2ViNTBlOGEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASeG/Cl\n",
+        "E3s04e07hBjVXH8/IMPXIiGewwOLPXEcJM4pU0ELoDcfpgZ0evvEiOKFC+R19CI3\n",
+        "/dbbU02U0VnXMMXxo1wwWjBDBgNVHREEPDA6hjh1cm46aXJvbm1lc2g6ZGV2aWNl\n",
+        "OjAxOWQxMDgzLWVhMjMtN2JmMS1iNWNiLTFkNWZjZWI1MGU4YTATBgNVHSUEDDAK\n",
+        "BggrBgEFBQcDAjAKBggqhkjOPQQDAgNIADBFAiBPOa5XZSZLs8CqhQO9PscDS2Il\n",
+        "jkjn2HXRB0g2pB2aeAIhALe+yYYMAqULo8WmhjcudAgQm/1vYSjowEWtUcMCY2J3\n",
+        "-----END CERTIFICATE-----\n",
+        "-----BEGIN PRIVATE KEY-----\n",
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgaxQmF3EgQxM8/nYg\n",
+        "C4fi+hVjqma6xwFK4pwamjmotA+hRANCAASeG/ClE3s04e07hBjVXH8/IMPXIiGe\n",
+        "wwOLPXEcJM4pU0ELoDcfpgZ0evvEiOKFC+R19CI3/dbbU02U0VnXMMXx\n",
+        "-----END PRIVATE KEY-----\n"
+    );
+
+    fn direct_bootstrap_for_url(cluster_id: ClusterId, url: &str) -> ConnectionBootstrap {
+        ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: vec![],
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: url.to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: None,
+            }],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+        }
+    }
+
+    fn identity_for_bootstrap(cluster_id: ClusterId) -> ClientIdentityMaterial {
+        ClientIdentityMaterial::generate(cluster_id, None, None)
+            .expect("identity should generate")
+    }
 
     async fn spawn_health_server(delay_ms: u64) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1156,6 +1305,54 @@ mod tests {
             serde_json::from_value(legacy).expect("legacy response should deserialize");
 
         assert_eq!(parsed.label.as_deref(), Some("Phone"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_client_with_identity_renewing_skips_renewal_when_no_cert() {
+        let cluster_id = ClusterId::now_v7();
+        // Port 9 is the discard port — connection will be refused, but no connection
+        // is attempted here because there's no cert to renew and a single direct target
+        // skips the startup probe.
+        let bootstrap = direct_bootstrap_for_url(cluster_id, "http://127.0.0.1:9");
+        let mut identity = identity_for_bootstrap(cluster_id);
+
+        let result = tokio::task::spawn_blocking(move || {
+            bootstrap.build_client_with_identity_renewing(&mut identity)
+        })
+        .await
+        .expect("task should not panic");
+
+        assert!(
+            result.is_ok(),
+            "renewal should be skipped and client built when no cert is present: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_client_with_identity_renewing_continues_when_renewal_endpoint_is_absent() {
+        let cluster_id = ClusterId::now_v7();
+        // The mock server serves only /api/v1/health — no renewal endpoint.
+        let (url, server) = spawn_health_server(0).await;
+        let bootstrap = direct_bootstrap_for_url(cluster_id, &url);
+        let mut identity = identity_for_bootstrap(cluster_id);
+        identity.rendezvous_client_identity_pem =
+            Some(EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM.to_string());
+
+        let result = tokio::task::spawn_blocking(move || {
+            bootstrap.build_client_with_identity_renewing(&mut identity)
+        })
+        .await
+        .expect("task should not panic");
+
+        assert!(
+            result.is_ok(),
+            "renewal failure should be non-fatal and client should still build: {:?}",
+            result.err()
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

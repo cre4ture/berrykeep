@@ -49,9 +49,10 @@ pub use relay_tunnel::{
 };
 pub use rendezvous::{
     PresenceEntry, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
-    RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
-    RendezvousEndpointStatus, RendezvousRuntimeState, TransportCapability,
-    is_expected_idle_relay_tunnel_accept_timeout,
+    RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RendezvousClientConfig, RendezvousControlClient,
+    RendezvousEndpointConnectionState, RendezvousEndpointStatus, RendezvousRuntimeState,
+    TransportCapability, is_expected_idle_relay_tunnel_accept_timeout,
+    rendezvous_client_identity_is_expired_at, rendezvous_client_identity_needs_renewal_at,
 };
 pub use rendezvous_runtime::{
     BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayTunnelBroker,

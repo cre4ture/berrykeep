@@ -25,8 +25,9 @@ pub use connection::{
 };
 pub use content_addressed_client_cache::ContentAddressedClientCache;
 pub use device_auth::{
-    DeviceEnrollmentRequest, DeviceEnrollmentResponse, enroll_device, enroll_device_blocking,
-    enroll_device_blocking_from_pem,
+    DeviceEnrollmentRequest, DeviceEnrollmentResponse, RenewRendezvousIdentityResponse,
+    enroll_device, enroll_device_blocking, enroll_device_blocking_from_pem,
+    renew_rendezvous_identity,
 };
 pub use ironmesh_client::{
     IronMeshClient, ObjectHeadInfo, PreferredHeadReason, RequestedRange, SnapshotRestoreResponse,

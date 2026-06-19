@@ -32,6 +32,7 @@ mod tests {
         BootstrapEndpointUse, ClientNode, ConnectionBootstrap, ContentAddressedClientCache,
         IronMeshClient, LatencyProbeConfig, UploadMode, enroll_connection_input_blocking,
     };
+    use transport_sdk::{rendezvous_client_identity_is_expired_at, rendezvous_client_identity_needs_renewal_at};
     use serde_json::json;
     use time::OffsetDateTime;
     use uuid::Uuid;
@@ -1385,5 +1386,102 @@ mod tests {
 
         stop_server(&mut server).await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_client_with_identity_renewing_renews_expired_rendezvous_cert_via_direct(
+    ) -> Result<()> {
+        let bind = "127.0.0.1:19252";
+        let cluster_id = "11111111-1111-7111-8111-111111111152";
+        let node_id = "00000000-0000-0000-0000-000000000952";
+        let server_data_dir = fresh_data_dir("renew-rendezvous-identity-server");
+        let client_dir = fresh_data_dir("renew-rendezvous-identity-client");
+        fs::create_dir_all(&client_dir)?;
+
+        let base_url = format!("http://{bind}");
+
+        let node_env = [
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("IRONMESH_RENDEZVOUS_MTLS_REQUIRED", "true"),
+        ];
+
+        let mut server =
+            start_open_server_with_env(bind, &server_data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        assert!(
+            OffsetDateTime::now_utc().unix_timestamp()
+                > KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_NOT_AFTER_UNIX,
+            "expired rendezvous identity fixture is no longer expired for the current test clock"
+        );
+
+        let result = async {
+            let enrolled = issue_bootstrap_bundle_and_enroll_client(
+                &http,
+                &base_url,
+                TEST_ADMIN_TOKEN,
+                &client_dir,
+                "renew-rendezvous.bootstrap.json",
+                Some("renew-rendezvous"),
+                Some(3600),
+            )
+            .await?;
+
+            assert!(
+                enrolled.identity.rendezvous_client_identity_pem.is_some(),
+                "enrollment should issue a rendezvous client identity when IRONMESH_RENDEZVOUS_MTLS_REQUIRED=true"
+            );
+
+            let mut identity = enrolled.identity.clone();
+            // Inject the known-expired cert to trigger automatic renewal on connect.
+            identity.rendezvous_client_identity_pem =
+                Some(KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM.to_string());
+
+            let bootstrap = enrolled.bootstrap.clone();
+            let (result, renewed_identity) = tokio::task::spawn_blocking(move || {
+                let result = bootstrap.build_client_with_identity_renewing(&mut identity);
+                (result, identity)
+            })
+            .await
+            .context("renewing client construction task panicked")?;
+
+            result.context("build_client_with_identity_renewing should succeed")?;
+
+            let new_pem = renewed_identity
+                .rendezvous_client_identity_pem
+                .as_deref()
+                .context("rendezvous_client_identity_pem should be set after renewal")?;
+
+            assert_ne!(
+                new_pem,
+                KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM,
+                "identity should have been updated with a fresh cert, not the expired fixture"
+            );
+
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            assert!(
+                !rendezvous_client_identity_is_expired_at(new_pem.as_bytes(), now_unix),
+                "renewed cert should not be expired"
+            );
+            assert!(
+                !rendezvous_client_identity_needs_renewal_at(new_pem.as_bytes(), now_unix),
+                "renewed cert should not need immediate renewal"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&client_dir);
+        let _ = fs::remove_dir_all(&server_data_dir);
+
+        result
     }
 }

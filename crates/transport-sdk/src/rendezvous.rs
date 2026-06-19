@@ -216,6 +216,12 @@ impl RendezvousControlClient {
         })
     }
 
+    pub fn client_identity_needs_renewal(&self) -> bool {
+        self.client_identity_pem
+            .as_deref()
+            .is_some_and(|pem| rendezvous_client_identity_needs_renewal_at(pem, unix_timestamp()))
+    }
+
     pub async fn probe_endpoints(&self) -> Result<RendezvousRuntimeState> {
         self.probe_endpoints_with_path("/control/presence").await
     }
@@ -654,6 +660,22 @@ fn decorate_rendezvous_transport_error(
     format!("{message}; {diagnostic}")
 }
 
+pub const RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+
+pub fn rendezvous_client_identity_needs_renewal_at(pem: &[u8], now_unix: u64) -> bool {
+    rendezvous_client_identity_not_after_unix(pem)
+        .ok()
+        .is_some_and(|not_after| {
+            not_after <= now_unix.saturating_add(RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS)
+        })
+}
+
+pub fn rendezvous_client_identity_is_expired_at(pem: &[u8], now_unix: u64) -> bool {
+    rendezvous_client_identity_not_after_unix(pem)
+        .ok()
+        .is_some_and(|not_after| not_after <= now_unix)
+}
+
 fn rendezvous_client_identity_expiry_diagnostic_at(
     client_identity_pem: &[u8],
     now_unix: u64,
@@ -893,6 +915,121 @@ mod tests {
 
         assert!(message.contains("failed contacting rendezvous endpoint"));
         assert!(message.contains("local rendezvous client identity is expired at"));
+    }
+
+    #[test]
+    fn renewal_check_returns_false_when_cert_is_well_outside_window() {
+        let not_after =
+            rendezvous_client_identity_not_after_unix(TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes())
+                .expect("test certificate should parse");
+        // A full window + 1 second before the window opens — cert is healthy
+        let before_window = not_after
+            .saturating_sub(RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS)
+            .saturating_sub(1);
+        assert!(
+            !rendezvous_client_identity_needs_renewal_at(
+                TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),
+                before_window
+            ),
+            "cert should not need renewal well before the renewal window"
+        );
+    }
+
+    #[test]
+    fn renewal_check_returns_true_at_window_boundary() {
+        let not_after =
+            rendezvous_client_identity_not_after_unix(TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes())
+                .expect("test certificate should parse");
+        // Exactly at the window boundary: now + RENEWAL_WINDOW_SECS == not_after
+        let at_boundary = not_after.saturating_sub(RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS);
+        assert!(
+            rendezvous_client_identity_needs_renewal_at(
+                TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),
+                at_boundary
+            ),
+            "cert should need renewal exactly at the window boundary"
+        );
+    }
+
+    #[test]
+    fn renewal_check_returns_true_when_cert_is_expired() {
+        let not_after =
+            rendezvous_client_identity_not_after_unix(TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes())
+                .expect("test certificate should parse");
+        // Past expiry — cert is expired, still needs renewal
+        let past_expiry = not_after.saturating_add(1);
+        assert!(
+            rendezvous_client_identity_needs_renewal_at(
+                TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),
+                past_expiry
+            ),
+            "expired cert should still be flagged as needing renewal"
+        );
+    }
+
+    #[test]
+    fn renewal_check_returns_false_on_invalid_pem() {
+        assert!(
+            !rendezvous_client_identity_needs_renewal_at(b"not-a-cert", 0),
+            "invalid PEM should not trigger renewal (returns false rather than erroring)"
+        );
+    }
+
+    #[test]
+    fn expiry_check_returns_false_when_cert_is_valid() {
+        let not_after =
+            rendezvous_client_identity_not_after_unix(TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes())
+                .expect("test certificate should parse");
+        let before_expiry = not_after.saturating_sub(1);
+        assert!(
+            !rendezvous_client_identity_is_expired_at(
+                TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),
+                before_expiry
+            ),
+            "cert should not be expired before its not_after"
+        );
+    }
+
+    #[test]
+    fn expiry_check_returns_true_at_expiry_boundary() {
+        let not_after =
+            rendezvous_client_identity_not_after_unix(TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes())
+                .expect("test certificate should parse");
+        assert!(
+            rendezvous_client_identity_is_expired_at(
+                TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),
+                not_after
+            ),
+            "cert should be considered expired exactly at not_after"
+        );
+    }
+
+    #[test]
+    fn expiry_check_returns_false_on_invalid_pem() {
+        assert!(
+            !rendezvous_client_identity_is_expired_at(b"not-a-cert", 0),
+            "invalid PEM should not report as expired (returns false rather than erroring)"
+        );
+    }
+
+    #[test]
+    fn client_identity_needs_renewal_returns_false_with_no_identity() {
+        let cluster_id = Uuid::now_v7();
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        assert!(
+            !client.client_identity_needs_renewal(),
+            "client without a rendezvous identity should not report renewal needed"
+        );
     }
 
     #[test]

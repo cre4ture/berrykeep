@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 use transport_sdk::IssuedClientIdentity;
 
+use crate::IronMeshClient;
 use crate::ironmesh_client::CLIENT_API_V1_PREFIX;
 
 use crate::connection::{
@@ -169,6 +170,32 @@ fn parse_enrollment_response(status: StatusCode, body: String) -> Result<DeviceE
     Ok(enrolled)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewRendezvousIdentityResponse {
+    pub rendezvous_client_identity_pem: String,
+}
+
+pub async fn renew_rendezvous_identity(client: &IronMeshClient) -> Result<String> {
+    let path = format!("{CLIENT_API_V1_PREFIX}/auth/device/renew-rendezvous-identity");
+    let response = client
+        .post_relative_path(&path)
+        .await
+        .context("failed to call renew-rendezvous-identity")?;
+    if !response.status.is_success() {
+        bail!(
+            "rendezvous identity renewal failed with HTTP {}: {}",
+            response.status,
+            response_error_message(&String::from_utf8_lossy(&response.body))
+        );
+    }
+    let parsed = serde_json::from_slice::<RenewRendezvousIdentityResponse>(&response.body)
+        .context("failed to parse rendezvous identity renewal response")?;
+    if parsed.rendezvous_client_identity_pem.trim().is_empty() {
+        bail!("rendezvous identity renewal returned an empty certificate");
+    }
+    Ok(parsed.rendezvous_client_identity_pem)
+}
+
 fn response_error_message(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -184,6 +211,8 @@ fn response_error_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, routing::post};
+    use crate::IronMeshClient;
     use uuid::Uuid;
 
     fn sample_response() -> DeviceEnrollmentResponse {
@@ -340,5 +369,115 @@ mod tests {
                 .to_string()
                 .contains("device enrollment returned an incomplete credential")
         );
+    }
+
+    async fn spawn_renewal_mock(
+        handler: axum::routing::MethodRouter,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        let app = Router::new().route(
+            "/api/v1/auth/device/renew-rendezvous-identity",
+            handler,
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    #[tokio::test]
+    async fn renew_rendezvous_identity_returns_pem_on_success() {
+        let pem = "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n";
+        let pem_owned = pem.to_string();
+        let (url, server) = spawn_renewal_mock(post(move || {
+            let pem = pem_owned.clone();
+            async move {
+                Json(serde_json::json!({ "rendezvous_client_identity_pem": pem }))
+            }
+        }))
+        .await;
+
+        let client = IronMeshClient::from_direct_base_url(url);
+        let result = renew_rendezvous_identity(&client)
+            .await
+            .expect("renewal should succeed");
+        assert_eq!(result, pem);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn renew_rendezvous_identity_fails_on_http_error() {
+        use axum::http::StatusCode as AxumStatus;
+        let (url, server) = spawn_renewal_mock(post(|| async {
+            (
+                AxumStatus::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "database unavailable" })),
+            )
+        }))
+        .await;
+
+        let client = IronMeshClient::from_direct_base_url(url);
+        let error = renew_rendezvous_identity(&client)
+            .await
+            .expect_err("HTTP 500 should fail");
+        assert!(
+            error.to_string().contains("renewal failed with HTTP 500"),
+            "expected HTTP 500 error, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("database unavailable"),
+            "expected JSON error message to be extracted, got: {error}"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn renew_rendezvous_identity_fails_on_empty_pem() {
+        let (url, server) = spawn_renewal_mock(post(|| async {
+            Json(serde_json::json!({ "rendezvous_client_identity_pem": "   " }))
+        }))
+        .await;
+
+        let client = IronMeshClient::from_direct_base_url(url);
+        let error = renew_rendezvous_identity(&client)
+            .await
+            .expect_err("empty PEM should fail");
+        assert!(
+            error.to_string().contains("returned an empty certificate"),
+            "expected empty PEM error, got: {error}"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn renew_rendezvous_identity_fails_on_invalid_json() {
+        use axum::response::IntoResponse;
+        let (url, server) = spawn_renewal_mock(post(|| async {
+            (axum::http::StatusCode::OK, "not-json").into_response()
+        }))
+        .await;
+
+        let client = IronMeshClient::from_direct_base_url(url);
+        let error = renew_rendezvous_identity(&client)
+            .await
+            .expect_err("invalid JSON should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse rendezvous identity renewal response"),
+            "expected parse error, got: {error}"
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 }

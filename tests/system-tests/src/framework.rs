@@ -92,6 +92,7 @@ impl EnrolledTestClient {
 
 struct TestCa {
     ca_pem: String,
+    ca_key_pem: String,
     issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
 }
 
@@ -104,6 +105,7 @@ fn test_ca() -> Result<&'static TestCa> {
     }
 
     let ca_key = rcgen::KeyPair::generate().context("failed generating CA key")?;
+    let ca_key_pem = ca_key.serialize_pem();
     let mut params = rcgen::CertificateParams::default();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params
@@ -121,7 +123,11 @@ fn test_ca() -> Result<&'static TestCa> {
     let ca_pem = ca_cert.pem();
 
     let issuer = rcgen::Issuer::new(params, ca_key);
-    let _ = TEST_CA.set(TestCa { ca_pem, issuer });
+    let _ = TEST_CA.set(TestCa {
+        ca_pem,
+        ca_key_pem,
+        issuer,
+    });
 
     Ok(TEST_CA
         .get()
@@ -707,13 +713,17 @@ async fn start_server_with_env_options_inner(
     let tls_dir = data_dir.join("tls");
     fs::create_dir_all(&tls_dir).context("failed creating tls dir")?;
 
-    let ca_pem = test_ca()?.ca_pem.as_bytes().to_vec();
+    let test_ca = test_ca()?;
+    let ca_pem = test_ca.ca_pem.as_bytes().to_vec();
+    let ca_key_pem = test_ca.ca_key_pem.as_bytes().to_vec();
     let (node_cert_pem, node_key_pem) = issue_node_cert(&node_id, &cluster_id)?;
 
     let ca_path = tls_dir.join("ca.pem");
+    let ca_key_path = tls_dir.join("ca.key");
     let cert_path = tls_dir.join("node.pem");
     let key_path = tls_dir.join("node.key");
     fs::write(&ca_path, ca_pem).context("failed writing CA pem")?;
+    fs::write(&ca_key_path, ca_key_pem).context("failed writing CA key pem")?;
     fs::write(&cert_path, node_cert_pem).context("failed writing node cert pem")?;
     fs::write(&key_path, node_key_pem).context("failed writing node key pem")?;
 
@@ -733,6 +743,7 @@ async fn start_server_with_env_options_inner(
         .env("IRONMESH_INTERNAL_BIND", internal_bind)
         .env("IRONMESH_INTERNAL_URL", internal_url)
         .env("IRONMESH_INTERNAL_TLS_CA_CERT", &ca_path)
+        .env("IRONMESH_INTERNAL_TLS_CA_KEY", &ca_key_path)
         .env("IRONMESH_INTERNAL_TLS_CERT", &cert_path)
         .env("IRONMESH_INTERNAL_TLS_KEY", &key_path)
         .env(

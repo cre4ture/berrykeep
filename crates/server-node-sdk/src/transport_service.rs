@@ -21,7 +21,8 @@ use crate::{
     health, latency_diagnostic, list_nodes, list_snapshots, list_store_index,
     list_store_index_response, list_tombstone_archives, list_versions, list_versions_response,
     placement_for_key, put_object, reconcile_from_node, redeem_client_bootstrap_claim,
-    rename_object_path, replication, replication_plan, request_has_admin_auth, require_client_auth,
+    rename_object_path, renew_device_rendezvous_identity, replication, replication_plan,
+    request_has_admin_auth, require_client_auth,
     require_client_or_admin_auth, require_internal_caller, restore_snapshot_path,
     restore_version_path, run_cleanup, run_tombstone_archive_purge, run_tombstone_archive_restore,
     run_tombstone_compaction, start_upload_session, storage_stats_current, storage_stats_history,
@@ -447,6 +448,10 @@ async fn buffered_response_from_axum_response(
 fn build_public_transport_router(state: ServerState) -> Router {
     let public_client_api = Router::new()
         .route("/diagnostics/latency", get(latency_diagnostic))
+        .route(
+            "/auth/device/renew-rendezvous-identity",
+            post(renew_device_rendezvous_identity),
+        )
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route(

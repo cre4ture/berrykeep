@@ -5295,6 +5295,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
     let public_client_api = Router::new()
         .route("/transport/ws", get(client_transport_ws))
         .route("/diagnostics/latency", get(latency_diagnostic))
+        .route(
+            "/auth/device/renew-rendezvous-identity",
+            post(renew_device_rendezvous_identity),
+        )
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route(
@@ -17031,6 +17035,50 @@ async fn enroll_client_device(
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err((status, error)) => (status, Json(json!({ "error": error }))).into_response(),
     }
+}
+
+async fn renew_device_rendezvous_identity(
+    State(state): State<ServerState>,
+    Extension(client_identity): Extension<AuthenticatedClientIdentity>,
+) -> impl IntoResponse {
+    let device_id = &client_identity.device_id;
+
+    let expires_at_unix = {
+        let auth_state = state.access.client_credentials.lock().await;
+        auth_state
+            .credentials
+            .iter()
+            .find(|r| &r.device_id == device_id && r.revoked_at_unix.is_none())
+            .and_then(|r| r.issued_credential_pem.as_deref())
+            .and_then(parse_credential_pem_expires_at)
+    };
+
+    match issue_client_rendezvous_identity_pem(&state, device_id, expires_at_unix) {
+        Ok(Some(pem)) => (
+            StatusCode::OK,
+            Json(json!({ "rendezvous_client_identity_pem": pem })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({ "error": "rendezvous mTLS is not enabled on this cluster" })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to issue rendezvous identity: {err}") })),
+        )
+            .into_response(),
+    }
+}
+
+fn parse_credential_pem_expires_at(credential_pem: &str) -> Option<u64> {
+    credential_pem
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("expires_at_unix=")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
 }
 
 async fn export_client_credentials(
