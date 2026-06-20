@@ -2064,7 +2064,7 @@ fn reconcile_managed_identity_targets_blocking(
         match reconcile_managed_identity_target_blocking(&target) {
             Ok(true) => {
                 if restart_running_services_for_identity(
-                    &store,
+                    store,
                     &target.dependent_services,
                     excluded_service,
                     launch_report_path,
