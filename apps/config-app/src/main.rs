@@ -11,7 +11,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::{Args, Parser, Subcommand};
-use client_sdk::enroll_connection_input_blocking;
+use client_sdk::{ClientIdentityMaterial, ConnectionBootstrap, enroll_connection_input_blocking};
 #[cfg(windows)]
 use desktop_client_config::default_desktop_status_file_path;
 use desktop_client_config::{
@@ -33,6 +33,7 @@ use desktop_status::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -110,6 +111,27 @@ struct AppState {
     launch_report_path: PathBuf,
     package_root: PathBuf,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedIdentityRenewalTarget {
+    identity: ClientIdentityConfig,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    windows_sync_root_paths: Vec<PathBuf>,
+    dependent_services: Vec<ManagedServiceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ManagedServiceRef {
+    kind: String,
+    id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ManagedIdentitySelection<'a> {
+    EnabledLaunch,
+    ServiceInstance { kind: &'a str, id: &'a str },
+    Identity { id: &'a str },
 }
 
 #[cfg(target_os = "linux")]
@@ -537,6 +559,12 @@ async fn main() -> Result<()> {
     if (cli.background || cli.launch_enabled_on_start) && !cli.skip_initial_service_launch {
         let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
             .context("failed loading managed instances before launch")?;
+        reconcile_managed_identities_for_selection(
+            &state,
+            &store,
+            ManagedIdentitySelection::EnabledLaunch,
+        )
+        .await;
         let report = launch_enabled_instances(&store, &state.package_root);
         save_launch_report(&state.launch_report_path, &report)
             .context("failed saving launch report before config app startup")?;
@@ -1253,10 +1281,19 @@ async fn upsert_client_identity(
         None
     };
 
+    let managed_identity_id = identity.id.clone();
     store.upsert_client_identity(identity);
     store
         .save(&state.instance_store_path)
         .map_err(ApiError::internal)?;
+    reconcile_managed_identities_for_selection(
+        &state,
+        &store,
+        ManagedIdentitySelection::Identity {
+            id: managed_identity_id.as_str(),
+        },
+    )
+    .await;
     Ok(Json(UpsertClientIdentityResponse {
         config: load_config_response(&state).map_err(ApiError::internal)?,
         enrollment,
@@ -1434,6 +1471,12 @@ async fn start_service_instance(
         }));
     }
 
+    reconcile_managed_identities_for_selection(
+        &state,
+        &store,
+        ManagedIdentitySelection::ServiceInstance { kind, id: &id },
+    )
+    .await;
     let launch = launch_configured_service(&store, kind, &id, &state.package_root)?;
     let updated_report =
         launch_report_with_updated_outcome(existing_report, &state.package_root, launch.clone());
@@ -1478,6 +1521,12 @@ async fn restart_service_instance(
     let launch = if stop.was_running && !stop.stopped {
         None
     } else {
+        reconcile_managed_identities_for_selection(
+            &state,
+            &store,
+            ManagedIdentitySelection::ServiceInstance { kind, id: &id },
+        )
+        .await;
         let launch = launch_configured_service(&store, kind, &id, &state.package_root)?;
         let updated_report = launch_report_with_updated_outcome(
             existing_report,
@@ -1499,6 +1548,12 @@ async fn restart_service_instance(
 async fn launch_enabled_now(State(state): State<AppState>) -> Result<Json<LaunchReport>, ApiError> {
     let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
         .map_err(ApiError::internal)?;
+    reconcile_managed_identities_for_selection(
+        &state,
+        &store,
+        ManagedIdentitySelection::EnabledLaunch,
+    )
+    .await;
     let report = launch_enabled_instances(&store, &state.package_root);
     save_launch_report(&state.launch_report_path, &report).map_err(ApiError::internal)?;
     Ok(Json(report))
@@ -1753,6 +1808,434 @@ fn launch_configured_service(
     }
 }
 
+async fn reconcile_managed_identities_for_selection(
+    state: &AppState,
+    store: &ManagedInstanceStore,
+    selection: ManagedIdentitySelection<'_>,
+) {
+    let targets = managed_identity_renewal_targets(store, selection);
+    if targets.is_empty() {
+        return;
+    }
+
+    let launch_report_path = state.launch_report_path.clone();
+    let package_root = state.package_root.clone();
+    let store = store.clone();
+    let excluded_service = match selection {
+        ManagedIdentitySelection::ServiceInstance { kind, id } => Some(ManagedServiceRef {
+            kind: kind.to_string(),
+            id: id.to_string(),
+        }),
+        _ => None,
+    };
+
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        reconcile_managed_identity_targets_blocking(
+            &store,
+            targets,
+            &launch_report_path,
+            &package_root,
+            excluded_service.as_ref(),
+        );
+    })
+    .await
+    {
+        eprintln!("config-app: managed identity reconciliation task failed: {error}");
+    }
+}
+
+fn managed_identity_renewal_targets(
+    store: &ManagedInstanceStore,
+    selection: ManagedIdentitySelection<'_>,
+) -> Vec<ManagedIdentityRenewalTarget> {
+    let mut selected_ids = BTreeSet::new();
+
+    match selection {
+        ManagedIdentitySelection::EnabledLaunch => {
+            for instance in &store.client_cli_instances {
+                if instance.enabled {
+                    push_managed_identity_id(
+                        &mut selected_ids,
+                        store,
+                        instance.client_identity_id.as_deref(),
+                        instance.client_identity_file.as_deref(),
+                    );
+                }
+            }
+            for instance in &store.os_integration_instances {
+                if instance.enabled {
+                    push_managed_identity_id(
+                        &mut selected_ids,
+                        store,
+                        instance.client_identity_id.as_deref(),
+                        instance.client_identity_file.as_deref(),
+                    );
+                }
+            }
+            for instance in &store.folder_agent_instances {
+                if instance.enabled {
+                    push_managed_identity_id(
+                        &mut selected_ids,
+                        store,
+                        instance.client_identity_id.as_deref(),
+                        instance.client_identity_file.as_deref(),
+                    );
+                }
+            }
+        }
+        ManagedIdentitySelection::ServiceInstance { kind, id } => match kind {
+            "client-cli" => {
+                if let Some(instance) = store
+                    .client_cli_instances
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                {
+                    push_managed_identity_id(
+                        &mut selected_ids,
+                        store,
+                        instance.client_identity_id.as_deref(),
+                        instance.client_identity_file.as_deref(),
+                    );
+                }
+            }
+            "os-integration" => {
+                if let Some(instance) = store
+                    .os_integration_instances
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                {
+                    push_managed_identity_id(
+                        &mut selected_ids,
+                        store,
+                        instance.client_identity_id.as_deref(),
+                        instance.client_identity_file.as_deref(),
+                    );
+                }
+            }
+            "folder-agent" => {
+                if let Some(instance) = store
+                    .folder_agent_instances
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                {
+                    push_managed_identity_id(
+                        &mut selected_ids,
+                        store,
+                        instance.client_identity_id.as_deref(),
+                        instance.client_identity_file.as_deref(),
+                    );
+                }
+            }
+            _ => {}
+        },
+        ManagedIdentitySelection::Identity { id } => {
+            if store.client_identity(id).is_some() {
+                selected_ids.insert(id.to_string());
+            }
+        }
+    }
+
+    selected_ids
+        .into_iter()
+        .filter_map(|id| {
+            let identity = store.client_identity(&id)?.clone();
+            Some(ManagedIdentityRenewalTarget {
+                windows_sync_root_paths: windows_sync_root_paths_for_identity(store, &identity),
+                dependent_services: dependent_services_for_identity(store, &identity),
+                identity,
+            })
+        })
+        .collect()
+}
+
+fn push_managed_identity_id(
+    selected_ids: &mut BTreeSet<String>,
+    store: &ManagedInstanceStore,
+    client_identity_id: Option<&str>,
+    client_identity_file: Option<&str>,
+) {
+    if let Some(id) = resolved_managed_identity_id(store, client_identity_id, client_identity_file)
+    {
+        selected_ids.insert(id);
+    }
+}
+
+fn resolved_managed_identity_id(
+    store: &ManagedInstanceStore,
+    client_identity_id: Option<&str>,
+    client_identity_file: Option<&str>,
+) -> Option<String> {
+    if let Some(client_identity_id) = normalized_optional_str(client_identity_id)
+        && store.client_identity(client_identity_id).is_some()
+    {
+        return Some(client_identity_id.to_string());
+    }
+
+    let client_identity_file = normalized_optional_str(client_identity_file)?;
+    store
+        .client_identities
+        .iter()
+        .find(|identity| identity.client_identity_file.trim() == client_identity_file)
+        .map(|identity| identity.id.clone())
+}
+
+fn windows_sync_root_paths_for_identity(
+    store: &ManagedInstanceStore,
+    identity: &ClientIdentityConfig,
+) -> Vec<PathBuf> {
+    let mut roots = BTreeSet::new();
+    for instance in &store.os_integration_instances {
+        if let Some(resolved_identity_id) = resolved_managed_identity_id(
+            store,
+            instance.client_identity_id.as_deref(),
+            instance.client_identity_file.as_deref(),
+        ) && resolved_identity_id == identity.id
+            && let Some(root_path) = normalized_optional_str(Some(instance.root_path.as_str()))
+        {
+            roots.insert(PathBuf::from(root_path));
+        }
+    }
+    roots.into_iter().collect()
+}
+
+fn dependent_services_for_identity(
+    store: &ManagedInstanceStore,
+    identity: &ClientIdentityConfig,
+) -> Vec<ManagedServiceRef> {
+    let mut services = BTreeSet::new();
+
+    for instance in &store.client_cli_instances {
+        if let Some(resolved_identity_id) = resolved_managed_identity_id(
+            store,
+            instance.client_identity_id.as_deref(),
+            instance.client_identity_file.as_deref(),
+        ) && resolved_identity_id == identity.id
+        {
+            services.insert(ManagedServiceRef {
+                kind: "client-cli".to_string(),
+                id: instance.id.clone(),
+            });
+        }
+    }
+
+    for instance in &store.os_integration_instances {
+        if let Some(resolved_identity_id) = resolved_managed_identity_id(
+            store,
+            instance.client_identity_id.as_deref(),
+            instance.client_identity_file.as_deref(),
+        ) && resolved_identity_id == identity.id
+        {
+            services.insert(ManagedServiceRef {
+                kind: "os-integration".to_string(),
+                id: instance.id.clone(),
+            });
+        }
+    }
+
+    for instance in &store.folder_agent_instances {
+        if let Some(resolved_identity_id) = resolved_managed_identity_id(
+            store,
+            instance.client_identity_id.as_deref(),
+            instance.client_identity_file.as_deref(),
+        ) && resolved_identity_id == identity.id
+        {
+            services.insert(ManagedServiceRef {
+                kind: "folder-agent".to_string(),
+                id: instance.id.clone(),
+            });
+        }
+    }
+
+    services.into_iter().collect()
+}
+
+fn reconcile_managed_identity_targets_blocking(
+    store: &ManagedInstanceStore,
+    targets: Vec<ManagedIdentityRenewalTarget>,
+    launch_report_path: &Path,
+    package_root: &Path,
+    excluded_service: Option<&ManagedServiceRef>,
+) {
+    let mut launch_report = None;
+    let mut launch_report_loaded = false;
+    let mut launch_report_dirty = false;
+
+    for target in targets {
+        match reconcile_managed_identity_target_blocking(&target) {
+            Ok(true) => {
+                if restart_running_services_for_identity(
+                    &store,
+                    &target.dependent_services,
+                    excluded_service,
+                    launch_report_path,
+                    &mut launch_report,
+                    &mut launch_report_loaded,
+                    package_root,
+                ) {
+                    launch_report_dirty = true;
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!(
+                    "config-app: failed reconciling managed client identity {}: {error:#}",
+                    target.identity.id
+                );
+            }
+        }
+    }
+
+    if launch_report_dirty
+        && let Some(report) = launch_report.as_ref()
+        && let Err(error) = save_launch_report(launch_report_path, report)
+    {
+        eprintln!(
+            "config-app: failed saving launch report after managed identity restart: {error:#}"
+        );
+    }
+}
+
+fn restart_running_services_for_identity(
+    store: &ManagedInstanceStore,
+    services: &[ManagedServiceRef],
+    excluded_service: Option<&ManagedServiceRef>,
+    launch_report_path: &Path,
+    launch_report: &mut Option<LaunchReport>,
+    launch_report_loaded: &mut bool,
+    package_root: &Path,
+) -> bool {
+    if !*launch_report_loaded {
+        match load_last_launch_report(launch_report_path) {
+            Ok(report) => {
+                *launch_report = report;
+                *launch_report_loaded = true;
+            }
+            Err(error) => {
+                eprintln!(
+                    "config-app: failed loading launch report for managed identity restart planning: {error:#}"
+                );
+                return false;
+            }
+        }
+    }
+
+    let runtime_statuses = service_runtime_statuses(store, launch_report.as_ref());
+    let mut any_restarted = false;
+
+    for service in services {
+        if excluded_service.is_some_and(|excluded| excluded == service) {
+            continue;
+        }
+
+        let is_running = runtime_statuses.iter().any(|status| {
+            status.instance_kind == service.kind && status.id == service.id && status.running
+        });
+        if !is_running {
+            continue;
+        }
+
+        let stop = stop_service_from_report(
+            launch_report.as_ref(),
+            service.kind.as_str(),
+            service.id.as_str(),
+        );
+        if stop.was_running && !stop.stopped {
+            eprintln!(
+                "config-app: failed stopping running service {}:{} after managed identity refresh: {}",
+                service.kind,
+                service.id,
+                stop.error
+                    .unwrap_or_else(|| "process did not stop".to_string())
+            );
+            continue;
+        }
+
+        let launch = match launch_configured_service(
+            store,
+            service.kind.as_str(),
+            service.id.as_str(),
+            package_root,
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                eprintln!(
+                    "config-app: failed relaunching service {}:{} after managed identity refresh: {}",
+                    service.kind, service.id, error.message
+                );
+                continue;
+            }
+        };
+
+        let updated_report =
+            launch_report_with_updated_outcome(launch_report.take(), package_root, launch);
+        *launch_report = Some(updated_report);
+        any_restarted = true;
+    }
+
+    any_restarted
+}
+
+fn reconcile_managed_identity_target_blocking(
+    target: &ManagedIdentityRenewalTarget,
+) -> Result<bool> {
+    let identity_path = Path::new(&target.identity.client_identity_file);
+    if !identity_path.exists() {
+        return Ok(false);
+    }
+
+    let mut material = ClientIdentityMaterial::from_path(identity_path).with_context(|| {
+        format!(
+            "failed loading managed client identity {}",
+            identity_path.display()
+        )
+    })?;
+    let original_rendezvous_identity = material.rendezvous_client_identity_pem.clone();
+
+    let bootstrap_path = Path::new(&target.identity.bootstrap_file);
+    let renewal_result = if bootstrap_path.exists() {
+        let bootstrap = ConnectionBootstrap::from_path(bootstrap_path).with_context(|| {
+            format!(
+                "failed loading managed bootstrap file {}",
+                bootstrap_path.display()
+            )
+        })?;
+        let _ = bootstrap
+            .build_client_with_identity_renewing(&mut material)
+            .with_context(|| {
+                format!(
+                    "failed renewing managed client identity {}",
+                    target.identity.id
+                )
+            })?;
+        Ok::<(), anyhow::Error>(())
+    } else {
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let refreshed = material.rendezvous_client_identity_pem != original_rendezvous_identity;
+
+    if refreshed {
+        material.write_to_path(identity_path).with_context(|| {
+            format!(
+                "failed writing renewed managed client identity {}",
+                identity_path.display()
+            )
+        })?;
+    }
+
+    #[cfg(windows)]
+    sync_managed_identity_to_windows_sync_roots(&material, &target.windows_sync_root_paths)
+        .with_context(|| {
+            format!(
+                "failed syncing Windows identity mirrors for {}",
+                target.identity.id
+            )
+        })?;
+
+    renewal_result?;
+    Ok(refreshed)
+}
+
 async fn enroll_client_identity(
     identity: ClientIdentityConfig,
 ) -> Result<ClientIdentityEnrollmentReport, ApiError> {
@@ -1858,6 +2341,10 @@ fn json_u64_field(value: &serde_json::Value, field: &str) -> Option<u64> {
     value.get(field).and_then(serde_json::Value::as_u64)
 }
 
+fn normalized_optional_str(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 fn resolve_client_identity<'a>(
     store: &'a ManagedInstanceStore,
     id: Option<&str>,
@@ -1892,6 +2379,77 @@ fn write_managed_text_file(path: &str, content: &str) -> Result<(), ApiError> {
             path.display()
         ))
     })
+}
+
+#[cfg(windows)]
+fn sync_managed_identity_to_windows_sync_roots(
+    material: &ClientIdentityMaterial,
+    sync_root_paths: &[PathBuf],
+) -> Result<()> {
+    for sync_root_path in sync_root_paths {
+        material
+            .write_to_path(&windows_local_appdata_client_identity_path(sync_root_path))
+            .with_context(|| {
+                format!(
+                    "failed writing Windows sync-root identity mirror for {}",
+                    sync_root_path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_local_appdata_client_identity_path(sync_root_path: &Path) -> PathBuf {
+    windows_local_appdata_sync_root_state_dir(sync_root_path).join("client-identity.json")
+}
+
+#[cfg(windows)]
+fn windows_local_appdata_sync_root_state_dir(sync_root_path: &Path) -> PathBuf {
+    windows_local_appdata_root()
+        .join("sync-roots")
+        .join(windows_sync_root_state_label(sync_root_path))
+}
+
+#[cfg(windows)]
+fn windows_local_appdata_root() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Ironmesh")
+}
+
+#[cfg(windows)]
+fn windows_sync_root_state_label(sync_root_path: &Path) -> String {
+    let normalized = sync_root_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    let hash = blake3::hash(normalized.as_bytes()).to_hex().to_string();
+    let leaf = sync_root_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sync-root");
+    let sanitized_leaf = leaf
+        .chars()
+        .map(|value| {
+            if value.is_ascii_alphanumeric() {
+                value.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    let label = if sanitized_leaf.is_empty() {
+        "sync_root".to_string()
+    } else {
+        sanitized_leaf
+    };
+    format!("{label}-{hash}")
 }
 
 fn default_managed_client_bootstrap_path(instance_store_path: &Path, id: &str) -> String {
@@ -3901,3 +4459,178 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
 });
 "###;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_identity(id: &str, client_identity_file: &str) -> ClientIdentityConfig {
+        ClientIdentityConfig {
+            id: id.to_string(),
+            label: format!("Identity {id}"),
+            bootstrap_file: format!("/managed/{id}.bootstrap.json"),
+            client_identity_file: client_identity_file.to_string(),
+            server_ca_pem_file: None,
+            cluster_id: None,
+            device_id: None,
+            device_label: None,
+            issued_at_unix: None,
+            expires_at_unix: None,
+            last_enrolled_at_unix_ms: None,
+        }
+    }
+
+    fn sample_client_cli_instance(
+        id: &str,
+        enabled: bool,
+        client_identity_id: Option<&str>,
+        client_identity_file: Option<&str>,
+    ) -> ClientCliInstance {
+        ClientCliInstance {
+            id: id.to_string(),
+            label: format!("Client {id}"),
+            enabled,
+            bind: None,
+            server_base_url: None,
+            bootstrap_file: None,
+            server_ca_pem_file: None,
+            client_identity_id: client_identity_id.map(ToString::to_string),
+            client_identity_file: client_identity_file.map(ToString::to_string),
+        }
+    }
+
+    fn sample_os_integration_instance(
+        id: &str,
+        root_path: &str,
+        client_identity_id: Option<&str>,
+        client_identity_file: Option<&str>,
+    ) -> OsIntegrationInstance {
+        OsIntegrationInstance {
+            id: id.to_string(),
+            label: format!("OS {id}"),
+            enabled: true,
+            sync_root_id: Some(format!("sync-{id}")),
+            display_name: Some(format!("Sync {id}")),
+            root_path: root_path.to_string(),
+            server_base_url: None,
+            prefix: None,
+            bootstrap_file: None,
+            client_identity_id: client_identity_id.map(ToString::to_string),
+            snapshot_file: None,
+            client_identity_file: client_identity_file.map(ToString::to_string),
+            server_ca_path: None,
+            client_edge_state_dir: None,
+            fs_name: None,
+            allow_other: false,
+            publish_gnome_status: false,
+            gnome_status_file: None,
+            remote_refresh_interval_ms: None,
+            remote_status_poll_interval_ms: None,
+            depth: None,
+        }
+    }
+
+    #[test]
+    fn resolved_managed_identity_id_prefers_existing_id() {
+        let store = ManagedInstanceStore {
+            client_identities: vec![
+                sample_identity("identity-a", "/managed/identity-a.client-identity.json"),
+                sample_identity("identity-b", "/managed/identity-b.client-identity.json"),
+            ],
+            ..ManagedInstanceStore::default()
+        };
+
+        let resolved = resolved_managed_identity_id(
+            &store,
+            Some("identity-a"),
+            Some("/managed/identity-b.client-identity.json"),
+        );
+
+        assert_eq!(resolved.as_deref(), Some("identity-a"));
+    }
+
+    #[test]
+    fn managed_identity_renewal_targets_follow_path_matches_and_collect_os_roots() {
+        let store = ManagedInstanceStore {
+            client_identities: vec![
+                sample_identity("identity-a", "/managed/identity-a.client-identity.json"),
+                sample_identity("identity-b", "/managed/identity-b.client-identity.json"),
+            ],
+            client_cli_instances: vec![
+                sample_client_cli_instance(
+                    "client-a",
+                    true,
+                    Some("missing-identity"),
+                    Some("/managed/identity-b.client-identity.json"),
+                ),
+                sample_client_cli_instance(
+                    "client-b",
+                    false,
+                    Some("identity-a"),
+                    Some("/managed/identity-a.client-identity.json"),
+                ),
+            ],
+            os_integration_instances: vec![
+                sample_os_integration_instance(
+                    "os-a",
+                    "/sync/alpha",
+                    Some("missing-identity"),
+                    Some("/managed/identity-b.client-identity.json"),
+                ),
+                sample_os_integration_instance(
+                    "os-b",
+                    "/sync/beta",
+                    Some("identity-b"),
+                    Some("/managed/identity-b.client-identity.json"),
+                ),
+            ],
+            ..ManagedInstanceStore::default()
+        };
+
+        let targets = managed_identity_renewal_targets(
+            &store,
+            ManagedIdentitySelection::ServiceInstance {
+                kind: "client-cli",
+                id: "client-a",
+            },
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].identity.id, "identity-b");
+        assert_eq!(
+            targets[0].windows_sync_root_paths,
+            vec![PathBuf::from("/sync/alpha"), PathBuf::from("/sync/beta")]
+        );
+    }
+
+    #[test]
+    fn managed_identity_renewal_targets_for_enabled_launch_ignore_disabled_profiles() {
+        let store = ManagedInstanceStore {
+            client_identities: vec![
+                sample_identity("identity-a", "/managed/identity-a.client-identity.json"),
+                sample_identity("identity-b", "/managed/identity-b.client-identity.json"),
+            ],
+            client_cli_instances: vec![
+                sample_client_cli_instance(
+                    "client-a",
+                    true,
+                    Some("identity-a"),
+                    Some("/managed/identity-a.client-identity.json"),
+                ),
+                sample_client_cli_instance(
+                    "client-b",
+                    false,
+                    Some("identity-b"),
+                    Some("/managed/identity-b.client-identity.json"),
+                ),
+            ],
+            ..ManagedInstanceStore::default()
+        };
+
+        let targets =
+            managed_identity_renewal_targets(&store, ManagedIdentitySelection::EnabledLaunch);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].identity.id, "identity-a");
+    }
+}

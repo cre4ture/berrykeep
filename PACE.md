@@ -8,25 +8,29 @@ This file defines how changes should be delivered in this repository.
    - Create a short task plan before coding.
    - Keep exactly one active step at a time.
 
-2. **Submit in meaningful slices**
+2. **Check both skill sources**
+   - Treat the repo-local `skills/` directory as a skills source in addition to any globally installed Codex skills.
+   - If a user mentions "skills" or has a file open under `skills/`, inspect this workspace directory before assuming only external/global skills apply.
+
+3. **Submit in meaningful slices**
    - Each slice must be one coherent outcome (example: "add server endpoint", "wire CLI command", "add integration docs").
    - Avoid mixing unrelated refactors and features in the same slice.
 
-3. **Small, reviewable diffs**
+4. **Small, reviewable diffs**
    - Prefer focused edits over large rewrites.
    - Keep naming and style consistent with existing code.
 
-4. **Validate each slice**
+5. **Validate each slice**
    - Run the narrowest relevant check first (crate-level or file-level).
    - Then run broader checks when appropriate (`cargo check --workspace`, tests if present).
 
-5. **Report deltas, not repetition**
+6. **Report deltas, not repetition**
    - After each slice, summarize:
      - What changed
      - What was validated
      - What comes next
 
-6. **Do not auto-commit unless asked**
+7. **Do not auto-commit unless asked**
    - Prepare clean change sets and wait for explicit commit instruction.
 
 ## Suggested commit granularity
@@ -70,4 +74,3 @@ Example pre-commit checklist (add to PR description or commit message when appli
 - [ ] Unit tests added/updated for refactored components
 
 - Large files should be split into modules or crates to keep focus clear and reduce review and maintenance cost.
-
