@@ -752,6 +752,7 @@ mod tests {
             ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
             ("IRONMESH_STARTUP_REPAIR_ENABLED", "false"),
             ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
+            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
         ];
 
         let mut node_a =
@@ -799,6 +800,7 @@ mod tests {
 
                 let initial_report: serde_json::Value = http
                     .post(format!("{base_a}/cluster/replication/repair"))
+                    .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                     .send()
                     .await?
                     .error_for_status()?
@@ -820,6 +822,7 @@ mod tests {
 
                 let delete_report: serde_json::Value = http
                     .post(format!("{base_a}/cluster/replication/repair"))
+                    .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                     .send()
                     .await?
                     .error_for_status()?

@@ -2950,7 +2950,14 @@ mod tests {
         let remove_node_id = "00000000-0000-0000-0000-0000000000e2";
 
         let data_dir = fresh_data_dir("node-decommission");
-        let mut server = start_open_server_with_config(bind, &data_dir, local_node_id, 2).await?;
+        let mut server = start_open_server_with_env(
+            bind,
+            &data_dir,
+            local_node_id,
+            2,
+            &[("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN)],
+        )
+        .await?;
 
         let base_url = format!("http://{bind}");
         let http = reqwest::Client::new();
@@ -2982,6 +2989,7 @@ mod tests {
 
             let remove_response = http
                 .delete(format!("{base_url}/cluster/nodes/{remove_node_id}"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?;
             assert_eq!(remove_response.status(), StatusCode::NO_CONTENT);
@@ -3010,12 +3018,14 @@ mod tests {
 
             let not_found = http
                 .delete(format!("{base_url}/cluster/nodes/{remove_node_id}"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?;
             assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
 
             let local_conflict = http
                 .delete(format!("{base_url}/cluster/nodes/{local_node_id}"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?;
             assert_eq!(local_conflict.status(), StatusCode::CONFLICT);
@@ -3083,6 +3093,7 @@ mod tests {
 
             let repair_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3190,6 +3201,7 @@ mod tests {
 
             let repair_report: serde_json::Value = http
                 .post(format!("{base_c}/cluster/replication/repair?scope=cluster"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3367,6 +3379,7 @@ mod tests {
 
             let report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair?batch_size=1"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3447,6 +3460,7 @@ mod tests {
 
             let repair_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3552,6 +3566,7 @@ mod tests {
                 .error_for_status()?;
 
             http.post(format!("{base_a}/cluster/replication/repair"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?;
@@ -3571,6 +3586,7 @@ mod tests {
                 .error_for_status()?;
 
             http.post(format!("{base_a}/cluster/replication/repair"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?;
@@ -3659,6 +3675,7 @@ mod tests {
 
             let initial_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3698,6 +3715,7 @@ mod tests {
 
             let delete_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3850,6 +3868,7 @@ mod tests {
             let start = Instant::now();
             let repair_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3956,8 +3975,11 @@ mod tests {
         let data_a = fresh_data_dir("internal-mtls-heartbeat-a");
         let data_b = fresh_data_dir("internal-mtls-heartbeat-b");
 
-        let mut node_a = start_open_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_open_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let admin_env = [("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN)];
+        let mut node_a =
+            start_open_server_with_env(bind_a, &data_a, node_id_a, 2, &admin_env).await?;
+        let mut node_b =
+            start_open_server_with_env(bind_b, &data_b, node_id_b, 2, &admin_env).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
@@ -4045,6 +4067,7 @@ mod tests {
 
             let reconcile = http
                 .post(format!("{base_a}/cluster/reconcile/{node_id_b}"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?;
@@ -4162,6 +4185,7 @@ mod tests {
 
             let first_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/reconcile/{node_id_b}"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -4190,6 +4214,7 @@ mod tests {
 
             let second_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/reconcile/{node_id_b}"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -4377,6 +4402,7 @@ mod tests {
 
             for _ in 0..120 {
                 http.post(format!("{base_a}/cluster/replication/repair"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                     .send()
                     .await?
                     .error_for_status()?;
@@ -4918,6 +4944,7 @@ mod tests {
 
             let repair_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?

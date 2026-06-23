@@ -129,11 +129,29 @@ async fn execute_replication_repair_with_trigger(
 }
 
 pub(crate) async fn execute_replication_repair_public(
-    state: State<ServerState>,
+    State(state): State<ServerState>,
+    headers: HeaderMap,
     query: Query<ReplicationRepairQuery>,
 ) -> impl IntoResponse {
-    execute_replication_repair_with_trigger(state, query, RepairRunTrigger::ManualRequest, false)
-        .await
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "replication_repair",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    execute_replication_repair_with_trigger(
+        State(state),
+        query,
+        RepairRunTrigger::ManualRequest,
+        false,
+    )
+    .await
 }
 
 pub(crate) async fn execute_replication_repair_peer(

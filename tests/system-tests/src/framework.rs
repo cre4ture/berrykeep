@@ -668,7 +668,10 @@ pub async fn start_open_server_with_env_options(
     heartbeat_timeout_secs: Option<u64>,
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
-    let mut merged_env = vec![("IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS", "true")];
+    let mut merged_env = vec![
+        ("IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS", "true"),
+        ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+    ];
     merged_env.extend_from_slice(extra_env);
     start_server_with_env_options_inner(
         bind,
@@ -858,6 +861,7 @@ pub async fn register_node(
     });
 
     http.put(format!("{controller_base}/cluster/nodes/{node_id}"))
+        .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
         .json(&body)
         .send()
         .await?
