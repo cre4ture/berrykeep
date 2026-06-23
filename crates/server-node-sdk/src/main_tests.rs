@@ -8846,12 +8846,16 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
 
 #[tokio::test]
 async fn register_node_uses_structured_reachability_payload() {
-    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let node_id = NodeId::new_v4();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
 
     let response = axum::response::IntoResponse::into_response(
         super::register_node(
             State(state.clone()),
+            headers,
             Path(node_id.to_string()),
             Json(super::RegisterNodeRequest {
                 reachability: cluster::NodeReachability {
@@ -9427,6 +9431,7 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
 #[tokio::test]
 async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     state.network.relay_mode = super::RelayMode::Required;
 
     let remote_node = {
@@ -9528,8 +9533,11 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
         cluster.note_replica(format!("{key}@{version_id}"), remote_node.node_id);
     }
 
+    let mut cleanup_headers = HeaderMap::new();
+    cleanup_headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
     let response = super::execute_replication_cleanup(
         State(state.clone()),
+        cleanup_headers,
         Query(super::ReplicationCleanupQuery {
             dry_run: Some(false),
             max_deletions: Some(1),
