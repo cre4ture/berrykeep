@@ -3927,6 +3927,7 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     config.enrollment_issuer_url = Some(issuer_public_url.clone());
     config.node_enrollment_auto_renew_enabled = true;
     config.node_enrollment_auto_renew_check_secs = 1;
+    config.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
     let public_ca_cert_path = config.public_ca_cert_path.clone().unwrap();
     let internal_tls = config.internal_tls.clone().unwrap();
     let expected_internal_node_id = config.node_id;
