@@ -31,6 +31,33 @@ fn mk_record(
     }
 }
 
+async fn persist_snapshot_fixture(
+    store: &PersistentStore,
+    snapshot_id: &str,
+    created_at_unix: u64,
+) {
+    store
+        .metadata_store
+        .persist_snapshot_manifest(&SnapshotManifest {
+            id: snapshot_id.to_string(),
+            created_at_unix,
+            objects: store.current_state.objects.clone(),
+            object_ids: store.current_state.object_ids.clone(),
+        })
+        .await
+        .unwrap();
+}
+
+async fn snapshot_ids_chronological(store: &PersistentStore) -> Vec<String> {
+    let mut snapshots = store.load_all_snapshots().await.unwrap();
+    snapshots.sort_by(|a, b| {
+        a.created_at_unix
+            .cmp(&b.created_at_unix)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    snapshots.into_iter().map(|snapshot| snapshot.id).collect()
+}
+
 fn sample_png_bytes() -> Vec<u8> {
     let image = image::DynamicImage::new_rgba8(4, 3);
     let mut cursor = std::io::Cursor::new(Vec::new());
@@ -2581,6 +2608,166 @@ run_on_all_metadata_backends!(
     reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_impl,
     reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata,
     reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_turso
+);
+
+async fn compact_snapshot_history_keeps_overlap_boundaries_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("compact-snapshot-history-overlap").await;
+
+    store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"alpha-1"),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    persist_snapshot_fixture(&store, "snap-overlap-001", 100).await;
+
+    store
+        .put_object_versioned(
+            "docs/b.txt",
+            Bytes::from_static(b"bravo-1"),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    persist_snapshot_fixture(&store, "snap-overlap-002", 200).await;
+
+    store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"alpha-2"),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    persist_snapshot_fixture(&store, "snap-overlap-003", 300).await;
+
+    store
+        .put_object_versioned(
+            "docs/c.txt",
+            Bytes::from_static(b"charlie-1"),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    persist_snapshot_fixture(&store, "snap-overlap-004", 400).await;
+
+    let dry_run = store.compact_snapshot_history(true).await.unwrap();
+    assert_eq!(dry_run.snapshots_before, 4);
+    assert_eq!(dry_run.snapshots_retained, 2);
+    assert_eq!(dry_run.removable_snapshots, 2);
+    assert_eq!(dry_run.removed_snapshots, 0);
+    assert!(!dry_run.vacuumed_metadata_db);
+    assert_eq!(dry_run.overlap_flush_boundaries, 1);
+    assert_eq!(dry_run.time_window_flush_boundaries, 0);
+    assert_eq!(
+        snapshot_ids_chronological(&store).await,
+        vec![
+            "snap-overlap-001".to_string(),
+            "snap-overlap-002".to_string(),
+            "snap-overlap-003".to_string(),
+            "snap-overlap-004".to_string(),
+        ]
+    );
+
+    let applied = store.compact_snapshot_history(false).await.unwrap();
+    assert_eq!(applied.removed_snapshots, 2);
+    assert!(applied.vacuumed_metadata_db);
+    assert_eq!(
+        snapshot_ids_chronological(&store).await,
+        vec![
+            "snap-overlap-002".to_string(),
+            "snap-overlap-004".to_string(),
+        ]
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    compact_snapshot_history_keeps_overlap_boundaries_impl,
+    compact_snapshot_history_keeps_overlap_boundaries,
+    compact_snapshot_history_keeps_overlap_boundaries_turso
+);
+
+async fn compact_snapshot_history_limits_batch_window_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("compact-snapshot-history-window").await;
+
+    store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"alpha"),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    persist_snapshot_fixture(&store, "snap-window-001", 1_000).await;
+
+    store
+        .put_object_versioned(
+            "docs/b.txt",
+            Bytes::from_static(b"bravo"),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    persist_snapshot_fixture(&store, "snap-window-002", 1_000 + 3_600).await;
+
+    store
+        .put_object_versioned(
+            "docs/c.txt",
+            Bytes::from_static(b"charlie"),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    persist_snapshot_fixture(&store, "snap-window-003", 1_000 + 7_201).await;
+
+    let dry_run = store.compact_snapshot_history(true).await.unwrap();
+    assert_eq!(dry_run.snapshots_before, 3);
+    assert_eq!(dry_run.snapshots_retained, 2);
+    assert_eq!(dry_run.removable_snapshots, 1);
+    assert!(!dry_run.vacuumed_metadata_db);
+    assert_eq!(dry_run.overlap_flush_boundaries, 0);
+    assert_eq!(dry_run.time_window_flush_boundaries, 1);
+
+    let applied = store.compact_snapshot_history(false).await.unwrap();
+    assert_eq!(applied.removed_snapshots, 1);
+    assert!(applied.vacuumed_metadata_db);
+    assert_eq!(
+        snapshot_ids_chronological(&store).await,
+        vec!["snap-window-002".to_string(), "snap-window-003".to_string(),]
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    compact_snapshot_history_limits_batch_window_impl,
+    compact_snapshot_history_limits_batch_window,
+    compact_snapshot_history_limits_batch_window_turso
 );
 
 async fn rename_replication_subjects_include_source_path_deletion_event_impl(

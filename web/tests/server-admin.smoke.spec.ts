@@ -1369,6 +1369,14 @@ async function installServerAdminMocks(
             description: "Collapse provably redundant delete/recreate loop lineages.",
             dry_run_supported: true,
             destructive: true
+          },
+          {
+            id: "compact_snapshot_history",
+            label: "Compact snapshot history",
+            description:
+              "Remove redundant snapshot checkpoints while preserving per-path retouch boundaries, with a 2-hour batch window.",
+            dry_run_supported: true,
+            destructive: true
           }
         ]
       });

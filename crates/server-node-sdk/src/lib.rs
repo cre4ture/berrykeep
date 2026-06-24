@@ -2502,6 +2502,7 @@ struct RepairActivityStatusResponse {
 const LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID: &str = "legacy_rename_logical_paths";
 const CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID: &str =
     "cleanup_delete_recreate_loop_metadata";
+const COMPACT_SNAPSHOT_HISTORY_REPAIR_ACTION_ID: &str = "compact_snapshot_history";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManualRepairActionDescriptor {
@@ -18784,6 +18785,13 @@ fn manual_repair_action_descriptors() -> Vec<ManualRepairActionDescriptor> {
             dry_run_supported: true,
             destructive: true,
         },
+        ManualRepairActionDescriptor {
+            id: COMPACT_SNAPSHOT_HISTORY_REPAIR_ACTION_ID.to_string(),
+            label: "Compact snapshot history".to_string(),
+            description: "Remove redundant snapshot checkpoints while preserving per-path retouch boundaries, and never batch distinct-path changes across more than a 2-hour window.".to_string(),
+            dry_run_supported: true,
+            destructive: true,
+        },
     ]
 }
 
@@ -18917,6 +18925,43 @@ async fn run_manual_repair_action(
                 format!(
                     "{} duplicate delete/recreate loop group(s) eligible; {} redundant lineage(s) removed",
                     report.duplicate_groups, report.removed_indexes
+                )
+            };
+            ManualRepairActionExecution {
+                changed,
+                summary,
+                report: serialize_manual_repair_report(&action_id, &report),
+            }
+        }
+        COMPACT_SNAPSHOT_HISTORY_REPAIR_ACTION_ID => {
+            let report = {
+                let mut store = lock_store(&state, "manual_repair.compact_snapshot_history").await;
+                match store.compact_snapshot_history(request.dry_run).await {
+                    Ok(report) => report,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            action_id = %action_id,
+                            dry_run = request.dry_run,
+                            "manual repair action failed"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            };
+
+            let changed = !request.dry_run && report.removed_snapshots > 0;
+            let summary = if request.dry_run {
+                format!(
+                    "{} redundant snapshot(s) removable; {} retained under path-overlap and 2h batch rules",
+                    report.removable_snapshots, report.snapshots_retained
+                )
+            } else {
+                format!(
+                    "{} redundant snapshot(s) removed, metadata DB vacuumed={}, {} retained under path-overlap and 2h batch rules",
+                    report.removed_snapshots,
+                    report.vacuumed_metadata_db,
+                    report.snapshots_retained
                 )
             };
             ManualRepairActionExecution {

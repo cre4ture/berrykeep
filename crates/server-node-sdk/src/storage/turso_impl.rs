@@ -852,6 +852,43 @@ impl MetadataStore for TursoMetadataStore {
         Ok(snapshots)
     }
 
+    async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()> {
+        const TURSO_SNAPSHOT_DELETE_BATCH_SIZE: usize = 500;
+
+        if snapshot_ids.is_empty() {
+            return Ok(());
+        }
+
+        self.connection.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: Result<()> = async {
+            for chunk in snapshot_ids.chunks(TURSO_SNAPSHOT_DELETE_BATCH_SIZE) {
+                let placeholders = std::iter::repeat("?")
+                    .take(chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.connection
+                    .execute(
+                        format!("DELETE FROM snapshots WHERE snapshot_id IN ({placeholders})"),
+                        params_from_iter(chunk.iter().cloned()),
+                    )
+                    .await?;
+            }
+            self.connection.execute_batch("COMMIT").await?;
+            Ok(())
+        }
+        .await;
+
+        if result.is_err() {
+            self.rollback().await;
+        }
+        result
+    }
+
+    async fn vacuum_metadata_store(&self) -> Result<()> {
+        self.connection.execute("VACUUM", ()).await?;
+        Ok(())
+    }
+
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>> {
         let mut rows = self
             .connection

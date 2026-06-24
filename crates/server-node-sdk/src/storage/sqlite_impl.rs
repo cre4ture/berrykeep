@@ -811,6 +811,31 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(snapshots)
     }
 
+    async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()> {
+        const SQLITE_SNAPSHOT_DELETE_BATCH_SIZE: usize = 500;
+
+        if snapshot_ids.is_empty() {
+            return Ok(());
+        }
+
+        self.in_metadata_tx(|db| {
+            for chunk in snapshot_ids.chunks(SQLITE_SNAPSHOT_DELETE_BATCH_SIZE) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let query = format!("DELETE FROM snapshots WHERE snapshot_id IN ({placeholders})");
+                db.execute(&query, params_from_iter(chunk.iter()))?;
+            }
+            Ok(())
+        })
+    }
+
+    async fn vacuum_metadata_store(&self) -> Result<()> {
+        let db = self.metadata_conn()?;
+        db.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>> {
         let db = self.metadata_conn()?;
         let payload = db

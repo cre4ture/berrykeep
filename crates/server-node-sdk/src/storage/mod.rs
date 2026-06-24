@@ -54,6 +54,9 @@ const MEDIA_CACHE_BUILD_MAX_CONCURRENCY: usize = 20;
 const READ_THROUGH_CACHE_CLASS: &str = "read_through";
 const LEGACY_RENAME_RECONCILE_UPDATE_SAMPLE_LIMIT: usize = 64;
 const DELETE_RECREATE_LOOP_REPAIR_SAMPLE_LIMIT: usize = 64;
+const SNAPSHOT_HISTORY_COMPACTION_SAMPLE_LIMIT: usize = 64;
+const SNAPSHOT_HISTORY_COMPACTION_CHANGED_PATH_SAMPLE_LIMIT: usize = 8;
+const SNAPSHOT_HISTORY_MAX_BATCH_WINDOW_SECS: u64 = 2 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ChunkRef {
@@ -206,6 +209,39 @@ pub struct DeleteRecreateLoopCleanupReport {
     pub sampled_groups: Vec<DeleteRecreateLoopCleanupGroup>,
     pub sampled_groups_truncated: bool,
     pub archive_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotHistoryCompactionRemovalReason {
+    BatchedDistinctPaths,
+    DuplicateState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotHistoryCompactionRemovedSnapshot {
+    pub snapshot_id: String,
+    pub created_at_unix: u64,
+    pub changed_path_count: usize,
+    pub sampled_changed_paths: Vec<String>,
+    pub reason: SnapshotHistoryCompactionRemovalReason,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SnapshotHistoryCompactionReport {
+    pub dry_run: bool,
+    pub max_batch_window_secs: u64,
+    pub snapshots_scanned: usize,
+    pub snapshots_before: usize,
+    pub snapshots_retained: usize,
+    pub removable_snapshots: usize,
+    pub removed_snapshots: usize,
+    pub overlap_flush_boundaries: usize,
+    pub time_window_flush_boundaries: usize,
+    pub duplicate_state_snapshots: usize,
+    pub vacuumed_metadata_db: bool,
+    pub sampled_removed_snapshots: Vec<SnapshotHistoryCompactionRemovedSnapshot>,
+    pub sampled_removed_snapshots_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1019,6 +1055,8 @@ trait MetadataStore: Send + Sync {
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
+    async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()>;
+    async fn vacuum_metadata_store(&self) -> Result<()>;
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>>;
     async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()>;
     async fn load_cached_chunk_record(&self, hash: &str) -> Result<Option<CachedChunkRecord>>;
@@ -3051,6 +3089,135 @@ impl PersistentStore {
         if !dry_run && current_state_changed {
             self.persist_current_state().await?;
             self.create_snapshot().await?;
+        }
+
+        Ok(report)
+    }
+
+    pub async fn compact_snapshot_history(
+        &mut self,
+        dry_run: bool,
+    ) -> Result<SnapshotHistoryCompactionReport> {
+        let mut report = SnapshotHistoryCompactionReport {
+            dry_run,
+            max_batch_window_secs: SNAPSHOT_HISTORY_MAX_BATCH_WINDOW_SECS,
+            ..SnapshotHistoryCompactionReport::default()
+        };
+
+        let mut snapshots = self.load_all_snapshots().await?;
+        snapshots.sort_by(|a, b| {
+            a.created_at_unix
+                .cmp(&b.created_at_unix)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        report.snapshots_scanned = snapshots.len();
+        report.snapshots_before = snapshots.len();
+        if snapshots.is_empty() {
+            return Ok(report);
+        }
+
+        let mut retained_snapshot_ids = HashSet::<String>::new();
+        let mut removable_snapshots = Vec::<SnapshotHistoryCompactionRemovedSnapshot>::new();
+        let mut dirty_paths = HashSet::<String>::new();
+        let mut batch_start_created_at_unix = None;
+        let mut previous_snapshot = None::<&SnapshotManifest>;
+        let mut previous_snapshot_changed_paths = BTreeSet::<String>::new();
+
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            let changed_paths = snapshot_changed_paths(previous_snapshot, snapshot);
+            if changed_paths.is_empty() {
+                report.duplicate_state_snapshots =
+                    report.duplicate_state_snapshots.saturating_add(1);
+            }
+
+            let has_overlap = !changed_paths.is_empty()
+                && changed_paths
+                    .iter()
+                    .any(|path| dirty_paths.contains(path.as_str()));
+            let exceeds_time_window = !changed_paths.is_empty()
+                && batch_start_created_at_unix
+                    .map(|started_at_unix| {
+                        snapshot.created_at_unix.saturating_sub(started_at_unix)
+                            > SNAPSHOT_HISTORY_MAX_BATCH_WINDOW_SECS
+                    })
+                    .unwrap_or(false);
+
+            if index > 0 && (has_overlap || exceeds_time_window) {
+                let previous = &snapshots[index - 1];
+                retained_snapshot_ids.insert(previous.id.clone());
+                if has_overlap {
+                    report.overlap_flush_boundaries =
+                        report.overlap_flush_boundaries.saturating_add(1);
+                }
+                if exceeds_time_window {
+                    report.time_window_flush_boundaries =
+                        report.time_window_flush_boundaries.saturating_add(1);
+                }
+                dirty_paths.clear();
+                batch_start_created_at_unix = None;
+            }
+
+            if !changed_paths.is_empty() {
+                if batch_start_created_at_unix.is_none() {
+                    batch_start_created_at_unix = Some(snapshot.created_at_unix);
+                }
+                dirty_paths.extend(changed_paths.iter().cloned());
+            }
+
+            if let Some(previous) = previous_snapshot {
+                let reason = if previous_snapshot_changed_paths.is_empty() {
+                    Some(SnapshotHistoryCompactionRemovalReason::DuplicateState)
+                } else if !retained_snapshot_ids.contains(&previous.id) {
+                    Some(SnapshotHistoryCompactionRemovalReason::BatchedDistinctPaths)
+                } else {
+                    None
+                };
+
+                if let Some(reason) = reason
+                    && !retained_snapshot_ids.contains(&previous.id)
+                {
+                    removable_snapshots.push(SnapshotHistoryCompactionRemovedSnapshot {
+                        snapshot_id: previous.id.clone(),
+                        created_at_unix: previous.created_at_unix,
+                        changed_path_count: previous_snapshot_changed_paths.len(),
+                        sampled_changed_paths: previous_snapshot_changed_paths
+                            .iter()
+                            .take(SNAPSHOT_HISTORY_COMPACTION_CHANGED_PATH_SAMPLE_LIMIT)
+                            .cloned()
+                            .collect(),
+                        reason,
+                    });
+                }
+            }
+
+            previous_snapshot = Some(snapshot);
+            previous_snapshot_changed_paths = changed_paths;
+        }
+
+        let latest_snapshot = snapshots
+            .last()
+            .expect("snapshot list is known to be non-empty");
+        retained_snapshot_ids.insert(latest_snapshot.id.clone());
+        report.snapshots_retained = retained_snapshot_ids.len();
+        report.removable_snapshots = removable_snapshots.len();
+        report.sampled_removed_snapshots = removable_snapshots
+            .iter()
+            .take(SNAPSHOT_HISTORY_COMPACTION_SAMPLE_LIMIT)
+            .cloned()
+            .collect();
+        report.sampled_removed_snapshots_truncated =
+            removable_snapshots.len() > SNAPSHOT_HISTORY_COMPACTION_SAMPLE_LIMIT;
+
+        if !dry_run && !removable_snapshots.is_empty() {
+            let removable_ids = removable_snapshots
+                .iter()
+                .map(|snapshot| snapshot.snapshot_id.clone())
+                .collect::<Vec<_>>();
+            self.delete_snapshots_by_id(&removable_ids).await?;
+            self.vacuum_metadata_store().await?;
+            report.removed_snapshots = removable_ids.len();
+            report.vacuumed_metadata_db = true;
         }
 
         Ok(report)
@@ -6437,6 +6604,16 @@ impl PersistentStore {
         self.metadata_store.load_all_snapshots().await
     }
 
+    async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()> {
+        self.metadata_store
+            .delete_snapshots_by_id(snapshot_ids)
+            .await
+    }
+
+    async fn vacuum_metadata_store(&self) -> Result<()> {
+        self.metadata_store.vacuum_metadata_store().await
+    }
+
     async fn has_version_index(&self, object_id: &str) -> Result<bool> {
         self.metadata_store.has_version_index(object_id).await
     }
@@ -6810,6 +6987,40 @@ fn snapshot_version_record_for_manifest<'a>(
                 .cmp(&right.created_at_unix)
                 .then_with(|| left.version_id.cmp(&right.version_id))
         })
+}
+
+fn snapshot_changed_paths(
+    previous: Option<&SnapshotManifest>,
+    current: &SnapshotManifest,
+) -> BTreeSet<String> {
+    let mut candidate_paths = BTreeSet::new();
+
+    if let Some(previous) = previous {
+        candidate_paths.extend(previous.objects.keys().cloned());
+        candidate_paths.extend(previous.object_ids.keys().cloned());
+    }
+    candidate_paths.extend(current.objects.keys().cloned());
+    candidate_paths.extend(current.object_ids.keys().cloned());
+
+    candidate_paths
+        .into_iter()
+        .filter(|path| {
+            snapshot_path_binding(previous, path) != snapshot_path_binding(Some(current), path)
+        })
+        .collect()
+}
+
+fn snapshot_path_binding<'a>(
+    snapshot: Option<&'a SnapshotManifest>,
+    path: &str,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let manifest_hash = snapshot
+        .and_then(|snapshot| snapshot.objects.get(path))
+        .map(String::as_str);
+    let object_id = snapshot
+        .and_then(|snapshot| snapshot.object_ids.get(path))
+        .map(String::as_str);
+    (manifest_hash, object_id)
 }
 
 fn rank_state(state: &VersionConsistencyState) -> u8 {
