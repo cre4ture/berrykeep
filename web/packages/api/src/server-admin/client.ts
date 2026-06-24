@@ -103,6 +103,16 @@ export async function logoutAdmin(adminTokenOverride?: string): Promise<{ status
   });
 }
 
+export async function changeAdminPassword(
+  currentPassword: string,
+  newPassword: string
+): Promise<{ status: string }> {
+  return fetchAdminJson<{ status: string }>(apiV1("/auth/admin/change-password"), {
+    method: "POST",
+    body: { current_password: currentPassword, new_password: newPassword }
+  });
+}
+
 export async function listAdminSnapshots(
   adminTokenOverride?: string
 ): Promise<AdminSnapshotSummary[]> {

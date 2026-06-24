@@ -1413,7 +1413,13 @@ async fn request_has_admin_auth(state: &ServerState, headers: &HeaderMap) -> boo
 }
 
 fn admin_auth_configured(state: &ServerState) -> bool {
-    state.access.admin_control.admin_password_hash.is_some()
+    state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .expect("admin_password_hash mutex poisoned")
+        .is_some()
         || state.access.admin_control.admin_token.is_some()
 }
 
@@ -2271,7 +2277,7 @@ struct PeerHeartbeatConfig {
 #[derive(Debug, Clone, Default)]
 struct AdminControl {
     admin_token: Option<String>,
-    admin_password_hash: Option<String>,
+    admin_password_hash: Arc<StdMutex<Option<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -4379,7 +4385,7 @@ impl ServerNodeConfig {
     fn admin_control(&self) -> AdminControl {
         AdminControl {
             admin_token: self.admin_token.clone(),
-            admin_password_hash: self.admin_password_hash.clone(),
+            admin_password_hash: Arc::new(StdMutex::new(self.admin_password_hash.clone())),
         }
     }
 
@@ -5419,6 +5425,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/admin/session", get(get_admin_session_status))
         .route("/auth/admin/login", post(login_admin_session))
         .route("/auth/admin/logout", post(logout_admin_session))
+        .route("/auth/admin/change-password", post(change_admin_password))
         .route("/auth/repair/activity", get(repair_activity_status))
         .route("/auth/repair/history", get(repair_history))
         .route("/auth/repair/actions", get(list_manual_repair_actions))
@@ -13503,6 +13510,14 @@ struct AdminSessionStatusResponse {
     authenticated: bool,
     session_expires_at_unix: Option<u64>,
     token_override_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password_upgraded: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminChangePasswordRequest {
+    current_password: String,
+    new_password: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -20021,9 +20036,59 @@ async fn current_admin_session_expiry(state: &ServerState, headers: &HeaderMap) 
     sessions.is_valid(&session_id, unix_ts())
 }
 
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn is_legacy_password_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn password_hash_matches(expected_hash: &str, password: &str) -> bool {
-    let provided_hash = hash_token(password);
-    constant_time_eq(expected_hash.as_bytes(), provided_hash.as_bytes())
+    if is_legacy_password_hash(expected_hash) {
+        let provided_hash = hash_token(password);
+        return constant_time_eq(expected_hash.as_bytes(), provided_hash.as_bytes());
+    }
+    if let Some(rest) = expected_hash.strip_prefix("pbkdf2sha256:") {
+        let parts: Vec<&str> = rest.splitn(3, ':').collect();
+        if parts.len() == 3 {
+            if let (Ok(rounds), Some(salt_bytes), Some(expected_bytes)) = (
+                parts[0].parse::<u32>(),
+                hex_to_bytes(parts[1]),
+                hex_to_bytes(parts[2]),
+            ) {
+                use pbkdf2::pbkdf2_hmac;
+                use sha2::Sha256;
+                let mut hash = vec![0u8; expected_bytes.len()];
+                pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt_bytes, rounds, &mut hash);
+                return constant_time_eq(&expected_bytes, &hash);
+            }
+        }
+    }
+    false
+}
+
+async fn upgrade_password_hash_if_legacy(state: &ServerState, password: &str) {
+    let new_hash = setup::hash_admin_password(password);
+    *state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .expect("admin_password_hash mutex poisoned") = Some(new_hash.clone());
+    let state_path = setup::managed_setup_state_path(&state.data_dir);
+    if let Ok(Some(mut managed)) = setup::read_managed_setup_state(&state_path) {
+        managed.admin_password_hash = Some(new_hash);
+        if let Err(err) = setup::write_managed_setup_state(&state_path, &managed) {
+            warn!(error = %err, "failed to persist upgraded admin password hash");
+        }
+    }
 }
 
 fn admin_session_cookie_name(state: &ServerState) -> String {
@@ -20110,6 +20175,7 @@ async fn get_admin_session_status(
             authenticated,
             session_expires_at_unix,
             token_override_enabled: state.access.admin_control.admin_token.is_some(),
+            password_upgraded: None,
         }),
     )
 }
@@ -20121,7 +20187,14 @@ async fn login_admin_session(
 ) -> impl IntoResponse {
     let action = "auth/admin/login";
     let request_meta = admin_request_metadata(&headers);
-    let Some(expected_hash) = state.access.admin_control.admin_password_hash.as_deref() else {
+    let expected_hash = state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .expect("admin_password_hash mutex poisoned")
+        .clone();
+    let Some(expected_hash) = expected_hash else {
         append_admin_audit(
             &state,
             action,
@@ -20140,7 +20213,7 @@ async fn login_admin_session(
             .into_response();
     };
 
-    if !password_hash_matches(expected_hash, &request.password) {
+    if !password_hash_matches(&expected_hash, &request.password) {
         append_admin_audit(
             &state,
             action,
@@ -20157,6 +20230,11 @@ async fn login_admin_session(
             Json(json!({ "error": "invalid admin password" })),
         )
             .into_response();
+    }
+
+    let password_upgraded = is_legacy_password_hash(&expected_hash);
+    if password_upgraded {
+        upgrade_password_hash_if_legacy(&state, &request.password).await;
     }
 
     let (session_id, session_expires_at_unix) = {
@@ -20216,6 +20294,7 @@ async fn login_admin_session(
             authenticated: true,
             session_expires_at_unix: Some(session_expires_at_unix),
             token_override_enabled: state.access.admin_control.admin_token.is_some(),
+            password_upgraded: if password_upgraded { Some(true) } else { None },
         }),
     )
         .into_response()
@@ -20254,9 +20333,117 @@ async fn logout_admin_session(
             authenticated: false,
             session_expires_at_unix: None,
             token_override_enabled: state.access.admin_control.admin_token.is_some(),
+            password_upgraded: None,
         }),
     )
         .into_response()
+}
+
+async fn change_admin_password(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<AdminChangePasswordRequest>,
+) -> impl IntoResponse {
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        "auth/admin/change-password",
+        true,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        Ok(meta) => meta,
+        Err(status) => return status.into_response(),
+    };
+
+    let expected_hash = state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .expect("admin_password_hash mutex poisoned")
+        .clone();
+    let Some(expected_hash) = expected_hash else {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({ "error": "password-backed admin login is not enabled on this node" })),
+        )
+            .into_response();
+    };
+
+    if !password_hash_matches(&expected_hash, &request.current_password) {
+        append_admin_audit(
+            &state,
+            "auth/admin/change-password",
+            &authz,
+            true,
+            true,
+            true,
+            "denied_auth",
+            json!({ "error": "current password is incorrect" }),
+        )
+        .await;
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "current password is incorrect" })),
+        )
+            .into_response();
+    }
+
+    if let Err(message) = setup::validate_admin_password(&request.new_password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": message })),
+        )
+            .into_response();
+    }
+
+    let new_hash = setup::hash_admin_password(&request.new_password);
+    *state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .expect("admin_password_hash mutex poisoned") = Some(new_hash.clone());
+
+    let state_path = setup::managed_setup_state_path(&state.data_dir);
+    if let Ok(Some(mut managed)) = setup::read_managed_setup_state(&state_path) {
+        managed.admin_password_hash = Some(new_hash);
+        if let Err(err) = setup::write_managed_setup_state(&state_path, &managed) {
+            append_admin_audit(
+                &state,
+                "auth/admin/change-password",
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
+    append_admin_audit(
+        &state,
+        "auth/admin/change-password",
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({}),
+    )
+    .await;
+
+    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
 }
 
 async fn authorize_admin_request(

@@ -46,14 +46,14 @@ enum SetupLifecycleState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ManagedSetupState {
+pub(crate) struct ManagedSetupState {
     version: u32,
     state: SetupLifecycleState,
     updated_at_unix: u64,
     cluster_id: Option<ClusterId>,
     node_id: Option<NodeId>,
     runtime_node_enrollment_path: Option<String>,
-    admin_password_hash: Option<String>,
+    pub(crate) admin_password_hash: Option<String>,
     managed_rendezvous_bind_addr: Option<String>,
     managed_rendezvous_public_url: Option<String>,
     pending_join_request: Option<NodeJoinRequest>,
@@ -607,7 +607,7 @@ async fn start_new_cluster(
     managed.cluster_id = Some(cluster_id);
     managed.node_id = Some(node_id);
     managed.runtime_node_enrollment_path = Some(runtime_enrollment_path.display().to_string());
-    managed.admin_password_hash = Some(hash_token(&request.admin_password));
+    managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     managed.managed_rendezvous_bind_addr = Some(managed_rendezvous_bind_addr.to_string());
     managed.managed_rendezvous_public_url = Some(managed_rendezvous_public_url.clone());
     managed.pending_join_request = None;
@@ -633,7 +633,7 @@ async fn start_new_cluster(
     };
     apply_managed_signer_paths(&state.config.data_dir, &mut config);
     apply_managed_rendezvous_config(&state.config.data_dir, &managed_snapshot, &mut config);
-    config.admin_password_hash = Some(hash_token(&request.admin_password));
+    config.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     let completion_permit = match state.completion_tx.clone().reserve_owned().await {
         Ok(permit) => permit,
         Err(_) => {
@@ -801,7 +801,7 @@ async fn import_node_enrollment_package(
     managed.cluster_id = Some(package.bootstrap.cluster_id);
     managed.node_id = Some(package.bootstrap.node_id);
     managed.runtime_node_enrollment_path = Some(runtime_enrollment_path.display().to_string());
-    managed.admin_password_hash = Some(hash_token(&request.admin_password));
+    managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     managed.managed_rendezvous_bind_addr = None;
     managed.managed_rendezvous_public_url = None;
     managed.pending_join_request = None;
@@ -827,7 +827,7 @@ async fn import_node_enrollment_package(
     };
     apply_managed_signer_paths(&state.config.data_dir, &mut config);
     apply_managed_rendezvous_config(&state.config.data_dir, &managed_snapshot, &mut config);
-    config.admin_password_hash = Some(hash_token(&request.admin_password));
+    config.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     let completion_permit = match state.completion_tx.clone().reserve_owned().await {
         Ok(permit) => permit,
         Err(_) => {
@@ -986,7 +986,7 @@ fn managed_setup_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("managed")
 }
 
-fn managed_setup_state_path(data_dir: &std::path::Path) -> PathBuf {
+pub(crate) fn managed_setup_state_path(data_dir: &std::path::Path) -> PathBuf {
     managed_setup_dir(data_dir).join("setup-state.json")
 }
 
@@ -1048,7 +1048,7 @@ fn ensure_managed_setup_state(path: &std::path::Path) -> Result<ManagedSetupStat
     Ok(state)
 }
 
-fn read_managed_setup_state(path: &std::path::Path) -> Result<Option<ManagedSetupState>> {
+pub(crate) fn read_managed_setup_state(path: &std::path::Path) -> Result<Option<ManagedSetupState>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -1062,7 +1062,7 @@ fn read_managed_setup_state(path: &std::path::Path) -> Result<Option<ManagedSetu
     Ok(Some(state))
 }
 
-fn write_managed_setup_state(path: &std::path::Path, state: &ManagedSetupState) -> Result<()> {
+pub(crate) fn write_managed_setup_state(path: &std::path::Path, state: &ManagedSetupState) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating {}", parent.display()))?;
@@ -1685,7 +1685,20 @@ pub(crate) fn default_managed_rendezvous_bind_addr(public_bind_addr: SocketAddr)
     SocketAddr::new(public_bind_addr.ip(), rendezvous_port)
 }
 
-fn validate_admin_password(password: &str) -> std::result::Result<(), &'static str> {
+pub(crate) fn hash_admin_password(password: &str) -> String {
+    const ROUNDS: u32 = 600_000;
+    const SALT_LEN: usize = 16;
+    const HASH_LEN: usize = 32;
+    let mut salt = [0u8; SALT_LEN];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+    let mut hash = [0u8; HASH_LEN];
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, ROUNDS, &mut hash);
+    let salt_hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
+    let hash_hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    format!("pbkdf2sha256:{ROUNDS}:{salt_hex}:{hash_hex}")
+}
+
+pub(crate) fn validate_admin_password(password: &str) -> std::result::Result<(), &'static str> {
     if password.trim().len() < 12 {
         return Err("admin password must be at least 12 characters long");
     }

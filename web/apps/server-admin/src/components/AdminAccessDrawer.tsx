@@ -1,6 +1,7 @@
 import {
   Badge,
   Button,
+  Collapse,
   Drawer,
   Group,
   PasswordInput,
@@ -9,6 +10,7 @@ import {
 } from "@mantine/core";
 import { JsonBlock } from "@ironmesh/ui";
 import { useState } from "react";
+import { changeAdminPassword } from "@ironmesh/api";
 import { useAdminAccess } from "../lib/admin-access";
 
 type AdminAccessDrawerProps = {
@@ -26,8 +28,13 @@ export function AdminAccessDrawer({ opened, onClose }: AdminAccessDrawerProps) {
     logout
   } = useAdminAccess();
   const [password, setPassword] = useState("");
-  const [pending, setPending] = useState<"login" | "logout" | "refresh" | null>(null);
+  const [pending, setPending] = useState<"login" | "logout" | "refresh" | "change-password" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [changePasswordOpen, setChangePasswordOpen] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [changePasswordSuccess, setChangePasswordSuccess] = useState(false);
 
   async function handleLogin() {
     if (!password.trim()) {
@@ -63,6 +70,35 @@ export function AdminAccessDrawer({ opened, onClose }: AdminAccessDrawerProps) {
     setActionError(null);
     try {
       await refreshSession();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPending(null);
+    }
+  }
+
+  async function handleChangePassword() {
+    if (!currentPassword.trim()) {
+      setActionError("current password is required");
+      return;
+    }
+    if (!newPassword.trim()) {
+      setActionError("new password is required");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setActionError("new passwords do not match");
+      return;
+    }
+    setPending("change-password");
+    setActionError(null);
+    setChangePasswordSuccess(false);
+    try {
+      await changeAdminPassword(currentPassword, newPassword);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      setChangePasswordSuccess(true);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -111,6 +147,53 @@ export function AdminAccessDrawer({ opened, onClose }: AdminAccessDrawerProps) {
             {sessionStatus?.authenticated ? "authenticated" : "not authenticated"}
           </Badge>
         </Group>
+
+        {sessionStatus?.authenticated ? (
+          <Stack gap="sm">
+            <Button
+              variant="subtle"
+              size="compact-sm"
+              onClick={() => {
+                setChangePasswordOpen((open) => !open);
+                setActionError(null);
+                setChangePasswordSuccess(false);
+              }}
+            >
+              {changePasswordOpen ? "Hide" : "Change password"}
+            </Button>
+            <Collapse in={changePasswordOpen}>
+              <Stack gap="sm">
+                <PasswordInput
+                  label="Current password"
+                  value={currentPassword}
+                  onChange={(event) => setCurrentPassword(event.currentTarget.value)}
+                  placeholder="Enter current password"
+                />
+                <PasswordInput
+                  label="New password"
+                  value={newPassword}
+                  onChange={(event) => setNewPassword(event.currentTarget.value)}
+                  placeholder="Enter new password"
+                />
+                <PasswordInput
+                  label="Confirm new password"
+                  value={confirmPassword}
+                  onChange={(event) => setConfirmPassword(event.currentTarget.value)}
+                  placeholder="Confirm new password"
+                />
+                <Button
+                  onClick={() => void handleChangePassword()}
+                  loading={pending === "change-password"}
+                >
+                  Update password
+                </Button>
+                {changePasswordSuccess ? (
+                  <Text c="teal">Password updated successfully.</Text>
+                ) : null}
+              </Stack>
+            </Collapse>
+          </Stack>
+        ) : null}
 
         {sessionError ? <Text c="red">{sessionError}</Text> : null}
         {actionError ? <Text c="red">{actionError}</Text> : null}

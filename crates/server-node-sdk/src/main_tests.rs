@@ -2826,8 +2826,12 @@ async fn export_managed_signer_backup_returns_encrypted_backup() {
 #[tokio::test]
 async fn admin_password_login_creates_session_cookie() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.access.admin_control.admin_password_hash =
-        Some(super::hash_token("super-secret-password"));
+    *state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .unwrap() = Some(super::hash_token("super-secret-password"));
 
     let response = super::login_admin_session(
         State(state.clone()),
@@ -2875,8 +2879,12 @@ async fn admin_session_status_stays_locked_when_admin_auth_is_unconfigured() {
 #[tokio::test]
 async fn admin_session_cookie_authorizes_admin_request() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.access.admin_control.admin_password_hash =
-        Some(super::hash_token("super-secret-password"));
+    *state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .unwrap() = Some(super::hash_token("super-secret-password"));
 
     let login_response = super::login_admin_session(
         State(state.clone()),
@@ -2910,10 +2918,18 @@ async fn admin_session_cookie_authorizes_admin_request() {
 async fn admin_session_cookies_are_isolated_per_node() {
     let mut node_a = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let mut node_b = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    node_a.access.admin_control.admin_password_hash =
-        Some(super::hash_token("super-secret-password"));
-    node_b.access.admin_control.admin_password_hash =
-        Some(super::hash_token("super-secret-password"));
+    *node_a
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .unwrap() = Some(super::hash_token("super-secret-password"));
+    *node_b
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .unwrap() = Some(super::hash_token("super-secret-password"));
 
     let login_a = super::login_admin_session(
         State(node_a.clone()),
