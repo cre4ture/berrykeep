@@ -1048,7 +1048,9 @@ fn ensure_managed_setup_state(path: &std::path::Path) -> Result<ManagedSetupStat
     Ok(state)
 }
 
-pub(crate) fn read_managed_setup_state(path: &std::path::Path) -> Result<Option<ManagedSetupState>> {
+pub(crate) fn read_managed_setup_state(
+    path: &std::path::Path,
+) -> Result<Option<ManagedSetupState>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -1062,7 +1064,10 @@ pub(crate) fn read_managed_setup_state(path: &std::path::Path) -> Result<Option<
     Ok(Some(state))
 }
 
-pub(crate) fn write_managed_setup_state(path: &std::path::Path, state: &ManagedSetupState) -> Result<()> {
+pub(crate) fn write_managed_setup_state(
+    path: &std::path::Path,
+    state: &ManagedSetupState,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating {}", parent.display()))?;

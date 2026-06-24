@@ -20037,7 +20037,7 @@ async fn current_admin_session_expiry(state: &ServerState, headers: &HeaderMap) 
 }
 
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -20050,28 +20050,28 @@ fn is_legacy_password_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+fn verify_pbkdf2_password(expected_hash: &str, password: &str) -> Option<bool> {
+    use pbkdf2::pbkdf2_hmac;
+    use sha2::Sha256;
+    let rest = expected_hash.strip_prefix("pbkdf2sha256:")?;
+    let parts: Vec<&str> = rest.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let rounds: u32 = parts[0].parse().ok()?;
+    let salt_bytes = hex_to_bytes(parts[1])?;
+    let expected_bytes = hex_to_bytes(parts[2])?;
+    let mut hash = vec![0u8; expected_bytes.len()];
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt_bytes, rounds, &mut hash);
+    Some(constant_time_eq(&expected_bytes, &hash))
+}
+
 fn password_hash_matches(expected_hash: &str, password: &str) -> bool {
     if is_legacy_password_hash(expected_hash) {
         let provided_hash = hash_token(password);
         return constant_time_eq(expected_hash.as_bytes(), provided_hash.as_bytes());
     }
-    if let Some(rest) = expected_hash.strip_prefix("pbkdf2sha256:") {
-        let parts: Vec<&str> = rest.splitn(3, ':').collect();
-        if parts.len() == 3 {
-            if let (Ok(rounds), Some(salt_bytes), Some(expected_bytes)) = (
-                parts[0].parse::<u32>(),
-                hex_to_bytes(parts[1]),
-                hex_to_bytes(parts[2]),
-            ) {
-                use pbkdf2::pbkdf2_hmac;
-                use sha2::Sha256;
-                let mut hash = vec![0u8; expected_bytes.len()];
-                pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt_bytes, rounds, &mut hash);
-                return constant_time_eq(&expected_bytes, &hash);
-            }
-        }
-    }
-    false
+    verify_pbkdf2_password(expected_hash, password).unwrap_or(false)
 }
 
 async fn upgrade_password_hash_if_legacy(state: &ServerState, password: &str) {
@@ -20393,11 +20393,7 @@ async fn change_admin_password(
     }
 
     if let Err(message) = setup::validate_admin_password(&request.new_password) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": message })),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
     }
 
     let new_hash = setup::hash_admin_password(&request.new_password);
