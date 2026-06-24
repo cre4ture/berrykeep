@@ -20397,17 +20397,32 @@ async fn change_admin_password(
     }
 
     let new_hash = setup::hash_admin_password(&request.new_password);
-    *state
-        .access
-        .admin_control
-        .admin_password_hash
-        .lock()
-        .expect("admin_password_hash mutex poisoned") = Some(new_hash.clone());
 
     let state_path = setup::managed_setup_state_path(&state.data_dir);
-    if let Ok(Some(mut managed)) = setup::read_managed_setup_state(&state_path) {
-        managed.admin_password_hash = Some(new_hash);
-        if let Err(err) = setup::write_managed_setup_state(&state_path, &managed) {
+    match setup::read_managed_setup_state(&state_path) {
+        Ok(Some(mut managed)) => {
+            managed.admin_password_hash = Some(new_hash.clone());
+            if let Err(err) = setup::write_managed_setup_state(&state_path, &managed) {
+                append_admin_audit(
+                    &state,
+                    "auth/admin/change-password",
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": err.to_string() }),
+                )
+                .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
             append_admin_audit(
                 &state,
                 "auth/admin/change-password",
@@ -20426,6 +20441,13 @@ async fn change_admin_password(
                 .into_response();
         }
     }
+
+    *state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .expect("admin_password_hash mutex poisoned") = Some(new_hash);
 
     append_admin_audit(
         &state,
