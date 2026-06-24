@@ -46,6 +46,8 @@ use tower::{Service, ServiceExt};
 use uuid::Uuid;
 use x509_parser::prelude::FromDer;
 
+const TEST_ADMIN_TOKEN: &str = "system-test-admin";
+
 #[derive(Clone, Copy)]
 enum MainTestBackend {
     Sqlite,
@@ -311,7 +313,7 @@ fn test_cluster_config_without_internal_tls(
         startup_repair_delay_secs: 5,
         peer_heartbeat_enabled: false,
         peer_heartbeat_interval_secs: 15,
-        admin_token: None,
+        admin_token: Some(TEST_ADMIN_TOKEN.to_string()),
         admin_password_hash: None,
         require_client_auth: false,
     }
@@ -424,6 +426,7 @@ async fn register_node_with_server(
             base_url.trim_end_matches('/'),
             node_id
         ))
+        .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
         .json(&serde_json::json!({
             "reachability": {
                 "public_api_url": public_api_url,
@@ -458,6 +461,7 @@ async fn register_node_with_server_client(
             base_url.trim_end_matches('/'),
             node_id
         ))
+        .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
         .json(&serde_json::json!({
             "reachability": {
                 "public_api_url": public_api_url,
@@ -3923,6 +3927,7 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     config.enrollment_issuer_url = Some(issuer_public_url.clone());
     config.node_enrollment_auto_renew_enabled = true;
     config.node_enrollment_auto_renew_check_secs = 1;
+    config.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
     let public_ca_cert_path = config.public_ca_cert_path.clone().unwrap();
     let internal_tls = config.internal_tls.clone().unwrap();
     let expected_internal_node_id = config.node_id;
@@ -8846,12 +8851,16 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
 
 #[tokio::test]
 async fn register_node_uses_structured_reachability_payload() {
-    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let node_id = NodeId::new_v4();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
 
     let response = axum::response::IntoResponse::into_response(
         super::register_node(
             State(state.clone()),
+            headers,
             Path(node_id.to_string()),
             Json(super::RegisterNodeRequest {
                 reachability: cluster::NodeReachability {
@@ -9427,6 +9436,7 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
 #[tokio::test]
 async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     state.network.relay_mode = super::RelayMode::Required;
 
     let remote_node = {
@@ -9528,8 +9538,11 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
         cluster.note_replica(format!("{key}@{version_id}"), remote_node.node_id);
     }
 
+    let mut cleanup_headers = HeaderMap::new();
+    cleanup_headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
     let response = super::execute_replication_cleanup(
         State(state.clone()),
+        cleanup_headers,
         Query(super::ReplicationCleanupQuery {
             dry_run: Some(false),
             max_deletions: Some(1),

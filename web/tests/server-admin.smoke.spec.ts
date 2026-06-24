@@ -42,6 +42,14 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
+  await expect(page.getByText(/live rendezvous registration details here\./i)).toBeVisible();
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  // Storage stats require admin auth — verify chart content is visible after login
   await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Collected at (UTC)" })).toBeVisible();
   await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Storage used (bytes)" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Zoom in on storage history chart" })).toBeVisible();
@@ -52,13 +60,6 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("columnheader", { name: "Chunk Store" })).toBeVisible();
   await expect(page.getByText("Latest snapshot ID:")).toBeVisible();
   await expect(page.getByText("Snapshot logical size:")).toBeVisible();
-  await expect(page.getByText(/live rendezvous registration details here\./i)).toBeVisible();
-
-  await page.getByRole("button", { name: "Admin Access" }).click();
-  await page.getByLabel("Admin password").fill("hunter2-harder");
-  await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
-  await page.keyboard.press("Escape");
   await expect(page.getByRole("cell", { name: "node-alpha", exact: true }).first()).toBeVisible();
   await expect(page.locator("td").filter({ hasText: /logical/ }).first()).toBeVisible();
   await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();

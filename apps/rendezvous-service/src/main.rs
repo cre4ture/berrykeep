@@ -127,6 +127,7 @@ mod tests {
         source_config.replication_repair_enabled = true;
         source_config.replication_repair_backoff_secs = 1;
         source_config.startup_repair_enabled = false;
+        source_config.audit_interval_secs = 2;
 
         let target_dir = fresh_test_dir("relay-required-target");
         let target_node_id = Uuid::now_v7();
@@ -164,6 +165,7 @@ mod tests {
         target_config.replication_repair_enabled = true;
         target_config.replication_repair_backoff_secs = 1;
         target_config.startup_repair_enabled = false;
+        target_config.audit_interval_secs = 2;
 
         let source_handle = tokio::spawn(async move {
             run(source_config)
@@ -365,6 +367,7 @@ mod tests {
         source_config.replication_repair_enabled = true;
         source_config.replication_repair_backoff_secs = 1;
         source_config.startup_repair_enabled = false;
+        source_config.audit_interval_secs = 2;
 
         let target_dir = fresh_test_dir("relay-required-target-mtls");
         let target_node_id = Uuid::now_v7();
@@ -402,6 +405,7 @@ mod tests {
         target_config.replication_repair_enabled = true;
         target_config.replication_repair_backoff_secs = 1;
         target_config.startup_repair_enabled = false;
+        target_config.audit_interval_secs = 2;
 
         let source_handle = tokio::spawn(async move {
             run(source_config)

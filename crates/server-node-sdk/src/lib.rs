@@ -18050,7 +18050,23 @@ async fn list_nodes(State(state): State<ServerState>) -> Json<Vec<NodeDescriptor
     Json(cluster.list_nodes())
 }
 
-async fn storage_stats_current(State(state): State<ServerState>) -> impl IntoResponse {
+async fn storage_stats_current(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "storage_stats_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
     let sample = {
         let store = read_store(&state, "storage_stats.load_current").await;
         match store.load_current_storage_stats().await {
@@ -18078,8 +18094,22 @@ async fn storage_stats_current(State(state): State<ServerState>) -> impl IntoRes
 
 async fn storage_stats_history(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Query(query): Query<StorageStatsHistoryQuery>,
 ) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "storage_stats_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
     let limit = query
         .limit
         .map(|limit| limit.clamp(1, MAX_STORAGE_STATS_HISTORY_LIMIT))
@@ -19059,12 +19089,26 @@ async fn apply_node_heartbeat(
 
 async fn register_node(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path(node_id): Path<String>,
     Json(request): Json<RegisterNodeRequest>,
 ) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "cluster_node_register",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
     let node_id = match node_id.parse::<NodeId>() {
         Ok(id) => id,
-        Err(_) => return StatusCode::BAD_REQUEST,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
     let reachability = NodeReachability {
@@ -19100,20 +19144,34 @@ async fn register_node(
         status: cluster::NodeStatus::Online,
     });
 
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn remove_node(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path(node_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "cluster_node_remove",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
     let node_id = match node_id.parse::<NodeId>() {
         Ok(id) => id,
-        Err(_) => return StatusCode::BAD_REQUEST,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
     if node_id == state.node_id {
-        return StatusCode::CONFLICT;
+        return StatusCode::CONFLICT.into_response();
     }
 
     let removed = {
@@ -19122,7 +19180,7 @@ async fn remove_node(
     };
 
     if !removed {
-        return StatusCode::NOT_FOUND;
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     if let Err(err) = persist_cluster_replicas_state(&state).await {
@@ -19131,10 +19189,10 @@ async fn remove_node(
             node_id = %node_id,
             "failed to persist cluster replicas after node removal"
         );
-        return StatusCode::INTERNAL_SERVER_ERROR;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn node_heartbeat(
@@ -19157,11 +19215,18 @@ async fn node_heartbeat(
 
 async fn placement_for_key(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path(key): Path<String>,
-) -> Json<cluster::PlacementDecision> {
+) -> impl IntoResponse {
+    if let Err(status) =
+        authorize_admin_request(&state, &headers, "placement_lookup", false, true, json!({})).await
+    {
+        return status.into_response();
+    }
+
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
-    Json(cluster.placement_for_key(&key))
+    Json(cluster.placement_for_key(&key)).into_response()
 }
 
 async fn replication_plan(State(state): State<ServerState>) -> Json<ReplicationPlan> {
@@ -19172,7 +19237,23 @@ async fn replication_plan(State(state): State<ServerState>) -> Json<ReplicationP
     Json(cluster.replication_plan(&keys))
 }
 
-async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<ReplicationPlan> {
+async fn trigger_replication_audit(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "replication_audit",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
     let keys = planning_replication_subjects(&state).await;
 
     let mut cluster = state.cluster.lock().await;
@@ -19186,7 +19267,7 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
         "manual replication audit result"
     );
 
-    Json(plan)
+    Json(plan).into_response()
 }
 
 async fn local_available_subjects(State(state): State<ServerState>) -> impl IntoResponse {
@@ -19320,8 +19401,22 @@ fn build_replication_drop_path(key: &str, version_id: &str) -> String {
 
 async fn execute_replication_cleanup(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Query(query): Query<ReplicationCleanupQuery>,
 ) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "replication_cleanup",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
     let dry_run = query.dry_run.unwrap_or(true);
     let max_deletions = query.max_deletions.unwrap_or(64).max(1);
     let retained_overhead_bytes = query.retained_overhead_bytes.unwrap_or(0);
@@ -20821,8 +20916,22 @@ async fn export_provisional_versions(State(state): State<ServerState>) -> impl I
 
 async fn reconcile_from_node(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path(node_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "cluster_reconcile",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
     let source_node_id = match node_id.parse::<NodeId>() {
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
