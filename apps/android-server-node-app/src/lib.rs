@@ -7,7 +7,7 @@ use server_node_sdk::EmbeddedManagedServerNodeConfig;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -50,7 +50,7 @@ struct RunningNode {
     bind_addr: SocketAddr,
     data_dir: PathBuf,
     local_url: String,
-    shutdown_tx: Sender<()>,
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
     result_rx: Receiver<Result<()>>,
     thread: thread::JoinHandle<()>,
 }
@@ -300,7 +300,7 @@ fn start_embedded_server(
     bind_addr: SocketAddr,
 ) -> Result<(RunningNode, Option<String>)> {
     let local_url = local_ui_url(bind_addr.port());
-    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let (result_tx, result_rx) = mpsc::channel::<Result<()>>();
 
     let thread_data_dir = data_dir.clone();
@@ -334,9 +334,7 @@ fn start_embedded_server(
                         };
                         let _ = result_tx.send(outcome);
                     }
-                    _ = async {
-                        let _ = shutdown_rx.recv();
-                    } => {
+                    _ = shutdown_rx => {
                         task.abort();
                         let _ = task.await;
                         let _ = result_tx.send(Ok(()));
@@ -511,7 +509,7 @@ fn start_node(data_dir: String, bind_host: String, bind_port: jint) -> Result<()
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if manager.running.is_some() {
+        if manager.running.is_some() || manager.status.state == "starting" {
             return Ok(());
         }
         manager.status = AndroidServerNodeStatus {
