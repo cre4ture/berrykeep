@@ -2,6 +2,7 @@ package io.ironmesh.android.data
 
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import io.ironmesh.android.ui.MainViewModel
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
@@ -14,6 +15,7 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class RendezvousCertificateRenewalInstrumentationTest {
+    private val application by lazy { ApplicationProvider.getApplicationContext<android.app.Application>() }
     private val appContext by lazy { ApplicationProvider.getApplicationContext<android.content.Context>() }
 
     @Before
@@ -76,6 +78,37 @@ class RendezvousCertificateRenewalInstrumentationTest {
         assertTrue(
             "expected store index request, got $capturedPaths",
             capturedPaths.contains("/api/v1/store/index?depth=1"),
+        )
+    }
+
+    @Test
+    fun mainViewModel_reloadsPersistedIdentityBeforeBuildingClientRequests() {
+        val scenario = JSONObject(RustClientTestBridge.startRendezvousRenewalScenario())
+        val bootstrapJson = scenario.getString("connectionBootstrapJson")
+        val expiredClientIdentityJson = scenario.getString("expiredClientIdentityJson")
+        val expectedRenewedPem = scenario.getString("renewedRendezvousClientIdentityPem").trim()
+
+        val expiredState = deviceAuthState(
+            connectionBootstrapJson = bootstrapJson,
+            clientIdentityJson = expiredClientIdentityJson,
+        )
+        IronmeshPreferences.setDeviceAuthState(appContext, expiredState)
+        val viewModel = MainViewModel(application)
+
+        val renewedState = expiredState.copy(rendezvousClientIdentityPem = expectedRenewedPem)
+        IronmeshPreferences.setDeviceAuthState(appContext, renewedState)
+
+        val method = MainViewModel::class.java.getDeclaredMethod("currentClientIdentityJson")
+        method.isAccessible = true
+        val reloadedIdentityJson = method.invoke(viewModel) as String
+        val reloadedPem = JSONObject(reloadedIdentityJson)
+            .getString("rendezvous_client_identity_pem")
+            .trim()
+
+        assertEquals(expectedRenewedPem, reloadedPem)
+        assertEquals(
+            expectedRenewedPem,
+            viewModel.uiState.value.deviceAuthState.rendezvousClientIdentityPem,
         )
     }
 

@@ -79,8 +79,8 @@ struct AndroidRendezvousRenewalServer {
     handle: JoinHandle<()>,
 }
 
-fn android_rendezvous_renewal_server_state(
-) -> &'static Mutex<Option<AndroidRendezvousRenewalServer>> {
+fn android_rendezvous_renewal_server_state()
+-> &'static Mutex<Option<AndroidRendezvousRenewalServer>> {
     static STATE: OnceLock<Mutex<Option<AndroidRendezvousRenewalServer>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(None))
 }
@@ -153,8 +153,8 @@ fn android_test_store_index_response() -> StoreIndexResponse {
     }
 }
 
-fn lock_server_state(
-) -> Result<std::sync::MutexGuard<'static, Option<AndroidRendezvousRenewalServer>>> {
+fn lock_server_state()
+-> Result<std::sync::MutexGuard<'static, Option<AndroidRendezvousRenewalServer>>> {
     android_rendezvous_renewal_server_state()
         .lock()
         .map_err(|_| anyhow::anyhow!("android rendezvous renewal server state mutex poisoned"))
@@ -248,10 +248,7 @@ struct AndroidTestSocketAdapter {
 impl Stream for AndroidTestSocketAdapter {
     type Item = Result<AndroidTestWsMessage, axum::Error>;
 
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match Pin::new(&mut this.socket).poll_next(cx) {
             Poll::Ready(Some(Ok(Message::Binary(bytes)))) => {
@@ -279,17 +276,11 @@ impl Stream for AndroidTestSocketAdapter {
 impl Sink<AndroidTestWsMessage> for AndroidTestSocketAdapter {
     type Error = axum::Error;
 
-    fn poll_ready(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.get_mut().socket).poll_ready(cx)
     }
 
-    fn start_send(
-        self: Pin<&mut Self>,
-        item: AndroidTestWsMessage,
-    ) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, item: AndroidTestWsMessage) -> Result<(), Self::Error> {
         let message = match item {
             AndroidTestWsMessage::Binary(bytes) => Message::Binary(bytes.into()),
             AndroidTestWsMessage::Text(text) => Message::Text(text.into()),
@@ -300,17 +291,11 @@ impl Sink<AndroidTestWsMessage> for AndroidTestSocketAdapter {
         Pin::new(&mut self.get_mut().socket).start_send(message)
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.get_mut().socket).poll_flush(cx)
     }
 
-    fn poll_close(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
         Pin::new(&mut self.get_mut().socket).poll_close(cx)
     }
 }
@@ -421,7 +406,8 @@ fn json_headers(content_length: usize) -> Vec<TransportHeader> {
 fn scenario_json() -> Result<String> {
     stop_android_rendezvous_renewal_server()?;
     let renewed_pem = renewed_rendezvous_client_identity_pem();
-    let server = runtime()?.block_on(start_android_rendezvous_renewal_server(renewed_pem.clone()))?;
+    let server =
+        runtime()?.block_on(start_android_rendezvous_renewal_server(renewed_pem.clone()))?;
     let bootstrap_json = android_test_connection_bootstrap(&server.state.public_url)?
         .to_json_pretty()
         .context("failed to serialize android rendezvous renewal bootstrap")?;
