@@ -6218,6 +6218,89 @@ run_on_main_metadata_backends!(
     list_store_index_includes_cached_media_metadata_for_images_turso
 );
 
+async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let first_put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/cat-a.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let second_put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/cat-b.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .ensure_media_cache(&first_put.manifest_hash)
+            .await
+            .unwrap();
+    }
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: None,
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entries = payload["entries"].as_array().unwrap();
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(payload["media_summary"]["ready_count"], 2);
+    assert_eq!(payload["media_summary"]["image_count"], 2);
+    assert_eq!(entries[0]["path"], "gallery/cat-a.png");
+    assert_eq!(entries[1]["path"], "gallery/cat-b.png");
+    assert_eq!(
+        entries[0]["content_fingerprint"], entries[1]["content_fingerprint"],
+        "duplicate payloads should share the same media cache fingerprint"
+    );
+    assert_eq!(entries[0]["media"]["status"], "ready");
+    assert_eq!(entries[1]["media"]["status"], "ready");
+    assert_eq!(entries[0]["media"]["mime_type"], "image/png");
+    assert_eq!(entries[1]["media"]["mime_type"], "image/png");
+    assert_ne!(
+        first_put.manifest_hash, second_put.manifest_hash,
+        "manifests remain key-specific even when payloads match"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_impl,
+    list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints,
+    list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_turso
+);
+
 async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
     backend: MainTestBackend,
 ) {

@@ -1139,6 +1139,35 @@ mod tests {
     }
 
     #[test]
+    fn import_replicas_rebuilds_node_subject_indexes() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+
+        let mut replicas = HashMap::new();
+        replicas.insert("subject-a".to_string(), vec![node_b, node_a]);
+        replicas.insert("subject-b".to_string(), vec![node_a]);
+
+        svc.import_replicas_by_key(replicas);
+
+        assert_eq!(
+            svc.subjects_for_node(node_a),
+            vec!["subject-a".to_string(), "subject-b".to_string()]
+        );
+        assert_eq!(
+            svc.available_subjects_for_node(node_a),
+            vec!["subject-a".to_string(), "subject-b".to_string()]
+        );
+        assert_eq!(svc.subjects_for_node(node_b), vec!["subject-a".to_string()]);
+        assert_eq!(
+            svc.available_subjects_for_node(node_b),
+            vec!["subject-a".to_string()]
+        );
+    }
+
+    #[test]
     fn replace_node_available_view_replaces_previous_membership_without_touching_replicas() {
         let local = NodeId::new_v4();
         let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
