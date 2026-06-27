@@ -5763,6 +5763,133 @@ run_on_main_metadata_backends!(
     replication_repair_records_max_retry_skip_details_turso
 );
 
+async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
+    backend: MainTestBackend,
+) {
+    // Scenario: the local store has data for an old (non-head) version, but the cluster's replica
+    // map only records the remote node as having it. This mirrors production cases where a node
+    // receives the current head directly without going through the full version chain, leaving
+    // ancestor versions locally present but untracked in the replica map. The repair should detect
+    // that the bundle is already local, register the replica, and do so without attempting any
+    // network transfer.
+    let state = build_test_state(2, false, backend).await;
+
+    let remote_node_id = {
+        let cluster = state.cluster.lock().await;
+        cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id != state.node_id)
+            .map(|node| node.node_id)
+            .expect("expected remote placeholder node from build_test_state(2, ...)")
+    };
+
+    let key = choose_locally_placed_key(&state, "local-replica-reg").await;
+    let version_old = "ver-local-reg-v1".to_string();
+    let version_new = "ver-local-reg-v2".to_string();
+
+    // Write both versions to the local store. v2 is a child of v1, making v1 a non-head version
+    // that list_replication_subjects() will not surface in availability syncs.
+    seed_subject_version(&state, &key, &version_old, b"old payload v1".to_vec(), Vec::new()).await;
+    seed_subject_version(
+        &state,
+        &key,
+        &version_new,
+        b"new payload v2".to_vec(),
+        vec![version_old.clone()],
+    )
+    .await;
+
+    // Set up the replica map to reflect the inconsistency: local node is known to have v2 (head)
+    // but NOT v1 (the old version), even though the local store actually has v1's data.
+    {
+        let mut cluster = state.cluster.lock().await;
+        cluster.note_replica(&key, state.node_id);
+        cluster.note_replica(format!("{key}@{version_new}"), state.node_id);
+        cluster.note_replica(&key, remote_node_id);
+        cluster.note_replica(format!("{key}@{version_old}"), remote_node_id);
+        cluster.note_replica(format!("{key}@{version_new}"), remote_node_id);
+    }
+
+    // Confirm the plan sees the local node as missing v1.
+    let old_version_subject = format!("{key}@{version_old}");
+    {
+        let plan = {
+            let mut cluster = state.cluster.lock().await;
+            cluster.update_health_and_detect_offline_transition();
+            cluster.replication_plan(&[
+                key.clone(),
+                old_version_subject.clone(),
+                format!("{key}@{version_new}"),
+            ])
+        };
+        assert!(
+            plan.items.iter().any(|item| {
+                item.key == old_version_subject && item.missing_nodes.contains(&state.node_id)
+            }),
+            "pre-repair plan should identify local node as missing the old version, items={:?}",
+            plan.items
+        );
+    }
+
+    let report = super::replication::execute_replication_repair_inner(&state, None).await;
+
+    assert_eq!(
+        report.attempted_transfers, 0,
+        "no network transfer should be needed: local store already has v1"
+    );
+    assert_eq!(report.failed_transfers, 0);
+    assert_eq!(report.skipped_items, 0);
+    assert!(
+        report.detailed_log.iter().any(|entry| {
+            entry.event == "local_replica_registered"
+                && entry.subject.as_deref() == Some(old_version_subject.as_str())
+        }),
+        "repair should emit local_replica_registered for the old version, log={:?}",
+        report.detailed_log
+    );
+
+    // After repair the cluster plan should no longer list v1 as a gap.
+    {
+        let plan = {
+            let mut cluster = state.cluster.lock().await;
+            cluster.update_health_and_detect_offline_transition();
+            cluster.replication_plan(&[
+                key.clone(),
+                old_version_subject.clone(),
+                format!("{key}@{version_new}"),
+            ])
+        };
+        assert!(
+            !plan.items.iter().any(|item| {
+                item.key == old_version_subject && item.missing_nodes.contains(&state.node_id)
+            }),
+            "post-repair plan should no longer show local node as missing v1, items={:?}",
+            plan.items
+        );
+    }
+
+    // Running repair a second time should produce no work for this subject.
+    let report2 = super::replication::execute_replication_repair_inner(&state, None).await;
+    assert_eq!(report2.attempted_transfers, 0);
+    assert_eq!(report2.skipped_items, 0);
+    assert!(
+        !report2.detailed_log.iter().any(|entry| {
+            entry.event == "local_replica_registered"
+                && entry.subject.as_deref() == Some(old_version_subject.as_str())
+        }),
+        "second repair run should not re-register the same local replica"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    repair_registers_local_replica_when_present_but_not_tracked_impl,
+    repair_registers_local_replica_when_present_but_not_tracked,
+    repair_registers_local_replica_when_present_but_not_tracked_turso
+);
+
 async fn autonomous_post_write_replication_pushes_to_missing_remote_nodes_impl(
     backend: MainTestBackend,
 ) {
