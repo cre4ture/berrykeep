@@ -875,7 +875,11 @@ impl ChunkVideoIndex {
             }
             let read_from = start.saturating_sub(chunk_start) as usize;
             let read_to = (end.min(chunk_end) - chunk_start) as usize;
-            let path = chunk_path_for_hash(&self.chunks_dir, &self.hashes[i]);
+            let hash = &self.hashes[i];
+            if !hash.chars().all(|c| c.is_ascii_hexdigit()) || hash.is_empty() {
+                bail!("invalid chunk hash: {hash}");
+            }
+            let path = chunk_path_for_hash(&self.chunks_dir, hash);
             let data = fs::read(&path).await?;
             result.extend_from_slice(&data[read_from..=read_to]);
         }
