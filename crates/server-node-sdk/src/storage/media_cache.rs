@@ -845,7 +845,11 @@ impl ChunkVideoIndex {
             offsets.push(offset);
             offset += chunk.size_bytes as u64;
         }
-        Self { paths, offsets, total_size: offset }
+        Self {
+            paths,
+            offsets,
+            total_size: offset,
+        }
     }
 
     async fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
@@ -1035,20 +1039,18 @@ async fn derive_video_media_cache(
     let chunk_paths = collect_local_chunk_paths(manifest, chunks_dir).await?;
     let chunk_index = Arc::new(ChunkVideoIndex::new(chunk_paths, manifest));
 
-    let temp_dir =
-        std::env::temp_dir().join(format!("ironmesh-media-cache-{}", Uuid::new_v4()));
+    let temp_dir = std::env::temp_dir().join(format!("ironmesh-media-cache-{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir)
         .await
         .with_context(|| format!("failed to create temp dir {}", temp_dir.display()))?;
 
-    let (server_task, video_url) =
-        match start_chunk_video_server(chunk_index, &temp_dir).await {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = fs::remove_dir_all(&temp_dir).await;
-                return Err(err);
-            }
-        };
+    let (server_task, video_url) = match start_chunk_video_server(chunk_index, &temp_dir).await {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&temp_dir).await;
+            return Err(err);
+        }
+    };
 
     let derived = async {
         let mut ffprobe = Command::new(&media_tools.ffprobe);
