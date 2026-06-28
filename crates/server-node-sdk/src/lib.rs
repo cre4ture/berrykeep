@@ -20472,7 +20472,10 @@ fn password_hash_matches(expected_hash: &str, password: &str) -> bool {
 
 async fn upgrade_password_hash_if_legacy(state: &ServerState, password: &str) {
     let upgrade_start = Instant::now();
-    let new_hash = setup::hash_admin_password(password);
+    let password_owned = password.to_string();
+    let new_hash = tokio::task::spawn_blocking(move || setup::hash_admin_password(&password_owned))
+        .await
+        .expect("hash_admin_password task panicked");
     *state
         .access
         .admin_control
@@ -20668,12 +20671,8 @@ async fn login_admin_session(
 
     let password_upgraded = is_legacy_password_hash(&expected_hash);
     if password_upgraded {
-        info!("admin password hash is legacy blake3; upgrading to pbkdf2 in background");
-        let state_for_upgrade = state.clone();
-        let password_for_upgrade = request.password.clone();
-        tokio::spawn(async move {
-            upgrade_password_hash_if_legacy(&state_for_upgrade, &password_for_upgrade).await;
-        });
+        info!("admin password hash is legacy blake3; upgrading to pbkdf2 before session is created");
+        upgrade_password_hash_if_legacy(&state, &request.password).await;
     }
 
     let (session_id, session_expires_at_unix) = {
