@@ -7,6 +7,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::client_async;
@@ -17,6 +18,8 @@ use crate::peer::PeerIdentity;
 use crate::relay::{RelayTicket, RelayTunnelSessionKind};
 use crate::ws_stream::WebSocketByteStream;
 use common::ClusterId;
+
+const RELAY_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -192,9 +195,13 @@ impl RelayTunnelClient {
     ) -> Result<Self> {
         let ws_url = relay_tunnel_ws_url(base_url)?;
         let stream = open_websocket_io(&ws_url, server_ca_pem, client_identity_pem).await?;
-        let (mut websocket, _response) = client_async(ws_url.as_str(), stream)
-            .await
-            .context("relay tunnel websocket handshake failed")?;
+        let (mut websocket, _response) = timeout(
+            RELAY_TUNNEL_CONNECT_TIMEOUT,
+            client_async(ws_url.as_str(), stream),
+        )
+        .await
+        .context("relay tunnel websocket handshake timed out")?
+        .context("relay tunnel websocket handshake failed")?;
         send_control_message(&mut websocket, &control).await?;
 
         let session = loop {
@@ -285,21 +292,31 @@ async fn open_websocket_io(
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow!("relay tunnel URL is missing a port"))?;
-    let tcp = TcpStream::connect((host, port))
-        .await
-        .with_context(|| format!("failed connecting relay tunnel TCP stream to {host}:{port}"))?;
+    let tcp = timeout(
+        RELAY_TUNNEL_CONNECT_TIMEOUT,
+        TcpStream::connect((host, port)),
+    )
+    .await
+    .with_context(|| format!("timed out connecting relay tunnel TCP stream to {host}:{port}"))?
+    .with_context(|| format!("failed connecting relay tunnel TCP stream to {host}:{port}"))?;
 
     match url.scheme() {
         "ws" => Ok(Box::new(tcp)),
         "wss" => {
             let server_name = ServerName::try_from(host.to_string())
                 .context("failed building relay tunnel TLS server name")?;
-            let tls_stream = TlsConnector::from(std::sync::Arc::new(build_tls_client_config(
-                server_ca_pem,
-                client_identity_pem,
-            )?))
-            .connect(server_name, tcp)
+            let tls_stream = timeout(
+                RELAY_TUNNEL_CONNECT_TIMEOUT,
+                TlsConnector::from(std::sync::Arc::new(build_tls_client_config(
+                    server_ca_pem,
+                    client_identity_pem,
+                )?))
+                .connect(server_name, tcp),
+            )
             .await
+            .with_context(|| {
+                format!("timed out establishing relay tunnel TLS stream to {host}:{port}")
+            })?
             .with_context(|| {
                 format!("failed establishing relay tunnel TLS stream to {host}:{port}")
             })?;
@@ -369,6 +386,8 @@ fn parse_client_identity_pem(
 mod tests {
     use super::*;
     use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+    use std::time::Instant;
+    use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::protocol::Role;
     use uuid::Uuid;
 
@@ -446,5 +465,51 @@ mod tests {
             .close()
             .await
             .expect("server multiplexed relay session should close");
+    }
+
+    #[tokio::test]
+    async fn accept_target_times_out_when_websocket_handshake_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test listener should have a local address");
+        let server_task = tokio::spawn(async move {
+            let (_socket, _peer) = listener
+                .accept()
+                .await
+                .expect("test server should accept the client TCP connection");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let request = RelayTunnelAcceptRequest {
+            cluster_id: Uuid::now_v7(),
+            target: PeerIdentity::Node(Uuid::now_v7()),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            wait_timeout_ms: Some(15_000),
+        };
+
+        let started_at = Instant::now();
+        let error =
+            match RelayTunnelClient::accept_target(&format!("ws://{addr}"), None, None, request)
+                .await
+            {
+                Ok(_) => panic!("stalled websocket handshake should fail"),
+                Err(error) => error,
+            };
+
+        server_task.abort();
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(7),
+            "relay tunnel handshake should fail within the timeout window"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("relay tunnel websocket handshake timed out"),
+            "unexpected relay tunnel error: {error:#}"
+        );
     }
 }
