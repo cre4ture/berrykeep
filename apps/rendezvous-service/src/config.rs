@@ -10,6 +10,7 @@ pub use rendezvous_server::{
 
 use crate::failover::{
     DecryptedRendezvousFailoverPackage, load_rendezvous_failover_package, normalize_public_url,
+    validate_failover_package_for_standalone_service,
 };
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -124,6 +125,9 @@ impl RendezvousServiceConfig {
                 )
             })
             .transpose()?;
+        if let Some(package) = failover_package.as_ref() {
+            validate_failover_package_for_standalone_service(package)?;
+        }
 
         let configured_public_url = lookup_env("IRONMESH_RENDEZVOUS_PUBLIC_URL");
         let public_url = match (configured_public_url, failover_package.as_ref()) {
@@ -273,6 +277,19 @@ mod tests {
         build_legacy_test_failover_package_json, build_test_failover_package_json,
     };
 
+    fn with_standalone_service_target(package_json: &str) -> String {
+        let mut value = serde_json::from_str::<serde_json::Value>(package_json)
+            .expect("test failover package JSON should parse");
+        value
+            .as_object_mut()
+            .expect("test failover package JSON should be an object")
+            .insert(
+                "deployment_target".to_string(),
+                serde_json::Value::String("standalone_service".to_string()),
+            );
+        serde_json::to_string(&value).expect("test failover package JSON should serialize")
+    }
+
     #[test]
     fn validate_startup_security_rejects_plain_http_by_default() {
         let config = RendezvousServiceConfig {
@@ -340,12 +357,12 @@ mod tests {
         let package_path = dir.join("failover.json");
         std::fs::write(
             &package_path,
-            build_test_failover_package_json(
+            with_standalone_service_target(&build_test_failover_package_json(
                 "https://creax.de:44042",
                 "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n",
                 "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
                 "correct horse battery staple",
-            ),
+            )),
         )
         .expect("test failover package should write");
 
@@ -394,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn from_lookup_rejects_failover_public_url_mismatch() {
+    fn from_lookup_rejects_embedded_node_failover_package() {
         let dir = std::env::temp_dir().join(format!(
             "ironmesh-rendezvous-config-{}",
             uuid::Uuid::now_v7()
@@ -405,10 +422,43 @@ mod tests {
             &package_path,
             build_test_failover_package_json(
                 "https://creax.de:44042",
+                "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n",
+                "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+                "correct horse battery staple",
+            ),
+        )
+        .expect("test failover package should write");
+
+        let cli = RendezvousServiceCliConfig {
+            bind_addr: Some("0.0.0.0:44042".parse().expect("bind addr should parse")),
+            failover_package_path: Some(package_path),
+            failover_passphrase: Some("correct horse battery staple".to_string()),
+        };
+        let env = HashMap::<String, String>::new();
+        let err = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
+            .expect_err("embedded-node failover package should be rejected");
+        assert!(err.to_string().contains("deployment_target=embedded_node"));
+        assert!(err.to_string().contains("deployment_target=standalone_service"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn from_lookup_rejects_failover_public_url_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "ironmesh-rendezvous-config-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should create");
+        let package_path = dir.join("failover.json");
+        std::fs::write(
+            &package_path,
+            with_standalone_service_target(&build_test_failover_package_json(
+                "https://creax.de:44042",
                 "cert",
                 "key",
                 "correct horse battery staple",
-            ),
+            )),
         )
         .expect("test failover package should write");
 
@@ -441,12 +491,12 @@ mod tests {
         let package_path = dir.join("failover.json");
         std::fs::write(
             &package_path,
-            build_legacy_test_failover_package_json(
+            with_standalone_service_target(&build_legacy_test_failover_package_json(
                 "https://creax.de:44042",
                 "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n",
                 "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
                 "correct horse battery staple",
-            ),
+            )),
         )
         .expect("test failover package should write");
 
