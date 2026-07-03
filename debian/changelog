@@ -1,3 +1,15 @@
+ironmesh (1.0.31-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add Android folder sync network rules for metered and Wi-Fi policy
+    handling.
+  * Harden standalone rendezvous failover package handling and allow
+    standalone exports without target enforcement.
+  * Timeout hanging relay tunnel websocket setup and extend CI coverage with
+    Windows workspace clippy.
+  * Roll the workspace release to 1.0.31.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 03 Jul 2026 12:35:40 +0200
+
 ironmesh (1.0.30-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Fix video thumbnail generation failure on large files by replacing
