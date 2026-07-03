@@ -15,10 +15,12 @@ use client_sdk::{
     ClientIdentityMaterial, ConnectionBootstrap, enroll_connection_input_blocking,
     rendezvous_client_identity_not_after_unix,
 };
+#[cfg(target_os = "linux")]
+use desktop_client_config::CONFIG_APP_EXE;
 #[cfg(windows)]
 use desktop_client_config::default_desktop_status_file_path;
 use desktop_client_config::{
-    CONFIG_APP_EXE, ClientCliInstance, ClientIdentityConfig, DESKTOP_CLIENT_CONFIG_REVISION,
+    ClientCliInstance, ClientIdentityConfig, DESKTOP_CLIENT_CONFIG_REVISION,
     DESKTOP_CLIENT_CONFIG_VERSION, FolderAgentInstance, LaunchOutcome, LaunchReport,
     ManagedInstanceStore, OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance,
     PLATFORM_KIND, STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE,
@@ -39,7 +41,9 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::process::Command as ProcessCommand;
+#[cfg(target_os = "linux")]
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
@@ -1711,6 +1715,7 @@ fn spawn_detached_process_checked(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_background_child_reaper(mut child: Child, process_label: String) {
     std::thread::spawn(move || {
         let pid = child.id();

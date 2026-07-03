@@ -867,9 +867,7 @@ fn resolve_cli_relative_path(root_path: &std::path::Path, requested_path: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, PinHydrationSnapshot, should_request_pin_hydration};
-    use clap::Parser;
-    use std::path::PathBuf;
+    use super::{PinHydrationSnapshot, should_request_pin_hydration};
 
     #[test]
     fn pin_hydration_requests_initial_explicit_hydrate() {
