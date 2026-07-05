@@ -2953,6 +2953,319 @@ run_on_main_metadata_backends!(
     s3_multipart_uploads_complete_and_abort_turso
 );
 
+async fn s3_versioning_surface_lists_versions_and_delete_markers_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "versions.example".to_string(),
+            root_prefix: Some("tenant/versions".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Disabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-versioning-test".to_string()),
+            bucket_scope: vec!["versions.example".to_string()],
+            prefix_scope: vec!["tenant/versions/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let get_versioning_before = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versioning=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_versioning_before.status(), StatusCode::OK);
+    let get_versioning_before_body = to_bytes(get_versioning_before.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_versioning_before_xml = String::from_utf8(get_versioning_before_body.to_vec()).unwrap();
+    assert!(!get_versioning_before_xml.contains("<Status>"));
+
+    let put_versioning = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/versions.example?versioning=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/xml")],
+            Bytes::from_static(
+                br#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_versioning.status(), StatusCode::OK);
+
+    let get_versioning_after = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versioning=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_versioning_after.status(), StatusCode::OK);
+    let get_versioning_after_body = to_bytes(get_versioning_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_versioning_after_xml = String::from_utf8(get_versioning_after_body.to_vec()).unwrap();
+    assert!(get_versioning_after_xml.contains("<Status>Enabled</Status>"));
+
+    let put_v1 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"version one"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_v1.status(), StatusCode::OK);
+    let v1_version_id = put_v1
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let put_v2 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"version two"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_v2.status(), StatusCode::OK);
+    let v2_version_id = put_v2
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let delete_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_current.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        delete_current
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    let delete_marker_version_id = delete_current
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let get_deleted_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_deleted_current.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        get_deleted_current
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+
+    let get_delete_marker_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/versions.example/docs/versioned.txt?versionId={delete_marker_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        get_delete_marker_version.status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(
+        get_delete_marker_version
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        get_delete_marker_version
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(delete_marker_version_id.as_str())
+    );
+    assert!(
+        get_delete_marker_version
+            .headers()
+            .get(axum::http::header::LAST_MODIFIED)
+            .is_some()
+    );
+
+    let first_versions_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versions=&max-keys=2&prefix=docs/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_versions_page.status(), StatusCode::OK);
+    let first_versions_page_body = to_bytes(first_versions_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_versions_page_xml = String::from_utf8(first_versions_page_body.to_vec()).unwrap();
+    assert!(first_versions_page_xml.contains("<DeleteMarker>"));
+    assert!(first_versions_page_xml.contains(&delete_marker_version_id));
+    assert!(first_versions_page_xml.contains(&v2_version_id));
+    assert_eq!(first_versions_page_xml.matches("<DeleteMarker>").count(), 1);
+    assert_eq!(first_versions_page_xml.matches("<Version>").count(), 1);
+    let next_key_marker = xml_tag_text(&first_versions_page_xml, "NextKeyMarker")
+        .expect("truncated versions listing should expose NextKeyMarker");
+    let next_version_id_marker = xml_tag_text(&first_versions_page_xml, "NextVersionIdMarker")
+        .expect("truncated versions listing should expose NextVersionIdMarker");
+
+    let second_versions_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!(
+                "/versions.example?versions=&prefix=docs/&key-marker={next_key_marker}&version-id-marker={next_version_id_marker}"
+            ),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_versions_page.status(), StatusCode::OK);
+    let second_versions_page_body = to_bytes(second_versions_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_versions_page_xml = String::from_utf8(second_versions_page_body.to_vec()).unwrap();
+    assert!(second_versions_page_xml.contains(&v1_version_id));
+    assert!(!second_versions_page_xml.contains(&delete_marker_version_id));
+    assert!(!second_versions_page_xml.contains("<NextKeyMarker>"));
+
+    let copy_source_header =
+        format!("/versions.example/docs/versioned.txt?versionId={v1_version_id}");
+    let copy_old_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/versions.example/docs/copied-from-v1.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("x-amz-copy-source", copy_source_header.as_str())],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(copy_old_version.status(), StatusCode::OK);
+
+    let get_copied_old_version = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example/docs/copied-from-v1.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_copied_old_version.status(), StatusCode::OK);
+    let get_copied_old_version_body = to_bytes(get_copied_old_version.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(get_copied_old_version_body.as_ref(), b"version one");
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_versioning_surface_lists_versions_and_delete_markers_impl,
+    s3_versioning_surface_lists_versions_and_delete_markers,
+    s3_versioning_surface_lists_versions_and_delete_markers_turso
+);
+
 async fn s3_transport_executes_listener_requests_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());

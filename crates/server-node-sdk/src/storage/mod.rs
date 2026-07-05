@@ -715,6 +715,15 @@ pub struct S3ObjectVersionRecord {
     pub created_at_unix: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectVersionInspection {
+    pub version_id: String,
+    pub manifest_hash: String,
+    pub created_at_unix: u64,
+    pub total_size_bytes: Option<u64>,
+    pub is_delete_marker: bool,
+}
+
 #[derive(Debug)]
 pub enum StoreReadError {
     NotFound,
@@ -1262,6 +1271,11 @@ trait MetadataStore: Send + Sync {
         &self,
         bucket_name: &str,
         ironmesh_key: &str,
+    ) -> Result<Vec<S3ObjectVersionRecord>>;
+    async fn list_s3_object_versions(
+        &self,
+        bucket_name: &str,
+        ironmesh_key_prefix: Option<&str>,
     ) -> Result<Vec<S3ObjectVersionRecord>>;
     async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()>;
     async fn delete_s3_object_version(&self, bucket_name: &str, version_id: &str) -> Result<()>;
@@ -2390,6 +2404,16 @@ impl PersistentStore {
             .await
     }
 
+    pub async fn list_s3_object_versions(
+        &self,
+        bucket_name: &str,
+        ironmesh_key_prefix: Option<&str>,
+    ) -> Result<Vec<S3ObjectVersionRecord>> {
+        self.metadata_store
+            .list_s3_object_versions(bucket_name, ironmesh_key_prefix)
+            .await
+    }
+
     pub async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()> {
         self.metadata_store.persist_s3_object_version(record).await
     }
@@ -2402,6 +2426,50 @@ impl PersistentStore {
         self.metadata_store
             .delete_s3_object_version(bucket_name, version_id)
             .await
+    }
+
+    pub async fn inspect_object_version(
+        &self,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<ObjectVersionInspection>> {
+        let Some(object_id) = self
+            .resolve_object_id_for_key_version(key, version_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(index) = self.load_version_index_by_object_id(&object_id).await? else {
+            return Ok(None);
+        };
+        let Some(record) = index.versions.get(version_id) else {
+            return Ok(None);
+        };
+        if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(Some(ObjectVersionInspection {
+                version_id: record.version_id.clone(),
+                manifest_hash: record.manifest_hash.clone(),
+                created_at_unix: record.created_at_unix,
+                total_size_bytes: None,
+                is_delete_marker: true,
+            }));
+        }
+
+        let Some(manifest) = self.load_manifest_by_hash(&record.manifest_hash).await? else {
+            bail!(
+                "manifest missing for key={key} version_id={} hash={}",
+                record.version_id,
+                record.manifest_hash
+            );
+        };
+
+        Ok(Some(ObjectVersionInspection {
+            version_id: record.version_id.clone(),
+            manifest_hash: record.manifest_hash.clone(),
+            created_at_unix: record.created_at_unix,
+            total_size_bytes: Some(manifest.total_size_bytes as u64),
+            is_delete_marker: false,
+        }))
     }
 
     #[cfg(test)]
@@ -3095,7 +3163,7 @@ impl PersistentStore {
     }
 
     pub async fn list_versions(&self, key: &str) -> Result<Option<VersionGraphSummary>> {
-        let Some(object_id) = self.object_id_for_key(key) else {
+        let Some(object_id) = self.resolve_object_id_for_key_history(key).await? else {
             return Ok(None);
         };
 
@@ -6677,7 +6745,10 @@ impl PersistentStore {
         source_path: &str,
         version_id: &str,
     ) -> Result<Option<SnapshotRestoreSource>> {
-        let Some(source_object_id) = self.object_id_for_key(source_path) else {
+        let Some(source_object_id) = self
+            .resolve_object_id_for_key_version(source_path, version_id)
+            .await?
+        else {
             return Ok(None);
         };
 

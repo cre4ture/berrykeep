@@ -1320,6 +1320,86 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(records)
     }
 
+    async fn list_s3_object_versions(
+        &self,
+        bucket_name: &str,
+        ironmesh_key_prefix: Option<&str>,
+    ) -> Result<Vec<S3ObjectVersionRecord>> {
+        let db = self.metadata_conn()?;
+        let mut records = Vec::new();
+        if let Some(prefix) = ironmesh_key_prefix {
+            let like_pattern = format!("{prefix}%");
+            let mut stmt = db.prepare(
+                "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
+                 FROM s3_object_versions
+                 WHERE bucket_name = ?1 AND ironmesh_key LIKE ?2
+                 ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
+            )?;
+            let rows = stmt.query_map(params![bucket_name, like_pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (ironmesh_key, version_id, etag, multipart_part_count, created_at_unix) = row?;
+                records.push(S3ObjectVersionRecord {
+                    bucket_name: bucket_name.to_string(),
+                    ironmesh_key,
+                    version_id,
+                    etag,
+                    multipart_part_count: multipart_part_count
+                        .map(|value| {
+                            u32::try_from(value)
+                                .context("negative or overflowing multipart_part_count in sqlite")
+                        })
+                        .transpose()?,
+                    created_at_unix: u64::try_from(created_at_unix)
+                        .context("negative s3 object version created_at_unix in sqlite")?,
+                });
+            }
+        } else {
+            let mut stmt = db.prepare(
+                "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
+                 FROM s3_object_versions
+                 WHERE bucket_name = ?1
+                 ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
+            )?;
+            let rows = stmt.query_map(params![bucket_name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (ironmesh_key, version_id, etag, multipart_part_count, created_at_unix) = row?;
+                records.push(S3ObjectVersionRecord {
+                    bucket_name: bucket_name.to_string(),
+                    ironmesh_key,
+                    version_id,
+                    etag,
+                    multipart_part_count: multipart_part_count
+                        .map(|value| {
+                            u32::try_from(value)
+                                .context("negative or overflowing multipart_part_count in sqlite")
+                        })
+                        .transpose()?,
+                    created_at_unix: u64::try_from(created_at_unix)
+                        .context("negative s3 object version created_at_unix in sqlite")?,
+                });
+            }
+        }
+        Ok(records)
+    }
+
     async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()> {
         let db = self.metadata_conn()?;
         db.execute(

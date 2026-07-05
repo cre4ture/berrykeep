@@ -1258,6 +1258,52 @@ impl MetadataStore for TursoMetadataStore {
         Ok(records)
     }
 
+    async fn list_s3_object_versions(
+        &self,
+        bucket_name: &str,
+        ironmesh_key_prefix: Option<&str>,
+    ) -> Result<Vec<S3ObjectVersionRecord>> {
+        let mut records = Vec::new();
+        let mut rows = if let Some(prefix) = ironmesh_key_prefix {
+            let like_pattern = format!("{prefix}%");
+            self.connection
+                .query(
+                    "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
+                     FROM s3_object_versions
+                     WHERE bucket_name = ?1 AND ironmesh_key LIKE ?2
+                     ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
+                    (bucket_name, like_pattern.as_str()),
+                )
+                .await?
+        } else {
+            self.connection
+                .query(
+                    "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
+                     FROM s3_object_versions
+                     WHERE bucket_name = ?1
+                     ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
+                    (bucket_name,),
+                )
+                .await?
+        };
+
+        while let Some(row) = rows.next().await? {
+            records.push(S3ObjectVersionRecord {
+                bucket_name: bucket_name.to_string(),
+                ironmesh_key: row_string(&row, 0, "s3_object_versions.ironmesh_key")?,
+                version_id: row_string(&row, 1, "s3_object_versions.version_id")?,
+                etag: row_string(&row, 2, "s3_object_versions.etag")?,
+                multipart_part_count: row_opt_u32(
+                    &row,
+                    3,
+                    "s3_object_versions.multipart_part_count",
+                )?,
+                created_at_unix: row_u64(&row, 4, "s3_object_versions.created_at_unix")?,
+            });
+        }
+        Ok(records)
+    }
+
     async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()> {
         self.connection
             .execute(

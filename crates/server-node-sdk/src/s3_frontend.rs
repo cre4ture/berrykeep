@@ -1,5 +1,5 @@
 use super::*;
-use crate::storage::{ObjectVersionMetadataRecord, S3ObjectVersionRecord};
+use crate::storage::{ObjectVersionInspection, ObjectVersionMetadataRecord, S3ObjectVersionRecord};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
 use axum::http::{HeaderName, Method, Request, StatusCode, Uri};
@@ -39,7 +39,7 @@ struct ParsedS3Authorization {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-struct S3ListObjectsV2Query {
+struct S3BucketQuery {
     #[serde(rename = "list-type")]
     list_type: Option<u8>,
     prefix: Option<String>,
@@ -50,6 +50,12 @@ struct S3ListObjectsV2Query {
     start_after: Option<String>,
     #[serde(rename = "max-keys")]
     max_keys: Option<usize>,
+    versions: Option<String>,
+    versioning: Option<String>,
+    #[serde(rename = "key-marker")]
+    key_marker: Option<String>,
+    #[serde(rename = "version-id-marker")]
+    version_id_marker: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -89,6 +95,17 @@ struct S3ListContentEntry {
 }
 
 #[derive(Debug, Clone)]
+struct S3ListVersionEntry {
+    key: String,
+    version_id: String,
+    etag: String,
+    size_bytes: Option<u64>,
+    modified_at_unix: u64,
+    is_latest: bool,
+    is_delete_marker: bool,
+}
+
+#[derive(Debug, Clone)]
 struct CompletedMultipartPart {
     part_number: u32,
     etag: String,
@@ -102,7 +119,7 @@ pub(crate) fn build_listener_app() -> Router<ServerState> {
             get(list_bucket_objects)
                 .head(head_bucket)
                 .post(s3_not_implemented_bucket_post)
-                .put(s3_bucket_mutation_not_supported)
+                .put(put_bucket)
                 .delete(s3_bucket_mutation_not_supported),
         )
         .route(
@@ -277,7 +294,7 @@ async fn list_bucket_objects(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path(bucket_name): Path<String>,
-    Query(query): Query<S3ListObjectsV2Query>,
+    Query(query): Query<S3BucketQuery>,
 ) -> Response {
     let request = match authenticate_request(&state, &Method::GET, &uri, &headers).await {
         Ok(request) => request,
@@ -291,6 +308,9 @@ async fn list_bucket_objects(
             uri.path(),
             &request.request_id,
         );
+    }
+    if query.versioning.is_some() {
+        return get_bucket_versioning_response(&state, &uri, &request, &bucket_name).await;
     }
     if query.list_type.is_some_and(|value| value != 2) {
         return s3_error_response(
@@ -324,6 +344,44 @@ async fn list_bucket_objects(
         );
     }
 
+    if query.versions.is_some() {
+        return list_object_versions_response(&state, &uri, &request, &bucket, &query).await;
+    }
+
+    list_objects_v2_response(&state, &uri, &request, &bucket, &query).await
+}
+
+async fn put_bucket(
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(bucket_name): Path<String>,
+    Query(query): Query<S3BucketQuery>,
+    payload: Bytes,
+) -> Response {
+    let request = match authenticate_request(&state, &Method::PUT, &uri, &headers).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if query.versioning.is_some() {
+        return put_bucket_versioning_response(&state, &uri, &request, &bucket_name, payload).await;
+    }
+    s3_error_response(
+        StatusCode::FORBIDDEN,
+        "AccessDenied",
+        "bucket creation and deletion are managed through the Ironmesh admin control plane",
+        uri.path(),
+        &request.request_id,
+    )
+}
+
+async fn list_objects_v2_response(
+    state: &ServerState,
+    uri: &Uri,
+    request: &S3RequestContext,
+    bucket: &S3BucketRecord,
+    query: &S3BucketQuery,
+) -> Response {
     let prefix = query.prefix.clone().unwrap_or_default();
     let delimiter = query.delimiter.as_deref().filter(|value| !value.is_empty());
     let max_keys = query
@@ -453,7 +511,7 @@ async fn list_bucket_objects(
 
     let key_count = content_entries.len() + common_prefixes.len();
     let xml = render_list_objects_v2_result(
-        &bucket,
+        bucket,
         &prefix,
         delimiter.unwrap_or(""),
         max_keys,
@@ -465,6 +523,318 @@ async fn list_bucket_objects(
         &common_prefixes,
     );
 
+    xml_response(StatusCode::OK, xml, &request.request_id)
+}
+
+async fn get_bucket_versioning_response(
+    state: &ServerState,
+    uri: &Uri,
+    request: &S3RequestContext,
+    bucket_name: &str,
+) -> Response {
+    let bucket = match resolve_bucket(state, bucket_name).await {
+        Some(bucket) => bucket,
+        None => {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "the specified bucket does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    if !access_key_allows_bucket(&request.access_key, &bucket) {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to access this bucket",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    xml_response(
+        StatusCode::OK,
+        render_bucket_versioning_result(&bucket),
+        &request.request_id,
+    )
+}
+
+async fn put_bucket_versioning_response(
+    state: &ServerState,
+    uri: &Uri,
+    request: &S3RequestContext,
+    bucket_name: &str,
+    payload: Bytes,
+) -> Response {
+    if !request.access_key.allow_write {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to change bucket versioning",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let requested_status = match parse_bucket_versioning_status(
+        std::str::from_utf8(payload.as_ref()).unwrap_or_default(),
+    ) {
+        Ok(status) => status,
+        Err(message) => {
+            return s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "MalformedXML",
+                &message,
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+
+    let mut changed = false;
+    {
+        let mut control_plane = state.s3.control_plane.lock().await;
+        let Some(bucket) = control_plane
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.bucket_name == bucket_name && bucket.deleted_at_unix.is_none())
+        else {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "the specified bucket does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        };
+        if !access_key_allows_bucket(&request.access_key, bucket) {
+            return s3_error_response(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "the access key is not allowed to access this bucket",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+        if bucket.read_only {
+            return s3_error_response(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "the bucket mapping is read-only",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+        if bucket.versioning_status != requested_status {
+            bucket.versioning_status = requested_status;
+            bucket.updated_at_unix = unix_ts();
+            changed = true;
+        }
+        *control_plane = normalize_s3_control_plane_state(control_plane.clone());
+    }
+
+    if changed {
+        if let Err(err) = persist_s3_control_plane_state(state, None).await {
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to persist bucket versioning configuration: {err:#}"),
+                uri.path(),
+                &request.request_id,
+            );
+        }
+        spawn_s3_control_plane_fanout(state.clone());
+    }
+
+    let mut response = StatusCode::OK.into_response();
+    append_request_id_header(&mut response, &request.request_id);
+    response
+}
+
+async fn list_object_versions_response(
+    state: &ServerState,
+    uri: &Uri,
+    request: &S3RequestContext,
+    bucket: &S3BucketRecord,
+    query: &S3BucketQuery,
+) -> Response {
+    if query
+        .delimiter
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "delimiter is not supported for ListObjectVersions yet",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let prefix = query.prefix.clone().unwrap_or_default();
+    let max_keys = query
+        .max_keys
+        .unwrap_or(S3_LIST_DEFAULT_MAX_KEYS)
+        .min(S3_MAX_LIST_KEYS);
+    if bucket.versioning_status != S3BucketVersioningStatus::Enabled {
+        return xml_response(
+            StatusCode::OK,
+            render_list_object_versions_result(
+                bucket,
+                &prefix,
+                query.key_marker.as_deref(),
+                query.version_id_marker.as_deref(),
+                max_keys,
+                false,
+                None,
+                None,
+                &[],
+            ),
+            &request.request_id,
+        );
+    }
+    let full_prefix = if prefix.is_empty() {
+        None
+    } else {
+        Some(format!("{}{}", bucket.root_prefix, prefix))
+    };
+
+    let store = read_store(state, "s3.list_object_versions.records").await;
+    let records = match store
+        .list_s3_object_versions(&bucket.bucket_name, full_prefix.as_deref())
+        .await
+    {
+        Ok(records) => records,
+        Err(err) => {
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to inspect S3 object versions: {err:#}"),
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+
+    let mut records_by_key = BTreeMap::<String, Vec<S3ObjectVersionRecord>>::new();
+    for record in records {
+        records_by_key
+            .entry(record.ironmesh_key.clone())
+            .or_default()
+            .push(record);
+    }
+
+    let mut all_entries = Vec::<S3ListVersionEntry>::new();
+    for (full_key, key_records) in records_by_key {
+        if !access_key_allows_storage_path(&request.access_key, &full_key) {
+            continue;
+        }
+        let Some(object_key) = full_key_to_object_key(bucket, &full_key) else {
+            continue;
+        };
+        if !prefix.is_empty() && !object_key.starts_with(&prefix) {
+            continue;
+        }
+
+        let version_graph = match store.list_versions(&full_key).await {
+            Ok(graph) => graph,
+            Err(err) => {
+                return s3_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    &format!("failed to inspect object version graph: {err:#}"),
+                    uri.path(),
+                    &request.request_id,
+                );
+            }
+        };
+        let ordered_records = linearize_s3_version_records(version_graph.as_ref(), &key_records);
+        let latest_version_id = ordered_records
+            .first()
+            .map(|record| record.version_id.clone());
+
+        for record in ordered_records {
+            let inspection = match store
+                .inspect_object_version(&full_key, &record.version_id)
+                .await
+            {
+                Ok(Some(inspection)) => inspection,
+                Ok(None) => continue,
+                Err(err) => {
+                    return s3_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        &format!("failed to inspect object version details: {err:#}"),
+                        uri.path(),
+                        &request.request_id,
+                    );
+                }
+            };
+
+            all_entries.push(S3ListVersionEntry {
+                key: object_key.clone(),
+                version_id: record.version_id.clone(),
+                etag: record.etag.clone(),
+                size_bytes: inspection.total_size_bytes,
+                modified_at_unix: inspection.created_at_unix,
+                is_latest: latest_version_id
+                    .as_deref()
+                    .is_some_and(|latest| latest == record.version_id),
+                is_delete_marker: inspection.is_delete_marker,
+            });
+        }
+    }
+    drop(store);
+
+    let mut collected = Vec::<S3ListVersionEntry>::new();
+    let mut next_key_marker = None::<String>;
+    let mut next_version_id_marker = None::<String>;
+    let mut started = query.key_marker.is_none();
+    let requested_key_marker = query.key_marker.as_deref();
+    let requested_version_id_marker = query.version_id_marker.as_deref();
+
+    for entry in all_entries {
+        if !started {
+            match entry
+                .key
+                .as_str()
+                .cmp(requested_key_marker.unwrap_or_default())
+            {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Greater => started = true,
+                std::cmp::Ordering::Equal => {
+                    if let Some(version_id_marker) = requested_version_id_marker
+                        && entry.version_id != version_id_marker
+                    {
+                        continue;
+                    }
+                    started = true;
+                }
+            }
+        }
+
+        if collected.len() >= max_keys {
+            next_key_marker = Some(entry.key.clone());
+            next_version_id_marker = Some(entry.version_id.clone());
+            break;
+        }
+        collected.push(entry);
+    }
+
+    let xml = render_list_object_versions_result(
+        bucket,
+        &prefix,
+        query.key_marker.as_deref(),
+        query.version_id_marker.as_deref(),
+        max_keys,
+        next_key_marker.is_some(),
+        next_key_marker.as_deref(),
+        next_version_id_marker.as_deref(),
+        &collected,
+    );
     xml_response(StatusCode::OK, xml, &request.request_id)
 }
 
@@ -1955,6 +2325,9 @@ async fn delete_object(
     let mut response = StatusCode::NO_CONTENT.into_response();
     append_request_id_header(&mut response, &request.request_id);
     append_version_id_header(&mut response, Some(&version_id));
+    if bucket.versioning_status == S3BucketVersioningStatus::Enabled {
+        append_delete_marker_header(&mut response);
+    }
     response
 }
 
@@ -2066,13 +2439,66 @@ async fn get_or_head_object_response(
     if !object_response.status().is_success() {
         let status = object_response.status();
         return match status {
-            StatusCode::NOT_FOUND => s3_error_response(
-                StatusCode::NOT_FOUND,
-                "NoSuchKey",
-                "the specified key does not exist",
-                uri.path(),
-                &request.request_id,
-            ),
+            StatusCode::NOT_FOUND => {
+                if let Some(version_id) = resolved_version_id
+                    .as_deref()
+                    .filter(|_| query.version_id.is_some())
+                {
+                    match inspect_object_version_for_s3(
+                        state,
+                        &full_key,
+                        version_id,
+                        uri.path(),
+                        &request.request_id,
+                    )
+                    .await
+                    {
+                        Ok(Some(inspection)) if inspection.is_delete_marker => {
+                            return build_delete_marker_version_response(
+                                head_only,
+                                &request.request_id,
+                                version_id,
+                                inspection.created_at_unix,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(response) => return response,
+                    }
+                }
+
+                if query.version_id.is_none()
+                    && bucket.versioning_status == S3BucketVersioningStatus::Enabled
+                    && let Some(version_id) = resolved_version_id.as_deref()
+                {
+                    match inspect_object_version_for_s3(
+                        state,
+                        &full_key,
+                        version_id,
+                        uri.path(),
+                        &request.request_id,
+                    )
+                    .await
+                    {
+                        Ok(Some(inspection)) if inspection.is_delete_marker => {
+                            return build_current_delete_marker_response(
+                                head_only,
+                                uri.path(),
+                                &request.request_id,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(response) => return response,
+                    }
+                }
+
+                s3_error_response(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchKey",
+                    "the specified key does not exist",
+                    uri.path(),
+                    &request.request_id,
+                )
+            }
             StatusCode::RANGE_NOT_SATISFIABLE => {
                 let mut response = object_response;
                 append_request_id_header(&mut response, &request.request_id);
@@ -2652,6 +3078,26 @@ async fn resolve_current_head_version_id(
     Ok(versions.and_then(|graph| graph.preferred_head_version_id))
 }
 
+async fn inspect_object_version_for_s3(
+    state: &ServerState,
+    full_key: &str,
+    version_id: &str,
+    request_path: &str,
+    request_id: &str,
+) -> Result<Option<ObjectVersionInspection>, Response> {
+    let store = read_store(state, "s3.get_object.inspect_version").await;
+    match store.inspect_object_version(full_key, version_id).await {
+        Ok(inspection) => Ok(inspection),
+        Err(err) => Err(s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &format!("failed to inspect object version: {err:#}"),
+            request_path,
+            request_id,
+        )),
+    }
+}
+
 async fn resolve_copy_source_version(
     store: &storage::PersistentStore,
     bucket: &S3BucketRecord,
@@ -3014,6 +3460,50 @@ fn s3_actor_context(access_key: &S3AccessKeyRecord) -> DataChangeActorContext {
     }
 }
 
+fn linearize_s3_version_records(
+    summary: Option<&crate::storage::VersionGraphSummary>,
+    records: &[S3ObjectVersionRecord],
+) -> Vec<S3ObjectVersionRecord> {
+    let records_by_version_id = records
+        .iter()
+        .cloned()
+        .map(|record| (record.version_id.clone(), record))
+        .collect::<HashMap<_, _>>();
+    let version_summaries = summary
+        .map(|summary| {
+            summary
+                .versions
+                .iter()
+                .map(|record| (record.version_id.clone(), record))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let mut ordered = Vec::with_capacity(records.len());
+    let mut visited = HashSet::<String>::new();
+    let mut cursor = summary.and_then(|summary| summary.preferred_head_version_id.clone());
+    while let Some(version_id) = cursor {
+        if !visited.insert(version_id.clone()) {
+            break;
+        }
+        if let Some(record) = records_by_version_id.get(&version_id) {
+            ordered.push(record.clone());
+        }
+        cursor = version_summaries
+            .get(&version_id)
+            .and_then(|record| record.parent_version_ids.first())
+            .cloned();
+    }
+
+    for record in records {
+        if visited.insert(record.version_id.clone()) {
+            ordered.push(record.clone());
+        }
+    }
+
+    ordered
+}
+
 fn render_list_objects_v2_result(
     bucket: &S3BucketRecord,
     prefix: &str,
@@ -3083,6 +3573,88 @@ fn render_copy_object_result(etag: &str, modified_at_unix: u64) -> String {
     xml.push_str("</LastModified><ETag>");
     xml.push_str(&xml_escape(etag));
     xml.push_str("</ETag></CopyObjectResult>");
+    xml
+}
+
+fn render_bucket_versioning_result(bucket: &S3BucketRecord) -> String {
+    let mut xml =
+        String::from(r#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration xmlns=""#);
+    xml.push('"');
+    xml.push_str(S3_XML_NAMESPACE);
+    xml.push_str(r#"">"#);
+    if bucket.versioning_status == S3BucketVersioningStatus::Enabled {
+        xml.push_str("<Status>Enabled</Status>");
+    }
+    xml.push_str("</VersioningConfiguration>");
+    xml
+}
+
+fn render_list_object_versions_result(
+    bucket: &S3BucketRecord,
+    prefix: &str,
+    key_marker: Option<&str>,
+    version_id_marker: Option<&str>,
+    max_keys: usize,
+    is_truncated: bool,
+    next_key_marker: Option<&str>,
+    next_version_id_marker: Option<&str>,
+    entries: &[S3ListVersionEntry],
+) -> String {
+    let mut xml =
+        String::from(r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns=""#);
+    xml.push('"');
+    xml.push_str(S3_XML_NAMESPACE);
+    xml.push_str(r#""><Name>"#);
+    xml.push_str(&xml_escape(&bucket.bucket_name));
+    xml.push_str("</Name><Prefix>");
+    xml.push_str(&xml_escape(prefix));
+    xml.push_str("</Prefix><KeyMarker>");
+    xml.push_str(&xml_escape(key_marker.unwrap_or("")));
+    xml.push_str("</KeyMarker><VersionIdMarker>");
+    xml.push_str(&xml_escape(version_id_marker.unwrap_or("")));
+    xml.push_str("</VersionIdMarker><MaxKeys>");
+    xml.push_str(&max_keys.to_string());
+    xml.push_str("</MaxKeys><IsTruncated>");
+    xml.push_str(if is_truncated { "true" } else { "false" });
+    xml.push_str("</IsTruncated>");
+    if let Some(marker) = next_key_marker {
+        xml.push_str("<NextKeyMarker>");
+        xml.push_str(&xml_escape(marker));
+        xml.push_str("</NextKeyMarker>");
+    }
+    if let Some(marker) = next_version_id_marker {
+        xml.push_str("<NextVersionIdMarker>");
+        xml.push_str(&xml_escape(marker));
+        xml.push_str("</NextVersionIdMarker>");
+    }
+    for entry in entries {
+        if entry.is_delete_marker {
+            xml.push_str("<DeleteMarker><Key>");
+            xml.push_str(&xml_escape(&entry.key));
+            xml.push_str("</Key><VersionId>");
+            xml.push_str(&xml_escape(&entry.version_id));
+            xml.push_str("</VersionId><IsLatest>");
+            xml.push_str(if entry.is_latest { "true" } else { "false" });
+            xml.push_str("</IsLatest><LastModified>");
+            xml.push_str(&xml_escape(&s3_timestamp(entry.modified_at_unix)));
+            xml.push_str("</LastModified></DeleteMarker>");
+        } else {
+            xml.push_str("<Version><Key>");
+            xml.push_str(&xml_escape(&entry.key));
+            xml.push_str("</Key><VersionId>");
+            xml.push_str(&xml_escape(&entry.version_id));
+            xml.push_str("</VersionId><IsLatest>");
+            xml.push_str(if entry.is_latest { "true" } else { "false" });
+            xml.push_str("</IsLatest><LastModified>");
+            xml.push_str(&xml_escape(&s3_timestamp(entry.modified_at_unix)));
+            xml.push_str("</LastModified><ETag>");
+            xml.push_str(&xml_escape(&entry.etag));
+            xml.push_str("</ETag><Size>");
+            xml.push_str(&entry.size_bytes.unwrap_or(0).to_string());
+            xml.push_str("</Size><StorageClass>STANDARD</StorageClass></Version>");
+        }
+    }
+    xml.push_str("</ListVersionsResult>");
     xml
 }
 
@@ -3201,6 +3773,54 @@ fn append_version_id_header(response: &mut Response, version_id: Option<&str>) {
     }
 }
 
+fn append_delete_marker_header(response: &mut Response) {
+    response
+        .headers_mut()
+        .insert("x-amz-delete-marker", HeaderValue::from_static("true"));
+}
+
+fn append_last_modified_header(response: &mut Response, modified_at_unix: u64) {
+    if let Ok(value) = HeaderValue::from_str(&s3_timestamp(modified_at_unix)) {
+        response.headers_mut().insert(header::LAST_MODIFIED, value);
+    }
+}
+
+fn build_current_delete_marker_response(
+    head_only: bool,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    let mut response = if head_only {
+        let mut response = StatusCode::NOT_FOUND.into_response();
+        append_request_id_header(&mut response, request_id);
+        response
+    } else {
+        s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchKey",
+            "the specified key does not exist",
+            resource,
+            request_id,
+        )
+    };
+    append_delete_marker_header(&mut response);
+    response
+}
+
+fn build_delete_marker_version_response(
+    _head_only: bool,
+    request_id: &str,
+    version_id: &str,
+    modified_at_unix: u64,
+) -> Response {
+    let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
+    append_request_id_header(&mut response, request_id);
+    append_delete_marker_header(&mut response);
+    append_version_id_header(&mut response, Some(version_id));
+    append_last_modified_header(&mut response, modified_at_unix);
+    response
+}
+
 fn xml_response(status: StatusCode, body: String, request_id: &str) -> Response {
     let mut response = (status, body).into_response();
     response.headers_mut().insert(
@@ -3233,6 +3853,17 @@ fn xml_escape(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn parse_bucket_versioning_status(xml: &str) -> Result<S3BucketVersioningStatus, String> {
+    let Some(status) = xml_tag_contents(xml, "Status") else {
+        return Err("VersioningConfiguration must include a Status element".to_string());
+    };
+    match status.trim() {
+        "Enabled" => Ok(S3BucketVersioningStatus::Enabled),
+        "Suspended" | "Disabled" => Ok(S3BucketVersioningStatus::Disabled),
+        _ => Err("VersioningConfiguration Status must be Enabled or Suspended".to_string()),
+    }
 }
 
 fn s3_timestamp(unix_ts: u64) -> String {
