@@ -663,6 +663,7 @@ export type S3ControlPlaneStatusResponse = {
   listener_enabled: boolean;
   public_url: string | null;
   tls_enabled: boolean;
+  gateway_command_hint: string;
   local_generation: number;
   last_applied_at_unix: number | null;
   last_source_node_id: string | null;

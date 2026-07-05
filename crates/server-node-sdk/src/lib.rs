@@ -14066,6 +14066,7 @@ struct S3ControlPlaneStatusResponse {
     listener_enabled: bool,
     public_url: Option<String>,
     tls_enabled: bool,
+    gateway_command_hint: String,
     local_generation: u64,
     last_applied_at_unix: Option<u64>,
     last_source_node_id: Option<NodeId>,
@@ -14420,6 +14421,9 @@ async fn build_s3_control_plane_status_response(
         listener_enabled: state.s3.listener_enabled,
         public_url: state.s3.public_url.clone(),
         tls_enabled: state.s3.tls_enabled,
+        gateway_command_hint:
+            "ironmesh --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000"
+                .to_string(),
         local_generation: runtime.generation,
         last_applied_at_unix: runtime.last_applied_at_unix,
         last_source_node_id: runtime.last_source_node_id,

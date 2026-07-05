@@ -376,6 +376,23 @@ export function S3ControlPlanePage() {
                   hint={status?.last_applied_at_unix ? formatUnixTs(status.last_applied_at_unix) : "No remote import yet"}
                 />
               </SimpleGrid>
+              <Stack gap="xs">
+                <Text c="dimmed">
+                  Use the gateway mode below when you need a standard S3 endpoint over authenticated
+                  Ironmesh direct or relay transport instead of exposing this node&apos;s listener
+                  directly.
+                </Text>
+                <Textarea
+                  label="Gateway command"
+                  value={
+                    status?.gateway_command_hint ??
+                    "ironmesh --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000"
+                  }
+                  readOnly
+                  autosize
+                  minRows={2}
+                />
+              </Stack>
               <JsonBlock
                 value={
                   status ?? {
