@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -613,6 +613,105 @@ pub struct ClientBootstrapClaimRecord {
     pub consumed_by_device_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum S3BucketVersioningStatus {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl S3BucketVersioningStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "disabled" => Some(Self::Disabled),
+            "enabled" => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct S3BucketRecord {
+    pub bucket_name: String,
+    pub root_prefix: String,
+    pub versioning_status: S3BucketVersioningStatus,
+    pub read_only: bool,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct S3AccessKeyRecord {
+    pub access_key_id: String,
+    pub secret_hash: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub bucket_scope: Vec<String>,
+    #[serde(default)]
+    pub prefix_scope: Vec<String>,
+    pub allow_list: bool,
+    pub allow_read: bool,
+    pub allow_write: bool,
+    pub allow_delete: bool,
+    pub created_at_unix: u64,
+    #[serde(default)]
+    pub last_used_at_unix: Option<u64>,
+    #[serde(default)]
+    pub revoked_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct S3ControlPlaneState {
+    #[serde(default)]
+    pub buckets: Vec<S3BucketRecord>,
+    #[serde(default)]
+    pub access_keys: Vec<S3AccessKeyRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ObjectVersionMetadataRecord {
+    pub version_id: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub content_encoding: Option<String>,
+    #[serde(default)]
+    pub content_language: Option<String>,
+    #[serde(default)]
+    pub cache_control: Option<String>,
+    #[serde(default)]
+    pub content_disposition: Option<String>,
+    #[serde(default)]
+    pub user_metadata: BTreeMap<String, String>,
+    #[serde(default)]
+    pub checksum_sha256: Option<String>,
+    #[serde(default)]
+    pub checksum_crc32c: Option<String>,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct S3ObjectVersionRecord {
+    pub bucket_name: String,
+    pub ironmesh_key: String,
+    pub version_id: String,
+    pub etag: String,
+    #[serde(default)]
+    pub multipart_part_count: Option<u32>,
+    pub created_at_unix: u64,
+}
+
 #[derive(Debug)]
 pub enum StoreReadError {
     NotFound,
@@ -882,6 +981,43 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["state_json"],
     },
     MetadataDbLogicalTableSpec {
+        table: "s3_buckets",
+        tracked_columns: &[
+            "bucket_name",
+            "root_prefix",
+            "versioning_status",
+            "created_by",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "s3_access_keys",
+        tracked_columns: &[
+            "access_key_id",
+            "secret_hash",
+            "description",
+            "bucket_scope_json",
+            "prefix_scope_json",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "object_version_metadata",
+        tracked_columns: &[
+            "version_id",
+            "content_type",
+            "content_encoding",
+            "content_language",
+            "cache_control",
+            "content_disposition",
+            "user_metadata_json",
+            "checksum_sha256",
+            "checksum_crc32c",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "s3_object_versions",
+        tracked_columns: &["bucket_name", "ironmesh_key", "version_id", "etag"],
+    },
+    MetadataDbLogicalTableSpec {
         table: "admin_audit_events",
         tracked_columns: &["event_id", "event_json"],
     },
@@ -1072,6 +1208,8 @@ trait MetadataStore: Send + Sync {
     -> Result<()>;
     async fn load_client_credential_state(&self) -> Result<ClientCredentialState>;
     async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()>;
+    async fn load_s3_control_plane_state(&self) -> Result<S3ControlPlaneState>;
+    async fn persist_s3_control_plane_state(&self, state: &S3ControlPlaneState) -> Result<()>;
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>>;
     async fn load_snapshot_batch_state(&self) -> Result<Option<ActiveSnapshotBatch>>;
     async fn persist_snapshot_batch_state(&self, state: Option<&ActiveSnapshotBatch>)
@@ -1101,6 +1239,27 @@ trait MetadataStore: Send + Sync {
         &self,
         manifest_hashes: &[String],
     ) -> Result<HashMap<String, ManifestSummary>>;
+    async fn load_object_version_metadata(
+        &self,
+        version_id: &str,
+    ) -> Result<Option<ObjectVersionMetadataRecord>>;
+    async fn persist_object_version_metadata(
+        &self,
+        metadata: &ObjectVersionMetadataRecord,
+    ) -> Result<()>;
+    async fn delete_object_version_metadata(&self, version_id: &str) -> Result<()>;
+    async fn load_s3_object_version(
+        &self,
+        bucket_name: &str,
+        version_id: &str,
+    ) -> Result<Option<S3ObjectVersionRecord>>;
+    async fn list_s3_object_versions_for_key(
+        &self,
+        bucket_name: &str,
+        ironmesh_key: &str,
+    ) -> Result<Vec<S3ObjectVersionRecord>>;
+    async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()>;
+    async fn delete_s3_object_version(&self, bucket_name: &str, version_id: &str) -> Result<()>;
     async fn persist_manifest_summary(
         &self,
         manifest_hash: &str,
@@ -2169,6 +2328,74 @@ impl PersistentStore {
     ) -> Result<()> {
         self.metadata_store
             .persist_client_credential_state(state)
+            .await
+    }
+
+    pub async fn load_s3_control_plane_state(&self) -> Result<S3ControlPlaneState> {
+        self.metadata_store.load_s3_control_plane_state().await
+    }
+
+    pub async fn persist_s3_control_plane_state(&self, state: &S3ControlPlaneState) -> Result<()> {
+        self.metadata_store
+            .persist_s3_control_plane_state(state)
+            .await
+    }
+
+    pub async fn load_object_version_metadata(
+        &self,
+        version_id: &str,
+    ) -> Result<Option<ObjectVersionMetadataRecord>> {
+        self.metadata_store
+            .load_object_version_metadata(version_id)
+            .await
+    }
+
+    pub async fn persist_object_version_metadata(
+        &self,
+        metadata: &ObjectVersionMetadataRecord,
+    ) -> Result<()> {
+        self.metadata_store
+            .persist_object_version_metadata(metadata)
+            .await
+    }
+
+    pub async fn delete_object_version_metadata(&self, version_id: &str) -> Result<()> {
+        self.metadata_store
+            .delete_object_version_metadata(version_id)
+            .await
+    }
+
+    pub async fn load_s3_object_version(
+        &self,
+        bucket_name: &str,
+        version_id: &str,
+    ) -> Result<Option<S3ObjectVersionRecord>> {
+        self.metadata_store
+            .load_s3_object_version(bucket_name, version_id)
+            .await
+    }
+
+    pub async fn list_s3_object_versions_for_key(
+        &self,
+        bucket_name: &str,
+        ironmesh_key: &str,
+    ) -> Result<Vec<S3ObjectVersionRecord>> {
+        self.metadata_store
+            .list_s3_object_versions_for_key(bucket_name, ironmesh_key)
+            .await
+    }
+
+    pub async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()> {
+        self.metadata_store.persist_s3_object_version(record).await
+    }
+
+    pub async fn delete_s3_object_version(
+        &self,
+        bucket_name: &str,
+        version_id: &str,
+    ) -> Result<()> {
+        self.metadata_store
+            .delete_s3_object_version(bucket_name, version_id)
             .await
     }
 
