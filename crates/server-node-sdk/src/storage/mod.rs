@@ -5513,7 +5513,6 @@ impl PersistentStore {
             if !overwrite {
                 return Ok(PathMutationResult::TargetExists);
             }
-            return Ok(PathMutationResult::TargetExists);
         }
 
         let Some(source_index) = self
@@ -5539,40 +5538,17 @@ impl PersistentStore {
         let copied_manifest_hash = self
             .clone_manifest_for_key(&source_head.manifest_hash, to_path)
             .await?;
-        let copied_object_id = generate_object_id();
-        let copied_version_id = format!("copy-{}-{}", unix_ts_nanos(), &copied_manifest_hash[..12]);
-        let copied_record = FileVersionRecord {
-            version_id: copied_version_id.clone(),
-            object_id: copied_object_id.clone(),
-            manifest_hash: copied_manifest_hash.clone(),
-            logical_path: Some(to_path.to_string()),
-            parent_version_ids: Vec::new(),
-            state: source_head.state.clone(),
-            created_at_unix: unix_ts(),
-            copied_from_object_id: Some(source_object_id),
-            copied_from_version_id: Some(source_head.version_id.clone()),
-            copied_from_path: Some(from_path.to_string()),
-        };
-
-        let mut copied_index = empty_version_index(&copied_object_id);
-        copied_index
-            .versions
-            .insert(copied_version_id.clone(), copied_record);
-        copied_index.head_version_ids = vec![copied_version_id];
-        copied_index.preferred_head_version_id = choose_preferred_head(&copied_index);
-        self.persist_version_index_by_object_id(&copied_object_id, &copied_index)
-            .await?;
-
-        self.current_state
-            .object_ids
-            .insert(to_path.to_string(), copied_object_id);
-        self.current_state
-            .objects
-            .insert(to_path.to_string(), copied_manifest_hash);
-        self.persist_current_state_with_snapshot_batch(touched_paths, true, unix_ts())
-            .await?;
-
-        Ok(PathMutationResult::Applied)
+        self.persist_copied_version_to_target(
+            from_path,
+            to_path,
+            copied_manifest_hash,
+            Some(source_object_id),
+            Some(source_head.version_id.clone()),
+            source_head.state.clone(),
+            "copy",
+            true,
+        )
+        .await
     }
 
     pub async fn restore_snapshot_path(
@@ -6535,90 +6511,79 @@ impl PersistentStore {
             if !overwrite {
                 return Ok(PathMutationResult::TargetExists);
             }
-            return Ok(PathMutationResult::TargetExists);
         }
 
-        let restored_manifest_hash = self
-            .clone_manifest_for_key(&source.manifest_hash, target_path)
-            .await?;
         let touched_paths = BTreeSet::from([target_path.to_string()]);
         if create_snapshot {
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         }
-
-        if source_path == target_path {
-            let object_id = self
-                .object_id_for_key(target_path)
-                .unwrap_or_else(generate_object_id);
-            let mut index = self
-                .load_version_index_by_object_id(&object_id)
-                .await?
-                .unwrap_or_else(|| empty_version_index(&object_id));
-            let restore_version_id = format!(
-                "restore-{}-{}",
-                unix_ts_nanos(),
-                &restored_manifest_hash[..12]
-            );
-            let parent_version_ids = index.preferred_head_version_id.iter().cloned().collect();
-
-            index.versions.insert(
-                restore_version_id.clone(),
-                FileVersionRecord {
-                    version_id: restore_version_id,
-                    object_id: object_id.clone(),
-                    manifest_hash: restored_manifest_hash,
-                    logical_path: Some(target_path.to_string()),
-                    parent_version_ids,
-                    state: source.state,
-                    created_at_unix: unix_ts(),
-                    copied_from_object_id: source.object_id,
-                    copied_from_version_id: source.version_id,
-                    copied_from_path: Some(source_path.to_string()),
-                },
-            );
-            index.head_version_ids = recompute_head_version_ids(&index);
-            index.preferred_head_version_id = choose_preferred_head(&index);
-
-            self.persist_version_index_by_object_id(&object_id, &index)
-                .await?;
-            self.sync_current_state_for_key_from_index(target_path, &index)?;
-            self.persist_current_state_with_snapshot_batch(
-                touched_paths,
-                create_snapshot,
-                unix_ts(),
-            )
+        let restored_manifest_hash = self
+            .clone_manifest_for_key(&source.manifest_hash, target_path)
             .await?;
-            return Ok(PathMutationResult::Applied);
-        }
 
-        let copied_object_id = generate_object_id();
+        self.persist_copied_version_to_target(
+            source_path,
+            target_path,
+            restored_manifest_hash,
+            source.object_id,
+            source.version_id,
+            source.state,
+            "restore",
+            create_snapshot,
+        )
+        .await
+    }
+
+    async fn persist_copied_version_to_target(
+        &mut self,
+        source_path: &str,
+        target_path: &str,
+        manifest_hash: String,
+        copied_from_object_id: Option<String>,
+        copied_from_version_id: Option<String>,
+        state: VersionConsistencyState,
+        version_prefix: &str,
+        create_snapshot: bool,
+    ) -> Result<PathMutationResult> {
+        let touched_paths = BTreeSet::from([target_path.to_string()]);
+        let target_object_id = self
+            .object_id_for_key(target_path)
+            .unwrap_or_else(generate_object_id);
+        let mut target_index = self
+            .load_version_index_by_object_id(&target_object_id)
+            .await?
+            .unwrap_or_else(|| empty_version_index(&target_object_id));
         let copied_version_id = format!(
-            "restore-{}-{}",
+            "{version_prefix}-{}-{}",
             unix_ts_nanos(),
-            &restored_manifest_hash[..12]
+            &manifest_hash[..12]
         );
-        let copied_record = FileVersionRecord {
-            version_id: copied_version_id.clone(),
-            object_id: copied_object_id.clone(),
-            manifest_hash: restored_manifest_hash,
-            logical_path: Some(target_path.to_string()),
-            parent_version_ids: Vec::new(),
-            state: source.state,
-            created_at_unix: unix_ts(),
-            copied_from_object_id: source.object_id,
-            copied_from_version_id: source.version_id,
-            copied_from_path: Some(source_path.to_string()),
-        };
+        let parent_version_ids = target_index
+            .preferred_head_version_id
+            .iter()
+            .cloned()
+            .collect();
 
-        let mut copied_index = empty_version_index(&copied_object_id);
-        copied_index
-            .versions
-            .insert(copied_version_id.clone(), copied_record);
-        copied_index.head_version_ids = vec![copied_version_id];
-        copied_index.preferred_head_version_id = choose_preferred_head(&copied_index);
-        self.persist_version_index_by_object_id(&copied_object_id, &copied_index)
+        target_index.versions.insert(
+            copied_version_id.clone(),
+            FileVersionRecord {
+                version_id: copied_version_id,
+                object_id: target_object_id.clone(),
+                manifest_hash,
+                logical_path: Some(target_path.to_string()),
+                parent_version_ids,
+                state,
+                created_at_unix: unix_ts(),
+                copied_from_object_id,
+                copied_from_version_id,
+                copied_from_path: Some(source_path.to_string()),
+            },
+        );
+        target_index.head_version_ids = recompute_head_version_ids(&target_index);
+        target_index.preferred_head_version_id = choose_preferred_head(&target_index);
+        self.persist_version_index_by_object_id(&target_object_id, &target_index)
             .await?;
-        self.sync_current_state_for_key_from_index(target_path, &copied_index)?;
+        self.sync_current_state_for_key_from_index(target_path, &target_index)?;
         self.persist_current_state_with_snapshot_batch(touched_paths, create_snapshot, unix_ts())
             .await?;
 

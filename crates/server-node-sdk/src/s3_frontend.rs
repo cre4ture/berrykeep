@@ -59,6 +59,19 @@ struct S3ObjectQuery {
 }
 
 #[derive(Debug, Clone)]
+struct S3CopySource {
+    bucket_name: String,
+    object_key: String,
+    version_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S3MetadataDirective {
+    Copy,
+    Replace,
+}
+
+#[derive(Debug, Clone)]
 struct S3ListContentEntry {
     key: String,
     etag: String,
@@ -543,6 +556,9 @@ async fn put_object(
             &request.request_id,
         );
     }
+    if header_value_name(&headers, "x-amz-copy-source").is_some() {
+        return copy_object_response(&state, &uri, &headers, &request, &bucket, &full_key).await;
+    }
 
     let metadata = object_metadata_from_headers(&headers);
     let total_size_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
@@ -660,6 +676,337 @@ async fn put_object(
     append_request_id_header(&mut response, &request.request_id);
     append_etag_header(&mut response, &object_etag(&outcome.manifest_hash));
     append_version_id_header(&mut response, Some(&outcome.version_id));
+    response
+}
+
+async fn copy_object_response(
+    state: &ServerState,
+    uri: &Uri,
+    headers: &HeaderMap,
+    request: &S3RequestContext,
+    destination_bucket: &S3BucketRecord,
+    destination_full_key: &str,
+) -> Response {
+    if !request.access_key.allow_read {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to read copy sources",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let Some(raw_copy_source) = header_value_name(headers, "x-amz-copy-source") else {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "x-amz-copy-source is required for CopyObject",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+    let copy_source = match parse_copy_source(&raw_copy_source) {
+        Ok(copy_source) => copy_source,
+        Err(message) => {
+            return s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                &message,
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    let metadata_directive = match parse_metadata_directive(headers) {
+        Ok(directive) => directive,
+        Err(message) => {
+            return s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                &message,
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+
+    let source_bucket = match resolve_bucket(state, &copy_source.bucket_name).await {
+        Some(bucket) => bucket,
+        None => {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "the specified source bucket does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    let source_full_key = format!("{}{}", source_bucket.root_prefix, copy_source.object_key);
+    if !access_key_allows_object(&request.access_key, &source_bucket, &source_full_key) {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to read the source object path",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let replace_metadata = matches!(metadata_directive, S3MetadataDirective::Replace)
+        .then(|| object_metadata_from_headers(headers));
+    let actor = s3_actor_context(&request.access_key);
+    let mut store = lock_store(state, "s3.copy_object.store").await;
+    let source_version_id = match resolve_copy_source_version(
+        &store,
+        &source_bucket,
+        &source_full_key,
+        copy_source.version_id.as_deref(),
+        uri.path(),
+        &request.request_id,
+    )
+    .await
+    {
+        Ok(version) => version,
+        Err(response) => return response,
+    };
+    let destination_head_before = match store.list_versions(destination_full_key).await {
+        Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
+        Err(err) => {
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to inspect destination versions before copy: {err:#}"),
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    if source_full_key == destination_full_key
+        && metadata_directive == S3MetadataDirective::Copy
+        && destination_head_before.as_deref() == Some(source_version_id.as_str())
+    {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "copying an object onto itself without changing metadata is not supported",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let copied_metadata = match metadata_directive {
+        S3MetadataDirective::Copy => {
+            match store.load_object_version_metadata(&source_version_id).await {
+                Ok(metadata) => metadata.unwrap_or_default(),
+                Err(err) => {
+                    return s3_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        &format!("failed to load source object metadata: {err:#}"),
+                        uri.path(),
+                        &request.request_id,
+                    );
+                }
+            }
+        }
+        S3MetadataDirective::Replace => replace_metadata.unwrap_or_default(),
+    };
+
+    let copy_result = if copy_source.version_id.is_some() || source_full_key == destination_full_key
+    {
+        store
+            .restore_version_path(
+                &source_full_key,
+                &source_version_id,
+                destination_full_key,
+                true,
+            )
+            .await
+    } else {
+        store
+            .copy_object_path(&source_full_key, destination_full_key, true)
+            .await
+    };
+    match copy_result {
+        Ok(PathMutationResult::Applied) => {}
+        Ok(PathMutationResult::SourceMissing) => {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                if copy_source.version_id.is_some() {
+                    "NoSuchVersion"
+                } else {
+                    "NoSuchKey"
+                },
+                "the specified copy source does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+        Ok(PathMutationResult::TargetExists) => {
+            return s3_error_response(
+                StatusCode::CONFLICT,
+                "InvalidRequest",
+                "the destination object could not be overwritten",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+        Err(err) => {
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to copy S3 object: {err:#}"),
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    }
+
+    let destination_graph = match store.list_versions(destination_full_key).await {
+        Ok(Some(graph)) => graph,
+        Ok(None) => {
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "the destination object is missing after copy",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+        Err(err) => {
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to inspect destination versions after copy: {err:#}"),
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    let Some(destination_head_version_id) = destination_graph.preferred_head_version_id.clone()
+    else {
+        return s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "the destination object has no preferred head after copy",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+    let Some(destination_head) = destination_graph
+        .versions
+        .iter()
+        .find(|record| record.version_id == destination_head_version_id)
+        .cloned()
+    else {
+        return s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "the destination head version could not be loaded after copy",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+
+    let mut destination_metadata = copied_metadata;
+    destination_metadata.version_id = destination_head.version_id.clone();
+    destination_metadata.updated_at_unix = unix_ts();
+    if let Err(err) = store
+        .persist_object_version_metadata(&destination_metadata)
+        .await
+    {
+        return s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &format!("failed to persist destination object metadata: {err:#}"),
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let destination_etag = object_etag(&destination_head.manifest_hash);
+    if let Err(err) = store
+        .persist_s3_object_version(&S3ObjectVersionRecord {
+            bucket_name: destination_bucket.bucket_name.clone(),
+            ironmesh_key: destination_full_key.to_string(),
+            version_id: destination_head.version_id.clone(),
+            etag: destination_etag.clone(),
+            multipart_part_count: None,
+            created_at_unix: unix_ts(),
+        })
+        .await
+    {
+        return s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &format!("failed to persist destination S3 version record: {err:#}"),
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    drop(store);
+
+    publish_namespace_change(state);
+    spawn_media_metadata_warmup(
+        state.clone(),
+        destination_full_key.to_string(),
+        destination_head.manifest_hash.clone(),
+    );
+
+    let mut cluster = state.cluster.lock().await;
+    cluster.note_replica(destination_full_key, state.node_id);
+    cluster.note_replica(
+        format!("{}@{}", destination_full_key, destination_head.version_id),
+        state.node_id,
+    );
+    drop(cluster);
+    if let Err(err) = persist_cluster_replicas_state(state).await {
+        warn!(
+            error = %err,
+            key = %destination_full_key,
+            "failed persisting cluster replicas after S3 copy"
+        );
+    }
+    if should_trigger_autonomous_post_write_replication(
+        state.autonomous_replication_on_put_enabled,
+        false,
+    ) {
+        enqueue_autonomous_post_write_replication(
+            state,
+            autonomous_post_write_replication_subjects(
+                destination_full_key,
+                &destination_head.version_id,
+            ),
+        )
+        .await;
+    }
+    record_data_change_event(
+        state,
+        PendingDataChangeEvent {
+            action: DataChangeAction::Copy,
+            actor: Some(actor),
+            path: destination_full_key.to_string(),
+            from_path: Some(source_full_key),
+            to_path: Some(destination_full_key.to_string()),
+            recursive: false,
+            affected_path_count: 1,
+            total_size_bytes: None,
+            version_id: Some(destination_head.version_id.clone()),
+            snapshot_id: None,
+            upload_mode: None,
+        },
+    )
+    .await;
+
+    let mut response = xml_response(
+        StatusCode::OK,
+        render_copy_object_result(&destination_etag, destination_head.created_at_unix),
+        &request.request_id,
+    );
+    append_etag_header(&mut response, &destination_etag);
+    append_version_id_header(&mut response, Some(&destination_head.version_id));
     response
 }
 
@@ -1442,6 +1789,137 @@ async fn resolve_requested_version_id(
     )
 }
 
+async fn resolve_copy_source_version(
+    store: &storage::PersistentStore,
+    bucket: &S3BucketRecord,
+    full_key: &str,
+    requested_version_id: Option<&str>,
+    request_path: &str,
+    request_id: &str,
+) -> Result<String, Response> {
+    if let Some(version_id) = requested_version_id {
+        let version = match store
+            .load_s3_object_version(&bucket.bucket_name, version_id)
+            .await
+        {
+            Ok(version) => version,
+            Err(err) => {
+                return Err(s3_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    &format!("failed to load copy source version record: {err:#}"),
+                    request_path,
+                    request_id,
+                ));
+            }
+        };
+        let Some(version) = version else {
+            return Err(s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchVersion",
+                "the specified source version does not exist",
+                request_path,
+                request_id,
+            ));
+        };
+        if version.ironmesh_key != full_key {
+            return Err(s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchVersion",
+                "the specified source version does not exist",
+                request_path,
+                request_id,
+            ));
+        }
+        return Ok(version.version_id);
+    }
+
+    let versions = match store.list_versions(full_key).await {
+        Ok(versions) => versions,
+        Err(err) => {
+            return Err(s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to inspect copy source versions: {err:#}"),
+                request_path,
+                request_id,
+            ));
+        }
+    };
+    let Some(versions) = versions else {
+        return Err(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchKey",
+            "the specified copy source does not exist",
+            request_path,
+            request_id,
+        ));
+    };
+    match versions.preferred_head_version_id {
+        Some(version_id) => Ok(version_id),
+        None => Err(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchKey",
+            "the specified copy source does not exist",
+            request_path,
+            request_id,
+        )),
+    }
+}
+
+fn parse_copy_source(value: &str) -> Result<S3CopySource, String> {
+    let trimmed = value.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("x-amz-copy-source must include a bucket and object key".to_string());
+    }
+
+    let (raw_path, raw_query) = trimmed.split_once('?').unwrap_or((trimmed, ""));
+    let decoded_path = percent_encoding::percent_decode_str(raw_path)
+        .decode_utf8()
+        .map_err(|_| "x-amz-copy-source contains invalid percent-encoding".to_string())?;
+    let (bucket_name, object_key) = decoded_path.split_once('/').ok_or_else(|| {
+        "x-amz-copy-source must include both a bucket name and object key".to_string()
+    })?;
+    if bucket_name.trim().is_empty() || object_key.trim().is_empty() {
+        return Err("x-amz-copy-source must include both a bucket name and object key".to_string());
+    }
+
+    let mut version_id = None::<String>;
+    for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if name != "versionId" {
+            continue;
+        }
+
+        let decoded_value = percent_encoding::percent_decode_str(value)
+            .decode_utf8()
+            .map_err(|_| {
+                "x-amz-copy-source versionId contains invalid percent-encoding".to_string()
+            })?;
+        if !decoded_value.is_empty() {
+            version_id = Some(decoded_value.to_string());
+        }
+    }
+
+    Ok(S3CopySource {
+        bucket_name: bucket_name.to_string(),
+        object_key: object_key.to_string(),
+        version_id,
+    })
+}
+
+fn parse_metadata_directive(headers: &HeaderMap) -> Result<S3MetadataDirective, String> {
+    match header_value_name(headers, "x-amz-metadata-directive")
+        .as_deref()
+        .map(str::to_ascii_uppercase)
+    {
+        None => Ok(S3MetadataDirective::Copy),
+        Some(value) if value == "COPY" => Ok(S3MetadataDirective::Copy),
+        Some(value) if value == "REPLACE" => Ok(S3MetadataDirective::Replace),
+        Some(_) => Err("x-amz-metadata-directive must be either COPY or REPLACE".to_string()),
+    }
+}
+
 fn object_metadata_from_headers(headers: &HeaderMap) -> ObjectVersionMetadataRecord {
     let mut user_metadata = BTreeMap::new();
     for (name, value) in headers {
@@ -1615,6 +2093,19 @@ fn render_list_objects_v2_result(
         xml.push_str("</Prefix></CommonPrefixes>");
     }
     xml.push_str("</ListBucketResult>");
+    xml
+}
+
+fn render_copy_object_result(etag: &str, modified_at_unix: u64) -> String {
+    let mut xml =
+        String::from(r#"<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult xmlns=""#);
+    xml.push('"');
+    xml.push_str(S3_XML_NAMESPACE);
+    xml.push_str(r#""><LastModified>"#);
+    xml.push_str(&xml_escape(&s3_timestamp(modified_at_unix)));
+    xml.push_str("</LastModified><ETag>");
+    xml.push_str(&xml_escape(etag));
+    xml.push_str("</ETag></CopyObjectResult>");
     xml
 }
 
