@@ -134,12 +134,18 @@ install_cargo_zigbuild() {
 }
 
 install_rust_target() {
-  if rustup target list --installed | grep -qx "${TARGET_TRIPLE}"; then
-    return
-  fi
+  # Run from ROOT_DIR so rustup resolves the repo's pinned toolchain
+  # (rust-toolchain.toml) rather than whatever toolchain is active in the
+  # caller's cwd when this script is invoked by absolute path.
+  (
+    cd "${ROOT_DIR}"
+    if rustup target list --installed | grep -qx "${TARGET_TRIPLE}"; then
+      exit 0
+    fi
 
-  log "adding rust target ${TARGET_TRIPLE}"
-  rustup target add "${TARGET_TRIPLE}"
+    log "adding rust target ${TARGET_TRIPLE}"
+    rustup target add "${TARGET_TRIPLE}"
+  )
 }
 
 main() {
