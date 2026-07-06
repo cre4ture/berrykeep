@@ -7,6 +7,7 @@ mod tests {
     };
     use anyhow::{Context, Result, bail};
     use hmac::{Hmac, Mac};
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     use reqwest::{Method, StatusCode};
     use sha2::{Digest, Sha256};
     use std::time::Duration;
@@ -128,6 +129,121 @@ mod tests {
             .send()
             .await
             .context("signed S3 request failed")
+    }
+
+    fn build_presigned_s3_url(
+        s3_base_url: &str,
+        method: &Method,
+        path_and_query: &str,
+        access_key_id: &str,
+        secret_material: &str,
+    ) -> Result<String> {
+        let host = s3_base_url
+            .trim_end_matches('/')
+            .strip_prefix("http://")
+            .or_else(|| s3_base_url.trim_end_matches('/').strip_prefix("https://"))
+            .context("S3 base URL must start with http:// or https://")?;
+        let url = format!("{}{path_and_query}", s3_base_url.trim_end_matches('/'));
+        let parsed_url = reqwest::Url::parse(&url)
+            .with_context(|| format!("failed parsing presigned S3 request URL {url}"))?;
+        let amz_date = "20260706T120000Z";
+        let date_scope = "20260706";
+        let region = "us-east-1";
+        let service = "s3";
+        let expires = "900";
+        let signed_headers = "host";
+        let payload_hash = "UNSIGNED-PAYLOAD";
+        let credential_scope = format!("{date_scope}/{region}/{service}/aws4_request");
+        let credential_value = utf8_percent_encode(
+            &format!("{access_key_id}/{credential_scope}"),
+            NON_ALPHANUMERIC,
+        )
+        .to_string();
+
+        let mut pairs = parsed_url
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (name.to_string(), value.to_string())
+            })
+            .collect::<Vec<_>>();
+        pairs.push((
+            "X-Amz-Algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ));
+        pairs.push(("X-Amz-Credential".to_string(), credential_value));
+        pairs.push(("X-Amz-Date".to_string(), amz_date.to_string()));
+        pairs.push(("X-Amz-Expires".to_string(), expires.to_string()));
+        pairs.push((
+            "X-Amz-SignedHeaders".to_string(),
+            signed_headers.to_string(),
+        ));
+        pairs.sort();
+
+        let canonical_query = pairs
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let canonical_request = format!(
+            "{}\n{}\n{}\nhost:{host}\n\n{signed_headers}\n{payload_hash}",
+            method.as_str(),
+            parsed_url.path(),
+            canonical_query,
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+            s3_test_sha256_hex(canonical_request.as_bytes())
+        );
+        let signing_key = s3_test_derive_signing_key(secret_material, date_scope, region, service);
+        let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
+            &signing_key,
+            string_to_sign.as_bytes(),
+        ));
+
+        Ok(format!(
+            "{}{}?{}&X-Amz-Signature={signature}",
+            s3_base_url.trim_end_matches('/'),
+            parsed_url.path(),
+            canonical_query
+        ))
+    }
+
+    async fn send_presigned_s3_request(
+        client: &reqwest::Client,
+        s3_base_url: &str,
+        method: Method,
+        path_and_query: &str,
+        access_key_id: &str,
+        secret_material: &str,
+        extra_headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<reqwest::Response> {
+        let host = s3_base_url
+            .trim_end_matches('/')
+            .strip_prefix("http://")
+            .or_else(|| s3_base_url.trim_end_matches('/').strip_prefix("https://"))
+            .context("S3 base URL must start with http:// or https://")?;
+        let presigned_url = build_presigned_s3_url(
+            s3_base_url,
+            &method,
+            path_and_query,
+            access_key_id,
+            secret_material,
+        )?;
+
+        let mut request = client.request(method, presigned_url).header("host", host);
+        for (name, value) in extra_headers {
+            request = request.header(*name, *value);
+        }
+        request
+            .body(body)
+            .send()
+            .await
+            .context("presigned S3 request failed")
     }
 
     async fn wait_for_signed_s3_status(
@@ -961,6 +1077,379 @@ mod tests {
             assert!(list_versions_xml.contains(&delete_marker_version_id));
             assert!(list_versions_xml.contains(&v2_version_id));
             assert!(list_versions_xml.contains(&v1_version_id));
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_serves_presigned_requests() -> Result<()> {
+        let public_bind = "127.0.0.1:19466";
+        let s3_bind = "127.0.0.1:19467";
+        let data_dir = fresh_data_dir("s3-listener-presigned-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-presigned-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed building system test HTTP client")?;
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{public_base}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "photos.example",
+                    "root_prefix": "tenant/photos",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-presigned",
+                    "bucket_scope": ["photos.example"],
+                    "prefix_scope": ["tenant/photos/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            let put_object = send_presigned_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/photos.example/docs/presigned.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                b"presigned body".to_vec(),
+            )
+            .await?;
+            assert_eq!(put_object.status(), StatusCode::OK);
+
+            let list_objects = send_presigned_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/photos.example?list-type=2&prefix=docs/",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(list_objects.status(), StatusCode::OK);
+            let list_objects_xml = list_objects.text().await?;
+            assert!(list_objects_xml.contains("<Key>docs/presigned.txt</Key>"));
+
+            let get_object = send_presigned_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/photos.example/docs/presigned.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_object.status(), StatusCode::OK);
+            assert_eq!(get_object.bytes().await?.as_ref(), b"presigned body");
+
+            let tampered_url = {
+                let presigned_url = build_presigned_s3_url(
+                    &s3_base,
+                    &Method::GET,
+                    "/photos.example/docs/presigned.txt",
+                    &access_key_id,
+                    &secret_access_key,
+                )?;
+                let (prefix, last_char) = presigned_url.split_at(presigned_url.len() - 1);
+                let replacement = if last_char == "0" { "1" } else { "0" };
+                format!("{prefix}{replacement}")
+            };
+            let tampered_get_object = http
+                .get(&tampered_url)
+                .header("host", s3_bind)
+                .send()
+                .await?;
+            assert_eq!(tampered_get_object.status(), StatusCode::FORBIDDEN);
+            let tampered_get_object_xml = tampered_get_object.text().await?;
+            assert!(tampered_get_object_xml.contains("<Code>SignatureDoesNotMatch</Code>"));
+
+            let delete_object = send_presigned_s3_request(
+                &http,
+                &s3_base,
+                Method::DELETE,
+                "/photos.example/docs/presigned.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+
+            let get_missing_object = send_presigned_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/photos.example/docs/presigned.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_missing_object.status(), StatusCode::NOT_FOUND);
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_serves_bucket_create_and_delete() -> Result<()> {
+        let public_bind = "127.0.0.1:19468";
+        let s3_bind = "127.0.0.1:19469";
+        let data_dir = fresh_data_dir("s3-listener-bucket-manage-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-bucket-manage-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed building system test HTTP client")?;
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-bucket-manage",
+                    "bucket_scope": ["managed.example", "managed-body.example"],
+                    "prefix_scope": [],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": true
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+            let allow_manage = create_access_key_json
+                .get("view")
+                .and_then(|view| view.get("allow_manage"))
+                .and_then(|value| value.as_bool())
+                .context("created manage-capable access key missing view.allow_manage")?;
+            assert!(allow_manage);
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            let create_bucket = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/managed.example",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(create_bucket.status(), StatusCode::OK);
+            assert_eq!(
+                create_bucket
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("/managed.example")
+            );
+
+            let head_bucket = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::HEAD,
+                "/managed.example",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(head_bucket.status(), StatusCode::OK);
+
+            let put_object = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/managed.example/docs/hello.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                b"hello".to_vec(),
+            )
+            .await?;
+            assert_eq!(put_object.status(), StatusCode::OK);
+
+            let delete_nonempty_bucket = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::DELETE,
+                "/managed.example",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(delete_nonempty_bucket.status(), StatusCode::CONFLICT);
+            let delete_nonempty_bucket_xml = delete_nonempty_bucket.text().await?;
+            assert!(delete_nonempty_bucket_xml.contains("<Code>BucketNotEmpty</Code>"));
+
+            let delete_object = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::DELETE,
+                "/managed.example/docs/hello.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+
+            let delete_bucket = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::DELETE,
+                "/managed.example",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(delete_bucket.status(), StatusCode::NO_CONTENT);
+
+            let head_deleted_bucket = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::HEAD,
+                "/managed.example",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(head_deleted_bucket.status(), StatusCode::NOT_FOUND);
+
+            let create_bucket_with_body = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/managed-body.example",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "application/xml")],
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <LocationConstraint>eu-central-1</LocationConstraint>
+</CreateBucketConfiguration>"#
+                    .to_vec(),
+            )
+            .await?;
+            assert_eq!(create_bucket_with_body.status(), StatusCode::OK);
+            assert_eq!(
+                create_bucket_with_body
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("/managed-body.example")
+            );
+
+            let head_bucket_with_body = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::HEAD,
+                "/managed-body.example",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(head_bucket_with_body.status(), StatusCode::OK);
 
             Ok(())
         }

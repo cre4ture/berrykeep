@@ -2984,6 +2984,7 @@ dependencies = [
  "ironmesh-folder-agent",
  "libc",
  "os-integration",
+ "percent-encoding",
  "rcgen",
  "rendezvous-service",
  "reqwest",

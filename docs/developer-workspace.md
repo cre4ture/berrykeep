@@ -162,6 +162,8 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ### Recent S3 milestone notes
 
+- 2026-07-06: dedicated-listener runtime coverage now includes presigned-request auth and S3-side bucket management over real HTTP.
+  The `system-tests` S3 suite now validates presigned `PUT`/`GET`/`DELETE` flows plus signature tampering failures, and it exercises `allow_manage` bucket creation and deletion semantics, including non-empty-bucket rejection and XML `CreateBucketConfiguration` handling, against a spawned `server-node` S3 listener.
 - 2026-07-06: dedicated-listener runtime coverage now includes versioned-object and delete-marker behavior over real HTTP.
   The `system-tests` S3 suite now validates enabled-bucket version headers, current-object deletes that produce delete markers, historical reads by `versionId`, and `?versions=` listings against a spawned `server-node` S3 listener.
 - 2026-07-06: dedicated-listener runtime coverage now includes multipart upload flows over real HTTP.
