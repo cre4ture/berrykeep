@@ -8319,6 +8319,7 @@ async fn build_test_state(
                 String,
                 Arc<super::web_maps::LogicalMbtilesSource>,
             >::new())),
+            last_gc_pass: Arc::new(std::sync::Mutex::new(None)),
         },
         access: super::ServerAccessRuntime {
             client_credentials: Arc::new(Mutex::new(
@@ -8509,6 +8510,87 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
         state.storage.upload_sessions_dirty.load(Ordering::SeqCst),
         0
     );
+}
+
+#[tokio::test]
+async fn process_stats_memory_reports_current_objects_uploads_and_last_gc_pass() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut store = lock_store(&state, "tests.process_stats_memory.seed").await;
+        store
+            .put_object_versioned(
+                "docs/live.txt",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let now = super::unix_ts();
+    {
+        let mut sessions =
+            super::write_upload_sessions(&state, "tests.process_stats_memory.seed").await;
+        sessions.sessions.insert(
+            "upload-in-flight".to_string(),
+            super::UploadSessionRecord {
+                upload_id: "upload-in-flight".to_string(),
+                owner_device_id: None,
+                key: "uploads/in-flight.bin".to_string(),
+                total_size_bytes: 4096,
+                chunk_size_bytes: 4096,
+                chunk_count: 1,
+                state: VersionConsistencyState::Confirmed,
+                parent_version_ids: Vec::new(),
+                explicit_version_id: None,
+                received_chunks: vec![None],
+                created_at_unix: now,
+                updated_at_unix: now,
+                expires_at_unix: now + 300,
+                finalizing: false,
+                completed: false,
+                completed_result: None,
+            },
+        );
+    }
+
+    let cleanup_response = super::run_cleanup(
+        State(state.clone()),
+        headers.clone(),
+        Query(super::CleanupQuery {
+            retention_secs: Some(0),
+            dry_run: Some(true),
+            approve: Some(false),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cleanup_response.status(), StatusCode::OK);
+
+    let memory_response = super::process_stats_memory(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(memory_response.status(), StatusCode::OK);
+
+    let body = to_bytes(memory_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let sample: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(sample["current_objects_total_count"], 1);
+    assert_eq!(sample["in_flight_upload_session_count"], 1);
+    assert_eq!(sample["in_flight_upload_bytes"], 4096);
+    assert!(sample["current_objects_cache"]["resident_entries"].as_u64().unwrap() >= 1);
+    assert!(sample["current_objects_cache"]["capacity"].as_u64().unwrap() > 0);
+
+    let last_gc_pass = &sample["last_gc_pass"];
+    assert_eq!(last_gc_pass["dry_run"], true);
+    assert_eq!(last_gc_pass["retained_manifests_processed"], 1);
+    assert!(last_gc_pass["peak_manifest_batch_size"].as_u64().unwrap() >= 1);
 }
 
 async fn data_scrub_activity_and_history_do_not_wait_on_active_scrub_impl(

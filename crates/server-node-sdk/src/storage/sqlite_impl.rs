@@ -113,7 +113,6 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(())
     }
 
-    #[cfg(test)]
     async fn count_current_objects(&self) -> Result<usize> {
         let db = self.metadata_conn()?;
         let count: i64 = db.query_row("SELECT COUNT(*) FROM current_objects", [], |row| row.get(0))?;

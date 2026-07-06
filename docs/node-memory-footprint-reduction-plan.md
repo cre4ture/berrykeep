@@ -44,21 +44,39 @@ for this plan — no action needed there.
   the Windows CFAPI adapter already uses (`crates/adapter-windows-cfapi/src/live.rs:163-229`,
   `common/src/range_chunk_cache.rs`) rather than inventing a new one.
 
-## Slice 0: Observability
+## Slice 0: Observability — implemented (2026-07-06)
 
 The dashboard already samples whole-process RSS (`ProcessStatsSample`,
-`crates/server-node-sdk/src/lib.rs:1906-1913`, `spawn_process_stats_sampler` at
-`lib.rs:6292`) and renders it in
-[DashboardPage.tsx](web/apps/server-admin/src/pages/DashboardPage.tsx). What's missing is
-attribution: knowing *why* RSS is high. Add, next to the existing process-stats panel:
+`crates/server-node-sdk/src/lib.rs`, `spawn_process_stats_sampler`) and renders it in
+[DashboardPage.tsx](web/apps/server-admin/src/pages/DashboardPage.tsx). Added a "Memory
+attribution" card next to it, backed by a new `/process/stats/memory` endpoint
+(`process_stats_memory` in `crates/server-node-sdk/src/lib.rs`, mounted alongside the
+existing `/process/stats/current` and `/process/stats/history` routes):
 
-- `current_state` entry count (cheap: `.len()` on both maps) and an estimated byte size.
-- FUSE hydrated-bytes gauge: running total of resident `FsNode.data` bytes per mount.
-- In-flight upload byte total (sum of `UploadSessionRecord` chunk counts × chunk size).
-- Last GC pass peak manifest count (and, once Slice 3 lands, peak batch size instead).
+- **Current-objects cache**: resident entry count vs. configured capacity
+  (`PersistentStore::current_objects_cache_stats`, new `RangeChunkCache::len`/`capacity`
+  in `crates/common/src/range_chunk_cache.rs`), an estimated resident-byte figure (rough
+  per-entry constant, not a precise accounting), and the total live object count from
+  sqlite (`count_current_objects`, now available outside tests). Reworked from the
+  original "current_state entry count" bullet since Slice 2b replaced the resident
+  `CurrentState` maps with this bounded cache — there's no full map left to size.
+- **In-flight uploads**: session count and total bytes (`chunk_count × chunk_size_bytes`
+  summed across open `UploadSessionRecord`s).
+- **Last GC pass**: `retained_manifests_processed` and `peak_manifest_batch_size` (added
+  to `CleanupReport` by Slice 3) plus deleted counts and dry-run flag, captured in
+  `ServerState.storage.last_gc_pass` on every `/maintenance/cleanup` call (dry or not) so
+  there's something to show without waiting for a real GC pass.
+- **FUSE hydrated-bytes gauge: deferred.** Not implemented — `adapter-linux-fuse` runs in
+  a separate client process (typically a different host) with no existing telemetry path
+  to server-node's dashboard, and Slice 1 (which would track resident hydrated bytes in
+  the first place) hasn't landed yet. Revisit once Slice 1 exists and a transport for
+  client-side gauges is decided.
 
-This is additive, low-risk, and should land first so later slices can be measured
-before/after rather than judged by guesswork.
+Additive, low-risk change with no effect on GC/cleanup behavior; the dashboard now shows
+attribution for the two implemented hotspot fixes (Slices 2b and 3) and for in-flight
+upload memory. Verified via `cargo test -p server-node-sdk` (300 tests) and
+`--features turso-metadata` (439 tests), `cargo clippy` clean on both, and
+`pnpm --filter @ironmesh/server-admin typecheck && build` clean.
 
 ## Slice 1: Bound FUSE hydrated memory
 
@@ -157,16 +175,18 @@ manifest in the store) is gone. `PersistentStore::cleanup_unreferenced`
 
 ## Implementation Order
 
-1. Slice 0 (observability) — ships independently, unblocks measurement for everything else.
+1. ~~Slice 0 (observability)~~ — done, see status above.
 2. Slice 1a (FUSE eviction budget) — highest-ranked hotspot, lowest-risk fix.
 3. ~~Slice 2 (compact `CurrentState` values)~~ — superseded by Slice 2b below, which
    replaces the resident map entirely rather than just shrinking its entries.
 4. Slice 1b (FUSE disk-backed staging for large files).
 5. ~~Slice 3 (GC batched scan)~~ — done, see status below.
 6. Slice 1c — only if Slice 0 telemetry from real usage shows it's needed.
-7. **Slice 2b — done** (see status below). Landed ahead of Slices 0/1 per direct request.
-8. **Slice 3 — done** (see status below). Landed ahead of Slices 0/1 per direct request;
-   those remain open.
+7. **Slice 2b — done** (see status below). Landed ahead of Slice 1 per direct request.
+8. **Slice 3 — done** (see status below). Landed ahead of Slice 1 per direct request.
+9. **Slice 0 — done** (see status above). Landed last, retrofitted to describe Slices 2b
+   and 3's already-implemented memory model rather than the original pre-2b/3 design;
+   Slice 1 remains open, so no FUSE hydrated-bytes gauge exists yet.
 
 ## Test Plan
 
@@ -224,5 +244,6 @@ manifest in the store) is gone. `PersistentStore::cleanup_unreferenced`
   no longer builds a full-store manifest map; retained-manifest content is loaded in
   bounded batches (default 500), so peak resident manifest data no longer scales with
   total manifest count on disk.
-- The admin dashboard shows per-structure memory attribution next to the existing
-  whole-process RSS graph, so operators can explain a node's memory use without guessing.
+- ~~The admin dashboard shows per-structure memory attribution next to the existing
+  whole-process RSS graph~~ — done for current-objects cache, in-flight uploads, and last
+  GC pass (Slice 0); FUSE hydrated bytes remains unattributed until Slice 1 exists.

@@ -186,10 +186,11 @@ use setup::{
     managed_rendezvous_key_path, managed_signer_ca_cert_path,
 };
 use storage::{
-    AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, ClientBootstrapClaimRecord,
-    ClientCredentialRecord, ClientCredentialState, DataChangeAction, DataChangeActorKind,
-    DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery, DataChangeUploadMode,
-    DataScrubReport, HostDependencyReport, HostDependencyStatus, MediaCacheLookup,
+    AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, CleanupReport, ClientBootstrapClaimRecord,
+    ClientCredentialRecord, ClientCredentialState, CurrentObjectsCacheStats, DataChangeAction,
+    DataChangeActorKind, DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery,
+    DataChangeUploadMode, DataScrubReport, HostDependencyReport, HostDependencyStatus,
+    MediaCacheLookup,
     MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
     ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
@@ -240,6 +241,7 @@ struct ServerStorageRuntime {
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
+    last_gc_pass: Arc<StdMutex<Option<GcPassSummary>>>,
 }
 
 #[derive(Clone)]
@@ -536,7 +538,6 @@ async fn write_upload_sessions<'a>(
     state.storage.upload_sessions.write(operation).await
 }
 
-#[cfg(test)]
 async fn read_upload_sessions<'a>(
     state: &'a ServerState,
     operation: &'static str,
@@ -1938,6 +1939,45 @@ impl ProcessStatsRuntime {
         let skip = self.history.len().saturating_sub(keep);
         self.history.iter().skip(skip).cloned().collect()
     }
+}
+
+/// Snapshot of the most recent `cleanup_unreferenced` (GC) pass, kept for dashboard
+/// attribution. Captured on every run (dry or not) so operators can see it without
+/// having to trigger a real cleanup first.
+#[derive(Debug, Clone, Serialize)]
+struct GcPassSummary {
+    collected_at_unix: u64,
+    dry_run: bool,
+    retained_manifests_processed: usize,
+    peak_manifest_batch_size: usize,
+    deleted_manifests: usize,
+    deleted_chunks: usize,
+}
+
+impl GcPassSummary {
+    fn from_report(report: &CleanupReport) -> Self {
+        Self {
+            collected_at_unix: unix_ts(),
+            dry_run: report.dry_run,
+            retained_manifests_processed: report.retained_manifests_processed,
+            peak_manifest_batch_size: report.peak_manifest_batch_size,
+            deleted_manifests: report.deleted_manifests,
+            deleted_chunks: report.deleted_chunks,
+        }
+    }
+}
+
+/// Attribution for the confirmed RAM hotspots in
+/// docs/node-memory-footprint-reduction-plan.md, next to the whole-process RSS gauge:
+/// what's resident and why, not just how big the process is.
+#[derive(Debug, Clone, Serialize)]
+struct MemoryAttributionSample {
+    collected_at_unix: u64,
+    current_objects_cache: CurrentObjectsCacheStats,
+    current_objects_total_count: usize,
+    in_flight_upload_session_count: usize,
+    in_flight_upload_bytes: u64,
+    last_gc_pass: Option<GcPassSummary>,
 }
 
 #[derive(Clone)]
@@ -5414,6 +5454,7 @@ async fn run_inner(
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
+            last_gc_pass: Arc::new(StdMutex::new(None)),
         },
         access: ServerAccessRuntime {
             client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
@@ -5805,6 +5846,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/storage/stats/history", get(storage_stats_history))
         .route("/process/stats/current", get(process_stats_current))
         .route("/process/stats/history", get(process_stats_history))
+        .route("/process/stats/memory", get(process_stats_memory))
         .route(
             "/cluster/nodes/{node_id}",
             put(register_node).delete(remove_node),
@@ -5873,6 +5915,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/storage/stats/history", get(storage_stats_history))
         .route("/process/stats/current", get(process_stats_current))
         .route("/process/stats/history", get(process_stats_history))
+        .route("/process/stats/memory", get(process_stats_memory))
         .route(
             "/cluster/nodes/{node_id}",
             put(register_node).delete(remove_node),
@@ -5957,6 +6000,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/storage/stats/history", get(storage_stats_history))
         .route("/process/stats/current", get(process_stats_current))
         .route("/process/stats/history", get(process_stats_history))
+        .route("/process/stats/memory", get(process_stats_memory))
         .route("/cluster/placement/{key}", get(placement_for_key))
         .route("/cluster/replication/plan", get(replication_plan))
         .route("/snapshots", get(list_snapshots))
@@ -18680,6 +18724,61 @@ async fn process_stats_history(
     (StatusCode::OK, Json(samples)).into_response()
 }
 
+async fn process_stats_memory(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "process_stats_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let (current_objects_cache, current_objects_total_count) = {
+        let store = read_store(&state, "process_stats.memory").await;
+        let cache_stats = store.current_objects_cache_stats();
+        let total_count = store.object_count().await.unwrap_or(0);
+        (cache_stats, total_count)
+    };
+
+    let (in_flight_upload_session_count, in_flight_upload_bytes) = {
+        let sessions = read_upload_sessions(&state, "process_stats.memory").await;
+        let count = sessions.sessions.len();
+        let bytes = sessions
+            .sessions
+            .values()
+            .map(|session| session.chunk_count as u64 * session.chunk_size_bytes as u64)
+            .sum();
+        (count, bytes)
+    };
+
+    let last_gc_pass = {
+        let guard = match state.storage.last_gc_pass.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+
+    let sample = MemoryAttributionSample {
+        collected_at_unix: unix_ts(),
+        current_objects_cache,
+        current_objects_total_count,
+        in_flight_upload_session_count,
+        in_flight_upload_bytes,
+        last_gc_pass,
+    };
+
+    (StatusCode::OK, Json(sample)).into_response()
+}
+
 fn metadata_db_logical_distribution_status_response(
     state: &ServerState,
 ) -> std::result::Result<MetadataDbLogicalDistributionStatusResponse, StatusCode> {
@@ -21673,6 +21772,13 @@ async fn run_cleanup(
         Ok(report) => {
             if !dry_run {
                 request_local_availability_refresh(&state);
+            }
+            {
+                let mut last_gc_pass = match state.storage.last_gc_pass.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *last_gc_pass = Some(GcPassSummary::from_report(&report));
             }
             append_admin_audit(
                 &state,

@@ -67,6 +67,18 @@ where
         removed
     }
 
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.max_chunks
+    }
+
     fn touch(&mut self, key: &K) {
         self.access_order.retain(|existing| existing != key);
         self.access_order.push_back(key.clone());

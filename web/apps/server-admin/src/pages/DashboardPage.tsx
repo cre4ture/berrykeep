@@ -10,10 +10,12 @@ import {
   getStorageStatsHistory,
   getProcessStatsCurrent,
   getProcessStatsHistory,
+  getProcessStatsMemory,
   getReplicationPlan,
   type StorageStatsSample,
   type ProcessStatsSample,
-  type ChildProcessStat
+  type ChildProcessStat,
+  type MemoryAttributionSample
 } from "@ironmesh/api";
 import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
 import {
@@ -144,6 +146,12 @@ export function DashboardPage() {
     enabled: canInspectCluster,
     refetchInterval: 3_000
   });
+  const processStatsMemoryQuery = useQuery({
+    queryKey: ["dashboard", "process-stats-memory", normalizedAdminTokenOverride],
+    queryFn: () => getProcessStatsMemory(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster,
+    refetchInterval: 5_000
+  });
   const clusterSummaryQuery = useQuery({
     queryKey: ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
     queryFn: () =>
@@ -184,7 +192,8 @@ export function DashboardPage() {
             ["dashboard", "replication-plan", normalizedAdminTokenOverride],
             ["dashboard", "repair-activity", normalizedAdminTokenOverride],
             ["dashboard", "process-stats-current", normalizedAdminTokenOverride],
-            ["dashboard", "process-stats-history", normalizedAdminTokenOverride]
+            ["dashboard", "process-stats-history", normalizedAdminTokenOverride],
+            ["dashboard", "process-stats-memory", normalizedAdminTokenOverride]
           ]
         : []),
       ...(canInspectRendezvous
@@ -234,6 +243,8 @@ export function DashboardPage() {
     canInspectCluster ? processStatsCurrentQuery.data ?? null : null;
   const processStatsHistory =
     canInspectCluster ? processStatsHistoryQuery.data ?? EMPTY_PROCESS_HISTORY : EMPTY_PROCESS_HISTORY;
+  const memoryAttribution: MemoryAttributionSample | null =
+    canInspectCluster ? processStatsMemoryQuery.data ?? null : null;
   const mediaCacheClearResult = mediaCacheClearMutation.data ?? null;
   const mediaCacheClearPending = mediaCacheClearMutation.isPending;
   const loading =
@@ -246,7 +257,8 @@ export function DashboardPage() {
         replicationPlanQuery.isFetching ||
         repairActivityQuery.isFetching ||
         processStatsCurrentQuery.isFetching ||
-        processStatsHistoryQuery.isFetching)) ||
+        processStatsHistoryQuery.isFetching ||
+        processStatsMemoryQuery.isFetching)) ||
     (canInspectRendezvous && rendezvousConfigQuery.isFetching);
   const error = firstErrorMessage([
     mediaCacheClearMutation.error,
@@ -258,7 +270,8 @@ export function DashboardPage() {
     canInspectCluster ? replicationPlanQuery.error : null,
     canInspectCluster ? repairActivityQuery.error : null,
     canInspectCluster ? processStatsCurrentQuery.error : null,
-    canInspectCluster ? processStatsHistoryQuery.error : null
+    canInspectCluster ? processStatsHistoryQuery.error : null,
+    canInspectCluster ? processStatsMemoryQuery.error : null
   ]);
 
   async function confirmMediaCacheClear() {
@@ -774,6 +787,83 @@ export function DashboardPage() {
                   </ScrollArea>
                 )}
               </Stack>
+            </Stack>
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={12}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="md">
+              <Group justify="space-between" align="flex-start">
+                <Stack gap={4}>
+                  <Text fw={700}>Memory attribution</Text>
+                  <Text size="sm" c="dimmed" maw={760}>
+                    Why the process RSS above is what it is, not just what it is. See{" "}
+                    <Code>docs/node-memory-footprint-reduction-plan.md</Code> for the full analysis.
+                  </Text>
+                </Stack>
+                <Badge variant="light">
+                  {memoryAttribution
+                    ? `updated ${formatUnixTs(memoryAttribution.collected_at_unix)}`
+                    : "no sample yet"}
+                </Badge>
+              </Group>
+              <Grid>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Current-objects cache"
+                    value={
+                      memoryAttribution
+                        ? `${memoryAttribution.current_objects_cache.resident_entries} / ${memoryAttribution.current_objects_cache.capacity}`
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      memoryAttribution
+                        ? `~${formatBytes(memoryAttribution.current_objects_cache.estimated_resident_bytes)} resident, of ${memoryAttribution.current_objects_total_count} total objects`
+                        : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="In-flight uploads"
+                    value={
+                      memoryAttribution
+                        ? `${memoryAttribution.in_flight_upload_session_count} session${memoryAttribution.in_flight_upload_session_count === 1 ? "" : "s"}`
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      memoryAttribution
+                        ? formatBytes(memoryAttribution.in_flight_upload_bytes)
+                        : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Last GC pass"
+                    value={
+                      memoryAttribution?.last_gc_pass
+                        ? `${memoryAttribution.last_gc_pass.retained_manifests_processed} manifests`
+                        : loading
+                          ? <Loader size="sm" />
+                          : "no pass yet"
+                    }
+                    hint={
+                      memoryAttribution?.last_gc_pass
+                        ? `batch ≤ ${memoryAttribution.last_gc_pass.peak_manifest_batch_size}, ${formatUnixTs(memoryAttribution.last_gc_pass.collected_at_unix)}${memoryAttribution.last_gc_pass.dry_run ? " (dry run)" : ""}`
+                        : "triggered manually via maintenance/cleanup"
+                    }
+                  />
+                </Grid.Col>
+              </Grid>
+              <Text size="xs" c="dimmed">
+                FUSE hydrated-file memory isn't attributed here yet — it's tracked client-side, not
+                by this server process, and the corresponding budget/eviction gauge lands with Slice 1.
+              </Text>
             </Stack>
           </Card>
         </Grid.Col>

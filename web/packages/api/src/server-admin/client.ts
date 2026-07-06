@@ -30,6 +30,7 @@ import type {
   ManualRepairActionHistoryResponse,
   ManualRepairActionListResponse,
   ManualRepairActionTriggerResponse,
+  MemoryAttributionSample,
   MetadataDbLogicalDistributionStatusResponse,
   MetadataDbLogicalDistributionTriggerResponse,
   NodeCertificateStatusResponse,
@@ -713,6 +714,14 @@ export async function getProcessStatsHistory(
     `${apiV1("/process/stats/history")}${suffix ? `?${suffix}` : ""}`,
     { adminTokenOverride }
   );
+}
+
+export async function getProcessStatsMemory(
+  adminTokenOverride?: string
+): Promise<MemoryAttributionSample> {
+  return fetchAdminJson<MemoryAttributionSample>(apiV1("/process/stats/memory"), {
+    adminTokenOverride
+  });
 }
 
 export async function getMetadataDbLogicalDistributionStatus(

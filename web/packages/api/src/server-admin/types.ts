@@ -512,6 +512,30 @@ export type ProcessStatsCurrentResponse = {
   logical_cpu_count: number;
 };
 
+export type CurrentObjectsCacheStats = {
+  resident_entries: number;
+  capacity: number;
+  estimated_resident_bytes: number;
+};
+
+export type GcPassSummary = {
+  collected_at_unix: number;
+  dry_run: boolean;
+  retained_manifests_processed: number;
+  peak_manifest_batch_size: number;
+  deleted_manifests: number;
+  deleted_chunks: number;
+};
+
+export type MemoryAttributionSample = {
+  collected_at_unix: number;
+  current_objects_cache: CurrentObjectsCacheStats;
+  current_objects_total_count: number;
+  in_flight_upload_session_count: number;
+  in_flight_upload_bytes: number;
+  last_gc_pass?: GcPassSummary | null;
+};
+
 export type MetadataDbBackendKind = "sqlite" | "turso";
 
 export type MetadataDbTableLogicalBreakdown = {

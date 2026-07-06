@@ -145,7 +145,6 @@ impl MetadataStore for TursoMetadataStore {
         Ok(())
     }
 
-    #[cfg(test)]
     async fn count_current_objects(&self) -> Result<usize> {
         let mut rows = self
             .connection
