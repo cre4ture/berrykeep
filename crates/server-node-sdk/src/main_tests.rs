@@ -8402,6 +8402,9 @@ async fn build_test_state(
         },
         log_buffer: Arc::new(super::LogBuffer::new(64)),
         runtime_log_control: super::RuntimeLogControl::disabled("info"),
+        process_stats_runtime: Arc::new(std::sync::Mutex::new(
+            super::ProcessStatsRuntime::default(),
+        )),
     };
 
     if seed_gap {

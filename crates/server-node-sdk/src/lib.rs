@@ -1924,7 +1924,12 @@ struct ProcessStatsRuntime {
 }
 
 impl ProcessStatsRuntime {
-    fn push(&mut self, sample: ProcessStatsSample, children: Vec<ChildProcessStat>, logical_cpu_count: usize) {
+    fn push(
+        &mut self,
+        sample: ProcessStatsSample,
+        children: Vec<ChildProcessStat>,
+        logical_cpu_count: usize,
+    ) {
         self.history.push_back(sample);
         while self.history.len() > PROCESS_STATS_HISTORY_MAX_SAMPLES {
             self.history.pop_front();
@@ -6330,8 +6335,10 @@ fn spawn_process_stats_sampler(state: ServerState) {
 
             let children_cpu_percent = children.iter().map(|child| child.cpu_percent).sum();
             let children_memory_bytes = children.iter().map(|child| child.memory_bytes).sum();
-            let children_disk_read_bytes_per_sec =
-                children.iter().map(|child| child.disk_read_bytes_per_sec).sum();
+            let children_disk_read_bytes_per_sec = children
+                .iter()
+                .map(|child| child.disk_read_bytes_per_sec)
+                .sum();
             let children_disk_write_bytes_per_sec = children
                 .iter()
                 .map(|child| child.disk_write_bytes_per_sec)
