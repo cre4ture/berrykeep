@@ -162,6 +162,8 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ### Recent S3 milestone notes
 
+- 2026-07-06: dedicated-listener runtime coverage now includes the remaining high-value S3 listing edge cases over real HTTP.
+  The `system-tests` S3 suite now validates folder-marker plus `CommonPrefixes` coexistence, continuation-token pagination for `ListObjectsV2`, and delimiter-aware `?versions=` listings with marker-based pagination against a spawned `server-node` S3 listener.
 - 2026-07-06: dedicated-listener runtime coverage now includes `CopyObject` and batched `DeleteObjects` flows over real HTTP.
   The `system-tests` S3 suite now validates overwrite and metadata-replacement copy semantics across buckets, plus mixed-success `DeleteObjects` responses, delete-marker creation, missing-version errors, and quiet-delete behavior against a spawned `server-node` S3 listener.
 - 2026-07-06: dedicated-listener runtime coverage now includes presigned-request auth and S3-side bucket management over real HTTP.

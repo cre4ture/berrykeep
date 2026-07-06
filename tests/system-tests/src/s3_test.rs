@@ -1897,4 +1897,421 @@ mod tests {
         result?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_lists_folder_markers_and_common_prefixes() -> Result<()> {
+        let public_bind = "127.0.0.1:19474";
+        let s3_bind = "127.0.0.1:19475";
+        let data_dir = fresh_data_dir("s3-listener-folder-marker-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-folder-marker-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed building system test HTTP client")?;
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{public_base}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "photos.example",
+                    "root_prefix": "tenant/photos",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-folder-marker",
+                    "bucket_scope": ["photos.example"],
+                    "prefix_scope": ["tenant/photos/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            for path in ["/photos.example/docs/", "/photos.example/docs/hello.txt"] {
+                let put_response = send_signed_s3_request(
+                    &http,
+                    &s3_base,
+                    Method::PUT,
+                    path,
+                    &access_key_id,
+                    &secret_access_key,
+                    &[],
+                    Vec::new(),
+                )
+                .await?;
+                assert_eq!(put_response.status(), StatusCode::OK);
+            }
+
+            let list_response = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/photos.example?list-type=2&delimiter=/",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(list_response.status(), StatusCode::OK);
+            let list_xml = list_response.text().await?;
+            assert!(list_xml.contains("<Key>docs/</Key>"));
+            assert!(list_xml.contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>"));
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_pages_continuation_tokens() -> Result<()> {
+        let public_bind = "127.0.0.1:19476";
+        let s3_bind = "127.0.0.1:19477";
+        let data_dir = fresh_data_dir("s3-listener-continuation-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-continuation-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed building system test HTTP client")?;
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{public_base}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "photos.example",
+                    "root_prefix": "tenant/photos",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-continuation",
+                    "bucket_scope": ["photos.example"],
+                    "prefix_scope": ["tenant/photos/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            for path in ["/photos.example/docs/a.txt", "/photos.example/docs/b.txt"] {
+                let put_response = send_signed_s3_request(
+                    &http,
+                    &s3_base,
+                    Method::PUT,
+                    path,
+                    &access_key_id,
+                    &secret_access_key,
+                    &[],
+                    b"payload".to_vec(),
+                )
+                .await?;
+                assert_eq!(put_response.status(), StatusCode::OK);
+            }
+
+            let first_response = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/photos.example?list-type=2&max-keys=1",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(first_response.status(), StatusCode::OK);
+            let first_xml = first_response.text().await?;
+            assert!(first_xml.contains("<Key>docs/a.txt</Key>"));
+            let next_token = xml_tag_text(&first_xml, "NextContinuationToken")
+                .context("paginated S3 listing should expose NextContinuationToken")?;
+
+            let second_response = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                &format!("/photos.example?list-type=2&max-keys=1&continuation-token={next_token}"),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(second_response.status(), StatusCode::OK);
+            let second_xml = second_response.text().await?;
+            assert!(second_xml.contains("<Key>docs/b.txt</Key>"));
+            assert!(!second_xml.contains("<NextContinuationToken>"));
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_lists_versions_with_delimiter() -> Result<()> {
+        let public_bind = "127.0.0.1:19478";
+        let s3_bind = "127.0.0.1:19479";
+        let data_dir = fresh_data_dir("s3-listener-version-delimiter-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-version-delimiter-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed building system test HTTP client")?;
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{public_base}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "versions.example",
+                    "root_prefix": "tenant/versions",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-version-delimiter",
+                    "bucket_scope": ["versions.example"],
+                    "prefix_scope": ["tenant/versions/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            for (path, body) in [
+                ("/versions.example/root.txt", b"root version".to_vec()),
+                ("/versions.example/docs/a.txt", b"docs a version".to_vec()),
+                ("/versions.example/docs/sub/b.txt", b"docs sub b version".to_vec()),
+            ] {
+                let put_response = send_signed_s3_request(
+                    &http,
+                    &s3_base,
+                    Method::PUT,
+                    path,
+                    &access_key_id,
+                    &secret_access_key,
+                    &[("content-type", "text/plain")],
+                    body,
+                )
+                .await?;
+                assert_eq!(put_response.status(), StatusCode::OK);
+            }
+
+            let root_versions = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/versions.example?versions=&delimiter=/",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(root_versions.status(), StatusCode::OK);
+            let root_versions_xml = root_versions.text().await?;
+            assert!(root_versions_xml.contains("<Delimiter>/</Delimiter>"));
+            assert!(root_versions_xml.contains("<Key>root.txt</Key>"));
+            assert!(
+                root_versions_xml
+                    .contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>")
+            );
+            assert!(!root_versions_xml.contains("<Key>docs/a.txt</Key>"));
+            assert!(!root_versions_xml.contains("<Key>docs/sub/b.txt</Key>"));
+
+            let first_root_page = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/versions.example?versions=&delimiter=/&max-keys=1",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(first_root_page.status(), StatusCode::OK);
+            let first_root_page_xml = first_root_page.text().await?;
+            assert!(first_root_page_xml.contains("<IsTruncated>true</IsTruncated>"));
+            assert!(
+                first_root_page_xml
+                    .contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>")
+            );
+            assert_eq!(
+                xml_tag_text(&first_root_page_xml, "NextKeyMarker").as_deref(),
+                Some("root.txt")
+            );
+            let root_version_id = xml_tag_text(&first_root_page_xml, "NextVersionIdMarker")
+                .context("truncated version listing should expose NextVersionIdMarker")?;
+
+            let second_root_page = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                &format!(
+                    "/versions.example?versions=&delimiter=/&max-keys=1&key-marker=root.txt&version-id-marker={root_version_id}"
+                ),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(second_root_page.status(), StatusCode::OK);
+            let second_root_page_xml = second_root_page.text().await?;
+            assert!(second_root_page_xml.contains("<Key>root.txt</Key>"));
+            assert!(
+                !second_root_page_xml
+                    .contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>")
+            );
+
+            let docs_versions = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/versions.example?versions=&prefix=docs/&delimiter=/",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(docs_versions.status(), StatusCode::OK);
+            let docs_versions_xml = docs_versions.text().await?;
+            assert!(docs_versions_xml.contains("<Key>docs/a.txt</Key>"));
+            assert!(
+                docs_versions_xml
+                    .contains("<CommonPrefixes><Prefix>docs/sub/</Prefix></CommonPrefixes>")
+            );
+            assert!(!docs_versions_xml.contains("<Key>docs/sub/b.txt</Key>"));
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
 }
