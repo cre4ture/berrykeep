@@ -2,8 +2,9 @@
 
 ## Status
 
-Proposed. Not started. Follows from an ad-hoc RAM analysis of server-node and the desktop
-sync clients (2026-07-06), confirmed against the current codebase.
+In progress (2026-07-06). Follows from an ad-hoc RAM analysis of server-node and the
+desktop sync clients, confirmed against the current codebase. Landed so far: Slice 2b,
+Slice 3, Slice 0, Slice 1a. Still open: Slice 1b, Slice 1c.
 
 ## Goal
 
@@ -44,6 +45,37 @@ for this plan — no action needed there.
   the Windows CFAPI adapter already uses (`crates/adapter-windows-cfapi/src/live.rs:163-229`,
   `common/src/range_chunk_cache.rs`) rather than inventing a new one.
 
+## Architecture note: custom FUSE driver vs. a generic S3-FUSE gateway (2026-07-06)
+
+With an S3 API for ironmesh in progress (separate PR), it's worth recording why this plan
+keeps investing in the custom `adapter-linux-fuse` driver rather than dropping it in favor
+of an existing FUSE-to-S3 mapping driver (s3fs-fuse, rclone mount, goofys, AWS's
+`mountpoint-s3`):
+
+- **Rename semantics.** S3 has no native rename; every generic S3-FUSE driver implements
+  it as copy-then-delete, which is expensive and non-atomic for large files. Ironmesh's
+  own metadata store can do a metadata-only rename (no data movement), which
+  `adapter-linux-fuse` relies on today.
+- **Placeholder/hydration/pinning UX.** The custom driver's placeholder-with-lazy-hydration
+  model (this plan's Slice 1) gives parity with the Windows CFAPI adapter — online-only
+  files, pinning, proactive eviction. A generic S3 gateway treats the mount as a plain
+  object store with no concept of this; it either caches everything locally (unbounded, the
+  same problem this plan is fixing) or has no offline-availability story at all.
+- **Manifest/version awareness.** Rename tracking, provisional-version reconciliation,
+  tombstones, and chunk-level dedup all live in ironmesh's manifest model, which a generic
+  driver talking to a bare S3 API has no visibility into.
+- **Counterpoint worth tracking.** AWS's `mountpoint-s3` (Rust, open source) has already
+  solved a meaningful chunk of what Slice 1 is building here — bounded-memory streaming
+  reads — so it's a useful reference implementation, and possibly a reasonable stopgap for
+  simple read-mostly mirrors. It is not a candidate to replace `adapter-linux-fuse` wholesale
+  given the rename/versioning gap above.
+
+Conclusion: keep the custom driver; this plan's FUSE slices remain worth doing. Revisit
+only if the S3 API PR reveals ironmesh doesn't actually need rename/version semantics for
+some class of mounts (e.g. a read-only archive mirror), in which case a generic gateway
+could be offered as an additional, simpler mount mode alongside the custom driver — not a
+replacement for it.
+
 ## Slice 0: Observability — implemented (2026-07-06)
 
 The dashboard already samples whole-process RSS (`ProcessStatsSample`,
@@ -80,15 +112,52 @@ upload memory. Verified via `cargo test -p server-node-sdk` (300 tests) and
 
 ## Slice 1: Bound FUSE hydrated memory
 
-### 1a — Global byte budget with eviction (low risk, do first)
+Clarification found while implementing 1a: `crates/adapter-linux-fuse/src/client_rights_edge.rs`
+already implements the bounded `RangeChunkCache`-backed hydrator used for **range reads**
+on read-only opens (`read_file_data`'s `hydrate_range` path never touches `FsNode.data` at
+all, so it was never part of the unbounded-growth problem). The actual hotspot is narrower
+than the original wording of 1c suggests: only `hydrate_if_needed` — the *eager, full-file*
+hydration triggered by a write-intent `open()` or a size-changing `setattr` — reads the
+whole file into `FsNode.data` and has no bound. 1c's "unify with `RangeChunkCache`" framing
+should be read as "extend the existing bounded range-read path to also serve writes",
+not "introduce range-based hydration for the first time."
 
-- Track total resident `FsNode.data` bytes for the mount.
-- Before a `hydrate_if_needed` allocation would exceed a configured budget (default e.g.
-  256 MiB), evict `data` from the least-recently-used *clean* nodes with no open handles —
-  same precondition already required for the existing re-placeholder clear, just triggered
-  proactively instead of only opportunistically.
+### 1a — Global byte budget with eviction (low risk, do first) — implemented (2026-07-06)
+
+- `IronmeshFuseFs` now tracks a `hydration_byte_budget: u64` (default 256 MiB, overridable
+  via `IRONMESH_FUSE_HYDRATION_BUDGET_BYTES`), and `resident_hydrated_bytes()` sums
+  `FsNode.data.len()` across all nodes on demand (computed only at hydration time, not
+  incrementally — avoids a counter that could silently desync from direct `.data` writes in
+  tests/other code paths).
+- `hydrate_if_needed` (`crates/adapter-linux-fuse/src/lib.rs`) now calls
+  `evict_hydrated_data_to_fit(additional_bytes)` before fetching the new file's bytes. This
+  walks all nodes, filters to eligible candidates (regular file, non-empty `data`,
+  `placeholder_content_hash.is_some()`, `sync_metadata.remote_version.is_some()`, no open
+  handle), sorts by `modified_at` ascending (oldest-hydrated first, an approximation of LRU
+  — see below), and clears `data` + restores `placeholder_version` on enough of them to fit
+  the incoming file within budget.
+- **Key correctness change**: `hydrate_if_needed` used to clear `placeholder_content_hash`
+  after a successful hydration. It no longer does — the content hash is left in place as
+  the "this file's resident bytes still match a known remote version" signal, and every
+  mutation path that can make local content diverge from that remote version (`write`,
+  `truncate_if_needed`, `upsert_file_local_only`) already independently clears
+  `placeholder_content_hash` to `None` the moment it happens. So a node's
+  `placeholder_content_hash.is_some()` after hydration is a reliable "safe to silently
+  drop and re-fetch later" signal without adding a new field or dirty-tracking mechanism.
+- "LRU" here is approximated by `modified_at`, which is already updated on each hydration
+  and not touched by plain reads — i.e. recency-of-hydration, not recency-of-access. Chosen
+  deliberately over adding a separate access-order queue (as `RangeChunkCache` uses) to
+  keep the hot read path completely unchanged and reduce risk on this correctness-critical
+  code.
+- Verified: `hydration_budget_evicts_lru_clean_files_but_protects_open_handles`
+  (`crates/adapter-linux-fuse/src/lib.rs`, `runtime::tests`) hydrates 3 synthetic 4 MiB
+  files under a budget that fits only 2, with one file's handle held open; asserts the
+  open-handled file survives eviction even though it wasn't the most recently hydrated,
+  the LRU clean file gets correctly re-placeholdered, resident bytes stay within budget,
+  and re-hydrating the evicted file afterward still returns correct content. Full existing
+  suite (41 tests) passes unmodified; `cargo clippy` clean.
 - No behavior change for small/typical workloads; only changes eviction *timing* under
-  memory pressure.
+  memory pressure — reads/writes/uploads are otherwise untouched.
 
 ### 1b — Disk-backed staging for large files (do second)
 
@@ -99,12 +168,15 @@ upload memory. Verified via `cargo test -p server-node-sdk` (300 tests) and
   stage file instead of cloning `node.data` wholesale (`lib.rs:1590-1597`).
 - Small files keep the current in-memory path — no need to pay staging overhead for the
   common case.
+- Not yet implemented.
 
 ### 1c — Range-based hydration for all sizes (optional, only if 1a/1b prove insufficient)
 
-- Unify Linux FUSE hydration with the bounded `RangeChunkCache` model already implemented
-  and used by the Windows CFAPI adapter, so no full-file read is ever required in memory.
-  Larger effort; only pursue if Slice 0 telemetry shows 1a/1b aren't enough in practice.
+- Extend the write-intent (`hydrate_if_needed`) path to reuse the bounded `RangeChunkCache`
+  model `client_rights_edge.rs` already uses for range reads, so no full-file read is ever
+  required in memory even for writes. Larger effort; only pursue if Slice 0 telemetry shows
+  1a/1b aren't enough in practice.
+- Not yet implemented.
 
 ## Slice 2: Shrink `CurrentState` per-entry cost
 
@@ -176,23 +248,29 @@ manifest in the store) is gone. `PersistentStore::cleanup_unreferenced`
 ## Implementation Order
 
 1. ~~Slice 0 (observability)~~ — done, see status above.
-2. Slice 1a (FUSE eviction budget) — highest-ranked hotspot, lowest-risk fix.
+2. ~~Slice 1a (FUSE eviction budget)~~ — done, see status above.
 3. ~~Slice 2 (compact `CurrentState` values)~~ — superseded by Slice 2b below, which
    replaces the resident map entirely rather than just shrinking its entries.
-4. Slice 1b (FUSE disk-backed staging for large files).
+4. Slice 1b (FUSE disk-backed staging for large files) — still open.
 5. ~~Slice 3 (GC batched scan)~~ — done, see status below.
-6. Slice 1c — only if Slice 0 telemetry from real usage shows it's needed.
+6. Slice 1c — only if Slice 0 telemetry from real usage shows it's needed. Still open.
 7. **Slice 2b — done** (see status below). Landed ahead of Slice 1 per direct request.
 8. **Slice 3 — done** (see status below). Landed ahead of Slice 1 per direct request.
-9. **Slice 0 — done** (see status above). Landed last, retrofitted to describe Slices 2b
-   and 3's already-implemented memory model rather than the original pre-2b/3 design;
-   Slice 1 remains open, so no FUSE hydrated-bytes gauge exists yet.
+9. **Slice 0 — done** (see status above). Landed ahead of Slice 1a per direct request;
+   its "GC pass peak manifest count" and "FUSE hydrated-bytes" gauges reflect the
+   post-2b/3, pre-1a state at the time — the dashboard has no FUSE budget/eviction gauge
+   yet even though 1a now exists (would be a natural follow-up, not yet done).
+10. **Slice 1a — done** (see status above). Landed last of the FUSE work; 1b and 1c remain
+    open, and Slice 1a's eviction activity is not yet surfaced on the Slice 0 dashboard.
 
 ## Test Plan
 
-- **FUSE 1a**: synthetic test mounting N files of size S, opening and holding handles past
-  the configured budget; assert eviction keeps resident bytes bounded and reads of evicted-
-  then-reopened files still return correct content.
+- **FUSE 1a (done)**: `hydration_budget_evicts_lru_clean_files_but_protects_open_handles` in
+  `crates/adapter-linux-fuse/src/lib.rs` (`runtime::tests`) — 3 synthetic 4 MiB files under
+  a budget fitting only 2, one handle held open; asserts the open-handled file survives
+  eviction despite being hydrated earlier, the LRU clean file is evicted and correctly
+  restored to a placeholder, resident bytes stay within budget, and re-hydrating the
+  evicted file afterward returns correct content.
 - **FUSE 1b**: large-file open/read/write/upload round-trip test; assert process RSS no
   longer grows proportionally with file size for files above the staging threshold.
 - **`CurrentState` compaction**: round-trip encode/decode tests for the new fixed-size
@@ -218,6 +296,13 @@ manifest in the store) is gone. `PersistentStore::cleanup_unreferenced`
   loss or corruption, not just a performance regression. Needs careful test coverage and a
   conservative rollout (e.g. behind a config flag defaulting to the current behavior until
   proven).
+  - **Slice 1a (done)**: mitigated by keeping the change narrow — eviction only triggers
+    from `hydrate_if_needed`, reads/writes/uploads are untouched, and the "safe to evict"
+    gate reuses an existing invariant (`placeholder_content_hash` cleared by every dirty-
+    causing mutation) rather than adding new dirty-tracking that could itself have bugs.
+    Still: this is the only slice-1a-shaped change in the codebase and has not been
+    exercised under real multi-GB workloads or concurrent-access stress — the synthetic
+    test covers the eviction algorithm's correctness, not production-scale timing/races.
 - Slice 1b/1c change performance characteristics for large sequential reads/writes (e.g.
   video scrubbing, large project files) — needs benchmarking against real editing workflows
   to avoid regressing UX for the sake of RAM.
@@ -233,8 +318,12 @@ manifest in the store) is gone. `PersistentStore::cleanup_unreferenced`
 
 ## Exit Criteria
 
-- FUSE process RSS stays within the configured hydration budget regardless of how much
-  total data is synced, verified by the large-file-open synthetic test.
+- ~~FUSE process RSS stays within the configured hydration budget regardless of how much
+  total data is synced~~ — done for the write-hydration path (1a): `hydrate_if_needed`
+  proactively evicts LRU clean resident data before exceeding
+  `IRONMESH_FUSE_HYDRATION_BUDGET_BYTES` (default 256 MiB), verified by the synthetic
+  eviction test. Not yet true for every byte a mount touches — 1b/1c (still open) would
+  extend the same bound to large-file staging and range-hydrated writes.
 - ~~Server steady-state RSS attributable to `current_state` is measurably reduced at
   constant file count~~ — superseded: as of Slice 2b, this structure's resident size is
   bounded by cache capacity (default 100k entries) regardless of file count, not just
