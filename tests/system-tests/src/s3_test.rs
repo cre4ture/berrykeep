@@ -3,14 +3,19 @@
 #[cfg(test)]
 mod tests {
     use crate::framework::{
-        TEST_ADMIN_TOKEN, fresh_data_dir, start_authenticated_server_with_env_options, stop_server,
+        ChildGuard, TEST_ADMIN_TOKEN, binary_path, default_client_identity_path, fresh_data_dir,
+        issue_bootstrap_bundle_and_enroll_client, lock_test_resources, register_node,
+        start_authenticated_server_with_env_options, stop_server, tcp_resource_key,
+        wait_for_online_nodes,
     };
     use anyhow::{Context, Result, bail};
     use hmac::{Hmac, Mac};
     use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     use reqwest::{Method, StatusCode};
     use sha2::{Digest, Sha256};
+    use std::process::Stdio;
     use std::time::Duration;
+    use tokio::process::Command;
     use tokio::time::sleep;
 
     type TestHmacSha256 = Hmac<Sha256>;
@@ -309,6 +314,73 @@ mod tests {
         let start = xml.find(&start_tag)? + start_tag.len();
         let end = start + xml[start..].find(&end_tag)?;
         Some(xml[start..end].to_string())
+    }
+
+    async fn start_cli_s3_gateway(bind: &str, cli_args: &[&str]) -> Result<ChildGuard> {
+        let cli_bin = binary_path("cli-client")?;
+        let resource_guards = lock_test_resources([tcp_resource_key(bind)]).await;
+        let child = Command::new(cli_bin)
+            .args(cli_args)
+            .arg("serve-s3")
+            .arg("--bind")
+            .arg(bind)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to spawn cli-client serve-s3")?;
+        Ok(ChildGuard::with_resources(child, resource_guards))
+    }
+
+    async fn wait_for_s3_control_plane_status(
+        http: &reqwest::Client,
+        base_url: &str,
+        expected_bucket_count: u64,
+        expected_access_key_count: u64,
+        expected_last_source_node_id: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut last_payload = None;
+        for _ in 0..120 {
+            if let Ok(response) = http
+                .get(format!("{base_url}/auth/s3/status"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .send()
+                .await
+                && let Ok(ok_response) = response.error_for_status()
+                && let Ok(payload) = ok_response.json::<serde_json::Value>().await
+            {
+                let bucket_count = payload
+                    .get("bucket_count")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or_default();
+                let access_key_count = payload
+                    .get("access_key_count")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or_default();
+                let last_source_node_id = payload
+                    .get("last_source_node_id")
+                    .and_then(|value| value.as_str());
+
+                last_payload = Some(payload.clone());
+                if bucket_count == expected_bucket_count
+                    && access_key_count == expected_access_key_count
+                    && expected_last_source_node_id
+                        .is_none_or(|expected| last_source_node_id == Some(expected))
+                {
+                    return Ok(payload);
+                }
+            }
+
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        bail!(
+            "S3 control-plane status at {base_url}/auth/s3/status did not reach bucket_count={}, access_key_count={}, last_source_node_id={:?}; last payload: {:?}",
+            expected_bucket_count,
+            expected_access_key_count,
+            expected_last_source_node_id,
+            last_payload
+        );
     }
 
     #[tokio::test]
@@ -2307,6 +2379,296 @@ mod tests {
             assert!(!docs_versions_xml.contains("<Key>docs/sub/b.txt</Key>"));
 
             Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_accepts_fanout_replicated_control_plane() -> Result<()> {
+        let bind_a = "127.0.0.1:19580";
+        let bind_b = "127.0.0.1:19582";
+        let s3_bind_a = "127.0.0.1:19581";
+        let s3_bind_b = "127.0.0.1:19583";
+        let node_id_a = "00000000-0000-0000-0000-00000000f0a1";
+        let node_id_b = "00000000-0000-0000-0000-00000000f0b2";
+        let data_a = fresh_data_dir("s3-fanout-node-a");
+        let data_b = fresh_data_dir("s3-fanout-node-b");
+
+        let mut node_a = start_authenticated_server_with_env_options(
+            bind_a,
+            &data_a,
+            node_id_a,
+            2,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind_a)],
+        )
+        .await?;
+        let mut node_b = start_authenticated_server_with_env_options(
+            bind_b,
+            &data_b,
+            node_id_b,
+            2,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind_b)],
+        )
+        .await?;
+
+        let http = reqwest::Client::new();
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let s3_base_b = format!("http://{s3_bind_b}");
+
+        let result: Result<()> = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
+            register_node(&http, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
+
+            wait_for_online_nodes(&http, &base_a, 2, 120).await?;
+            wait_for_online_nodes(&http, &base_b, 2, 120).await?;
+
+            let create_bucket_response = http
+                .post(format!("{base_a}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "fanout.example",
+                    "root_prefix": "tenant/fanout",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{base_a}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-fanout",
+                    "bucket_scope": ["fanout.example"],
+                    "prefix_scope": ["tenant/fanout/uploads/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            let status_b =
+                wait_for_s3_control_plane_status(&http, &base_b, 1, 1, Some(node_id_a)).await?;
+            assert_eq!(
+                status_b
+                    .get("last_source_node_id")
+                    .and_then(|value| value.as_str()),
+                Some(node_id_a)
+            );
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base_b,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            let put_object = send_signed_s3_request(
+                &http,
+                &s3_base_b,
+                Method::PUT,
+                "/fanout.example/uploads/fanout.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                b"fanout replicated".to_vec(),
+            )
+            .await?;
+            assert_eq!(put_object.status(), StatusCode::OK);
+
+            let get_object = send_signed_s3_request(
+                &http,
+                &s3_base_b,
+                Method::GET,
+                "/fanout.example/uploads/fanout.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_object.status(), StatusCode::OK);
+            assert_eq!(get_object.bytes().await?.as_ref(), b"fanout replicated");
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serve_s3_gateway_transports_signed_s3_requests() -> Result<()> {
+        let server_bind = "127.0.0.1:19484";
+        let gateway_bind = "127.0.0.1:19485";
+        let data_dir = fresh_data_dir("s3-gateway-server");
+        let client_dir = fresh_data_dir("s3-gateway-client");
+        let mut server = start_authenticated_server_with_env_options(
+            server_bind,
+            &data_dir,
+            "s3-gateway-runtime-node",
+            1,
+            None,
+            None,
+            &[],
+        )
+        .await?;
+
+        let http = reqwest::Client::new();
+        let base_url = format!("http://{server_bind}");
+        let gateway_base = format!("http://{gateway_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{base_url}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "gateway.example",
+                    "root_prefix": "tenant/gateway",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{base_url}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-gateway",
+                    "bucket_scope": ["gateway.example"],
+                    "prefix_scope": ["tenant/gateway/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            let enrolled = issue_bootstrap_bundle_and_enroll_client(
+                &http,
+                &base_url,
+                TEST_ADMIN_TOKEN,
+                &client_dir,
+                "s3-gateway.bootstrap.json",
+                Some("s3-gateway"),
+                Some(3600),
+            )
+            .await?;
+            let identity_path = default_client_identity_path(&enrolled.bootstrap_path);
+            let bootstrap_arg = enrolled.bootstrap_path.to_string_lossy().into_owned();
+            let identity_arg = identity_path.to_string_lossy().into_owned();
+            let cli_args = [
+                "--bootstrap-file",
+                bootstrap_arg.as_str(),
+                "--client-identity-file",
+                identity_arg.as_str(),
+            ];
+            let mut gateway = start_cli_s3_gateway(gateway_bind, &cli_args).await?;
+
+            let gateway_result: Result<()> = async {
+                wait_for_signed_s3_status(
+                    &http,
+                    &gateway_base,
+                    Method::GET,
+                    "/",
+                    &access_key_id,
+                    &secret_access_key,
+                    StatusCode::OK,
+                )
+                .await?;
+
+                let list_buckets = send_signed_s3_request(
+                    &http,
+                    &gateway_base,
+                    Method::GET,
+                    "/",
+                    &access_key_id,
+                    &secret_access_key,
+                    &[],
+                    Vec::new(),
+                )
+                .await?;
+                assert_eq!(list_buckets.status(), StatusCode::OK);
+                let list_buckets_xml = list_buckets.text().await?;
+                assert!(list_buckets_xml.contains("<Name>gateway.example</Name>"));
+
+                let put_object = send_signed_s3_request(
+                    &http,
+                    &gateway_base,
+                    Method::PUT,
+                    "/gateway.example/docs/transport.txt",
+                    &access_key_id,
+                    &secret_access_key,
+                    &[("content-type", "text/plain")],
+                    b"transported through gateway".to_vec(),
+                )
+                .await?;
+                assert_eq!(put_object.status(), StatusCode::OK);
+
+                let get_object = send_signed_s3_request(
+                    &http,
+                    &gateway_base,
+                    Method::GET,
+                    "/gateway.example/docs/transport.txt",
+                    &access_key_id,
+                    &secret_access_key,
+                    &[],
+                    Vec::new(),
+                )
+                .await?;
+                assert_eq!(get_object.status(), StatusCode::OK);
+                assert!(
+                    get_object
+                        .headers()
+                        .get("x-amz-version-id")
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| !value.is_empty())
+                );
+                assert_eq!(
+                    get_object.bytes().await?.as_ref(),
+                    b"transported through gateway"
+                );
+
+                Ok(())
+            }
+            .await;
+
+            stop_server(&mut gateway).await;
+            gateway_result
         }
         .await;
 

@@ -162,6 +162,8 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ### Recent S3 milestone notes
 
+- 2026-07-06: S3 runtime coverage now reaches beyond single-node listener behavior into real distributed and transport-backed paths.
+  The `system-tests` S3 suite now proves S3 control-plane fanout from one spawned node to another strongly enough that the peer node's own dedicated S3 listener accepts the replicated bucket mapping and access key, and it also validates a spawned `cli-client serve-s3` gateway carrying signed S3 requests over the real `/s3/*` transport path.
 - 2026-07-06: dedicated-listener runtime coverage now includes the remaining high-value S3 listing edge cases over real HTTP.
   The `system-tests` S3 suite now validates folder-marker plus `CommonPrefixes` coexistence, continuation-token pagination for `ListObjectsV2`, and delimiter-aware `?versions=` listings with marker-based pagination against a spawned `server-node` S3 listener.
 - 2026-07-06: dedicated-listener runtime coverage now includes `CopyObject` and batched `DeleteObjects` flows over real HTTP.
