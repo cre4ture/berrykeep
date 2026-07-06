@@ -337,7 +337,7 @@ async fn s3_gateway_proxy(
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect::<Vec<_>>();
-    if method == Method::GET {
+    if method == Method::GET && s3_gateway_get_uses_streaming_transport(&uri) {
         let response = state
             .client
             .request_relative_path_streaming_response(method, &transport_path, forwarded_headers)
@@ -410,6 +410,11 @@ async fn s3_gateway_proxy(
     *proxy_response.status_mut() = response.status;
     *proxy_response.headers_mut() = response.headers;
     proxy_response
+}
+
+fn s3_gateway_get_uses_streaming_transport(uri: &axum::http::Uri) -> bool {
+    let trimmed_path = uri.path().trim_matches('/');
+    !trimmed_path.is_empty() && trimmed_path.contains('/')
 }
 
 fn s3_transport_proxy_path(uri: &axum::http::Uri) -> String {
@@ -1756,6 +1761,20 @@ mod tests {
             s3_transport_proxy_path(&object_uri),
             "/s3/bucket/photos/cat.jpg?versionId=v1"
         );
+    }
+
+    #[test]
+    fn s3_gateway_get_streaming_mode_distinguishes_object_reads_from_listings() {
+        let service_root: axum::http::Uri = "/?x-id=ListBuckets".parse().unwrap();
+        assert!(!s3_gateway_get_uses_streaming_transport(&service_root));
+
+        let bucket_listing: axum::http::Uri =
+            "/photos.example?list-type=2&prefix=docs/".parse().unwrap();
+        assert!(!s3_gateway_get_uses_streaming_transport(&bucket_listing));
+
+        let object_read: axum::http::Uri =
+            "/photos.example/docs/cat.jpg?versionId=v1".parse().unwrap();
+        assert!(s3_gateway_get_uses_streaming_transport(&object_read));
     }
 
     #[tokio::test]

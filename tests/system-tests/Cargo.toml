@@ -7,6 +7,9 @@ authors = ["ironmesh contributors"]
 
 [dependencies]
 anyhow = "1"
+aws-credential-types = "1"
+aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+aws-types = "1"
 axum = "0.8"
 bytes = "1"
 client-sdk = { path = "../../crates/client-sdk" }

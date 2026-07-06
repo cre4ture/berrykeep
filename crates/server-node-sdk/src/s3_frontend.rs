@@ -179,6 +179,14 @@ pub(crate) fn build_listener_app() -> Router<ServerState> {
                 .delete(delete_bucket),
         )
         .route(
+            "/{bucket}/",
+            get(list_bucket_objects)
+                .head(head_bucket)
+                .post(post_bucket)
+                .put(put_bucket)
+                .delete(delete_bucket),
+        )
+        .route(
             "/{bucket}/{*key}",
             get(get_object)
                 .head(head_object)
@@ -281,7 +289,6 @@ async fn list_buckets(
     let buckets = visible_buckets(&state, &request.access_key).await;
     let mut xml =
         String::from(r#"<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult xmlns=""#);
-    xml.push('"');
     xml.push_str(S3_XML_NAMESPACE);
     xml.push_str(r#""><Owner><ID>"#);
     xml.push_str(&xml_escape(&state.cluster_id.to_string()));
@@ -4297,7 +4304,6 @@ fn render_list_objects_v2_result(
 ) -> String {
     let mut xml =
         String::from(r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns=""#);
-    xml.push('"');
     xml.push_str(S3_XML_NAMESPACE);
     xml.push_str(r#""><Name>"#);
     xml.push_str(&xml_escape(&bucket.bucket_name));
@@ -4345,7 +4351,6 @@ fn render_list_objects_v2_result(
 fn render_copy_object_result(etag: &str, modified_at_unix: u64) -> String {
     let mut xml =
         String::from(r#"<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult xmlns=""#);
-    xml.push('"');
     xml.push_str(S3_XML_NAMESPACE);
     xml.push_str(r#""><LastModified>"#);
     xml.push_str(&xml_escape(&s3_timestamp(modified_at_unix)));
@@ -4358,7 +4363,6 @@ fn render_copy_object_result(etag: &str, modified_at_unix: u64) -> String {
 fn render_bucket_versioning_result(bucket: &S3BucketRecord) -> String {
     let mut xml =
         String::from(r#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration xmlns=""#);
-    xml.push('"');
     xml.push_str(S3_XML_NAMESPACE);
     xml.push_str(r#"">"#);
     if bucket.versioning_status == S3BucketVersioningStatus::Enabled {
@@ -4374,7 +4378,6 @@ fn render_delete_objects_result(
     errors: &[DeleteObjectsErrorEntry],
 ) -> String {
     let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns=""#);
-    xml.push('"');
     xml.push_str(S3_XML_NAMESPACE);
     xml.push_str(r#"">"#);
     if !quiet {
@@ -4432,7 +4435,6 @@ fn render_list_object_versions_result(
 ) -> String {
     let mut xml =
         String::from(r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns=""#);
-    xml.push('"');
     xml.push_str(S3_XML_NAMESPACE);
     xml.push_str(r#""><Name>"#);
     xml.push_str(&xml_escape(&bucket.bucket_name));
@@ -4507,7 +4509,6 @@ fn render_create_multipart_upload_result(
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult xmlns=""#,
     );
-    xml.push('"');
     xml.push_str(S3_XML_NAMESPACE);
     xml.push_str(r#""><Bucket>"#);
     xml.push_str(&xml_escape(bucket_name));
@@ -4530,7 +4531,6 @@ fn render_list_parts_result(
     parts: &[StagedUploadPart],
 ) -> String {
     let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-8"?><ListPartsResult xmlns=""#);
-    xml.push('"');
     xml.push_str(S3_XML_NAMESPACE);
     xml.push_str(r#""><Bucket>"#);
     xml.push_str(&xml_escape(bucket_name));
@@ -4573,7 +4573,6 @@ fn render_complete_multipart_upload_result(
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult xmlns=""#,
     );
-    xml.push('"');
     xml.push_str(S3_XML_NAMESPACE);
     xml.push_str(r#""><Location>/"#);
     xml.push_str(&xml_escape(bucket_name));

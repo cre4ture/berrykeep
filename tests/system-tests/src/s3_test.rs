@@ -9,6 +9,13 @@ mod tests {
         tcp_resource_key, wait_for_online_nodes, wait_for_rendezvous_registered_endpoints,
     };
     use anyhow::{Context, Result, bail};
+    use aws_credential_types::Credentials;
+    use aws_sdk_s3::{
+        Client as AwsS3Client,
+        config::{BehaviorVersion, RequestChecksumCalculation, ResponseChecksumValidation},
+        primitives::ByteStream,
+    };
+    use aws_types::region::Region;
     use hmac::{Hmac, Mac};
     use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     use reqwest::{Method, StatusCode};
@@ -381,6 +388,169 @@ mod tests {
             expected_last_source_node_id,
             last_payload
         );
+    }
+
+    fn build_aws_sdk_s3_client(
+        endpoint_url: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+    ) -> AwsS3Client {
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(Credentials::new(
+                access_key_id,
+                secret_access_key,
+                None,
+                None,
+                "system-tests",
+            ))
+            .endpoint_url(endpoint_url)
+            .force_path_style(true)
+            .region(Region::new("us-east-1"))
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+            .build();
+        AwsS3Client::from_conf(config)
+    }
+
+    async fn exercise_aws_sdk_s3_crud(
+        endpoint_url: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        bucket_name: &str,
+        object_key: &str,
+        body: Vec<u8>,
+    ) -> Result<()> {
+        let client = build_aws_sdk_s3_client(endpoint_url, access_key_id, secret_access_key);
+
+        let list_buckets = match client.list_buckets().send().await {
+            Ok(output) => output,
+            Err(error) => {
+                let raw_summary = error.raw_response().map(|response| {
+                    let body = response
+                        .body()
+                        .bytes()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                        .unwrap_or_else(|| "<streaming body unavailable>".to_string());
+                    format!("status={} body={body:?}", response.status())
+                });
+                bail!("AWS SDK list_buckets failed: {error:#}; raw_response={raw_summary:?}");
+            }
+        };
+        assert!(
+            list_buckets
+                .buckets()
+                .iter()
+                .any(|bucket| bucket.name().is_some_and(|name| name == bucket_name))
+        );
+
+        client
+            .put_object()
+            .bucket(bucket_name)
+            .key(object_key)
+            .content_type("application/octet-stream")
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+            .context("AWS SDK put_object failed")?;
+
+        let head_object = client
+            .head_object()
+            .bucket(bucket_name)
+            .key(object_key)
+            .send()
+            .await
+            .context("AWS SDK head_object failed")?;
+        assert_eq!(head_object.content_length(), Some(body.len() as i64));
+        assert!(head_object.e_tag().is_some_and(|etag| !etag.is_empty()));
+        assert!(
+            head_object
+                .version_id()
+                .is_some_and(|version_id| !version_id.is_empty())
+        );
+
+        let get_object = client
+            .get_object()
+            .bucket(bucket_name)
+            .key(object_key)
+            .send()
+            .await
+            .context("AWS SDK get_object failed")?;
+        let get_object_body = get_object
+            .body
+            .collect()
+            .await
+            .context("AWS SDK get_object body collection failed")?
+            .into_bytes();
+        assert_eq!(get_object_body.as_ref(), body.as_slice());
+
+        let list_objects = match client
+            .list_objects_v2()
+            .bucket(bucket_name)
+            .prefix(object_key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let raw_summary = error.raw_response().map(|response| {
+                    let body = response
+                        .body()
+                        .bytes()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                        .unwrap_or_else(|| "<streaming body unavailable>".to_string());
+                    format!("status={} body={body:?}", response.status())
+                });
+                bail!(
+                    "AWS SDK list_objects_v2 after put failed: {error:#}; raw_response={raw_summary:?}"
+                );
+            }
+        };
+        assert!(
+            list_objects
+                .contents()
+                .iter()
+                .any(|object| object.key().is_some_and(|key| key == object_key))
+        );
+
+        client
+            .delete_object()
+            .bucket(bucket_name)
+            .key(object_key)
+            .send()
+            .await
+            .context("AWS SDK delete_object failed")?;
+
+        let list_objects_after_delete = match client
+            .list_objects_v2()
+            .bucket(bucket_name)
+            .prefix(object_key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let raw_summary = error.raw_response().map(|response| {
+                    let body = response
+                        .body()
+                        .bytes()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                        .unwrap_or_else(|| "<streaming body unavailable>".to_string());
+                    format!("status={} body={body:?}", response.status())
+                });
+                bail!(
+                    "AWS SDK list_objects_v2 after delete failed: {error:#}; raw_response={raw_summary:?}"
+                );
+            }
+        };
+        assert!(
+            list_objects_after_delete
+                .contents()
+                .iter()
+                .all(|object| object.key() != Some(object_key))
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -2810,6 +2980,16 @@ mod tests {
                     b"transported through gateway"
                 );
 
+                exercise_aws_sdk_s3_crud(
+                    &gateway_base,
+                    &access_key_id,
+                    &secret_access_key,
+                    "gateway.example",
+                    "sdk/direct-gateway.txt",
+                    b"official aws rust sdk through direct gateway".to_vec(),
+                )
+                .await?;
+
                 Ok(())
             }
             .await;
@@ -3018,6 +3198,19 @@ mod tests {
                     get_large_object.bytes().await?.as_ref(),
                     large_payload.as_slice()
                 );
+
+                let sdk_large_payload = (0..((1024 * 1024) + 511))
+                    .map(|index| (255 - (index % 251)) as u8)
+                    .collect::<Vec<_>>();
+                exercise_aws_sdk_s3_crud(
+                    &gateway_base,
+                    &access_key_id,
+                    &secret_access_key,
+                    "relay-gateway.example",
+                    "sdk/relay-gateway.bin",
+                    sdk_large_payload,
+                )
+                .await?;
 
                 Ok(())
             }
