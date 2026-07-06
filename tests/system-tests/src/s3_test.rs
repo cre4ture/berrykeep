@@ -190,6 +190,14 @@ mod tests {
             .with_context(|| format!("JSON field {key} missing or not a string"))
     }
 
+    fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
+        let start_tag = format!("<{tag}>");
+        let end_tag = format!("</{tag}>");
+        let start = xml.find(&start_tag)? + start_tag.len();
+        let end = start + xml[start..].find(&end_tag)?;
+        Some(xml[start..end].to_string())
+    }
+
     #[tokio::test]
     async fn dedicated_s3_listener_serves_signed_crud_and_listing() -> Result<()> {
         let public_bind = "127.0.0.1:19460";
@@ -443,6 +451,283 @@ mod tests {
             assert_eq!(get_deleted.status(), StatusCode::NOT_FOUND);
             let deleted_xml = get_deleted.text().await?;
             assert!(deleted_xml.contains("<Code>NoSuchKey</Code>"));
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_serves_multipart_uploads() -> Result<()> {
+        let public_bind = "127.0.0.1:19462";
+        let s3_bind = "127.0.0.1:19463";
+        let data_dir = fresh_data_dir("s3-listener-multipart-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-multipart-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed building system test HTTP client")?;
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{public_base}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "media.example",
+                    "root_prefix": "tenant/media",
+                    "versioning_status": "disabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-multipart",
+                    "bucket_scope": ["media.example"],
+                    "prefix_scope": ["tenant/media/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            let create_upload = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::POST,
+                "/media.example/archive/movie.bin?uploads=",
+                &access_key_id,
+                &secret_access_key,
+                &[
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-meta-origin", "camera"),
+                ],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(create_upload.status(), StatusCode::OK);
+            let create_upload_xml = create_upload.text().await?;
+            let upload_id = xml_tag_text(&create_upload_xml, "UploadId")
+                .context("multipart initiation response missing UploadId")?;
+
+            let part1_payload = vec![b'a'; 5 * 1024 * 1024];
+            let part2_payload = b"tail".to_vec();
+
+            let upload_part1 = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                &format!("/media.example/archive/movie.bin?partNumber=1&uploadId={upload_id}"),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                part1_payload.clone(),
+            )
+            .await?;
+            assert_eq!(upload_part1.status(), StatusCode::OK);
+            let part1_etag = upload_part1
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .context("multipart part 1 response missing ETag")?
+                .to_string();
+
+            let upload_part2 = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                &format!("/media.example/archive/movie.bin?partNumber=2&uploadId={upload_id}"),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                part2_payload.clone(),
+            )
+            .await?;
+            assert_eq!(upload_part2.status(), StatusCode::OK);
+            let part2_etag = upload_part2
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .context("multipart part 2 response missing ETag")?
+                .to_string();
+
+            let list_parts = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                &format!("/media.example/archive/movie.bin?max-parts=1&uploadId={upload_id}"),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(list_parts.status(), StatusCode::OK);
+            let list_parts_xml = list_parts.text().await?;
+            assert!(list_parts_xml.contains("<PartNumber>1</PartNumber>"));
+            assert!(!list_parts_xml.contains("<PartNumber>2</PartNumber>"));
+            assert!(list_parts_xml.contains("<NextPartNumberMarker>1</NextPartNumberMarker>"));
+
+            let complete_upload = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::POST,
+                &format!("/media.example/archive/movie.bin?uploadId={upload_id}"),
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "application/xml")],
+                format!(
+                    concat!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                        "<CompleteMultipartUpload>",
+                        "<Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>",
+                        "<Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part>",
+                        "</CompleteMultipartUpload>"
+                    ),
+                    part1_etag, part2_etag
+                )
+                .into_bytes(),
+            )
+            .await?;
+            assert_eq!(complete_upload.status(), StatusCode::OK);
+            let complete_etag = complete_upload
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .context("multipart complete response missing ETag")?
+                .to_string();
+            assert!(complete_etag.ends_with("-2\""));
+            let complete_upload_xml = complete_upload.text().await?;
+            assert_eq!(
+                xml_tag_text(&complete_upload_xml, "ETag").as_deref(),
+                Some(complete_etag.as_str())
+            );
+
+            let get_completed = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/media.example/archive/movie.bin",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_completed.status(), StatusCode::OK);
+            assert_eq!(
+                get_completed
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/octet-stream")
+            );
+            assert_eq!(
+                get_completed
+                    .headers()
+                    .get("x-amz-meta-origin")
+                    .and_then(|value| value.to_str().ok()),
+                Some("camera")
+            );
+            let completed_body = get_completed.bytes().await?;
+            let mut expected_payload = part1_payload.clone();
+            expected_payload.extend_from_slice(&part2_payload);
+            assert_eq!(completed_body.as_ref(), expected_payload.as_slice());
+
+            let create_abort_upload = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::POST,
+                "/media.example/archive/abort.bin?uploads=",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(create_abort_upload.status(), StatusCode::OK);
+            let create_abort_upload_xml = create_abort_upload.text().await?;
+            let abort_upload_id = xml_tag_text(&create_abort_upload_xml, "UploadId")
+                .context("abort multipart initiation response missing UploadId")?;
+
+            let upload_abort_part = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                &format!("/media.example/archive/abort.bin?partNumber=1&uploadId={abort_upload_id}"),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                b"abort-me".to_vec(),
+            )
+            .await?;
+            assert_eq!(upload_abort_part.status(), StatusCode::OK);
+
+            let abort_upload = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::DELETE,
+                &format!("/media.example/archive/abort.bin?uploadId={abort_upload_id}"),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(abort_upload.status(), StatusCode::NO_CONTENT);
+
+            let list_aborted_parts = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                &format!("/media.example/archive/abort.bin?uploadId={abort_upload_id}"),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(list_aborted_parts.status(), StatusCode::NOT_FOUND);
+            let list_aborted_parts_xml = list_aborted_parts.text().await?;
+            assert!(list_aborted_parts_xml.contains("<Code>NoSuchUpload</Code>"));
 
             Ok(())
         }
