@@ -8,7 +8,6 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
-lru.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

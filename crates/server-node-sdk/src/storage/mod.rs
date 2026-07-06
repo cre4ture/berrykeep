@@ -80,6 +80,14 @@ const LEGACY_RENAME_RECONCILE_UPDATE_SAMPLE_LIMIT: usize = 64;
 const DELETE_RECREATE_LOOP_REPAIR_SAMPLE_LIMIT: usize = 64;
 const SNAPSHOT_HISTORY_COMPACTION_SAMPLE_LIMIT: usize = 64;
 const SNAPSHOT_HISTORY_COMPACTION_CHANGED_PATH_SAMPLE_LIMIT: usize = 8;
+/// Bounds how many retained manifests `cleanup_unreferenced` loads into memory at once
+/// while computing protected chunks/media fingerprints, so GC peak memory stays flat
+/// as total manifest count grows.
+const GC_MANIFEST_LOAD_BATCH_SIZE: usize = 500;
+/// Rough per-entry cost of a resident `current_objects_cache` slot (key stored once in
+/// the lookup map plus once in the LRU order queue, value holds two id/hash strings),
+/// used only for the dashboard's memory-attribution estimate.
+const CURRENT_OBJECT_CACHE_ENTRY_ESTIMATED_BYTES: u64 = 300;
 const SNAPSHOT_HISTORY_MAX_BATCH_WINDOW_SECS: u64 = 2 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +420,15 @@ pub struct CleanupReport {
     pub deleted_chunks: usize,
     pub deleted_cached_chunks: usize,
     pub deleted_cached_chunk_records: usize,
+    pub retained_manifests_processed: usize,
+    pub peak_manifest_batch_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CurrentObjectsCacheStats {
+    pub resident_entries: usize,
+    pub capacity: usize,
+    pub estimated_resident_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -978,6 +995,7 @@ pub struct PersistentStore {
     media_thumbnails_dir: PathBuf,
     media_cache_build_permits: Arc<Semaphore>,
     current_objects_cache: std::sync::Mutex<RangeChunkCache<String, CurrentObjectEntry>>,
+    gc_manifest_load_batch_size: usize,
     snapshot_batch: Option<ActiveSnapshotBatch>,
     metadata_store: Arc<dyn MetadataStore>,
     storage_stats_lock: Arc<AsyncMutex<()>>,
@@ -1060,7 +1078,6 @@ trait MetadataStore: Send + Sync {
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
     async fn remove_current_object(&self, key: &str) -> Result<()>;
-    #[cfg(test)]
     async fn count_current_objects(&self) -> Result<usize>;
     async fn list_current_object_keys(&self) -> Result<Vec<String>>;
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>>;
@@ -1985,6 +2002,7 @@ impl PersistentStore {
             media_thumbnails_dir,
             media_cache_build_permits,
             current_objects_cache,
+            gc_manifest_load_batch_size: GC_MANIFEST_LOAD_BATCH_SIZE,
             snapshot_batch,
             metadata_store,
             storage_stats_lock,
@@ -2034,6 +2052,11 @@ impl PersistentStore {
     #[cfg(test)]
     pub fn set_current_objects_cache_capacity_for_test(&mut self, capacity: usize) {
         self.current_objects_cache = std::sync::Mutex::new(RangeChunkCache::new(capacity));
+    }
+
+    #[cfg(test)]
+    pub fn set_gc_manifest_load_batch_size_for_test(&mut self, batch_size: usize) {
+        self.gc_manifest_load_batch_size = batch_size;
     }
 
     pub(crate) async fn store_index_inspector(&self) -> Result<StoreIndexInspector> {
@@ -2092,7 +2115,9 @@ impl PersistentStore {
         ClusterNodesPersister::new(self.metadata_store.clone())
     }
 
-    pub(crate) async fn replication_subject_inspector(&self) -> Result<ReplicationSubjectInspector> {
+    pub(crate) async fn replication_subject_inspector(
+        &self,
+    ) -> Result<ReplicationSubjectInspector> {
         Ok(ReplicationSubjectInspector::new(
             self.metadata_store.load_current_state().await?,
             self.manifests_dir.clone(),
@@ -2246,13 +2271,25 @@ impl PersistentStore {
         chunk_path_for_hash(&self.chunks_dir, chunk_hash).unwrap()
     }
 
-    #[cfg(test)]
     pub async fn object_count(&self) -> Result<usize> {
         self.metadata_store.count_current_objects().await
     }
 
     pub async fn current_keys(&self) -> Result<Vec<String>> {
         self.metadata_store.list_current_object_keys().await
+    }
+
+    /// Dashboard attribution for the resident `current_objects_cache`: how many entries
+    /// are actually held in memory right now (bounded by its configured capacity)
+    /// vs. the total live object count backing it in sqlite.
+    pub fn current_objects_cache_stats(&self) -> CurrentObjectsCacheStats {
+        let cache = self.current_objects_cache.lock().unwrap();
+        CurrentObjectsCacheStats {
+            resident_entries: cache.len(),
+            capacity: cache.capacity(),
+            estimated_resident_bytes: (cache.len() as u64)
+                * CURRENT_OBJECT_CACHE_ENTRY_ESTIMATED_BYTES,
+        }
     }
 
     #[cfg(test)]
@@ -2348,7 +2385,8 @@ impl PersistentStore {
             record.manifest_hash = manifest_hash.clone();
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index).await?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
             return Ok(manifest_hash);
         }
 
@@ -2785,7 +2823,8 @@ impl PersistentStore {
             if create_snapshot {
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             }
-            self.sync_current_state_for_key_from_index(key, &index).await?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
             let changed_paths = if self.current_state_binding(key).await? != before_binding {
                 touched_paths
             } else {
@@ -2874,7 +2913,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
@@ -2926,7 +2966,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
@@ -3949,7 +3990,8 @@ impl PersistentStore {
 
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index).await?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
             let changed_paths = if self.current_state_binding(key).await? != before_binding {
                 touched_paths
             } else {
@@ -4053,7 +4095,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
@@ -4378,7 +4421,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
             self.apply_selected_replica_tombstone_current_state(key, bundle)
                 .await?;
@@ -4426,7 +4470,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
@@ -5123,7 +5168,8 @@ impl PersistentStore {
             if options.create_snapshot {
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             }
-            self.sync_current_state_for_key_from_index(key, &index).await?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
             let changed_paths = if self.current_state_binding(key).await? != before_binding {
                 touched_paths
             } else {
@@ -5178,7 +5224,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
@@ -5674,7 +5721,7 @@ impl PersistentStore {
         let now = unix_ts();
         let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
         let owned_referenced_manifests = self.collect_owned_referenced_manifest_hashes().await?;
-        let all_manifests = self.load_all_manifests().await?;
+        let manifest_hashes = self.list_manifest_hashes().await?;
         let cached_chunk_records = self.metadata_store.list_cached_chunk_records().await?;
         let tracked_cached_chunks = cached_chunk_records.len();
         let cached_chunk_hashes = cached_chunk_records
@@ -5686,7 +5733,7 @@ impl PersistentStore {
         let mut skipped_recent_manifests = 0usize;
         let mut deleted_manifests = 0usize;
 
-        for manifest_hash in all_manifests.keys() {
+        for manifest_hash in &manifest_hashes {
             if referenced_manifests.contains(manifest_hash) {
                 continue;
             }
@@ -5720,12 +5767,22 @@ impl PersistentStore {
             }
         }
 
+        // Only the retained set (referenced, or too-recent-to-reap) ever needs its
+        // content inspected, and even that is read one bounded batch at a time so peak
+        // resident manifest data stays flat as the store grows instead of scaling with
+        // total manifest count (see docs/node-memory-footprint-reduction-plan.md Slice 3).
         let mut protected_chunks = HashSet::<String>::new();
         let mut protected_media_fingerprints = HashSet::<String>::new();
-        for manifest_hash in &retained_manifests {
-            if let Some(manifest) = all_manifests.get(manifest_hash) {
-                protected_media_fingerprints.insert(content_fingerprint_from_manifest(manifest));
-                if owned_referenced_manifests.contains(manifest_hash) {
+        let mut peak_manifest_batch_size = 0usize;
+        let retained_manifest_hashes: Vec<&String> = retained_manifests.iter().collect();
+        for batch in retained_manifest_hashes.chunks(self.gc_manifest_load_batch_size.max(1)) {
+            peak_manifest_batch_size = peak_manifest_batch_size.max(batch.len());
+            for manifest_hash in batch {
+                let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+                    continue;
+                };
+                protected_media_fingerprints.insert(content_fingerprint_from_manifest(&manifest));
+                if owned_referenced_manifests.contains(*manifest_hash) {
                     for chunk in &manifest.chunks {
                         protected_chunks.insert(chunk.hash.clone());
                     }
@@ -5830,6 +5887,8 @@ impl PersistentStore {
             deleted_chunks,
             deleted_cached_chunks,
             deleted_cached_chunk_records,
+            retained_manifests_processed: retained_manifest_hashes.len(),
+            peak_manifest_batch_size,
         })
     }
 
@@ -6226,7 +6285,9 @@ impl PersistentStore {
     }
 
     async fn upsert_current_object(&self, key: &str, entry: CurrentObjectEntry) -> Result<()> {
-        self.metadata_store.upsert_current_object(key, &entry).await?;
+        self.metadata_store
+            .upsert_current_object(key, &entry)
+            .await?;
         self.current_objects_cache
             .lock()
             .unwrap()
@@ -6384,9 +6445,7 @@ impl PersistentStore {
         create_snapshot: bool,
         overwrite: bool,
     ) -> Result<PathMutationResult> {
-        if source_path != target_path
-            && self.current_object_entry(target_path).await?.is_some()
-        {
+        if source_path != target_path && self.current_object_entry(target_path).await?.is_some() {
             if !overwrite {
                 return Ok(PathMutationResult::TargetExists);
             }
@@ -6873,8 +6932,7 @@ impl PersistentStore {
             if index.versions.is_empty() {
                 self.delete_version_index_by_object_id(&index.object_id)
                     .await?;
-                if self.object_id_for_key(key).await?.as_deref() == Some(index.object_id.as_str())
-                {
+                if self.object_id_for_key(key).await?.as_deref() == Some(index.object_id.as_str()) {
                     self.remove_current_object(key).await?;
                 }
                 continue;
@@ -7120,7 +7178,13 @@ impl PersistentStore {
     async fn collect_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
         let mut referenced = HashSet::<String>::new();
 
-        for manifest_hash in self.metadata_store.load_current_state().await?.objects.values() {
+        for manifest_hash in self
+            .metadata_store
+            .load_current_state()
+            .await?
+            .objects
+            .values()
+        {
             referenced.insert(manifest_hash.clone());
         }
 
@@ -7139,8 +7203,11 @@ impl PersistentStore {
         Ok(referenced)
     }
 
-    async fn load_all_manifests(&self) -> Result<HashMap<String, ObjectManifest>> {
-        let mut manifests = HashMap::<String, ObjectManifest>::new();
+    /// Lists manifest hashes present in the manifest store without parsing their
+    /// content, so GC's orphan scan doesn't have to hold every manifest's bytes in
+    /// memory just to enumerate hashes.
+    async fn list_manifest_hashes(&self) -> Result<Vec<String>> {
+        let mut hashes = Vec::<String>::new();
         let mut entries = fs::read_dir(&self.manifests_dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
@@ -7153,13 +7220,10 @@ impl PersistentStore {
                 continue;
             };
 
-            let payload = fs::read(&path).await?;
-            let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
-                .with_context(|| format!("invalid manifest {}", path.display()))?;
-            manifests.insert(file_stem.to_string(), manifest);
+            hashes.push(file_stem.to_string());
         }
 
-        Ok(manifests)
+        Ok(hashes)
     }
 
     async fn collect_chunk_file_paths(&self) -> Result<Vec<PathBuf>> {

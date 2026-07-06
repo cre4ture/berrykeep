@@ -167,6 +167,8 @@ const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thum
 const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP";
 const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS";
 const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
+const TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV: &str =
+    "IRONMESH_TEST_SEED_PROCESS_TEMPERATURE_STATS";
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const CLIENT_CREDENTIAL_EXPORT_PATH: &str = "/cluster/client-credentials/export";
@@ -186,17 +188,17 @@ use setup::{
     managed_rendezvous_key_path, managed_signer_ca_cert_path,
 };
 use storage::{
-    AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, ClientBootstrapClaimRecord,
-    ClientCredentialRecord, ClientCredentialState, DataChangeAction, DataChangeActorKind,
-    DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery, DataChangeUploadMode,
-    DataScrubReport, HostDependencyReport, HostDependencyStatus, MediaCacheLookup,
-    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
-    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
-    PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions, ReconcileVersionEntry,
-    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
-    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
-    UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
+    AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, CleanupReport, ClientBootstrapClaimRecord,
+    ClientCredentialRecord, ClientCredentialState, CurrentObjectsCacheStats, DataChangeAction,
+    DataChangeActorKind, DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery,
+    DataChangeUploadMode, DataScrubReport, HostDependencyReport, HostDependencyStatus,
+    MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
+    MetadataDbLogicalDistribution, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
+    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
+    PutOptions, ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
+    ReplicationExportBundle, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
+    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
     metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
 };
 
@@ -240,6 +242,7 @@ struct ServerStorageRuntime {
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
+    last_gc_pass: Arc<StdMutex<Option<GcPassSummary>>>,
 }
 
 #[derive(Clone)]
@@ -536,7 +539,6 @@ async fn write_upload_sessions<'a>(
     state.storage.upload_sessions.write(operation).await
 }
 
-#[cfg(test)]
 async fn read_upload_sessions<'a>(
     state: &'a ServerState,
     operation: &'static str,
@@ -1903,6 +1905,14 @@ struct ChildProcessStat {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct TemperatureComponentStat {
+    label: String,
+    temperature_celsius: Option<f32>,
+    max_celsius: Option<f32>,
+    critical_celsius: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ProcessStatsSample {
     collected_at_unix: u64,
     main_cpu_percent: f32,
@@ -1914,12 +1924,17 @@ struct ProcessStatsSample {
     children_disk_read_bytes_per_sec: u64,
     children_disk_write_bytes_per_sec: u64,
     children_count: u32,
+    temperature_component_count: u32,
+    temperature_reporting_component_count: u32,
+    hottest_temperature_celsius: Option<f32>,
+    average_temperature_celsius: Option<f32>,
 }
 
 #[derive(Default)]
 struct ProcessStatsRuntime {
     history: VecDeque<ProcessStatsSample>,
     latest_children: Vec<ChildProcessStat>,
+    latest_temperature_components: Vec<TemperatureComponentStat>,
     logical_cpu_count: usize,
 }
 
@@ -1928,6 +1943,7 @@ impl ProcessStatsRuntime {
         &mut self,
         sample: ProcessStatsSample,
         children: Vec<ChildProcessStat>,
+        temperature_components: Vec<TemperatureComponentStat>,
         logical_cpu_count: usize,
     ) {
         self.history.push_back(sample);
@@ -1935,6 +1951,7 @@ impl ProcessStatsRuntime {
             self.history.pop_front();
         }
         self.latest_children = children;
+        self.latest_temperature_components = temperature_components;
         self.logical_cpu_count = logical_cpu_count;
     }
 
@@ -1943,6 +1960,173 @@ impl ProcessStatsRuntime {
         let skip = self.history.len().saturating_sub(keep);
         self.history.iter().skip(skip).cloned().collect()
     }
+}
+
+fn seed_process_temperature_stats_for_tests(state: &ServerState) {
+    if !env_flag_is_truthy(TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV) {
+        return;
+    }
+
+    let temperature_components = vec![TemperatureComponentStat {
+        label: "Seeded runtime sensor".to_string(),
+        temperature_celsius: Some(42.5),
+        max_celsius: Some(85.0),
+        critical_celsius: Some(100.0),
+    }];
+    let temperature_summary = summarize_temperature_components(&temperature_components);
+    let logical_cpu_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let sample = ProcessStatsSample {
+        collected_at_unix: unix_ts(),
+        main_cpu_percent: 0.0,
+        main_memory_bytes: 0,
+        main_disk_read_bytes_per_sec: 0,
+        main_disk_write_bytes_per_sec: 0,
+        children_cpu_percent: 0.0,
+        children_memory_bytes: 0,
+        children_disk_read_bytes_per_sec: 0,
+        children_disk_write_bytes_per_sec: 0,
+        children_count: 0,
+        temperature_component_count: temperature_summary.component_count,
+        temperature_reporting_component_count: temperature_summary.reporting_component_count,
+        hottest_temperature_celsius: temperature_summary.hottest_temperature_celsius,
+        average_temperature_celsius: temperature_summary.average_temperature_celsius,
+    };
+
+    let mut runtime = match state.process_stats_runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if runtime.history.is_empty() {
+        runtime.push(
+            sample,
+            Vec::new(),
+            temperature_components,
+            logical_cpu_count,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TemperatureSummary {
+    component_count: u32,
+    reporting_component_count: u32,
+    hottest_temperature_celsius: Option<f32>,
+    average_temperature_celsius: Option<f32>,
+}
+
+fn sanitize_temperature_reading(value: Option<f32>) -> Option<f32> {
+    value.filter(|value| value.is_finite())
+}
+
+fn collect_temperature_components(
+    components: &sysinfo::Components,
+) -> Vec<TemperatureComponentStat> {
+    let mut stats = components
+        .iter()
+        .filter_map(|component: &sysinfo::Component| {
+            let temperature_celsius = sanitize_temperature_reading(component.temperature());
+            let max_celsius = sanitize_temperature_reading(component.max());
+            let critical_celsius = sanitize_temperature_reading(component.critical());
+            if temperature_celsius.is_none() && max_celsius.is_none() && critical_celsius.is_none()
+            {
+                return None;
+            }
+
+            let label = component.label().trim();
+            let label = if label.is_empty() {
+                component.id().unwrap_or("unnamed component")
+            } else {
+                label
+            };
+
+            Some(TemperatureComponentStat {
+                label: label.to_string(),
+                temperature_celsius,
+                max_celsius,
+                critical_celsius,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    stats.sort_by(|left, right| {
+        let left_temp = left.temperature_celsius.unwrap_or(f32::NEG_INFINITY);
+        let right_temp = right.temperature_celsius.unwrap_or(f32::NEG_INFINITY);
+        right_temp
+            .partial_cmp(&left_temp)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    stats
+}
+
+fn summarize_temperature_components(components: &[TemperatureComponentStat]) -> TemperatureSummary {
+    let mut summary = TemperatureSummary {
+        component_count: components.len() as u32,
+        ..TemperatureSummary::default()
+    };
+    let mut total_temperature = 0.0_f32;
+
+    for component in components {
+        let Some(temperature_celsius) = component.temperature_celsius else {
+            continue;
+        };
+        summary.reporting_component_count += 1;
+        total_temperature += temperature_celsius;
+        summary.hottest_temperature_celsius = Some(
+            summary
+                .hottest_temperature_celsius
+                .map(|current| current.max(temperature_celsius))
+                .unwrap_or(temperature_celsius),
+        );
+    }
+
+    if summary.reporting_component_count > 0 {
+        summary.average_temperature_celsius =
+            Some(total_temperature / summary.reporting_component_count as f32);
+    }
+
+    summary
+}
+
+/// Snapshot of the most recent `cleanup_unreferenced` (GC) pass, kept for dashboard
+/// attribution. Captured on every run (dry or not) so operators can see it without
+/// having to trigger a real cleanup first.
+#[derive(Debug, Clone, Serialize)]
+struct GcPassSummary {
+    collected_at_unix: u64,
+    dry_run: bool,
+    retained_manifests_processed: usize,
+    peak_manifest_batch_size: usize,
+    deleted_manifests: usize,
+    deleted_chunks: usize,
+}
+
+impl GcPassSummary {
+    fn from_report(report: &CleanupReport) -> Self {
+        Self {
+            collected_at_unix: unix_ts(),
+            dry_run: report.dry_run,
+            retained_manifests_processed: report.retained_manifests_processed,
+            peak_manifest_batch_size: report.peak_manifest_batch_size,
+            deleted_manifests: report.deleted_manifests,
+            deleted_chunks: report.deleted_chunks,
+        }
+    }
+}
+
+/// Attribution for the confirmed RAM hotspots in
+/// docs/node-memory-footprint-reduction-plan.md, next to the whole-process RSS gauge:
+/// what's resident and why, not just how big the process is.
+#[derive(Debug, Clone, Serialize)]
+struct MemoryAttributionSample {
+    collected_at_unix: u64,
+    current_objects_cache: CurrentObjectsCacheStats,
+    current_objects_total_count: usize,
+    in_flight_upload_session_count: usize,
+    in_flight_upload_bytes: u64,
+    last_gc_pass: Option<GcPassSummary>,
 }
 
 #[derive(Clone)]
@@ -5419,6 +5603,7 @@ async fn run_inner(
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
+            last_gc_pass: Arc::new(StdMutex::new(None)),
         },
         access: ServerAccessRuntime {
             client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
@@ -5496,6 +5681,7 @@ async fn run_inner(
         runtime_log_control,
         process_stats_runtime: Arc::new(StdMutex::new(ProcessStatsRuntime::default())),
     };
+    seed_process_temperature_stats_for_tests(&state);
 
     let internal_peer_url = config
         .internal_tls
@@ -5810,6 +5996,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/storage/stats/history", get(storage_stats_history))
         .route("/process/stats/current", get(process_stats_current))
         .route("/process/stats/history", get(process_stats_history))
+        .route("/process/stats/memory", get(process_stats_memory))
         .route(
             "/cluster/nodes/{node_id}",
             put(register_node).delete(remove_node),
@@ -5878,6 +6065,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/storage/stats/history", get(storage_stats_history))
         .route("/process/stats/current", get(process_stats_current))
         .route("/process/stats/history", get(process_stats_history))
+        .route("/process/stats/memory", get(process_stats_memory))
         .route(
             "/cluster/nodes/{node_id}",
             put(register_node).delete(remove_node),
@@ -5962,6 +6150,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/storage/stats/history", get(storage_stats_history))
         .route("/process/stats/current", get(process_stats_current))
         .route("/process/stats/history", get(process_stats_history))
+        .route("/process/stats/memory", get(process_stats_memory))
         .route("/cluster/placement/{key}", get(placement_for_key))
         .route("/cluster/replication/plan", get(replication_plan))
         .route("/snapshots", get(list_snapshots))
@@ -6297,6 +6486,7 @@ fn spawn_storage_stats_refresher(state: ServerState) {
 fn spawn_process_stats_sampler(state: ServerState) {
     tokio::spawn(async move {
         let mut system = sysinfo::System::new();
+        let mut temperature_components = sysinfo::Components::new_with_refreshed_list();
         let main_pid = sysinfo::Pid::from_u32(std::process::id());
         let mut ticker =
             tokio::time::interval(Duration::from_secs(PROCESS_STATS_SAMPLE_INTERVAL_SECS));
@@ -6304,6 +6494,7 @@ fn spawn_process_stats_sampler(state: ServerState) {
         loop {
             ticker.tick().await;
             system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            temperature_components.refresh(true);
 
             let main_process = system.process(main_pid);
             let main_cpu_percent = main_process.map(|p| p.cpu_usage()).unwrap_or(0.0);
@@ -6344,6 +6535,8 @@ fn spawn_process_stats_sampler(state: ServerState) {
                 .map(|child| child.disk_write_bytes_per_sec)
                 .sum();
             let children_count = children.len() as u32;
+            let temperature_components = collect_temperature_components(&temperature_components);
+            let temperature_summary = summarize_temperature_components(&temperature_components);
 
             let sample = ProcessStatsSample {
                 collected_at_unix: unix_ts(),
@@ -6358,6 +6551,11 @@ fn spawn_process_stats_sampler(state: ServerState) {
                 children_disk_read_bytes_per_sec,
                 children_disk_write_bytes_per_sec,
                 children_count,
+                temperature_component_count: temperature_summary.component_count,
+                temperature_reporting_component_count: temperature_summary
+                    .reporting_component_count,
+                hottest_temperature_celsius: temperature_summary.hottest_temperature_celsius,
+                average_temperature_celsius: temperature_summary.average_temperature_celsius,
             };
 
             let logical_cpu_count = system.cpus().len();
@@ -6365,7 +6563,7 @@ fn spawn_process_stats_sampler(state: ServerState) {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            runtime.push(sample, children, logical_cpu_count);
+            runtime.push(sample, children, temperature_components, logical_cpu_count);
         }
     });
 }
@@ -18616,6 +18814,7 @@ async fn storage_stats_history(
 struct ProcessStatsCurrentResponse {
     sample: Option<ProcessStatsSample>,
     children: Vec<ChildProcessStat>,
+    temperature_components: Vec<TemperatureComponentStat>,
     logical_cpu_count: usize,
 }
 
@@ -18643,6 +18842,7 @@ async fn process_stats_current(
     let response = ProcessStatsCurrentResponse {
         sample: runtime.history.back().cloned(),
         children: runtime.latest_children.clone(),
+        temperature_components: runtime.latest_temperature_components.clone(),
         logical_cpu_count: runtime.logical_cpu_count,
     };
 
@@ -18685,6 +18885,61 @@ async fn process_stats_history(
     };
 
     (StatusCode::OK, Json(samples)).into_response()
+}
+
+async fn process_stats_memory(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "process_stats_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let (current_objects_cache, current_objects_total_count) = {
+        let store = read_store(&state, "process_stats.memory").await;
+        let cache_stats = store.current_objects_cache_stats();
+        let total_count = store.object_count().await.unwrap_or(0);
+        (cache_stats, total_count)
+    };
+
+    let (in_flight_upload_session_count, in_flight_upload_bytes) = {
+        let sessions = read_upload_sessions(&state, "process_stats.memory").await;
+        let count = sessions.sessions.len();
+        let bytes = sessions
+            .sessions
+            .values()
+            .map(|session| session.chunk_count as u64 * session.chunk_size_bytes as u64)
+            .sum();
+        (count, bytes)
+    };
+
+    let last_gc_pass = {
+        let guard = match state.storage.last_gc_pass.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+
+    let sample = MemoryAttributionSample {
+        collected_at_unix: unix_ts(),
+        current_objects_cache,
+        current_objects_total_count,
+        in_flight_upload_session_count,
+        in_flight_upload_bytes,
+        last_gc_pass,
+    };
+
+    (StatusCode::OK, Json(sample)).into_response()
 }
 
 fn metadata_db_logical_distribution_status_response(
@@ -21680,6 +21935,13 @@ async fn run_cleanup(
         Ok(report) => {
             if !dry_run {
                 request_local_availability_refresh(&state);
+            }
+            {
+                let mut last_gc_pass = match state.storage.last_gc_pass.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *last_gc_pass = Some(GcPassSummary::from_report(&report));
             }
             append_admin_audit(
                 &state,
