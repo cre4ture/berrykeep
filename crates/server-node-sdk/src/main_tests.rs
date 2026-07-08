@@ -314,6 +314,7 @@ fn test_cluster_config_without_internal_tls(
         public_peer_api_enabled: false,
         internal_tls: None,
         internal_ca_key_path: None,
+        local_status_bind_addr: None,
         rendezvous_ca_cert_path: None,
         rendezvous_urls: vec![format!("http://{bind_addr}")],
         rendezvous_registration_enabled: false,
@@ -6247,7 +6248,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
     // ensure underlying store current keys no longer include the key
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(!keys.contains(&key));
 
@@ -6302,7 +6303,7 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
 
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(
         !keys
@@ -6358,7 +6359,7 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
 
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(!keys.contains(&"docs/".to_string()));
 
@@ -7071,6 +7072,8 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
 
         let replica_subjects = locked
             .replication_subject_inspector()
+            .await
+            .unwrap()
             .list_replication_subjects()
             .await
             .unwrap();
@@ -8317,6 +8320,7 @@ async fn build_test_state(
                 String,
                 Arc<super::web_maps::LogicalMbtilesSource>,
             >::new())),
+            last_gc_pass: Arc::new(std::sync::Mutex::new(None)),
         },
         access: super::ServerAccessRuntime {
             client_credentials: Arc::new(Mutex::new(
@@ -8402,6 +8406,9 @@ async fn build_test_state(
         },
         log_buffer: Arc::new(super::LogBuffer::new(64)),
         runtime_log_control: super::RuntimeLogControl::disabled("info"),
+        process_stats_runtime: Arc::new(std::sync::Mutex::new(
+            super::ProcessStatsRuntime::default(),
+        )),
     };
 
     if seed_gap {
@@ -8503,6 +8510,188 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
     assert_eq!(
         state.storage.upload_sessions_dirty.load(Ordering::SeqCst),
         0
+    );
+}
+
+#[tokio::test]
+async fn process_stats_memory_reports_current_objects_uploads_and_last_gc_pass() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut store = lock_store(&state, "tests.process_stats_memory.seed").await;
+        store
+            .put_object_versioned(
+                "docs/live.txt",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let now = super::unix_ts();
+    {
+        let mut sessions =
+            super::write_upload_sessions(&state, "tests.process_stats_memory.seed").await;
+        sessions.sessions.insert(
+            "upload-in-flight".to_string(),
+            super::UploadSessionRecord {
+                upload_id: "upload-in-flight".to_string(),
+                owner_device_id: None,
+                key: "uploads/in-flight.bin".to_string(),
+                total_size_bytes: 4096,
+                chunk_size_bytes: 4096,
+                chunk_count: 1,
+                state: VersionConsistencyState::Confirmed,
+                parent_version_ids: Vec::new(),
+                explicit_version_id: None,
+                received_chunks: vec![None],
+                created_at_unix: now,
+                updated_at_unix: now,
+                expires_at_unix: now + 300,
+                finalizing: false,
+                completed: false,
+                completed_result: None,
+            },
+        );
+    }
+
+    let cleanup_response = super::run_cleanup(
+        State(state.clone()),
+        headers.clone(),
+        Query(super::CleanupQuery {
+            retention_secs: Some(0),
+            dry_run: Some(true),
+            approve: Some(false),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cleanup_response.status(), StatusCode::OK);
+
+    let memory_response = super::process_stats_memory(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(memory_response.status(), StatusCode::OK);
+
+    let body = to_bytes(memory_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let sample: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(sample["current_objects_total_count"], 1);
+    assert_eq!(sample["in_flight_upload_session_count"], 1);
+    assert_eq!(sample["in_flight_upload_bytes"], 4096);
+    assert!(
+        sample["current_objects_cache"]["resident_entries"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        sample["current_objects_cache"]["capacity"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    let last_gc_pass = &sample["last_gc_pass"];
+    assert_eq!(last_gc_pass["dry_run"], true);
+    assert_eq!(last_gc_pass["retained_manifests_processed"], 1);
+    assert!(last_gc_pass["peak_manifest_batch_size"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn process_stats_current_reports_temperature_snapshot() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut runtime = state
+            .process_stats_runtime
+            .lock()
+            .expect("process stats runtime lock should not be poisoned");
+        runtime.push(
+            super::ProcessStatsSample {
+                collected_at_unix: 1_720_000_000,
+                main_cpu_percent: 12.5,
+                main_memory_bytes: 512 * 1024 * 1024,
+                main_disk_read_bytes_per_sec: 4096,
+                main_disk_write_bytes_per_sec: 2048,
+                children_cpu_percent: 6.25,
+                children_memory_bytes: 128 * 1024 * 1024,
+                children_disk_read_bytes_per_sec: 1024,
+                children_disk_write_bytes_per_sec: 512,
+                children_count: 1,
+                temperature_component_count: 2,
+                temperature_reporting_component_count: 1,
+                hottest_temperature_celsius: Some(68.25),
+                average_temperature_celsius: Some(68.25),
+            },
+            vec![super::ChildProcessStat {
+                pid: 4242,
+                name: "ffmpeg".to_string(),
+                cpu_percent: 6.25,
+                memory_bytes: 128 * 1024 * 1024,
+                disk_read_bytes_per_sec: 1024,
+                disk_write_bytes_per_sec: 512,
+            }],
+            vec![
+                super::TemperatureComponentStat {
+                    label: "CPU package".to_string(),
+                    temperature_celsius: Some(68.25),
+                    max_celsius: Some(85.0),
+                    critical_celsius: Some(100.0),
+                },
+                super::TemperatureComponentStat {
+                    label: "NVMe".to_string(),
+                    temperature_celsius: None,
+                    max_celsius: Some(72.0),
+                    critical_celsius: Some(84.0),
+                },
+            ],
+            16,
+        );
+    }
+
+    let response = super::process_stats_current(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(payload["logical_cpu_count"], 16);
+    assert_eq!(payload["children"][0]["name"], "ffmpeg");
+    assert_eq!(payload["sample"]["temperature_component_count"], 2);
+    assert_eq!(
+        payload["sample"]["temperature_reporting_component_count"],
+        1
+    );
+    assert_eq!(
+        payload["sample"]["hottest_temperature_celsius"]
+            .as_f64()
+            .unwrap(),
+        68.25
+    );
+    assert_eq!(payload["temperature_components"][0]["label"], "CPU package");
+    assert_eq!(
+        payload["temperature_components"][0]["temperature_celsius"]
+            .as_f64()
+            .unwrap(),
+        68.25
+    );
+    assert_eq!(
+        payload["temperature_components"][1]["critical_celsius"]
+            .as_f64()
+            .unwrap(),
+        84.0
     );
 }
 
@@ -9389,6 +9578,72 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
 }
 
 #[tokio::test]
+async fn backfill_cluster_nodes_from_replica_rows_adds_placeholders_for_legacy_replicas() {
+    let remote_a = NodeId::new_v4();
+    let remote_b = NodeId::new_v4();
+    let replicas = HashMap::from([("subject-a".to_string(), vec![remote_b, remote_a])]);
+
+    let nodes = super::backfill_cluster_nodes_from_replica_rows(Vec::new(), &replicas);
+
+    assert_eq!(nodes.len(), 2);
+    assert!(nodes.iter().any(|node| node.node_id == remote_a));
+    assert!(nodes.iter().any(|node| node.node_id == remote_b));
+    for node in nodes {
+        assert_eq!(node.status, cluster::NodeStatus::Offline);
+        assert_eq!(node.public_api_url(), None);
+        assert_eq!(node.peer_api_url(), None);
+        assert!(!node.relay_required());
+        assert!(!node.relay_capable());
+    }
+}
+
+#[tokio::test]
+async fn backfill_cluster_nodes_from_replica_rows_preserves_existing_descriptors() {
+    let remote_a = NodeId::new_v4();
+    let remote_b = NodeId::new_v4();
+    let existing = cluster::NodeDescriptor {
+        node_id: remote_a,
+        reachability: cluster::NodeReachability {
+            public_api_url: Some("https://public.example".to_string()),
+            peer_api_url: Some("https://internal.example".to_string()),
+            relay_required: true,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: true,
+        },
+        labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+        capacity_bytes: 100,
+        free_bytes: 40,
+        storage_stats: None,
+        last_heartbeat_unix: 123,
+        status: cluster::NodeStatus::Offline,
+    };
+    let replicas = HashMap::from([("subject-a".to_string(), vec![remote_a, remote_b])]);
+
+    let nodes = super::backfill_cluster_nodes_from_replica_rows(vec![existing.clone()], &replicas);
+
+    assert_eq!(nodes.len(), 2);
+    let preserved = nodes
+        .iter()
+        .find(|node| node.node_id == remote_a)
+        .expect("existing node descriptor should remain");
+    assert_eq!(preserved.public_api_url(), Some("https://public.example"));
+    assert_eq!(preserved.peer_api_url(), Some("https://internal.example"));
+    assert!(preserved.relay_required());
+    assert!(preserved.relay_capable());
+
+    let placeholder = nodes
+        .iter()
+        .find(|node| node.node_id == remote_b)
+        .expect("missing replica owner should be backfilled");
+    assert_eq!(placeholder.public_api_url(), None);
+    assert_eq!(placeholder.peer_api_url(), None);
+    assert_eq!(placeholder.status, cluster::NodeStatus::Offline);
+}
+
+#[tokio::test]
 async fn register_node_uses_structured_reachability_payload() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
@@ -9439,6 +9694,18 @@ async fn register_node_uses_structured_reachability_payload() {
     assert_eq!(node.capacity_bytes, 100);
     assert_eq!(node.free_bytes, 40);
 
+    let persisted_nodes = {
+        let store = read_store(&state, "tests.load_cluster_nodes_after_register").await;
+        store.load_cluster_nodes().await.unwrap()
+    };
+    let persisted = persisted_nodes
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .expect("registered node should be persisted");
+    assert_eq!(persisted.public_api_url(), Some("https://public.example"));
+    assert_eq!(persisted.peer_api_url(), Some("https://internal.example"));
+    assert!(persisted.relay_required());
+
     cleanup_test_state(&state).await;
 }
 
@@ -9469,6 +9736,111 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
     assert_eq!(descriptor.public_api_url(), None);
     assert_eq!(descriptor.peer_api_url(), None);
     assert!(descriptor.relay_capable());
+}
+
+#[tokio::test]
+async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let node_id = NodeId::new_v4();
+    let entry = transport_sdk::PresenceEntry {
+        registration: transport_sdk::PresenceRegistration {
+            cluster_id: state.cluster_id,
+            identity: transport_sdk::PeerIdentity::Node(node_id),
+            public_api_url: Some("https://public.example".to_string()),
+            peer_api_url: Some("https://internal.example".to_string()),
+            direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                kind: transport_sdk::CandidateKind::DirectHttps,
+                endpoint: "https://internal.example".to_string(),
+                rtt_ms: None,
+            }],
+            labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+            capacity_bytes: Some(100),
+            free_bytes: Some(40),
+            capabilities: vec![transport_sdk::TransportCapability::RelayTunnel],
+            relay_mode: transport_sdk::RelayMode::Fallback,
+            connected_at_unix: 123,
+        },
+        updated_at_unix: 456,
+    };
+
+    let discovered = super::apply_rendezvous_presence_entries(&state, &[entry]).await;
+    assert_eq!(discovered, 1);
+
+    let persisted_nodes = {
+        let store = read_store(&state, "tests.load_cluster_nodes_after_discovery").await;
+        store.load_cluster_nodes().await.unwrap()
+    };
+    let persisted = persisted_nodes
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .expect("discovered node should be persisted");
+    assert_eq!(persisted.public_api_url(), Some("https://public.example"));
+    assert_eq!(persisted.peer_api_url(), Some("https://internal.example"));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn remove_node_persists_forget_to_cluster_state() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let node_id = NodeId::new_v4();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        let _ = cluster.register_node(cluster::NodeDescriptor {
+            node_id,
+            reachability: cluster::NodeReachability {
+                public_api_url: Some("https://public.example".to_string()),
+                peer_api_url: Some("https://internal.example".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 100,
+            free_bytes: 40,
+            storage_stats: None,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        });
+        cluster.note_replica("subject-a", node_id);
+    }
+    super::persist_cluster_topology_state(&state).await.unwrap();
+
+    let response = axum::response::IntoResponse::into_response(
+        super::remove_node(State(state.clone()), headers, Path(node_id.to_string())).await,
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let persisted_nodes = {
+        let store = read_store(&state, "tests.load_cluster_nodes_after_remove").await;
+        store.load_cluster_nodes().await.unwrap()
+    };
+    assert!(
+        persisted_nodes
+            .into_iter()
+            .all(|node| node.node_id != node_id),
+        "removed node should be forgotten from persisted node state"
+    );
+
+    let persisted_replicas = {
+        let store = read_store(&state, "tests.load_cluster_replicas_after_remove").await;
+        store.load_cluster_replicas().await.unwrap()
+    };
+    assert!(
+        persisted_replicas
+            .values()
+            .all(|nodes| !nodes.contains(&node_id)),
+        "removed node should be forgotten from persisted replica state"
+    );
+
+    cleanup_test_state(&state).await;
 }
 
 #[tokio::test]
@@ -10965,6 +11337,60 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
     let _ = handle_a.await;
     handle_b.abort();
     let _ = handle_b.await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_registration_success_clears_versionless_heartbeat_but_preserves_relay_version()
+{
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let rendezvous_url = "https://rendezvous-a.example:9443/".to_string();
+    *state.network.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
+    *state.network.rendezvous_registration_state.lock().await = HashMap::from([(
+        rendezvous_url.clone(),
+        super::RendezvousEndpointRegistrationRuntime {
+            last_attempt_unix: Some(10),
+            last_success_unix: Some(10),
+            consecutive_failures: 0,
+            last_error: None,
+            software_version: Some("1.0.31".to_string()),
+        },
+    )]);
+
+    let _ = super::record_rendezvous_registration_success(
+        &state,
+        &rendezvous_url,
+        super::RendezvousRegistrationSuccessVersionUpdate::Sync(None),
+    )
+    .await;
+    {
+        let registration_state = state.network.rendezvous_registration_state.lock().await;
+        let endpoint = registration_state
+            .get(&rendezvous_url)
+            .expect("endpoint state should exist");
+        assert_eq!(endpoint.software_version, None);
+    }
+
+    let _ = super::record_rendezvous_registration_success(
+        &state,
+        &rendezvous_url,
+        super::RendezvousRegistrationSuccessVersionUpdate::Sync(Some("1.0.32")),
+    )
+    .await;
+    let _ = super::record_rendezvous_registration_success(
+        &state,
+        &rendezvous_url,
+        super::RendezvousRegistrationSuccessVersionUpdate::Preserve,
+    )
+    .await;
+    {
+        let registration_state = state.network.rendezvous_registration_state.lock().await;
+        let endpoint = registration_state
+            .get(&rendezvous_url)
+            .expect("endpoint state should exist");
+        assert_eq!(endpoint.software_version.as_deref(), Some("1.0.32"));
+    }
+
     cleanup_test_state(&state).await;
 }
 
