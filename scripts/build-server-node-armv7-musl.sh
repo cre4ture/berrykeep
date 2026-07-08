@@ -162,7 +162,18 @@ main() {
   log "building ${BIN_NAME} for ${TARGET_TRIPLE}"
   (
     cd "${ROOT_DIR}"
-    cargo zigbuild --target "${TARGET_TRIPLE}" --release -p "${PACKAGE}" --bin "${BIN_NAME}"
+    # target-cpu=cortex-a7 unlocks NEON/VFPv4 codegen (confirmed present via
+    # /proc/cpuinfo on the LuckFox PicoKVM) instead of the generic armv7
+    # baseline, which benefits blake3's SIMD hashing kernels among others.
+    #
+    # panic=abort is set here via --config rather than in the shared
+    # workspace Cargo.toml: it's safe for this standalone binary, but
+    # unsafe to apply workspace-wide since the android/ios app crates rely
+    # on catching panics at their FFI boundary to avoid aborting the host
+    # app process.
+    RUSTFLAGS="-C target-cpu=cortex-a7" cargo zigbuild \
+      --config profile.release.panic='"abort"' \
+      --target "${TARGET_TRIPLE}" --release -p "${PACKAGE}" --bin "${BIN_NAME}"
   )
 
   local bin_path="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${BIN_NAME}"

@@ -37,6 +37,11 @@ authors = ["ironmesh contributors"]
 [workspace.lints.rust]
 unsafe_code = "deny"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+
 [workspace.dependencies]
 anyhow = "1"
 assert_cmd = "2"

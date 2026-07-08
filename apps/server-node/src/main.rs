@@ -21,8 +21,24 @@ const LONG_VERSION: &str = git_version::git_version!(
 #[command(after_help = BUILD_INFO)]
 struct Cli {}
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     Cli::parse();
-    server_node_sdk::run_from_env().await
+
+    // Defaults to the multi-thread scheduler (matches prior `#[tokio::main]`
+    // behavior) since most deployments have multiple cores. Single-core
+    // hosts (e.g. the LuckFox PicoKVM) can opt into the current-thread
+    // runtime to drop the worker-pool thread stacks and cross-thread wake
+    // overhead, which is pure cost with no parallelism to gain on one core.
+    let use_current_thread = std::env::var_os("IRONMESH_TOKIO_CURRENT_THREAD")
+        .is_some_and(|v| v != "0");
+
+    let runtime = if use_current_thread {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    }
+    .enable_all()
+    .build()?;
+
+    runtime.block_on(server_node_sdk::run_from_env())
 }
