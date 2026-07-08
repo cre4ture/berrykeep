@@ -5,8 +5,10 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import android.provider.DocumentsContract
 import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.activity.result.ActivityResult
@@ -92,6 +94,23 @@ fun requestWifiNameAccessIfNeeded(
     if (missing.isNotEmpty()) {
         launcher.launch(missing)
     }
+}
+
+fun isDeviceLocationEnabled(context: Context): Boolean {
+    val locationManager = context.getSystemService(LocationManager::class.java) ?: return false
+    return runCatching {
+        locationManager.isLocationEnabled
+    }.getOrDefault(false)
+}
+
+fun openLocationSettings(context: Context): Boolean {
+    val intent = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    return runCatching {
+        context.startActivity(intent)
+        true
+    }.getOrDefault(false)
 }
 
 fun handleFolderPickerResult(

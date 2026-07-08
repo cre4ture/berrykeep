@@ -55,6 +55,7 @@ class MainActivity : ComponentActivity() {
                 val snackbarHostState = remember { SnackbarHostState() }
                 var lastSnackbarMessage by rememberSaveable { mutableStateOf("") }
                 var openWebUiWhenReady by rememberSaveable { mutableStateOf(false) }
+                var existingProfilePermissionRequestAttempted by rememberSaveable { mutableStateOf(false) }
 
                 val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
                     if (result.contents != null) {
@@ -140,7 +141,8 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 val hasPhotoAccess = missingOriginalPhotoAccessPermissions(context).isEmpty()
-                val hasWifiNameAccess = missingWifiNameAccessPermissions(context).isEmpty()
+                val hasWifiNamePermissions = missingWifiNameAccessPermissions(context).isEmpty()
+                val isLocationEnabled = isDeviceLocationEnabled(context)
 
                 LaunchedEffect(openWebUiWhenReady, state.loading, state.webUiUrl) {
                     if (!openWebUiWhenReady || state.loading) {
@@ -150,6 +152,15 @@ class MainActivity : ComponentActivity() {
                         openWebUi(state.webUiUrl, vm::setStatus)
                     }
                     openWebUiWhenReady = false
+                }
+
+                LaunchedEffect(state.syncProfiles) {
+                    if (existingProfilePermissionRequestAttempted || state.syncProfiles.isEmpty()) {
+                        return@LaunchedEffect
+                    }
+
+                    existingProfilePermissionRequestAttempted = true
+                    requestOriginalPhotoAccessIfNeeded(context, photoAccessPermissionLauncher)
                 }
 
                 LaunchedEffect(state.status) {
@@ -208,7 +219,8 @@ class MainActivity : ComponentActivity() {
                                 MainSection.SETTINGS -> SettingsScreen(
                                     state = state,
                                     hasPhotoAccess = hasPhotoAccess,
-                                    hasWifiNameAccess = hasWifiNameAccess,
+                                    hasWifiNamePermissions = hasWifiNamePermissions,
+                                    isLocationEnabled = isLocationEnabled,
                                     onRequestPhotoAccess = {
                                         requestOriginalPhotoAccessIfNeeded(
                                             context,
@@ -219,6 +231,11 @@ class MainActivity : ComponentActivity() {
                                         val missing = missingWifiNameAccessPermissions(context)
                                         if (missing.isNotEmpty()) {
                                             wifiNamePermissionLauncher.launch(missing)
+                                        }
+                                    },
+                                    onOpenLocationSettings = {
+                                        if (!openLocationSettings(context)) {
+                                            vm.setStatus("Unable to open Android location settings")
                                         }
                                     },
                                     onOpenFiles = { openFilesAtIronmeshRoot(vm) },

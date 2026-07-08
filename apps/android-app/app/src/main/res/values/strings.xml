@@ -71,10 +71,12 @@
     <string name="permission_granted">Granted</string>
     <string name="permission_needed">Needs attention</string>
     <string name="grant_access">Grant access</string>
+    <string name="location_required">Turn on device location</string>
+    <string name="open_location_settings">Open location settings</string>
     <string name="photo_access_title">Photo metadata access</string>
     <string name="photo_access_body">Used to preserve original photo metadata such as GPS EXIF data during sync.</string>
     <string name="wifi_access_title">Restricted Wi-Fi rules</string>
-    <string name="wifi_access_body">Needed only when sync profiles are restricted to specific Wi-Fi network names.</string>
+    <string name="wifi_access_body">Needed only when sync profiles are restricted to specific Wi-Fi network names. Even with permissions granted, Android location services must stay enabled for Wi-Fi names to remain visible.</string>
     <string name="folder_access_title">Folder access</string>
     <string name="folder_access_body">Pick a local folder when creating a sync profile. The selected folder will be stored with a persistable tree permission.</string>
     <string name="sync_empty_title">No sync profiles yet</string>

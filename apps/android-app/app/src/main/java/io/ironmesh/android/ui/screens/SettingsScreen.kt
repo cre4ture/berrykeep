@@ -28,9 +28,11 @@ import io.ironmesh.android.ui.components.SectionCard
 fun SettingsScreen(
     state: MainUiState,
     hasPhotoAccess: Boolean,
-    hasWifiNameAccess: Boolean,
+    hasWifiNamePermissions: Boolean,
+    isLocationEnabled: Boolean,
     onRequestPhotoAccess: () -> Unit,
     onRequestWifiNameAccess: () -> Unit,
+    onOpenLocationSettings: () -> Unit,
     onOpenFiles: () -> Unit,
     onOpenWebConsole: () -> Unit,
     onClearEnrollment: () -> Unit,
@@ -39,6 +41,23 @@ fun SettingsScreen(
     onPutObject: () -> Unit,
     onGetObject: () -> Unit,
 ) {
+    val wifiAccessGranted = hasWifiNamePermissions && isLocationEnabled
+    val wifiStatusText = when {
+        wifiAccessGranted -> stringResource(R.string.permission_granted)
+        !hasWifiNamePermissions -> stringResource(R.string.permission_needed)
+        else -> stringResource(R.string.location_required)
+    }
+    val wifiActionLabel = when {
+        wifiAccessGranted -> null
+        !hasWifiNamePermissions -> stringResource(R.string.grant_access)
+        else -> stringResource(R.string.open_location_settings)
+    }
+    val wifiAction = when {
+        wifiAccessGranted -> null
+        !hasWifiNamePermissions -> onRequestWifiNameAccess
+        else -> onOpenLocationSettings
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -75,15 +94,9 @@ fun SettingsScreen(
             PermissionExplainerCard(
                 title = stringResource(R.string.wifi_access_title),
                 body = stringResource(R.string.wifi_access_body),
-                status = stringResource(
-                    if (hasWifiNameAccess) {
-                        R.string.permission_granted
-                    } else {
-                        R.string.permission_needed
-                    },
-                ),
-                actionLabel = if (hasWifiNameAccess) null else stringResource(R.string.grant_access),
-                onAction = if (hasWifiNameAccess) null else onRequestWifiNameAccess,
+                status = wifiStatusText,
+                actionLabel = wifiActionLabel,
+                onAction = wifiAction,
             )
         }
 
