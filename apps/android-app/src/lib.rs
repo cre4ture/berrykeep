@@ -87,7 +87,8 @@ mod tests {
 }
 use client_sdk::{
     BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    IronMeshClient, build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    IronMeshClient, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
+    StoreIndexView, build_http_client_from_pem, build_http_client_with_identity_from_pem,
     enroll_connection_input_blocking,
 };
 use jni::JNIEnv;
@@ -1164,6 +1165,34 @@ fn configured_client_node(
     )?))
 }
 
+fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("raw") => Ok(Some(StoreIndexView::Raw)),
+        Some("tree") => Ok(Some(StoreIndexView::Tree)),
+        Some(other) => anyhow::bail!("unsupported store index view: {other}"),
+        None => Ok(None),
+    }
+}
+
+fn parse_store_index_sort_order(value: Option<&str>) -> Result<Option<StoreIndexSortOrder>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("path_asc") => Ok(Some(StoreIndexSortOrder::PathAsc)),
+        Some("captured_desc") => Ok(Some(StoreIndexSortOrder::CapturedDesc)),
+        Some(other) => anyhow::bail!("unsupported store index sort order: {other}"),
+        None => Ok(None),
+    }
+}
+
+fn parse_store_index_media_filter(value: Option<&str>) -> Result<Option<StoreIndexMediaFilter>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("all") => Ok(Some(StoreIndexMediaFilter::All)),
+        Some("image") => Ok(Some(StoreIndexMediaFilter::Image)),
+        Some("video") => Ok(Some(StoreIndexMediaFilter::Video)),
+        Some(other) => anyhow::bail!("unsupported store index media filter: {other}"),
+        None => Ok(None),
+    }
+}
+
 /// # Safety
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
@@ -1380,6 +1409,75 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
         },
         Err(err) => {
             throw_java_error(&mut env, format!("rust storeIndex failed: {err:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_storeIndexWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    prefix: jstring,
+    depth: jint,
+    snapshot: jstring,
+    view: jstring,
+    offset: jint,
+    limit: jint,
+    sort: jstring,
+    media_filter: jstring,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let prefix = optional_jstring(&mut env, prefix)?;
+        let snapshot = optional_jstring(&mut env, snapshot)?;
+        let view = optional_jstring(&mut env, view)?;
+        let sort = optional_jstring(&mut env, sort)?;
+        let media_filter = optional_jstring(&mut env, media_filter)?;
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let sdk = configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        let options = StoreIndexRequestOptions {
+            view: parse_store_index_view(view.as_deref())?,
+            offset: usize::try_from(offset).ok(),
+            limit: usize::try_from(limit).ok(),
+            sort: parse_store_index_sort_order(sort.as_deref())?,
+            media_filter: parse_store_index_media_filter(media_filter.as_deref())?,
+            ..StoreIndexRequestOptions::default()
+        };
+        let response = sdk.store_index_with_options_blocking(
+            prefix.as_deref(),
+            usize::try_from(depth).unwrap_or(1).max(1),
+            snapshot.as_deref(),
+            options,
+        )?;
+
+        serde_json::to_string(&response).context("failed to serialize paged store index response")
+    })();
+
+    match result {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!("rust storeIndexWithOptions failed to create java string: {err:#}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust storeIndexWithOptions failed: {err:#}"),
+            );
             std::ptr::null_mut()
         }
     }
