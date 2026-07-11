@@ -2,12 +2,16 @@ import { getSetupStatus, isHttpErrorStatus } from "@ironmesh/api";
 import { ColorSchemeControl, NavigationShell, PageHeader } from "@ironmesh/ui";
 import { Alert, Badge, Button, Center, Loader, Stack, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { serverAdminRoutes } from "./routes";
 import { AdminAccessDrawer } from "../components/AdminAccessDrawer";
 import { useAdminAccess } from "../lib/admin-access";
 
 type SurfaceMode = "probing" | "runtime" | "setup";
+
+type RouteLoadingStateProps = {
+  routeLabel: string;
+};
 
 export function ServerAdminShell() {
   const [accessOpened, accessControls] = useDisclosure(false);
@@ -93,7 +97,7 @@ export function ServerAdminShell() {
             <Center py="xl">
               <Stack align="center" gap="sm">
                 <Loader color="teal" />
-                <Text c="dimmed">Loading the server-admin surface…</Text>
+                <Text c="dimmed">Loading the server-admin surface...</Text>
               </Stack>
             </Center>
           </>
@@ -105,11 +109,24 @@ export function ServerAdminShell() {
                 {surfaceError}
               </Alert>
             ) : null}
-            {activeRoute.element}
+            <Suspense fallback={<RouteLoadingState routeLabel={activeRoute.label} />}>
+              {activeRoute.element}
+            </Suspense>
           </>
         )}
       </NavigationShell>
       <AdminAccessDrawer opened={accessOpened} onClose={accessControls.close} />
     </>
+  );
+}
+
+function RouteLoadingState({ routeLabel }: RouteLoadingStateProps) {
+  return (
+    <Center py="xl">
+      <Stack align="center" gap="sm">
+        <Loader color="teal" />
+        <Text c="dimmed">Loading {routeLabel}...</Text>
+      </Stack>
+    </Center>
   );
 }
