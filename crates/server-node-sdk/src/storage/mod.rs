@@ -1257,6 +1257,29 @@ impl ChunkIngestor {
         Ok((hash, stored))
     }
 
+    pub(crate) async fn available_upload_chunk_refs(
+        &self,
+        chunk_refs: &[UploadChunkRef],
+    ) -> Result<Vec<Option<UploadChunkRef>>> {
+        let mut available = Vec::with_capacity(chunk_refs.len());
+        for chunk_ref in chunk_refs {
+            let entry = match validate_local_chunk_integrity(
+                &self.chunks_dir,
+                &chunk_ref.hash,
+                chunk_ref.size_bytes,
+            )
+            .await?
+            {
+                LocalChunkIntegrity::Valid => Some(chunk_ref.clone()),
+                LocalChunkIntegrity::Missing
+                | LocalChunkIntegrity::SizeMismatch { .. }
+                | LocalChunkIntegrity::HashMismatch { .. } => None,
+            };
+            available.push(entry);
+        }
+        Ok(available)
+    }
+
     async fn reconcile_chunk_store_bytes_state(&self) -> Result<StorageStatsState> {
         let state = StorageStatsState {
             chunk_store_bytes: directory_size_bytes(&self.chunks_dir).await?,
