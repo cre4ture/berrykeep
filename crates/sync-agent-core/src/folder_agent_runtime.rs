@@ -2063,6 +2063,19 @@ fn matching_local_entry_for_remote_file_change<B: FolderAgentLocalBackend>(
     Ok(Some(entry_state))
 }
 
+fn remote_index_contains_path_or_descendants(remote_index: &RemoteTreeIndex, path: &str) -> bool {
+    if remote_index.files.contains(path) || remote_index.directories.contains(path) {
+        return true;
+    }
+
+    let prefix = format!("{path}/");
+    remote_index
+        .files
+        .iter()
+        .chain(remote_index.directories.iter())
+        .any(|entry| entry.starts_with(&prefix))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
     backend: &mut B,
@@ -2185,6 +2198,15 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                     }
                     None => {
                         outcome.changed_path_count += 1;
+                        let local_entry = backend.local_entry_state(options, path)?;
+                        if local_entry.is_some()
+                            && !remote_index_contains_path_or_descendants(remote_index, path)
+                        {
+                            tracing::info!(
+                                "remote-sync: skipped stale remote delete for {path}; local path was recreated after the remote path was already known absent"
+                            );
+                            continue;
+                        }
                         outcome.removed_local_path_count += 1;
                         let remote_key = scope
                             .local_to_remote(path)
@@ -3084,6 +3106,65 @@ mod tests {
         );
         assert!(suppressed_uploads.is_empty());
         assert!(remote_index.directories.is_empty());
+        assert!(remote_index.files.is_empty());
+    }
+
+    #[test]
+    fn apply_remote_snapshot_skips_stale_remote_delete_for_locally_recreated_path() {
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert(
+            "empty-lifecycle/marker-only".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 16,
+                modified_unix_ms: 42,
+            },
+        );
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::directory("empty-lifecycle")],
+        };
+        let changed_paths = vec!["empty-lifecycle/marker-only".to_string()];
+        let scope = PathScope::new(None);
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+        remote_index
+            .directories
+            .insert("empty-lifecycle".to_string());
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("stale remote delete should be skipped");
+
+        assert_eq!(outcome.changed_path_count, 1);
+        assert_eq!(outcome.removed_local_path_count, 0);
+        assert!(
+            backend
+                .local_entries
+                .contains_key("empty-lifecycle/marker-only"),
+            "locally recreated file should be preserved"
+        );
+        assert!(backend.operations.is_empty());
+        assert!(suppressed_uploads.is_empty());
+        assert_eq!(
+            remote_index.directories,
+            BTreeSet::from(["empty-lifecycle".to_string()])
+        );
         assert!(remote_index.files.is_empty());
     }
 }
