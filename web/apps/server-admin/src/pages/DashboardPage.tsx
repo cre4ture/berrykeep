@@ -53,12 +53,18 @@ import {
   YAxis,
   type TooltipContentProps
 } from "recharts";
+import {
+  resolveLivePollInterval,
+  useLivePollingMode,
+  useViewportVisibility
+} from "../lib/live-polling";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 
 type StorageHistoryRangeKey = "24h" | "7d" | "30d" | "90d" | "1y" | "all";
 
 const STORAGE_HISTORY_MAX_POINTS = 360;
+const PROCESS_STATS_HISTORY_LIMIT = 120;
 const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
   key: StorageHistoryRangeKey;
   label: string;
@@ -122,6 +128,15 @@ export function DashboardPage() {
     !sessionLoading && (!loginRequired || hasExplicitAdminAccess);
   const canInspectCluster = canRunAdminMaintenance;
   const canInspectRendezvous = canRunAdminMaintenance;
+  const dashboardPollingMode = useLivePollingMode();
+  const {
+    ref: processStatsSectionRef,
+    isVisible: processStatsSectionVisible
+  } = useViewportVisibility<HTMLDivElement>({
+    initialVisible: false,
+    rootMargin: "240px 0px",
+    threshold: 0.1
+  });
 
   const backendHealthQuery = useQuery({
     queryKey: ["dashboard", "health"],
@@ -141,19 +156,51 @@ export function DashboardPage() {
     queryKey: ["dashboard", "process-stats-current", normalizedAdminTokenOverride],
     queryFn: () => getProcessStatsCurrent(normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    refetchInterval: 3_000
+    refetchInterval: (query) => {
+      if (!processStatsSectionVisible && query.state.data?.sample) {
+        return false;
+      }
+
+      return resolveLivePollInterval(dashboardPollingMode, {
+        live: 5_000,
+        passive: 15_000,
+        hidden: 30_000
+      });
+    },
+    refetchOnWindowFocus: processStatsSectionVisible,
+    refetchOnReconnect: processStatsSectionVisible
   });
   const processStatsHistoryQuery = useQuery({
     queryKey: ["dashboard", "process-stats-history", normalizedAdminTokenOverride],
-    queryFn: () => getProcessStatsHistory(undefined, normalizedAdminTokenOverride || undefined),
+    queryFn: () =>
+      getProcessStatsHistory(
+        PROCESS_STATS_HISTORY_LIMIT,
+        normalizedAdminTokenOverride || undefined
+      ),
     enabled: canInspectCluster,
-    refetchInterval: 3_000
+    refetchInterval: (query) => {
+      if (!processStatsSectionVisible && (query.state.data?.length ?? 0) > 0) {
+        return false;
+      }
+
+      return resolveLivePollInterval(dashboardPollingMode, {
+        live: 15_000,
+        passive: 45_000,
+        hidden: false
+      });
+    },
+    refetchOnWindowFocus: processStatsSectionVisible,
+    refetchOnReconnect: processStatsSectionVisible
   });
   const processStatsMemoryQuery = useQuery({
     queryKey: ["dashboard", "process-stats-memory", normalizedAdminTokenOverride],
     queryFn: () => getProcessStatsMemory(normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    refetchInterval: 5_000
+    refetchInterval: resolveLivePollInterval(dashboardPollingMode, {
+      live: 10_000,
+      passive: 30_000,
+      hidden: 60_000
+    })
   });
   const clusterSummaryQuery = useQuery({
     queryKey: ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
@@ -175,7 +222,11 @@ export function DashboardPage() {
     queryKey: ["dashboard", "repair-activity", normalizedAdminTokenOverride],
     queryFn: () => getRepairActivityStatus(normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    refetchInterval: 3_000
+    refetchInterval: resolveLivePollInterval(dashboardPollingMode, {
+      live: 5_000,
+      passive: 15_000,
+      hidden: 30_000
+    })
   });
   const rendezvousConfigQuery = useQuery({
     queryKey: ["dashboard", "rendezvous-config", normalizedAdminTokenOverride],
@@ -186,8 +237,13 @@ export function DashboardPage() {
   const refresh = useCallback(async () => {
     const queryKeys: ReadonlyArray<readonly unknown[]> = [
       ["dashboard", "health"],
-      ["dashboard", "storage-stats-current"],
-      ["dashboard", "storage-stats-history", storageHistoryRange],
+      ["dashboard", "storage-stats-current", normalizedAdminTokenOverride],
+      [
+        "dashboard",
+        "storage-stats-history",
+        storageHistoryRange,
+        normalizedAdminTokenOverride
+      ],
       ...(canInspectCluster
         ? [
             ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
@@ -245,7 +301,9 @@ export function DashboardPage() {
   const processStatsCurrent =
     canInspectCluster ? processStatsCurrentQuery.data ?? null : null;
   const processStatsHistory =
-    canInspectCluster ? processStatsHistoryQuery.data ?? EMPTY_PROCESS_HISTORY : EMPTY_PROCESS_HISTORY;
+    canInspectCluster
+      ? processStatsHistoryQuery.data ?? EMPTY_PROCESS_HISTORY
+      : EMPTY_PROCESS_HISTORY;
   const memoryAttribution: MemoryAttributionSample | null =
     canInspectCluster ? processStatsMemoryQuery.data ?? null : null;
   const mediaCacheClearResult = mediaCacheClearMutation.data ?? null;
@@ -301,6 +359,15 @@ export function DashboardPage() {
     STORAGE_HISTORY_RANGE_OPTIONS.find((option) => option.key === storageHistoryRange) ??
     STORAGE_HISTORY_RANGE_OPTIONS[0];
   const latestProcessSample = processStatsCurrent?.sample ?? null;
+  const processStatsChartSamples = useMemo(
+    () =>
+      processStatsHistory.length > 0
+        ? processStatsHistory
+        : latestProcessSample
+          ? [latestProcessSample]
+          : EMPTY_PROCESS_HISTORY,
+    [latestProcessSample, processStatsHistory]
+  );
   const processChildren = processStatsCurrent?.children ?? EMPTY_PROCESS_CHILDREN;
   const temperatureComponents =
     processStatsCurrent?.temperature_components ?? EMPTY_TEMPERATURE_COMPONENTS;
@@ -654,8 +721,9 @@ export function DashboardPage() {
           </Card>
         </Grid.Col>
         <Grid.Col span={12}>
-          <Card withBorder radius="md" padding="lg">
-            <Stack gap="md">
+          <div ref={processStatsSectionRef}>
+            <Card withBorder radius="md" padding="lg">
+              <Stack gap="md">
               <Group justify="space-between" align="flex-start">
                 <Stack gap={4}>
                   <Text fw={700}>Process resource usage</Text>
@@ -816,7 +884,7 @@ export function DashboardPage() {
                   />
                 </Grid.Col>
               </Grid>
-              <ProcessStatsCharts samples={processStatsHistory} />
+              <ProcessStatsCharts samples={processStatsChartSamples} />
               <Stack gap={6}>
                 <Text size="sm" fw={600}>Running child processes</Text>
                 {processChildren.length === 0 ? (
@@ -879,8 +947,9 @@ export function DashboardPage() {
                   </ScrollArea>
                 )}
               </Stack>
-            </Stack>
-          </Card>
+              </Stack>
+            </Card>
+          </div>
         </Grid.Col>
         <Grid.Col span={12}>
           <Card withBorder radius="md" padding="lg">
