@@ -137,8 +137,6 @@ export function DashboardPage() {
     rootMargin: "240px 0px",
     threshold: 0.1
   });
-  const shouldLoadProcessStats =
-    canInspectCluster && processStatsSectionVisible;
 
   const backendHealthQuery = useQuery({
     queryKey: ["dashboard", "health"],
@@ -157,12 +155,20 @@ export function DashboardPage() {
   const processStatsCurrentQuery = useQuery({
     queryKey: ["dashboard", "process-stats-current", normalizedAdminTokenOverride],
     queryFn: () => getProcessStatsCurrent(normalizedAdminTokenOverride || undefined),
-    enabled: shouldLoadProcessStats,
-    refetchInterval: resolveLivePollInterval(dashboardPollingMode, {
-      live: 5_000,
-      passive: 15_000,
-      hidden: 30_000
-    })
+    enabled: canInspectCluster,
+    refetchInterval: (query) => {
+      if (!processStatsSectionVisible && query.state.data?.sample) {
+        return false;
+      }
+
+      return resolveLivePollInterval(dashboardPollingMode, {
+        live: 5_000,
+        passive: 15_000,
+        hidden: 30_000
+      });
+    },
+    refetchOnWindowFocus: processStatsSectionVisible,
+    refetchOnReconnect: processStatsSectionVisible
   });
   const processStatsHistoryQuery = useQuery({
     queryKey: ["dashboard", "process-stats-history", normalizedAdminTokenOverride],
@@ -171,12 +177,20 @@ export function DashboardPage() {
         PROCESS_STATS_HISTORY_LIMIT,
         normalizedAdminTokenOverride || undefined
       ),
-    enabled: shouldLoadProcessStats,
-    refetchInterval: resolveLivePollInterval(dashboardPollingMode, {
-      live: 15_000,
-      passive: 45_000,
-      hidden: false
-    })
+    enabled: canInspectCluster,
+    refetchInterval: (query) => {
+      if (!processStatsSectionVisible && (query.state.data?.length ?? 0) > 0) {
+        return false;
+      }
+
+      return resolveLivePollInterval(dashboardPollingMode, {
+        live: 15_000,
+        passive: 45_000,
+        hidden: false
+      });
+    },
+    refetchOnWindowFocus: processStatsSectionVisible,
+    refetchOnReconnect: processStatsSectionVisible
   });
   const processStatsMemoryQuery = useQuery({
     queryKey: ["dashboard", "process-stats-memory", normalizedAdminTokenOverride],
@@ -285,9 +299,9 @@ export function DashboardPage() {
   const storageStats = storageStatsQuery.data ?? null;
   const storageHistory = storageHistoryQuery.data ?? EMPTY_STORAGE_HISTORY;
   const processStatsCurrent =
-    shouldLoadProcessStats ? processStatsCurrentQuery.data ?? null : null;
+    canInspectCluster ? processStatsCurrentQuery.data ?? null : null;
   const processStatsHistory =
-    shouldLoadProcessStats
+    canInspectCluster
       ? processStatsHistoryQuery.data ?? EMPTY_PROCESS_HISTORY
       : EMPTY_PROCESS_HISTORY;
   const memoryAttribution: MemoryAttributionSample | null =
@@ -303,9 +317,8 @@ export function DashboardPage() {
         nodesQuery.isFetching ||
         replicationPlanQuery.isFetching ||
         repairActivityQuery.isFetching ||
-        (shouldLoadProcessStats &&
-          (processStatsCurrentQuery.isFetching ||
-            processStatsHistoryQuery.isFetching)) ||
+        processStatsCurrentQuery.isFetching ||
+        processStatsHistoryQuery.isFetching ||
         processStatsMemoryQuery.isFetching)) ||
     (canInspectRendezvous && rendezvousConfigQuery.isFetching);
   const error = firstErrorMessage([
@@ -317,8 +330,8 @@ export function DashboardPage() {
     canInspectCluster ? nodesQuery.error : null,
     canInspectCluster ? replicationPlanQuery.error : null,
     canInspectCluster ? repairActivityQuery.error : null,
-    shouldLoadProcessStats ? processStatsCurrentQuery.error : null,
-    shouldLoadProcessStats ? processStatsHistoryQuery.error : null,
+    canInspectCluster ? processStatsCurrentQuery.error : null,
+    canInspectCluster ? processStatsHistoryQuery.error : null,
     canInspectCluster ? processStatsMemoryQuery.error : null
   ]);
 
@@ -346,6 +359,15 @@ export function DashboardPage() {
     STORAGE_HISTORY_RANGE_OPTIONS.find((option) => option.key === storageHistoryRange) ??
     STORAGE_HISTORY_RANGE_OPTIONS[0];
   const latestProcessSample = processStatsCurrent?.sample ?? null;
+  const processStatsChartSamples = useMemo(
+    () =>
+      processStatsHistory.length > 0
+        ? processStatsHistory
+        : latestProcessSample
+          ? [latestProcessSample]
+          : EMPTY_PROCESS_HISTORY,
+    [latestProcessSample, processStatsHistory]
+  );
   const processChildren = processStatsCurrent?.children ?? EMPTY_PROCESS_CHILDREN;
   const temperatureComponents =
     processStatsCurrent?.temperature_components ?? EMPTY_TEMPERATURE_COMPONENTS;
@@ -862,7 +884,7 @@ export function DashboardPage() {
                   />
                 </Grid.Col>
               </Grid>
-              <ProcessStatsCharts samples={processStatsHistory} />
+              <ProcessStatsCharts samples={processStatsChartSamples} />
               <Stack gap={6}>
                 <Text size="sm" fw={600}>Running child processes</Text>
                 {processChildren.length === 0 ? (
