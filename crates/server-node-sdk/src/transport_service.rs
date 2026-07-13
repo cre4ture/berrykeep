@@ -71,7 +71,6 @@ pub(super) fn is_streamed_object_read_path(path_and_query: &str) -> bool {
     !tail.is_empty()
         && tail != "index"
         && !tail.starts_with("index/")
-        && tail != "uploads"
         && !tail.starts_with("uploads/")
 }
 
@@ -709,7 +708,7 @@ mod tests {
         assert!(!is_streamed_object_read_path(
             "/store/index/changes/wait?since=1"
         ));
-        assert!(!is_streamed_object_read_path("/store/uploads"));
+        assert!(is_streamed_object_read_path("/store/uploads"));
         assert!(!is_streamed_object_read_path("/store/uploads/session-1"));
         assert!(!is_streamed_object_read_path("/cluster/status"));
     }
