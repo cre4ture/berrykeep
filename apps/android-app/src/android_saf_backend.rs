@@ -927,10 +927,8 @@ mod tests {
         state.insert("albums/live/set.txt".to_string(), file_entry(3));
         state.insert("docs/readme.txt".to_string(), file_entry(4));
 
-        let mut backend = AndroidSafBackend {
-            cached_tree_state: Some(state),
-            ..AndroidSafBackend::default()
-        };
+        let mut backend = AndroidSafBackend::default();
+        backend.cached_tree_state = Some(state);
 
         backend.forget_cached_path("albums");
 
@@ -945,10 +943,8 @@ mod tests {
 
     #[test]
     fn remember_cached_entry_state_updates_existing_snapshot_cache() {
-        let mut backend = AndroidSafBackend {
-            cached_tree_state: Some(LocalTreeState::new()),
-            ..AndroidSafBackend::default()
-        };
+        let mut backend = AndroidSafBackend::default();
+        backend.cached_tree_state = Some(LocalTreeState::new());
         let entry = file_entry(9);
 
         backend.remember_cached_entry_state("notes/todo.txt", &entry);
