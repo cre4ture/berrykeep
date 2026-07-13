@@ -11451,7 +11451,7 @@ async fn put_object_response(
             );
             drop(cluster);
 
-            if let Err(err) = persist_cluster_replicas_state(&state).await {
+            if let Err(err) = persist_cluster_replicas_state(state).await {
                 warn!(error = %err, "failed to persist cluster replicas after put");
             }
 
@@ -11460,7 +11460,7 @@ async fn put_object_response(
                 query.internal_replication,
             ) {
                 enqueue_autonomous_post_write_replication(
-                    &state,
+                    state,
                     autonomous_post_write_replication_subjects(&key, outcome.version_id.as_str()),
                 )
                 .await;
@@ -11587,12 +11587,12 @@ async fn start_upload_session_response(
     };
     let now = unix_ts();
 
-    let mut sessions = write_upload_sessions(&state, "upload_sessions.start").await;
+    let mut sessions = write_upload_sessions(state, "upload_sessions.start").await;
     prune_expired_upload_sessions(&mut sessions, now);
 
     let session = UploadSessionRecord {
         upload_id: Uuid::now_v7().to_string(),
-        owner_device_id: request_device_id(&headers),
+        owner_device_id: request_device_id(headers),
         key: key.to_string(),
         total_size_bytes: request.total_size_bytes,
         chunk_size_bytes,
@@ -11621,7 +11621,7 @@ async fn start_upload_session_response(
     );
     sessions.sessions.insert(session.upload_id.clone(), session);
     drop(sessions);
-    persist_upload_session_store_after_mutation(&state, "start_upload_session").await;
+    persist_upload_session_store_after_mutation(state, "start_upload_session").await;
 
     (StatusCode::CREATED, Json(response)).into_response()
 }
@@ -11676,7 +11676,7 @@ async fn delete_upload_session_response(
     headers: &HeaderMap,
     upload_id: &str,
 ) -> Response {
-    let requester_device_id = request_device_id(&headers);
+    let requester_device_id = request_device_id(headers);
     let now = unix_ts();
     let mut sessions = write_upload_sessions(state, "upload_sessions.delete").await;
     prune_expired_upload_sessions(&mut sessions, now);
@@ -18656,7 +18656,7 @@ async fn renew_device_rendezvous_identity_response(
             .and_then(parse_credential_pem_expires_at)
     };
 
-    match issue_client_rendezvous_identity_pem(&state, device_id, expires_at_unix) {
+    match issue_client_rendezvous_identity_pem(state, device_id, expires_at_unix) {
         Ok(Some(pem)) => (
             StatusCode::OK,
             Json(json!({ "rendezvous_client_identity_pem": pem })),

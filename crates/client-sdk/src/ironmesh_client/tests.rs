@@ -2475,7 +2475,8 @@ async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fa
     let (direct_state, direct_server) =
         spawn_direct_transport_server_that_stalls_object_write().await;
     let (relay_state, relay_server) =
-        spawn_relay_test_server(StatusCode::OK.as_u16(), Vec::new(), Vec::new()).await;
+        spawn_relay_test_server_with_delay(StatusCode::OK.as_u16(), Vec::new(), Vec::new(), 500)
+            .await;
 
     let test_result = async {
         let mut identity = ClientIdentityMaterial::generate(
@@ -2499,10 +2500,13 @@ async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fa
             .expect("initial direct request should succeed");
         assert_eq!(first["route"], "direct");
 
-        client
-            .post_relative_path("/cluster/status")
-            .await
-            .expect("mutating request should fall back to relay");
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            client.post_relative_path("/cluster/status"),
+        )
+        .await
+        .expect("mutating request should fall back within 4 seconds")
+        .expect("mutating request should fall back to relay");
 
         let direct_request = direct_state
             .captured_stalled_request
