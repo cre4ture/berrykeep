@@ -2508,18 +2508,26 @@ async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fa
         .expect("mutating request should fall back within 4 seconds")
         .expect("mutating request should fall back to relay");
 
-        let direct_request = direct_state
-            .captured_stalled_request
-            .lock()
-            .await
-            .clone()
-            .expect("direct stalled request should be captured");
-        let relay_request = relay_state
-            .captured_request
-            .lock()
-            .await
-            .clone()
-            .expect("relay fallback request should be captured");
+        let direct_request = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(request) = direct_state.captured_stalled_request.lock().await.clone() {
+                    break request;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("direct stalled request should be captured");
+        let relay_request = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(request) = relay_state.captured_request.lock().await.clone() {
+                    break request;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("relay fallback request should be captured");
 
         let direct_operation_id =
             relay_header_value(&direct_request.headers, transport_sdk::HEADER_OPERATION_ID)
