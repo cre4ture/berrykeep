@@ -48,7 +48,7 @@ pub use relay_tunnel::{
     RelayTunnelSession, relay_tunnel_ws_url,
 };
 pub use rendezvous::{
-    PresenceEntry, PresenceListResponse, PresenceRegistration,
+    DiscoveryResponse, PresenceEntry, PresenceListResponse, PresenceRegistration,
     RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse, RendezvousClientConfig,
     RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
     RendezvousRuntimeState, TransportCapability, is_expected_idle_relay_tunnel_accept_timeout,

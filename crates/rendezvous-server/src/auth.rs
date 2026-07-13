@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use axum::extract::{FromRequestParts, connect_info::ConnectInfo};
-use common::NodeId;
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -82,20 +81,18 @@ where
     }
 }
 
-pub(crate) fn require_authenticated_node(
+pub(crate) fn require_any_authenticated_peer(
     mtls_enabled: bool,
     authenticated_peer: &MaybeAuthenticatedPeer,
-) -> Result<Option<NodeId>> {
+) -> Result<()> {
     if !mtls_enabled {
-        return Ok(None);
+        return Ok(());
     }
 
-    match authenticated_peer.identity() {
-        Some(PeerIdentity::Node(node_id)) => Ok(Some(*node_id)),
-        Some(PeerIdentity::Device(device_id)) => bail!(
-            "rendezvous mTLS requires an authenticated node certificate, got device:{device_id}"
-        ),
-        None => bail!("rendezvous mTLS requires an authenticated peer certificate"),
+    if authenticated_peer.identity().is_some() {
+        Ok(())
+    } else {
+        bail!("rendezvous mTLS requires an authenticated peer certificate")
     }
 }
 
@@ -350,4 +347,28 @@ fn parse_peer_identity_from_san_uri(uri: &str) -> Option<PeerIdentity> {
     uri.strip_prefix("urn:ironmesh:device:")
         .and_then(|rest| rest.parse().ok())
         .map(PeerIdentity::Device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::DeviceId;
+
+    #[test]
+    fn require_any_authenticated_peer_accepts_device_certificate() {
+        let peer = MaybeAuthenticatedPeer(Some(AuthenticatedPeer {
+            identity: PeerIdentity::Device(DeviceId::now_v7()),
+        }));
+
+        require_any_authenticated_peer(true, &peer)
+            .expect("device certificates should satisfy read-only rendezvous auth");
+    }
+
+    #[test]
+    fn require_any_authenticated_peer_rejects_missing_certificate_when_mtls_enabled() {
+        let error = require_any_authenticated_peer(true, &MaybeAuthenticatedPeer::default())
+            .expect_err("missing certificates should be rejected");
+
+        assert!(error.to_string().contains("authenticated peer certificate"));
+    }
 }
