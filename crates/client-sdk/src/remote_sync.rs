@@ -361,7 +361,15 @@ impl RemoteSnapshotPoller {
                             ) {
                                 Ok(response) => {
                                     observed_sequence = response.sequence;
-                                    should_fetch |= response.changed;
+                                    if response.sequence < last_sequence {
+                                        tracing::warn!(
+                                            "remote-refresh: server change sequence regressed from {last_sequence} to {}; reloading snapshot to rebaseline notification state",
+                                            response.sequence
+                                        );
+                                        should_fetch = true;
+                                    } else {
+                                        should_fetch |= response.changed;
+                                    }
                                 }
                                 Err(error) => {
                                     if should_fallback_to_polling_after_wait_error(&error) {
@@ -371,12 +379,12 @@ impl RemoteSnapshotPoller {
                                         notifications_available = false;
                                     } else {
                                         tracing::warn!(
-                                            "remote-refresh: server change wait failed, retrying notifications: {error:#}"
+                                            "remote-refresh: server change wait failed, polling snapshot before retrying notifications: {error:#}"
                                         );
                                         if !scheduler.wait_for_next_tick_blocking(&running) {
                                             break;
                                         }
-                                        continue;
+                                        should_fetch = true;
                                     }
                                 }
                             }
@@ -997,7 +1005,143 @@ mod tests {
             .expect("notification loop should stop cleanly");
 
         assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(wait_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(update.changed_paths, vec!["docs/readme.md".to_string()]);
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+    }
+
+    #[test]
+    fn server_notification_loop_polls_snapshot_after_retryable_wait_errors() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let wait_attempts = Arc::new(AtomicUsize::new(0));
+        let wait_attempts_for_route = Arc::clone(&wait_attempts);
+        let router = Router::new().route(
+            "/api/v1/store/index/changes/wait",
+            get(move || {
+                let wait_attempts = Arc::clone(&wait_attempts_for_route);
+                async move {
+                    wait_attempts.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }),
+        );
+        let (addr, shutdown_tx, server) = spawn_test_server(router);
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let fetch_count_for_loop = Arc::clone(&fetch_count);
+        let (tx, rx) = mpsc::channel();
+        let running_for_callback = Arc::clone(&running);
+
+        let handle = poller.spawn_fetcher_loop_with_fetch(
+            Arc::clone(&running),
+            Some(SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+            }),
+            fetcher,
+            move |_fetcher| {
+                fetch_count_for_loop.fetch_add(1, Ordering::SeqCst);
+                Ok(SyncSnapshot {
+                    local: Vec::new(),
+                    remote: vec![NamespaceEntry::file("docs/readme.md", "v2", "h2")],
+                })
+            },
+            move |update| {
+                running_for_callback.store(false, Ordering::SeqCst);
+                tx.send(update).expect("update should send");
+            },
+        );
+
+        let update = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retryable wait failures should still trigger a snapshot poll");
+        handle
+            .join()
+            .expect("notification loop should stop cleanly");
+
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert!(wait_attempts.load(Ordering::SeqCst) >= 1);
+        assert_eq!(update.changed_paths, vec!["docs/readme.md".to_string()]);
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+    }
+
+    #[test]
+    fn server_notification_loop_rebases_after_sequence_regression() {
+        let wait_attempts = Arc::new(AtomicUsize::new(0));
+        let wait_attempts_for_route = Arc::clone(&wait_attempts);
+        let router = Router::new().route(
+            "/api/v1/store/index/changes/wait",
+            get(move || {
+                let wait_attempts = Arc::clone(&wait_attempts_for_route);
+                async move {
+                    let attempt = wait_attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Json(serde_json::json!({ "sequence": 5, "changed": true }))
+                    } else {
+                        Json(serde_json::json!({ "sequence": 0, "changed": false }))
+                    }
+                }
+            }),
+        );
+        let (addr, shutdown_tx, server) = spawn_test_server(router);
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let fetch_attempts = Arc::new(AtomicUsize::new(0));
+        let fetch_attempts_for_loop = Arc::clone(&fetch_attempts);
+        let (tx, rx) = mpsc::channel();
+        let running_for_callback = Arc::clone(&running);
+
+        let handle = poller.spawn_fetcher_loop_with_fetch(
+            Arc::clone(&running),
+            Some(SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+            }),
+            fetcher,
+            move |_fetcher| {
+                let attempt = fetch_attempts_for_loop.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Ok(SyncSnapshot {
+                        local: Vec::new(),
+                        remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+                    })
+                } else {
+                    Ok(SyncSnapshot {
+                        local: Vec::new(),
+                        remote: vec![NamespaceEntry::file("docs/readme.md", "v2", "h2")],
+                    })
+                }
+            },
+            move |update| {
+                running_for_callback.store(false, Ordering::SeqCst);
+                tx.send(update).expect("update should send");
+            },
+        );
+
+        let update = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sequence regression should trigger a rebaseline snapshot fetch");
+        handle
+            .join()
+            .expect("notification loop should stop cleanly");
+
         assert_eq!(wait_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(fetch_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(update.changed_paths, vec!["docs/readme.md".to_string()]);
 
         let _ = shutdown_tx.send(());
