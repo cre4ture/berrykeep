@@ -278,6 +278,10 @@ impl RendezvousControlClient {
         self.get_json("/control/presence").await
     }
 
+    pub async fn fetch_mesh(&self) -> Result<RendezvousRuntimeState> {
+        self.get_json("/control/mesh").await
+    }
+
     pub async fn issue_relay_ticket(&self, request: &RelayTicketRequest) -> Result<RelayTicket> {
         request.validate()?;
         if request.cluster_id != self.config.cluster_id {

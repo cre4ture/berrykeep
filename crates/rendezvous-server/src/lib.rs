@@ -3,6 +3,7 @@ mod auth;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
@@ -17,7 +18,8 @@ use serde::Serialize;
 use tracing::warn;
 use transport_sdk::peer::PeerIdentity;
 use transport_sdk::rendezvous::{
-    PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
+    PresenceListResponse, PresenceRegistration, RegisterPresenceResponse, RendezvousClientConfig,
+    RendezvousControlClient, RendezvousRuntimeState,
 };
 use transport_sdk::{
     BufferedTransportRequest, CandidateKind, ClientBootstrapClaimRedeemRequest,
@@ -66,6 +68,7 @@ pub struct RendezvousServerConfig {
     pub bind_addr: SocketAddr,
     pub public_url: String,
     pub relay_public_urls: Vec<String>,
+    pub peer_rendezvous_urls: Vec<String>,
     pub mtls: Option<RendezvousMtlsConfig>,
 }
 
@@ -74,15 +77,17 @@ pub struct RendezvousAppState {
     pub config: RendezvousServerConfig,
     pub presence: PresenceRegistry,
     pub relay_tunnel: RelayTunnelBroker,
+    pub mesh_peers: Option<RendezvousControlClient>,
 }
 
 impl RendezvousAppState {
-    pub fn new(config: RendezvousServerConfig) -> Self {
-        Self {
+    pub fn new(config: RendezvousServerConfig) -> Result<Self> {
+        Ok(Self {
+            mesh_peers: build_mesh_probe_client(&config)?,
             config,
             presence: PresenceRegistry::new(),
             relay_tunnel: RelayTunnelBroker::new(),
-        }
+        })
     }
 }
 
@@ -99,6 +104,7 @@ pub fn build_router(state: RendezvousAppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/control/mesh", get(mesh_status))
         .route("/control/presence", get(list_presence))
         .route("/control/presence/register", post(register_presence))
         .route("/control/relay/ticket", post(issue_relay_ticket))
@@ -110,6 +116,7 @@ pub fn build_router(state: RendezvousAppState) -> Router {
 pub async fn serve(state: RendezvousAppState) -> Result<()> {
     let bind_addr = state.config.bind_addr;
     let app = build_router(state.clone());
+    spawn_mesh_probe_task(state.mesh_peers.clone());
 
     if let Some(mtls) = state.config.mtls.as_ref() {
         let tls_config = build_mtls_rustls_config(mtls)?;
@@ -136,6 +143,21 @@ async fn health(State(state): State<RendezvousAppState>) -> Json<HealthResponse>
         registered_endpoints: state.presence.len(),
         software_version: PACKAGE_VERSION,
     })
+}
+
+async fn mesh_status(
+    State(state): State<RendezvousAppState>,
+    authenticated_peer: MaybeAuthenticatedPeer,
+) -> std::result::Result<Json<RendezvousRuntimeState>, (StatusCode, String)> {
+    require_authenticated_node(state.config.mtls.is_some(), &authenticated_peer)
+        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    Ok(Json(
+        state
+            .mesh_peers
+            .as_ref()
+            .map(RendezvousControlClient::runtime_state)
+            .unwrap_or_else(empty_rendezvous_runtime_state),
+    ))
 }
 
 async fn register_presence(
@@ -244,6 +266,72 @@ fn has_candidate_endpoint(candidates: &[ConnectionCandidate], endpoint: &str) ->
     candidates
         .iter()
         .any(|candidate| candidate.endpoint.trim_end_matches('/') == endpoint)
+}
+
+fn build_mesh_probe_client(
+    config: &RendezvousServerConfig,
+) -> Result<Option<RendezvousControlClient>> {
+    if config.peer_rendezvous_urls.is_empty() {
+        return Ok(None);
+    }
+
+    // Mesh health probes are cluster-agnostic, but the shared rendezvous client
+    // still validates that a non-nil cluster_id is present.
+    let cluster_id = ClusterId::now_v7();
+    let server_ca_pem = rendezvous_mesh_server_ca_pem(config.mtls.as_ref())?;
+    Ok(Some(RendezvousControlClient::new(
+        RendezvousClientConfig {
+            cluster_id,
+            rendezvous_urls: config.peer_rendezvous_urls.clone(),
+            heartbeat_interval_secs: 15,
+        },
+        server_ca_pem.as_deref(),
+        None,
+    )?))
+}
+
+fn rendezvous_mesh_server_ca_pem(mtls: Option<&RendezvousMtlsConfig>) -> Result<Option<String>> {
+    let Some(mtls) = mtls else {
+        return Ok(None);
+    };
+
+    match &mtls.client_ca {
+        RendezvousClientCa::File { cert_path } => Ok(Some(
+            std::fs::read_to_string(cert_path)
+                .with_context(|| format!("failed reading {}", cert_path.display()))?,
+        )),
+        RendezvousClientCa::InlinePem { cert_pem } => Ok(Some(cert_pem.clone())),
+    }
+}
+
+fn spawn_mesh_probe_task(mesh_peers: Option<RendezvousControlClient>) {
+    let Some(mesh_peers) = mesh_peers else {
+        return;
+    };
+
+    tokio::spawn(async move {
+        let interval_secs = mesh_peers.config().heartbeat_interval_secs.max(1);
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        ticker.tick().await;
+
+        loop {
+            if let Err(err) = mesh_peers.probe_health_endpoints().await {
+                warn!(
+                    error = %err,
+                    rendezvous_urls = ?mesh_peers.config().rendezvous_urls,
+                    "failed to probe rendezvous mesh peers"
+                );
+            }
+            ticker.tick().await;
+        }
+    });
+}
+
+fn empty_rendezvous_runtime_state() -> RendezvousRuntimeState {
+    RendezvousRuntimeState {
+        active_url: None,
+        endpoint_statuses: Vec::new(),
+    }
 }
 
 async fn issue_relay_ticket(
@@ -864,8 +952,10 @@ mod tests {
             bind_addr,
             public_url: "http://rendezvous.example".to_string(),
             relay_public_urls: Vec::new(),
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
-        });
+        })
+        .expect("rendezvous app state should build");
         let router = build_router(state);
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
@@ -930,5 +1020,56 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn mesh_status_reports_connected_peer_after_probe() {
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let peer_addr = peer_listener.local_addr().expect("peer listener addr");
+        let peer_server = tokio::spawn(async move {
+            axum::serve(
+                peer_listener,
+                Router::new().route("/health", get(|| async { StatusCode::OK })),
+            )
+            .await
+            .expect("peer rendezvous should run");
+        });
+
+        let state = RendezvousAppState::new(RendezvousServerConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            public_url: "http://rendezvous.example".to_string(),
+            relay_public_urls: Vec::new(),
+            peer_rendezvous_urls: vec![format!("http://{peer_addr}")],
+            mtls: None,
+        })
+        .expect("rendezvous app state should build");
+        let mesh_peers = state
+            .mesh_peers
+            .as_ref()
+            .expect("mesh peer client should exist");
+        mesh_peers
+            .probe_health_endpoints()
+            .await
+            .expect("mesh probe should succeed");
+
+        let response = mesh_status(State(state), MaybeAuthenticatedPeer::default())
+            .await
+            .expect("mesh status should succeed without mTLS")
+            .0;
+        assert_eq!(response.active_url, None);
+        assert_eq!(response.endpoint_statuses.len(), 1);
+        assert_eq!(
+            response.endpoint_statuses[0].url,
+            format!("http://{peer_addr}")
+        );
+        assert_eq!(
+            response.endpoint_statuses[0].status,
+            transport_sdk::RendezvousEndpointConnectionState::Connected
+        );
+
+        peer_server.abort();
+        let _ = peer_server.await;
     }
 }
