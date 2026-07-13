@@ -679,7 +679,7 @@ async fn list_objects_v2_response(
         .min(S3_MAX_LIST_KEYS);
 
     let inspector = {
-        let store = read_store(&state, "s3.list.clone_inspector").await;
+        let store = read_store(state, "s3.list.clone_inspector").await;
         match store.store_index_inspector().await {
             Ok(inspector) => inspector,
             Err(err) => {
@@ -704,7 +704,7 @@ async fn list_objects_v2_response(
                 && access_key_allows_storage_path(&request.access_key, key)
         })
         .filter_map(|(key, _)| {
-            full_key_to_object_key(&bucket, key).map(|object_key| (object_key, key.clone()))
+            full_key_to_object_key(bucket, key).map(|object_key| (object_key, key.clone()))
         })
         .collect::<HashMap<_, _>>();
     let mut relative_keys = relative_keys_by_object_key
@@ -1855,6 +1855,7 @@ async fn create_multipart_upload_response(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_multipart_part_response(
     state: &ServerState,
     uri: &Uri,
@@ -2036,8 +2037,7 @@ async fn list_multipart_parts_response(
     let max_parts = query
         .max_parts
         .unwrap_or(S3_LIST_DEFAULT_MAX_PARTS)
-        .max(1)
-        .min(S3_LIST_DEFAULT_MAX_PARTS);
+        .clamp(1, S3_LIST_DEFAULT_MAX_PARTS);
     let part_number_marker = query.part_number_marker.unwrap_or(0);
     let all_parts = session
         .multipart_parts
@@ -2942,6 +2942,7 @@ async fn delete_objects_response(
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_or_head_object_response(
     state: &ServerState,
     method: &Method,
@@ -4069,7 +4070,7 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
         }
     }
 
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err("hex-encoded values must have an even number of digits".to_string());
     }
 
@@ -4195,10 +4196,10 @@ fn object_metadata_from_headers(headers: &HeaderMap) -> ObjectVersionMetadataRec
     let mut user_metadata = BTreeMap::new();
     for (name, value) in headers {
         let name = name.as_str();
-        if let Some(metadata_key) = name.strip_prefix("x-amz-meta-") {
-            if let Ok(value) = value.to_str() {
-                user_metadata.insert(metadata_key.to_string(), value.to_string());
-            }
+        if let Some(metadata_key) = name.strip_prefix("x-amz-meta-")
+            && let Ok(value) = value.to_str()
+        {
+            user_metadata.insert(metadata_key.to_string(), value.to_string());
         }
     }
 
@@ -4352,6 +4353,7 @@ fn linearize_s3_version_records(
     ordered
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_list_objects_v2_result(
     bucket: &S3BucketRecord,
     prefix: &str,
@@ -4482,6 +4484,7 @@ fn render_delete_objects_result(
     xml
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_list_object_versions_result(
     bucket: &S3BucketRecord,
     prefix: &str,
@@ -4582,6 +4585,7 @@ fn render_create_multipart_upload_result(
     xml
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_list_parts_result(
     bucket_name: &str,
     object_key: &str,

@@ -38,6 +38,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use bytes::Bytes;
+use futures_util::io::AsyncReadExt as FuturesAsyncReadExt;
 use futures_util::{Sink, Stream};
 use hmac::{Hmac, Mac};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -718,6 +719,7 @@ async fn capture_mtls_presence_register(
         entry: transport_sdk::PresenceEntry {
             registration,
             updated_at_unix,
+            observed_source_addr: None,
         },
     })
 }
@@ -803,6 +805,7 @@ async fn https_presence_register(
         entry: transport_sdk::PresenceEntry {
             registration,
             updated_at_unix,
+            observed_source_addr: None,
         },
     })
 }
@@ -1278,7 +1281,7 @@ fn s3_signed_request(
         "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
         s3_test_sha256_hex(canonical_request.as_bytes())
     );
-    let signing_key = s3_test_derive_signing_key(secret_material, &date_scope, region, service);
+    let signing_key = s3_test_derive_signing_key(secret_material, date_scope, region, service);
     let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
         &signing_key,
         string_to_sign.as_bytes(),
@@ -1331,6 +1334,7 @@ fn s3_presigned_request(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn s3_presigned_request_at(
     method: Method,
     uri: &str,
@@ -6205,8 +6209,10 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
             bind_addr: rendezvous_bind_addr,
             public_url: canonical_rendezvous_url.clone(),
             relay_public_urls: vec![canonical_rendezvous_url.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
-        });
+        })
+        .expect("rendezvous app state should build");
     let rendezvous_listener = tokio::net::TcpListener::bind(rendezvous_bind_addr)
         .await
         .expect("rendezvous listener should bind");
@@ -6245,7 +6251,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
         true,
         local_descriptor.as_ref(),
     );
-    rendezvous_state.presence.register(registration);
+    rendezvous_state.presence.register(registration, None);
 
     let endpoint = super::current_rendezvous_endpoint_clients(&state)
         .await
@@ -6359,8 +6365,10 @@ async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_mul
             bind_addr: bind_addr_a,
             public_url: canonical_rendezvous_url_a.clone(),
             relay_public_urls: vec![canonical_rendezvous_url_a.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
-        });
+        })
+        .expect("rendezvous app state A should build");
     let listener_a = tokio::net::TcpListener::bind(bind_addr_a)
         .await
         .expect("rendezvous listener A should bind");
@@ -6382,8 +6390,10 @@ async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_mul
             bind_addr: bind_addr_b,
             public_url: canonical_rendezvous_url_b.clone(),
             relay_public_urls: vec![canonical_rendezvous_url_b.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
-        });
+        })
+        .expect("rendezvous app state B should build");
     let listener_b = tokio::net::TcpListener::bind(bind_addr_b)
         .await
         .expect("rendezvous listener B should bind");
@@ -14028,6 +14038,7 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
             connected_at_unix: 123,
         },
         updated_at_unix: 456,
+        observed_source_addr: None,
     };
 
     let descriptor = node_descriptor_from_presence_entry(&entry)
@@ -14203,6 +14214,7 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
             connected_at_unix: 123,
         },
         updated_at_unix: 456,
+        observed_source_addr: None,
     };
 
     let descriptor = node_descriptor_from_presence_entry(&entry)
@@ -14237,6 +14249,7 @@ async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
             connected_at_unix: 123,
         },
         updated_at_unix: 456,
+        observed_source_addr: None,
     };
 
     let discovered = super::apply_rendezvous_presence_entries(&state, &[entry]).await;
@@ -14970,6 +14983,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
             relay_base_url.clone(),
             expected_target,
             None,
+            RelayStubResponse::ok(Vec::new()),
         )
         .await;
 
@@ -15052,7 +15066,10 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     assert_eq!(observed_paths.len(), 1);
     assert_eq!(
         observed_paths[0],
-        super::build_replication_drop_path(key, &version_id)
+        ObservedRelayRequest {
+            kind: transport_sdk::TransportStreamKind::Rpc,
+            path: super::build_replication_drop_path(key, &version_id),
+        }
     );
     assert_eq!(issued_ticket_count.load(Ordering::SeqCst), 1);
     assert_eq!(paired_session_count.load(Ordering::SeqCst), 1);
@@ -15112,6 +15129,7 @@ async fn execute_peer_request_reuses_warm_relay_session() {
             relay_base_url.clone(),
             transport_sdk::PeerIdentity::Node(remote_node.node_id),
             None,
+            RelayStubResponse::ok(Vec::new()),
         )
         .await;
 
@@ -15141,8 +15159,13 @@ async fn execute_peer_request_reuses_warm_relay_session() {
     }
 
     assert_eq!(
-        observed_paths.lock().await.as_slice(),
-        ["/cluster/status", "/cluster/status"]
+        observed_paths
+            .lock()
+            .await
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/cluster/status", "/cluster/status"]
     );
     assert_eq!(issued_ticket_count.load(Ordering::SeqCst), 1);
     assert_eq!(paired_session_count.load(Ordering::SeqCst), 1);
@@ -15193,6 +15216,7 @@ async fn execute_peer_request_reconnects_after_relay_session_closes() {
             relay_base_url.clone(),
             transport_sdk::PeerIdentity::Node(remote_node.node_id),
             Some(1),
+            RelayStubResponse::ok(Vec::new()),
         )
         .await;
 
@@ -15226,8 +15250,13 @@ async fn execute_peer_request_reconnects_after_relay_session_closes() {
     }
 
     assert_eq!(
-        observed_paths.lock().await.as_slice(),
-        ["/cluster/status", "/cluster/status"]
+        observed_paths
+            .lock()
+            .await
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/cluster/status", "/cluster/status"]
     );
     assert_eq!(issued_ticket_count.load(Ordering::SeqCst), 2);
     assert_eq!(paired_session_count.load(Ordering::SeqCst), 2);
@@ -15336,18 +15365,42 @@ async fn relay_health_check_via_rendezvous(
     Ok(status)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedRelayRequest {
+    kind: transport_sdk::TransportStreamKind,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayStubResponse {
+    status: StatusCode,
+    headers: Vec<transport_sdk::TransportHeader>,
+    body: Vec<u8>,
+}
+
+impl RelayStubResponse {
+    fn ok(body: Vec<u8>) -> Self {
+        Self {
+            status: StatusCode::OK,
+            headers: Vec::new(),
+            body,
+        }
+    }
+}
+
 async fn spawn_cleanup_relay_stub(
     relay_bind_addr: SocketAddr,
     relay_base_url: String,
     expected_target: transport_sdk::PeerIdentity,
     max_requests_per_session: Option<usize>,
+    response: RelayStubResponse,
 ) -> (
-    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<ObservedRelayRequest>>>,
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
-    let observed_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed_paths = Arc::new(Mutex::new(Vec::<ObservedRelayRequest>::new()));
     let issued_ticket_count = Arc::new(AtomicUsize::new(0));
     let paired_session_count = Arc::new(AtomicUsize::new(0));
 
@@ -15389,6 +15442,7 @@ async fn spawn_cleanup_relay_stub(
                     let relay_paths = observed_paths_for_ws.clone();
                     let expected_target = expected_target.clone();
                     let paired_session_count = paired_session_count_for_ws.clone();
+                    let response = response.clone();
                     async move {
                         websocket.on_upgrade(move |socket| async move {
                             serve_cleanup_relay_tunnel_socket(
@@ -15396,6 +15450,7 @@ async fn spawn_cleanup_relay_stub(
                                 expected_target,
                                 paired_session_count,
                                 max_requests_per_session,
+                                response,
                                 socket,
                             )
                             .await;
@@ -15422,10 +15477,11 @@ async fn spawn_cleanup_relay_stub(
 }
 
 async fn serve_cleanup_relay_tunnel_socket(
-    relay_paths: Arc<Mutex<Vec<String>>>,
+    relay_paths: Arc<Mutex<Vec<ObservedRelayRequest>>>,
     expected_target: transport_sdk::PeerIdentity,
     paired_session_count: Arc<AtomicUsize>,
     max_requests_per_session: Option<usize>,
+    response: RelayStubResponse,
     mut socket: axum::extract::ws::WebSocket,
 ) {
     let initial = match socket.recv().await {
@@ -15584,17 +15640,27 @@ async fn serve_cleanup_relay_tunnel_socket(
         .await
         .expect("relay cleanup stream accept should succeed")
     {
-        let request = transport_sdk::read_buffered_transport_request(&mut stream)
+        let request = transport_sdk::read_transport_request_head(&mut stream)
             .await
             .expect("relay cleanup request should decode");
-        relay_paths.lock().await.push(request.path.clone());
+        if !request.end_of_stream {
+            let mut ignored = Vec::new();
+            stream
+                .read_to_end(&mut ignored)
+                .await
+                .expect("relay cleanup request body should drain");
+        }
+        relay_paths.lock().await.push(ObservedRelayRequest {
+            kind: request.kind,
+            path: request.path.clone(),
+        });
         transport_sdk::write_buffered_transport_response(
             &mut stream,
             &transport_sdk::BufferedTransportResponse {
                 request_id: request.request_id,
-                status: StatusCode::OK.as_u16(),
-                headers: Vec::new(),
-                body: Vec::new(),
+                status: response.status.as_u16(),
+                headers: response.headers.clone(),
+                body: response.body.clone(),
             },
         )
         .await
@@ -15607,6 +15673,107 @@ async fn serve_cleanup_relay_tunnel_socket(
     }
 
     let _ = session.close().await;
+}
+
+#[tokio::test]
+async fn execute_peer_request_streams_object_reads_over_relay() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.relay_mode = super::RelayMode::Required;
+
+    let remote_node = {
+        let mut cluster = state.cluster.lock().await;
+        let node = cluster::NodeDescriptor {
+            node_id: NodeId::new_v4(),
+            reachability: cluster::NodeReachability {
+                public_api_url: Some("https://relay-object-read-remote.example".to_string()),
+                peer_api_url: Some("https://relay-object-read-remote-internal.example".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 800_000,
+            storage_stats: None,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        };
+        cluster.register_node(node.clone());
+        node
+    };
+
+    let relay_bind_addr = free_bind_addr();
+    let relay_base_url = format!("http://{relay_bind_addr}");
+    *state.network.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
+    configure_test_relay_outbound_clients(&state, &relay_base_url).await;
+
+    let object_body = vec![b'O'; 1024 * 1024];
+    let (observed_requests, issued_ticket_count, paired_session_count, relay_handle) =
+        spawn_cleanup_relay_stub(
+            relay_bind_addr,
+            relay_base_url.clone(),
+            transport_sdk::PeerIdentity::Node(remote_node.node_id),
+            None,
+            RelayStubResponse {
+                status: StatusCode::OK,
+                headers: vec![transport_sdk::TransportHeader {
+                    name: "content-type".to_string(),
+                    value: "application/octet-stream".to_string(),
+                }],
+                body: object_body.clone(),
+            },
+        )
+        .await;
+
+    wait_for_condition(
+        "relay object-read stub health",
+        Duration::from_secs(5),
+        || {
+            let relay_base_url = relay_base_url.clone();
+            async move {
+                match reqwest::get(format!("{relay_base_url}/health")).await {
+                    Ok(response) => response.status() == StatusCode::OK,
+                    Err(_) => false,
+                }
+            }
+        },
+    )
+    .await;
+
+    let response = super::execute_peer_request(
+        &state,
+        &remote_node,
+        reqwest::Method::GET,
+        "/store/folder%2Fobject.bin?version=test-version",
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+    .expect("relay object read request should succeed");
+
+    assert!(response.is_success());
+    assert_eq!(response.body, Bytes::from(object_body));
+    assert!(response.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("content-type")
+            && header.value == "application/octet-stream"
+    }));
+
+    assert_eq!(
+        observed_requests.lock().await.as_slice(),
+        &[ObservedRelayRequest {
+            kind: transport_sdk::TransportStreamKind::ObjectRead,
+            path: "/store/folder%2Fobject.bin?version=test-version".to_string(),
+        }]
+    );
+    assert_eq!(issued_ticket_count.load(Ordering::SeqCst), 1);
+    assert_eq!(paired_session_count.load(Ordering::SeqCst), 1);
+
+    relay_handle.abort();
+    let _ = relay_handle.await;
+    cleanup_test_state(&state).await;
 }
 
 #[tokio::test]
@@ -15701,6 +15868,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                         entry: transport_sdk::PresenceEntry {
                             registration,
                             updated_at_unix,
+                            observed_source_addr: None,
                         },
                     })
                 }
@@ -15762,6 +15930,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                         entry: transport_sdk::PresenceEntry {
                             registration,
                             updated_at_unix,
+                            observed_source_addr: None,
                         },
                     })
                 }

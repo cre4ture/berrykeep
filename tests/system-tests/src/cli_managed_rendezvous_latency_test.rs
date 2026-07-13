@@ -305,9 +305,11 @@ async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_c
             .filter_map(|endpoint| endpoint.node_id.map(|node_id| node_id.to_string()))
             .collect::<Vec<_>>();
         direct_node_ids.sort();
+        let mut expected_direct_node_ids = vec![node_id_a.clone(), node_id_b.clone()];
+        expected_direct_node_ids.sort();
         assert_eq!(
             direct_node_ids,
-            vec![node_id_a.clone(), node_id_b.clone()],
+            expected_direct_node_ids,
             "expected both cluster nodes in the managed bootstrap, got {:?}",
             bootstrap.direct_endpoints
         );

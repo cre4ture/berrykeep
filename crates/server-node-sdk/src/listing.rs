@@ -38,6 +38,7 @@ struct KeyListingCursor {
     last_kind: KeyListingEntryKind,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paginate_sorted_keys(
     sorted_keys: &[String],
     scope: &str,
