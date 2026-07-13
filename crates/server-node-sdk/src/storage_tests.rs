@@ -4523,6 +4523,64 @@ run_on_all_metadata_backends!(
     ensure_media_metadata_persists_without_thumbnail_turso
 );
 
+async fn ensure_media_cache_rejects_thumbnail_builds_that_exceed_image_limits_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("media-cache-image-limits").await;
+    store.set_media_cache_image_limits_for_test(3, 1_000, 1024 * 1024);
+
+    let put = store
+        .put_object_versioned(
+            "photos/oversized-thumb.png",
+            Bytes::from(sample_png_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata_only = store
+        .ensure_media_metadata(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata_only.status, MediaCacheStatus::Ready);
+    assert_eq!(metadata_only.width, Some(4));
+    assert_eq!(metadata_only.height, Some(3));
+    assert!(metadata_only.thumbnail.is_none());
+
+    let full = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(full.status, MediaCacheStatus::Unsupported);
+    assert_eq!(full.media_type.as_deref(), Some("image"));
+    assert_eq!(full.mime_type.as_deref(), Some("image/png"));
+    assert_eq!(full.width, Some(4));
+    assert_eq!(full.height, Some(3));
+    assert!(full.thumbnail.is_none());
+    assert!(
+        full.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("dimensions 4x3 exceed limit 3px")
+    );
+
+    let thumb_path = store.media_thumbnail_path(&full.content_fingerprint, "grid");
+    assert!(!fs::try_exists(&thumb_path).await.unwrap());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_media_cache_rejects_thumbnail_builds_that_exceed_image_limits_impl,
+    ensure_media_cache_rejects_thumbnail_builds_that_exceed_image_limits,
+    ensure_media_cache_rejects_thumbnail_builds_that_exceed_image_limits_turso
+);
+
 #[cfg(unix)]
 async fn ensure_media_cache_generates_thumbnail_for_mp4_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("media-cache-mp4").await;
