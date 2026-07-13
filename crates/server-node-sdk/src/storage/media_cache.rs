@@ -509,9 +509,10 @@ impl MediaCacheWorker {
                     manifest.total_size_bytes,
                     image_dimensions(&sniff_bytes, format).ok(),
                     include_thumbnail,
+                    self.media_cache_build_config.image_limits(),
                 ),
             );
-            let _build_permit = self
+            let build_permit = self
                 .media_cache_build_permits
                 .clone()
                 .acquire_many_owned(build_permits)
@@ -525,6 +526,7 @@ impl MediaCacheWorker {
             let image_limits = self.media_cache_build_config.image_limits().clone();
 
             return match task::spawn_blocking(move || {
+                let _build_permit = build_permit;
                 build_image_media_cache_blocking(
                     &manifest_hash_owned,
                     &content_fingerprint_owned,
@@ -1456,6 +1458,7 @@ fn estimated_image_build_bytes(
     source_size_bytes: usize,
     dimensions: Option<(u32, u32)>,
     include_thumbnail: bool,
+    image_limits: &MediaCacheImageLimits,
 ) -> u64 {
     let source_size_bytes = u64::try_from(source_size_bytes).unwrap_or(u64::MAX);
     if !include_thumbnail {
@@ -1468,7 +1471,13 @@ fn estimated_image_build_bytes(
                 .saturating_mul(u64::from(height))
                 .saturating_mul(IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL)
         })
-        .unwrap_or(source_size_bytes);
+        .unwrap_or_else(|| {
+            image_limits.max_decode_bytes.max(
+                image_limits
+                    .max_pixels
+                    .saturating_mul(IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL),
+            )
+        });
 
     decode_bytes.max(source_size_bytes)
 }
@@ -1755,6 +1764,22 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("pixel count")
+        );
+    }
+
+    #[test]
+    fn estimated_image_build_bytes_uses_conservative_budget_without_dimensions() {
+        let image_limits = MediaCacheImageLimits {
+            max_dimension: 4_096,
+            max_pixels: 40_000_000,
+            max_decode_bytes: 256 * 1024 * 1024,
+        };
+
+        assert_eq!(
+            estimated_image_build_bytes(32 * 1024, None, true, &image_limits),
+            image_limits
+                .max_decode_bytes
+                .max(image_limits.max_pixels * IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL)
         );
     }
 }
