@@ -12,6 +12,7 @@ use transport_sdk::ClientIdentityMaterial;
 
 const SNAPSHOT_BUILD_PROGRESS_STRIDE: u64 = 512;
 const PREFERRED_SERVER_NOTIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const STOP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy)]
 pub struct RemoteSyncStrategy {
@@ -537,12 +538,12 @@ fn sleep_until_or_stop(duration: Duration, running: &AtomicBool) -> bool {
     }
 
     let mut remaining = duration;
-    let step = Duration::from_millis(100);
-    while remaining > Duration::from_millis(0) {
+    let step = duration.min(STOP_CHECK_INTERVAL);
+    while remaining > Duration::ZERO {
         if !running.load(Ordering::SeqCst) {
             return false;
         }
-        let nap = if remaining > step { step } else { remaining };
+        let nap = remaining.min(step);
         thread::sleep(nap);
         remaining = remaining.saturating_sub(nap);
     }
