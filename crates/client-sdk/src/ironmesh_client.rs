@@ -755,15 +755,39 @@ fn apply_headers_to_request(
     })
 }
 
+#[derive(Clone, Copy)]
+struct TransportRequestOptions<'a> {
+    connection_name: Option<&'a str>,
+    direct_failover_timeout: Option<Duration>,
+}
+
+impl<'a> TransportRequestOptions<'a> {
+    const fn new(
+        connection_name: Option<&'a str>,
+        direct_failover_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            connection_name,
+            direct_failover_timeout,
+        }
+    }
+
+    const fn without_direct_failover_timeout(self) -> Self {
+        Self {
+            connection_name: self.connection_name,
+            direct_failover_timeout: None,
+        }
+    }
+}
+
 async fn execute_buffered_request_for_transport(
     transport: &ClientTransport,
     auth: &ClientRequestAuth,
-    connection_name: Option<&str>,
+    options: TransportRequestOptions<'_>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
     body: &[u8],
-    direct_failover_timeout: Option<Duration>,
 ) -> Result<BufferedTransportResponse> {
     match transport {
         ClientTransport::Direct {
@@ -777,7 +801,7 @@ async fn execute_buffered_request_for_transport(
                     server_base_url,
                     session_pool,
                     identity,
-                    connection_name,
+                    connection_name: options.connection_name,
                 };
                 return execute_direct_multiplex_buffered_request(
                     direct,
@@ -785,7 +809,7 @@ async fn execute_buffered_request_for_transport(
                     url,
                     headers,
                     body,
-                    direct_failover_timeout,
+                    options.direct_failover_timeout,
                 )
                 .await
                 .with_context(|| format!("failed to execute multiplexed {} {}", method, url));
@@ -817,7 +841,7 @@ async fn execute_buffered_request_for_transport(
             execute_relay_multiplex_buffered_request(
                 relay,
                 source,
-                connection_name,
+                options.connection_name,
                 method,
                 url,
                 headers,
@@ -879,12 +903,11 @@ async fn execute_streaming_object_read_request_for_transport(
 async fn execute_streaming_object_write_request_for_transport(
     transport: &ClientTransport,
     auth: &ClientRequestAuth,
-    connection_name: Option<&str>,
+    options: TransportRequestOptions<'_>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
     body: &[u8],
-    direct_failover_timeout: Option<Duration>,
 ) -> Result<BufferedTransportResponse> {
     match transport {
         ClientTransport::Direct {
@@ -897,7 +920,7 @@ async fn execute_streaming_object_write_request_for_transport(
                     server_base_url,
                     session_pool,
                     identity,
-                    connection_name,
+                    connection_name: options.connection_name,
                 };
                 return execute_direct_multiplex_streaming_object_write_request(
                     direct,
@@ -905,7 +928,7 @@ async fn execute_streaming_object_write_request_for_transport(
                     url,
                     headers,
                     body,
-                    direct_failover_timeout,
+                    options.direct_failover_timeout,
                 )
                 .await
                 .with_context(|| format!("failed to execute streamed {} {}", method, url));
@@ -914,12 +937,11 @@ async fn execute_streaming_object_write_request_for_transport(
             execute_buffered_request_for_transport(
                 transport,
                 auth,
-                connection_name,
+                options.without_direct_failover_timeout(),
                 method,
                 url,
                 headers,
                 body,
-                None,
             )
             .await
         }
@@ -928,7 +950,7 @@ async fn execute_streaming_object_write_request_for_transport(
             execute_relay_multiplex_streaming_object_write_request(
                 relay,
                 source,
-                connection_name,
+                options.connection_name,
                 method,
                 url,
                 headers,
@@ -965,12 +987,11 @@ async fn probe_endpoint_background_quality(
     let response = execute_buffered_request_for_transport(
         &endpoint.transport,
         auth,
-        connection_name,
+        TransportRequestOptions::new(connection_name, None),
         &method,
         &url,
         &headers,
         &[],
-        None,
     )
     .await?;
     if !response.status.is_success() {
@@ -1690,12 +1711,14 @@ impl IronMeshClient {
             match execute_buffered_request_for_transport(
                 &endpoint.transport,
                 &self.auth,
-                self.connection_name.as_deref(),
+                TransportRequestOptions::new(
+                    self.connection_name.as_deref(),
+                    direct_failover_timeout,
+                ),
                 &method,
                 &endpoint_url,
                 &auth_headers,
                 body.as_deref().unwrap_or_default(),
-                direct_failover_timeout,
             )
             .await
             {
@@ -1790,12 +1813,14 @@ impl IronMeshClient {
             match execute_streaming_object_write_request_for_transport(
                 &endpoint.transport,
                 &self.auth,
-                self.connection_name.as_deref(),
+                TransportRequestOptions::new(
+                    self.connection_name.as_deref(),
+                    direct_failover_timeout,
+                ),
                 &Method::PUT,
                 &endpoint_url,
                 &auth_headers,
                 &payload,
-                direct_failover_timeout,
             )
             .await
             {
