@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Component, Path};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use common::{ClusterId, DeviceId, NodeId};
@@ -184,7 +184,8 @@ impl ClientBootstrap {
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
-        let raw = read_transport_json_file(path, "client bootstrap")?;
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read client bootstrap {}", path.display()))?;
         Self::from_json_str(&raw)
     }
 
@@ -194,7 +195,12 @@ impl ClientBootstrap {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
-        write_transport_json_file(path, "client bootstrap", &self.to_json_pretty()?)
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        fs::write(path, self.to_json_pretty()?)
+            .with_context(|| format!("failed to write client bootstrap {}", path.display()))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -226,7 +232,8 @@ impl NodeBootstrap {
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
-        let raw = read_transport_json_file(path, "node bootstrap")?;
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read node bootstrap {}", path.display()))?;
         Self::from_json_str(&raw)
     }
 
@@ -236,7 +243,12 @@ impl NodeBootstrap {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
-        write_transport_json_file(path, "node bootstrap", &self.to_json_pretty()?)
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        fs::write(path, self.to_json_pretty()?)
+            .with_context(|| format!("failed to write node bootstrap {}", path.display()))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -279,7 +291,8 @@ impl NodeJoinRequest {
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
-        let raw = read_transport_json_file(path, "node join request")?;
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read node join request {}", path.display()))?;
         Self::from_json_str(&raw)
     }
 
@@ -289,7 +302,12 @@ impl NodeJoinRequest {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
-        write_transport_json_file(path, "node join request", &self.to_json_pretty()?)
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        fs::write(path, self.to_json_pretty()?)
+            .with_context(|| format!("failed to write node join request {}", path.display()))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -324,7 +342,8 @@ impl NodeEnrollmentPackage {
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
-        let raw = read_transport_json_file(path, "node enrollment")?;
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read node enrollment {}", path.display()))?;
         Self::from_json_str(&raw)
     }
 
@@ -334,7 +353,12 @@ impl NodeEnrollmentPackage {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
-        write_transport_json_file(path, "node enrollment", &self.to_json_pretty()?)
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        fs::write(path, self.to_json_pretty()?)
+            .with_context(|| format!("failed to write node enrollment {}", path.display()))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -364,36 +388,6 @@ impl NodeEnrollmentPackage {
             (None, None) => Ok(()),
         }
     }
-}
-
-fn read_transport_json_file(path: &Path, label: &str) -> Result<String> {
-    validate_transport_json_path(path, label)?;
-    fs::read_to_string(path).with_context(|| format!("failed to read {label} {}", path.display()))
-}
-
-fn write_transport_json_file(path: &Path, label: &str, contents: &str) -> Result<()> {
-    validate_transport_json_path(path, label)?;
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-    fs::write(path, contents).with_context(|| format!("failed to write {label} {}", path.display()))
-}
-
-fn validate_transport_json_path(path: &Path, label: &str) -> Result<()> {
-    if path.as_os_str().is_empty() {
-        bail!("{label} path must not be empty");
-    }
-    if path
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        bail!("{label} path must not contain parent directory traversal");
-    }
-    Ok(())
 }
 
 fn validate_version(version: u32) -> Result<()> {
