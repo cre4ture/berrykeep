@@ -2524,6 +2524,16 @@ async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fa
         .expect("mutating request should fall back within 4 seconds")
         .expect("mutating request should fall back to relay");
 
+        let direct_request = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(request) = direct_state.captured_stalled_request.lock().await.clone() {
+                    break request;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("direct stalled request should be captured");
         let relay_request = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(request) = relay_state.captured_request.lock().await.clone() {
@@ -2535,15 +2545,22 @@ async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fa
         .await
         .expect("relay fallback request should be captured");
 
+        let direct_operation_id =
+            relay_header_value(&direct_request.headers, transport_sdk::HEADER_OPERATION_ID)
+                .expect("direct request should carry an operation id");
         let relay_operation_id =
             relay_header_value(&relay_request.headers, transport_sdk::HEADER_OPERATION_ID)
                 .expect("relay request should carry an operation id");
 
+        assert!(!direct_operation_id.trim().is_empty());
         assert!(!relay_operation_id.trim().is_empty());
+        assert_eq!(direct_operation_id, relay_operation_id);
+        assert_eq!(direct_request.method, "POST");
         assert_eq!(relay_request.method, "POST");
+        assert_eq!(direct_request.path_and_query, "/api/v1/cluster/status");
         assert_eq!(relay_request.path_and_query, "/api/v1/cluster/status");
-        assert_eq!(direct_state.cluster_status_hits.load(Ordering::SeqCst), 1);
-        assert!(direct_state.stalled_request_count.load(Ordering::SeqCst) <= 1);
+        assert_eq!(direct_state.cluster_status_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(direct_state.stalled_request_count.load(Ordering::SeqCst), 1);
         assert!(client.uses_relay_transport());
         assert_eq!(client.relay_target_node_id(), Some(target_node_id));
         assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 1);
