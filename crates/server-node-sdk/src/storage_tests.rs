@@ -78,6 +78,18 @@ fn chunk_path_for_hash_rejects_non_blake3_hex_lengths() {
     assert!(chunk_path_for_hash(chunks_dir, &"a".repeat(blake3::OUT_LEN * 2)).is_ok());
 }
 
+#[test]
+fn manifest_path_from_hash_rejects_non_blake3_hex_lengths() {
+    let manifests_dir = Path::new("manifests");
+
+    assert!(manifest_path_from_hash(manifests_dir, TOMBSTONE_MANIFEST_HASH).is_err());
+    assert!(manifest_path_from_hash(manifests_dir, "a").is_err());
+    assert!(
+        manifest_path_from_hash(manifests_dir, &"a".repeat((blake3::OUT_LEN * 2) - 1)).is_err()
+    );
+    assert!(manifest_path_from_hash(manifests_dir, &"a".repeat(blake3::OUT_LEN * 2)).is_ok());
+}
+
 fn sample_oriented_jpeg_bytes(orientation: u16) -> Vec<u8> {
     let mut image = image::RgbImage::new(40, 30);
     for y in 0..30 {

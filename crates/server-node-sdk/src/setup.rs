@@ -285,7 +285,22 @@ pub(crate) fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<
         return Ok(StartupMode::Setup(config));
     };
 
-    let resolved_path = resolve_materialized_path(&config.data_dir, enrollment_path);
+    let resolved_path = match resolve_materialized_path(&config.data_dir, enrollment_path) {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(
+                startup_mode = "bootstrap_setup",
+                startup_reason = "runtime_node_enrollment_path_invalid",
+                state_path = %config.state_path.display(),
+                enrollment_path = %enrollment_path,
+                error = %err,
+                cluster_id = ?managed_state.cluster_id,
+                node_id = ?managed_state.node_id,
+                "server node managed state references an invalid runtime enrollment path"
+            );
+            return Ok(StartupMode::Setup(config));
+        }
+    };
     if !resolved_path.exists() {
         tracing::warn!(
             startup_mode = "bootstrap_setup",
@@ -984,20 +999,22 @@ fn default_setup_bootstrap_config() -> Result<SetupBootstrapConfig> {
         .unwrap_or_else(|_| "0.0.0.0:8443".to_string())
         .parse()
         .context("invalid IRONMESH_SERVER_BIND for bootstrap setup mode")?;
-    Ok(managed_startup_bootstrap_config(data_dir, bind_addr))
+    managed_startup_bootstrap_config(data_dir, bind_addr)
 }
 
 pub(crate) fn managed_startup_bootstrap_config(
     data_dir: PathBuf,
     bind_addr: SocketAddr,
-) -> SetupBootstrapConfig {
-    SetupBootstrapConfig {
+) -> Result<SetupBootstrapConfig> {
+    ensure_non_traversing_path(&data_dir, "managed setup data directory")?;
+    let data_dir = normalize_non_traversing_path(&data_dir);
+    Ok(SetupBootstrapConfig {
         state_path: managed_setup_state_path(&data_dir),
         bootstrap_cert_path: bootstrap_setup_cert_path(&data_dir),
         bootstrap_key_path: bootstrap_setup_key_path(&data_dir),
         data_dir,
         bind_addr,
-    }
+    })
 }
 
 fn managed_setup_dir(data_dir: &std::path::Path) -> PathBuf {
@@ -2022,7 +2039,7 @@ mod tests {
         let stored = runtime_node_enrollment_relative_path()
             .display()
             .to_string();
-        let resolved = resolve_materialized_path(&relative_data_dir, &stored);
+        let resolved = resolve_materialized_path(&relative_data_dir, &stored).unwrap();
         assert_eq!(resolved, runtime_node_enrollment_path(&relative_data_dir));
         assert!(
             !resolved
@@ -2031,6 +2048,23 @@ mod tests {
                 .contains("data/server-node/./data/server-node"),
             "enrollment path doubled the data_dir prefix: {}",
             resolved.display()
+        );
+    }
+
+    #[test]
+    fn resolve_materialized_path_rejects_parent_traversal() {
+        let data_dir = std::path::PathBuf::from("./data/server-node");
+
+        assert!(resolve_materialized_path(&data_dir, "../node-enrollment.json").is_err());
+    }
+
+    #[test]
+    fn managed_startup_bootstrap_config_rejects_parent_traversal_data_dir() {
+        let bind_addr = "127.0.0.1:18443".parse::<SocketAddr>().unwrap();
+
+        assert!(
+            managed_startup_bootstrap_config(std::path::PathBuf::from("../data"), bind_addr)
+                .is_err()
         );
     }
 
@@ -2130,7 +2164,7 @@ mod tests {
         let dir = temp_dir("import-node-local-admin-password");
         let data_dir = dir.join("data");
         let bind_addr = "127.0.0.1:18443".parse::<SocketAddr>().unwrap();
-        let config = managed_startup_bootstrap_config(data_dir.clone(), bind_addr);
+        let config = managed_startup_bootstrap_config(data_dir.clone(), bind_addr).unwrap();
         let (completion_tx, mut completion_rx) = mpsc::channel(1);
         let state = SetupServerState {
             config,

@@ -3339,25 +3339,74 @@ fn parse_metadata_backend(raw: &str) -> Result<MetadataBackendKind> {
     }
 }
 
-fn resolve_materialized_path(data_dir: &std::path::Path, raw_path: &str) -> PathBuf {
-    let candidate = PathBuf::from(raw_path);
-    if candidate.is_absolute() {
-        candidate
+fn path_has_parent_traversal(path: &FsPath) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn ensure_non_traversing_path(path: &FsPath, label: &str) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        bail!("{label} must not be empty");
+    }
+    if path_has_parent_traversal(path) {
+        bail!("{label} must not contain parent traversal");
+    }
+    Ok(())
+}
+
+fn normalize_non_traversing_path(path: &FsPath) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::Normal(segment) => normalized.push(segment),
+            std::path::Component::ParentDir => unreachable!("parent traversal rejected earlier"),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    normalized
+}
+
+fn resolve_materialized_path(data_dir: &FsPath, raw_path: &str) -> Result<PathBuf> {
+    ensure_non_traversing_path(data_dir, "data directory")?;
+    let normalized_data_dir = normalize_non_traversing_path(data_dir);
+
+    let candidate = FsPath::new(raw_path);
+    ensure_non_traversing_path(candidate, "materialized path")?;
+    let normalized_candidate = normalize_non_traversing_path(candidate);
+
+    if normalized_candidate.is_absolute() {
+        if !normalized_data_dir.is_absolute() {
+            bail!("absolute materialized paths require an absolute data directory");
+        }
+        if !normalized_candidate.starts_with(&normalized_data_dir) {
+            bail!(
+                "materialized path {} must stay within {}",
+                normalized_candidate.display(),
+                normalized_data_dir.display()
+            );
+        }
+        Ok(normalized_candidate)
     } else {
-        data_dir.join(candidate)
+        Ok(normalized_data_dir.join(normalized_candidate))
     }
 }
 
-fn tls_metadata_sidecar_path(cert_path: &std::path::Path) -> PathBuf {
+fn tls_metadata_sidecar_path(cert_path: &FsPath) -> Result<PathBuf> {
     let file_name = cert_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "certificate".to_string());
-    cert_path.with_file_name(format!("{file_name}.metadata.json"))
+        .context("certificate path must include a file name")?;
+    Ok(cert_path.with_file_name(format!("{file_name}.metadata.json")))
 }
 
-fn existing_tls_metadata_sidecar_path(cert_path: &std::path::Path) -> Option<PathBuf> {
-    let path = tls_metadata_sidecar_path(cert_path);
+fn existing_tls_metadata_sidecar_path(cert_path: &FsPath) -> Option<PathBuf> {
+    let path = tls_metadata_sidecar_path(cert_path).ok()?;
     path.exists().then_some(path)
 }
 
@@ -3402,10 +3451,10 @@ fn env_u64_or(name: &str, default: u64) -> u64 {
 }
 
 fn write_tls_material_metadata_sidecar(
-    cert_path: &std::path::Path,
+    cert_path: &FsPath,
     metadata: &BootstrapTlsMaterialMetadata,
 ) -> Result<()> {
-    let metadata_path = tls_metadata_sidecar_path(cert_path);
+    let metadata_path = tls_metadata_sidecar_path(cert_path)?;
     if let Some(parent) = metadata_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating {}", parent.display()))?;
@@ -4300,9 +4349,9 @@ fn materialize_node_enrollment_package(
         bootstrap.internal_tls.as_mut(),
         internal_tls_material.as_ref(),
     ) {
-        let ca_path = resolve_materialized_path(&data_dir, &internal_tls.ca_cert_path);
-        let cert_path = resolve_materialized_path(&data_dir, &internal_tls.cert_path);
-        let key_path = resolve_materialized_path(&data_dir, &internal_tls.key_path);
+        let ca_path = resolve_materialized_path(&data_dir, &internal_tls.ca_cert_path)?;
+        let cert_path = resolve_materialized_path(&data_dir, &internal_tls.cert_path)?;
+        let key_path = resolve_materialized_path(&data_dir, &internal_tls.key_path)?;
 
         for (path, contents) in [
             (&ca_path, material.ca_cert_pem.as_str()),
@@ -4326,8 +4375,8 @@ fn materialize_node_enrollment_package(
     if let (Some(public_tls), Some(material)) =
         (bootstrap.public_tls.as_mut(), public_tls_material.as_ref())
     {
-        let cert_path = resolve_materialized_path(&data_dir, &public_tls.cert_path);
-        let key_path = resolve_materialized_path(&data_dir, &public_tls.key_path);
+        let cert_path = resolve_materialized_path(&data_dir, &public_tls.cert_path)?;
+        let key_path = resolve_materialized_path(&data_dir, &public_tls.key_path)?;
 
         for (path, contents) in [
             (&cert_path, material.cert_pem.as_str()),
@@ -4352,7 +4401,7 @@ fn materialize_node_enrollment_package(
         .or(bootstrap.trust_roots.public_api_ca_pem.as_deref())
         && let Some(public_ca_cert_path) = bootstrap.public_ca_cert_path.as_mut()
     {
-        let public_ca_path = resolve_materialized_path(&data_dir, public_ca_cert_path);
+        let public_ca_path = resolve_materialized_path(&data_dir, public_ca_cert_path)?;
         if let Some(parent) = public_ca_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed creating {}", parent.display()))?;
@@ -5090,7 +5139,8 @@ pub async fn run_embedded_managed(config: EmbeddedManagedServerNodeConfig) -> Re
     common::logging::init_compact_tracing_default(config.log_directive.as_str());
     ensure_rustls_crypto_provider_installed();
 
-    let startup_config = setup::managed_startup_bootstrap_config(config.data_dir, config.bind_addr);
+    let startup_config =
+        setup::managed_startup_bootstrap_config(config.data_dir, config.bind_addr)?;
     let log_buffer = Arc::new(LogBuffer::new(500));
     let runtime_log_control = RuntimeLogControl::disabled(config.log_directive.as_str());
 

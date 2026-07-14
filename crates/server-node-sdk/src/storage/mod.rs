@@ -91,6 +91,22 @@ const GC_MANIFEST_LOAD_BATCH_SIZE: usize = 500;
 const CURRENT_OBJECT_CACHE_ENTRY_ESTIMATED_BYTES: u64 = 300;
 const SNAPSHOT_HISTORY_MAX_BATCH_WINDOW_SECS: u64 = 2 * 60 * 60;
 
+fn manifest_hash_looks_safe_filename(manifest_hash: &str) -> bool {
+    manifest_hash.len() == blake3::OUT_LEN * 2
+        && manifest_hash.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn manifest_path_from_hash(
+    manifests_dir: &Path,
+    manifest_hash: impl AsRef<str>,
+) -> Result<PathBuf> {
+    let manifest_hash = manifest_hash.as_ref();
+    if !manifest_hash_looks_safe_filename(manifest_hash) {
+        bail!("invalid manifest hash: {manifest_hash}");
+    }
+    Ok(manifests_dir.join(format!("{manifest_hash}.json")))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ChunkRef {
     pub(super) hash: String,
@@ -1586,7 +1602,7 @@ impl StorageStatsCollector {
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -1742,7 +1758,7 @@ impl StoreIndexInspector {
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -2117,7 +2133,7 @@ impl ReplicationSubjectInspector {
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -2735,7 +2751,8 @@ impl PersistentStore {
 
     #[cfg(test)]
     pub fn manifest_path_for_test(&self, manifest_hash: &str) -> PathBuf {
-        self.manifests_dir.join(format!("{manifest_hash}.json"))
+        manifest_path_from_hash(&self.manifests_dir, manifest_hash)
+            .expect("test manifest hash should be a safe filename")
     }
 
     #[cfg(test)]
@@ -3113,7 +3130,7 @@ impl PersistentStore {
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_hash = hash_hex(&manifest_bytes);
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
 
         if !fs::try_exists(&manifest_path).await? {
             write_atomic(&manifest_path, &manifest_bytes).await?;
@@ -3198,7 +3215,7 @@ impl PersistentStore {
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_hash = hash_hex(&manifest_bytes);
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
         let manifest_build_ms = manifest_build_started_at.elapsed().as_millis();
 
         let manifest_store_started_at = Instant::now();
@@ -4170,7 +4187,7 @@ impl PersistentStore {
             }));
         }
 
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -4526,7 +4543,7 @@ impl PersistentStore {
             }
         }
 
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
         let manifest_needs_write = match fs::read(&manifest_path).await {
             Ok(existing_payload) => existing_payload != manifest_payload,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
@@ -4617,9 +4634,8 @@ impl PersistentStore {
             let parsed_manifest: ObjectManifest = serde_json::from_slice(&manifest.manifest_bytes)
                 .context("invalid metadata manifest payload")?;
 
-            let manifest_path = self
-                .manifests_dir
-                .join(format!("{}.json", manifest.manifest_hash));
+            let manifest_path =
+                manifest_path_from_hash(&self.manifests_dir, &manifest.manifest_hash)?;
             if !fs::try_exists(&manifest_path).await? {
                 write_atomic(&manifest_path, &manifest.manifest_bytes).await?;
                 changed = true;
@@ -4797,9 +4813,8 @@ impl PersistentStore {
                 }
             }
 
-            let manifest_path = self
-                .manifests_dir
-                .join(format!("{}.json", bundle.manifest_hash));
+            let manifest_path =
+                manifest_path_from_hash(&self.manifests_dir, &bundle.manifest_hash)?;
             let manifest_needs_write = match fs::read(&manifest_path).await {
                 Ok(existing_payload) => existing_payload != bundle.manifest_bytes,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
@@ -5043,7 +5058,7 @@ impl PersistentStore {
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -5055,7 +5070,7 @@ impl PersistentStore {
     }
 
     async fn load_manifest_payload_by_hash(&self, manifest_hash: &str) -> Result<Option<Vec<u8>>> {
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -5109,9 +5124,7 @@ impl PersistentStore {
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let cloned_manifest_hash = hash_hex(&manifest_bytes);
-        let manifest_path = self
-            .manifests_dir
-            .join(format!("{cloned_manifest_hash}.json"));
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &cloned_manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             write_atomic(&manifest_path, &manifest_bytes).await?;
         }
@@ -6208,7 +6221,7 @@ impl PersistentStore {
                 continue;
             }
 
-            let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+            let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
             let metadata = match fs::metadata(&manifest_path).await {
                 Ok(metadata) => metadata,
                 Err(_) => continue,

@@ -57,6 +57,10 @@ use x509_parser::prelude::FromDer;
 const TEST_ADMIN_TOKEN: &str = "system-test-admin";
 type TestHmacSha256 = Hmac<Sha256>;
 
+fn fresh_test_secret(label: &str) -> String {
+    format!("{label}-{}", Uuid::now_v7())
+}
+
 #[derive(Clone, Copy)]
 enum MainTestBackend {
     Sqlite,
@@ -885,7 +889,7 @@ run_on_main_metadata_backends!(
 
 async fn admin_authorization_requires_token_when_configured_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
-    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.admin_control.admin_token = Some(fresh_test_secret("admin"));
     let headers = HeaderMap::new();
 
     let result = super::authorize_admin_request(
@@ -912,9 +916,10 @@ async fn admin_authorization_requires_explicit_approval_for_destructive_action_i
     backend: MainTestBackend,
 ) {
     let mut state = build_test_state(1, false, backend).await;
-    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let admin_token = fresh_test_secret("admin");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-ironmesh-admin-token", admin_token.parse().unwrap());
 
     let result = super::authorize_admin_request(
         &state,
@@ -942,7 +947,8 @@ run_on_main_metadata_backends!(
 async fn public_logs_route_requires_client_or_admin_auth_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.access.client_auth_control.require_client_auth = true;
-    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let admin_token = fresh_test_secret("admin");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
 
     let app = Router::new()
         .route("/logs", get(super::ui::list_logs))
@@ -963,7 +969,7 @@ async fn public_logs_route_requires_client_or_admin_auth_impl(backend: MainTestB
         .oneshot(
             Request::builder()
                 .uri("/logs")
-                .header("x-ironmesh-admin-token", "admin-secret")
+                .header("x-ironmesh-admin-token", admin_token)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1033,12 +1039,13 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     let state = build_test_state(1, false, backend).await;
     let device_id = Uuid::now_v7().to_string();
     let now = super::unix_ts();
+    let pairing_token = fresh_test_secret("pairing");
     {
         let mut auth = state.access.client_credentials.lock().await;
         auth.pairing_authorizations
             .push(super::PairingAuthorizationRecord {
                 token_id: "pair-1".to_string(),
-                pairing_secret_hash: super::hash_token("pair-secret"),
+                pairing_secret_hash: super::hash_token(&pairing_token),
                 label: Some("Pixel".to_string()),
                 created_at_unix: now,
                 expires_at_unix: now + 300,
@@ -1051,7 +1058,7 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
         State(state.clone()),
         Json(super::ClientDeviceEnrollRequest {
             cluster_id: state.cluster_id,
-            pairing_token: "pair-secret".to_string(),
+            pairing_token: pairing_token.clone(),
             device_id: Some(device_id.clone()),
             label: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----"
@@ -1842,12 +1849,13 @@ async fn client_credential_fanout_after_enrollment_enables_remote_client_auth_im
     register_online_source_node(&source, &target, &peer_base_url).await;
 
     let now = super::unix_ts();
+    let pairing_token = fresh_test_secret("pairing-fanout");
     {
         let mut auth = source.access.client_credentials.lock().await;
         auth.pairing_authorizations
             .push(super::PairingAuthorizationRecord {
                 token_id: "pair-fanout-1".to_string(),
-                pairing_secret_hash: super::hash_token("pair-secret-fanout"),
+                pairing_secret_hash: super::hash_token(&pairing_token),
                 label: Some("Fanout Laptop".to_string()),
                 created_at_unix: now,
                 expires_at_unix: now + 300,
@@ -1862,7 +1870,7 @@ async fn client_credential_fanout_after_enrollment_enables_remote_client_auth_im
         &source,
         super::ClientEnrollmentRequest {
             cluster_id: source.cluster_id,
-            pairing_token: "pair-secret-fanout".to_string(),
+            pairing_token: pairing_token.clone(),
             device_id: Some(identity.device_id),
             label: None,
             public_key_pem: identity.public_key_pem.clone(),
@@ -2298,9 +2306,10 @@ async fn s3_control_plane_import_merges_tombstones_and_revocations_impl(backend:
     let state = build_test_state(1, false, backend).await;
     let source_node_id = NodeId::new_v4();
     let initial_bucket = sample_s3_bucket_record("archive.example", "s3/archive.example/", 10);
+    let replicated_secret = fresh_test_secret("replicated");
     let initial_access_key = sample_s3_access_key_record(
         "IMSYNC123456789012",
-        "replicated-secret-v1",
+        &replicated_secret,
         vec!["archive.example".to_string()],
         10,
     );
