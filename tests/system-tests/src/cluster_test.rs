@@ -5350,8 +5350,7 @@ mod tests {
                 .error_for_status()?;
 
             let orphan_chunk_bytes = b"orphan-chunk-payload";
-            let orphan_chunk_hash =
-                "aa11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff".to_string();
+            let orphan_chunk_hash = blake3::hash(orphan_chunk_bytes).to_hex().to_string();
             let orphan_chunk_dir = fixture
                 .data_dir
                 .join("chunks")
@@ -5365,18 +5364,16 @@ mod tests {
             let orphan_manifest = serde_json::json!({
                 "key": "orphan-key",
                 "total_size_bytes": orphan_chunk_bytes.len(),
-                "created_at_unix": 0,
                 "chunks": [
                     {
-                        "hash": orphan_chunk_hash,
+                        "hash": orphan_chunk_hash.clone(),
                         "size_bytes": orphan_chunk_bytes.len()
                     }
                 ]
             });
 
             let orphan_manifest_bytes = serde_json::to_vec_pretty(&orphan_manifest)?;
-            let orphan_manifest_hash =
-                "bb11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff".to_string();
+            let orphan_manifest_hash = blake3::hash(&orphan_manifest_bytes).to_hex().to_string();
             fs::write(
                 fixture
                     .data_dir
