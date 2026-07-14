@@ -1,3 +1,22 @@
+ironmesh (1.0.34-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add S3 frontend support with replicated control-plane APIs, relay-capable
+    object streaming, versioned bucket operations, admin UI, and AWS
+    compatibility coverage.
+  * Add dynamic rendezvous reachability discovery and alternative direct node
+    URLs for bootstrap target refresh and mesh health probing.
+  * Reduce folder-agent overhead with server-side remote notifications,
+    incremental local-state maintenance, lower idle wakeups, SQLite write
+    batching, and Android SAF caching.
+  * Tighten relay failover semantics and coverage, stream exact store and
+    relay object reads, move replication planning off the cluster lock, and
+    bound media-cache and data-scrub work.
+  * Address follow-up hardening for bootstrap JSON validation, CodeQL
+    findings, and orphan cleanup system-test coverage.
+  * Roll the workspace release to 1.0.34.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 14 Jul 2026 12:28:11 +0200
+
 ironmesh (1.0.33-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Move sqlite metadata reads onto tokio-rusqlite and harden media cache
