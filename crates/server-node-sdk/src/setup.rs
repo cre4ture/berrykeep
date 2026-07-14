@@ -2040,12 +2040,14 @@ mod tests {
             .display()
             .to_string();
         let resolved = resolve_materialized_path(&relative_data_dir, &stored).unwrap();
-        assert_eq!(resolved, runtime_node_enrollment_path(&relative_data_dir));
+        let expected =
+            normalize_non_traversing_path(&runtime_node_enrollment_path(&relative_data_dir));
+        assert_eq!(resolved, expected);
         assert!(
             !resolved
                 .display()
                 .to_string()
-                .contains("data/server-node/./data/server-node"),
+                .contains("data/server-node/data/server-node"),
             "enrollment path doubled the data_dir prefix: {}",
             resolved.display()
         );

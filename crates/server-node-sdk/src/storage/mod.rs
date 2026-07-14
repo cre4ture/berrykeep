@@ -1602,7 +1602,11 @@ impl StorageStatsCollector {
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -1758,7 +1762,11 @@ impl StoreIndexInspector {
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -2133,7 +2141,11 @@ impl ReplicationSubjectInspector {
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -3130,7 +3142,7 @@ impl PersistentStore {
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_hash = hash_hex(&manifest_bytes);
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash.as_str())?;
 
         if !fs::try_exists(&manifest_path).await? {
             write_atomic(&manifest_path, &manifest_bytes).await?;
@@ -3215,7 +3227,7 @@ impl PersistentStore {
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_hash = hash_hex(&manifest_bytes);
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash.as_str())?;
         let manifest_build_ms = manifest_build_started_at.elapsed().as_millis();
 
         let manifest_store_started_at = Instant::now();
@@ -4187,7 +4199,7 @@ impl PersistentStore {
             }));
         }
 
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash.as_str())?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -4543,7 +4555,7 @@ impl PersistentStore {
             }
         }
 
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
         let manifest_needs_write = match fs::read(&manifest_path).await {
             Ok(existing_payload) => existing_payload != manifest_payload,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
@@ -4635,7 +4647,7 @@ impl PersistentStore {
                 .context("invalid metadata manifest payload")?;
 
             let manifest_path =
-                manifest_path_from_hash(&self.manifests_dir, &manifest.manifest_hash)?;
+                manifest_path_from_hash(&self.manifests_dir, manifest.manifest_hash.as_str())?;
             if !fs::try_exists(&manifest_path).await? {
                 write_atomic(&manifest_path, &manifest.manifest_bytes).await?;
                 changed = true;
@@ -4814,7 +4826,7 @@ impl PersistentStore {
             }
 
             let manifest_path =
-                manifest_path_from_hash(&self.manifests_dir, &bundle.manifest_hash)?;
+                manifest_path_from_hash(&self.manifests_dir, bundle.manifest_hash.as_str())?;
             let manifest_needs_write = match fs::read(&manifest_path).await {
                 Ok(existing_payload) => existing_payload != bundle.manifest_bytes,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
@@ -5058,7 +5070,11 @@ impl PersistentStore {
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -5070,7 +5086,11 @@ impl PersistentStore {
     }
 
     async fn load_manifest_payload_by_hash(&self, manifest_hash: &str) -> Result<Option<Vec<u8>>> {
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -5124,7 +5144,8 @@ impl PersistentStore {
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let cloned_manifest_hash = hash_hex(&manifest_bytes);
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, &cloned_manifest_hash)?;
+        let manifest_path =
+            manifest_path_from_hash(&self.manifests_dir, cloned_manifest_hash.as_str())?;
         if !fs::try_exists(&manifest_path).await? {
             write_atomic(&manifest_path, &manifest_bytes).await?;
         }
@@ -6221,7 +6242,7 @@ impl PersistentStore {
                 continue;
             }
 
-            let manifest_path = manifest_path_from_hash(&self.manifests_dir, &manifest_hash)?;
+            let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
             let metadata = match fs::metadata(&manifest_path).await {
                 Ok(metadata) => metadata,
                 Err(_) => continue,
