@@ -78,6 +78,16 @@ fn chunk_path_for_hash_rejects_non_blake3_hex_lengths() {
     assert!(chunk_path_for_hash(chunks_dir, &"a".repeat(blake3::OUT_LEN * 2)).is_ok());
 }
 
+#[test]
+fn manifest_path_from_hash_rejects_non_blake3_hex_lengths() {
+    let manifests_dir = Path::new("manifests");
+
+    assert!(manifest_path_from_hash(manifests_dir, TOMBSTONE_MANIFEST_HASH).is_err());
+    assert!(manifest_path_from_hash(manifests_dir, "a").is_err());
+    assert!(manifest_path_from_hash(manifests_dir, "a".repeat((blake3::OUT_LEN * 2) - 1)).is_err());
+    assert!(manifest_path_from_hash(manifests_dir, "a".repeat(blake3::OUT_LEN * 2)).is_ok());
+}
+
 fn sample_oriented_jpeg_bytes(orientation: u16) -> Vec<u8> {
     let mut image = image::RgbImage::new(40, 30);
     for y in 0..30 {
@@ -1057,6 +1067,63 @@ run_on_all_metadata_backends!(
     cleanup_unreferenced_processes_retained_manifests_across_batches_impl,
     cleanup_unreferenced_processes_retained_manifests_across_batches,
     cleanup_unreferenced_processes_retained_manifests_across_batches_turso
+);
+
+async fn cleanup_unreferenced_ignores_tombstone_manifest_markers_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("cleanup-tombstone-markers").await;
+
+    store
+        .put_object_versioned(
+            "deleted",
+            Bytes::from_static(b"to-be-deleted"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("deleted", PutOptions::default())
+        .await
+        .unwrap();
+
+    let orphan_chunk_payload = b"orphan-after-tombstone";
+    let orphan_chunk_hash = hash_hex(orphan_chunk_payload);
+    let orphan_chunk_path = chunk_path_for_hash(&store.chunks_dir, &orphan_chunk_hash).unwrap();
+    fs::create_dir_all(orphan_chunk_path.parent().unwrap())
+        .await
+        .unwrap();
+    fs::write(&orphan_chunk_path, orphan_chunk_payload)
+        .await
+        .unwrap();
+
+    let orphan_manifest = ObjectManifest {
+        key: "orphan-after-tombstone".to_string(),
+        total_size_bytes: orphan_chunk_payload.len(),
+        chunks: vec![ChunkRef {
+            hash: orphan_chunk_hash.clone(),
+            size_bytes: orphan_chunk_payload.len(),
+        }],
+    };
+    let orphan_manifest_bytes = serde_json::to_vec_pretty(&orphan_manifest).unwrap();
+    let orphan_manifest_hash = hash_hex(&orphan_manifest_bytes);
+    let orphan_manifest_path = store.manifest_path_for_test(&orphan_manifest_hash);
+    fs::write(&orphan_manifest_path, orphan_manifest_bytes)
+        .await
+        .unwrap();
+
+    let report = store.cleanup_unreferenced(0, false).await.unwrap();
+    assert!(report.deleted_manifests >= 1);
+    assert!(report.deleted_chunks >= 1);
+    assert!(!fs::try_exists(&orphan_manifest_path).await.unwrap());
+    assert!(!fs::try_exists(&orphan_chunk_path).await.unwrap());
+    assert!(store.list_versions("deleted").await.unwrap().is_none());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_unreferenced_ignores_tombstone_manifest_markers_impl,
+    cleanup_unreferenced_ignores_tombstone_manifest_markers,
+    cleanup_unreferenced_ignores_tombstone_manifest_markers_turso
 );
 
 async fn compact_tombstone_indexes_dry_run_reports_without_deleting_index_impl(

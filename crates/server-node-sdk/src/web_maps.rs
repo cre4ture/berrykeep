@@ -4,7 +4,7 @@ use axum::http::header::{
     CONTENT_RANGE, CONTENT_TYPE, ETAG, RANGE,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -388,10 +388,9 @@ pub(crate) async fn font_range(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let path = glyphs_root.join(&fontstack).join(&range);
-    if !path.starts_with(&glyphs_root) {
+    let Some(path) = resolve_glyph_asset_path(&glyphs_root, &fontstack, &range) else {
         return StatusCode::BAD_REQUEST.into_response();
-    }
+    };
 
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
@@ -810,6 +809,21 @@ fn is_safe_glyph_range_segment(value: &str) -> bool {
         && end.chars().all(|ch| ch.is_ascii_digit())
 }
 
+fn resolve_glyph_asset_path(glyphs_root: &FsPath, fontstack: &str, range: &str) -> Option<PathBuf> {
+    let fontstack_path = FsPath::new(fontstack);
+    let range_path = FsPath::new(range);
+    if fontstack_path.components().count() != 1
+        || fontstack_path.file_name() != Some(fontstack_path.as_os_str())
+        || range_path.components().count() != 1
+        || range_path.file_name() != Some(range_path.as_os_str())
+    {
+        return None;
+    }
+
+    let path = glyphs_root.join(fontstack_path).join(range_path);
+    path.starts_with(glyphs_root).then_some(path)
+}
+
 fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
     match error {
         StoreReadError::NotFound => anyhow!("object not found"),
@@ -820,9 +834,10 @@ fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorResponseBody, error_response};
+    use super::{ErrorResponseBody, error_response, resolve_glyph_asset_path};
     use axum::body::to_bytes;
     use axum::http::StatusCode;
+    use std::path::Path as FsPath;
 
     #[tokio::test]
     async fn error_response_preserves_public_json_contract() {
@@ -841,6 +856,29 @@ mod tests {
             ErrorResponseBody {
                 error: "bad manifest".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn resolve_glyph_asset_path_rejects_parent_traversal() {
+        let glyphs_root = FsPath::new("/tmp/fonts");
+        assert!(
+            resolve_glyph_asset_path(glyphs_root, "../Noto Sans Regular", "0-255.pbf").is_none()
+        );
+        assert!(
+            resolve_glyph_asset_path(glyphs_root, "Noto Sans Regular", "../0-255.pbf").is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_glyph_asset_path_accepts_single_segments() {
+        let glyphs_root = FsPath::new("/tmp/fonts");
+        let resolved =
+            resolve_glyph_asset_path(glyphs_root, "Noto Sans Regular", "0-255.pbf").unwrap();
+
+        assert_eq!(
+            resolved,
+            glyphs_root.join("Noto Sans Regular").join("0-255.pbf")
         );
     }
 }

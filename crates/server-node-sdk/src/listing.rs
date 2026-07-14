@@ -74,11 +74,7 @@ pub(crate) fn paginate_sorted_keys(
         None
     };
 
-    let mut entries = Vec::with_capacity(
-        max_keys
-            .min(sorted_keys.len())
-            .min(KEY_LISTING_PREALLOC_LIMIT),
-    );
+    let mut entries = Vec::with_capacity(KEY_LISTING_PREALLOC_LIMIT.min(sorted_keys.len()));
     let mut last_emitted_entry = None::<(String, KeyListingEntryKind)>;
     let mut has_more = false;
 

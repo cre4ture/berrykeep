@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use anyhow::{Context, Result, bail};
 use common::{ClusterId, DeviceId, NodeId};
@@ -175,6 +175,34 @@ pub struct NodeEnrollmentPackage {
     pub internal_tls_material: Option<BootstrapMutualTlsMaterial>,
 }
 
+fn validate_json_artifact_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        bail!("bootstrap artifact path must not be empty");
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!(
+            "bootstrap artifact path {} must not contain parent traversal",
+            path.display()
+        );
+    }
+    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        bail!(
+            "bootstrap artifact path {} must end with .json",
+            path.display()
+        );
+    }
+    if path.file_name().is_none() {
+        bail!(
+            "bootstrap artifact path {} must include a file name",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 impl ClientBootstrap {
     pub fn from_json_str(raw: &str) -> Result<Self> {
         let bootstrap =
@@ -184,6 +212,7 @@ impl ClientBootstrap {
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
+        validate_json_artifact_path(path)?;
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read client bootstrap {}", path.display()))?;
         Self::from_json_str(&raw)
@@ -195,6 +224,7 @@ impl ClientBootstrap {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
+        validate_json_artifact_path(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create directory {}", parent.display()))?;
@@ -232,6 +262,7 @@ impl NodeBootstrap {
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
+        validate_json_artifact_path(path)?;
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read node bootstrap {}", path.display()))?;
         Self::from_json_str(&raw)
@@ -243,6 +274,7 @@ impl NodeBootstrap {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
+        validate_json_artifact_path(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create directory {}", parent.display()))?;
@@ -291,6 +323,7 @@ impl NodeJoinRequest {
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
+        validate_json_artifact_path(path)?;
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read node join request {}", path.display()))?;
         Self::from_json_str(&raw)
@@ -302,6 +335,7 @@ impl NodeJoinRequest {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
+        validate_json_artifact_path(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create directory {}", parent.display()))?;
@@ -342,6 +376,7 @@ impl NodeEnrollmentPackage {
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
+        validate_json_artifact_path(path)?;
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read node enrollment {}", path.display()))?;
         Self::from_json_str(&raw)
@@ -353,6 +388,7 @@ impl NodeEnrollmentPackage {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
+        validate_json_artifact_path(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create directory {}", parent.display()))?;
@@ -889,5 +925,17 @@ mod tests {
         };
 
         assert!(bootstrap.validate().is_err());
+    }
+
+    #[test]
+    fn bootstrap_artifact_path_rejects_parent_traversal() {
+        assert!(validate_json_artifact_path(Path::new("../node-enrollment.json")).is_err());
+        assert!(validate_json_artifact_path(Path::new("managed/../node-enrollment.json")).is_err());
+    }
+
+    #[test]
+    fn bootstrap_artifact_path_requires_json_extension() {
+        assert!(validate_json_artifact_path(Path::new("node-enrollment.txt")).is_err());
+        assert!(validate_json_artifact_path(Path::new("managed/node-enrollment.json")).is_ok());
     }
 }
