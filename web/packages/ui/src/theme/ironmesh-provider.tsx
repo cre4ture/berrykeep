@@ -8,8 +8,10 @@ import {
   type ReactNode
 } from "react";
 import {
+  buildIronmeshAccentCssVariables,
   createIronmeshTheme,
   defaultIronmeshAccentColor,
+  defaultIronmeshAccentCssVariables,
   ironmeshAccentColorStorageKey,
   normalizeIronmeshAccentColor
 } from "./ironmesh-theme";
@@ -50,6 +52,14 @@ export function IronmeshMantineProvider({ children }: IronmeshMantineProviderPro
     } catch {
       // Ignore local persistence failures and keep the active in-memory theme.
     }
+  }, [accentColor]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+
+    applyAccentCssVariables(document.documentElement, accentColor);
   }, [accentColor]);
 
   useEffect(() => {
@@ -117,5 +127,13 @@ function readStoredAccentColor() {
       ?? defaultIronmeshAccentColor;
   } catch {
     return defaultIronmeshAccentColor;
+  }
+}
+
+function applyAccentCssVariables(target: HTMLElement, accentColor: string) {
+  const accentVariables = buildIronmeshAccentCssVariables(accentColor);
+
+  for (const [name, fallback] of Object.entries(defaultIronmeshAccentCssVariables)) {
+    target.style.setProperty(name, accentVariables[name] ?? fallback);
   }
 }

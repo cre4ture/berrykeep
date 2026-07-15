@@ -15,6 +15,10 @@ const black: RgbColor = { r: 0, g: 0, b: 0 };
 
 export const ironmeshTheme = createIronmeshTheme();
 
+export const defaultIronmeshAccentCssVariables = buildIronmeshAccentCssVariables(
+  defaultIronmeshAccentColor
+);
+
 export function normalizeIronmeshAccentColor(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   if (!trimmed) {
@@ -82,6 +86,17 @@ function parseHexColor(color: string): RgbColor {
   };
 }
 
+export function buildIronmeshAccentCssVariables(accentColor: string): Record<string, string> {
+  const scale = buildIronmeshColorScale(accentColor);
+
+  return {
+    "--ironmesh-accent-rgb": toRgbChannels(parseHexColor(scale[6])),
+    "--ironmesh-accent-soft-rgb": toRgbChannels(parseHexColor(scale[3])),
+    "--ironmesh-accent-deep-rgb": toRgbChannels(parseHexColor(scale[8])),
+    "--ironmesh-accent-strong-rgb": toRgbChannels(parseHexColor(scale[9]))
+  };
+}
+
 function mixColors(color: RgbColor, target: RgbColor, amount: number): string {
   return rgbToHex({
     r: mixChannel(color.r, target.r, amount),
@@ -100,4 +115,8 @@ function rgbToHex(color: RgbColor): string {
 
 function toHexChannel(value: number): string {
   return Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0");
+}
+
+function toRgbChannels(color: RgbColor): string {
+  return `${color.r}, ${color.g}, ${color.b}`;
 }
