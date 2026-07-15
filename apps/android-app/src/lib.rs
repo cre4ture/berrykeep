@@ -97,7 +97,7 @@ use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyte, jbyteArray, jint, jlong, jstring};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,6 +112,8 @@ use sync_agent_core::{
 use tokio::task::JoinHandle;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
+
+const ANDROID_CONNECTION_LOG_TARGET: &str = "ironmesh_android_connection";
 
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -135,7 +137,9 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
 fn init_android_tracing() {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
     TRACING_INIT.call_once(|| {
-        let env_filter = common::logging::env_filter_from_default_env("info");
+        let env_filter = common::logging::env_filter_from_default_env(
+            "info,ironmesh_android_connection=debug",
+        );
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with(common::logging::compact_fmt_layer())
@@ -306,11 +310,18 @@ fn install_android_connection_diagnostics_bridge() {
     INSTALL.call_once(|| {
         set_connection_diagnostics_observer(Some(Arc::new(|event| {
             let update = summarize_android_connection_diagnostics(event);
+            log_android_connection_diagnostics(&update);
             if update.last_successful_connection_unix_ms.is_none() && update.failed_attempts.is_empty()
             {
                 return;
             }
-            let _ = persist_android_connection_diagnostics(&update);
+            if let Err(error) = persist_android_connection_diagnostics(&update) {
+                tracing::warn!(
+                    target: ANDROID_CONNECTION_LOG_TARGET,
+                    error = %error,
+                    "failed to persist app connection diagnostics"
+                );
+            }
         })));
     });
 }
@@ -382,6 +393,95 @@ fn summarize_android_error(error: &str) -> String {
     } else {
         format!("{}...", &trimmed[..177])
     }
+}
+
+fn android_connection_log_state() -> &'static Mutex<HashMap<String, String>> {
+    static STATE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn log_android_connection_diagnostics(update: &AndroidAppConnectionDiagnosticsUpdate) {
+    let source_label = update
+        .source_label
+        .as_deref()
+        .unwrap_or("android client")
+        .to_string();
+    let last_failure = update.failed_attempts.first();
+    let last_failure_unix_ms = last_failure.map(|attempt| {
+        attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms)
+    });
+    let latest_event_is_failure = match (last_failure_unix_ms, update.last_successful_connection_unix_ms) {
+        (Some(failure_unix_ms), Some(success_unix_ms)) => failure_unix_ms > success_unix_ms,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let current_key = if latest_event_is_failure {
+        let Some(attempt) = last_failure else {
+            return;
+        };
+        format!(
+            "failure|{}|{}|{}|{}|{}|{}",
+            attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms),
+            attempt.method,
+            attempt.url,
+            attempt.timeout_ms.unwrap_or_default(),
+            attempt.endpoint_locator,
+            attempt.error.as_deref().unwrap_or_default()
+        )
+    } else if let Some(last_success_unix_ms) = update.last_successful_connection_unix_ms {
+        format!(
+            "success|{}|{}",
+            last_success_unix_ms,
+            update.last_successful_connection_url.as_deref().unwrap_or_default()
+        )
+    } else {
+        return;
+    };
+
+    let mut state = android_connection_log_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state
+        .get(source_label.as_str())
+        .is_some_and(|previous| previous == &current_key)
+    {
+        return;
+    }
+    state.insert(source_label.clone(), current_key);
+    drop(state);
+
+    if latest_event_is_failure {
+        let Some(attempt) = last_failure else {
+            return;
+        };
+        tracing::debug!(
+            target: ANDROID_CONNECTION_LOG_TARGET,
+            source_label = %source_label,
+            outcome = "failure",
+            endpoint_locator = %attempt.endpoint_locator,
+            path_kind = %attempt.path_kind,
+            method = %attempt.method,
+            url = %attempt.url,
+            timeout_ms = ?attempt.timeout_ms,
+            finished_unix_ms = ?attempt.finished_unix_ms,
+            last_successful_connection_unix_ms = ?update.last_successful_connection_unix_ms,
+            last_successful_connection_url = ?update.last_successful_connection_url,
+            failed_attempt_count = update.failed_attempts.len(),
+            error = ?attempt.error,
+            "app connection attempt"
+        );
+        return;
+    }
+
+    tracing::debug!(
+        target: ANDROID_CONNECTION_LOG_TARGET,
+        source_label = %source_label,
+        outcome = "success",
+        last_successful_connection_unix_ms = ?update.last_successful_connection_unix_ms,
+        last_successful_connection_url = ?update.last_successful_connection_url,
+        failed_attempt_count = update.failed_attempts.len(),
+        "app connection attempt"
+    );
 }
 
 fn android_no_backup_files_dir() -> Result<PathBuf> {

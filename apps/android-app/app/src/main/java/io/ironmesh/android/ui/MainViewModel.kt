@@ -19,6 +19,8 @@ import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import io.ironmesh.android.data.parseAllowedWifiSsidsInput
 import io.ironmesh.android.work.FolderSyncForegroundService
+import io.ironmesh.android.ui.theme.DEFAULT_IRONMESH_ACCENT_COLOR_HEX
+import io.ironmesh.android.ui.theme.normalizeIronmeshAccentColorHex
 import io.ironmesh.android.work.FolderSyncScheduler
 import io.ironmesh.android.work.FolderSyncNetworkGate
 import kotlinx.coroutines.Dispatchers
@@ -143,6 +145,7 @@ data class MainUiState(
     val galleryCurrentDirectoryDocumentId: String = GALLERY_ROOT_DOCUMENT_ID,
     val galleryCurrentDirectoryPath: String = GALLERY_ROOT_PATH,
     val gallerySort: GallerySortOption = GallerySortOption.CREATION_TIME,
+    val themeAccentColorHex: String = DEFAULT_IRONMESH_ACCENT_COLOR_HEX,
     val galleryLoading: Boolean = false,
     val loading: Boolean = false,
 )
@@ -163,12 +166,14 @@ class MainViewModel(
         val persistedDeviceAuth = IronmeshPreferences.getDeviceAuthState(getApplication())
         val persistedGalleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication())
         val persistedConnectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
+        val persistedThemeAccentColor = IronmeshPreferences.getThemeAccentColor(getApplication())
         uiState.value = uiState.value.copy(
             syncProfiles = persistedProfiles,
             deviceAuthState = persistedDeviceAuth,
             deviceLabelInput = persistedDeviceAuth.label.orEmpty(),
             galleryMode = persistedGalleryViewMode,
             appConnectionStatus = persistedConnectionStatus,
+            themeAccentColorHex = persistedThemeAccentColor,
         )
         FolderSyncScheduler.reschedule(getApplication())
         observeFolderSyncStatus()
@@ -188,6 +193,12 @@ class MainViewModel(
 
     fun updatePayload(value: String) {
         uiState.value = uiState.value.copy(payload = value)
+    }
+
+    fun updateThemeAccentColor(value: String) {
+        val normalized = normalizeIronmeshAccentColorHex(value) ?: return
+        IronmeshPreferences.setThemeAccentColor(getApplication(), normalized)
+        uiState.value = uiState.value.copy(themeAccentColorHex = normalized)
     }
 
     fun putObject() {
