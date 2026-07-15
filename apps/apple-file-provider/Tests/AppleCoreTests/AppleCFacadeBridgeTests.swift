@@ -114,6 +114,17 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(ffi.lastDeletePath, "docs/guide.txt")
     }
 
+    func testDeletePreservesDirectoryMarkerForRecursiveDeletes() throws {
+        let ffi = MockFFI()
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+
+        let delete = try bridge.delete(path: "docs/archive/", expectedRevision: nil)
+
+        XCTAssertTrue(delete.accepted)
+        XCTAssertEqual(ffi.lastDeletePath, "docs/archive/")
+    }
+
     func testMkdirReturnsNonAcceptedPlaceholderUntilDirectoryCreationExists() throws {
         let bridge = AppleCFacadeBridge(ffi: MockFFI())
         let result = try bridge.mkdir(path: "docs/new-folder")

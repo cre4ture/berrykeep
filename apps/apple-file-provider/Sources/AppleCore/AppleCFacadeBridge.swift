@@ -129,7 +129,7 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     public func delete(path: String, expectedRevision: String?) throws -> AppleMutationResult {
         _ = expectedRevision
         return try withHandle { handle in
-            let normalized = normalizedPath(path)
+            let normalized = normalizedDeleteKey(path)
             try ffi.deletePath(handle: handle, key: normalized)
             return AppleMutationResult(accepted: true)
         }
@@ -212,6 +212,15 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
             return nil
         }
         return normalized.hasSuffix("/") ? normalized : "\(normalized)/"
+    }
+
+    private func normalizedDeleteKey(_ path: String) -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = normalizedPath(trimmed)
+        guard !normalized.isEmpty, trimmed.replacingOccurrences(of: "\\", with: "/").hasSuffix("/") else {
+            return normalized
+        }
+        return "\(normalized)/"
     }
 }
 
