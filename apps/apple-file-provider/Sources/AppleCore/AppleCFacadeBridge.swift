@@ -16,6 +16,12 @@ public protocol AppleManualCBridgeFFI: Sendable {
     func putBytes(handle: AppleRustHandle, key: String, data: Data) throws -> String
     func deletePath(handle: AppleRustHandle, key: String) throws
     func movePath(handle: AppleRustHandle, fromPath: String, toPath: String, overwrite: Bool) throws
+    func connectionDiagnosticsJSON(handle: AppleRustHandle) throws -> String
+    func startWebUI(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?
+    ) throws -> String
 }
 
 public enum AppleManualCBridgeError: Error, Sendable, Equatable, LocalizedError {
@@ -150,6 +156,20 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
 
     public func refresh(cursor: String?) throws -> AppleRefreshResult {
         AppleRefreshResult(changed: false, cursor: cursor, changedPaths: [])
+    }
+
+    public func connectionDiagnosticsJSON() throws -> String {
+        try withHandle { handle in
+            try ffi.connectionDiagnosticsJSON(handle: handle)
+        }
+    }
+
+    public func startWebUI(configuration: AppleConnectionConfiguration) throws -> String {
+        try ffi.startWebUI(
+            connectionInput: configuration.normalizedConnectionInput,
+            serverCAPem: configuration.serverCAPem,
+            clientIdentityJSON: configuration.clientIdentityJSON
+        )
     }
 
     private func disconnectIfNeeded() {

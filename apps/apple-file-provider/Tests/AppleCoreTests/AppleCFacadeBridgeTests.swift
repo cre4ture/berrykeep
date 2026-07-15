@@ -146,6 +146,8 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var metadataResponseJSON = #"{"key":"","item_id":"dir:root","kind":"directory"}"#
     var putResponseJSON = #"{"item_id":"file:path:test.txt"}"#
     var fetchResponseData = Data()
+    var diagnosticsResponseJSON = #"{"endpoints":[]}"#
+    var webUIURL = "http://127.0.0.1:4100/"
 
     func createHandle(
         connectionInput: String,
@@ -199,5 +201,21 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = overwrite
         lastMoveFromPath = fromPath
         lastMoveToPath = toPath
+    }
+
+    func connectionDiagnosticsJSON(handle: AppleRustHandle) throws -> String {
+        _ = handle
+        return diagnosticsResponseJSON
+    }
+
+    func startWebUI(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?
+    ) throws -> String {
+        _ = connectionInput
+        _ = serverCAPem
+        _ = clientIdentityJSON
+        return webUIURL
     }
 }

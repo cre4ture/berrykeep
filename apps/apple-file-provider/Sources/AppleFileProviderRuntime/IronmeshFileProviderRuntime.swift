@@ -12,11 +12,13 @@ struct IronmeshBundleConfiguration {
     init(
         domainIdentifier: String,
         domainDisplayName: String = "IronMesh",
-        connectionInput: String = "127.0.0.1:18080"
+        connectionInput: String = "127.0.0.1:18080",
+        appGroupIdentifier: String? = nil
     ) {
         self.domainIdentifier = domainIdentifier.nilIfBlank ?? "dev.ironmesh.default"
         self.domainDisplayName = domainDisplayName.nilIfBlank ?? "IronMesh"
         self.connectionInput = connectionInput.nilIfBlank ?? "127.0.0.1:18080"
+        self.appGroupIdentifier = appGroupIdentifier.nilIfBlank
     }
 
     init(bundle: Bundle = .main) {
