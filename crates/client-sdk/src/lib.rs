@@ -32,13 +32,13 @@ pub use device_auth::{
 };
 pub use ironmesh_client::{
     ClientConnectionAttempt, ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent,
-    ClientEndpointDiagnostics, IronMeshClient, ObjectHeadInfo, PreferredHeadReason,
-    RequestedRange, SnapshotRestoreResponse, StoreIndexEntry, StoreIndexMediaFilter,
-    StoreIndexMediaSummary, StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder,
-    StoreIndexView, UploadMode, UploadResult, UploadSessionChunkRef, UploadSessionChunkStatus,
-    UploadSessionCompleteInfo, UploadSessionStatus, VersionConsistencyState,
-    VersionGraphSummary, VersionRecordSummary, normalize_server_base_url,
-    set_connection_diagnostics_observer, snapshot_from_store_index_entries,
+    ClientEndpointDiagnostics, IronMeshClient, ObjectHeadInfo, PreferredHeadReason, RequestedRange,
+    SnapshotRestoreResponse, StoreIndexEntry, StoreIndexMediaFilter, StoreIndexMediaSummary,
+    StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, UploadMode,
+    UploadResult, UploadSessionChunkRef, UploadSessionChunkStatus, UploadSessionCompleteInfo,
+    UploadSessionStatus, VersionConsistencyState, VersionGraphSummary, VersionRecordSummary,
+    normalize_server_base_url, set_connection_diagnostics_observer,
+    snapshot_from_store_index_entries,
 };
 pub use latency_probe::{
     LatencyProbeAssessment, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,

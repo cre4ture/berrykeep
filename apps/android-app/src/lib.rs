@@ -87,10 +87,10 @@ mod tests {
 }
 use client_sdk::{
     BootstrapEnrollmentResult, ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent,
-    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient,
-    StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView,
-    build_http_client_from_pem, build_http_client_with_identity_from_pem,
-    enroll_connection_input_blocking, set_connection_diagnostics_observer,
+    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient, StoreIndexMediaFilter,
+    StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem, enroll_connection_input_blocking,
+    set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -137,9 +137,8 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
 fn init_android_tracing() {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
     TRACING_INIT.call_once(|| {
-        let env_filter = common::logging::env_filter_from_default_env(
-            "info,ironmesh_android_connection=debug",
-        );
+        let env_filter =
+            common::logging::env_filter_from_default_env("info,ironmesh_android_connection=debug");
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with(common::logging::compact_fmt_layer())
@@ -311,7 +310,8 @@ fn install_android_connection_diagnostics_bridge() {
         set_connection_diagnostics_observer(Some(Arc::new(|event| {
             let update = summarize_android_connection_diagnostics(event);
             log_android_connection_diagnostics(&update);
-            if update.last_successful_connection_unix_ms.is_none() && update.failed_attempts.is_empty()
+            if update.last_successful_connection_unix_ms.is_none()
+                && update.failed_attempts.is_empty()
             {
                 return;
             }
@@ -386,7 +386,10 @@ fn summarize_android_connection_diagnostics(
 }
 
 fn summarize_android_error(error: &str) -> String {
-    let normalized = error.lines().find(|line| !line.trim().is_empty()).unwrap_or(error);
+    let normalized = error
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(error);
     let trimmed = normalized.trim();
     if trimmed.len() <= 180 {
         trimmed.to_string()
@@ -407,10 +410,12 @@ fn log_android_connection_diagnostics(update: &AndroidAppConnectionDiagnosticsUp
         .unwrap_or("android client")
         .to_string();
     let last_failure = update.failed_attempts.first();
-    let last_failure_unix_ms = last_failure.map(|attempt| {
-        attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms)
-    });
-    let latest_event_is_failure = match (last_failure_unix_ms, update.last_successful_connection_unix_ms) {
+    let last_failure_unix_ms =
+        last_failure.map(|attempt| attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms));
+    let latest_event_is_failure = match (
+        last_failure_unix_ms,
+        update.last_successful_connection_unix_ms,
+    ) {
         (Some(failure_unix_ms), Some(success_unix_ms)) => failure_unix_ms > success_unix_ms,
         (Some(_), None) => true,
         _ => false,
@@ -432,7 +437,10 @@ fn log_android_connection_diagnostics(update: &AndroidAppConnectionDiagnosticsUp
         format!(
             "success|{}|{}",
             last_success_unix_ms,
-            update.last_successful_connection_url.as_deref().unwrap_or_default()
+            update
+                .last_successful_connection_url
+                .as_deref()
+                .unwrap_or_default()
         )
     } else {
         return;

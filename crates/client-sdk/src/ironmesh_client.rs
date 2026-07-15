@@ -352,8 +352,8 @@ impl ClientEndpoint {
     }
 }
 
-fn connection_diagnostics_observer(
-) -> &'static RwLock<Option<Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>>> {
+fn connection_diagnostics_observer()
+-> &'static RwLock<Option<Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>>> {
     static OBSERVER: OnceLock<
         RwLock<Option<Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>>>,
     > = OnceLock::new();
