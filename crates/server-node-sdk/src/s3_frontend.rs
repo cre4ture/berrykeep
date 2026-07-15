@@ -202,6 +202,7 @@ fn build_path_style_listener_app() -> Router<ServerState> {
                 .delete(delete_object)
                 .post(post_object),
         )
+        .layer(DefaultBodyLimit::disable())
 }
 
 async fn dispatch_listener_request(
