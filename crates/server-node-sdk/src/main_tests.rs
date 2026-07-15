@@ -1528,6 +1528,7 @@ fn s3_transport_request(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn s3_transport_request_with_host(
     method: Method,
     external_uri: &str,
