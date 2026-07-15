@@ -22,6 +22,10 @@ pub struct ConnectionCandidateTransportHints {
     pub relay_url: Option<String>,
     #[serde(default)]
     pub alpn: Option<String>,
+    #[serde(default)]
+    pub direct_socket_addrs: Vec<String>,
+    #[serde(default)]
+    pub observed_socket_addrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,8 +75,23 @@ impl ConnectionCandidateTransportHints {
             Url::parse(relay_url.trim())
                 .with_context(|| format!("invalid candidate relay_url {relay_url}"))?;
         }
+        validate_socket_addr_list("direct_socket_addrs", &self.direct_socket_addrs)?;
+        validate_socket_addr_list("observed_socket_addrs", &self.observed_socket_addrs)?;
         Ok(())
     }
+}
+
+fn validate_socket_addr_list(field_name: &str, values: &[String]) -> Result<()> {
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("candidate {field_name} entries must not be blank");
+        }
+        trimmed
+            .parse::<std::net::SocketAddr>()
+            .with_context(|| format!("invalid candidate {field_name} entry {value}"))?;
+    }
+    Ok(())
 }
 
 pub fn rank_candidates(candidates: &[ConnectionCandidate]) -> Vec<ConnectionCandidate> {
@@ -176,6 +195,8 @@ mod tests {
                 transport_id: Some(" ".to_string()),
                 relay_url: None,
                 alpn: None,
+                direct_socket_addrs: Vec::new(),
+                observed_socket_addrs: Vec::new(),
             }),
         }
         .validate()
@@ -194,6 +215,8 @@ mod tests {
                 transport_id: Some("peer-key-1".to_string()),
                 relay_url: Some("not-a-url".to_string()),
                 alpn: Some("iroh/0".to_string()),
+                direct_socket_addrs: Vec::new(),
+                observed_socket_addrs: Vec::new(),
             }),
         }
         .validate()
@@ -212,9 +235,51 @@ mod tests {
                 transport_id: Some("peer-key-1".to_string()),
                 relay_url: Some("https://relay.example".to_string()),
                 alpn: Some("iroh/0".to_string()),
+                direct_socket_addrs: vec!["192.0.2.10:4242".to_string()],
+                observed_socket_addrs: vec!["203.0.113.10:55000".to_string()],
             }),
         }
         .validate()
         .expect("valid transport hints should pass");
+    }
+
+    #[test]
+    fn candidate_validation_rejects_invalid_direct_socket_addr_hint() {
+        let error = ConnectionCandidate {
+            kind: CandidateKind::DirectQuic,
+            endpoint: "iroh://peer-key-1".to_string(),
+            rtt_ms: None,
+            transport_hints: Some(ConnectionCandidateTransportHints {
+                transport_id: Some("peer-key-1".to_string()),
+                relay_url: Some("https://relay.example".to_string()),
+                alpn: Some("iroh/0".to_string()),
+                direct_socket_addrs: vec!["not-a-socket-addr".to_string()],
+                observed_socket_addrs: Vec::new(),
+            }),
+        }
+        .validate()
+        .expect_err("invalid direct socket addr should fail");
+
+        assert!(error.to_string().contains("direct_socket_addrs"));
+    }
+
+    #[test]
+    fn candidate_validation_rejects_blank_observed_socket_addr_hint() {
+        let error = ConnectionCandidate {
+            kind: CandidateKind::DirectQuic,
+            endpoint: "iroh://peer-key-1".to_string(),
+            rtt_ms: None,
+            transport_hints: Some(ConnectionCandidateTransportHints {
+                transport_id: Some("peer-key-1".to_string()),
+                relay_url: Some("https://relay.example".to_string()),
+                alpn: Some("iroh/0".to_string()),
+                direct_socket_addrs: Vec::new(),
+                observed_socket_addrs: vec![" ".to_string()],
+            }),
+        }
+        .validate()
+        .expect_err("blank observed socket addr should fail");
+
+        assert!(error.to_string().contains("observed_socket_addrs"));
     }
 }
