@@ -340,13 +340,13 @@ jobs:
       IRONMESH_IOS_EXTENSION_PROFILE_B64: ${{ secrets.IRONMESH_IOS_EXTENSION_PROFILE_B64 }}
       IRONMESH_IOS_EXPORT_METHOD: ${{ vars.IRONMESH_IOS_EXPORT_METHOD }}
       IOS_APP_SCHEME: IronmeshIosApp
-      IOS_ARCHIVE_PATH: ${{ runner.temp }}/IronmeshIosApp.xcarchive
-      IOS_DERIVED_DATA_PATH: ${{ runner.temp }}/ironmesh-ios-derived-data
-      IOS_EXPORT_OPTIONS_PATH: ${{ runner.temp }}/ironmesh-ios-export-options.plist
-      IOS_EXPORT_PATH: ${{ runner.temp }}/ironmesh-ios-export
+      IOS_ARCHIVE_PATH: ${{ github.workspace }}/.tmp/IronmeshIosApp.xcarchive
+      IOS_DERIVED_DATA_PATH: ${{ github.workspace }}/.tmp/ironmesh-ios-derived-data
+      IOS_EXPORT_OPTIONS_PATH: ${{ github.workspace }}/.tmp/ironmesh-ios-export-options.plist
+      IOS_EXPORT_PATH: ${{ github.workspace }}/.tmp/ironmesh-ios-export
       IOS_PROJECT_PATH: apps/apple-file-provider/IronmeshAppleFileProvider.xcodeproj
       IOS_TEST_SCHEME: IronmeshIosProject
-      IOS_XCRESULT_PATH: ${{ runner.temp }}/IronmeshIosProject.xcresult
+      IOS_XCRESULT_PATH: ${{ github.workspace }}/.tmp/IronmeshIosProject.xcresult
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -375,6 +375,9 @@ jobs:
 
           EXPORT_METHOD="${IRONMESH_IOS_EXPORT_METHOD:-development}"
           echo "IRONMESH_IOS_EXPORT_METHOD=${EXPORT_METHOD}" >> "$GITHUB_ENV"
+
+      - name: Create iOS temp workspace
+        run: mkdir -p "$(dirname "$IOS_ARCHIVE_PATH")"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
