@@ -114,6 +114,17 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(ffi.lastDeletePath, "docs/guide.txt")
     }
 
+    func testDeletePreservesDirectoryMarkerForRecursiveDeletes() throws {
+        let ffi = MockFFI()
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+
+        let delete = try bridge.delete(path: "docs/archive/", expectedRevision: nil)
+
+        XCTAssertTrue(delete.accepted)
+        XCTAssertEqual(ffi.lastDeletePath, "docs/archive/")
+    }
+
     func testMkdirReturnsNonAcceptedPlaceholderUntilDirectoryCreationExists() throws {
         let bridge = AppleCFacadeBridge(ffi: MockFFI())
         let result = try bridge.mkdir(path: "docs/new-folder")
@@ -135,6 +146,8 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var metadataResponseJSON = #"{"key":"","item_id":"dir:root","kind":"directory"}"#
     var putResponseJSON = #"{"item_id":"file:path:test.txt"}"#
     var fetchResponseData = Data()
+    var diagnosticsResponseJSON = #"{"endpoints":[]}"#
+    var webUIURL = "http://127.0.0.1:4100/"
 
     func createHandle(
         connectionInput: String,
@@ -199,5 +212,21 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = overwrite
         lastMoveFromPath = fromPath
         lastMoveToPath = toPath
+    }
+
+    func connectionDiagnosticsJSON(handle: AppleRustHandle) throws -> String {
+        _ = handle
+        return diagnosticsResponseJSON
+    }
+
+    func startWebUI(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?
+    ) throws -> String {
+        _ = connectionInput
+        _ = serverCAPem
+        _ = clientIdentityJSON
+        return webUIURL
     }
 }
