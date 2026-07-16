@@ -799,7 +799,6 @@
 				BUNDLE_LOADER = "";
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosProjectTests-Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -809,7 +808,6 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.ios.tests;
 				SDKROOT = iphoneos;
-				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "";
 			};
@@ -841,7 +839,6 @@
 				BUNDLE_LOADER = "";
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosProjectTests-Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -851,7 +848,6 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.ios.tests;
 				SDKROOT = iphoneos;
-				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "";
 			};

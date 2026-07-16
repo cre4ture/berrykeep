@@ -1,7 +1,6 @@
 import AppleCore
 import AppleFileProviderShared
 import XCTest
-@testable import IronmeshIosApp
 
 final class IronmeshIosProjectTests: XCTestCase {
     func testSharedPackageTypesAreAvailableToTheXcodeProject() {
