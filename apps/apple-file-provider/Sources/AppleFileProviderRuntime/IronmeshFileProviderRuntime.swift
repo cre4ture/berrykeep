@@ -165,6 +165,7 @@ final class IronmeshFileProviderService: @unchecked Sendable {
     let configuration: IronmeshBundleConfiguration
 
     private let bridge: AppleCFacadeBridge
+    private let ffi: AppleManualCBridgeFFI
     private let cache: IronmeshIdentifierPathCache
     private let settingsStore: AppleConnectionSettingsStore
     private let lock = NSLock()
@@ -177,6 +178,7 @@ final class IronmeshFileProviderService: @unchecked Sendable {
         settingsStore: AppleConnectionSettingsStore? = nil
     ) {
         self.configuration = configuration
+        self.ffi = ffi
         bridge = AppleCFacadeBridge(ffi: ffi)
         cache = IronmeshIdentifierPathCache(domainIdentifier: configuration.domainIdentifier)
         self.settingsStore = settingsStore ?? configuration.makeSettingsStore()
@@ -384,6 +386,19 @@ final class IronmeshFileProviderService: @unchecked Sendable {
     func clearStoredConnectionState() {
         settingsStore.clear()
         resetConnection()
+    }
+
+    func startWebUi() throws -> URL {
+        let connectionConfiguration = currentConnectionConfiguration()
+        let urlString = try ffi.startWebUi(
+            connectionInput: connectionConfiguration.normalizedConnectionInput,
+            serverCAPem: connectionConfiguration.serverCAPem,
+            clientIdentityJSON: connectionConfiguration.clientIdentityJSON
+        )
+        guard let url = URL(string: urlString) else {
+            throw AppleManualCBridgeError.invalidResponse("invalid Web UI URL '\(urlString)'")
+        }
+        return url
     }
 
     private func connectIfNeeded() throws {
@@ -823,8 +838,7 @@ open class IronmeshFileProviderExtensionHost: NSObject, NSFileProviderReplicated
         let supportedFields: NSFileProviderItemFields = [
             .contents,
             .filename,
-            .parentItemIdentifier,
-            .contentModificationDate
+            .parentItemIdentifier
         ]
         let actionableFields = changedFields.intersection(supportedFields)
         let unsupportedFields = changedFields.subtracting(supportedFields)

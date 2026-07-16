@@ -373,8 +373,10 @@ impl IosStorageApp {
         snapshot: Option<&str>,
         options: StoreIndexRequestOptions,
     ) -> Result<StoreIndexResponse> {
-        self.runtime
-            .block_on(self.sdk.store_index_with_options(prefix, depth, snapshot, options))
+        self.runtime.block_on(
+            self.sdk
+                .store_index_with_options(prefix, depth, snapshot, options),
+        )
     }
 
     async fn put_async(&self, key: String, data: Vec<u8>) -> Result<ApplePutResponse> {
@@ -530,10 +532,8 @@ fn start_embedded_web_ui(
         client_identity_json.clone(),
         Some("ios-web-ui".to_string()),
     )?;
-    let mut web_ui_config =
-        web_ui_backend::WebUiConfig::from_client(configured.sdk.clone()).with_service_name(
-            "ironmesh-ios",
-        );
+    let mut web_ui_config = web_ui_backend::WebUiConfig::from_client(configured.sdk.clone())
+        .with_service_name("ironmesh-ios");
     if connection_input.starts_with('{') {
         let mut bootstrap = ConnectionBootstrap::from_json_str(&connection_input)
             .context("failed to parse iOS bootstrap for embedded web ui")?;
@@ -607,6 +607,7 @@ fn metadata_json(handle: *mut c_void, key: impl AsRef<str>) -> Result<String> {
 }
 
 #[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
 fn store_index_with_options_json(
     handle: *mut c_void,
     prefix: Option<&str>,
@@ -627,7 +628,11 @@ fn store_index_with_options_json(
         limit,
         sort: parse_store_index_sort_order(sort)?,
         media_filter: parse_store_index_media_filter(media_filter)?,
-        synthesize_missing_folder_markers: true,
+        synthesize_missing_folder_markers: matches!(view, Some("tree"))
+            && offset.is_none()
+            && limit.is_none()
+            && sort.is_none()
+            && media_filter.is_none(),
     };
     serde_json::to_string(&app.store_index_with_options(prefix, depth, snapshot, options)?)
         .context("failed to serialize Apple store index response")
@@ -837,7 +842,11 @@ pub extern "C" fn ironmesh_ios_facade_store_index_with_options_json(
         } else {
             Some(offset as usize)
         };
-        let limit = if limit < 0 { None } else { Some(limit as usize) };
+        let limit = if limit < 0 {
+            None
+        } else {
+            Some(limit as usize)
+        };
         store_index_with_options_json(
             handle,
             prefix.as_deref(),
