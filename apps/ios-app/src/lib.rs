@@ -121,7 +121,8 @@ impl IosStorageApp {
         server_ca_pem: Option<String>,
         client_identity_json: Option<String>,
     ) -> Result<Self> {
-        let configured = configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?;
+        let configured =
+            configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?;
         Self::with_client(ClientNode::with_client(configured.client))
     }
 
@@ -401,8 +402,8 @@ fn start_embedded_web_ui(
         server_ca_pem.clone(),
         client_identity_json.clone(),
     )?;
-    let mut web_ui_config =
-        web_ui_backend::WebUiConfig::from_client(configured.client).with_service_name("ironmesh-ios");
+    let mut web_ui_config = web_ui_backend::WebUiConfig::from_client(configured.client)
+        .with_service_name("ironmesh-ios");
     let (_, client_bootstrap_json) = split_connection_input(connection_input.clone())?;
     if let Some(raw_bootstrap) = client_bootstrap_json {
         let mut bootstrap = ConnectionBootstrap::from_json_str(&raw_bootstrap)
