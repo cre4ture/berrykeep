@@ -151,6 +151,17 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = handle
     }
 
+    func startWebUi(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?
+    ) throws -> String {
+        _ = connectionInput
+        _ = serverCAPem
+        _ = clientIdentityJSON
+        return "http://127.0.0.1:3000"
+    }
+
     func listJSON(handle: AppleRustHandle, prefix: String?, depth: Int, snapshot: String?) throws -> String {
         _ = handle
         _ = snapshot
