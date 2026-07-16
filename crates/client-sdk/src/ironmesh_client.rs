@@ -55,6 +55,7 @@ const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
 const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
+const CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_ROUTE_RECENT_ATTEMPT_LIMIT: usize = 8;
 const CLIENT_DIRECT_MULTIPLEX_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
@@ -1390,16 +1391,26 @@ async fn probe_endpoint_background_quality(
         })?;
     let headers = request_auth_headers_for_auth(auth, &method, &url, connection_name)?;
     let started_at = std::time::Instant::now();
-    let response = execute_buffered_request_for_transport(
-        &endpoint.transport,
-        auth,
-        TransportRequestOptions::new(connection_name, None),
-        &method,
-        &url,
-        &headers,
-        &[],
+    let response = tokio::time::timeout(
+        CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
+        execute_buffered_request_for_transport(
+            &endpoint.transport,
+            auth,
+            TransportRequestOptions::new(connection_name, None),
+            &method,
+            &url,
+            &headers,
+            &[],
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "background health probe timed out after {} ms for {}",
+            CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
+            endpoint.descriptor.locator
+        )
+    })??;
     if !response.status.is_success() {
         bail!(
             "background health probe returned {} from {}",
