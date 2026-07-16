@@ -599,10 +599,10 @@ async fn collect_runtime_findings(
     if let Ok(Some(latest_scrub)) = latest_data_scrub_run_record(state).await {
         findings.extend(scrub_findings(&latest_scrub));
     }
-    if let Ok(Some(latest_repair)) = latest_repair_run_record(state).await {
-        if let Some(finding) = repair_finding(&latest_repair) {
-            findings.push(finding);
-        }
+    if let Ok(Some(latest_repair)) = latest_repair_run_record(state).await
+        && let Some(finding) = repair_finding(&latest_repair)
+    {
+        findings.push(finding);
     }
 
     findings.extend(log_pattern_findings(
@@ -929,7 +929,7 @@ async fn collect_inventory_linux(
 
 async fn enrich_storage_with_smartctl(
     storage_devices: &mut [HardwareStorageDevice],
-    storage_targets: &mut Vec<(usize, String)>,
+    storage_targets: &mut [(usize, String)],
     generated_at_unix: u64,
 ) -> (HardwareHealthCollectorStatus, Vec<HardwareHealthFinding>) {
     if storage_targets.is_empty() {
