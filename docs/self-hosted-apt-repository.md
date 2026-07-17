@@ -108,6 +108,9 @@ After publishing, check that the signed metadata and package index are visible:
 
 ```bash
 curl -fsSL https://creax.de/apt/ironmesh/dists/noble/InRelease | gpg --verify
+curl -fsSL https://creax.de/apt/ironmesh/dists/noble/main/binary-amd64/Packages.gz \
+  | gzip -dc \
+  | grep '^Package: '
 curl -fsSL https://creax.de/apt/ironmesh/dists/focal/InRelease | gpg --verify
 curl -fsSL https://creax.de/apt/ironmesh/dists/focal/main/binary-arm64/Packages.gz \
   | gzip -dc \
@@ -123,10 +126,18 @@ curl -fsSL https://creax.de/apt/ironmesh/ironmesh-archive-keyring.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/ironmesh-archive-keyring.gpg
 ```
 
-Add the apt source:
+Add exactly one apt source, matching the Ubuntu release and architecture of the
+host:
 
 ```bash
+# Ubuntu 20.04 ARM64
 echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg] https://creax.de/apt/ironmesh focal main' \
+  | sudo tee /etc/apt/sources.list.d/ironmesh.list
+```
+
+```bash
+# Ubuntu 24.04 AMD64
+echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg] https://creax.de/apt/ironmesh noble main' \
   | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```
 

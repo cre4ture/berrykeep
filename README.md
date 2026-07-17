@@ -89,7 +89,8 @@ curl -fsSL https://creax.de/apt/ironmesh/ironmesh-archive-keyring.asc \
   | sudo gpg --dearmor --yes -o /usr/share/keyrings/ironmesh-archive-keyring.gpg
 ```
 
-Add the apt source:
+Add exactly one apt source, matching the Ubuntu release and architecture of the
+host:
 
 ```bash
 # Ubuntu 20.04 ARM64
