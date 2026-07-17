@@ -911,7 +911,9 @@ async fn probe_download_source(
     let final_url = response.url().clone();
     let dataset_filename = dataset_filename_from_url(&final_url)?;
     Ok(MapDatasetProbe {
-        source_url: final_url.to_string(),
+        // Keep the stable user-provided URL. Redirect targets may be short-lived
+        // signed CDN URLs and must be re-resolved after a restart.
+        source_url: source_url.to_string(),
         dataset_filename,
         total_size_bytes,
     })
