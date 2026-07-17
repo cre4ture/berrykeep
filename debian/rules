@@ -7,16 +7,12 @@ export CARGO_HOME := $(CURDIR)/debian/cargo-home
 export CARGO_TARGET_DIR := $(CURDIR)/target/debian
 export CARGO_NET_OFFLINE := true
 
-CARGO_BIN := $(firstword \
-	$(wildcard /usr/bin/cargo-1.91) \
-	$(wildcard /usr/bin/cargo-1.89) \
-	$(wildcard /usr/bin/cargo-1.85) \
-	/usr/bin/cargo)
-RUSTC_BIN := $(firstword \
-	$(wildcard /usr/bin/rustc-1.91) \
-	$(wildcard /usr/bin/rustc-1.89) \
-	$(wildcard /usr/bin/rustc-1.85) \
-	/usr/bin/rustc)
+CARGO_BIN := $(shell for candidate in /usr/bin/cargo-1.91 /usr/bin/cargo-1.89 /usr/bin/cargo-1.85 /usr/bin/cargo; do \
+	if [ -x "$$candidate" ]; then printf '%s' "$$candidate"; exit 0; fi; \
+done; command -v cargo)
+RUSTC_BIN := $(shell for candidate in /usr/bin/rustc-1.91 /usr/bin/rustc-1.89 /usr/bin/rustc-1.85 /usr/bin/rustc; do \
+	if [ -x "$$candidate" ]; then printf '%s' "$$candidate"; exit 0; fi; \
+done; command -v rustc)
 
 CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/ironmesh-client/usr/lib/ironmesh-client
 CLIENT_EXTENSION_ROOT := $(CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
