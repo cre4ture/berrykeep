@@ -312,14 +312,14 @@ impl MediaCacheWorker {
             return Ok(None);
         }
 
-        let build_permits = self.media_cache_build_config.permits_for_estimated_bytes(
-            estimated_image_build_bytes(
-                manifest.total_size_bytes,
-                image_dimensions(&sniff_bytes, format).ok(),
-                true,
-                self.media_cache_build_config.image_limits(),
-            ),
-        );
+        let build_permits =
+            self.media_cache_build_config
+                .permits_for_estimated_bytes(estimated_image_build_bytes(
+                    manifest.total_size_bytes,
+                    image_dimensions(&sniff_bytes, format).ok(),
+                    true,
+                    self.media_cache_build_config.image_limits(),
+                ));
         let build_permit = self
             .media_cache_build_permits
             .clone()
@@ -1503,7 +1503,7 @@ fn derive_image_media_cache(
     }
 
     let image = decode_image_with_limits(payload, format, image_limits)?;
-        let rendered_thumbnail = render_thumbnail(image, orientation, grid_thumbnail_profile())?;
+    let rendered_thumbnail = render_thumbnail(image, orientation, grid_thumbnail_profile())?;
 
     metadata.thumbnail = Some(CachedThumbnailInfo {
         profile: grid_thumbnail_profile().name.to_string(),

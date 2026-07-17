@@ -12867,7 +12867,11 @@ async fn get_media_thumbnail_mobile_viewer_profile_serves_image_impl(backend: Ma
 
     let lookup = {
         let locked = lock_store(&state, "tests.state.store").await;
-        locked.lookup_media_cache(&manifest_hash).await.unwrap().unwrap()
+        locked
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
     };
     assert!(lookup.metadata.is_some());
 

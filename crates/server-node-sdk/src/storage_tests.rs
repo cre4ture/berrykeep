@@ -4664,9 +4664,7 @@ run_on_all_metadata_backends!(
     ensure_media_cache_generates_thumbnail_and_dimensions_for_png_turso
 );
 
-async fn ensure_mobile_viewer_thumbnail_profile_can_be_generated_impl(
-    backend: StorageTestBackend,
-) {
+async fn ensure_mobile_viewer_thumbnail_profile_can_be_generated_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("media-cache-mobile-viewer-jpeg").await;
 
     let put = store
