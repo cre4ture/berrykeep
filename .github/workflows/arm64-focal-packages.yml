@@ -61,13 +61,19 @@ jobs:
               CARGO_BUILD_JOBS=2 ./scripts/build-local-debs.sh \
                 --no-prepare --no-check-build-deps -- -j2
             '
+          mkdir -p artifacts
+          shopt -s nullglob
+          artifacts=(
+            ../ironmesh_*_arm64.deb
+            ../ironmesh_*_arm64.changes
+            ../ironmesh_*_arm64.buildinfo
+          )
+          ((${#artifacts[@]}))
+          cp -- "${artifacts[@]}" artifacts/
 
       - name: Upload Focal ARM64 Debian packages
         uses: actions/upload-artifact@v4
         with:
           name: focal-arm64-debian-packages
           if-no-files-found: error
-          path: |
-            ../ironmesh_*_arm64.deb
-            ../ironmesh_*_arm64.changes
-            ../ironmesh_*_arm64.buildinfo
+          path: artifacts/
