@@ -70,6 +70,9 @@ use media_cache::{
     preferred_video_seek_time,
 };
 pub(crate) use media_cache::{MediaCacheWorker, current_media_cache_metadata};
+pub(crate) use media_cache::{grid_thumbnail_profile, thumbnail_profile_from_query};
+#[cfg(test)]
+pub(crate) use media_cache::mobile_viewer_thumbnail_profile;
 use media_tools::MediaToolPaths;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
