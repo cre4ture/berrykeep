@@ -46,7 +46,6 @@ jobs:
             ubuntu:20.04 \
             bash -lc '
               set -euo pipefail
-              git config --global --add safe.directory /build/ironmesh
               export DEBIAN_FRONTEND=noninteractive
               echo "deb http://ports.ubuntu.com/ubuntu-ports focal-backports main universe" \
                 > /etc/apt/sources.list.d/focal-backports.list
@@ -55,6 +54,7 @@ jobs:
                 build-essential ca-certificates clang curl dh-sysuser git \
                 libfuse3-dev pkg-config
               apt-get install -y --no-install-recommends -t focal-backports debhelper
+              git config --global --add safe.directory /build/ironmesh
               curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs \
                 | sh -s -- -y --profile minimal --default-toolchain nightly-2026-02-17
               export PATH=/root/.cargo/bin:$PATH
