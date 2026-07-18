@@ -24,6 +24,7 @@ object RustPreferencesBridge {
     }
 
     @JvmStatic
+    @Throws(DeviceIdentityStorageException::class)
     fun updateDeviceAuthBootstrapJson(bootstrapJson: String) {
         val context = appContext ?: error("RustPreferencesBridge is not initialized")
         val current = IronmeshPreferences.getDeviceAuthState(context)
@@ -34,6 +35,7 @@ object RustPreferencesBridge {
     }
 
     @JvmStatic
+    @Throws(DeviceIdentityStorageException::class)
     fun updateDeviceAuthClientIdentityJson(clientIdentityJson: String) {
         val context = appContext ?: error("RustPreferencesBridge is not initialized")
         val current = IronmeshPreferences.getDeviceAuthState(context)
