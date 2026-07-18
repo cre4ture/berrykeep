@@ -83,17 +83,18 @@ use transport_sdk::{
     MultiplexedSession, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
     NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
     PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
-    RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelSession, RelayTunnelSessionKind,
-    RelayTunnelSourceSecurityConfig, RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity,
-    RelayWakeClient, RelayWakeEvent, RelayWakeRegistration, RendezvousClientConfig,
-    RendezvousControlClient, SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability,
-    TransportHeader, TransportPathKind, TransportRequestHead, TransportResponseHead,
-    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
-    credential_fingerprint, endpoint_id_from_candidate, load_or_create_secret_key,
-    perform_transport_client_handshake, perform_transport_server_handshake,
-    read_buffered_transport_response, read_transport_request_head, read_transport_response_head,
-    verify_signed_request_headers, write_buffered_transport_request,
-    write_buffered_transport_response, write_transport_response_head,
+    RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSecurityMode,
+    RelayTunnelSession, RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig,
+    RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity, RelayWakeClient, RelayWakeEvent,
+    RelayWakeRegistration, RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders,
+    TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader, TransportPathKind,
+    TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
+    TransportSessionRole, TransportStreamKind, credential_fingerprint, endpoint_id_from_candidate,
+    load_or_create_secret_key, perform_transport_client_handshake,
+    perform_transport_server_handshake, read_buffered_transport_response,
+    read_transport_request_head, read_transport_response_head, verify_signed_request_headers,
+    write_buffered_transport_request, write_buffered_transport_response,
+    write_transport_response_head,
 };
 use uuid::Uuid;
 
@@ -8630,6 +8631,7 @@ async fn open_relay_peer_session(
             source: PeerIdentity::Node(state.node_id),
             target: PeerIdentity::Node(node.node_id),
             session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: RelayTunnelSecurityMode::InnerMtls,
             requested_expires_in_secs: Some(300),
         })
         .await
@@ -9925,6 +9927,26 @@ fn spawn_rendezvous_relay_multiplex_session_task(
     });
 }
 
+async fn into_mode_aware_relay_target_session(
+    state: &ServerState,
+    tunnel: RelayTunnelClient,
+) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+    match tunnel.session().security_mode {
+        RelayTunnelSecurityMode::LegacyPlaintext => tunnel
+            .into_legacy_plaintext_multiplexed_session(
+                MultiplexMode::Server,
+                MultiplexConfig::default(),
+            ),
+        RelayTunnelSecurityMode::InnerMtls => {
+            let security =
+                relay_tunnel_target_security_config(state, tunnel.session().source.clone())?;
+            tunnel
+                .into_secure_multiplexed_target_session(security, MultiplexConfig::default())
+                .await
+        }
+    }
+}
+
 /// Drains any relay sources currently pending for this node against `endpoint`, in
 /// reaction to either a wake push or the periodic fallback tick. Each dial uses a
 /// short timeout since, by construction, we only call this when a source is believed
@@ -9948,11 +9970,7 @@ async fn drain_pending_relay_multiplex_targets(
                     wait_timeout_ms: Some(RENDEZVOUS_RELAY_WAKE_DRAIN_TIMEOUT_MS),
                 })
                 .await?;
-            let security =
-                relay_tunnel_target_security_config(state, tunnel.session().source.clone())?;
-            tunnel
-                .into_secure_multiplexed_target_session(security, MultiplexConfig::default())
-                .await
+            into_mode_aware_relay_target_session(state, tunnel).await
         }
         .await;
 

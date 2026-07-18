@@ -495,7 +495,7 @@ impl RendezvousControlClient {
         Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
     }
 
-    pub async fn connect_relay_multiplex_source(
+    pub async fn connect_relay_legacy_plaintext_multiplex_source(
         &self,
         ticket: &RelayTicket,
         config: MultiplexConfig,
@@ -504,10 +504,25 @@ impl RendezvousControlClient {
         multiplex_ticket.session_kind = crate::relay::RelayTunnelSessionKind::MultiplexTransport;
         self.connect_relay_tunnel_source(&multiplex_ticket)
             .await?
-            .into_multiplexed_session(MultiplexMode::Client, config)
+            .into_legacy_plaintext_multiplexed_session(MultiplexMode::Client, config)
     }
 
-    pub async fn accept_relay_multiplex_target(
+    /// Deprecated compatibility alias for
+    /// [`Self::connect_relay_legacy_plaintext_multiplex_source`].
+    #[deprecated(
+        since = "1.0.34",
+        note = "use connect_relay_legacy_plaintext_multiplex_source for explicit legacy behavior"
+    )]
+    pub async fn connect_relay_multiplex_source(
+        &self,
+        ticket: &RelayTicket,
+        config: MultiplexConfig,
+    ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+        self.connect_relay_legacy_plaintext_multiplex_source(ticket, config)
+            .await
+    }
+
+    pub async fn accept_relay_legacy_plaintext_multiplex_target(
         &self,
         request: &RelayTunnelAcceptRequest,
         config: MultiplexConfig,
@@ -516,7 +531,22 @@ impl RendezvousControlClient {
         multiplex_request.session_kind = crate::relay::RelayTunnelSessionKind::MultiplexTransport;
         self.accept_relay_tunnel(&multiplex_request)
             .await?
-            .into_multiplexed_session(MultiplexMode::Server, config)
+            .into_legacy_plaintext_multiplexed_session(MultiplexMode::Server, config)
+    }
+
+    /// Deprecated compatibility alias for
+    /// [`Self::accept_relay_legacy_plaintext_multiplex_target`].
+    #[deprecated(
+        since = "1.0.34",
+        note = "use accept_relay_legacy_plaintext_multiplex_target for explicit legacy behavior"
+    )]
+    pub async fn accept_relay_multiplex_target(
+        &self,
+        request: &RelayTunnelAcceptRequest,
+        config: MultiplexConfig,
+    ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+        self.accept_relay_legacy_plaintext_multiplex_target(request, config)
+            .await
     }
 
     async fn get_json<T>(&self, path: &str) -> Result<T>

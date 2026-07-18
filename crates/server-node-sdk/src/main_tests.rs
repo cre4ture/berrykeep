@@ -157,6 +157,145 @@ async fn relay_only_node_transport_fails_closed_without_internal_tls_identity() 
     cleanup_test_state(&state).await;
 }
 
+async fn pair_test_relay_tunnel(
+    state: &ServerState,
+    security_mode: transport_sdk::RelayTunnelSecurityMode,
+) -> (
+    transport_sdk::RelayTunnelClient,
+    transport_sdk::RelayTunnelClient,
+    tokio::task::JoinHandle<()>,
+) {
+    let relay_bind_addr = free_bind_addr();
+    let relay_url = format!("http://{relay_bind_addr}");
+    let rendezvous_state =
+        rendezvous_server::RendezvousAppState::new(rendezvous_server::RendezvousServerConfig {
+            bind_addr: relay_bind_addr,
+            public_url: format!("{relay_url}/"),
+            relay_public_urls: vec![format!("{relay_url}/")],
+            peer_rendezvous_urls: Vec::new(),
+            mtls: None,
+        })
+        .expect("mode dispatch rendezvous state should build");
+    let listener = tokio::net::TcpListener::bind(relay_bind_addr)
+        .await
+        .expect("mode dispatch rendezvous listener should bind");
+    let rendezvous_handle = tokio::spawn(async move {
+        axum::serve(listener, rendezvous_server::build_router(rendezvous_state))
+            .await
+            .expect("mode dispatch rendezvous should serve");
+    });
+    wait_for_http_status(
+        &reqwest::Client::new(),
+        &format!("{relay_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let control = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id: state.cluster_id,
+            rendezvous_urls: vec![relay_url],
+            heartbeat_interval_secs: 15,
+        },
+        None,
+        None,
+    )
+    .expect("mode dispatch rendezvous client should build");
+    let source = transport_sdk::PeerIdentity::Node(NodeId::new_v4());
+    let target = transport_sdk::PeerIdentity::Node(state.node_id);
+    let ticket = control
+        .issue_relay_ticket(&transport_sdk::RelayTicketRequest {
+            cluster_id: state.cluster_id,
+            source,
+            target: target.clone(),
+            session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+            security_mode,
+            requested_expires_in_secs: Some(10),
+        })
+        .await
+        .expect("mode dispatch relay ticket should issue");
+    let accept_request = transport_sdk::RelayTunnelAcceptRequest {
+        cluster_id: state.cluster_id,
+        target,
+        session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+        wait_timeout_ms: Some(5_000),
+    };
+
+    let (source_result, target_result) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            control.connect_relay_tunnel_source(&ticket),
+            control.accept_relay_tunnel(&accept_request)
+        )
+    })
+    .await
+    .expect("mode dispatch relay endpoints should pair in time");
+
+    (
+        source_result.expect("mode dispatch relay source should connect"),
+        target_result.expect("mode dispatch relay target should connect"),
+        rendezvous_handle,
+    )
+}
+
+#[tokio::test]
+async fn relay_target_dispatch_accepts_explicit_legacy_plaintext_without_tls_identity() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (source_tunnel, target_tunnel, rendezvous_handle) = pair_test_relay_tunnel(
+        &state,
+        transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
+    )
+    .await;
+
+    let (source_relay, source_session) = source_tunnel
+        .into_legacy_plaintext_multiplexed_session(
+            transport_sdk::MultiplexMode::Client,
+            transport_sdk::MultiplexConfig::default(),
+        )
+        .expect("explicit legacy relay source should convert");
+    let (target_relay, target_session) =
+        super::into_mode_aware_relay_target_session(&state, target_tunnel)
+            .await
+            .expect("legacy relay target should dispatch without TLS material");
+
+    assert_eq!(
+        source_relay.security_mode,
+        transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext
+    );
+    assert_eq!(target_relay.security_mode, source_relay.security_mode);
+    let _ = source_session.close().await;
+    let _ = target_session.close().await;
+    rendezvous_handle.abort();
+    let _ = rendezvous_handle.await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn relay_target_dispatch_fails_closed_for_inner_mtls_without_tls_identity() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (source_tunnel, target_tunnel, rendezvous_handle) =
+        pair_test_relay_tunnel(&state, transport_sdk::RelayTunnelSecurityMode::InnerMtls).await;
+    assert_eq!(
+        source_tunnel.session().security_mode,
+        transport_sdk::RelayTunnelSecurityMode::InnerMtls
+    );
+
+    let error = match super::into_mode_aware_relay_target_session(&state, target_tunnel).await {
+        Ok(_) => panic!("inner-mTLS relay target must not fall back to plaintext"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("relay transport requires a configured internal TLS identity")
+    );
+
+    drop(source_tunnel);
+    rendezvous_handle.abort();
+    let _ = rendezvous_handle.await;
+    cleanup_test_state(&state).await;
+}
+
 #[test]
 fn normalize_rendezvous_url_list_deduplicates_trailing_slash_variants() {
     let normalized = super::normalize_rendezvous_url_list(&[
@@ -6772,19 +6911,20 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
         .expect("rendezvous endpoint client should exist");
     let relay_state = state.clone();
     let relay_accept_task = tokio::spawn(async move {
-        let (relay_session, multiplexed) = endpoint
+        let tunnel = endpoint
             .control
-            .accept_relay_multiplex_target(
-                &transport_sdk::RelayTunnelAcceptRequest {
-                    cluster_id: relay_state.cluster_id,
-                    target: transport_sdk::PeerIdentity::Node(relay_state.node_id),
-                    session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
-                    wait_timeout_ms: Some(5_000),
-                },
-                transport_sdk::MultiplexConfig::default(),
-            )
+            .accept_relay_tunnel(&transport_sdk::RelayTunnelAcceptRequest {
+                cluster_id: relay_state.cluster_id,
+                target: transport_sdk::PeerIdentity::Node(relay_state.node_id),
+                session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+                wait_timeout_ms: Some(5_000),
+            })
             .await
             .expect("relay target accept should succeed");
+        let (relay_session, multiplexed) =
+            super::into_mode_aware_relay_target_session(&relay_state, tunnel)
+                .await
+                .expect("legacy bootstrap relay target should dispatch without inner TLS");
         let endpoint_url = endpoint.url;
         let mut multiplexed = multiplexed;
         let completed_session = super::complete_relay_multiplex_handshake(
@@ -16503,6 +16643,7 @@ async fn relay_health_check_via_rendezvous(
             source: source.clone(),
             target: transport_sdk::PeerIdentity::Node(target_node_id),
             session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: transport_sdk::RelayTunnelSecurityMode::InnerMtls,
             requested_expires_in_secs: Some(10),
         })
         .await
@@ -16896,6 +17037,7 @@ async fn spawn_plaintext_cleanup_relay_stub(
                             source: request.source,
                             target: request.target,
                             session_kind: request.session_kind,
+                            security_mode: request.security_mode,
                             relay_urls: vec![relay_base_url],
                             issued_at_unix: 1,
                             expires_at_unix: 301,
@@ -16973,6 +17115,7 @@ async fn serve_cleanup_relay_tunnel_socket(
         source: ticket.source.clone(),
         target: ticket.target.clone(),
         session_kind: ticket.session_kind,
+        security_mode: ticket.security_mode,
     };
     socket
         .send(axum::extract::ws::Message::Text(
