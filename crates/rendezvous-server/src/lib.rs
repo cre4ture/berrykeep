@@ -1232,6 +1232,7 @@ mod tests {
                 source: identity.clone(),
                 target: PeerIdentity::Node(NodeId::now_v7()),
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: transport_sdk::RelayTunnelSecurityMode::InnerMtls,
                 requested_expires_in_secs: Some(30),
             }),
         )
@@ -1249,6 +1250,7 @@ mod tests {
                     source: identity.clone(),
                     target: PeerIdentity::Node(NodeId::now_v7()),
                     session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                    security_mode: transport_sdk::RelayTunnelSecurityMode::InnerMtls,
                     relay_urls: state.config.relay_public_urls.clone(),
                     issued_at_unix: 1,
                     expires_at_unix: 2,
