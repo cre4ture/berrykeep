@@ -18,13 +18,14 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use transport_sdk::{
     BufferedTransportResponse as MultiplexBufferedTransportResponse, ConnectionCandidate,
     DecodedWebSocketMessage, DirectQuicEndpoint, DirectQuicEndpointConfig, MultiplexConfig,
-    MultiplexMode, MultiplexedSession, RelayHttpHeader, RelayTicket, RelayTicketRequest,
-    RelayTunnelControlMessage, RelayTunnelSession, RelayTunnelSessionKind,
-    RelayTunnelSourceSecurityConfig, RelayTunnelTlsIdentity, RendezvousClientConfig,
+    MultiplexMode, MultiplexedSession, PeerIdentity, RelayHttpHeader, RelayTicket,
+    RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelControlMessage,
+    RelayTunnelSession, RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig,
+    RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity, RendezvousClientConfig,
     RendezvousControlClient, TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportResponseHead,
     TransportSessionControlMessage, TransportSessionRole, TransportStreamKind, WebSocketByteStream,
     WebSocketMessageCodec, perform_transport_server_handshake, read_buffered_transport_request,
@@ -545,6 +546,7 @@ async fn spawn_upload_session_http_server(
 #[derive(Clone)]
 struct RelayTestState {
     public_url: String,
+    tunnel: RelayTestTunnelCoordinator,
     captured_request: Arc<Mutex<Option<RelayTestCapturedRequest>>>,
     health_hits: Arc<AtomicUsize>,
     issued_ticket_count: Arc<AtomicUsize>,
@@ -554,6 +556,30 @@ struct RelayTestState {
     response_status: u16,
     response_headers: Vec<RelayHttpHeader>,
     response_body: Vec<u8>,
+}
+
+struct PendingRelayTarget {
+    request: RelayTunnelAcceptRequest,
+    socket: WebSocket,
+}
+
+#[derive(Clone)]
+struct RelayTestTunnelCoordinator {
+    public_url: String,
+    pending_target: Arc<Mutex<Option<oneshot::Sender<PendingRelayTarget>>>>,
+    observed_binary_frames: Arc<Mutex<Vec<Vec<u8>>>>,
+    target_identity_override: Arc<Mutex<Option<RelayTunnelTlsIdentity>>>,
+}
+
+impl RelayTestTunnelCoordinator {
+    fn new(public_url: String) -> Self {
+        Self {
+            public_url,
+            pending_target: Arc::new(Mutex::new(None)),
+            observed_binary_frames: Arc::new(Mutex::new(Vec::new())),
+            target_identity_override: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 async fn issue_ticket(
@@ -578,7 +604,7 @@ async fn relay_tunnel_ws(
     websocket: WebSocketUpgrade,
 ) -> impl axum::response::IntoResponse {
     websocket.on_upgrade(move |socket| async move {
-        serve_relay_tunnel_test_socket(state, socket).await;
+        serve_relay_tunnel_test_connection(state, socket).await;
     })
 }
 
@@ -600,6 +626,7 @@ async fn direct_transport_ws(
 #[derive(Clone)]
 struct RelayMixedWorkloadState {
     public_url: String,
+    tunnel: RelayTestTunnelCoordinator,
     payload: Arc<Vec<u8>>,
     issued_ticket_count: Arc<AtomicUsize>,
     paired_session_count: Arc<AtomicUsize>,
@@ -626,44 +653,8 @@ async fn relay_mixed_workload_tunnel_ws(
     State(state): State<RelayMixedWorkloadState>,
     websocket: WebSocketUpgrade,
 ) -> impl axum::response::IntoResponse {
-    websocket.on_upgrade(move |mut socket| async move {
-        let initial = match socket.recv().await {
-            Some(Ok(Message::Text(text))) => text,
-            _ => return,
-        };
-        let RelayTunnelControlMessage::ConnectSource { ticket } =
-            serde_json::from_str(&initial).expect("mixed workload relay control should parse")
-        else {
-            return;
-        };
-
-        let session = RelayTunnelSession {
-            cluster_id: ticket.cluster_id,
-            session_id: ticket.session_id.clone(),
-            source: ticket.source.clone(),
-            target: ticket.target.clone(),
-            session_kind: ticket.session_kind,
-        };
-        socket
-            .send(Message::Text(
-                serde_json::to_string(&RelayTunnelControlMessage::Paired { session })
-                    .expect("mixed workload paired control should serialize")
-                    .into(),
-            ))
-            .await
-            .expect("mixed workload paired response should send");
-
-        state.paired_session_count.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(
-            ticket.session_kind,
-            RelayTunnelSessionKind::MultiplexTransport
-        );
-        serve_mixed_workload_transport_socket(
-            socket,
-            Arc::clone(&state.payload),
-            ticket.session_id,
-        )
-        .await;
+    websocket.on_upgrade(move |socket| async move {
+        serve_relay_mixed_workload_connection(state, socket).await;
     })
 }
 
@@ -755,47 +746,35 @@ impl Sink<RelayTestWsMessage> for RelayTestSocketAdapter {
     }
 }
 
-async fn serve_relay_tunnel_test_socket(state: RelayTestState, mut socket: WebSocket) {
+async fn serve_relay_tunnel_test_connection(state: RelayTestState, mut socket: WebSocket) {
     let initial = match socket.recv().await {
         Some(Ok(Message::Text(text))) => text,
         _ => return,
     };
-    let RelayTunnelControlMessage::ConnectSource { ticket } =
-        serde_json::from_str(&initial).expect("test relay tunnel control should parse")
-    else {
-        return;
-    };
-
-    let session = RelayTunnelSession {
-        cluster_id: ticket.cluster_id,
-        session_id: ticket.session_id.clone(),
-        source: ticket.source.clone(),
-        target: ticket.target.clone(),
-        session_kind: ticket.session_kind,
-    };
-    socket
-        .send(Message::Text(
-            serde_json::to_string(&RelayTunnelControlMessage::Paired { session })
-                .expect("paired control should serialize")
-                .into(),
-        ))
-        .await
-        .expect("paired response should send");
-
-    state.paired_session_count.fetch_add(1, Ordering::SeqCst);
-    assert_eq!(
-        ticket.session_kind,
-        RelayTunnelSessionKind::MultiplexTransport
-    );
-    serve_relay_multiplex_test_socket(state, socket, ticket).await;
+    match serde_json::from_str(&initial).expect("test relay tunnel control should parse") {
+        RelayTunnelControlMessage::ConnectSource { ticket } => {
+            serve_relay_tunnel_test_source(state, socket, ticket).await;
+        }
+        RelayTunnelControlMessage::AcceptTarget { request } => {
+            deliver_relay_test_target(&state.tunnel, request, socket).await;
+        }
+        _ => {}
+    }
 }
 
 async fn serve_test_multiplex_socket(state: RelayTestState, socket: WebSocket, session_id: String) {
     let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
-    let mut session =
+    let session =
         MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
             .expect("multiplexed relay test session should spawn");
+    serve_test_multiplex_session(state, session, session_id).await;
+}
 
+async fn serve_test_multiplex_session(
+    state: RelayTestState,
+    mut session: MultiplexedSession,
+    session_id: String,
+) {
     let hello = perform_transport_server_handshake(
         &mut session,
         TransportSessionControlMessage::Ready {
@@ -887,12 +866,197 @@ async fn serve_test_multiplex_socket(state: RelayTestState, socket: WebSocket, s
     }
 }
 
-async fn serve_relay_multiplex_test_socket(
+async fn serve_relay_tunnel_test_source(
     state: RelayTestState,
     socket: WebSocket,
     ticket: RelayTicket,
 ) {
-    serve_test_multiplex_socket(state, socket, ticket.session_id).await;
+    assert_eq!(
+        ticket.session_kind,
+        RelayTunnelSessionKind::MultiplexTransport
+    );
+    let target_tunnel = pair_relay_test_tunnel(&state.tunnel, socket, &ticket).await;
+    let target_security = relay_test_target_security(&state.tunnel, &ticket).await;
+    let Ok((_session, multiplexed)) = target_tunnel
+        .into_secure_multiplexed_target_session(target_security, MultiplexConfig::default())
+        .await
+    else {
+        return;
+    };
+
+    state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+    serve_test_multiplex_session(state, multiplexed, ticket.session_id).await;
+}
+
+async fn serve_relay_mixed_workload_connection(
+    state: RelayMixedWorkloadState,
+    mut socket: WebSocket,
+) {
+    let initial = match socket.recv().await {
+        Some(Ok(Message::Text(text))) => text,
+        _ => return,
+    };
+    match serde_json::from_str(&initial).expect("mixed workload relay control should parse") {
+        RelayTunnelControlMessage::ConnectSource { ticket } => {
+            assert_eq!(
+                ticket.session_kind,
+                RelayTunnelSessionKind::MultiplexTransport
+            );
+            let target_tunnel = pair_relay_test_tunnel(&state.tunnel, socket, &ticket).await;
+            let target_security = relay_test_target_security(&state.tunnel, &ticket).await;
+            let Ok((_session, multiplexed)) = target_tunnel
+                .into_secure_multiplexed_target_session(target_security, MultiplexConfig::default())
+                .await
+            else {
+                return;
+            };
+
+            state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+            serve_mixed_workload_multiplex_session(
+                multiplexed,
+                Arc::clone(&state.payload),
+                ticket.session_id,
+            )
+            .await;
+        }
+        RelayTunnelControlMessage::AcceptTarget { request } => {
+            deliver_relay_test_target(&state.tunnel, request, socket).await;
+        }
+        _ => {}
+    }
+}
+
+async fn deliver_relay_test_target(
+    coordinator: &RelayTestTunnelCoordinator,
+    request: RelayTunnelAcceptRequest,
+    socket: WebSocket,
+) {
+    let sender = coordinator.pending_target.lock().await.take();
+    if let Some(sender) = sender {
+        let _ = sender.send(PendingRelayTarget { request, socket });
+    }
+}
+
+async fn pair_relay_test_tunnel(
+    coordinator: &RelayTestTunnelCoordinator,
+    mut source_socket: WebSocket,
+    ticket: &RelayTicket,
+) -> RelayTunnelClient {
+    let (sender, receiver) = oneshot::channel();
+    {
+        let mut pending = coordinator.pending_target.lock().await;
+        assert!(
+            pending.is_none(),
+            "relay test server supports one pending target per relay endpoint"
+        );
+        *pending = Some(sender);
+    }
+
+    let target_request = RelayTunnelAcceptRequest {
+        cluster_id: ticket.cluster_id,
+        target: ticket.target.clone(),
+        session_kind: ticket.session_kind,
+        wait_timeout_ms: Some(1_000),
+    };
+    let public_url = coordinator.public_url.clone();
+    let target_task = tokio::spawn(async move {
+        RelayTunnelClient::accept_target(&public_url, None, None, target_request).await
+    });
+    let PendingRelayTarget {
+        request,
+        socket: mut target_socket,
+    } = tokio::time::timeout(Duration::from_secs(2), receiver)
+        .await
+        .expect("relay test target should connect")
+        .expect("relay test target sender should remain available");
+    assert_eq!(request.cluster_id, ticket.cluster_id);
+    assert_eq!(request.target, ticket.target);
+    assert_eq!(request.session_kind, ticket.session_kind);
+
+    let session = RelayTunnelSession {
+        cluster_id: ticket.cluster_id,
+        session_id: ticket.session_id.clone(),
+        source: ticket.source.clone(),
+        target: ticket.target.clone(),
+        session_kind: ticket.session_kind,
+    };
+    let paired = serde_json::to_string(&RelayTunnelControlMessage::Paired { session })
+        .expect("relay test paired control should serialize");
+    source_socket
+        .send(Message::Text(paired.clone().into()))
+        .await
+        .expect("relay test source paired response should send");
+    target_socket
+        .send(Message::Text(paired.into()))
+        .await
+        .expect("relay test target paired response should send");
+
+    let target_tunnel = target_task
+        .await
+        .expect("relay test target task should not panic")
+        .expect("relay test target should pair");
+    let observed_binary_frames = Arc::clone(&coordinator.observed_binary_frames);
+    tokio::spawn(async move {
+        forward_relay_test_frames(source_socket, target_socket, observed_binary_frames).await;
+    });
+    target_tunnel
+}
+
+async fn forward_relay_test_frames(
+    mut source: WebSocket,
+    mut target: WebSocket,
+    observed_binary_frames: Arc<Mutex<Vec<Vec<u8>>>>,
+) {
+    loop {
+        tokio::select! {
+            message = source.recv() => {
+                if !forward_relay_test_frame(message, &mut target, &observed_binary_frames).await {
+                    return;
+                }
+            }
+            message = target.recv() => {
+                if !forward_relay_test_frame(message, &mut source, &observed_binary_frames).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn forward_relay_test_frame(
+    message: Option<Result<Message, axum::Error>>,
+    destination: &mut WebSocket,
+    observed_binary_frames: &Arc<Mutex<Vec<Vec<u8>>>>,
+) -> bool {
+    let Some(Ok(message)) = message else {
+        return false;
+    };
+    if let Message::Binary(bytes) = &message {
+        observed_binary_frames.lock().await.push(bytes.to_vec());
+    }
+    let is_close = matches!(&message, Message::Close(_));
+    destination.send(message).await.is_ok() && !is_close
+}
+
+async fn relay_test_target_security(
+    coordinator: &RelayTestTunnelCoordinator,
+    ticket: &RelayTicket,
+) -> RelayTunnelTargetSecurityConfig {
+    let target_node_id = match ticket.target {
+        PeerIdentity::Node(node_id) => node_id,
+        PeerIdentity::Device(_) => panic!("relay test target must be a node"),
+    };
+    let identity = coordinator
+        .target_identity_override
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| relay_test_target_identity(target_node_id));
+    RelayTunnelTargetSecurityConfig {
+        expected_source: ticket.source.clone(),
+        cluster_ca_pem: RELAY_TEST_CLUSTER_CA_PEM.to_vec(),
+        identity,
+    }
 }
 
 async fn spawn_relay_test_server(
@@ -971,8 +1135,10 @@ async fn spawn_relay_test_server_at(
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener addr");
+    let public_url = format!("http://{addr}");
     let state = RelayTestState {
-        public_url: format!("http://{addr}"),
+        public_url: public_url.clone(),
+        tunnel: RelayTestTunnelCoordinator::new(public_url),
         captured_request: Arc::new(Mutex::new(None)),
         health_hits: Arc::new(AtomicUsize::new(0)),
         issued_ticket_count: Arc::new(AtomicUsize::new(0)),
@@ -1006,8 +1172,10 @@ async fn spawn_direct_transport_test_server(
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener addr");
+    let public_url = format!("http://{addr}");
     let state = RelayTestState {
-        public_url: format!("http://{addr}"),
+        public_url: public_url.clone(),
+        tunnel: RelayTestTunnelCoordinator::new(public_url),
         captured_request: Arc::new(Mutex::new(None)),
         health_hits: Arc::new(AtomicUsize::new(0)),
         issued_ticket_count: Arc::new(AtomicUsize::new(0)),
@@ -1402,15 +1570,31 @@ fn relay_header_value(headers: &[RelayHttpHeader], name: &str) -> Option<String>
         .map(|header| header.value.clone())
 }
 
+fn relay_binary_frames_contain(frames: &[Vec<u8>], plaintext: &[u8]) -> bool {
+    frames.iter().any(|frame| {
+        frame
+            .windows(plaintext.len())
+            .any(|candidate| candidate == plaintext)
+    })
+}
+
 async fn serve_mixed_workload_transport_socket(
     socket: WebSocket,
     payload: Arc<Vec<u8>>,
     session_id: String,
 ) {
     let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
-    let mut session =
+    let session =
         MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
             .expect("mixed workload session should spawn");
+    serve_mixed_workload_multiplex_session(session, payload, session_id).await;
+}
+
+async fn serve_mixed_workload_multiplex_session(
+    mut session: MultiplexedSession,
+    payload: Arc<Vec<u8>>,
+    session_id: String,
+) {
     let hello = perform_transport_server_handshake(
         &mut session,
         TransportSessionControlMessage::Ready {
@@ -1661,8 +1845,10 @@ async fn spawn_relay_mixed_workload_test_server(
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener addr");
+    let public_url = format!("http://{addr}");
     let state = RelayMixedWorkloadState {
-        public_url: format!("http://{addr}"),
+        public_url: public_url.clone(),
+        tunnel: RelayTestTunnelCoordinator::new(public_url),
         payload,
         issued_ticket_count: Arc::new(AtomicUsize::new(0)),
         paired_session_count: Arc::new(AtomicUsize::new(0)),
@@ -1686,6 +1872,127 @@ async fn spawn_relay_mixed_workload_test_server(
     )
 }
 
+const RELAY_TEST_CLUSTER_CA_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
+MIIBdTCCASegAwIBAgIUTAmHXbmklpn9cR+NYspWDqFx5HgwBQYDK2VwMCgxJjAk
+BgNVBAMMHWlyb25tZXNoLWNsaWVudC1yZWxheS10ZXN0LWNhMB4XDTI2MDcxODEy
+MDA1MFoXDTM2MDcxNTEyMDA1MFowKDEmMCQGA1UEAwwdaXJvbm1lc2gtY2xpZW50
+LXJlbGF5LXRlc3QtY2EwKjAFBgMrZXADIQB1yUvlrXRvCJTVy8rvQ9w2oNosUu31
+gWuoAjbX4Thy6qNjMGEwHQYDVR0OBBYEFBJQ+0tTV/fwjfvCNIQGfE3tDYwPMB8G
+A1UdIwQYMBaAFBJQ+0tTV/fwjfvCNIQGfE3tDYwPMA8GA1UdEwEB/wQFMAMBAf8w
+DgYDVR0PAQH/BAQDAgGGMAUGAytlcANBAGJs/RG8Ny1ChFm1IfSZ1pTSp7sVPst3
+6QYnFYEz1YZBr/1CB2aVmLC+v8lewclcjwxaybHFkHjzf6DFVeTTNwI=
+-----END CERTIFICATE-----
+"#;
+
+const RELAY_TEST_DEVICE_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
+MIIBpzCCAVmgAwIBAgIUUllSOBs4p5L3mul7N1WwCHru2iswBQYDK2VwMCgxJjAk
+BgNVBAMMHWlyb25tZXNoLWNsaWVudC1yZWxheS10ZXN0LWNhMB4XDTI2MDcxODEy
+MDA1MFoXDTM2MDcxNTEyMDA1MFowHzEdMBsGA1UEAwwUaXJvbm1lc2gtdGVzdC1k
+ZXZpY2UwKjAFBgMrZXADIQBi15Ew6XFHba9sBaO1vPKTBbwD59lMPMtzer7XVPOJ
+r6OBnTCBmjBDBgNVHREEPDA6hjh1cm46aXJvbm1lc2g6ZGV2aWNlOjExMTExMTEx
+LTExMTEtNDExMS04MTExLTExMTExMTExMTExMTATBgNVHSUEDDAKBggrBgEFBQcD
+AjAdBgNVHQ4EFgQUTk5zKB4OV29HXfRYJ/eK76AfcvAwHwYDVR0jBBgwFoAUElD7
+S1NX9/CN+8I0hAZ8Te0NjA8wBQYDK2VwA0EA4VyaAmXX5VLy9VEhfeMxtnYFG9ha
+dt/bEx3BPR+X2juAV6UQCvkGHRW6bPJRoP22p+Th5wg/h01xUVCJg+JoBA==
+-----END CERTIFICATE-----
+"#;
+
+const RELAY_TEST_DEVICE_PRIVATE_KEY_PEM: &[u8] = br#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIE54qTegcr5AxJc38901WwsLV0dJ/kCx51+wox0VwImj
+-----END PRIVATE KEY-----
+"#;
+
+const RELAY_TEST_PRIMARY_NODE_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
+MIIB8DCCAaKgAwIBAgIUUllSOBs4p5L3mul7N1WwCHru2iwwBQYDK2VwMCgxJjAk
+BgNVBAMMHWlyb25tZXNoLWNsaWVudC1yZWxheS10ZXN0LWNhMB4XDTI2MDcxODEy
+MDA1MFoXDTM2MDcxNTEyMDA1MFowJTEjMCEGA1UEAwwaaXJvbm1lc2gtdGVzdC1w
+cmltYXJ5LW5vZGUwKjAFBgMrZXADIQDycFdl3pvrCagyj2aCBV5rb/cyDXc+xJLt
+rANG7JzQVaOB4DCB3TB8BgNVHREEdTBzhjZ1cm46aXJvbm1lc2g6bm9kZToyMjIy
+MjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjKGOXVybjppcm9ubWVzaDpj
+bHVzdGVyOjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMTAdBgNV
+HSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwHQYDVR0OBBYEFN6ThF2RHLqPTFcr
+EE9hCB005JUqMB8GA1UdIwQYMBaAFBJQ+0tTV/fwjfvCNIQGfE3tDYwPMAUGAytl
+cANBAKCQ0VYwFn63G4wMc+oIt7A68CrX1ilLEaiEMjpK3TQaBa1qOgx/9MYsIyW8
+rj0YNUu1qLPLENZf0Q5Z4eRIGws=
+-----END CERTIFICATE-----
+"#;
+
+const RELAY_TEST_PRIMARY_NODE_PRIVATE_KEY_PEM: &[u8] = br#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJXGOuKLDCoh2qI1rjK5t6bbPhhK7ApCaJkZhZsiHhGL
+-----END PRIVATE KEY-----
+"#;
+
+const RELAY_TEST_FALLBACK_NODE_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
+MIIB8TCCAaOgAwIBAgIUUllSOBs4p5L3mul7N1WwCHru2i0wBQYDK2VwMCgxJjAk
+BgNVBAMMHWlyb25tZXNoLWNsaWVudC1yZWxheS10ZXN0LWNhMB4XDTI2MDcxODEy
+MDA1MFoXDTM2MDcxNTEyMDA1MFowJjEkMCIGA1UEAwwbaXJvbm1lc2gtdGVzdC1m
+YWxsYmFjay1ub2RlMCowBQYDK2VwAyEAnKh3sMFV4xLlfzF8ZLOtzY7NK+RK1eBD
+9c175jPiOHqjgeAwgd0wfAYDVR0RBHUwc4Y2dXJuOmlyb25tZXNoOm5vZGU6MzMz
+MzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzhjl1cm46aXJvbm1lc2g6
+Y2x1c3RlcjowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEwHQYD
+VR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMB0GA1UdDgQWBBQzPWmAyzGTNWt6
+vevH9xd1aokxMjAfBgNVHSMEGDAWgBQSUPtLU1f38I37wjSEBnxN7Q2MDzAFBgMr
+ZXADQQA4KhD5VwQxGmK6IjN0A4HtPrGruRBWskt4vycjigi85Es2b3GfH7Oeawsv
+FHANbgrxJJ0v8CV1Cw6mUWpotjoJ
+-----END CERTIFICATE-----
+"#;
+
+const RELAY_TEST_FALLBACK_NODE_PRIVATE_KEY_PEM: &[u8] = br#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIDmH4aJthlxYKPUD7X871wXaxo/9DGqqnu5H8UwIkmuw
+-----END PRIVATE KEY-----
+"#;
+
+fn relay_test_identity(label: &str) -> ClientIdentityMaterial {
+    let mut identity = ClientIdentityMaterial::generate(
+        relay_test_cluster_id(),
+        Some(relay_test_device_id()),
+        Some(label.to_string()),
+    )
+    .expect("relay test identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+    identity
+}
+
+fn relay_test_cluster_id() -> common::ClusterId {
+    "00000000-0000-4000-8000-000000000001"
+        .parse()
+        .expect("relay test cluster ID should parse")
+}
+
+fn relay_test_device_id() -> common::DeviceId {
+    "11111111-1111-4111-8111-111111111111"
+        .parse()
+        .expect("relay test device ID should parse")
+}
+
+fn relay_test_primary_node_id() -> NodeId {
+    "22222222-2222-4222-8222-222222222222"
+        .parse()
+        .expect("relay test primary node ID should parse")
+}
+
+fn relay_test_fallback_node_id() -> NodeId {
+    "33333333-3333-4333-8333-333333333333"
+        .parse()
+        .expect("relay test fallback node ID should parse")
+}
+
+fn relay_test_target_identity(node_id: NodeId) -> RelayTunnelTlsIdentity {
+    if node_id == relay_test_primary_node_id() {
+        RelayTunnelTlsIdentity::new(
+            RELAY_TEST_PRIMARY_NODE_CERTIFICATE_PEM,
+            RELAY_TEST_PRIMARY_NODE_PRIVATE_KEY_PEM,
+        )
+    } else if node_id == relay_test_fallback_node_id() {
+        RelayTunnelTlsIdentity::new(
+            RELAY_TEST_FALLBACK_NODE_CERTIFICATE_PEM,
+            RELAY_TEST_FALLBACK_NODE_PRIVATE_KEY_PEM,
+        )
+    } else {
+        panic!("relay test target node needs a fixture identity: {node_id}");
+    }
+}
+
 fn relay_test_client_for_public_url(
     public_url: impl Into<String>,
     identity: ClientIdentityMaterial,
@@ -1704,9 +2011,10 @@ fn relay_test_client_for_public_url(
     let source_security = RelayTunnelSourceSecurityConfig {
         cluster_id: identity.cluster_id,
         expected_target_node_id: target_node_id,
-        cluster_ca_pem: b"pending-p1-c-test-cluster-ca".to_vec(),
-        identity: RelayTunnelTlsIdentity::from_combined_pem(
-            b"pending-p1-c-test-rendezvous-identity".to_vec(),
+        cluster_ca_pem: RELAY_TEST_CLUSTER_CA_PEM.to_vec(),
+        identity: RelayTunnelTlsIdentity::new(
+            RELAY_TEST_DEVICE_CERTIFICATE_PEM,
+            RELAY_TEST_DEVICE_PRIVATE_KEY_PEM,
         ),
     };
     IronMeshClient::with_relay_transport(
@@ -1856,7 +2164,6 @@ fn parse_range_header(range: &str, total_len: usize) -> (usize, usize) {
 }
 
 #[tokio::test]
-#[ignore = "requires P1-C secure relay target integration"]
 async fn relay_transport_executes_store_index_request_with_signed_device_identity() {
     let (relay_state, server) = spawn_relay_test_server(
         200,
@@ -1918,14 +2225,8 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
     )
     .await;
 
-    let mut identity = ClientIdentityMaterial::generate(
-        uuid::Uuid::now_v7(),
-        None,
-        Some("relay-test-device".to_string()),
-    )
-    .expect("identity should generate");
-    identity.credential_pem = Some("issued-credential".to_string());
-    let target_node_id = NodeId::new_v4();
+    let identity = relay_test_identity("relay-test-device");
+    let target_node_id = relay_test_primary_node_id();
     let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
 
     let response = client
@@ -1958,7 +2259,6 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
 }
 
 #[tokio::test]
-#[ignore = "requires P1-C secure relay target integration"]
 async fn relay_transport_executes_generic_json_get_request() {
     let (relay_state, server) = spawn_relay_test_server(
         200,
@@ -1976,14 +2276,8 @@ async fn relay_transport_executes_generic_json_get_request() {
     )
     .await;
 
-    let mut identity = ClientIdentityMaterial::generate(
-        uuid::Uuid::now_v7(),
-        None,
-        Some("relay-test-device".to_string()),
-    )
-    .expect("identity should generate");
-    identity.credential_pem = Some("issued-credential".to_string());
-    let target_node_id = NodeId::new_v4();
+    let identity = relay_test_identity("relay-test-device");
+    let target_node_id = relay_test_primary_node_id();
     let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
 
     let response = client
@@ -2013,7 +2307,32 @@ async fn relay_transport_executes_generic_json_get_request() {
 }
 
 #[tokio::test]
-#[ignore = "requires P1-C secure relay target integration"]
+async fn relay_transport_rejects_target_with_wrong_node_identity() {
+    let (relay_state, server) = spawn_relay_test_server(200, Vec::new(), Vec::new()).await;
+    *relay_state.tunnel.target_identity_override.lock().await =
+        Some(relay_test_target_identity(relay_test_fallback_node_id()));
+    let client = relay_test_client(
+        &relay_state,
+        relay_test_identity("relay-wrong-target-identity-device"),
+        relay_test_primary_node_id(),
+    );
+
+    let error = client
+        .get_json_path("/cluster/status")
+        .await
+        .expect_err("relay source must reject a target certificate with the wrong node SAN");
+    assert!(
+        format!("{error:#}").contains("inner relay TLS source handshake failed"),
+        "unexpected relay target identity error: {error:#}"
+    );
+    assert!(relay_state.captured_request.lock().await.is_none());
+    assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 0);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn relay_transport_executes_relative_path_get_request() {
     let (relay_state, server) = spawn_relay_test_server(
         200,
@@ -2031,14 +2350,8 @@ async fn relay_transport_executes_relative_path_get_request() {
     )
     .await;
 
-    let mut identity = ClientIdentityMaterial::generate(
-        uuid::Uuid::now_v7(),
-        None,
-        Some("relay-test-device".to_string()),
-    )
-    .expect("identity should generate");
-    identity.credential_pem = Some("issued-credential".to_string());
-    let target_node_id = NodeId::new_v4();
+    let identity = relay_test_identity("relay-test-device");
+    let target_node_id = relay_test_primary_node_id();
     let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
 
     let response = client
@@ -2072,7 +2385,6 @@ async fn relay_transport_executes_relative_path_get_request() {
 }
 
 #[tokio::test]
-#[ignore = "requires P1-C secure relay target integration"]
 async fn relay_transport_preserves_head_response_headers() {
     let payload = b"head-only-payload";
     let (relay_state, server) = spawn_relay_test_server(
@@ -2095,14 +2407,8 @@ async fn relay_transport_preserves_head_response_headers() {
     )
     .await;
 
-    let mut identity = ClientIdentityMaterial::generate(
-        uuid::Uuid::now_v7(),
-        None,
-        Some("relay-test-device".to_string()),
-    )
-    .expect("identity should generate");
-    identity.credential_pem = Some("issued-credential".to_string());
-    let target_node_id = NodeId::new_v4();
+    let identity = relay_test_identity("relay-test-device");
+    let target_node_id = relay_test_primary_node_id();
     let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
 
     let response = client
@@ -2128,7 +2434,6 @@ async fn relay_transport_preserves_head_response_headers() {
 }
 
 #[tokio::test]
-#[ignore = "requires P1-C secure relay target integration"]
 async fn relay_transport_reuses_multiplexed_session_for_multiple_requests() {
     let (relay_state, server) = spawn_relay_test_server(
         200,
@@ -2146,14 +2451,8 @@ async fn relay_transport_reuses_multiplexed_session_for_multiple_requests() {
     )
     .await;
 
-    let mut identity = ClientIdentityMaterial::generate(
-        uuid::Uuid::now_v7(),
-        None,
-        Some("relay-test-device".to_string()),
-    )
-    .expect("identity should generate");
-    identity.credential_pem = Some("issued-credential".to_string());
-    let target_node_id = NodeId::new_v4();
+    let identity = relay_test_identity("relay-test-device");
+    let target_node_id = relay_test_primary_node_id();
     let client = relay_test_client(&relay_state, identity, target_node_id);
 
     let first = client
@@ -2175,7 +2474,6 @@ async fn relay_transport_reuses_multiplexed_session_for_multiple_requests() {
 }
 
 #[tokio::test]
-#[ignore = "requires P1-C secure relay target integration"]
 async fn relay_transport_streams_upload_session_chunks_over_object_write() {
     let response_body = serde_json::to_vec(&UploadSessionChunkResponse {
         stored: true,
@@ -2198,14 +2496,8 @@ async fn relay_transport_streams_upload_session_chunks_over_object_write() {
     )
     .await;
 
-    let mut identity = ClientIdentityMaterial::generate(
-        uuid::Uuid::now_v7(),
-        None,
-        Some("relay-upload-test-device".to_string()),
-    )
-    .expect("identity should generate");
-    identity.credential_pem = Some("issued-credential".to_string());
-    let target_node_id = NodeId::new_v4();
+    let identity = relay_test_identity("relay-upload-test-device");
+    let target_node_id = relay_test_primary_node_id();
     let client = relay_test_client(&relay_state, identity, target_node_id);
 
     let response = client
@@ -2229,13 +2521,22 @@ async fn relay_transport_streams_upload_session_chunks_over_object_write() {
         "/api/v1/store/uploads/upload-123/chunk/2"
     );
     assert_eq!(captured.body, b"chunk-body".to_vec());
+    let observed_binary_frames = relay_state
+        .tunnel
+        .observed_binary_frames
+        .lock()
+        .await
+        .clone();
+    assert!(
+        !relay_binary_frames_contain(&observed_binary_frames, b"chunk-body"),
+        "relay WebSocket binary frames must not expose the upload body"
+    );
 
     server.abort();
     let _ = server.await;
 }
 
 #[tokio::test]
-#[ignore = "requires P1-C secure relay target integration"]
 async fn relay_transport_retries_streamed_upload_chunk_after_partial_session_failure() {
     let response_body = serde_json::to_vec(&UploadSessionChunkResponse {
         stored: true,
@@ -2259,14 +2560,8 @@ async fn relay_transport_retries_streamed_upload_chunk_after_partial_session_fai
     )
     .await;
 
-    let mut identity = ClientIdentityMaterial::generate(
-        uuid::Uuid::now_v7(),
-        None,
-        Some("relay-upload-retry-test-device".to_string()),
-    )
-    .expect("identity should generate");
-    identity.credential_pem = Some("issued-credential".to_string());
-    let target_node_id = NodeId::new_v4();
+    let identity = relay_test_identity("relay-upload-retry-test-device");
+    let target_node_id = relay_test_primary_node_id();
     let client = relay_test_client(&relay_state, identity, target_node_id);
 
     let response = client
@@ -2707,7 +3002,6 @@ async fn combined_direct_transports_fail_over_to_second_endpoint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires P1-C secure relay target integration"]
 async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
     let (direct_state, direct_server) =
         spawn_direct_transport_server_that_hangs_after_first_success().await;
@@ -2730,14 +3024,8 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
     .await;
 
     let test_result = async {
-        let mut identity = ClientIdentityMaterial::generate(
-            uuid::Uuid::now_v7(),
-            None,
-            Some("direct-stall-failover-device".to_string()),
-        )
-        .expect("identity should generate");
-        identity.credential_pem = Some("issued-credential".to_string());
-        let target_node_id = NodeId::new_v4();
+        let identity = relay_test_identity("direct-stall-failover-device");
+        let target_node_id = relay_test_primary_node_id();
 
         let direct = IronMeshClient::from_direct_base_url(direct_state.public_url.clone())
             .with_client_identity(identity.clone());
@@ -2862,7 +3150,6 @@ fn ensure_operation_id_header_reuses_existing_value_for_mutating_methods() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires P1-C secure relay target integration"]
 async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fallback() {
     let (direct_state, direct_server) =
         spawn_direct_transport_server_that_stalls_object_write().await;
@@ -2871,14 +3158,8 @@ async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fa
             .await;
 
     let test_result = async {
-        let mut identity = ClientIdentityMaterial::generate(
-            uuid::Uuid::now_v7(),
-            None,
-            Some("direct-write-failover-device".to_string()),
-        )
-        .expect("identity should generate");
-        identity.credential_pem = Some("issued-credential".to_string());
-        let target_node_id = NodeId::new_v4();
+        let identity = relay_test_identity("direct-write-failover-device");
+        let target_node_id = relay_test_primary_node_id();
 
         let direct = IronMeshClient::from_direct_base_url(direct_state.public_url.clone())
             .with_client_identity(identity.clone());
@@ -3064,7 +3345,6 @@ async fn refresh_connection_route_snapshot_times_out_stalled_probe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires P1-C secure relay target integration"]
 async fn background_probe_reprioritizes_recovered_relay_endpoint() {
     let reserved_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -3097,15 +3377,9 @@ async fn background_probe_reprioritizes_recovered_relay_endpoint() {
     )
     .await;
 
-    let mut identity = ClientIdentityMaterial::generate(
-        uuid::Uuid::now_v7(),
-        None,
-        Some("relay-background-refresh-device".to_string()),
-    )
-    .expect("identity should generate");
-    identity.credential_pem = Some("issued-credential".to_string());
-    let primary_target_node_id = NodeId::new_v4();
-    let fallback_target_node_id = NodeId::new_v4();
+    let identity = relay_test_identity("relay-background-refresh-device");
+    let primary_target_node_id = relay_test_primary_node_id();
+    let fallback_target_node_id = relay_test_fallback_node_id();
     let primary = relay_test_client_for_public_url(
         primary_url.clone(),
         identity.clone(),
@@ -3509,21 +3783,15 @@ async fn direct_transport_streams_relative_s3_reads_without_blocking_small_rpcs(
 }
 
 #[tokio::test]
-#[ignore = "requires P1-C secure relay target integration"]
 async fn relay_transport_streams_relative_s3_reads_without_blocking_small_rpcs() {
     let payload = Arc::new(vec![0x7B; 1024 * 1024]);
     let payload_len = payload.len();
     let (public_url, issued_ticket_count, paired_session_count, server) =
         spawn_relay_mixed_workload_test_server(Arc::clone(&payload)).await;
 
-    let mut identity = ClientIdentityMaterial::generate(
-        uuid::Uuid::now_v7(),
-        None,
-        Some("relay-stream-relative-s3-device".to_string()),
-    )
-    .expect("identity should generate");
-    identity.credential_pem = Some("issued-credential".to_string());
-    let client = relay_test_client_for_public_url(public_url, identity, NodeId::new_v4());
+    let identity = relay_test_identity("relay-stream-relative-s3-device");
+    let client =
+        relay_test_client_for_public_url(public_url, identity, relay_test_primary_node_id());
 
     let download_client = client.clone();
     let download_future = async move {
