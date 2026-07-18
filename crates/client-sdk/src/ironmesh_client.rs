@@ -2565,19 +2565,49 @@ impl IronMeshClient {
         &self,
         method: Method,
         url: Url,
-        mut headers: Vec<RelayHttpHeader>,
+        headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
     ) -> Result<BufferedTransportResponse> {
         let routed = self
-            .execute_buffered_request_on_route_indices(
-                method,
-                url,
-                std::mem::take(&mut headers),
-                body,
-                &self.transport_router.rank_indices(),
-            )
+            .execute_buffered_request_with_route(method, url, headers, body)
             .await?;
         Ok(routed.response)
+    }
+
+    async fn execute_buffered_request_with_route(
+        &self,
+        method: Method,
+        url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_on_route_indices(
+            method,
+            url,
+            headers,
+            body,
+            &self.transport_router.rank_indices(),
+        )
+        .await
+    }
+
+    fn endpoint_context_for_route(&self, route_index: usize) -> String {
+        let Some(endpoint) = self.transport_router.endpoint(route_index) else {
+            return format!(
+                "endpoint_index={route_index} endpoint_locator=<unknown> target_node_id=<unknown>"
+            );
+        };
+
+        let target_node_id = endpoint
+            .transport
+            .target_node_id()
+            .map(|node_id| node_id.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        format!(
+            "endpoint_index={route_index} endpoint_locator={} target_node_id={target_node_id} transport_path_kind={}",
+            endpoint.descriptor.locator,
+            transport_path_kind_label(endpoint.descriptor.transport_path_kind),
+        )
     }
 
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
@@ -2613,14 +2643,16 @@ impl IronMeshClient {
         append_optional_query(&mut url, "snapshot", snapshot);
         append_optional_query(&mut url, "version", version);
 
-        let response = self
-            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+        let routed = self
+            .execute_buffered_request_with_route(Method::GET, url, Vec::new(), None)
             .await
             .with_context(|| format!("failed to GET object key={key}"))?;
+        let endpoint_context = self.endpoint_context_for_route(routed.route_index);
+        let response = routed.response;
         if !response.status.is_success() {
             bail!(
-                "object not found or inaccessible key={key}: {}",
-                response.status
+                "object not found or inaccessible key={key}: {} ({endpoint_context})",
+                response.status,
             );
         }
         Ok(response.body)
@@ -3514,14 +3546,16 @@ impl IronMeshClient {
         append_optional_query(&mut url, "snapshot", snapshot);
         append_optional_query(&mut url, "version", version);
 
-        let response = self
-            .execute_buffered_request(Method::HEAD, url, Vec::new(), None)
+        let routed = self
+            .execute_buffered_request_with_route(Method::HEAD, url, Vec::new(), None)
             .await
             .with_context(|| format!("failed to HEAD object key={key}"))?;
+        let endpoint_context = self.endpoint_context_for_route(routed.route_index);
+        let response = routed.response;
         if !response.status.is_success() {
             bail!(
-                "object not found or inaccessible key={key}: {}",
-                response.status
+                "object not found or inaccessible key={key}: {} ({endpoint_context})",
+                response.status,
             );
         }
 
