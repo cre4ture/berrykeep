@@ -467,6 +467,22 @@ test("client-ui gallery cards stay compact on narrow viewports", async ({ page }
   await expect(page.locator('[data-gallery-card-metadata="true"]')).toHaveCount(0);
 });
 
+test("client-ui gallery exposes all sort orders", async ({ page }) => {
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+
+  const gallerySort = page.getByRole("textbox", { name: "Sort" });
+  await gallerySort.click();
+  await expect(page.getByRole("option", { name: "Date (newest first)", exact: true })).toBeVisible();
+  await expect(page.getByRole("option", { name: "Date (oldest first)", exact: true })).toBeVisible();
+  await expect(page.getByRole("option", { name: "Path (A–Z)", exact: true })).toBeVisible();
+  await expect(page.getByRole("option", { name: "Path (Z–A)", exact: true })).toBeVisible();
+
+  await page.getByRole("option", { name: "Date (oldest first)", exact: true }).click();
+  await expect(gallerySort).toHaveValue("Date (oldest first)");
+});
+
 test("client-ui gallery lightbox skips unsupported iOS originals and keeps the thumbnail fallback", async ({
   page
 }) => {
@@ -1547,7 +1563,25 @@ function sortMockGalleryEntries(entries: MockStoreEntry[], sort: string | null):
     return sorted;
   }
 
-  sorted.sort((left, right) => (right.modified_at_unix ?? 0) - (left.modified_at_unix ?? 0));
+  if (sort === "path_desc") {
+    sorted.sort((left, right) => right.path.localeCompare(left.path));
+    return sorted;
+  }
+
+  if (sort === "captured_asc") {
+    sorted.sort(
+      (left, right) =>
+        (left.modified_at_unix ?? 0) - (right.modified_at_unix ?? 0) ||
+        left.path.localeCompare(right.path)
+    );
+    return sorted;
+  }
+
+  sorted.sort(
+    (left, right) =>
+      (right.modified_at_unix ?? 0) - (left.modified_at_unix ?? 0) ||
+      left.path.localeCompare(right.path)
+  );
   return sorted;
 }
 

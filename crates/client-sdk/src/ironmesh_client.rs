@@ -1846,6 +1846,8 @@ impl StoreIndexView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreIndexSortOrder {
     PathAsc,
+    PathDesc,
+    CapturedAsc,
     CapturedDesc,
 }
 
@@ -1853,6 +1855,8 @@ impl StoreIndexSortOrder {
     fn as_query_value(self) -> &'static str {
         match self {
             Self::PathAsc => "path_asc",
+            Self::PathDesc => "path_desc",
+            Self::CapturedAsc => "captured_asc",
             Self::CapturedDesc => "captured_desc",
         }
     }

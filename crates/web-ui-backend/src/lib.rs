@@ -2355,6 +2355,8 @@ async fn web_store_list(
     let sort = match query.sort.as_deref() {
         None => None,
         Some("path_asc") => Some(StoreIndexSortOrder::PathAsc),
+        Some("path_desc") => Some(StoreIndexSortOrder::PathDesc),
+        Some("captured_asc") => Some(StoreIndexSortOrder::CapturedAsc),
         Some("captured_desc") => Some(StoreIndexSortOrder::CapturedDesc),
         Some(other) => {
             return error_response(
