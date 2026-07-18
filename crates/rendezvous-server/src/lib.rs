@@ -219,7 +219,6 @@ async fn register_presence(
         state.config.mtls.is_some(),
         &authenticated_peer,
         request.cluster_id,
-        state.presence.only_cluster_id(),
         "presence registration",
     )
     .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
@@ -414,7 +413,6 @@ fn resolve_presence_cluster_id(
         mtls_enabled,
         authenticated_peer,
         effective_cluster_id,
-        single_cluster_id,
         "presence query",
     )
     .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
@@ -477,7 +475,6 @@ async fn issue_relay_ticket(
         state.config.mtls.is_some(),
         &authenticated_peer,
         request.cluster_id,
-        state.presence.only_cluster_id(),
         "relay ticket",
     )
     .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
@@ -564,7 +561,6 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
             state.config.mtls.is_some(),
             authenticated_peer,
             target_presence.registration.cluster_id,
-            Some(target_presence.registration.cluster_id),
             "bootstrap claim target",
         )
         .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
@@ -992,7 +988,6 @@ async fn establish_relay_tunnel_endpoint(
                 state.config.mtls.is_some(),
                 authenticated_peer,
                 ticket.cluster_id,
-                state.presence.only_cluster_id(),
                 "relay tunnel source",
             )?;
             state.relay_tunnel.connect_source(ticket).await
@@ -1008,7 +1003,6 @@ async fn establish_relay_tunnel_endpoint(
                 state.config.mtls.is_some(),
                 authenticated_peer,
                 request.cluster_id,
-                state.presence.only_cluster_id(),
                 "relay tunnel target",
             )?;
             state.relay_tunnel.accept_target(request).await
@@ -1128,7 +1122,6 @@ fn ensure_relay_wake_registration_authorized(
         state.config.mtls.is_some(),
         authenticated_peer,
         registration.cluster_id,
-        state.presence.only_cluster_id(),
         "relay wake target",
     )?;
     Ok(())
@@ -1279,13 +1272,10 @@ mod tests {
         .expect("mTLS rendezvous app state should build")
     }
 
-    fn authenticated_peer(
-        identity: PeerIdentity,
-        cluster_id: Option<ClusterId>,
-    ) -> MaybeAuthenticatedPeer {
+    fn authenticated_peer(identity: PeerIdentity, cluster_id: ClusterId) -> MaybeAuthenticatedPeer {
         MaybeAuthenticatedPeer(Some(AuthenticatedPeer {
             identity,
-            cluster_id,
+            cluster_id: Some(cluster_id),
         }))
     }
 
@@ -1614,7 +1604,7 @@ mod tests {
             presence_registration(cluster_b, identity.clone(), "https://node-b.example:7443"),
             None,
         );
-        let cluster_a_peer = authenticated_peer(identity.clone(), Some(cluster_a));
+        let cluster_a_peer = authenticated_peer(identity.clone(), cluster_a);
 
         let foreign_list = list_presence(
             State(state.clone()),
@@ -1728,58 +1718,6 @@ mod tests {
             own_cluster_list.entries[0].registration.cluster_id,
             cluster_a
         );
-    }
-
-    #[tokio::test]
-    async fn mtls_legacy_certificates_require_an_existing_single_cluster() {
-        let cluster_id = ClusterId::now_v7();
-        let identity = PeerIdentity::Node(NodeId::now_v7());
-        let state = mtls_test_state();
-        let legacy_peer = authenticated_peer(identity.clone(), None);
-
-        let first_registration = register_presence(
-            State(state.clone()),
-            legacy_peer.clone(),
-            MaybeObservedPeerAddr::default(),
-            Json(presence_registration(
-                cluster_id,
-                identity.clone(),
-                "https://node.example:7443",
-            )),
-        )
-        .await
-        .expect_err("legacy certificates must not establish a new tenant");
-        assert_eq!(first_registration.0, StatusCode::UNAUTHORIZED);
-
-        state.presence.register(
-            presence_registration(
-                cluster_id,
-                PeerIdentity::Node(NodeId::now_v7()),
-                "https://existing-node.example:7443",
-            ),
-            None,
-        );
-        let _ = register_presence(
-            State(state.clone()),
-            legacy_peer.clone(),
-            MaybeObservedPeerAddr::default(),
-            Json(presence_registration(
-                cluster_id,
-                identity,
-                "https://node.example:7443",
-            )),
-        )
-        .await
-        .expect("legacy certificates should remain compatible with the single tenant");
-        let list = list_presence(
-            State(state),
-            legacy_peer,
-            Query(PresenceListQuery { cluster_id: None }),
-        )
-        .await
-        .expect("legacy certificates should list the unambiguous tenant")
-        .0;
-        assert_eq!(list.registered_endpoints, 2);
     }
 
     #[tokio::test]

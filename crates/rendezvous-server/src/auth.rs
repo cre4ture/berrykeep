@@ -125,14 +125,10 @@ pub(crate) fn ensure_authenticated_peer_identity(
     }
 }
 
-/// Legacy certificates without a cluster SAN can only access the cluster that the
-/// runtime already identifies as its single tenant. They can never create or select a
-/// new tenant, while certificates with a cluster SAN must match exactly.
 pub(crate) fn ensure_authenticated_peer_cluster(
     mtls_enabled: bool,
     authenticated_peer: &MaybeAuthenticatedPeer,
-    requested_cluster_id: ClusterId,
-    legacy_single_cluster_id: Option<ClusterId>,
+    cluster_id: ClusterId,
     field_name: &str,
 ) -> Result<()> {
     if !mtls_enabled {
@@ -142,18 +138,16 @@ pub(crate) fn ensure_authenticated_peer_cluster(
     let Some(authenticated_peer) = authenticated_peer.0.as_ref() else {
         bail!("rendezvous mTLS requires an authenticated peer certificate");
     };
+    let Some(authenticated_cluster_id) = authenticated_peer.cluster_id else {
+        bail!("authenticated rendezvous client certificate is missing a cluster URI SAN");
+    };
 
-    match authenticated_peer.cluster_id {
-        Some(authenticated_cluster_id) if authenticated_cluster_id == requested_cluster_id => {
-            Ok(())
-        }
-        Some(authenticated_cluster_id) => bail!(
-            "{field_name} cluster_id {requested_cluster_id} does not match authenticated rendezvous client cluster_id {authenticated_cluster_id}"
-        ),
-        None if legacy_single_cluster_id == Some(requested_cluster_id) => Ok(()),
-        None => bail!(
-            "{field_name} cluster_id {requested_cluster_id} requires a matching authenticated cluster SAN; legacy certificates are accepted only for an already unambiguous single-cluster runtime"
-        ),
+    if authenticated_cluster_id == cluster_id {
+        Ok(())
+    } else {
+        bail!(
+            "{field_name} cluster_id {cluster_id} does not match authenticated rendezvous client cluster_id {authenticated_cluster_id}"
+        )
     }
 }
 
@@ -454,43 +448,31 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_cluster_san_rejects_a_different_requested_cluster() {
+    fn authenticated_cluster_san_authorizes_only_its_cluster() {
         let cluster_a = ClusterId::now_v7();
         let cluster_b = ClusterId::now_v7();
-        let error = ensure_authenticated_peer_cluster(
-            true,
-            &authenticated_peer(Some(cluster_a)),
-            cluster_b,
-            Some(cluster_b),
-            "presence query",
-        )
-        .expect_err("cluster A certificate must not authorize cluster B");
+        let peer = authenticated_peer(Some(cluster_a));
+
+        ensure_authenticated_peer_cluster(true, &peer, cluster_a, "presence registration")
+            .expect("matching cluster SAN should authorize the request");
+        let error =
+            ensure_authenticated_peer_cluster(true, &peer, cluster_b, "presence registration")
+                .expect_err("cluster A certificate must not authorize cluster B");
 
         assert!(error.to_string().contains("does not match"));
     }
 
     #[test]
-    fn legacy_certificate_is_allowed_only_for_an_unambiguous_cluster() {
-        let cluster_id = ClusterId::now_v7();
-        ensure_authenticated_peer_cluster(
+    fn authenticated_cluster_check_rejects_legacy_certificate_without_cluster_san() {
+        let error = ensure_authenticated_peer_cluster(
             true,
             &authenticated_peer(None),
-            cluster_id,
-            Some(cluster_id),
-            "presence query",
+            ClusterId::now_v7(),
+            "relay ticket",
         )
-        .expect("legacy certificate should work for the single effective cluster");
+        .expect_err("cluster-bound requests require a cluster SAN");
 
-        assert!(
-            ensure_authenticated_peer_cluster(
-                true,
-                &authenticated_peer(None),
-                cluster_id,
-                None,
-                "presence registration",
-            )
-            .is_err()
-        );
+        assert!(error.to_string().contains("missing a cluster URI SAN"));
     }
 
     #[test]
