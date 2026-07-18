@@ -16799,6 +16799,7 @@ async fn spawn_cleanup_relay_stub(
     };
     let target_tls = relay_target_tls_material_for_test(state, target_node_id);
     let observed_paths = Arc::new(Mutex::new(Vec::<ObservedRelayRequest>::new()));
+    let issued_ticket_count = Arc::new(AtomicUsize::new(0));
     let paired_session_count = Arc::new(AtomicUsize::new(0));
     let rendezvous_state =
         rendezvous_server::RendezvousAppState::new(rendezvous_server::RendezvousServerConfig {
@@ -16812,7 +16813,21 @@ async fn spawn_cleanup_relay_stub(
     let relay_listener = tokio::net::TcpListener::bind(relay_bind_addr)
         .await
         .expect("secure cleanup relay listener should bind");
-    let relay_app = rendezvous_server::build_router(rendezvous_state);
+    let relay_app =
+        rendezvous_server::build_router(rendezvous_state).layer(axum::middleware::from_fn({
+            let issued_ticket_count = issued_ticket_count.clone();
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let issued_ticket_count = issued_ticket_count.clone();
+                async move {
+                    if request.method() == axum::http::Method::POST
+                        && request.uri().path() == "/control/relay/ticket"
+                    {
+                        issued_ticket_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    next.run(request).await
+                }
+            }
+        }));
     let target_relay_base_url = relay_base_url.clone();
     let target_expected = transport_sdk::PeerIdentity::Node(target_node_id);
     let target_paired_session_count = paired_session_count.clone();
@@ -16837,7 +16852,7 @@ async fn spawn_cleanup_relay_stub(
 
     (
         observed_paths,
-        paired_session_count.clone(),
+        issued_ticket_count,
         paired_session_count,
         relay_handle,
     )
