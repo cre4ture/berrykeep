@@ -122,6 +122,41 @@ fn constant_time_eq_compares_equal_and_non_equal_values() {
     assert!(!constant_time_eq(b"secret", b"secret-long"));
 }
 
+#[tokio::test]
+async fn relay_only_node_transport_fails_closed_without_internal_tls_identity() {
+    let state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    let remote_node = {
+        let cluster = state.cluster.lock().await;
+        cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id != state.node_id)
+            .expect("test state should include a relay target node")
+    };
+    let rendezvous = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id: state.cluster_id,
+            rendezvous_urls: vec!["http://127.0.0.1:9".to_string()],
+            heartbeat_interval_secs: 15,
+        },
+        None,
+        None,
+    )
+    .expect("rendezvous client should build without a live endpoint");
+
+    let error = match super::open_relay_peer_session(&state, &rendezvous, &remote_node).await {
+        Ok(_) => panic!("relay-only node transport must reject missing internal TLS material"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("relay transport requires a configured internal TLS identity")
+    );
+
+    cleanup_test_state(&state).await;
+}
+
 #[test]
 fn normalize_rendezvous_url_list_deduplicates_trailing_slash_variants() {
     let normalized = super::normalize_rendezvous_url_list(&[
@@ -6833,6 +6868,25 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
 async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_multiple_endpoints() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.network.relay_mode = super::RelayMode::Required;
+    install_relay_tls_for_test_state(&mut state);
+    let source_node_id = NodeId::new_v4();
+    let source_material = super::issue_internal_node_tls_material_for_identity(
+        &state,
+        state.cluster_id,
+        source_node_id,
+        default_tls_issue_policy(),
+    )
+    .expect("relay test source TLS material should issue");
+    let source_security = transport_sdk::RelayTunnelSourceSecurityConfig {
+        cluster_id: state.cluster_id,
+        expected_target_node_id: state.node_id,
+        cluster_ca_pem: source_material.ca_cert_pem.into_bytes(),
+        identity: transport_sdk::RelayTunnelTlsIdentity::new(
+            source_material.cert_pem,
+            source_material.key_pem,
+        ),
+    };
+    let source = transport_sdk::PeerIdentity::Node(source_node_id);
 
     let bind_addr_a = free_bind_addr();
     let rendezvous_url_a = format!("http://{bind_addr_a}");
@@ -6915,26 +6969,32 @@ async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_mul
 
         let barrier_a = barrier.clone();
         let rendezvous_url_a = rendezvous_url_a.clone();
+        let source_a = source.clone();
+        let source_security_a = source_security.clone();
         let task_a = tokio::spawn(async move {
             barrier_a.wait().await;
             relay_health_check_via_rendezvous(
                 &rendezvous_url_a,
                 cluster_id,
                 target_node_id,
-                transport_sdk::PeerIdentity::Device(Uuid::now_v7()),
+                source_a,
+                source_security_a,
             )
             .await
         });
 
         let barrier_b = barrier.clone();
         let rendezvous_url_b = rendezvous_url_b.clone();
+        let source_b = source.clone();
+        let source_security_b = source_security.clone();
         let task_b = tokio::spawn(async move {
             barrier_b.wait().await;
             relay_health_check_via_rendezvous(
                 &rendezvous_url_b,
                 cluster_id,
                 target_node_id,
-                transport_sdk::PeerIdentity::Device(Uuid::now_v7()),
+                source_b,
+                source_security_b,
             )
             .await
         });
@@ -16014,6 +16074,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     configure_test_relay_outbound_clients(&state, &relay_base_url).await;
     let (observed_paths, issued_ticket_count, paired_session_count, relay_handle) =
         spawn_cleanup_relay_stub(
+            &mut state,
             relay_bind_addr,
             relay_base_url.clone(),
             expected_target,
@@ -16254,6 +16315,7 @@ async fn execute_peer_request_reuses_warm_relay_session() {
 
     let (observed_paths, issued_ticket_count, paired_session_count, relay_handle) =
         spawn_cleanup_relay_stub(
+            &mut state,
             relay_bind_addr,
             relay_base_url.clone(),
             transport_sdk::PeerIdentity::Node(remote_node.node_id),
@@ -16341,6 +16403,7 @@ async fn execute_peer_request_reconnects_after_relay_session_closes() {
 
     let (observed_paths, issued_ticket_count, paired_session_count, relay_handle) =
         spawn_cleanup_relay_stub(
+            &mut state,
             relay_bind_addr,
             relay_base_url.clone(),
             transport_sdk::PeerIdentity::Node(remote_node.node_id),
@@ -16422,6 +16485,7 @@ async fn relay_health_check_via_rendezvous(
     cluster_id: ClusterId,
     target_node_id: NodeId,
     source: transport_sdk::PeerIdentity,
+    source_security: transport_sdk::RelayTunnelSourceSecurityConfig,
 ) -> Result<StatusCode, String> {
     let rendezvous = transport_sdk::RendezvousControlClient::new(
         transport_sdk::RendezvousClientConfig {
@@ -16443,10 +16507,17 @@ async fn relay_health_check_via_rendezvous(
         })
         .await
         .map_err(|err| format!("failed issuing relay ticket via {rendezvous_url}: {err}"))?;
-    let (_relay_session, session) = rendezvous
-        .connect_relay_multiplex_source(&ticket, transport_sdk::MultiplexConfig::default())
+    let tunnel = rendezvous
+        .connect_relay_tunnel_source(&ticket)
         .await
-        .map_err(|err| format!("failed opening relay session via {rendezvous_url}: {err}"))?;
+        .map_err(|err| format!("failed opening relay tunnel via {rendezvous_url}: {err}"))?;
+    let (_relay_session, session) = tunnel
+        .into_secure_multiplexed_source_session(
+            source_security,
+            transport_sdk::MultiplexConfig::default(),
+        )
+        .await
+        .map_err(|err| format!("failed securing relay session via {rendezvous_url}: {err}"))?;
     transport_sdk::perform_transport_client_handshake(
         &session,
         transport_sdk::TransportSessionControlMessage::Hello {
@@ -16517,7 +16588,263 @@ impl RelayStubResponse {
     }
 }
 
+#[derive(Clone)]
+struct RelayTargetTlsMaterial {
+    cluster_ca_pem: Vec<u8>,
+    identity: transport_sdk::RelayTunnelTlsIdentity,
+}
+
+struct SecureCleanupRelayTarget {
+    relay_base_url: String,
+    cluster_id: ClusterId,
+    expected_target: transport_sdk::PeerIdentity,
+    target_tls: RelayTargetTlsMaterial,
+    paired_session_count: Arc<AtomicUsize>,
+    relay_paths: Arc<Mutex<Vec<ObservedRelayRequest>>>,
+    max_requests_per_session: Option<usize>,
+    response: RelayStubResponse,
+}
+
+fn install_relay_tls_for_test_state(state: &mut ServerState) {
+    if state.network.internal_tls_runtime.is_some() {
+        return;
+    }
+
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.network.cluster_ca_pem = Some(cluster_ca_pem);
+    state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
+    let material = super::issue_internal_node_tls_material_for_identity(
+        state,
+        state.cluster_id,
+        state.node_id,
+        default_tls_issue_policy(),
+    )
+    .expect("test source internal TLS material should issue");
+    let tls_dir = state.data_dir.join("relay-test-tls");
+    std::fs::create_dir_all(&tls_dir).expect("test relay TLS directory should create");
+    let ca_cert_path = tls_dir.join("cluster-ca.pem");
+    let cert_path = tls_dir.join("source.pem");
+    let key_path = tls_dir.join("source.key");
+    std::fs::write(&ca_cert_path, &material.ca_cert_pem)
+        .expect("test cluster CA certificate should write");
+    std::fs::write(&cert_path, &material.cert_pem).expect("test source certificate should write");
+    std::fs::write(&key_path, &material.key_pem).expect("test source key should write");
+
+    state.network.internal_tls_runtime = Some(super::InternalTlsRuntime {
+        config: super::build_internal_mtls_rustls_config(&ca_cert_path, &cert_path, &key_path)
+            .expect("test internal TLS runtime should build"),
+        ca_cert_path,
+        cert_path,
+        key_path,
+        metadata_path: None,
+    });
+}
+
+fn relay_target_tls_material_for_test(
+    state: &ServerState,
+    target_node_id: NodeId,
+) -> RelayTargetTlsMaterial {
+    let material = super::issue_internal_node_tls_material_for_identity(
+        state,
+        state.cluster_id,
+        target_node_id,
+        default_tls_issue_policy(),
+    )
+    .expect("test target internal TLS material should issue");
+    RelayTargetTlsMaterial {
+        cluster_ca_pem: material.ca_cert_pem.into_bytes(),
+        identity: transport_sdk::RelayTunnelTlsIdentity::new(material.cert_pem, material.key_pem),
+    }
+}
+
+async fn serve_secure_cleanup_relay_targets(target: SecureCleanupRelayTarget) {
+    let SecureCleanupRelayTarget {
+        relay_base_url,
+        cluster_id,
+        expected_target,
+        target_tls,
+        paired_session_count,
+        relay_paths,
+        max_requests_per_session,
+        response,
+    } = target;
+    let control = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id,
+            rendezvous_urls: vec![relay_base_url],
+            heartbeat_interval_secs: 15,
+        },
+        None,
+        None,
+    )
+    .expect("secure cleanup relay target control should build");
+
+    loop {
+        let tunnel = control
+            .accept_relay_tunnel(&transport_sdk::RelayTunnelAcceptRequest {
+                cluster_id,
+                target: expected_target.clone(),
+                session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+                wait_timeout_ms: Some(3_000),
+            })
+            .await
+            .expect("secure cleanup relay target should accept a tunnel");
+        let relay_session = tunnel.session().clone();
+        assert_eq!(relay_session.target, expected_target);
+        let (_, session) = tunnel
+            .into_secure_multiplexed_target_session(
+                transport_sdk::RelayTunnelTargetSecurityConfig {
+                    expected_source: relay_session.source,
+                    cluster_ca_pem: target_tls.cluster_ca_pem.clone(),
+                    identity: target_tls.identity.clone(),
+                },
+                transport_sdk::MultiplexConfig::default(),
+            )
+            .await
+            .expect("secure cleanup relay target should establish inner mTLS");
+        paired_session_count.fetch_add(1, Ordering::SeqCst);
+        serve_cleanup_relay_multiplexed_session(
+            session,
+            relay_paths.clone(),
+            max_requests_per_session,
+            response.clone(),
+        )
+        .await;
+    }
+}
+
+async fn serve_cleanup_relay_multiplexed_session(
+    mut session: transport_sdk::MultiplexedSession,
+    relay_paths: Arc<Mutex<Vec<ObservedRelayRequest>>>,
+    max_requests_per_session: Option<usize>,
+    response: RelayStubResponse,
+) {
+    let hello = transport_sdk::perform_transport_server_handshake(
+        &mut session,
+        transport_sdk::TransportSessionControlMessage::Ready {
+            protocol_version: transport_sdk::TRANSPORT_PROTOCOL_VERSION,
+            session_id: "cleanup-relay-session".to_string(),
+            max_concurrent_streams: transport_sdk::MultiplexConfig::default().max_num_streams,
+        },
+    )
+    .await
+    .expect("relay cleanup transport handshake should succeed");
+    assert!(matches!(
+        hello,
+        transport_sdk::TransportSessionControlMessage::Hello {
+            role: transport_sdk::TransportSessionRole::Node,
+            ..
+        }
+    ));
+
+    let mut served_requests = 0usize;
+    while let Some(mut stream) = session
+        .accept_stream()
+        .await
+        .expect("relay cleanup stream accept should succeed")
+    {
+        let request = transport_sdk::read_transport_request_head(&mut stream)
+            .await
+            .expect("relay cleanup request should decode");
+        if !request.end_of_stream {
+            let mut ignored = Vec::new();
+            stream
+                .read_to_end(&mut ignored)
+                .await
+                .expect("relay cleanup request body should drain");
+        }
+        relay_paths.lock().await.push(ObservedRelayRequest {
+            kind: request.kind,
+            path: request.path.clone(),
+        });
+        transport_sdk::write_buffered_transport_response(
+            &mut stream,
+            &transport_sdk::BufferedTransportResponse {
+                request_id: request.request_id,
+                status: response.status.as_u16(),
+                headers: response.headers.clone(),
+                body: response.body.clone(),
+            },
+        )
+        .await
+        .expect("relay cleanup response should write");
+
+        served_requests += 1;
+        if max_requests_per_session.is_some_and(|limit| served_requests >= limit) {
+            break;
+        }
+    }
+
+    let _ = session.close().await;
+}
+
 async fn spawn_cleanup_relay_stub(
+    state: &mut ServerState,
+    relay_bind_addr: SocketAddr,
+    relay_base_url: String,
+    expected_target: transport_sdk::PeerIdentity,
+    max_requests_per_session: Option<usize>,
+    response: RelayStubResponse,
+) -> (
+    Arc<Mutex<Vec<ObservedRelayRequest>>>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    install_relay_tls_for_test_state(state);
+    let cluster_id = state.cluster_id;
+    let target_node_id = match expected_target {
+        transport_sdk::PeerIdentity::Node(node_id) => node_id,
+        _ => panic!("secure cleanup relay target must be a node"),
+    };
+    let target_tls = relay_target_tls_material_for_test(state, target_node_id);
+    let observed_paths = Arc::new(Mutex::new(Vec::<ObservedRelayRequest>::new()));
+    let paired_session_count = Arc::new(AtomicUsize::new(0));
+    let rendezvous_state =
+        rendezvous_server::RendezvousAppState::new(rendezvous_server::RendezvousServerConfig {
+            bind_addr: relay_bind_addr,
+            public_url: format!("{relay_base_url}/"),
+            relay_public_urls: vec![format!("{relay_base_url}/")],
+            peer_rendezvous_urls: Vec::new(),
+            mtls: None,
+        })
+        .expect("secure cleanup rendezvous state should build");
+    let relay_listener = tokio::net::TcpListener::bind(relay_bind_addr)
+        .await
+        .expect("secure cleanup relay listener should bind");
+    let relay_app = rendezvous_server::build_router(rendezvous_state);
+    let target_relay_base_url = relay_base_url.clone();
+    let target_expected = transport_sdk::PeerIdentity::Node(target_node_id);
+    let target_paired_session_count = paired_session_count.clone();
+    let target_observed_paths = observed_paths.clone();
+    let relay_handle = tokio::spawn(async move {
+        tokio::select! {
+            result = axum::serve(relay_listener, relay_app) => {
+                result.expect("secure cleanup relay should serve");
+            }
+            _ = serve_secure_cleanup_relay_targets(SecureCleanupRelayTarget {
+                relay_base_url: target_relay_base_url,
+                cluster_id,
+                expected_target: target_expected,
+                target_tls,
+                paired_session_count: target_paired_session_count,
+                relay_paths: target_observed_paths,
+                max_requests_per_session,
+                response,
+            }) => {}
+        }
+    });
+
+    (
+        observed_paths,
+        paired_session_count.clone(),
+        paired_session_count,
+        relay_handle,
+    )
+}
+
+#[allow(dead_code)]
+async fn spawn_plaintext_cleanup_relay_stub(
     relay_bind_addr: SocketAddr,
     relay_base_url: String,
     expected_target: transport_sdk::PeerIdentity,
@@ -16850,6 +17177,7 @@ async fn execute_peer_request_streams_object_reads_over_relay() {
     let object_body = vec![b'O'; 1024 * 1024];
     let (observed_requests, issued_ticket_count, paired_session_count, relay_handle) =
         spawn_cleanup_relay_stub(
+            &mut state,
             relay_bind_addr,
             relay_base_url.clone(),
             transport_sdk::PeerIdentity::Node(remote_node.node_id),

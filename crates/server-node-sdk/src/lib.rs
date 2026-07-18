@@ -84,6 +84,7 @@ use transport_sdk::{
     NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
     PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
     RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelSession, RelayTunnelSessionKind,
+    RelayTunnelSourceSecurityConfig, RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity,
     RelayWakeClient, RelayWakeEvent, RelayWakeRegistration, RendezvousClientConfig,
     RendezvousControlClient, SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability,
     TransportHeader, TransportPathKind, TransportRequestHead, TransportResponseHead,
@@ -8549,11 +8550,80 @@ async fn ensure_direct_quic_peer_session(
     Ok(cached)
 }
 
+fn relay_tunnel_tls_material(state: &ServerState) -> Result<(Vec<u8>, RelayTunnelTlsIdentity)> {
+    let internal_tls = state
+        .network
+        .internal_tls_runtime
+        .as_ref()
+        .context("relay transport requires a configured internal TLS identity")?;
+
+    let cluster_ca_pem = std::fs::read(&internal_tls.ca_cert_path).with_context(|| {
+        format!(
+            "relay transport failed reading cluster CA certificate {}",
+            internal_tls.ca_cert_path.display()
+        )
+    })?;
+    if cluster_ca_pem.is_empty() {
+        bail!("relay transport cluster CA certificate must not be empty");
+    }
+
+    let certificate_chain_pem = std::fs::read(&internal_tls.cert_path).with_context(|| {
+        format!(
+            "relay transport failed reading internal TLS certificate {}",
+            internal_tls.cert_path.display()
+        )
+    })?;
+    if certificate_chain_pem.is_empty() {
+        bail!("relay transport internal TLS certificate must not be empty");
+    }
+
+    let private_key_pem = std::fs::read(&internal_tls.key_path).with_context(|| {
+        format!(
+            "relay transport failed reading internal TLS private key {}",
+            internal_tls.key_path.display()
+        )
+    })?;
+    if private_key_pem.is_empty() {
+        bail!("relay transport internal TLS private key must not be empty");
+    }
+
+    Ok((
+        cluster_ca_pem,
+        RelayTunnelTlsIdentity::new(certificate_chain_pem, private_key_pem),
+    ))
+}
+
+fn relay_tunnel_source_security_config(
+    state: &ServerState,
+    expected_target_node_id: NodeId,
+) -> Result<RelayTunnelSourceSecurityConfig> {
+    let (cluster_ca_pem, identity) = relay_tunnel_tls_material(state)?;
+    Ok(RelayTunnelSourceSecurityConfig {
+        cluster_id: state.cluster_id,
+        expected_target_node_id,
+        cluster_ca_pem,
+        identity,
+    })
+}
+
+fn relay_tunnel_target_security_config(
+    state: &ServerState,
+    expected_source: PeerIdentity,
+) -> Result<RelayTunnelTargetSecurityConfig> {
+    let (cluster_ca_pem, identity) = relay_tunnel_tls_material(state)?;
+    Ok(RelayTunnelTargetSecurityConfig {
+        expected_source,
+        cluster_ca_pem,
+        identity,
+    })
+}
+
 async fn open_relay_peer_session(
     state: &ServerState,
     rendezvous: &RendezvousControlClient,
     node: &NodeDescriptor,
 ) -> Result<EstablishedPeerRelaySession> {
+    let security = relay_tunnel_source_security_config(state, node.node_id)?;
     let ticket = rendezvous
         .issue_relay_ticket(&RelayTicketRequest {
             cluster_id: state.cluster_id,
@@ -8564,12 +8634,16 @@ async fn open_relay_peer_session(
         })
         .await
         .with_context(|| format!("failed issuing relay ticket for node {}", node.node_id))?;
-    let (relay_session, session) = rendezvous
-        .connect_relay_multiplex_source(&ticket, MultiplexConfig::default())
+    let tunnel = rendezvous
+        .connect_relay_tunnel_source(&ticket)
+        .await
+        .with_context(|| format!("failed opening relay tunnel for node {}", node.node_id))?;
+    let (relay_session, session) = tunnel
+        .into_secure_multiplexed_source_session(security, MultiplexConfig::default())
         .await
         .with_context(|| {
             format!(
-                "failed opening multiplex relay session for node {}",
+                "failed opening secure multiplex relay session for node {}",
                 node.node_id
             )
         })?;
@@ -9864,18 +9938,23 @@ async fn drain_pending_relay_multiplex_targets(
     let node_id = state.node_id;
 
     for _ in 0..RENDEZVOUS_RELAY_WAKE_DRAIN_MAX_ITERATIONS {
-        let result = endpoint
-            .control
-            .accept_relay_multiplex_target(
-                &RelayTunnelAcceptRequest {
+        let result = async {
+            let tunnel = endpoint
+                .control
+                .accept_relay_tunnel(&RelayTunnelAcceptRequest {
                     cluster_id,
                     target: PeerIdentity::Node(node_id),
                     session_kind: RelayTunnelSessionKind::MultiplexTransport,
                     wait_timeout_ms: Some(RENDEZVOUS_RELAY_WAKE_DRAIN_TIMEOUT_MS),
-                },
-                MultiplexConfig::default(),
-            )
-            .await;
+                })
+                .await?;
+            let security =
+                relay_tunnel_target_security_config(state, tunnel.session().source.clone())?;
+            tunnel
+                .into_secure_multiplexed_target_session(security, MultiplexConfig::default())
+                .await
+        }
+        .await;
 
         match result {
             Ok((relay_session, multiplexed)) => {
