@@ -1078,6 +1078,7 @@ mod tests {
             .post(format!("{rendezvous_public_url}/bootstrap-claims/redeem"))
             .json(&transport_sdk::ClientBootstrapClaimRedeemRequest {
                 claim_token: claim_token.to_string(),
+                cluster_id: Some(cluster_id),
                 target_node_id,
                 device_id: Some(Uuid::now_v7().to_string()),
                 label: Some("Laptop".to_string()),
@@ -1114,6 +1115,7 @@ mod tests {
             .post(format!("{rendezvous_public_url}/bootstrap-claims/redeem"))
             .json(&transport_sdk::ClientBootstrapClaimRedeemRequest {
                 claim_token: claim_token.to_string(),
+                cluster_id: Some(cluster_id),
                 target_node_id,
                 device_id: Some(Uuid::now_v7().to_string()),
                 label: Some("Laptop".to_string()),
