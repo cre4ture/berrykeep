@@ -549,6 +549,11 @@ mod tests {
                 Bytes::from_static(KNOWN_RELAY_PAYLOAD),
                 "the second client must complete inner mTLS before tampering is armed"
             );
+            let established_session = tampered_client.transport_session_pool_snapshot();
+            assert_eq!(
+                established_session.connect_count, 1,
+                "the warm-up read must establish exactly one relay session"
+            );
 
             observer.clear();
             observer.arm_next_tls_application_data_record_tampering();
@@ -564,6 +569,15 @@ mod tests {
             assert!(
                 tampered_result.is_err(),
                 "a relay session with modified inner-TLS ciphertext must fail closed"
+            );
+            let failed_write_session = tampered_client.transport_session_pool_snapshot();
+            assert_eq!(
+                failed_write_session.connect_count, established_session.connect_count,
+                "the tampered write must use the already established inner-mTLS session"
+            );
+            assert!(
+                failed_write_session.reuse_count > established_session.reuse_count,
+                "the tampered write must reuse the warm relay session"
             );
             assert!(
                 observer.tls_application_data_tamper_count() == 1,
