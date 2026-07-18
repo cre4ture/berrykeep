@@ -100,7 +100,7 @@ class AtomicFileDeviceIdentitySecretStore(
     private val envelopeAdapter = moshi.adapter(DeviceIdentityEnvelope::class.java)
 
     override fun load(): DeviceIdentitySecret? {
-        if (!atomicFile.exists()) {
+        if (!atomicFile.baseFile.exists()) {
             return null
         }
 
