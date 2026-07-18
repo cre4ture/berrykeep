@@ -41,6 +41,31 @@ class DeviceAuthStatePersistenceTest {
     }
 
     @Test
+    fun loadRejectsLegacyPrivateKeyWithoutCredentialBeforeMigration() {
+        val legacyState = completeState().copy(credentialPem = null)
+        val rawLegacyState = codec.encode(legacyState)
+        val events = mutableListOf<String>()
+        val preferences = InMemoryDeviceAuthPreferences(
+            raw = rawLegacyState,
+            events = events,
+        )
+        val secretStore = InMemoryDeviceIdentitySecretStore(events = events)
+        val persistence = DeviceAuthStatePersistence(preferences, secretStore, codec)
+
+        val error = assertThrows(DeviceIdentityStorageException::class.java) {
+            persistence.load()
+        }
+
+        assertTrue(error.message.orEmpty().contains("issued credential"))
+        assertTrue(error.message.orEmpty().contains("enroll this device again"))
+        assertEquals(listOf("secret.load"), events)
+        assertEquals(0, secretStore.saveCount)
+        assertNull(secretStore.secret)
+        assertEquals(rawLegacyState, preferences.raw)
+        assertTrue(preferences.raw.orEmpty().contains("private-key-secret"))
+    }
+
+    @Test
     fun protectedIdentityWinsOverDifferingPartialLegacyFields() {
         val protectedState = completeState(
             deviceId = "applied-device",
@@ -111,6 +136,25 @@ class DeviceAuthStatePersistenceTest {
         }
 
         assertEquals(listOf("secret.load", "secret.save"), events)
+        assertNull(preferences.raw)
+    }
+
+    @Test
+    fun saveRejectsPrivateKeyWithBlankCredentialBeforeWritingAnything() {
+        val events = mutableListOf<String>()
+        val preferences = InMemoryDeviceAuthPreferences(events = events)
+        val secretStore = InMemoryDeviceIdentitySecretStore(events = events)
+        val persistence = DeviceAuthStatePersistence(preferences, secretStore, codec)
+
+        val error = assertThrows(DeviceIdentityStorageException::class.java) {
+            persistence.save(completeState().copy(credentialPem = "   "))
+        }
+
+        assertTrue(error.message.orEmpty().contains("issued credential"))
+        assertTrue(error.message.orEmpty().contains("enroll this device again"))
+        assertTrue(events.isEmpty())
+        assertEquals(0, secretStore.saveCount)
+        assertNull(secretStore.secret)
         assertNull(preferences.raw)
     }
 

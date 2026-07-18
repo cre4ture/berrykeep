@@ -6,7 +6,7 @@ data class DeviceIdentitySecret(
     val label: String?,
     val publicKeyPem: String,
     val privateKeyPem: String,
-    val credentialPem: String?,
+    val credentialPem: String,
     val rendezvousClientIdentityPem: String?,
 ) {
     fun applyingTo(state: DeviceAuthState): DeviceAuthState =
@@ -32,7 +32,7 @@ data class DeviceIdentitySecret(
                 label = state.label?.takeIf { it.isNotBlank() },
                 publicKeyPem = state.publicKeyPem.requiredIdentityValue("public key"),
                 privateKeyPem = state.privateKeyPem.requiredIdentityValue("private key"),
-                credentialPem = state.credentialPem?.takeIf { it.isNotBlank() },
+                credentialPem = state.credentialPem.requiredIdentityValue("issued credential"),
                 rendezvousClientIdentityPem =
                     state.rendezvousClientIdentityPem?.takeIf { it.isNotBlank() },
             )
@@ -41,7 +41,7 @@ data class DeviceIdentitySecret(
         private fun String?.requiredIdentityValue(name: String): String =
             this?.takeIf { it.isNotBlank() }
                 ?: throw DeviceIdentityStorageException(
-                    "The stored device identity has no $name. Clear local enrollment and enroll this device again.",
+                    "The device identity is incomplete: it has no $name. Clear local enrollment and enroll this device again.",
                 )
     }
 }

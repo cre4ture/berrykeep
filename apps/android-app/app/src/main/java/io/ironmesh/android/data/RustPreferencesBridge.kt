@@ -48,7 +48,7 @@ object RustPreferencesBridge {
                 label = json.optionalTrimmedString("label"),
                 publicKeyPem = json.requiredTrimmedString("public_key_pem"),
                 privateKeyPem = json.requiredTrimmedString("private_key_pem"),
-                credentialPem = json.optionalTrimmedString("credential_pem"),
+                credentialPem = json.requiredTrimmedString("credential_pem"),
                 rendezvousClientIdentityPem =
                     json.optionalTrimmedString("rendezvous_client_identity_pem"),
             ),
@@ -143,7 +143,9 @@ object RustPreferencesBridge {
     }
 
     private fun JSONObject.requiredTrimmedString(name: String): String =
-        optionalTrimmedString(name) ?: error("client identity JSON is missing $name")
+        optionalTrimmedString(name) ?: throw DeviceIdentityStorageException(
+            "The client identity update is missing $name. Clear local enrollment and enroll this device again.",
+        )
 
     private fun failedAttemptKey(attempt: AppFailedConnectionAttempt): String {
         return listOf(
