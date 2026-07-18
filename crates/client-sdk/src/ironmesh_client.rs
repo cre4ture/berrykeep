@@ -2346,7 +2346,7 @@ impl IronMeshClient {
                 Err(error) => {
                     let error = error.context(endpoint_context);
                     self.transport_router
-                        .record_failure(index, &error.to_string());
+                        .record_failure(index, &format!("{error:#}"));
                     last_error = Some(error);
                     continue;
                 }
@@ -2412,7 +2412,7 @@ impl IronMeshClient {
                             timeout: direct_failover_timeout,
                             started_unix_ms,
                         },
-                        &error.to_string(),
+                        &format!("{error:#}"),
                     );
                     self.publish_connection_diagnostics();
                     last_error = Some(error);

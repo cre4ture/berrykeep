@@ -3404,6 +3404,61 @@ async fn direct_transport_retryable_head_error_includes_endpoint_and_target_node
 }
 
 #[tokio::test]
+async fn direct_transport_diagnostics_preserve_contextualized_error_chain() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let unavailable_url = format!(
+        "http://{}",
+        listener
+            .local_addr()
+            .expect("listener should have an address")
+    );
+    drop(listener);
+
+    let mut identity = ClientIdentityMaterial::generate(
+        uuid::Uuid::now_v7(),
+        None,
+        Some("direct-diagnostics-device".to_string()),
+    )
+    .expect("identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+    let target_node_id = NodeId::new_v4();
+    let client = IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+        unavailable_url.clone(),
+        HttpClient::new(),
+        Some(target_node_id),
+        None,
+    )
+    .with_client_identity(identity);
+
+    client
+        .head_object("gallery/unavailable.jpg", None, None)
+        .await
+        .expect_err("unavailable direct endpoint should fail");
+
+    let diagnostics = client.connection_diagnostics();
+    let endpoint = diagnostics
+        .endpoints
+        .first()
+        .expect("direct endpoint diagnostics should exist");
+    let last_error = endpoint
+        .last_error
+        .as_deref()
+        .expect("direct endpoint should record its failure");
+    assert!(last_error.contains(&format!("endpoint_locator={unavailable_url}")));
+    assert!(last_error.contains("failed to execute multiplexed HEAD"));
+
+    let attempt_error = endpoint
+        .recent_attempts
+        .last()
+        .and_then(|attempt| attempt.error.as_deref())
+        .expect("request attempt should retain its failure");
+    assert!(attempt_error.contains(&format!("endpoint_locator={unavailable_url}")));
+    assert!(attempt_error.contains("failed to execute multiplexed HEAD"));
+}
+
+#[tokio::test]
 async fn direct_transport_streams_upload_session_chunks_over_object_write() {
     let response_body = serde_json::to_vec(&UploadSessionChunkResponse {
         stored: true,
