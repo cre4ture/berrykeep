@@ -140,9 +140,13 @@ if [[ "${DRY_RUN}" == true ]]; then
 fi
 
 if [[ "${DRY_RUN}" == false ]]; then
+  REMOTE_DISTS_DIR="${REMOTE_DIR%/}/dists"
+  REMOTE_SUITE_DIR="${REMOTE_DISTS_DIR}/${SUITE}"
+
   log "ensuring ${REMOTE}:${REMOTE_DIR}/dists/${SUITE} exists"
   ssh "${REMOTE}" \
-    "mkdir -p $(shell_quote "${REMOTE_DIR%/}/dists/${SUITE}")"
+    "mkdir -p $(shell_quote "${REMOTE_SUITE_DIR}") && \
+      chmod a+rx $(shell_quote "${REMOTE_DISTS_DIR}") $(shell_quote "${REMOTE_SUITE_DIR}")"
 fi
 
 log "syncing ${SUITE} metadata"
