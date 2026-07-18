@@ -186,12 +186,16 @@ async fn discovery(
 ) -> std::result::Result<Json<DiscoveryResponse>, (StatusCode, String)> {
     require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
         .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let cluster_id = resolve_presence_cluster_id(
-        &state.presence,
-        state.config.mtls.is_some(),
-        &authenticated_peer,
-        query.cluster_id,
-    )?;
+    let cluster_id = if query.node_id.is_some() {
+        resolve_presence_cluster_id(
+            &state.presence,
+            state.config.mtls.is_some(),
+            &authenticated_peer,
+            query.cluster_id,
+        )?
+    } else {
+        None
+    };
     Ok(Json(discovery_response(&state, cluster_id, query.node_id)))
 }
 
@@ -1525,7 +1529,20 @@ mod tests {
         .await
         .expect_err("multi-cluster list must require a cluster_id");
         assert_eq!(unscoped_list.0, StatusCode::BAD_REQUEST);
-        let unscoped_discovery = discovery(
+        let mesh_only_discovery = discovery(
+            State(state.clone()),
+            MaybeAuthenticatedPeer::default(),
+            Query(DiscoveryQuery {
+                node_id: None,
+                cluster_id: None,
+            }),
+        )
+        .await
+        .expect("mesh-only discovery must not require a cluster_id")
+        .0;
+        assert_eq!(mesh_only_discovery.node_candidates, None);
+        assert!(!mesh_only_discovery.node_relay_capable);
+        let unscoped_node_discovery = discovery(
             State(state.clone()),
             MaybeAuthenticatedPeer::default(),
             Query(DiscoveryQuery {
@@ -1534,8 +1551,8 @@ mod tests {
             }),
         )
         .await
-        .expect_err("multi-cluster discovery must require a cluster_id");
-        assert_eq!(unscoped_discovery.0, StatusCode::BAD_REQUEST);
+        .expect_err("multi-cluster node discovery must require a cluster_id");
+        assert_eq!(unscoped_node_discovery.0, StatusCode::BAD_REQUEST);
 
         let discovery_a = discovery(
             State(state.clone()),
