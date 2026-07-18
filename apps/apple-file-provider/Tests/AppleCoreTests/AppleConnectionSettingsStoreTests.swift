@@ -2,6 +2,23 @@ import XCTest
 @testable import AppleCore
 
 final class AppleConnectionSettingsStoreTests: XCTestCase {
+    func testPreferencesSuiteAndKeychainAccessGroupRemainIndependent() throws {
+        let preferences = try IsolatedDefaults(label: "SeparateGroups")
+        defer { preferences.clear() }
+        let keychainAccessGroup = "ABCDE12345.dev.ironmesh.apple.shared-keychain"
+
+        let store = AppleConnectionSettingsStore(
+            preferencesSuiteName: preferences.suiteName,
+            keychainAccessGroup: keychainAccessGroup
+        )
+        let keychainStore = try XCTUnwrap(
+            store.secretStore as? AppleKeychainSecretStore
+        )
+
+        XCTAssertEqual(keychainStore.accessGroup, keychainAccessGroup)
+        XCTAssertNotEqual(keychainStore.accessGroup, preferences.suiteName)
+    }
+
     func testSaveAndLoadKeepClientIdentityOutOfPreferences() throws {
         let testDefaults = try IsolatedDefaults(label: "RoundTrip")
         defer { testDefaults.clear() }

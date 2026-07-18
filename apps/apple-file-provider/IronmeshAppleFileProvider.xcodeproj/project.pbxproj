@@ -624,7 +624,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacApp-Info.plist";
@@ -647,7 +647,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosApp-Info.plist";
@@ -693,7 +693,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosApp-Info.plist";
@@ -817,7 +817,7 @@
 		438673375255170381B484EA /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacFileProviderExtension-Info.plist";
@@ -927,7 +927,7 @@
 			buildSettings = {
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosFileProviderExtension-Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
@@ -949,7 +949,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacApp-Info.plist";
@@ -969,7 +969,7 @@
 		C8D904EEB4580E12BF4D2C45 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacFileProviderExtension-Info.plist";
@@ -992,7 +992,7 @@
 			buildSettings = {
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosFileProviderExtension-Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;

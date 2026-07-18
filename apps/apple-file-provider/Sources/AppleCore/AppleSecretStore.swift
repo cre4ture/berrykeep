@@ -13,7 +13,7 @@ public struct AppleKeychainSecretStore: AppleSecretStore, Sendable {
 
     private let service: String
     private let account: String
-    private let accessGroup: String?
+    let accessGroup: String?
 
     public init(
         service: String = defaultService,

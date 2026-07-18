@@ -8,17 +8,20 @@ struct IronmeshBundleConfiguration {
     let domainDisplayName: String
     let connectionInput: String
     let appGroupIdentifier: String?
+    let keychainAccessGroup: String?
 
     init(
         domainIdentifier: String,
         domainDisplayName: String = "IronMesh",
         connectionInput: String = "127.0.0.1:18080",
-        appGroupIdentifier: String? = nil
+        appGroupIdentifier: String? = nil,
+        keychainAccessGroup: String? = nil
     ) {
         self.domainIdentifier = domainIdentifier.nilIfBlank ?? "dev.ironmesh.default"
         self.domainDisplayName = domainDisplayName.nilIfBlank ?? "IronMesh"
         self.connectionInput = connectionInput.nilIfBlank ?? "127.0.0.1:18080"
         self.appGroupIdentifier = appGroupIdentifier.nilIfBlank
+        self.keychainAccessGroup = keychainAccessGroup.nilIfBlank
     }
 
     init(bundle: Bundle = .main) {
@@ -27,6 +30,7 @@ struct IronmeshBundleConfiguration {
         domainDisplayName = (info["IronmeshDomainDisplayName"] as? String)?.nilIfBlank ?? "IronMesh"
         connectionInput = (info["IronmeshConnectionInput"] as? String)?.nilIfBlank ?? "127.0.0.1:18080"
         appGroupIdentifier = (info["IronmeshAppGroupIdentifier"] as? String)?.nilIfBlank
+        keychainAccessGroup = (info["IronmeshKeychainAccessGroup"] as? String)?.nilIfBlank
     }
 
     var defaultConnectionConfiguration: AppleConnectionConfiguration {
@@ -38,7 +42,10 @@ struct IronmeshBundleConfiguration {
     }
 
     func makeSettingsStore() -> AppleConnectionSettingsStore {
-        AppleConnectionSettingsStore(suiteName: appGroupIdentifier)
+        AppleConnectionSettingsStore(
+            preferencesSuiteName: appGroupIdentifier,
+            keychainAccessGroup: keychainAccessGroup
+        )
     }
 }
 

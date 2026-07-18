@@ -227,7 +227,7 @@ public final class AppleConnectionSettingsStore: @unchecked Sendable {
 
     private let defaults: UserDefaults
     private let stateKey: String
-    private let secretStore: any AppleSecretStore
+    let secretStore: any AppleSecretStore
 
     public init(
         defaults: UserDefaults = .standard,
@@ -240,15 +240,16 @@ public final class AppleConnectionSettingsStore: @unchecked Sendable {
     }
 
     public convenience init(
-        suiteName: String?,
+        preferencesSuiteName: String?,
+        keychainAccessGroup: String?,
         stateKey: String = defaultStateKey,
         secretStore: (any AppleSecretStore)? = nil
     ) {
-        let normalizedSuiteName = suiteName?.nilIfBlank
+        let normalizedSuiteName = preferencesSuiteName?.nilIfBlank
         let resolvedSecretStore = secretStore ?? AppleKeychainSecretStore(
-            accessGroup: normalizedSuiteName
+            accessGroup: keychainAccessGroup
         )
-        if let suiteName = suiteName?.nilIfBlank,
+        if let suiteName = normalizedSuiteName,
            let defaults = UserDefaults(suiteName: suiteName) {
             self.init(
                 defaults: defaults,
