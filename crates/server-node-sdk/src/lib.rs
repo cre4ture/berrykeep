@@ -11732,6 +11732,8 @@ enum StoreIndexView {
 #[serde(rename_all = "snake_case")]
 enum StoreIndexSortOrder {
     PathAsc,
+    PathDesc,
+    CapturedAsc,
     CapturedDesc,
 }
 
@@ -14043,7 +14045,14 @@ async fn list_store_index_response_cursor_mode(
         || query.offset.is_some()
         || query.limit.is_some()
         || query.media_filter.is_some()
-        || matches!(query.sort, Some(StoreIndexSortOrder::CapturedDesc))
+        || matches!(
+            query.sort,
+            Some(
+                StoreIndexSortOrder::PathDesc
+                    | StoreIndexSortOrder::CapturedAsc
+                    | StoreIndexSortOrder::CapturedDesc
+            )
+        )
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -14441,24 +14450,24 @@ fn matches_store_index_media_filter(
     }
 }
 
+fn store_index_entry_captured_at(entry: &StoreIndexEntry) -> u64 {
+    entry
+        .media
+        .as_ref()
+        .and_then(|media| media.taken_at_unix)
+        .unwrap_or(0)
+}
+
 fn sort_store_index_entries(entries: &mut [StoreIndexEntry], sort: StoreIndexSortOrder) {
     entries.sort_by(|left, right| match sort {
         StoreIndexSortOrder::PathAsc => left.path.cmp(&right.path),
-        StoreIndexSortOrder::CapturedDesc => {
-            let left_taken_at = left
-                .media
-                .as_ref()
-                .and_then(|media| media.taken_at_unix)
-                .unwrap_or(0);
-            let right_taken_at = right
-                .media
-                .as_ref()
-                .and_then(|media| media.taken_at_unix)
-                .unwrap_or(0);
-            right_taken_at
-                .cmp(&left_taken_at)
-                .then_with(|| left.path.cmp(&right.path))
-        }
+        StoreIndexSortOrder::PathDesc => right.path.cmp(&left.path),
+        StoreIndexSortOrder::CapturedAsc => store_index_entry_captured_at(left)
+            .cmp(&store_index_entry_captured_at(right))
+            .then_with(|| left.path.cmp(&right.path)),
+        StoreIndexSortOrder::CapturedDesc => store_index_entry_captured_at(right)
+            .cmp(&store_index_entry_captured_at(left))
+            .then_with(|| left.path.cmp(&right.path)),
     });
 }
 

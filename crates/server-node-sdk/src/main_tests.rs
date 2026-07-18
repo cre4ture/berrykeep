@@ -12233,7 +12233,35 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
     entries.retain(|entry| {
         super::matches_store_index_media_filter(entry, super::StoreIndexMediaFilter::All)
     });
-    super::sort_store_index_entries(&mut entries, super::StoreIndexSortOrder::CapturedDesc);
+
+    for (sort, expected_paths) in [
+        (
+            super::StoreIndexSortOrder::PathAsc,
+            ["gallery/clip.mp4", "gallery/newer.jpg", "gallery/older.jpg"],
+        ),
+        (
+            super::StoreIndexSortOrder::PathDesc,
+            ["gallery/older.jpg", "gallery/newer.jpg", "gallery/clip.mp4"],
+        ),
+        (
+            super::StoreIndexSortOrder::CapturedAsc,
+            ["gallery/older.jpg", "gallery/clip.mp4", "gallery/newer.jpg"],
+        ),
+        (
+            super::StoreIndexSortOrder::CapturedDesc,
+            ["gallery/newer.jpg", "gallery/clip.mp4", "gallery/older.jpg"],
+        ),
+    ] {
+        super::sort_store_index_entries(&mut entries, sort);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            expected_paths
+        );
+    }
+
     let summary = super::summarize_store_index_entries(&entries);
     let page = entries.into_iter().skip(1).take(1).collect::<Vec<_>>();
 
