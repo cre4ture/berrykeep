@@ -84,6 +84,7 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
     page
       .getByText(/No (image|media) objects in view/)
       .or(page.getByText("0 items", { exact: true }))
+      .first()
   ).toBeVisible();
 
   await page.getByText("S3", { exact: true }).click();

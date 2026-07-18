@@ -2337,14 +2337,16 @@ impl IronMeshClient {
             let Some(endpoint) = self.transport_router.endpoint(index).cloned() else {
                 continue;
             };
+            let endpoint_context = self.endpoint_context_for_route(index);
             let endpoint_url = endpoint
                 .rewrite_url(&url)
                 .with_context(|| format!("failed to rewrite {} {}", method, url));
             let endpoint_url = match endpoint_url {
                 Ok(endpoint_url) => endpoint_url,
                 Err(error) => {
+                    let error = error.context(endpoint_context);
                     self.transport_router
-                        .record_failure(index, &error.to_string());
+                        .record_failure(index, &format!("{error:#}"));
                     last_error = Some(error);
                     continue;
                 }
@@ -2374,16 +2376,12 @@ impl IronMeshClient {
                             timeout: direct_failover_timeout,
                             started_unix_ms,
                         },
-                        &format!(
-                            "retryable HTTP {} from {}",
-                            response.status, endpoint.descriptor.locator
-                        ),
+                        &format!("retryable HTTP {} ({endpoint_context})", response.status,),
                     );
                     self.publish_connection_diagnostics();
                     last_error = Some(anyhow!(
-                        "retryable transport response {} from {}",
+                        "retryable transport response {} ({endpoint_context})",
                         response.status,
-                        endpoint.descriptor.locator
                     ));
                 }
                 Ok(response) => {
@@ -2405,6 +2403,7 @@ impl IronMeshClient {
                     });
                 }
                 Err(error) => {
+                    let error = error.context(endpoint_context);
                     self.transport_router.record_request_failure(
                         index,
                         ClientRequestAttemptContext {
@@ -2413,7 +2412,7 @@ impl IronMeshClient {
                             timeout: direct_failover_timeout,
                             started_unix_ms,
                         },
-                        &error.to_string(),
+                        &format!("{error:#}"),
                     );
                     self.publish_connection_diagnostics();
                     last_error = Some(error);
@@ -2562,19 +2561,49 @@ impl IronMeshClient {
         &self,
         method: Method,
         url: Url,
-        mut headers: Vec<RelayHttpHeader>,
+        headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
     ) -> Result<BufferedTransportResponse> {
         let routed = self
-            .execute_buffered_request_on_route_indices(
-                method,
-                url,
-                std::mem::take(&mut headers),
-                body,
-                &self.transport_router.rank_indices(),
-            )
+            .execute_buffered_request_with_route(method, url, headers, body)
             .await?;
         Ok(routed.response)
+    }
+
+    async fn execute_buffered_request_with_route(
+        &self,
+        method: Method,
+        url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_on_route_indices(
+            method,
+            url,
+            headers,
+            body,
+            &self.transport_router.rank_indices(),
+        )
+        .await
+    }
+
+    fn endpoint_context_for_route(&self, route_index: usize) -> String {
+        let Some(endpoint) = self.transport_router.endpoint(route_index) else {
+            return format!(
+                "endpoint_index={route_index} endpoint_locator=<unknown> target_node_id=<unknown>"
+            );
+        };
+
+        let target_node_id = endpoint
+            .transport
+            .target_node_id()
+            .map(|node_id| node_id.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        format!(
+            "endpoint_index={route_index} endpoint_locator={} target_node_id={target_node_id} transport_path_kind={}",
+            endpoint.descriptor.locator,
+            transport_path_kind_label(endpoint.descriptor.transport_path_kind),
+        )
     }
 
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
@@ -2610,14 +2639,16 @@ impl IronMeshClient {
         append_optional_query(&mut url, "snapshot", snapshot);
         append_optional_query(&mut url, "version", version);
 
-        let response = self
-            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+        let routed = self
+            .execute_buffered_request_with_route(Method::GET, url, Vec::new(), None)
             .await
-            .with_context(|| format!("failed to GET object key={key}"))?;
+            .map_err(|error| anyhow!("failed to GET object key={key}: {error:#}"))?;
+        let endpoint_context = self.endpoint_context_for_route(routed.route_index);
+        let response = routed.response;
         if !response.status.is_success() {
             bail!(
-                "object not found or inaccessible key={key}: {}",
-                response.status
+                "object not found or inaccessible key={key}: {} ({endpoint_context})",
+                response.status,
             );
         }
         Ok(response.body)
@@ -3511,14 +3542,16 @@ impl IronMeshClient {
         append_optional_query(&mut url, "snapshot", snapshot);
         append_optional_query(&mut url, "version", version);
 
-        let response = self
-            .execute_buffered_request(Method::HEAD, url, Vec::new(), None)
+        let routed = self
+            .execute_buffered_request_with_route(Method::HEAD, url, Vec::new(), None)
             .await
-            .with_context(|| format!("failed to HEAD object key={key}"))?;
+            .map_err(|error| anyhow!("failed to HEAD object key={key}: {error:#}"))?;
+        let endpoint_context = self.endpoint_context_for_route(routed.route_index);
+        let response = routed.response;
         if !response.status.is_success() {
             bail!(
-                "object not found or inaccessible key={key}: {}",
-                response.status
+                "object not found or inaccessible key={key}: {} ({endpoint_context})",
+                response.status,
             );
         }
 
