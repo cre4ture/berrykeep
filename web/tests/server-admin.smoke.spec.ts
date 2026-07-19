@@ -683,6 +683,118 @@ test("server-admin gallery derives child folders from nested media entries", asy
   await expect(page.getByText("oppo-uli/", { exact: true }).first()).toBeVisible();
 });
 
+test("server-admin map import wizard starts the Natural Earth background job", async ({ page }) => {
+  let naturalEarthStartRequests = 0;
+  let naturalEarthJob: Record<string, unknown> | null = null;
+
+  await installServerAdminMocks(page);
+  await page.route(`**${apiV1("/auth/maps/import")}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return json(route, { active_job: null, can_start_new: true });
+    }
+    return route.fallback();
+  });
+  await page.route(`**${apiV1("/auth/maps/import/natural-earth")}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return json(route, { active_job: naturalEarthJob, can_start_new: naturalEarthJob === null });
+    }
+    if (route.request().method() === "POST") {
+      naturalEarthStartRequests += 1;
+      naturalEarthJob = {
+        id: "natural-earth-job-1",
+        state: "running",
+        phase: "Downloading Natural Earth physical data",
+        source_url: "https://naciscdn.org/naturalearth/10m/physical/10m_physical.zip",
+        logical_key: "sys/maps/natural-earth-globe.mbtiles",
+        manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json",
+        logical_size_bytes: 0,
+        error: null,
+        started_at_unix: 1_700_000_000,
+        updated_at_unix: 1_700_000_001
+      };
+      return json(route, naturalEarthJob);
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await expect(page.getByText("Map dataset import wizard", { exact: true })).toBeVisible();
+  await page.getByRole("radio", { name: "Natural Earth physical world map" }).check();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText("Official Natural Earth source", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText("Configured Natural Earth destination", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText("Review before starting the background job", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Start background import" }).click();
+
+  await expect.poll(() => naturalEarthStartRequests).toBe(1);
+  await expect(page.getByText("Downloading Natural Earth physical data", { exact: true })).toBeVisible();
+  await expect(page.getByText("Natural Earth: running", { exact: true }).first()).toBeVisible();
+});
+
+test("server-admin map import wizard forwards remote MBTiles details to its background job", async ({ page }) => {
+  let mapImportRequest: Record<string, unknown> | null = null;
+
+  await installServerAdminMocks(page);
+  await page.route(`**${apiV1("/auth/maps/import")}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return json(route, { active_job: null, can_start_new: true });
+    }
+    if (route.request().method() === "POST") {
+      mapImportRequest = JSON.parse(route.request().postData() ?? "{}");
+      return json(route, {
+        started: true,
+        status: {
+          active_job: null,
+          can_start_new: false
+        }
+      });
+    }
+    return route.fallback();
+  });
+  await page.route(`**${apiV1("/auth/maps/import/natural-earth")}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return json(route, { active_job: null, can_start_new: true });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await page.getByRole("radio", { name: "An existing MBTiles package" }).check();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page
+    .getByLabel("MBTiles URL or pasted CLI command")
+    .fill("https://maps.example.test/custom-globe.mbtiles");
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText(/Target manifest:/)).toBeVisible();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText("Existing MBTiles package", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Start background import" }).click();
+
+  await expect.poll(() => mapImportRequest).not.toBeNull();
+  expect(mapImportRequest).toMatchObject({
+    source: "https://maps.example.test/custom-globe.mbtiles",
+    variant_id: "natural-earth-globe",
+    asset: "raster",
+    part_size_bytes: 10 * 1024 ** 3
+  });
+});
+
 test("server-admin gallery retries missing video poster extraction from the fullscreen view", async ({ page }) => {
   const mockState = await installServerAdminMocks(page, {
     galleryEntries: [
