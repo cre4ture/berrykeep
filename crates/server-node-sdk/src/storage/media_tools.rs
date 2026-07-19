@@ -275,7 +275,7 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&cockpit_ws_path, permissions).unwrap();
 
-        let ready = cockpit_dependency_check_for_candidates(&[cockpit_ws_path.clone()]);
+        let ready = cockpit_dependency_check_for_candidates(std::slice::from_ref(&cockpit_ws_path));
         assert_eq!(ready.status, HostDependencyStatus::Ready);
         assert_eq!(
             ready.resolved_path.as_deref(),
