@@ -548,7 +548,10 @@ async fn suspend_cluster(http: &reqwest::Client, base_url: &str, cluster_id: Uui
             &format!("/global/cluster-registration/clusters/{cluster_id}/suspension"),
         ))
         .bearer_auth(ADMIN_TOKEN)
-        .json(&serde_json::json!({ "suspended": true }))
+        .json(&serde_json::json!({
+            "suspended": true,
+            "reason": "system test suspension",
+        }))
         .send()
         .await
         .context("failed calling global rendezvous cluster suspension endpoint")?

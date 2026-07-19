@@ -92,7 +92,7 @@ impl ClusterCaRegistry {
     /// Opens an existing registry, or creates an empty in-memory registry that
     /// is persisted on its first mutation.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
+        let path = normalize_registry_path(path.into())?;
         let clusters = load_registry(&path)?;
         Ok(Self {
             inner: Arc::new(ClusterCaRegistryInner {
@@ -323,22 +323,10 @@ fn persist_registry(path: &Path, clusters: &BTreeMap<ClusterId, ClusterCaRecord>
     .context("failed serializing cluster CA registry")?;
     let parent = path
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed creating cluster CA registry directory {}",
-            parent.display()
-        )
-    })?;
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("cluster-ca-registry.json");
+        .expect("normalized cluster CA registry path must have a parent");
     let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary_path = parent.join(format!(
-        ".{file_name}.{}.{}.tmp",
+        ".ironmesh-cluster-ca-registry.{}.{}.tmp",
         std::process::id(),
         sequence
     ));
@@ -379,6 +367,46 @@ fn persist_registry(path: &Path, clusters: &BTreeMap<ClusterId, ClusterCaRecord>
         .sync_all()
         .context("failed syncing cluster CA registry directory")?;
     Ok(())
+}
+
+fn normalize_registry_path(path: PathBuf) -> Result<PathBuf> {
+    // The registry is configured by the service operator, but reject traversal
+    // components before it reaches any filesystem API.
+    let path = path
+        .to_str()
+        .context("cluster CA registry path must be valid UTF-8")?
+        .to_owned();
+    if path.contains("..") {
+        bail!("cluster CA registry path must not contain '..'");
+    }
+    let path = PathBuf::from(path);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()
+        .context("cluster CA registry parent directory must already exist")?;
+    if !parent.is_dir() {
+        bail!(
+            "cluster CA registry parent {} is not a directory",
+            parent.display()
+        );
+    }
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("cluster CA registry path must name a file")?;
+    let normalized = parent.join(file_name);
+    if fs::symlink_metadata(&normalized)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!(
+            "cluster CA registry {} must not be a symbolic link",
+            normalized.display()
+        );
+    }
+    Ok(normalized)
 }
 
 fn parse_single_cluster_ca(ca_pem: &str) -> Result<CertificateDer<'static>> {
@@ -494,6 +522,13 @@ mod tests {
         assert_eq!(reloaded.registered_ca(cluster_id), Some(observed));
         assert_eq!(registered.ca_fingerprint, reloaded.list()[0].ca_fingerprint);
         fs::remove_file(path).expect("test registry should be removable");
+    }
+
+    #[test]
+    fn registry_rejects_parent_directory_components() {
+        let error = ClusterCaRegistry::open(PathBuf::from("../cluster-ca-registry.json"))
+            .expect_err("registry path traversal must be rejected");
+        assert!(error.to_string().contains("must not contain '..'"));
     }
 
     #[test]

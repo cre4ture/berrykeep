@@ -16,6 +16,7 @@ encrypted inner TLS stream, not application payloads or inner TLS termination.
   CAs and their private keys.
 - [ ] Put the registry on durable storage and set
   `IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY` to its persistent path. The
+  parent directory must already exist, the path must not contain `..`, and the
   process account must have only the permissions required to read and update
   that path.
 - [ ] Back up the registry and audit records on a schedule, protect backup
