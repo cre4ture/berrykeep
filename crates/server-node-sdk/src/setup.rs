@@ -1685,7 +1685,21 @@ fn issue_public_node_tls_material_from_ca(
     params.not_after = OffsetDateTime::from_unix_timestamp(policy.not_after_unix as i64)
         .context("failed setting public TLS not_after")?;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    params.subject_alt_names = build_public_node_subject_alt_names(bootstrap)?;
+    // URLs are mutable reachability locators.  Direct clients bind the
+    // connection to these immutable URI SANs, while ordinary HTTPS clients
+    // continue to use the DNS/IP SANs supplied by the bootstrap origin.
+    let mut subject_alt_names = build_public_node_subject_alt_names(bootstrap)?;
+    subject_alt_names.push(SanType::URI(
+        format!("urn:ironmesh:node:{}", bootstrap.node_id)
+            .try_into()
+            .context("invalid IronMesh node identity URI SAN")?,
+    ));
+    subject_alt_names.push(SanType::URI(
+        format!("urn:ironmesh:cluster:{}", bootstrap.cluster_id)
+            .try_into()
+            .context("invalid IronMesh cluster identity URI SAN")?,
+    ));
+    params.subject_alt_names = subject_alt_names;
     let key_pair = KeyPair::generate().context("failed generating public TLS keypair")?;
     let cert = params
         .signed_by(&key_pair, &issuer)
