@@ -1022,6 +1022,14 @@ fn generate_test_https_ca_and_server_material(
     bind_addr: SocketAddr,
     label: &str,
 ) -> (String, String, String, String) {
+    generate_test_https_ca_and_server_material_with_identity(bind_addr, label, None)
+}
+
+fn generate_test_https_ca_and_server_material_with_identity(
+    bind_addr: SocketAddr,
+    label: &str,
+    identity: Option<(NodeId, ClusterId)>,
+) -> (String, String, String, String) {
     let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.distinguished_name = rcgen::DistinguishedName::new();
@@ -1046,6 +1054,15 @@ fn generate_test_https_ca_and_server_material(
     server_params
         .subject_alt_names
         .push(rcgen::SanType::IpAddress(bind_addr.ip()));
+    if let Some((node_id, cluster_id)) = identity {
+        server_params.subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:node:{node_id}")).unwrap(),
+        ));
+        server_params.subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:cluster:{cluster_id}"))
+                .unwrap(),
+        ));
+    }
     let server_key_pair = rcgen::KeyPair::generate().unwrap();
     let server_cert = server_params.signed_by(&server_key_pair, &issuer).unwrap();
 
@@ -6664,7 +6681,11 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
     let bind_addr = free_bind_addr();
     let public_url = format!("https://127.0.0.1:{}", bind_addr.port());
     let (public_ca_pem, _, server_cert_pem, server_key_pem) =
-        generate_test_https_ca_and_server_material(bind_addr, "bootstrap-remote-client-auth");
+        generate_test_https_ca_and_server_material_with_identity(
+            bind_addr,
+            "bootstrap-remote-client-auth",
+            Some((target.node_id, target.cluster_id)),
+        );
     source.network.public_ca_pem = Some(public_ca_pem.clone());
 
     {
@@ -8228,6 +8249,59 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
     assert!(public_metadata.not_after_unix > public_metadata.issued_at_unix);
     assert!(public_metadata.renew_after_unix >= public_metadata.issued_at_unix);
     assert!(!public_metadata.certificate_fingerprint.is_empty());
+
+    let mut reader = std::io::Cursor::new(
+        package
+            .public_tls_material
+            .as_ref()
+            .unwrap()
+            .cert_pem
+            .as_bytes(),
+    );
+    let certs = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("public certificate PEM should parse");
+    let cert = certs
+        .first()
+        .expect("issued public TLS material should include a certificate");
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
+        .expect("issued public certificate DER should parse");
+    let mut saw_node_uri = false;
+    let mut saw_cluster_uri = false;
+    let mut saw_public_dns_name = false;
+
+    for extension in parsed.extensions() {
+        if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+            extension.parsed_extension()
+        {
+            for name in &san.general_names {
+                match name {
+                    x509_parser::extensions::GeneralName::URI(uri) => {
+                        saw_node_uri |=
+                            *uri == format!("urn:ironmesh:node:{}", package.bootstrap.node_id);
+                        saw_cluster_uri |=
+                            *uri == format!("urn:ironmesh:cluster:{}", state.cluster_id);
+                    }
+                    x509_parser::extensions::GeneralName::DNSName(name) => {
+                        saw_public_dns_name |= *name == "node-b.example";
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(
+        saw_node_uri,
+        "public certificate should include node identity SAN"
+    );
+    assert!(
+        saw_cluster_uri,
+        "public certificate should include cluster identity SAN"
+    );
+    assert!(
+        saw_public_dns_name,
+        "public certificate should retain a hostname SAN for generic HTTPS clients"
+    );
 
     cleanup_test_state(&state).await;
 }

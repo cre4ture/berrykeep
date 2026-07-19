@@ -17,8 +17,9 @@ use transport_sdk::{
 };
 
 use crate::connection::{
-    build_blocking_reqwest_client_from_pem_for_url, build_http_client_from_planned_targets,
-    build_http_client_with_identity_from_planned_targets,
+    build_blocking_reqwest_client_from_pem_for_url,
+    build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity,
+    build_http_client_from_planned_targets, build_http_client_with_identity_from_planned_targets,
 };
 use crate::device_auth::{
     DeviceEnrollmentRequest, DeviceEnrollmentResponse, enroll_device_blocking_from_pem,
@@ -1388,12 +1389,18 @@ fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) 
         .with_context(|| format!("failed to build health URL from {endpoint}"))?;
 
     let probe_client = if endpoint.scheme() == "https" {
-        build_blocking_reqwest_client_from_pem_for_url(
+        build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity(
             target
                 .server_ca_pem
                 .as_deref()
                 .or(target.cluster_ca_pem.as_deref()),
             &health_url,
+            target
+                .target_node_id
+                .map(|node_id| transport_sdk::ExpectedNodeServerIdentity {
+                    node_id,
+                    cluster_id: target.cluster_id,
+                }),
         )
         .context("failed building bootstrap trusted client")?
     } else {

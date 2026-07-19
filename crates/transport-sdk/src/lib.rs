@@ -101,5 +101,9 @@ pub use transport_protocol::{
     TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportSessionControlMessage,
     TransportSessionRole, TransportStreamControlMessage, TransportStreamKind,
 };
+pub use websocket_client::{
+    ExpectedNodeServerIdentity, build_tls_client_config,
+    connect_websocket_with_expected_server_identity,
+};
 pub use websocket_client::{connect_websocket, websocket_url};
 pub use ws_stream::{DecodedWebSocketMessage, WebSocketByteStream, WebSocketMessageCodec};

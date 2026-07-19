@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use transport_sdk::{
     ClientIdentityMaterial, ConnectionCandidate, DEFAULT_DIRECT_QUIC_ALPN, DirectQuicEndpoint,
-    DirectQuicEndpointConfig, MultiplexConfig, MultiplexMode, MultiplexedSession, PeerIdentity,
-    RelayTicketRequest, RelayTunnelSession, RelayTunnelSessionKind,
-    RelayTunnelSourceSecurityConfig, RendezvousControlClient, TRANSPORT_PROTOCOL_VERSION,
-    TransportSessionControlMessage, TransportSessionRole, WebSocketByteStream,
-    build_signed_request_headers, connect_websocket, perform_transport_client_handshake,
+    DirectQuicEndpointConfig, ExpectedNodeServerIdentity, MultiplexConfig, MultiplexMode,
+    MultiplexedSession, PeerIdentity, RelayTicketRequest, RelayTunnelSession,
+    RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig, RendezvousControlClient,
+    TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
+    WebSocketByteStream, build_signed_request_headers,
+    connect_websocket_with_expected_server_identity, perform_transport_client_handshake,
     websocket_url,
 };
 
@@ -27,6 +28,7 @@ enum SessionPoolTarget {
     DirectHttps {
         server_base_url: String,
         server_ca_pem: Option<String>,
+        expected_server_identity: Option<ExpectedNodeServerIdentity>,
     },
     DirectQuic {
         candidate: ConnectionCandidate,
@@ -63,11 +65,13 @@ impl TransportSessionPool {
     pub(crate) fn new_direct(
         server_base_url: impl Into<String>,
         server_ca_pem: Option<String>,
+        expected_server_identity: Option<ExpectedNodeServerIdentity>,
     ) -> Self {
         Self {
             target: SessionPoolTarget::DirectHttps {
                 server_base_url: server_base_url.into().trim_end_matches('/').to_string(),
                 server_ca_pem,
+                expected_server_identity,
             },
             cached_session: Arc::new(Mutex::new(None)),
             stats: Arc::new(TransportSessionPoolStats::default()),
@@ -135,17 +139,21 @@ impl TransportSessionPool {
             SessionPoolTarget::DirectHttps {
                 server_base_url,
                 server_ca_pem,
+                expected_server_identity,
             } => {
                 let ws_url = websocket_url(server_base_url, "transport/ws").with_context(|| {
                     format!("failed building direct transport websocket URL from {server_base_url}")
                 })?;
                 let ws_headers = websocket_auth_headers(identity, connection_name)?;
-                let websocket =
-                    connect_websocket(&ws_url, server_ca_pem.as_deref(), None, &ws_headers)
-                        .await
-                        .with_context(|| {
-                            format!("failed opening direct transport websocket {}", ws_url)
-                        })?;
+                let websocket = connect_websocket_with_expected_server_identity(
+                    &ws_url,
+                    server_ca_pem.as_deref(),
+                    None,
+                    *expected_server_identity,
+                    &ws_headers,
+                )
+                .await
+                .with_context(|| format!("failed opening direct transport websocket {}", ws_url))?;
                 let transport = WebSocketByteStream::new(websocket);
                 (
                     MultiplexedSession::spawn(
@@ -155,7 +163,7 @@ impl TransportSessionPool {
                     )
                     .context("failed creating direct multiplexed transport session")?,
                     format!("failed performing direct transport handshake for {server_base_url}"),
-                    None,
+                    expected_server_identity.map(|identity| PeerIdentity::Node(identity.node_id)),
                 )
             }
             SessionPoolTarget::DirectQuic {
