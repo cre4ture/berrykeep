@@ -5,18 +5,20 @@ const PLAYWRIGHT_RUNTIME_ADMIN_PASSWORD = "playwright-runtime-password";
 test("server-admin is served by a real server-node runtime", async ({ page }) => {
   await page.goto("/");
 
+  await expect(page.getByRole("heading", { name: "Admin login required" })).toBeVisible();
+  await expect(page.getByLabel("Primary navigation")).toHaveCount(0);
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
+  await page.getByLabel("Admin password").fill(PLAYWRIGHT_RUNTIME_ADMIN_PASSWORD);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByTestId("server-admin-session-badge")).toHaveText("signed in", { timeout: 60_000 });
+  await page.keyboard.press("Escape");
+
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
   await expect(page.getByText("Version info", { exact: true })).toBeVisible();
   await expect(page.getByText(/UI build:\s*\S+\s+\(.+\)/)).toBeVisible();
   await expect(page.getByText(/Backend build:\s*\S+\s+\(.+\)/)).toBeVisible();
   await expect(page.getByRole("heading", { name: "ironmesh Server Node" })).toHaveCount(0);
   await expect(page.getByText("Server Admin", { exact: true })).toBeVisible();
-
-  await page.getByRole("button", { name: "Admin Access" }).click();
-  await page.getByLabel("Admin password").fill(PLAYWRIGHT_RUNTIME_ADMIN_PASSWORD);
-  await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page.getByTestId("server-admin-session-badge")).toHaveText("signed in", { timeout: 60_000 });
-  await page.keyboard.press("Escape");
 
   await expect(page.getByTestId("dashboard-cluster-nodes-card")).toContainText("1 / 1", { timeout: 60_000 });
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
