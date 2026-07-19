@@ -18,11 +18,20 @@ admin UI is picked up by the client UI on its next configuration refresh.
 | `natural-earth-globe` | Small raster world overview based on Natural Earth | enabled and active |
 | `natural-earth-labels` | The Natural Earth base plus cities, borders, and optional roads | disabled until its overlay is imported |
 | `openmaptiles-street` | A detailed global vector street map | disabled until its larger artifact is imported |
+| `maptiler-satellite` | The original MapTiler Satellite 2017 planet package | disabled; retained for upgrades |
+| `maptiler-hybrid` | The original MapTiler satellite package with its OpenMapTiles overlay | disabled; retained for upgrades |
+| `maptiler-street` | The original MapTiler OpenMapTiles 2020 planet package | disabled; retained for upgrades |
 
 Natural Earth data is public domain. The detailed street profile is deliberately
 not coupled to a particular provider: the administrator must use a compatible,
 properly licensed MBTiles source. OpenStreetMap-derived data normally requires
 attribution and observance of the [Open Database License](https://www.openstreetmap.org/copyright).
+
+The import card displays a provider link and acquisition hint for every included
+profile: [Natural Earth](https://www.naturalearthdata.com/),
+[OpenMapTiles](https://openmaptiles.org/), or legacy
+[MapTiler Data](https://data.maptiler.com/). Custom profiles retain a generic
+license and attribution reminder because their provider is administrator-defined.
 
 ## Configure a map variant
 

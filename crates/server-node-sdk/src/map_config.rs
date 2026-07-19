@@ -76,6 +76,7 @@ pub(crate) struct MapVariantImportTarget {
 pub(crate) struct LoadedMapConfiguration {
     pub(crate) configuration: ClusterMapConfiguration,
     pub(crate) stored: bool,
+    needs_persistence: bool,
 }
 
 fn default_configuration_version() -> u32 {
@@ -123,8 +124,105 @@ pub(crate) fn default_configuration() -> ClusterMapConfiguration {
                 raster_manifest_key: None,
                 vector_manifest_key: Some("sys/maps/openmaptiles-street.mbtiles.manifest.json".to_string()),
             },
-        ],
+        ]
+        .into_iter()
+        .chain(legacy_maptiler_variants())
+        .collect(),
     }
+}
+
+/// The first gallery map used these three profiles directly, before gallery
+/// map profiles became cluster configuration. Keep their original artifact
+/// keys available so an upgrade neither hides an already-imported package nor
+/// forces an administrator to copy a multi-gigabyte MBTiles file.
+fn legacy_maptiler_variants() -> [ClusterMapVariant; 3] {
+    [
+        ClusterMapVariant {
+            id: "maptiler-satellite".to_string(),
+            label: "MapTiler Satellite (legacy)".to_string(),
+            mode_label: "Satellite".to_string(),
+            description: "The existing MapTiler Satellite 2017 planet package, retained for gallery-map upgrades.".to_string(),
+            attribution:
+                "Imagery © MapTiler 2017. Data © OpenStreetMap contributors.".to_string(),
+            kind: MapVariantKind::Raster,
+            style: MapVariantStyle::Raster,
+            enabled: false,
+            raster_manifest_key: Some(
+                "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json"
+                    .to_string(),
+            ),
+            vector_manifest_key: None,
+        },
+        ClusterMapVariant {
+            id: "maptiler-hybrid".to_string(),
+            label: "MapTiler Satellite + Street (legacy)".to_string(),
+            mode_label: "Hybrid".to_string(),
+            description: "The established MapTiler satellite package with the original OpenMapTiles label overlay.".to_string(),
+            attribution:
+                "Imagery © MapTiler 2017. Data © OpenStreetMap contributors.".to_string(),
+            kind: MapVariantKind::Hybrid,
+            style: MapVariantStyle::Openmaptiles,
+            enabled: false,
+            raster_manifest_key: Some(
+                "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json"
+                    .to_string(),
+            ),
+            vector_manifest_key: Some(
+                "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles.manifest.json"
+                    .to_string(),
+            ),
+        },
+        ClusterMapVariant {
+            id: "maptiler-street".to_string(),
+            label: "MapTiler Street (legacy)".to_string(),
+            mode_label: "Street".to_string(),
+            description: "The existing MapTiler OpenMapTiles 2020 planet package, retained for gallery-map upgrades.".to_string(),
+            attribution: "Data © OpenStreetMap contributors.".to_string(),
+            kind: MapVariantKind::Vector,
+            style: MapVariantStyle::Openmaptiles,
+            enabled: false,
+            raster_manifest_key: None,
+            vector_manifest_key: Some(
+                "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles.manifest.json"
+                    .to_string(),
+            ),
+        },
+    ]
+}
+
+/// Configurations materialized by the initial profile release contain the
+/// three Natural Earth/OpenMapTiles entries but not the earlier MapTiler
+/// profiles. Add the compatibility entries on read, while leaving a wholly
+/// custom configuration untouched.
+fn add_legacy_maptiler_variants(
+    mut configuration: ClusterMapConfiguration,
+) -> (ClusterMapConfiguration, bool) {
+    let preceding_default_ids = [
+        "natural-earth-globe",
+        "natural-earth-labels",
+        "openmaptiles-street",
+    ];
+    if !preceding_default_ids.iter().all(|id| {
+        configuration
+            .variants
+            .iter()
+            .any(|variant| variant.id == *id)
+    }) {
+        return (configuration, false);
+    }
+
+    let mut changed = false;
+    for variant in legacy_maptiler_variants() {
+        if configuration
+            .variants
+            .iter()
+            .all(|existing| existing.id != variant.id)
+        {
+            configuration.variants.push(variant);
+            changed = true;
+        }
+    }
+    (configuration, changed)
 }
 
 pub(crate) async fn public_config(State(state): State<ServerState>) -> impl IntoResponse {
@@ -290,14 +388,18 @@ pub(crate) async fn load_current_configuration(
         return Ok(LoadedMapConfiguration {
             configuration: default_configuration(),
             stored: false,
+            needs_persistence: true,
         });
     };
-    let configuration = serde_json::from_slice::<ClusterMapConfiguration>(&payload)
+    let stored_configuration = serde_json::from_slice::<ClusterMapConfiguration>(&payload)
         .context("failed parsing gallery map configuration")?;
+    validate_configuration(&stored_configuration)?;
+    let (configuration, needs_persistence) = add_legacy_maptiler_variants(stored_configuration);
     validate_configuration(&configuration)?;
     Ok(LoadedMapConfiguration {
         configuration,
         stored: true,
+        needs_persistence,
     })
 }
 
@@ -306,7 +408,7 @@ pub(crate) async fn load_current_configuration(
 /// default so administrators immediately get a real replicated config file.
 async fn load_or_initialize_configuration(state: &ServerState) -> Result<LoadedMapConfiguration> {
     let loaded = load_current_configuration(state).await?;
-    if loaded.stored {
+    if loaded.stored && !loaded.needs_persistence {
         return Ok(loaded);
     }
 
@@ -314,14 +416,16 @@ async fn load_or_initialize_configuration(state: &ServerState) -> Result<LoadedM
     // received an already-known custom document yet. The replica reconciler
     // will bring that object across; returning the safe default meanwhile is
     // preferable to creating a competing version.
-    if !state
-        .cluster
-        .lock()
-        .await
-        .replica_nodes_for_subject(MAP_CONFIGURATION_STORAGE_KEY)
-        .is_empty()
-    {
-        return Ok(loaded);
+    if !loaded.stored {
+        if !state
+            .cluster
+            .lock()
+            .await
+            .replica_nodes_for_subject(MAP_CONFIGURATION_STORAGE_KEY)
+            .is_empty()
+        {
+            return Ok(loaded);
+        }
     }
 
     let payload = serde_json::to_vec_pretty(&loaded.configuration)
@@ -352,6 +456,7 @@ async fn load_or_initialize_configuration(state: &ServerState) -> Result<LoadedM
     Ok(LoadedMapConfiguration {
         configuration: loaded.configuration,
         stored: true,
+        needs_persistence: false,
     })
 }
 
@@ -508,6 +613,24 @@ mod tests {
     fn default_configuration_is_valid_and_uses_the_small_globe() {
         let configuration = default_configuration();
         assert_eq!(configuration.active_variant_id, "natural-earth-globe");
+        assert!(
+            configuration
+                .variants
+                .iter()
+                .any(|variant| variant.id == "maptiler-satellite")
+        );
+        assert!(
+            configuration
+                .variants
+                .iter()
+                .any(|variant| variant.id == "maptiler-hybrid")
+        );
+        assert!(
+            configuration
+                .variants
+                .iter()
+                .any(|variant| variant.id == "maptiler-street")
+        );
         assert!(validate_configuration(&configuration).is_ok());
     }
 
@@ -532,5 +655,63 @@ mod tests {
         let mut configuration = default_configuration();
         configuration.variants[0].enabled = false;
         assert!(validate_configuration(&configuration).is_err());
+    }
+
+    #[test]
+    fn previous_default_configuration_is_enriched_with_legacy_maptiler_profiles() {
+        let mut previous_configuration = default_configuration();
+        previous_configuration
+            .variants
+            .retain(|variant| !variant.id.starts_with("maptiler-"));
+
+        let (configuration, changed) = add_legacy_maptiler_variants(previous_configuration);
+
+        assert!(changed);
+        assert!(
+            configuration
+                .variants
+                .iter()
+                .any(|variant| variant.id == "maptiler-satellite")
+        );
+        assert!(
+            configuration
+                .variants
+                .iter()
+                .any(|variant| variant.id == "maptiler-hybrid")
+        );
+        assert!(
+            configuration
+                .variants
+                .iter()
+                .any(|variant| variant.id == "maptiler-street")
+        );
+        assert!(validate_configuration(&configuration).is_ok());
+    }
+
+    #[test]
+    fn custom_configuration_is_not_changed_by_legacy_profile_migration() {
+        let configuration = ClusterMapConfiguration {
+            version: MAP_CONFIGURATION_VERSION,
+            active_variant_id: "custom-globe".to_string(),
+            variants: vec![ClusterMapVariant {
+                id: "custom-globe".to_string(),
+                label: "Custom Globe".to_string(),
+                mode_label: "Globe".to_string(),
+                description: "A custom world overview map.".to_string(),
+                attribution: "Example provider.".to_string(),
+                kind: MapVariantKind::Raster,
+                style: MapVariantStyle::Raster,
+                enabled: true,
+                raster_manifest_key: Some(
+                    "sys/maps/custom-globe.mbtiles.manifest.json".to_string(),
+                ),
+                vector_manifest_key: None,
+            }],
+        };
+
+        let (migrated, changed) = add_legacy_maptiler_variants(configuration.clone());
+
+        assert!(!changed);
+        assert_eq!(migrated, configuration);
     }
 }
