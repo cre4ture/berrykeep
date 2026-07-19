@@ -357,27 +357,8 @@ fn persist_registry(path: &Path, clusters: &BTreeMap<ClusterId, ClusterCaRecord>
             path.display()
         )
     })?;
-    sync_registry_directory(parent)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_registry_directory(parent: &Path) -> Result<()> {
-    std::fs::File::open(parent)
-        .with_context(|| {
-            format!(
-                "failed opening cluster CA registry directory {}",
-                parent.display()
-            )
-        })?
-        .sync_all()
-        .context("failed syncing cluster CA registry directory")
-}
-
-#[cfg(not(unix))]
-fn sync_registry_directory(_parent: &Path) -> Result<()> {
-    // Windows does not expose a portable, openable directory handle for fsync.
-    // The registry file itself has already been fully synced before its rename.
+    // The replacement file is fully synced before this atomic rename, so an
+    // interrupted write cannot leave a partially written registry behind.
     Ok(())
 }
 
