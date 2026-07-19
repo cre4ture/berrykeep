@@ -456,6 +456,10 @@ test("server-admin validates and saves storage-pool configuration with Cockpit g
   await expect(page.getByText("Optional host administration tooling unavailable", { exact: true })).toBeVisible();
   await expect(page.getByText("Cockpit host administration", { exact: true })).toBeVisible();
   await expect(page.getByText("optional", { exact: true })).toBeVisible();
+  await expect(page.getByRole("table")).toBeVisible();
+  await expect(page.getByText("Natural Earth archive extraction (unzip)", { exact: true })).toBeVisible();
+  await expect(page.getByText("Natural Earth map conversion (GDAL)", { exact: true })).toBeVisible();
+  await expect(page.getByText(/install the `gdal-bin` package/)).toBeVisible();
 });
 
 test("server-admin Dependencies reports a detected Cockpit installation", async ({ page }) => {
@@ -471,7 +475,9 @@ test("server-admin Dependencies reports a detected Cockpit installation", async 
   await page.getByText("Dependencies", { exact: true }).click();
   await expect(page.getByText("Optional host administration tooling unavailable", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Cockpit web service found at /usr/lib/cockpit/cockpit-ws")).toBeVisible();
-  await expect(page.getByText("ready", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("row").filter({ hasText: "Cockpit host administration" }).getByText("ready", { exact: true })
+  ).toBeVisible();
 });
 
 test("server-admin explorer loads version history with thumbnails", async ({ page }) => {
@@ -1305,6 +1311,27 @@ async function installServerAdminMocks(
             configured_path: null,
             resolved_path: cockpitReady ? "/usr/lib/cockpit/cockpit-ws" : null,
             install_hint: cockpitReady ? null : "Install Cockpit with the host package manager."
+          },
+          {
+            id: "natural-earth-unzip",
+            feature: "Natural Earth archive extraction (unzip)",
+            status: "ready",
+            summary: "Resolved on host at /usr/bin/unzip",
+            detail: "Automatic Natural Earth map imports need unzip to extract the official source archive.",
+            configured_path: "unzip",
+            resolved_path: "/usr/bin/unzip",
+            install_hint: null
+          },
+          {
+            id: "natural-earth-gdal",
+            feature: "Natural Earth map conversion (GDAL)",
+            status: "missing",
+            summary: "Required GDAL command(s) not found on PATH: gdal_rasterize",
+            detail: "Automatic Natural Earth map imports need GDAL to rasterize source layers, project them to Web Mercator, and create MBTiles overviews.",
+            configured_path: "gdal_rasterize, gdalwarp, gdal_translate, gdaladdo",
+            resolved_path: null,
+            install_hint:
+              "On Debian or Ubuntu, install the `gdal-bin` package; it provides gdal_rasterize, gdalwarp, gdal_translate, and gdaladdo."
           }
         ]
       });
