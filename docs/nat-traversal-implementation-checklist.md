@@ -59,6 +59,12 @@ Use this section as the current source of truth for remaining work. The detailed
    The in-memory cluster model now uses a structured reachability plus capability record under `NodeDescriptor`, peer planning/projection no longer depends on raw `public_url` / `internal_url` fields directly, and the admin registration surface plus system-test/local-cluster helpers now use the same nested `reachability` / `capabilities` payload shape.
 5. Refresh tests and operational docs to match the real implementation state.
    Remaining work: reconcile this checklist with completed work, expand the new rendezvous-backed system coverage into more outbound-only and failure/reconnect scenarios, keep platform-facing docs aligned with the new enrollment and transport model, and eventually add a more automated control-plane handoff beyond the current export/import plus restart flow.
+6. Deliver global rendezvous tenancy for Option 1. Status: implemented by this
+   branch, pending review and merge. Phase 1 relay security is on `main`, and
+   Phase 2 adds the persistent P2-C registry/dynamic verifier, the versioned
+   global registration and operator API, explicit server-node opt-in and
+   auto-registration, and two-cluster/restart end-to-end coverage. The feature
+   is available on `main` only after this branch merges.
 
 ## 2. Target workspace shape
 
@@ -287,6 +293,38 @@ Keep only if still useful:
 - `IRONMESH_PUBLIC_TLS_CERT`
 - `IRONMESH_PUBLIC_TLS_KEY`
 - `IRONMESH_PUBLIC_TLS_CA_CERT`
+
+### Phase 2 global rendezvous contract
+
+The following names and semantics are the implemented Phase-2 configuration
+contract. They are available on this branch and become available on `main` on
+merge.
+
+Global rendezvous service:
+
+- `IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY`: persistent path for the
+  Option-1 cluster registry.
+- `IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED`: explicit operator gate
+  for self-service cluster registration.
+- `IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN`: secret used for global registry
+  administration, including suspend and resume actions.
+- `IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE`: maximum
+  self-registration attempts accepted per minute.
+- `IRONMESH_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS`: lifetime of a registration
+  challenge before a proof must be rejected.
+- `IRONMESH_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES`: bound on outstanding
+  in-memory registration challenges.
+
+Server node:
+
+- `IRONMESH_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED`: explicit node opt-in for
+  automatic registration against a global rendezvous. It must not override a
+  disabled service-side registration gate.
+
+The global service must use HTTPS service certificate and key material from its
+normal TLS configuration, not the cluster CA registry. The registry stores one
+active P-256 CA per cluster and is not a private-key store. See
+`docs/global-rendezvous-operations.md` for the operational checklist.
 
 Delete or replace:
 

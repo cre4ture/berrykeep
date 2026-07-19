@@ -1,6 +1,9 @@
 # Global Rendezvous Relay and End-to-End Security Plan
 
-Status: implementation plan. The first implementation phase is in progress.
+Status: Phase 1 is implemented on `main`. Phase 2 is implemented by this
+branch and is pending review and merge. It adds the global registration API,
+server-node opt-in and auto-registration, and the Phase-2 end-to-end coverage;
+those capabilities become available on `main` when this branch is merged.
 
 ## Goal
 
@@ -31,6 +34,8 @@ Implementation order:
 
 ## Phase 1: End-to-end relay transport
 
+Status: implemented on `main`.
+
 ### Protocol decision
 
 Use a nested TLS 1.3 connection, not a new bespoke AEAD protocol.
@@ -49,9 +54,11 @@ source mTLS  -- WSS/TLS -->  terminates outer WSS  <-- WSS/TLS --    target mTLS
 The inner TLS stream runs above `WebSocketByteStream` and below
 `MultiplexedSession`. Consequently, multiplex control messages, HTTP request
 and response bytes, application credentials, and payloads are all encrypted
-from source peer to target node. The relay still necessarily sees connection
-metadata: time, byte counts, the relay ticket/session id, and the authenticated
-outer rendezvous identities.
+from source peer to target node. This is a hard boundary for the global relay:
+it sees only outer rendezvous metadata, such as authenticated outer identities,
+cluster scope, relay ticket/session id, timing, and frame or byte sizes, plus
+the encrypted inner TLS stream. It does not receive application payloads and
+does not terminate the inner TLS layer.
 
 Existing cluster-issued identities are sufficient for this first phase:
 
@@ -163,7 +170,11 @@ Deliverables:
 
 ## Phase 2: Cluster tenancy for Option 1
 
-This phase starts only after Phase 1 acceptance criteria are met.
+Phase 1 acceptance criteria are met on `main`. This branch completes Phase 2:
+it integrates the P2-C registry and dynamic verifier, exposes the P2-D global
+registration and operator controls, adds node opt-in and auto-registration,
+and covers the full two-cluster lifecycle in P2-E. Review and merge remain
+required before this status applies to `main`.
 
 ### Tenant key and certificate binding
 
@@ -171,12 +182,17 @@ Tenant ownership is the tuple `(cluster_id, peer_identity)`, never identity
 alone. The service must derive `cluster_id` from a verified certificate SAN,
 not from an untrusted JSON request body.
 
-For the Option 1 MVP, every cluster has exactly one active registered CA. Node
-and device rendezvous certificates must both carry:
+For the Option 1 MVP, every cluster has exactly one active registered P-256
+CA. Node and device rendezvous certificates must both carry:
 
 - `urn:ironmesh:cluster:<cluster_id>`
 - either `urn:ironmesh:node:<node_id>` or
   `urn:ironmesh:device:<device_id>`
+
+The verifier reads the cluster SAN from the presented certificate and selects
+exactly that cluster's one registered CA. It must verify only against that CA;
+it must not try every CA in the registry as a fallback. A missing, unknown, or
+mismatched cluster SAN is a verification failure.
 
 The current node certificate already carries the cluster SAN; client
 rendezvous identity issuance needs the same binding before tenant-aware dynamic
@@ -199,10 +215,20 @@ cluster can never return another cluster's presence metadata.
 ### Dynamic self-service registration
 
 There is no administrative approval per cluster. Instead a new cluster
-registers a self-signed CA once over TLS and proves possession of the matching
-private key by signing a canonical registration challenge. The service verifies
-that the requested `cluster_id`, submitted CA fingerprint, and signed proof
-are bound together, then stores the CA for that cluster.
+registers one self-signed P-256 CA over HTTPS and proves possession of the
+matching private key by signing the versioned canonical registration proof.
+The canonical proof binds the `cluster_id`, normalized CA DER fingerprint,
+challenge id, nonce, and expiry. The service must verify that binding, the
+challenge expiry and single use, and the P-256 proof before storing the CA for
+that cluster.
+
+Registration is idempotent only when the existing `cluster_id` is submitted
+with the same normalized CA fingerprint and a valid fresh proof. That request
+returns the existing registration rather than creating another active CA. A
+request for an existing `cluster_id` with a different CA fingerprint is
+rejected, even if the caller can prove possession of that different CA. There
+is no self-service or administrator API in the MVP that rewrites a cluster to
+a foreign CA.
 
 This is automatic admission, not an assertion that every registrant is
 trustworthy. Public operation still needs limits against abuse: registration
@@ -219,43 +245,39 @@ The service needs a reloadable custom client-certificate verifier that:
 4. rejects a certificate whose node/device SAN or request tenant does not
    match.
 
-### Phase 2 work packages
+### Phase 2 work packages and status
 
-- P2-A: Add cluster SAN to all issued rendezvous identities and validation
-  tests.
-- P2-B: Make in-memory rendezvous presence, discovery, relay, and wake state
+- P2-A: Cluster SAN issuance and validation are present.
+- P2-B: In-memory rendezvous presence, discovery, relay, and wake state are
   cluster-keyed.
-- P2-C: Add a persistent cluster CA registry plus dynamic verifier snapshots.
-- P2-D: Add the self-service registration challenge API, abuse controls, and
-  operator suspend/list controls.
-- P2-E: Add two-cluster isolation, restart persistence, and CA-registration
-  system tests.
+- P2-C: The persistent cluster CA registry and dynamic verifier are integrated
+  into the global rendezvous service. Exactly one active CA is selected by the
+  verified cluster SAN, without an all-CA fallback.
+- P2-D: The versioned self-service challenge/proof API, registration rate
+  limiting, authenticated list/suspend/resume controls with suspension audit
+  data, and explicit server-node auto-registration opt-in are implemented.
+- P2-E: The system test covers HTTPS registration, two-cluster mTLS tenancy,
+  rejection of a bad CA, suspension, and restart persistence.
 
 ## Deferred work
 
-The MVP intentionally supports one active CA per cluster. Multiple active CAs
-of the same role become useful during CA rotation, when old and new client
-certificates must overlap. That is an operational extension after the first
-deployment: store an ordered active CA set per cluster, accept both during the
-overlap, issue only from the new CA, then retire the old CA after all issued
-certificates expire or are revoked.
+The MVP intentionally has no CA rotation. It supports exactly one active P-256
+CA per cluster and rejects replacement by another CA. A later rotation design
+may introduce an ordered active CA set, an overlap window, issuance from the
+new CA, and retirement after the old certificates expire or are revoked. That
+is explicitly outside Option 1 MVP and must not be approximated by an
+all-registered-CA fallback verifier.
 
 A dedicated global rendezvous PKI is also deferred. It remains a worthwhile
 later hardening step because it gives the global operator a narrower,
 rendezvous-only credential boundary, but it is not required for the first
 Option 1 delivery.
 
-## Pull request sequence
+## Delivery dependency
 
-1. `global-rendezvous-e2e-plan`: this plan and the security-status correction.
-2. `relay-inner-mtls`: P1-A secure stream primitive and tests.
-3. `client-relay-inner-mtls`: P1-B client integration, based on P1-A.
-4. `node-relay-inner-mtls`: P1-C target-node integration, based on P1-A.
-5. `relay-e2e-system-tests`: P1-D validation and final documentation, based
-   on the three implementation PRs.
-6. The Phase 2 packages above follow only after the Phase 1 PRs are merged and
-   their relay-only tests pass.
-
-Each PR remains small, independently testable where dependencies permit, and
-is monitored for CI failures. No package changes unrelated user work or
-silently weakens existing TLS behavior.
+The Phase-2 implementation on this branch meets the single-CA and cluster-SAN
+rules above. It may be merged only with the persistent registry, dynamic
+verifier, service-side abuse controls, node opt-in, and isolation and restart
+tests intact. Production enablement remains subject to the operations checklist
+and its service TLS, durable-storage, secret-management, monitoring, and backup
+requirements.
