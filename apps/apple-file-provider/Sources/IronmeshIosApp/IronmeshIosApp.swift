@@ -49,7 +49,7 @@ private struct IronmeshIosRootView: View {
         ) { presentation in
             IronmeshHostedWebView(session: presentation.session)
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase) { phase in
             if phase != .active {
                 model.closeWebUI()
             }
@@ -1114,7 +1114,7 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
-            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+            decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
         ) {
             guard let candidate = navigationAction.request.url,
                   candidate.scheme == origin.scheme,
