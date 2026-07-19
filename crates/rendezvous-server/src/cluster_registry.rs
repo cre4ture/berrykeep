@@ -390,6 +390,15 @@ fn normalize_registry_path(path: PathBuf) -> Result<PathBuf> {
         .filter(|name| !name.is_empty())
         .context("cluster CA registry path must name a file")?;
     let normalized = parent.join(file_name);
+    // Keep the configured file inside its canonical parent. This guards both
+    // the persistent registry and the fixed-name temporary replacement file.
+    if !normalized.starts_with(&parent) {
+        bail!(
+            "cluster CA registry {} escapes its parent directory {}",
+            normalized.display(),
+            parent.display()
+        );
+    }
     if fs::symlink_metadata(&normalized)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
