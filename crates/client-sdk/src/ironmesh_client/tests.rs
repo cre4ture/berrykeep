@@ -2592,17 +2592,20 @@ async fn upload_session_affinity_uses_same_node_after_path_change() {
             HttpClient::new(),
             Some(node_a),
             None,
+            None,
         ),
         IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
             node_b_url,
             HttpClient::new(),
             Some(node_b),
             None,
+            None,
         ),
         IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
             node_a_secondary_url,
             HttpClient::new(),
             Some(node_a),
+            None,
             None,
         ),
     ])
@@ -3582,6 +3585,7 @@ async fn direct_transport_head_error_includes_endpoint_and_target_node_id() {
         HttpClient::new(),
         Some(target_node_id),
         None,
+        None,
     )
     .with_client_identity(identity);
 
@@ -3636,6 +3640,7 @@ async fn direct_transport_retryable_head_error_includes_endpoint_and_target_node
         direct_state.public_url.clone(),
         HttpClient::new(),
         Some(target_node_id),
+        None,
         None,
     )
     .with_client_identity(identity);
@@ -3699,6 +3704,7 @@ async fn direct_transport_diagnostics_preserve_contextualized_error_chain() {
         unavailable_url.clone(),
         HttpClient::new(),
         Some(target_node_id),
+        None,
         None,
     )
     .with_client_identity(identity);

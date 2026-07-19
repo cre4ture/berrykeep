@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use common::NodeId;
+use common::{ClusterId, NodeId};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Certificate;
 use reqwest::Client;
@@ -14,8 +14,9 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 use transport_sdk::{
-    ClientIdentityMaterial, ConnectionCandidate, RelayTunnelSourceSecurityConfig,
-    RelayTunnelTlsIdentity, RendezvousClientConfig, TransportPathKind,
+    ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity,
+    RelayTunnelSourceSecurityConfig, RelayTunnelTlsIdentity, RendezvousClientConfig,
+    TransportPathKind,
 };
 
 use crate::latency_probe::LatencyProbeConfig;
@@ -52,8 +53,22 @@ pub fn build_reqwest_client_from_pem_for_url(
     server_ca_pem: Option<&str>,
     url: &Url,
 ) -> Result<Client> {
+    build_reqwest_client_from_pem_for_url_with_expected_server_identity(server_ca_pem, url, None)
+}
+
+fn build_reqwest_client_from_pem_for_url_with_expected_server_identity(
+    server_ca_pem: Option<&str>,
+    url: &Url,
+    expected_server_identity: Option<ExpectedNodeServerIdentity>,
+) -> Result<Client> {
     let builder = configure_reqwest_client_builder(Client::builder());
-    let builder = if let Some(pem) = server_ca_pem {
+    let builder = if let Some(expected_server_identity) = expected_server_identity {
+        builder.use_preconfigured_tls(transport_sdk::build_tls_client_config(
+            server_ca_pem,
+            None,
+            Some(expected_server_identity),
+        )?)
+    } else if let Some(pem) = server_ca_pem {
         builder.add_root_certificate(load_root_certificate_pem(pem)?)
     } else {
         builder
@@ -80,8 +95,26 @@ pub fn build_blocking_reqwest_client_from_pem_for_url(
     server_ca_pem: Option<&str>,
     url: &Url,
 ) -> Result<BlockingClient> {
+    build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity(
+        server_ca_pem,
+        url,
+        None,
+    )
+}
+
+pub(crate) fn build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity(
+    server_ca_pem: Option<&str>,
+    url: &Url,
+    expected_server_identity: Option<ExpectedNodeServerIdentity>,
+) -> Result<BlockingClient> {
     let builder = configure_blocking_reqwest_client_builder(BlockingClient::builder());
-    let builder = if let Some(pem) = server_ca_pem {
+    let builder = if let Some(expected_server_identity) = expected_server_identity {
+        builder.use_preconfigured_tls(transport_sdk::build_tls_client_config(
+            server_ca_pem,
+            None,
+            Some(expected_server_identity),
+        )?)
+    } else if let Some(pem) = server_ca_pem {
         builder.add_root_certificate(load_root_certificate_pem(pem)?)
     } else {
         builder
@@ -96,22 +129,29 @@ pub fn build_http_client_from_pem(
     server_ca_pem: Option<&str>,
     base_url_str: &str,
 ) -> Result<IronMeshClient> {
-    build_http_client_from_pem_with_target_node_id(server_ca_pem, base_url_str, None)
+    build_http_client_from_pem_with_target_node_id(server_ca_pem, base_url_str, None, None)
 }
 
 fn build_http_client_from_pem_with_target_node_id(
     server_ca_pem: Option<&str>,
     base_url_str: &str,
     target_node_id: Option<NodeId>,
+    target_cluster_id: Option<ClusterId>,
 ) -> Result<IronMeshClient> {
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
-    let http = build_reqwest_client_from_pem_for_url(server_ca_pem, &base_url)?;
+    let expected_server_identity = expected_server_identity(target_node_id, target_cluster_id)?;
+    let http = build_reqwest_client_from_pem_for_url_with_expected_server_identity(
+        server_ca_pem,
+        &base_url,
+        expected_server_identity,
+    )?;
     Ok(
         IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
             base_url.as_str(),
             http,
             target_node_id,
+            expected_server_identity,
             server_ca_pem.map(ToString::to_string),
         ),
     )
@@ -127,6 +167,7 @@ pub fn build_http_client_with_identity_from_pem(
         base_url_str,
         identity,
         None,
+        None,
     )
 }
 
@@ -135,15 +176,22 @@ fn build_http_client_with_identity_from_pem_with_target_node_id(
     base_url_str: &str,
     identity: &ClientIdentityMaterial,
     target_node_id: Option<NodeId>,
+    target_cluster_id: Option<ClusterId>,
 ) -> Result<IronMeshClient> {
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
-    let http = build_reqwest_client_from_pem_for_url(server_ca_pem, &base_url)?;
+    let expected_server_identity = expected_server_identity(target_node_id, target_cluster_id)?;
+    let http = build_reqwest_client_from_pem_for_url_with_expected_server_identity(
+        server_ca_pem,
+        &base_url,
+        expected_server_identity,
+    )?;
     Ok(
         IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
             base_url.as_str(),
             http,
             target_node_id,
+            expected_server_identity,
             server_ca_pem.map(ToString::to_string),
         )
         .with_client_identity(identity.clone()),
@@ -168,6 +216,7 @@ pub fn build_http_client_with_identity_from_planned_target(
                 server_base_url,
                 identity,
                 target.target_node_id,
+                Some(target.cluster_id),
             );
         }
         TransportPathKind::DirectQuic => {
@@ -288,6 +337,7 @@ pub fn build_http_client_from_planned_targets(
                 .or(target.cluster_ca_pem.as_deref()),
             server_base_url,
             target.target_node_id,
+            Some(target.cluster_id),
         ) {
             Ok(client) => clients.push(client),
             Err(error) => build_errors.push(error.to_string()),
@@ -330,6 +380,7 @@ pub fn build_client_with_optional_identity_from_planned_target(
                         .or(target.cluster_ca_pem.as_deref()),
                     server_base_url,
                     target.target_node_id,
+                    Some(target.cluster_id),
                 );
             }
 
@@ -373,6 +424,25 @@ pub fn build_blocking_http_client(server_ca_cert: Option<&Path>) -> Result<Block
         })
         .transpose()?;
     build_blocking_reqwest_client_from_pem(server_ca_pem.as_deref())
+}
+
+fn expected_server_identity(
+    target_node_id: Option<NodeId>,
+    target_cluster_id: Option<ClusterId>,
+) -> Result<Option<ExpectedNodeServerIdentity>> {
+    match (target_node_id, target_cluster_id) {
+        (Some(node_id), Some(cluster_id)) => Ok(Some(ExpectedNodeServerIdentity {
+            node_id,
+            cluster_id,
+        })),
+        (None, None) => Ok(None),
+        (Some(_), None) => {
+            bail!("identity-bound direct HTTPS target is missing its expected cluster_id")
+        }
+        (None, Some(_)) => {
+            bail!("identity-bound direct HTTPS target is missing its expected node_id")
+        }
+    }
 }
 
 fn configure_reqwest_client_builder(builder: ClientBuilder) -> ClientBuilder {

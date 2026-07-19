@@ -33,9 +33,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
-    ClientIdentityMaterial, ConnectionCandidate, PeerIdentity, RelayHttpHeader,
-    RelayTunnelSourceSecurityConfig, RendezvousControlClient, TransportHeader, TransportPathKind,
-    TransportRequestHead, TransportStreamKind, build_signed_request_headers,
+    ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity, PeerIdentity,
+    RelayHttpHeader, RelayTunnelSourceSecurityConfig, RendezvousControlClient, TransportHeader,
+    TransportPathKind, TransportRequestHead, TransportStreamKind, build_signed_request_headers,
     read_buffered_transport_response, read_transport_response_head,
     write_buffered_transport_request, write_transport_request_head,
 };
@@ -2017,6 +2017,7 @@ impl IronMeshClient {
             server_base_url,
             http,
             None,
+            None,
             server_ca_pem,
         )
     }
@@ -2025,6 +2026,7 @@ impl IronMeshClient {
         server_base_url: impl Into<String>,
         http: HttpClient,
         target_node_id: Option<NodeId>,
+        expected_server_identity: Option<ExpectedNodeServerIdentity>,
         server_ca_pem: Option<String>,
     ) -> Self {
         let server_base_url = server_base_url.into().trim_end_matches('/').to_string();
@@ -2036,6 +2038,7 @@ impl IronMeshClient {
                     session_pool: TransportSessionPool::new_direct(
                         server_base_url.clone(),
                         server_ca_pem,
+                        expected_server_identity,
                     ),
                     server_base_url,
                 },

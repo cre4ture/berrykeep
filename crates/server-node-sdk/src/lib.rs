@@ -18934,6 +18934,10 @@ fn extract_public_node_subject_alt_names_from_cert_pem(cert_pem: &str) -> Result
                             subject_alt_names.push(SanType::IpAddress(ip_addr));
                         }
                     }
+                    // Public node certificates also carry IronMesh node and cluster URI
+                    // SANs.  They are reconstructed from the authenticated enrollment
+                    // identity below rather than copied from an old certificate.
+                    x509_parser::extensions::GeneralName::URI(_) => {}
                     other => {
                         bail!("unsupported SAN type in current public TLS certificate: {other:?}");
                     }
@@ -19015,7 +19019,7 @@ fn issue_internal_node_tls_material_for_identity(
 fn issue_public_node_tls_material_with_subject_alt_names(
     state: &ServerState,
     node_id: NodeId,
-    subject_alt_names: Vec<SanType>,
+    mut subject_alt_names: Vec<SanType>,
     policy: NodeTlsIssuePolicy,
 ) -> std::result::Result<BootstrapMutualTlsMaterial, StatusCode> {
     let trust_material =
@@ -19052,6 +19056,19 @@ fn issue_public_node_tls_material_with_subject_alt_names(
     params.not_after = OffsetDateTime::from_unix_timestamp(policy.not_after_unix as i64)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    // URLs are mutable reachability locators.  IronMesh direct clients bind the
+    // connection to these immutable URI SANs, while ordinary HTTPS clients can
+    // continue to use any DNS/IP SANs supplied above.
+    subject_alt_names.push(SanType::URI(
+        format!("urn:ironmesh:node:{node_id}")
+            .try_into()
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+    ));
+    subject_alt_names.push(SanType::URI(
+        format!("urn:ironmesh:cluster:{}", state.cluster_id)
+            .try_into()
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+    ));
     params.subject_alt_names = subject_alt_names;
 
     let key_pair = KeyPair::generate().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
