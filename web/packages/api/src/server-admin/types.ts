@@ -93,6 +93,11 @@ export type StartAdminMapDatasetImportResponse = {
 
 export type NaturalEarthImportState = "running" | "ready" | "failed";
 
+export type NaturalEarthImportLogEntry = {
+  timestamp_unix: number;
+  message: string;
+};
+
 export type NaturalEarthImportJobView = {
   id: string;
   state: NaturalEarthImportState;
@@ -102,6 +107,7 @@ export type NaturalEarthImportJobView = {
   manifest_key: string;
   logical_size_bytes: number;
   error?: string | null;
+  log_entries: NaturalEarthImportLogEntry[];
   started_at_unix: number;
   updated_at_unix: number;
 };

@@ -12,8 +12,17 @@ const NATURAL_EARTH_IMPORT_MAX_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
 const NATURAL_EARTH_IMPORT_MAX_ARTIFACT_BYTES: usize = 512 * 1024 * 1024;
 const NATURAL_EARTH_IMPORT_PART_BYTES: usize = 256 * 1024 * 1024;
 const NATURAL_EARTH_COMMAND_TIMEOUT_SECS: u64 = 20 * 60;
-const NATURAL_EARTH_COMMAND_OUTPUT_LIMIT: usize = 32 * 1024;
+const NATURAL_EARTH_COMMAND_OUTPUT_LIMIT: usize = 8 * 1024;
+const NATURAL_EARTH_COMMAND_LOG_OUTPUT_LIMIT: usize = 2 * 1024;
+const NATURAL_EARTH_IMPORT_LOG_MAX_ENTRIES: usize = 64;
 const WEB_MERCATOR_WORLD_METERS: &str = "20037508.342789244";
+const REQUIRED_MAP_IMPORT_COMMANDS: [(&str, &str); 5] = [
+    ("unzip", "-v"),
+    ("gdal_rasterize", "--version"),
+    ("gdalwarp", "--version"),
+    ("gdal_translate", "--version"),
+    ("gdaladdo", "--version"),
+];
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +30,12 @@ pub(crate) enum NaturalEarthImportState {
     Running,
     Ready,
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NaturalEarthImportLogEntry {
+    pub(crate) timestamp_unix: u64,
+    pub(crate) message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,6 +48,7 @@ pub(crate) struct NaturalEarthImportJobView {
     pub(crate) manifest_key: String,
     pub(crate) logical_size_bytes: u64,
     pub(crate) error: Option<String>,
+    pub(crate) log_entries: Vec<NaturalEarthImportLogEntry>,
     pub(crate) started_at_unix: u64,
     pub(crate) updated_at_unix: u64,
 }
@@ -69,6 +85,14 @@ struct SplitFileManifestPartDocument {
     key: String,
     offset_bytes: u64,
     size_bytes: u64,
+}
+
+struct PhysicalMapLayers<'a> {
+    ocean: &'a Path,
+    land: &'a Path,
+    lakes: &'a Path,
+    rivers: &'a Path,
+    coastline: &'a Path,
 }
 
 pub(crate) async fn is_running(state: &ServerState) -> bool {
@@ -166,6 +190,10 @@ async fn start_import(
         manifest_key: target.manifest_key,
         logical_size_bytes: 0,
         error: None,
+        log_entries: vec![NaturalEarthImportLogEntry {
+            timestamp_unix: now,
+            message: "Import job accepted; waiting for the conversion worker".to_string(),
+        }],
         started_at_unix: now,
         updated_at_unix: now,
     };
@@ -215,7 +243,7 @@ async fn start_import(
 
 async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Result<u64> {
     update_phase(state, "Checking GDAL and unzip dependencies").await;
-    ensure_import_commands_available().await?;
+    ensure_import_commands_available(state).await?;
     let staging_dir = state
         .data_dir
         .join("state")
@@ -231,11 +259,12 @@ async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Res
     let result = async {
         let archive_path = staging_dir.join("natural-earth-physical.zip");
         update_phase(state, "Downloading Natural Earth physical data").await;
-        download_natural_earth_archive(&archive_path).await?;
+        download_natural_earth_archive(state, &archive_path).await?;
         let extracted_dir = staging_dir.join("source");
         fs::create_dir_all(&extracted_dir).await?;
         update_phase(state, "Extracting Natural Earth source layers").await;
         run_command(
+            state,
             "unzip",
             [
                 "-q".into(),
@@ -256,24 +285,29 @@ async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Res
         let artifact_path = staging_dir.join("natural-earth-globe.mbtiles");
         update_phase(state, "Rendering the physical world map").await;
         rasterize_physical_map(
-            &ocean,
-            &land,
-            &lakes,
-            &rivers,
-            &coastline,
+            state,
+            PhysicalMapLayers {
+                ocean: &ocean,
+                land: &land,
+                lakes: &lakes,
+                rivers: &rivers,
+                coastline: &coastline,
+            },
             &source_raster,
             &staging_dir,
         )
         .await?;
         update_phase(state, "Generating Web Mercator MBTiles").await;
         project_and_create_mbtiles(
+            state,
             &source_raster,
             &mercator_raster,
             &artifact_path,
             &staging_dir,
         )
         .await?;
-        validate_generated_mbtiles(&artifact_path).await?;
+        update_phase(state, "Validating generated MBTiles").await;
+        validate_generated_mbtiles(state, &artifact_path).await?;
         update_phase(state, "Publishing the map artifact").await;
         publish_generated_mbtiles(state, job, &artifact_path).await
     }
@@ -291,7 +325,26 @@ async fn update_phase(state: &ServerState, phase: &str) {
     {
         job.phase = phase.to_string();
         job.updated_at_unix = unix_ts();
+        append_job_log(job, format!("Phase: {phase}"));
     }
+}
+
+async fn append_import_log(state: &ServerState, message: impl Into<String>) {
+    let mut runtime = state.storage.natural_earth_import.lock().await;
+    if let Some(job) = runtime.job.as_mut() {
+        append_job_log(job, message);
+        job.updated_at_unix = unix_ts();
+    }
+}
+
+fn append_job_log(job: &mut NaturalEarthImportJobView, message: impl Into<String>) {
+    if job.log_entries.len() == NATURAL_EARTH_IMPORT_LOG_MAX_ENTRIES {
+        job.log_entries.remove(0);
+    }
+    job.log_entries.push(NaturalEarthImportLogEntry {
+        timestamp_unix: unix_ts(),
+        message: message.into(),
+    });
 }
 
 async fn finish_job(
@@ -303,49 +356,79 @@ async fn finish_job(
 ) {
     let mut runtime = state.storage.natural_earth_import.lock().await;
     if let Some(job) = runtime.job.as_mut() {
-        job.state = import_state;
         job.phase = phase.to_string();
         job.logical_size_bytes = logical_size_bytes;
         job.error = error;
         job.updated_at_unix = unix_ts();
+        let completion_log = match &import_state {
+            NaturalEarthImportState::Ready => Some("Import completed successfully".to_string()),
+            NaturalEarthImportState::Failed => Some(format!(
+                "Import failed: {}",
+                job.error.as_deref().unwrap_or("unknown error")
+            )),
+            NaturalEarthImportState::Running => None,
+        };
+        job.state = import_state;
+        if let Some(completion_log) = completion_log {
+            append_job_log(job, completion_log);
+        }
     }
 }
 
-async fn ensure_import_commands_available() -> Result<()> {
-    for command in [
-        "unzip",
-        "gdal_rasterize",
-        "gdalwarp",
-        "gdal_translate",
-        "gdaladdo",
-    ] {
+async fn ensure_import_commands_available(state: &ServerState) -> Result<()> {
+    for (command, version_argument) in REQUIRED_MAP_IMPORT_COMMANDS {
+        let arguments = vec![version_argument.into()];
+        let command_display = format_command(command, &arguments);
+        append_import_log(
+            state,
+            format!("Checking required command: {command_display}"),
+        )
+        .await;
         match timeout(
             Duration::from_secs(10),
             Command::new(command)
-                .arg("--version")
+                .args(&arguments)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .kill_on_drop(true)
-                .status(),
+                .output(),
         )
         .await
         {
-            Ok(Ok(status)) if status.success() => {}
-            Ok(Ok(status)) => bail!("required map import command {command} exited with {status}"),
+            Ok(Ok(output)) if output.status.success() => {
+                append_import_log(
+                    state,
+                    format!("Required command is available: {command_display}"),
+                )
+                .await;
+            }
+            Ok(Ok(output)) => {
+                let error = command_failure_message(&command_display, &output);
+                append_import_log(state, format!("Required command check failed: {error}")).await;
+                bail!("required map import command {error}")
+            }
             Ok(Err(error)) if error.kind() == io::ErrorKind::NotFound => {
-                bail!("required map import command {command} is not installed or not on PATH")
+                let error = format!("`{command_display}` is not installed or not on PATH");
+                append_import_log(state, format!("Required command check failed: {error}")).await;
+                bail!("required map import command {error}")
             }
             Ok(Err(error)) => {
-                bail!("failed starting required map import command {command}: {error}")
+                let error = format!("could not start `{command_display}`: {error}");
+                append_import_log(state, format!("Required command check failed: {error}")).await;
+                bail!("failed starting required map import command {error}")
             }
-            Err(_) => bail!("timed out checking required map import command {command}"),
+            Err(_) => {
+                let error = format!("`{command_display}` timed out after 10 seconds");
+                append_import_log(state, format!("Required command check failed: {error}")).await;
+                bail!("required map import command {error}")
+            }
         }
     }
     Ok(())
 }
 
-async fn download_natural_earth_archive(destination: &Path) -> Result<()> {
+async fn download_natural_earth_archive(state: &ServerState, destination: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10 * 60))
         .redirect(reqwest::redirect::Policy::limited(3))
@@ -384,36 +467,42 @@ async fn download_natural_earth_archive(destination: &Path) -> Result<()> {
         }
         payload.extend_from_slice(&chunk);
     }
+    let downloaded_bytes = payload.len();
     fs::write(destination, payload).await.with_context(|| {
         format!(
             "failed writing Natural Earth archive {}",
             destination.display()
         )
-    })
+    })?;
+    append_import_log(
+        state,
+        format!("Downloaded Natural Earth archive ({downloaded_bytes} bytes)"),
+    )
+    .await;
+    Ok(())
 }
 
 async fn rasterize_physical_map(
-    ocean: &Path,
-    land: &Path,
-    lakes: &Path,
-    rivers: &Path,
-    coastline: &Path,
+    state: &ServerState,
+    layers: PhysicalMapLayers<'_>,
     destination: &Path,
     working_dir: &Path,
 ) -> Result<()> {
     run_command(
+        state,
         "gdal_rasterize",
-        rasterize_create_arguments(ocean, destination, [199, 224, 239, 255]),
+        rasterize_create_arguments(layers.ocean, destination, [199, 224, 239, 255]),
         working_dir,
     )
     .await?;
     for (layer, color) in [
-        (land, [225, 232, 205, 255]),
-        (lakes, [171, 211, 233, 255]),
-        (rivers, [104, 170, 214, 255]),
-        (coastline, [94, 117, 122, 255]),
+        (layers.land, [225, 232, 205, 255]),
+        (layers.lakes, [171, 211, 233, 255]),
+        (layers.rivers, [104, 170, 214, 255]),
+        (layers.coastline, [94, 117, 122, 255]),
     ] {
         run_command(
+            state,
             "gdal_rasterize",
             rasterize_overlay_arguments(layer, destination, color),
             working_dir,
@@ -478,12 +567,14 @@ fn append_raster_color_arguments(
 }
 
 async fn project_and_create_mbtiles(
+    state: &ServerState,
     source: &Path,
     mercator: &Path,
     artifact: &Path,
     working_dir: &Path,
 ) -> Result<()> {
     run_command(
+        state,
         "gdalwarp",
         vec![
             "-overwrite".into(),
@@ -506,6 +597,7 @@ async fn project_and_create_mbtiles(
     )
     .await?;
     run_command(
+        state,
         "gdal_translate",
         vec![
             "-of".into(),
@@ -537,6 +629,7 @@ async fn project_and_create_mbtiles(
     )
     .await?;
     run_command(
+        state,
         "gdaladdo",
         vec![
             "-r".into(),
@@ -554,14 +647,18 @@ async fn project_and_create_mbtiles(
 }
 
 async fn run_command(
+    state: &ServerState,
     program: &str,
     args: impl IntoIterator<Item = std::ffi::OsString>,
     working_dir: &Path,
 ) -> Result<()> {
-    let output = timeout(
+    let args = args.into_iter().collect::<Vec<_>>();
+    let command_display = format_command(program, &args);
+    append_import_log(state, format!("Running command: {command_display}")).await;
+    let output = match timeout(
         Duration::from_secs(NATURAL_EARTH_COMMAND_TIMEOUT_SECS),
         Command::new(program)
-            .args(args)
+            .args(&args)
             .current_dir(working_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -570,26 +667,93 @@ async fn run_command(
             .output(),
     )
     .await
-    .with_context(|| format!("{program} timed out"))?
-    .with_context(|| format!("failed starting {program}"))?;
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            let error = format!("`{command_display}` could not be started: {error}");
+            append_import_log(state, format!("Command failed: {error}")).await;
+            bail!("map conversion command {error}")
+        }
+        Err(_) => {
+            let error = format!(
+                "`{command_display}` timed out after {NATURAL_EARTH_COMMAND_TIMEOUT_SECS} seconds"
+            );
+            append_import_log(state, format!("Command failed: {error}")).await;
+            bail!("map conversion command {error}")
+        }
+    };
     if output.status.success() {
+        let output_details =
+            command_output_details(&output, NATURAL_EARTH_COMMAND_LOG_OUTPUT_LIMIT);
+        let message = if output_details.is_empty() {
+            format!("Command completed successfully: {command_display}")
+        } else {
+            format!("Command completed successfully: {command_display}\n{output_details}")
+        };
+        append_import_log(state, message).await;
         return Ok(());
     }
-    bail!(
-        "{program} failed with {}:{}{}",
-        output.status,
-        truncate_command_output(&output.stderr),
-        truncate_command_output(&output.stdout),
-    )
+    let error = command_failure_message(&command_display, &output);
+    append_import_log(state, format!("Command failed: {error}")).await;
+    bail!("map conversion command {error}")
 }
 
-fn truncate_command_output(output: &[u8]) -> String {
-    let clipped = &output[..output.len().min(NATURAL_EARTH_COMMAND_OUTPUT_LIMIT)];
+fn format_command(program: &str, args: &[std::ffi::OsString]) -> String {
+    std::iter::once(program.to_string())
+        .chain(
+            args.iter()
+                .map(|arg| quote_command_argument(&arg.to_string_lossy())),
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_command_argument(argument: &str) -> String {
+    if argument
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-._/=:".contains(character))
+    {
+        argument.to_string()
+    } else {
+        format!("'{}'", argument.replace('\'', "'\\''"))
+    }
+}
+
+fn command_failure_message(command_display: &str, output: &std::process::Output) -> String {
+    let details = command_output_details(output, NATURAL_EARTH_COMMAND_OUTPUT_LIMIT);
+    if details.is_empty() {
+        format!("`{command_display}` exited with {}", output.status)
+    } else {
+        format!(
+            "`{command_display}` exited with {}:\n{details}",
+            output.status
+        )
+    }
+}
+
+fn command_output_details(output: &std::process::Output, limit: usize) -> String {
+    let mut sections = Vec::new();
+    if let Some(stderr) = truncate_command_output(&output.stderr, limit) {
+        sections.push(format!("stderr:\n{stderr}"));
+    }
+    if let Some(stdout) = truncate_command_output(&output.stdout, limit) {
+        sections.push(format!("stdout:\n{stdout}"));
+    }
+    sections.join("\n")
+}
+
+fn truncate_command_output(output: &[u8], limit: usize) -> Option<String> {
+    let clipped = &output[..output.len().min(limit)];
     let text = String::from_utf8_lossy(clipped).trim().to_string();
     if text.is_empty() {
-        String::new()
+        None
     } else {
-        format!(" {text}")
+        let truncated = output.len() > clipped.len();
+        Some(if truncated {
+            format!("{text}\n… output truncated")
+        } else {
+            text
+        })
     }
 }
 
@@ -618,7 +782,7 @@ fn find_layer(root: &Path, target_file_name: &str) -> Result<PathBuf> {
     bail!("Natural Earth archive does not contain required layer {target_file_name}")
 }
 
-async fn validate_generated_mbtiles(path: &Path) -> Result<()> {
+async fn validate_generated_mbtiles(state: &ServerState, path: &Path) -> Result<()> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -643,7 +807,9 @@ async fn validate_generated_mbtiles(path: &Path) -> Result<()> {
         Ok(())
     })
     .await
-    .context("generated MBTiles validation task failed")?
+    .context("generated MBTiles validation task failed")??;
+    append_import_log(state, "Generated MBTiles validation completed successfully").await;
+    Ok(())
 }
 
 async fn publish_generated_mbtiles(
@@ -682,6 +848,7 @@ async fn publish_generated_mbtiles(
             .checked_add(size_bytes)
             .context("map artifact size overflow")?;
     }
+    let parts_count = parts.len();
     let manifest = SplitFileManifestDocument {
         manifest_version: 1,
         manifest_type: "split_file_manifest",
@@ -691,7 +858,7 @@ async fn publish_generated_mbtiles(
         storage_root: "sys/maps",
         logical_size_bytes: offset,
         last_part_size_bytes: parts.last().map(|part| part.size_bytes).unwrap_or_default(),
-        parts_count: parts.len(),
+        parts_count,
         parts,
     };
     put_system_object(
@@ -704,6 +871,11 @@ async fn publish_generated_mbtiles(
     )
     .await?;
     map_dataset_import::invalidate_cached_mbtiles_source(state, &job.manifest_key).await;
+    append_import_log(
+        state,
+        format!("Published {parts_count} map artifact part(s) and manifest"),
+    )
+    .await;
     Ok(offset)
 }
 
@@ -741,5 +913,20 @@ mod tests {
         assert_eq!(split_part_id(0).unwrap(), "aa");
         assert_eq!(split_part_id(25).unwrap(), "az");
         assert_eq!(split_part_id(26).unwrap(), "ba");
+    }
+
+    #[test]
+    fn command_probes_use_unzip_version_flag() {
+        assert_eq!(
+            REQUIRED_MAP_IMPORT_COMMANDS
+                .iter()
+                .find(|(command, _)| *command == "unzip"),
+            Some(&("unzip", "-v"))
+        );
+    }
+
+    #[test]
+    fn command_display_names_the_exact_command() {
+        assert_eq!(format_command("unzip", &["-v".into()]), "unzip -v");
     }
 }

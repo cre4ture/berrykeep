@@ -11,11 +11,13 @@ import { ironmeshPrimaryColor } from "@ironmesh/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
+  Accordion,
   Badge,
   Card,
   Code,
   Group,
   Progress,
+  ScrollArea,
   Stack,
   Text
 } from "@mantine/core";
@@ -316,6 +318,29 @@ function NaturalEarthImportProgress({ job }: { job: NaturalEarthImportJobView })
           <Alert color="red" variant="light" title="Import stopped with an error">
             {job.error}
           </Alert>
+        ) : null}
+        {job.log_entries.length > 0 ? (
+          <Accordion variant="contained">
+            <Accordion.Item value="natural-earth-import-log">
+              <Accordion.Control>
+                Conversion log ({job.log_entries.length} entries)
+              </Accordion.Control>
+              <Accordion.Panel>
+                <ScrollArea h={320} type="auto">
+                  <Stack gap="sm" pr="sm">
+                    {job.log_entries.map((entry, index) => (
+                      <div key={`${entry.timestamp_unix}-${index}`}>
+                        <Text size="xs" c="dimmed" mb={4}>
+                          {formatUnixTs(entry.timestamp_unix)}
+                        </Text>
+                        <Code block>{entry.message}</Code>
+                      </div>
+                    ))}
+                  </Stack>
+                </ScrollArea>
+              </Accordion.Panel>
+            </Accordion.Item>
+          </Accordion>
         ) : null}
       </Stack>
     </Card>

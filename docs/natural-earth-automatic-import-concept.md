@@ -57,8 +57,11 @@ and manifest path.
 Only one map import runs at a time: the automatic job and the existing
 resumable URL importer exclude one another. The Admin UI reports the current
 or most recently completed job with its phase, output size, and safe failure
-message. A failed conversion never publishes a new manifest, leaving the
-previously usable map in place.
+message. Its expandable conversion log records the phase, every dependency
+probe and converter command, and bounded command output; a failure names the
+exact command, exit status, and captured standard/error output. A failed
+conversion never publishes a new manifest, leaving the previously usable map
+in place.
 
 The generated MBTiles artifact is limited to 512 MiB and is split into at most
 256 MiB parts. The download is limited to 128 MiB. Staging data is removed when
@@ -70,7 +73,9 @@ The source URL, GDAL executable names, output paths, colors, and command-line
 arguments are server-controlled. The feature accepts neither an arbitrary URL
 nor shell fragments. It needs `unzip`, `gdal_rasterize`, `gdalwarp`,
 `gdal_translate`, and `gdaladdo` on `PATH`. Debian installations receive
-`gdal-bin` and `unzip` as package dependencies.
+`gdal-bin` and `unzip` as package dependencies. Dependency checks use `unzip
+-v`, which is supported by Info-ZIP, rather than the unsupported `--version`
+spelling.
 
 This first version intentionally does not accept uploaded archives, arbitrary
 Shapefiles/GeoPackages, custom styles, PMTiles output, or vector labels. Those

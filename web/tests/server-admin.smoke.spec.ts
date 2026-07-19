@@ -709,6 +709,12 @@ test("server-admin map import wizard starts the Natural Earth background job", a
         manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json",
         logical_size_bytes: 0,
         error: null,
+        log_entries: [
+          {
+            timestamp_unix: 1_700_000_001,
+            message: "Phase: Downloading Natural Earth physical data"
+          }
+        ],
         started_at_unix: 1_700_000_000,
         updated_at_unix: 1_700_000_001
       };
@@ -738,6 +744,10 @@ test("server-admin map import wizard starts the Natural Earth background job", a
   await expect.poll(() => naturalEarthStartRequests).toBe(1);
   await expect(page.getByText("Downloading Natural Earth physical data", { exact: true })).toBeVisible();
   await expect(page.getByText("Natural Earth: running", { exact: true }).first()).toBeVisible();
+  await page.getByText("Conversion log (1 entries)", { exact: true }).click();
+  await expect(
+    page.getByText("Phase: Downloading Natural Earth physical data", { exact: true })
+  ).toBeVisible();
 });
 
 test("server-admin map import wizard forwards remote MBTiles details to its background job", async ({ page }) => {
