@@ -9,19 +9,22 @@ struct IronmeshBundleConfiguration {
     let connectionInput: String
     let appGroupIdentifier: String?
     let keychainAccessGroup: String?
+    let syncProfile: AppleSyncProfile?
 
     init(
         domainIdentifier: String,
         domainDisplayName: String = "IronMesh",
         connectionInput: String = "127.0.0.1:18080",
         appGroupIdentifier: String? = nil,
-        keychainAccessGroup: String? = nil
+        keychainAccessGroup: String? = nil,
+        syncProfile: AppleSyncProfile? = nil
     ) {
         self.domainIdentifier = domainIdentifier.nilIfBlank ?? "dev.ironmesh.default"
         self.domainDisplayName = domainDisplayName.nilIfBlank ?? "IronMesh"
         self.connectionInput = connectionInput.nilIfBlank ?? "127.0.0.1:18080"
         self.appGroupIdentifier = appGroupIdentifier.nilIfBlank
         self.keychainAccessGroup = keychainAccessGroup.nilIfBlank
+        self.syncProfile = syncProfile
     }
 
     init(bundle: Bundle = .main) {
@@ -31,6 +34,17 @@ struct IronmeshBundleConfiguration {
         connectionInput = (info["IronmeshConnectionInput"] as? String)?.nilIfBlank ?? "127.0.0.1:18080"
         appGroupIdentifier = (info["IronmeshAppGroupIdentifier"] as? String)?.nilIfBlank
         keychainAccessGroup = (info["IronmeshKeychainAccessGroup"] as? String)?.nilIfBlank
+        syncProfile = nil
+    }
+
+    init(bundle: Bundle, domain: NSFileProviderDomain, syncProfile: AppleSyncProfile?) {
+        let bundled = Self(bundle: bundle)
+        domainIdentifier = domain.identifier.rawValue
+        domainDisplayName = syncProfile?.displayName ?? domain.displayName
+        connectionInput = bundled.connectionInput
+        appGroupIdentifier = bundled.appGroupIdentifier
+        keychainAccessGroup = bundled.keychainAccessGroup
+        self.syncProfile = syncProfile
     }
 
     var defaultConnectionConfiguration: AppleConnectionConfiguration {
@@ -46,6 +60,10 @@ struct IronmeshBundleConfiguration {
             preferencesSuiteName: appGroupIdentifier,
             keychainAccessGroup: keychainAccessGroup
         )
+    }
+
+    func makeProfileStore() -> AppleSyncProfileStore {
+        AppleSyncProfileStore(preferencesSuiteName: appGroupIdentifier)
     }
 }
 
@@ -175,6 +193,10 @@ final class IronmeshFileProviderService: @unchecked Sendable {
     private let ffi: AppleManualCBridgeFFI
     private let cache: IronmeshIdentifierPathCache
     private let settingsStore: AppleConnectionSettingsStore
+    private let profileStore: AppleSyncProfileStore
+    private let pathMapper: AppleProfilePathMapper
+    private let environment: any IronmeshSyncEnvironmentProviding
+    private let changeJournal: AppleRemoteChangeJournalStore
     private let lock = NSLock()
     private var connected = false
     private var connectedConfiguration: AppleConnectionConfiguration?
@@ -182,13 +204,24 @@ final class IronmeshFileProviderService: @unchecked Sendable {
     init(
         configuration: IronmeshBundleConfiguration = IronmeshBundleConfiguration(),
         ffi: AppleManualCBridgeFFI = IronmeshRustFFIAdapter(),
-        settingsStore: AppleConnectionSettingsStore? = nil
+        settingsStore: AppleConnectionSettingsStore? = nil,
+        profileStore: AppleSyncProfileStore? = nil,
+        environment: any IronmeshSyncEnvironmentProviding = IronmeshLiveSyncEnvironment.shared,
+        changeJournal: AppleRemoteChangeJournalStore? = nil
     ) {
         self.configuration = configuration
         self.ffi = ffi
         bridge = AppleCFacadeBridge(ffi: ffi)
         cache = IronmeshIdentifierPathCache(domainIdentifier: configuration.domainIdentifier)
         self.settingsStore = settingsStore ?? configuration.makeSettingsStore()
+        self.profileStore = profileStore ?? configuration.makeProfileStore()
+        pathMapper = AppleProfilePathMapper(
+            remotePrefix: configuration.syncProfile?.remotePrefix ?? ""
+        )
+        self.environment = environment
+        self.changeJournal = changeJournal ?? AppleRemoteChangeJournalStore(
+            fileURL: ironmeshChangeJournalURL(domainIdentifier: configuration.domainIdentifier)
+        )
     }
 
     func rootItem() -> AppleBridgeItem {
@@ -202,9 +235,41 @@ final class IronmeshFileProviderService: @unchecked Sendable {
 
     func list(path: String) throws -> [AppleBridgeItem] {
         try connectIfNeeded()
-        let items = try bridge.list(path: path, depth: 1)
+        let items = try bridge.list(path: pathMapper.remotePath(forLocalPath: path), depth: 1)
+            .map(pathMapper.localItem)
+            .filter { !$0.path.isEmpty }
         cache.record(items: items)
         return items
+    }
+
+    func reconcileRemoteChanges(after anchor: UInt64) throws -> (
+        itemsByIdentifier: [String: AppleBridgeItem],
+        batch: AppleRemoteChangeBatch
+    ) {
+        try connectIfNeeded()
+        let profile = try currentProfile()
+        let items = try bridge.list(
+            path: pathMapper.remotePath(forLocalPath: ""),
+            depth: profile.depth
+        )
+        .map(pathMapper.localItem)
+        .filter { !$0.path.isEmpty }
+        cache.record(items: items)
+        _ = try changeJournal.reconcile(items)
+        let batch = try changeJournal.changes(after: anchor)
+        let itemsByIdentifier = items.reduce(into: [String: AppleBridgeItem]()) {
+            result, item in
+            let identifier = item.identifier.serialized
+            if let existing = result[identifier], existing.path <= item.path {
+                return
+            }
+            result[identifier] = item
+        }
+        return (itemsByIdentifier, batch)
+    }
+
+    func currentChangeGeneration() throws -> UInt64 {
+        try changeJournal.load().generation
     }
 
     func item(for identifier: NSFileProviderItemIdentifier) throws -> AppleBridgeItem {
@@ -215,17 +280,22 @@ final class IronmeshFileProviderService: @unchecked Sendable {
         try connectIfNeeded()
         let appleIdentifier = try appleIdentifier(from: identifier)
         let lookupPath = try pathForLookup(identifier: appleIdentifier)
-        let item = try bridge.metadata(pathOrIdentifier: lookupPath + (appleIdentifier.kind == .directory && !lookupPath.hasSuffix("/") ? "/" : ""))
+        let remoteLookupPath = pathMapper.remotePath(forLocalPath: lookupPath)
+        let item = try bridge.metadata(pathOrIdentifier: remoteLookupPath + (appleIdentifier.kind == .directory && !remoteLookupPath.hasSuffix("/") ? "/" : ""))
             ?? { throw fileProviderError(.noSuchItem) }()
-        cache.record(items: [item])
-        return item
+        let localItem = try pathMapper.localItem(from: item)
+        cache.record(items: [localItem])
+        return localItem
     }
 
     func fetchContents(for identifier: NSFileProviderItemIdentifier) throws -> (URL, AppleBridgeItem) {
         let item = try item(for: identifier)
         let appleIdentifier = try appleIdentifier(from: identifier)
         let lookupPath = try pathForLookup(identifier: appleIdentifier)
-        let data = try bridge.download(path: lookupPath, revisionHint: item.revisionHint)
+        let data = try bridge.download(
+            path: pathMapper.remotePath(forLocalPath: lookupPath),
+            revisionHint: item.revisionHint
+        )
 
         let temporaryDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("IronMeshDownloads", isDirectory: true)
@@ -248,7 +318,7 @@ final class IronmeshFileProviderService: @unchecked Sendable {
 
         let destinationPath = try childPath(parentPath: parentItem.path, filename: filename)
         if contentType.conforms(to: .folder) {
-            let result = try bridge.mkdir(path: destinationPath)
+            let result = try bridge.mkdir(path: pathMapper.remotePath(forLocalPath: destinationPath))
             guard result.accepted else {
                 throw unsupportedFeatureError(
                     result.message ?? "Directory creation is not implemented in the Apple File Provider bridge yet."
@@ -262,7 +332,7 @@ final class IronmeshFileProviderService: @unchecked Sendable {
         }
 
         let result = try bridge.upload(
-            path: destinationPath,
+            path: pathMapper.remotePath(forLocalPath: destinationPath),
             data: try uploadData(from: url, allowMissingContents: true),
             expectedRevision: nil
         )
@@ -279,14 +349,44 @@ final class IronmeshFileProviderService: @unchecked Sendable {
         parentIdentifier: NSFileProviderItemIdentifier,
         contentType: UTType,
         changedFields: NSFileProviderItemFields,
-        contents url: URL?
+        contents url: URL?,
+        expectedRevision: String?
     ) throws -> AppleBridgeItem {
         let currentItem = try item(for: identifier)
         guard currentItem.identifier.kind != .root else {
             throw unsupportedFeatureError("Modifying the provider root is not supported.")
         }
 
+        if let expectedRevision,
+           let currentRevision = currentItem.revisionHint,
+           expectedRevision != currentRevision {
+            if changedFields.contains(.contents) {
+                let conflictCopyPath = AppleConflictCopyNaming.path(
+                    originalPath: currentItem.path,
+                    expectedRevision: expectedRevision,
+                    currentRevision: currentRevision
+                )
+                _ = try bridge.upload(
+                    path: pathMapper.remotePath(forLocalPath: conflictCopyPath),
+                    data: try uploadData(from: url, allowMissingContents: false),
+                    expectedRevision: nil
+                )
+                throw ironmeshConflictError(
+                    originalPath: currentItem.path,
+                    conflictCopyPath: conflictCopyPath,
+                    expectedRevision: expectedRevision,
+                    currentRevision: currentRevision
+                )
+            }
+            throw ironmeshRevisionConflictError(
+                path: currentItem.path,
+                expectedRevision: expectedRevision,
+                currentRevision: currentRevision
+            )
+        }
+
         var workingPath = currentItem.path
+        var workingRevision = expectedRevision ?? currentItem.revisionHint
         let wantsMove = changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier)
         if wantsMove {
             if currentItem.kind == .directory {
@@ -300,9 +400,24 @@ final class IronmeshFileProviderService: @unchecked Sendable {
                 changedFields: changedFields
             )
             if destinationPath != currentItem.path {
-                _ = try bridge.move(from: currentItem.path, to: destinationPath, expectedRevision: currentItem.revisionHint)
+                do {
+                    _ = try bridge.move(
+                        from: pathMapper.remotePath(forLocalPath: currentItem.path),
+                        to: pathMapper.remotePath(forLocalPath: destinationPath),
+                        expectedRevision: workingRevision
+                    )
+                } catch {
+                    try rethrowRevisionConflictIfRemoteChanged(
+                        error,
+                        localPath: currentItem.path,
+                        expectedRevision: workingRevision
+                    )
+                }
                 cache.movePathPrefix(from: currentItem.path, to: destinationPath)
                 workingPath = destinationPath
+                workingRevision = try bridge.metadata(
+                    pathOrIdentifier: pathMapper.remotePath(forLocalPath: destinationPath)
+                )?.revisionHint
             }
         }
 
@@ -311,10 +426,11 @@ final class IronmeshFileProviderService: @unchecked Sendable {
                 throw unsupportedFeatureError("Directory content updates are not supported.")
             }
 
-            let result = try bridge.upload(
-                path: workingPath,
-                data: try uploadData(from: url, allowMissingContents: false),
-                expectedRevision: currentItem.revisionHint
+            let uploadData = try uploadData(from: url, allowMissingContents: false)
+            let result = try uploadWithConflictRecovery(
+                localPath: workingPath,
+                data: uploadData,
+                expectedRevision: workingRevision
             )
             return try resolvedItem(
                 after: result,
@@ -336,12 +452,22 @@ final class IronmeshFileProviderService: @unchecked Sendable {
 
     func deleteItem(
         identifier: NSFileProviderItemIdentifier,
-        options: NSFileProviderDeleteItemOptions
+        options: NSFileProviderDeleteItemOptions,
+        expectedRevision: String?
     ) throws {
         do {
             let item = try item(for: identifier)
             guard item.identifier.kind != .root else {
                 throw unsupportedFeatureError("Deleting the provider root is not supported.")
+            }
+            if let expectedRevision,
+               let currentRevision = item.revisionHint,
+               expectedRevision != currentRevision {
+                throw ironmeshRevisionConflictError(
+                    path: item.path,
+                    expectedRevision: expectedRevision,
+                    currentRevision: currentRevision
+                )
             }
 
             if item.kind == .directory {
@@ -350,12 +476,45 @@ final class IronmeshFileProviderService: @unchecked Sendable {
                     throw fileProviderError(.directoryNotEmpty)
                 }
 
-                _ = try bridge.delete(path: "\(item.path)/", expectedRevision: item.revisionHint)
+                do {
+                    _ = try bridge.delete(
+                        path: "\(pathMapper.remotePath(forLocalPath: item.path))/",
+                        // Directory markers receive the same CAS. Synthetic namespace directories
+                        // have no revision, so the child preflight is their strongest guard.
+                        expectedRevision: item.revisionHint
+                    )
+                } catch {
+                    try rethrowRevisionConflictIfRemoteChanged(
+                        error,
+                        localPath: item.path,
+                        expectedRevision: item.revisionHint,
+                        isDirectory: true
+                    )
+                }
                 cache.removeSubtree(at: item.path)
                 return
             }
 
-            _ = try bridge.delete(path: item.path, expectedRevision: item.revisionHint)
+            let result: AppleMutationResult
+            do {
+                result = try bridge.delete(
+                    path: pathMapper.remotePath(forLocalPath: item.path),
+                    expectedRevision: item.revisionHint
+                )
+            } catch {
+                try rethrowRevisionConflictIfRemoteChanged(
+                    error,
+                    localPath: item.path,
+                    expectedRevision: item.revisionHint
+                )
+            }
+            if let conflictingRevision = result.conflictingRevision {
+                throw ironmeshRevisionConflictError(
+                    path: item.path,
+                    expectedRevision: item.revisionHint ?? "unknown",
+                    currentRevision: conflictingRevision
+                )
+            }
             cache.removeSubtree(at: item.path)
         } catch let error as NSError
             where error.domain == NSFileProviderErrorDomain
@@ -396,6 +555,7 @@ final class IronmeshFileProviderService: @unchecked Sendable {
     }
 
     func startWebUi() throws -> URL {
+        try enforceProfileConstraints()
         let connectionConfiguration = try currentConnectionConfiguration()
         let urlString = try ffi.startWebUi(
             connectionInput: connectionConfiguration.normalizedConnectionInput,
@@ -409,6 +569,7 @@ final class IronmeshFileProviderService: @unchecked Sendable {
     }
 
     private func connectIfNeeded() throws {
+        try enforceProfileConstraints()
         let configuration = try currentConnectionConfiguration()
         lock.lock()
         let alreadyConnected = connected
@@ -425,6 +586,37 @@ final class IronmeshFileProviderService: @unchecked Sendable {
         connected = true
         connectedConfiguration = configuration
         lock.unlock()
+    }
+
+    private func enforceProfileConstraints() throws {
+        let profile = try currentProfile()
+        let decision = AppleSyncConstraintEvaluator.evaluate(
+            profile: profile,
+            environment: environment.snapshot()
+        )
+        if case .blocked(let reason) = decision {
+            throw ironmeshConstraintError(reason)
+        }
+    }
+
+    private func currentProfile() throws -> AppleSyncProfile {
+        if let storedProfile = try profileStore.profile(
+            domainIdentifier: configuration.domainIdentifier
+        ) {
+            return storedProfile
+        }
+        if let configuredProfile = configuration.syncProfile {
+            return configuredProfile
+        }
+        return AppleSyncProfile(
+            id: "legacy-default",
+            displayName: configuration.domainDisplayName,
+            networkPolicy: AppleSyncProfileNetworkPolicy(
+                allowsExpensiveNetwork: true,
+                allowsConstrainedNetwork: true
+            ),
+            powerPolicy: AppleSyncProfilePowerPolicy(defersInLowPowerMode: false)
+        )
     }
 
     private func resetConnection() {
@@ -502,8 +694,11 @@ final class IronmeshFileProviderService: @unchecked Sendable {
             throw unsupportedFeatureError(result.message ?? "The Apple bridge rejected the mutation.")
         }
 
-        let metadataPath = kind == .directory ? "\(normalizedPath(path))/" : normalizedPath(path)
-        if let item = try? bridge.metadata(pathOrIdentifier: metadataPath) {
+        let metadataPath = normalizedPath(path)
+        let remoteBasePath = pathMapper.remotePath(forLocalPath: metadataPath)
+        let remoteMetadataPath = kind == .directory ? "\(remoteBasePath)/" : remoteBasePath
+        if let remoteItem = try? bridge.metadata(pathOrIdentifier: remoteMetadataPath),
+           let item = try? pathMapper.localItem(from: remoteItem) {
             cache.record(item: item)
             return item
         }
@@ -551,6 +746,102 @@ final class IronmeshFileProviderService: @unchecked Sendable {
         return try Data(contentsOf: url)
     }
 
+    private func uploadWithConflictRecovery(
+        localPath: String,
+        data: Data,
+        expectedRevision: String?
+    ) throws -> AppleMutationResult {
+        let remotePath = pathMapper.remotePath(forLocalPath: localPath)
+        let result: AppleMutationResult
+        do {
+            result = try bridge.upload(
+                path: remotePath,
+                data: data,
+                expectedRevision: expectedRevision
+            )
+        } catch {
+            guard let expectedRevision else {
+                throw error
+            }
+            let currentRevision: String?
+            do {
+                currentRevision = try bridge.metadata(pathOrIdentifier: remotePath)?.revisionHint
+            } catch {
+                throw error
+            }
+            guard let currentRevision, currentRevision != expectedRevision else {
+                throw error
+            }
+            try materializeConflictCopy(
+                localPath: localPath,
+                data: data,
+                expectedRevision: expectedRevision,
+                currentRevision: currentRevision
+            )
+        }
+
+        if let expectedRevision, let conflictingRevision = result.conflictingRevision {
+            try materializeConflictCopy(
+                localPath: localPath,
+                data: data,
+                expectedRevision: expectedRevision,
+                currentRevision: conflictingRevision
+            )
+        }
+        return result
+    }
+
+    private func materializeConflictCopy(
+        localPath: String,
+        data: Data,
+        expectedRevision: String,
+        currentRevision: String
+    ) throws -> Never {
+        let conflictCopyPath = AppleConflictCopyNaming.path(
+            originalPath: localPath,
+            expectedRevision: expectedRevision,
+            currentRevision: currentRevision
+        )
+        _ = try bridge.upload(
+            path: pathMapper.remotePath(forLocalPath: conflictCopyPath),
+            data: data,
+            expectedRevision: nil
+        )
+        throw ironmeshConflictError(
+            originalPath: localPath,
+            conflictCopyPath: conflictCopyPath,
+            expectedRevision: expectedRevision,
+            currentRevision: currentRevision
+        )
+    }
+
+    private func rethrowRevisionConflictIfRemoteChanged(
+        _ originalError: Error,
+        localPath: String,
+        expectedRevision: String?,
+        isDirectory: Bool = false
+    ) throws -> Never {
+        guard let expectedRevision else {
+            throw originalError
+        }
+        let remoteBasePath = pathMapper.remotePath(forLocalPath: localPath)
+        let remotePath = isDirectory ? "\(remoteBasePath)/" : remoteBasePath
+        let currentRevision: String?
+        do {
+            currentRevision = try bridge.metadata(pathOrIdentifier: remotePath)?.revisionHint
+        } catch {
+            throw originalError
+        }
+        guard let currentRevision, currentRevision != expectedRevision else {
+            throw originalError
+        }
+        throw ironmeshRevisionConflictError(
+            path: localPath,
+            expectedRevision: expectedRevision,
+            currentRevision: currentRevision
+        )
+    }
+
     private func validatedLeafName(_ value: String) throws -> String {
         guard let trimmed = value.nilIfBlank else {
             throw mutationUsageError("The Apple File Provider requires a non-empty filename.")
@@ -563,7 +854,10 @@ final class IronmeshFileProviderItem: NSObject, NSFileProviderItem {
     private let bridgeItem: AppleBridgeItem
     private let domainDisplayName: String
 
-    init(bridgeItem: AppleBridgeItem, domainDisplayName: String) {
+    init(
+        bridgeItem: AppleBridgeItem,
+        domainDisplayName: String
+    ) {
         self.bridgeItem = bridgeItem
         self.domainDisplayName = domainDisplayName
     }
@@ -614,14 +908,29 @@ final class IronmeshFileProviderItem: NSObject, NSFileProviderItem {
     }
 
     var capabilities: NSFileProviderItemCapabilities {
+        var capabilities: NSFileProviderItemCapabilities
         switch bridgeItem.identifier.kind {
         case .root:
-            return [.allowsReading, .allowsWriting]
+            capabilities = [.allowsReading, .allowsWriting]
         case .directory:
-            return [.allowsReading, .allowsWriting, .allowsDeleting]
+            capabilities = [.allowsReading, .allowsWriting, .allowsDeleting]
         case .file, .temporaryFile:
-            return [.allowsReading, .allowsWriting, .allowsRenaming, .allowsReparenting, .allowsDeleting]
+            capabilities = [
+                .allowsReading,
+                .allowsWriting,
+                .allowsRenaming,
+                .allowsReparenting,
+                .allowsDeleting,
+            ]
         }
+        capabilities.insert(.allowsEvicting)
+        return capabilities
+    }
+
+    var contentPolicy: NSFileProviderContentPolicy {
+        bridgeItem.identifier.kind == .root
+            ? .downloadLazilyAndEvictOnRemoteUpdate
+            : .inherited
     }
 
     var documentSize: NSNumber? {
@@ -703,15 +1012,56 @@ final class IronmeshFileProviderEnumerator: NSObject, NSFileProviderEnumerator, 
     }
 
     func enumerateChanges(for observer: NSFileProviderChangeObserver, from syncAnchor: NSFileProviderSyncAnchor) {
-        _ = syncAnchor
-        observer.finishEnumeratingChanges(
-            upTo: NSFileProviderSyncAnchor(rawValue: Data()),
-            moreComing: false
-        )
+        let observerBox = UncheckedBox(observer)
+        DispatchQueue.global(qos: .utility).async {
+            let observer = observerBox.value
+            do {
+                let anchorGeneration = try IronmeshSyncAnchorCodec.generation(from: syncAnchor)
+                guard self.containerIdentifier == .workingSet else {
+                    let generation = try self.service.currentChangeGeneration()
+                    observer.finishEnumeratingChanges(
+                        upTo: IronmeshSyncAnchorCodec.anchor(for: generation),
+                        moreComing: false
+                    )
+                    return
+                }
+
+                let changes = try self.service.reconcileRemoteChanges(after: anchorGeneration)
+                let updatedItems = changes.batch.updatedIdentifiers.compactMap {
+                    changes.itemsByIdentifier[$0]
+                }.map {
+                    IronmeshFileProviderItem(
+                        bridgeItem: $0,
+                        domainDisplayName: self.service.configuration.domainDisplayName
+                    )
+                }
+                if !updatedItems.isEmpty {
+                    observer.didUpdate(updatedItems)
+                }
+                let deletedIdentifiers = changes.batch.deletedIdentifiers.map {
+                    NSFileProviderItemIdentifier(rawValue: $0)
+                }
+                if !deletedIdentifiers.isEmpty {
+                    observer.didDeleteItems(withIdentifiers: deletedIdentifiers)
+                }
+                observer.finishEnumeratingChanges(
+                    upTo: IronmeshSyncAnchorCodec.anchor(for: changes.batch.generation),
+                    moreComing: false
+                )
+            } catch AppleRemoteChangeJournalError.expiredAnchor {
+                observer.finishEnumeratingWithError(fileProviderError(.syncAnchorExpired))
+            } catch {
+                observer.finishEnumeratingWithError(asNSError(error))
+            }
+        }
     }
 
     func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
-        completionHandler(NSFileProviderSyncAnchor(rawValue: Data()))
+        let completion = UncheckedBox(completionHandler)
+        DispatchQueue.global(qos: .utility).async {
+            let generation = (try? self.service.currentChangeGeneration()) ?? 0
+            completion.value(IronmeshSyncAnchorCodec.anchor(for: generation))
+        }
     }
 }
 
@@ -721,8 +1071,17 @@ open class IronmeshFileProviderExtensionHost: NSObject, NSFileProviderReplicated
 
     public required init(domain: NSFileProviderDomain) {
         self.domain = domain
+        let bundle = Bundle(for: Self.self)
+        let bundledConfiguration = IronmeshBundleConfiguration(bundle: bundle)
+        let profile = try? bundledConfiguration.makeProfileStore().profile(
+            domainIdentifier: domain.identifier.rawValue
+        )
         service = IronmeshFileProviderService(
-            configuration: IronmeshBundleConfiguration(bundle: Bundle(for: Self.self))
+            configuration: IronmeshBundleConfiguration(
+                bundle: bundle,
+                domain: domain,
+                syncProfile: profile
+            )
         )
         super.init()
     }
@@ -837,7 +1196,6 @@ open class IronmeshFileProviderExtensionHost: NSObject, NSFileProviderReplicated
         request: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, (any Error)?) -> Void
     ) -> Progress {
-        _ = baseVersion
         _ = options
         _ = request
         let progress = Progress(totalUnitCount: 1)
@@ -862,7 +1220,11 @@ open class IronmeshFileProviderExtensionHost: NSObject, NSFileProviderReplicated
                         parentIdentifier: item.parentItemIdentifier,
                         contentType: item.contentType ?? .data,
                         changedFields: actionableFields,
-                        contents: url
+                        contents: url,
+                        expectedRevision: String(
+                            data: baseVersion.contentVersion,
+                            encoding: .utf8
+                        )
                     )
                 }
 
@@ -887,13 +1249,19 @@ open class IronmeshFileProviderExtensionHost: NSObject, NSFileProviderReplicated
         request: NSFileProviderRequest,
         completionHandler: @escaping ((any Error)?) -> Void
     ) -> Progress {
-        _ = baseVersion
         _ = request
         let progress = Progress(totalUnitCount: 1)
         let completion = UncheckedBox(completionHandler)
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                try self.service.deleteItem(identifier: itemIdentifier, options: options)
+                try self.service.deleteItem(
+                    identifier: itemIdentifier,
+                    options: options,
+                    expectedRevision: String(
+                        data: baseVersion.contentVersion,
+                        encoding: .utf8
+                    )
+                )
                 progress.completedUnitCount = 1
                 completion.value(nil)
             } catch {
