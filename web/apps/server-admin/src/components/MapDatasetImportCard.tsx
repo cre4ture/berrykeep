@@ -8,6 +8,7 @@ import { ironmeshPrimaryColor } from "@ironmesh/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
+  Anchor,
   Badge,
   Button,
   Card,
@@ -33,6 +34,13 @@ type MapImportTarget = {
   asset: "raster" | "vector";
   label: string;
   manifestKey: string;
+  provider: MapDatasetProvider;
+};
+
+type MapDatasetProvider = {
+  label?: string;
+  homepageUrl?: string;
+  acquisitionHint: string;
 };
 
 export function MapDatasetImportCard() {
@@ -155,9 +163,25 @@ export function MapDatasetImportCard() {
             nothingFoundMessage="No configured map artifact"
           />
           {selectedTarget ? (
-            <Text size="xs" c="dimmed">
-              Target manifest: <Code>{selectedTarget.manifestKey}</Code>
-            </Text>
+            <Stack gap={4}>
+              <Text size="xs" c="dimmed">
+                Target manifest: <Code>{selectedTarget.manifestKey}</Code>
+              </Text>
+              <Alert color="blue" variant="light" title="Find matching map data">
+                <Text size="sm">
+                  {selectedTarget.provider.acquisitionHint}{" "}
+                  {selectedTarget.provider.homepageUrl && selectedTarget.provider.label ? (
+                    <Anchor
+                      href={selectedTarget.provider.homepageUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open {selectedTarget.provider.label}
+                    </Anchor>
+                  ) : null}
+                </Text>
+              </Alert>
+            </Stack>
           ) : null}
 
           <Textarea
@@ -357,13 +381,15 @@ function mapImportTargets(
 ): MapImportTarget[] {
   return variants.flatMap((variant) => {
     const targets: MapImportTarget[] = [];
+    const provider = mapDatasetProvider(variant);
     if (variant.raster_manifest_key) {
       targets.push({
         key: `${variant.id}:raster`,
         variantId: variant.id,
         asset: "raster",
         label: variant.label,
-        manifestKey: variant.raster_manifest_key
+        manifestKey: variant.raster_manifest_key,
+        provider
       });
     }
     if (variant.vector_manifest_key) {
@@ -372,11 +398,48 @@ function mapImportTargets(
         variantId: variant.id,
         asset: "vector",
         label: variant.label,
-        manifestKey: variant.vector_manifest_key
+        manifestKey: variant.vector_manifest_key,
+        provider
       });
     }
     return targets;
   });
+}
+
+function mapDatasetProvider(variant: {
+  id: string;
+  raster_manifest_key?: string | null;
+  vector_manifest_key?: string | null;
+}): MapDatasetProvider {
+  const manifestKeys = [variant.raster_manifest_key, variant.vector_manifest_key];
+  if (variant.id.startsWith("maptiler-") || manifestKeys.some((key) => key?.includes("maptiler-"))) {
+    return {
+      label: "MapTiler Data",
+      homepageUrl: "https://data.maptiler.com/",
+      acquisitionHint:
+        "Get the matching legacy MBTiles package from MapTiler Data and check its current license before importing."
+    };
+  }
+  if (variant.id.startsWith("natural-earth-")) {
+    return {
+      label: "Natural Earth",
+      homepageUrl: "https://www.naturalearthdata.com/",
+      acquisitionHint:
+        "Natural Earth publishes public-domain source data; package the needed layers as a compatible MBTiles file before importing."
+    };
+  }
+  if (variant.id === "openmaptiles-street") {
+    return {
+      label: "OpenMapTiles",
+      homepageUrl: "https://openmaptiles.org/",
+      acquisitionHint:
+        "Use an OpenMapTiles-compatible MBTiles package and confirm the data provider's license and attribution requirements."
+    };
+  }
+  return {
+    acquisitionHint:
+      "Obtain a properly licensed MBTiles package compatible with this variant's style and keep the required attribution in the map configuration."
+  };
 }
 
 function ImportDetail({ label, children }: { label: string; children: ReactNode }) {
