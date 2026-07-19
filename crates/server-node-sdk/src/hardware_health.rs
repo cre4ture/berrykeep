@@ -1258,12 +1258,18 @@ fn empty_inventory() -> HardwareInventory {
 
 #[cfg(target_os = "linux")]
 fn collect_system_info_linux() -> HardwareSystemInfo {
+    // ARM SBCs (e.g. NanoPi, Raspberry Pi) typically have no SMBIOS/DMI tables, so
+    // /sys/class/dmi/id/* is empty. The devicetree "model" property is the closest
+    // analogue to a DMI product/board name on those boards.
+    let device_tree_model = read_device_tree_string("/proc/device-tree/model");
+
     HardwareSystemInfo {
         vendor: read_trimmed_file("/sys/class/dmi/id/sys_vendor"),
-        product_name: read_trimmed_file("/sys/class/dmi/id/product_name"),
+        product_name: read_trimmed_file("/sys/class/dmi/id/product_name")
+            .or_else(|| device_tree_model.clone()),
         product_version: read_trimmed_file("/sys/class/dmi/id/product_version"),
         board_vendor: read_trimmed_file("/sys/class/dmi/id/board_vendor"),
-        board_name: read_trimmed_file("/sys/class/dmi/id/board_name"),
+        board_name: read_trimmed_file("/sys/class/dmi/id/board_name").or(device_tree_model),
         board_version: read_trimmed_file("/sys/class/dmi/id/board_version"),
         bios_vendor: read_trimmed_file("/sys/class/dmi/id/bios_vendor"),
         bios_version: read_trimmed_file("/sys/class/dmi/id/bios_version"),
@@ -1277,6 +1283,40 @@ fn collect_cpu_packages_linux() -> Vec<HardwareCpuPackage> {
         return Vec::new();
     };
 
+    // ARM CPUs generally omit "model name"/"vendor_id" from /proc/cpuinfo, exposing
+    // only numeric "CPU implementer"/"CPU part" codes instead. sysinfo already knows
+    // how to decode those codes into human-readable strings (e.g. "Cortex-A53"), so
+    // reuse it as a fallback rather than re-deriving the implementer/part table here.
+    let mut sysinfo_system = sysinfo::System::new();
+    sysinfo_system.refresh_cpu_all();
+    let sysinfo_cpus = sysinfo_system.cpus();
+
+    parse_cpu_packages(&raw, |processor_index| {
+        let cpu = sysinfo_cpus.get(processor_index)?;
+        let vendor_id = non_empty_string(cpu.vendor_id());
+        let model_name = non_empty_string(cpu.brand());
+        if vendor_id.is_none() && model_name.is_none() {
+            None
+        } else {
+            Some((vendor_id, model_name))
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn non_empty_string(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cpu_packages(
+    raw: &str,
+    sysinfo_fallback: impl Fn(usize) -> Option<(Option<String>, Option<String>)>,
+) -> Vec<HardwareCpuPackage> {
     let mut packages = BTreeMap::<String, CpuPackageSeed>::new();
     for block in raw.split("\n\n") {
         let mut fields = HashMap::<&str, &str>::new();
@@ -1286,9 +1326,26 @@ fn collect_cpu_packages_linux() -> Vec<HardwareCpuPackage> {
             };
             fields.insert(key.trim(), value.trim());
         }
-        if fields.is_empty() {
+        // Skip blocks without a "processor" key: on ARM boards /proc/cpuinfo ends with
+        // a trailing "Hardware"/"Serial" block that describes the board, not a core.
+        // Without this guard it falls back to physical id "0" and double-counts a core.
+        if !fields.contains_key("processor") {
             continue;
         }
+
+        let fallback = fields
+            .get("processor")
+            .and_then(|value| value.parse::<usize>().ok())
+            .and_then(&sysinfo_fallback);
+        let (fallback_vendor_id, fallback_model_name) = fallback.unwrap_or((None, None));
+        let vendor_id = fields
+            .get("vendor_id")
+            .map(|value| (*value).to_string())
+            .or(fallback_vendor_id);
+        let model_name = fields
+            .get("model name")
+            .map(|value| (*value).to_string())
+            .or(fallback_model_name);
 
         let package_key = fields
             .get("physical id")
@@ -1299,8 +1356,8 @@ fn collect_cpu_packages_linux() -> Vec<HardwareCpuPackage> {
         let stable_material = format!(
             "{}|{}|{}|{}",
             package_key,
-            fields.get("vendor_id").copied().unwrap_or_default(),
-            fields.get("model name").copied().unwrap_or_default(),
+            vendor_id.as_deref().unwrap_or_default(),
+            model_name.as_deref().unwrap_or_default(),
             fields.get("microcode").copied().unwrap_or_default(),
         );
 
@@ -1309,8 +1366,8 @@ fn collect_cpu_packages_linux() -> Vec<HardwareCpuPackage> {
             .or_insert_with(|| CpuPackageSeed {
                 component_ref,
                 stable_material,
-                vendor_id: fields.get("vendor_id").map(|value| (*value).to_string()),
-                model_name: fields.get("model name").map(|value| (*value).to_string()),
+                vendor_id,
+                model_name,
                 family: fields.get("cpu family").map(|value| (*value).to_string()),
                 model: fields.get("model").map(|value| (*value).to_string()),
                 stepping: fields.get("stepping").map(|value| (*value).to_string()),
@@ -1709,6 +1766,19 @@ fn read_trimmed_file(path: impl AsRef<FsPath>) -> Option<String> {
     }
 }
 
+/// Devicetree string properties (e.g. /proc/device-tree/model) are NUL-terminated,
+/// unlike sysfs/procfs text files, so trim that out along with whitespace.
+#[cfg(target_os = "linux")]
+fn read_device_tree_string(path: impl AsRef<FsPath>) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn extract_pci_slot(path: &FsPath) -> Option<String> {
     path.components().find_map(|component| {
@@ -1907,5 +1977,66 @@ mod tests {
                 (2, "/dev/vdb".to_string()),
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_cpu_packages_falls_back_to_decoded_identifiers_when_model_name_is_absent() {
+        // Mirrors a real /proc/cpuinfo capture from a NanoPi NEO3 (aarch64): no
+        // "model name"/"vendor_id" fields, only numeric implementer/part codes.
+        let raw = "processor\t: 0\n\
+BogoMIPS\t: 48.00\n\
+CPU implementer\t: 0x41\n\
+CPU part\t: 0xd03\n\
+\n\
+processor\t: 1\n\
+BogoMIPS\t: 48.00\n\
+CPU implementer\t: 0x41\n\
+CPU part\t: 0xd03\n";
+
+        let packages = parse_cpu_packages(raw, |_processor_index| {
+            Some((Some("ARM".to_string()), Some("Cortex-A53".to_string())))
+        });
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].vendor_id.as_deref(), Some("ARM"));
+        assert_eq!(packages[0].model_name.as_deref(), Some("Cortex-A53"));
+        assert_eq!(packages[0].logical_cpu_count, 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_cpu_packages_prefers_cpuinfo_fields_over_fallback() {
+        let raw = "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon\n";
+
+        let packages = parse_cpu_packages(raw, |_processor_index| {
+            Some((Some("ARM".to_string()), Some("Cortex-A53".to_string())))
+        });
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].vendor_id.as_deref(), Some("GenuineIntel"));
+        assert_eq!(packages[0].model_name.as_deref(), Some("Intel(R) Xeon"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_cpu_packages_ignores_trailing_hardware_block_without_processor_key() {
+        // Real aarch64 /proc/cpuinfo ends with a board-level "Hardware"/"Serial" block
+        // that has no "processor" key. It must not be miscounted as an extra core.
+        let raw = "processor\t: 0\n\
+CPU implementer\t: 0x41\n\
+CPU part\t: 0xd03\n\
+\n\
+processor\t: 1\n\
+CPU implementer\t: 0x41\n\
+CPU part\t: 0xd03\n\
+\n\
+Hardware\t: FriendlyElec NanoPi NEO3\n\
+Serial\t\t: 76ffbd65db2f1f5d\n";
+
+        let packages = parse_cpu_packages(raw, |_processor_index| None);
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].logical_cpu_count, 2);
     }
 }
