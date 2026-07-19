@@ -88,11 +88,12 @@ Follow-up design note:
 ### 4.2.1 Rendezvous and Relay Transport
 - Rendezvous control APIs run over HTTPS and the relay tunnel runs over `wss://` when TLS is enabled.
 - When rendezvous mTLS is enabled, nodes and enrolled clients authenticate to rendezvous with certificate-backed identities before they can register presence, issue relay tickets, or open relay tunnels.
-- The relay tunnel brokers opaque byte streams and does not need feature-specific knowledge of gallery, maps, replication, or other HTTP routes.
-- Current implementation detail:
-  - Ironmesh carries serialized HTTP/1.1 request/response bytes through the tunnel,
-  - rendezvous no longer buffers JSON-wrapped base64 request/response envelopes for the primary relay path,
-  - node-side and client-side authorization still happens at the Ironmesh endpoint layer after the tunneled request is replayed locally.
+- The production relay path establishes TLS 1.3 with mutual certificate authentication *inside* the WebSocket tunnel before multiplexing HTTP bytes. The source validates the target node and cluster SANs; the target validates the source node/device and cluster SANs.
+- Enrolled-client and node data-plane relay tickets negotiate `inner_mtls`; these paths fail closed when the peer identity, cluster binding, certificate chain, or security mode is invalid, without a plaintext downgrade fallback.
+- Pre-enrollment bootstrap-claim relay is the deliberate legacy exception because the client does not have its certificate yet. Issue #120 tracks replacing that bootstrap path with a secure claim-specific design.
+- The rendezvous operator can observe control-plane metadata needed to broker a session, including authenticated endpoint identities, cluster scope, timing, and frame sizes. It cannot decrypt or alter protected application bytes without the inner TLS session failing.
+- The relay tunnel therefore brokers opaque byte streams and does not need feature-specific knowledge of gallery, maps, replication, or other HTTP routes. Ironmesh carries serialized HTTP/1.1 request/response bytes through the encrypted tunnel; node-side and client-side authorization still happens at the actual Ironmesh endpoint.
+- `tests/system-tests/src/relay_security_e2e_test.rs` verifies a relay-only enrolled client against a real node and rendezvous service. It confirms that known HTTP, authorization, credential, and object payload bytes are absent from observed relay binary frames. It also modifies one post-handshake TLS application-data record and verifies that the client discards the affected session, reconnects with inner mTLS, and retries the unchanged request without exposing or committing modified application data.
 
 ### 4.3 Human/Admin Authentication
 - Replace shared token with identity-backed auth:

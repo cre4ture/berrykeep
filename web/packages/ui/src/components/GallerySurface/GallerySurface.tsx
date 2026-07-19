@@ -66,7 +66,14 @@ import {
 export type { GalleryBasemapConfig } from "./GalleryBasemapMap";
 export type GallerySurfaceViewMode = GalleryViewMode;
 
-type GallerySortOrder = "captured_desc" | "path_asc";
+const GALLERY_SORT_OPTIONS = [
+  { value: "captured_desc", label: "Date (newest first)" },
+  { value: "captured_asc", label: "Date (oldest first)" },
+  { value: "path_asc", label: "Path (A–Z)" },
+  { value: "path_desc", label: "Path (Z–A)" }
+] as const;
+
+type GallerySortOrder = (typeof GALLERY_SORT_OPTIONS)[number]["value"];
 type GalleryMediaKind = "image" | "video";
 type GalleryMediaFilter = "all" | GalleryMediaKind;
 type GalleryViewMode = "grid" | "map";
@@ -1304,14 +1311,14 @@ export function GallerySurface({
               >
                 <Select
                   label="Sort"
-                  data={[
-                    { value: "captured_desc", label: "Newest first" },
-                    { value: "path_asc", label: "Path" }
-                  ]}
+                  data={GALLERY_SORT_OPTIONS}
                   value={sortOrder}
-                  onChange={(value) =>
-                    setSortOrder(value === "path_asc" ? "path_asc" : "captured_desc")
-                  }
+                  onChange={(value) => {
+                    const nextSortOrder =
+                      GALLERY_SORT_OPTIONS.find((option) => option.value === value)?.value ??
+                      "captured_desc";
+                    setSortOrder(nextSortOrder);
+                  }}
                 />
                 {enabledMediaKinds.length > 1 ? (
                   <Select

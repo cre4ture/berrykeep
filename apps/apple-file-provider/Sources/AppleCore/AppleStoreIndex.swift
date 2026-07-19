@@ -7,6 +7,8 @@ public enum AppleStoreIndexView: String, Codable, Equatable, Sendable {
 
 public enum AppleStoreIndexSortOrder: String, Codable, Equatable, Sendable {
     case pathAscending = "path_asc"
+    case pathDescending = "path_desc"
+    case capturedAscending = "captured_asc"
     case capturedDescending = "captured_desc"
 }
 

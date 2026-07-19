@@ -22,6 +22,8 @@ enum class StoreIndexSortOrder(
     val wireValue: String,
 ) {
     PATH_ASC("path_asc"),
+    PATH_DESC("path_desc"),
+    CAPTURED_ASC("captured_asc"),
     CAPTURED_DESC("captured_desc"),
 }
 

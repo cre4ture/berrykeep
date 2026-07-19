@@ -60,7 +60,7 @@ export type StoreIndexResponse = {
 
 export type StoreListView = "raw" | "tree";
 
-export type StoreListSortOrder = "captured_desc" | "path_asc";
+export type StoreListSortOrder = "captured_asc" | "captured_desc" | "path_asc" | "path_desc";
 
 export type StoreListMediaFilter = "all" | "image" | "video";
 

@@ -1493,6 +1493,8 @@ fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>>
 fn parse_store_index_sort_order(value: Option<&str>) -> Result<Option<StoreIndexSortOrder>> {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some("path_asc") => Ok(Some(StoreIndexSortOrder::PathAsc)),
+        Some("path_desc") => Ok(Some(StoreIndexSortOrder::PathDesc)),
+        Some("captured_asc") => Ok(Some(StoreIndexSortOrder::CapturedAsc)),
         Some("captured_desc") => Ok(Some(StoreIndexSortOrder::CapturedDesc)),
         Some(other) => anyhow::bail!("unsupported store index sort order: {other}"),
         None => Ok(None),
