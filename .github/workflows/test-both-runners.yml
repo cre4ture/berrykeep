@@ -1,0 +1,42 @@
+name: Test Both Runners
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Optional note for why this comparison run was triggered"
+        required: false
+        default: ""
+
+jobs:
+  compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, self-hosted]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Report runner context
+        run: |
+          echo "runner.os=${{ runner.os }}"
+          echo "runner.arch=${{ runner.arch }}"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install web workspace dependencies (timed)
+        working-directory: web
+        run: time pnpm install --frozen-lockfile
