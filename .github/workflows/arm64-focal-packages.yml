@@ -82,7 +82,7 @@ jobs:
                 build-essential ca-certificates clang curl dh-sysuser git \
                 libfuse3-dev pkg-config
               apt-get install -y --no-install-recommends -t focal-backports debhelper
-              git config --global --add safe.directory /build/ironmesh
+              git config --global --add safe.directory "$PWD"
               curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs \
                 | sh -s -- -y --profile minimal --default-toolchain nightly-2026-02-17
               export PATH=/root/.cargo/bin:$PATH
