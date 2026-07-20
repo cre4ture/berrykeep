@@ -61,10 +61,11 @@ jobs:
           sccache_dir="${RUNNER_TEMP}/sccache-arm64"
           mkdir -p "$sccache_dir"
           workspace_parent="$(dirname "$GITHUB_WORKSPACE")"
+          workspace_dir="$(basename "$GITHUB_WORKSPACE")"
           docker run --rm \
             --volume "${workspace_parent}:/build" \
             --volume "${sccache_dir}:/sccache" \
-            --workdir /build/ironmesh \
+            --workdir "/build/${workspace_dir}" \
             --env RUSTC_WRAPPER=sccache \
             --env SCCACHE_DIR=/sccache \
             --env SCCACHE_CACHE_SIZE=2G \
