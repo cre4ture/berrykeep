@@ -98,7 +98,7 @@ jobs:
                 \( -name "ironmesh-*_*_arm64.deb" \
                   -o -name "ironmesh_*_arm64.changes" \
                   -o -name "ironmesh_*_arm64.buildinfo" \) \
-                -exec cp -v {} /build/ironmesh/artifacts/ \;
+                -exec cp -v {} artifacts/ \;
             '
           # actions/cache runs its post-job save as the runner user, but the
           # container wrote the cache as root; hand ownership back so it saves.
