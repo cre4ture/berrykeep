@@ -1,8 +1,10 @@
-# ironmesh
+# General
+
+Official project language: English
 
 Work pacing and delivery rules live in [PACE.md](PACE.md).
 
-## Skills
+# Skills
 
 Project-specific skills live in [skills/](skills/). Each subdirectory is a skill with its own `SKILL.md`. Read the relevant `SKILL.md` before performing the corresponding task.
 
