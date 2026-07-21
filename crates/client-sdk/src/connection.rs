@@ -7,7 +7,7 @@ use reqwest::ClientBuilder;
 use reqwest::Url;
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::blocking::ClientBuilder as BlockingClientBuilder;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
@@ -27,6 +27,10 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_PROBE_RESPONSE_BYTES: usize = 64;
 const STARTUP_PROBE_FAILURE_PENALTY_MS: f64 = 500.0;
 const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_PROBE_SUCCESS_GRACE: Duration = Duration::from_millis(250);
+
+type StartupProbeResult = (usize, Result<f64>);
+type StartupProbeWorkerResult = (Vec<IronMeshClient>, Vec<StartupProbeResult>);
 
 pub fn load_root_certificate(path: &Path) -> Result<Certificate> {
     let pem = fs::read(path)
@@ -486,59 +490,83 @@ fn order_clients_by_startup_probe(
 ) -> Result<Vec<IronMeshClient>> {
     let worker = std::thread::Builder::new()
         .name("ironmesh-client-startup-probe".to_string())
-        .spawn(
-            move || -> Result<Vec<(usize, IronMeshClient, Result<f64>)>> {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("failed to build startup probe runtime")?;
+        .spawn(move || -> Result<StartupProbeWorkerResult> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build startup probe runtime")?;
 
-                Ok(runtime.block_on(async move {
-                    let mut probes = FuturesUnordered::new();
-                    for (index, client) in clients.into_iter().enumerate() {
-                        probes.push(async move {
-                            let probe = if signed_probe {
-                                probe_signed_client_startup_quality(&client).await
-                            } else {
-                                probe_direct_client_startup_quality(&client).await
-                            };
-                            (index, client, probe)
-                        });
-                    }
+            Ok(runtime.block_on(async move {
+                let mut probes = FuturesUnordered::new();
+                for (index, client) in clients.iter().cloned().enumerate() {
+                    probes.push(async move {
+                        let probe = if signed_probe {
+                            probe_signed_client_startup_quality(&client).await
+                        } else {
+                            probe_direct_client_startup_quality(&client).await
+                        };
+                        (index, probe)
+                    });
+                }
 
-                    let mut results = Vec::new();
-                    while let Some(result) = probes.next().await {
-                        results.push(result);
+                let mut results = Vec::new();
+                let mut success_grace_deadline = None;
+                loop {
+                    let next = if let Some(deadline) = success_grace_deadline {
+                        tokio::select! {
+                            result = probes.next() => result,
+                            () = tokio::time::sleep_until(deadline) => None,
+                        }
+                    } else {
+                        probes.next().await
+                    };
+                    let Some((index, probe)) = next else {
+                        break;
+                    };
+                    if probe.is_ok() && success_grace_deadline.is_none() {
+                        success_grace_deadline =
+                            Some(tokio::time::Instant::now() + STARTUP_PROBE_SUCCESS_GRACE);
                     }
-                    results
-                }))
-            },
-        )
+                    results.push((index, probe));
+                }
+                (clients, results)
+            }))
+        })
         .context("failed to spawn startup probe worker")?;
 
-    let probed = worker
+    let (clients, probed) = worker
         .join()
         .map_err(|_| anyhow!("startup probe worker panicked"))??;
 
     let mut success = Vec::new();
     let mut failed = Vec::new();
     let mut probe_errors = Vec::new();
+    let mut scores = HashMap::new();
 
-    for (index, client, probe) in probed {
+    for (index, probe) in probed {
         match probe {
-            Ok(score) => success.push((score, index, client)),
+            Ok(score) => {
+                scores.insert(index, score);
+            }
             Err(error) => {
                 probe_errors.push(format!("{error:#}"));
-                failed.push((index, client));
             }
         }
     }
 
-    if success.is_empty() {
+    if scores.is_empty() {
         bail!(
             "startup connection quality probe failed for all client transport targets{}",
             format_build_error_suffix(&probe_errors)
         );
+    }
+
+    for (index, client) in clients.into_iter().enumerate() {
+        if let Some(score) = scores.remove(&index) {
+            success.push((score, index, client));
+        } else {
+            failed.push((index, client));
+        }
     }
 
     success.sort_by(|left, right| {
@@ -565,16 +593,25 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
         bail!(diagnostic);
     }
 
-    let result = tokio::time::timeout(
-        STARTUP_PROBE_TIMEOUT,
-        client.run_latency_probe(LatencyProbeConfig {
-            sample_count: 2,
-            warmup_count: 0,
-            response_bytes: STARTUP_PROBE_RESPONSE_BYTES,
-            server_delay_ms: 0,
-            pause_between_samples_ms: 0,
-        }),
-    )
+    let probe_config = LatencyProbeConfig {
+        sample_count: 1,
+        warmup_count: 0,
+        response_bytes: STARTUP_PROBE_RESPONSE_BYTES,
+        server_delay_ms: 0,
+        pause_between_samples_ms: 0,
+    };
+    let result = tokio::time::timeout(STARTUP_PROBE_TIMEOUT, async {
+        let mut latest_result = None;
+        for _ in 0..2 {
+            let result = client.run_latency_probe(probe_config.clone()).await?;
+            let reached_target = result.summary.success_count > 0;
+            latest_result = Some(result);
+            if reached_target {
+                break;
+            }
+        }
+        latest_result.ok_or_else(|| anyhow!("startup signed latency probe did not run"))
+    })
     .await
     .with_context(|| {
         format!(
@@ -582,6 +619,15 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
             STARTUP_PROBE_TIMEOUT
         )
     })??;
+
+    if result.summary.success_count == 0 {
+        let detail = result
+            .samples
+            .iter()
+            .find_map(|sample| sample.error.as_deref())
+            .unwrap_or("all latency probe samples failed");
+        bail!("startup signed latency probe failed for {target_label}: {detail}");
+    }
 
     let latency_ms = result
         .summary
@@ -728,6 +774,8 @@ fn prioritize_socket_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<S
 mod tests {
     use super::*;
     use common::NodeId;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use transport_sdk::candidates::ConnectionCandidateTransportHints;
     use transport_sdk::{CandidateKind, DEFAULT_DIRECT_QUIC_ALPN, RelayMode, TransportPathKind};
@@ -765,6 +813,90 @@ mod tests {
                 .to_string()
                 .contains("failed to parse server base URL")
         );
+    }
+
+    #[test]
+    fn startup_probe_returns_after_first_success_without_discarding_slow_fallback() {
+        let fast_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("fast test listener should bind");
+        let fast_addr = fast_listener
+            .local_addr()
+            .expect("fast test listener address should resolve");
+        let fast_server = std::thread::spawn(move || {
+            let (mut socket, _) = fast_listener.accept().expect("fast probe should connect");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .expect("fast probe response should write");
+        });
+
+        let slow_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("slow test listener should bind");
+        let slow_addr = slow_listener
+            .local_addr()
+            .expect("slow test listener address should resolve");
+        let slow_server = std::thread::spawn(move || {
+            let (_socket, _) = slow_listener.accept().expect("slow probe should connect");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let slow_url = format!("http://{slow_addr}");
+        let fast_url = format!("http://{fast_addr}");
+        let started = Instant::now();
+        let ordered = order_clients_by_startup_probe(
+            vec![
+                IronMeshClient::from_direct_base_url(&slow_url),
+                IronMeshClient::from_direct_base_url(&fast_url),
+            ],
+            false,
+        )
+        .expect("a successful startup path should be returned");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "slow unfinished candidates must not hold up startup"
+        );
+        assert_eq!(ordered[0].direct_server_base_url(), Some(fast_url.as_str()));
+        assert_eq!(ordered[1].direct_server_base_url(), Some(slow_url.as_str()));
+        fast_server.join().expect("fast server should finish");
+        slow_server.join().expect("slow server should finish");
+    }
+
+    #[test]
+    fn signed_startup_probe_rejects_report_without_successful_sample() {
+        let listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("probe test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("probe test listener address should resolve");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("probe should connect");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 11\r\n\r\nunavailable",
+                )
+                .expect("failed probe response should write");
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("probe test runtime should build");
+        let error = runtime
+            .block_on(probe_signed_client_startup_quality(
+                &IronMeshClient::from_direct_base_url(format!("http://{address}")),
+            ))
+            .expect_err("an all-failed diagnostic report must not mark the path reachable");
+
+        assert!(
+            error
+                .to_string()
+                .contains("startup signed latency probe failed")
+        );
+        server.join().expect("probe test server should finish");
     }
 
     #[test]

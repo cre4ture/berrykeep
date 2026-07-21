@@ -70,7 +70,7 @@ pub use relay_security::{
 };
 pub use relay_tunnel::{
     RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelControlMessage, RelayTunnelEvent,
-    RelayTunnelSession, relay_tunnel_ws_url,
+    RelayTunnelPairingTiming, RelayTunnelSession, relay_tunnel_ws_url,
 };
 pub use relay_wake::{
     RelayWakeClient, RelayWakeControlMessage, RelayWakeEvent, RelayWakeRegistration,
@@ -98,8 +98,10 @@ pub use session::{
     select_session_plan,
 };
 pub use transport_protocol::{
-    TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportSessionControlMessage,
-    TransportSessionRole, TransportStreamControlMessage, TransportStreamKind,
+    HEADER_SERVER_PROCESSING_DURATION_US, HEADER_SERVER_RECEIVED_UNIX_MS,
+    HEADER_SERVER_RESPONDED_UNIX_MS, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
+    TransportSessionControlMessage, TransportSessionRole, TransportStreamControlMessage,
+    TransportStreamKind,
 };
 pub use websocket_client::{
     ExpectedNodeServerIdentity, build_tls_client_config,

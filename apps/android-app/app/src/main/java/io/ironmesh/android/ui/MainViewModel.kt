@@ -55,6 +55,7 @@ enum class GalleryViewMode {
 enum class MainSection {
     HOME,
     CONNECTIVITY,
+    REQUEST_TIMINGS,
     SYNC,
     LIBRARY,
     GALLERY_MAP,
@@ -371,7 +372,7 @@ class MainViewModel(
 
     fun selectSection(section: MainSection) {
         uiState.value = uiState.value.copy(selectedSection = section)
-        if (section == MainSection.CONNECTIVITY) {
+        if (section.isConnectionDiagnosticsSection()) {
             startConnectionRoutesMonitor()
         } else {
             stopConnectionRoutesMonitor()
@@ -400,7 +401,7 @@ class MainViewModel(
                 showLoading = true,
                 statusOnFailure = true,
             )
-            if (uiState.value.selectedSection == MainSection.CONNECTIVITY) {
+            if (uiState.value.selectedSection.isConnectionDiagnosticsSection()) {
                 startConnectionRoutesMonitor()
             }
         }
@@ -1650,4 +1651,8 @@ class MainViewModel(
         val normalized = path.trim().trim('/')
         return if (normalized.isBlank()) GALLERY_ROOT_PATH else "$normalized/"
     }
+}
+
+private fun MainSection.isConnectionDiagnosticsSection(): Boolean {
+    return this == MainSection.CONNECTIVITY || this == MainSection.REQUEST_TIMINGS
 }

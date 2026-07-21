@@ -292,6 +292,12 @@ impl IronMeshClient {
             reset_count: session_pool_after
                 .reset_count
                 .saturating_sub(session_pool_before.reset_count),
+            connect_duration_us: session_pool_after
+                .connect_duration_us
+                .saturating_sub(session_pool_before.connect_duration_us),
+            relay_pairing_duration_us: session_pool_after
+                .relay_pairing_duration_us
+                .saturating_sub(session_pool_before.relay_pairing_duration_us),
         };
         let summary = summarize_latency_probe(
             &samples,
@@ -785,6 +791,8 @@ mod tests {
                 connect_count: 1,
                 reuse_count: 3,
                 reset_count: 0,
+                connect_duration_us: 0,
+                relay_pairing_duration_us: 0,
             },
             samples: Vec::new(),
             summary: LatencyProbeSummary {
@@ -813,6 +821,8 @@ mod tests {
                 connect_count: 1,
                 reuse_count: 3,
                 reset_count: 0,
+                connect_duration_us: 0,
+                relay_pairing_duration_us: 0,
             },
             samples: Vec::new(),
             summary: LatencyProbeSummary {
@@ -862,6 +872,8 @@ mod tests {
                 connect_count: 1,
                 reuse_count: 4,
                 reset_count: 1,
+                connect_duration_us: 0,
+                relay_pairing_duration_us: 0,
             },
         );
 

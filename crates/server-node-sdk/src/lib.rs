@@ -82,22 +82,23 @@ use transport_sdk::{
     ClientBootstrapClaimTrust, ClientEnrollmentRequest, ClusterRegistrationChallengeRequest,
     ClusterRegistrationChallengeResponse, ClusterRegistrationCompleteRequest,
     ClusterRegistrationProofAlgorithm, ClusterRegistrationRecord, ConnectionCandidate,
-    DirectQuicEndpoint, DirectQuicEndpointConfig, DirectQuicSession, MultiplexConfig,
-    MultiplexMode, MultiplexedSession, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
-    NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
-    PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
-    RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSecurityMode,
-    RelayTunnelSession, RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig,
-    RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity, RelayWakeClient, RelayWakeEvent,
-    RelayWakeRegistration, RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders,
-    TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader, TransportPathKind,
-    TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
-    TransportSessionRole, TransportStreamKind, credential_fingerprint, endpoint_id_from_candidate,
-    load_or_create_secret_key, perform_transport_client_handshake,
-    perform_transport_server_handshake, read_buffered_transport_response,
-    read_transport_request_head, read_transport_response_head, verify_signed_request_headers,
-    write_buffered_transport_request, write_buffered_transport_response,
-    write_transport_response_head,
+    DirectQuicEndpoint, DirectQuicEndpointConfig, DirectQuicSession,
+    HEADER_SERVER_PROCESSING_DURATION_US, HEADER_SERVER_RECEIVED_UNIX_MS,
+    HEADER_SERVER_RESPONDED_UNIX_MS, MultiplexConfig, MultiplexMode, MultiplexedSession,
+    NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
+    NodeJoinRequest, PeerIdentity, PeerTransportClient, PeerTransportClientConfig,
+    PresenceRegistration, RelayHttpHeader, RelayMode, RelayTicketRequest, RelayTunnelAcceptRequest,
+    RelayTunnelClient, RelayTunnelSecurityMode, RelayTunnelSession, RelayTunnelSessionKind,
+    RelayTunnelSourceSecurityConfig, RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity,
+    RelayWakeClient, RelayWakeEvent, RelayWakeRegistration, RendezvousClientConfig,
+    RendezvousControlClient, SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability,
+    TransportHeader, TransportPathKind, TransportRequestHead, TransportResponseHead,
+    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
+    credential_fingerprint, endpoint_id_from_candidate, load_or_create_secret_key,
+    perform_transport_client_handshake, perform_transport_server_handshake,
+    read_buffered_transport_response, read_transport_request_head, read_transport_response_head,
+    verify_signed_request_headers, write_buffered_transport_request,
+    write_buffered_transport_response, write_transport_response_head,
 };
 use uuid::Uuid;
 
@@ -7656,6 +7657,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .nest(PUBLIC_API_V1_PREFIX, public_api_v1)
         .merge(legacy_public_api)
         .with_state(state.clone())
+        .layer(middleware::from_fn(record_server_request_timing))
         .layer(middleware::from_fn(log_named_client_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -7724,6 +7726,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .merge(build_internal_peer_api())
         .with_state(state.clone())
+        .layer(middleware::from_fn(record_server_request_timing))
         .layer(middleware::from_fn(log_named_client_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -7732,6 +7735,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
 
     let s3_app = s3_frontend::build_listener_app()
         .with_state(state.clone())
+        .layer(middleware::from_fn(record_server_request_timing))
         .layer(middleware::from_fn(log_named_client_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -7741,7 +7745,8 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
     let local_status_app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/cluster/status", get(cluster_status))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .layer(middleware::from_fn(record_server_request_timing));
 
     ServerApps {
         public_app,
@@ -9742,6 +9747,64 @@ fn buffered_transport_error_response(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ServerRequestTiming {
+    started_at: Instant,
+    received_unix_ms: u64,
+}
+
+impl ServerRequestTiming {
+    fn start() -> Self {
+        Self {
+            started_at: Instant::now(),
+            received_unix_ms: unix_ts_ms(),
+        }
+    }
+
+    fn headers(self) -> [TransportHeader; 3] {
+        [
+            TransportHeader {
+                name: HEADER_SERVER_PROCESSING_DURATION_US.to_string(),
+                value: duration_as_u64_micros(self.started_at.elapsed()).to_string(),
+            },
+            TransportHeader {
+                name: HEADER_SERVER_RECEIVED_UNIX_MS.to_string(),
+                value: self.received_unix_ms.to_string(),
+            },
+            TransportHeader {
+                name: HEADER_SERVER_RESPONDED_UNIX_MS.to_string(),
+                value: unix_ts_ms().to_string(),
+            },
+        ]
+    }
+}
+
+fn apply_server_timing_to_buffered_response(
+    response: &mut BufferedTransportResponse,
+    timing: ServerRequestTiming,
+) {
+    response.headers.retain(|header| {
+        !matches!(
+            header.name.to_ascii_lowercase().as_str(),
+            HEADER_SERVER_PROCESSING_DURATION_US
+                | HEADER_SERVER_RECEIVED_UNIX_MS
+                | HEADER_SERVER_RESPONDED_UNIX_MS
+        )
+    });
+    response.headers.extend(timing.headers());
+}
+
+fn apply_server_timing_to_response(response: &mut Response, timing: ServerRequestTiming) {
+    for header in timing.headers() {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(header.name.as_bytes()),
+            HeaderValue::from_str(&header.value),
+        ) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+}
+
 async fn handle_multiplexed_relay_stream<S>(
     state: ServerState,
     scope: transport_service::TransportExecutionScope,
@@ -9762,7 +9825,8 @@ where
     let request = read_buffered_transport_request_from_head(&mut stream, request_head)
         .await
         .context("failed decoding multiplexed relay request body")?;
-    let response =
+    let timing = ServerRequestTiming::start();
+    let mut response =
         match transport_service::execute_buffered_transport_request(&state, &scope, &request).await
         {
             Ok(response) => {
@@ -9782,6 +9846,7 @@ where
                 format!("transport execution failed: {err:#}"),
             ),
         };
+    apply_server_timing_to_buffered_response(&mut response, timing);
 
     write_buffered_transport_response(&mut stream, &response)
         .await
@@ -9820,8 +9885,9 @@ async fn handle_streamed_object_read_request<S>(
 where
     S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
 {
+    let timing = ServerRequestTiming::start();
     if request_head.method != "GET" {
-        let response = buffered_transport_error_response(
+        let mut response = buffered_transport_error_response(
             request_head.request_id,
             405,
             format!(
@@ -9829,6 +9895,7 @@ where
                 request_head.method
             ),
         );
+        apply_server_timing_to_buffered_response(&mut response, timing);
         return write_buffered_transport_response(stream, &response)
             .await
             .context("failed writing object read method error");
@@ -9840,11 +9907,12 @@ where
             .read_to_end(&mut ignored)
             .await
             .context("failed draining unexpected object read request body")?;
-        let response = buffered_transport_error_response(
+        let mut response = buffered_transport_error_response(
             request_head.request_id,
             400,
             "object read streams must not include request bodies".to_string(),
         );
+        apply_server_timing_to_buffered_response(&mut response, timing);
         return write_buffered_transport_response(stream, &response)
             .await
             .context("failed writing object read body error");
@@ -9858,13 +9926,14 @@ where
         .unwrap_or(raw_path);
     let path_only = transport_service::strip_public_api_v1_prefix(path_only);
     if !transport_service::is_streamed_object_read_path(raw_path) {
-        let response = buffered_transport_error_response(
+        let mut response = buffered_transport_error_response(
             request_head.request_id,
             400,
             format!(
                 "object read streams only support /store/* or /s3/* GET paths, received {path_only}"
             ),
         );
+        apply_server_timing_to_buffered_response(&mut response, timing);
         return write_buffered_transport_response(stream, &response)
             .await
             .context("failed writing object read path error");
@@ -9874,11 +9943,12 @@ where
     {
         Ok(headers) => headers,
         Err(err) => {
-            let response = buffered_transport_error_response(
+            let mut response = buffered_transport_error_response(
                 request_head.request_id,
                 400,
                 format!("invalid object read headers: {err:#}"),
             );
+            apply_server_timing_to_buffered_response(&mut response, timing);
             return write_buffered_transport_response(stream, &response)
                 .await
                 .context("failed writing object read header error");
@@ -9888,11 +9958,12 @@ where
         let query = match transport_service::parse_query::<ObjectGetQuery>(&normalized_raw_path) {
             Ok(query) => query,
             Err(err) => {
-                let response = buffered_transport_error_response(
+                let mut response = buffered_transport_error_response(
                     request_head.request_id,
                     400,
                     format!("invalid object read query: {err:#}"),
                 );
+                apply_server_timing_to_buffered_response(&mut response, timing);
                 return write_buffered_transport_response(stream, &response)
                     .await
                     .context("failed writing object read query error");
@@ -9901,11 +9972,12 @@ where
         let key = match transport_service::decode_route_tail(path_only, "/store/") {
             Ok(key) => key,
             Err(err) => {
-                let response = buffered_transport_error_response(
+                let mut response = buffered_transport_error_response(
                     request_head.request_id,
                     400,
                     format!("invalid object read path: {err:#}"),
                 );
+                apply_server_timing_to_buffered_response(&mut response, timing);
                 return write_buffered_transport_response(stream, &response)
                     .await
                     .context("failed writing object read key error");
@@ -9927,7 +9999,7 @@ where
         )
         .await
     };
-    write_transport_response_from_axum(stream, request_head.request_id, response).await
+    write_transport_response_from_axum(stream, request_head.request_id, response, timing).await
 }
 
 async fn handle_streamed_object_write_request<S>(
@@ -9938,8 +10010,9 @@ async fn handle_streamed_object_write_request<S>(
 where
     S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
 {
+    let validation_timing = ServerRequestTiming::start();
     if !matches!(request_head.method.as_str(), "PUT" | "POST" | "DELETE") {
-        let response = buffered_transport_error_response(
+        let mut response = buffered_transport_error_response(
             request_head.request_id,
             405,
             format!(
@@ -9947,6 +10020,7 @@ where
                 request_head.method
             ),
         );
+        apply_server_timing_to_buffered_response(&mut response, validation_timing);
         return write_buffered_transport_response(stream, &response)
             .await
             .context("failed writing object write method error");
@@ -9962,11 +10036,12 @@ where
     {
         Ok(headers) => headers,
         Err(err) => {
-            let response = buffered_transport_error_response(
+            let mut response = buffered_transport_error_response(
                 request_head.request_id,
                 400,
                 format!("invalid object write headers: {err:#}"),
             );
+            apply_server_timing_to_buffered_response(&mut response, validation_timing);
             return write_buffered_transport_response(stream, &response)
                 .await
                 .context("failed writing object write header error");
@@ -9977,16 +10052,18 @@ where
         .read_to_end(&mut body)
         .await
         .context("failed reading object write request body")?;
+    let timing = ServerRequestTiming::start();
 
     let response = if let Some(path_tail) = path_only.strip_prefix("/store/uploads/") {
         let Some((upload_id, index_raw)) = path_tail.split_once("/chunk/") else {
-            let response = buffered_transport_error_response(
+            let mut response = buffered_transport_error_response(
                 request_head.request_id,
                 400,
                 format!(
                     "object write streams only support upload chunk paths, received {path_only}"
                 ),
             );
+            apply_server_timing_to_buffered_response(&mut response, timing);
             return write_buffered_transport_response(stream, &response)
                 .await
                 .context("failed writing object write chunk-path error");
@@ -9994,11 +10071,12 @@ where
         let index = match index_raw.parse::<usize>() {
             Ok(index) => index,
             Err(err) => {
-                let response = buffered_transport_error_response(
+                let mut response = buffered_transport_error_response(
                     request_head.request_id,
                     400,
                     format!("invalid upload chunk index {index_raw}: {err}"),
                 );
+                apply_server_timing_to_buffered_response(&mut response, timing);
                 return write_buffered_transport_response(stream, &response)
                     .await
                     .context("failed writing object write chunk-index error");
@@ -10021,28 +10099,31 @@ where
         )
         .await
     } else {
-        let response = buffered_transport_error_response(
+        let mut response = buffered_transport_error_response(
             request_head.request_id,
             400,
             format!(
                 "object write streams only support /store/uploads/* or /s3/* paths, received {path_only}"
             ),
         );
+        apply_server_timing_to_buffered_response(&mut response, timing);
         return write_buffered_transport_response(stream, &response)
             .await
             .context("failed writing object write path error");
     };
-    write_transport_response_from_axum(stream, request_head.request_id, response).await
+    write_transport_response_from_axum(stream, request_head.request_id, response, timing).await
 }
 
 async fn write_transport_response_from_axum<S>(
     stream: &mut S,
     request_id: String,
-    response: Response,
+    mut response: Response,
+    timing: ServerRequestTiming,
 ) -> Result<()>
 where
     S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
 {
+    apply_server_timing_to_response(&mut response, timing);
     let (parts, mut body) = response.into_parts();
     write_transport_response_head(
         stream,
@@ -11202,6 +11283,13 @@ async fn log_named_client_request(request: Request, next: Next) -> Response {
         );
     }
     next.run(request).await
+}
+
+async fn record_server_request_timing(request: Request, next: Next) -> Response {
+    let timing = ServerRequestTiming::start();
+    let mut response = next.run(request).await;
+    apply_server_timing_to_response(&mut response, timing);
+    response
 }
 
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
@@ -27176,6 +27264,10 @@ fn unix_ts_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn duration_as_u64_micros(duration: Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
 
 async fn write_json_atomic(path: &FsPath, payload: &[u8]) -> Result<()> {

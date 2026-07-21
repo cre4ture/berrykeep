@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::peer::PeerIdentity;
 
 pub const TRANSPORT_PROTOCOL_VERSION: u16 = 1;
+pub const HEADER_SERVER_PROCESSING_DURATION_US: &str = "x-ironmesh-server-processing-duration-us";
+pub const HEADER_SERVER_RECEIVED_UNIX_MS: &str = "x-ironmesh-server-received-unix-ms";
+pub const HEADER_SERVER_RESPONDED_UNIX_MS: &str = "x-ironmesh-server-responded-unix-ms";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransportHeader {

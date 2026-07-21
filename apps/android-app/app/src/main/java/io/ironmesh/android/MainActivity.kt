@@ -37,6 +37,7 @@ import io.ironmesh.android.ui.screens.HomeScreen
 import io.ironmesh.android.ui.screens.GalleryMapScreen
 import io.ironmesh.android.ui.screens.LibraryScreen
 import io.ironmesh.android.ui.screens.OnboardingScreen
+import io.ironmesh.android.ui.screens.RequestTimingsScreen
 import io.ironmesh.android.ui.screens.SettingsScreen
 import io.ironmesh.android.ui.screens.SyncScreen
 import io.ironmesh.android.ui.theme.IronmeshTheme
@@ -209,6 +210,11 @@ class MainActivity : ComponentActivity() {
                                 )
 
                                 MainSection.CONNECTIVITY -> ConnectionPathsScreen(
+                                    state = state,
+                                    onRefresh = vm::refreshConnectionRoutes,
+                                )
+
+                                MainSection.REQUEST_TIMINGS -> RequestTimingsScreen(
                                     state = state,
                                     onRefresh = vm::refreshConnectionRoutes,
                                 )
