@@ -14,9 +14,8 @@ import androidx.compose.ui.Modifier
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.ironmesh.android.data.EmbeddedWebUiSession
-import io.ironmesh.android.data.RustClientBridge
+import io.ironmesh.android.data.EmbeddedWebUiSessionRegistry
 import io.ironmesh.android.ui.components.IronmeshEmbeddedWebUi
-import io.ironmesh.android.ui.components.clearEmbeddedWebUiSession
 
 class WebUiActivity : ComponentActivity() {
     private var hostedWebView: WebView? = null
@@ -64,15 +63,10 @@ class WebUiActivity : ComponentActivity() {
         }
     }
 
-    override fun onStop() {
-        super.onStop()
-        if (!isChangingConfigurations) {
-            hostedWebView?.apply {
-                clearHistory()
-                clearCache(true)
-            }
-            session?.let { clearEmbeddedWebUiSession(it.url) }
-            RustClientBridge.stopWebUi()
+    override fun onResume() {
+        super.onResume()
+        val currentSession = session
+        if (currentSession != null && !EmbeddedWebUiSessionRegistry.isActive(currentSession)) {
             finish()
         }
     }
