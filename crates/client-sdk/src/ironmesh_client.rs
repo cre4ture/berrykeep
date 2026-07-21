@@ -5990,6 +5990,7 @@ fn normalize_client_api_path(path: &str) -> Cow<'_, str> {
         || path_only.starts_with("/auth/")
         || path_only.starts_with("/storage/")
         || path_only.starts_with("/media/")
+        || path_only.starts_with("/maps/")
         || path_only.starts_with("/maintenance/")
     {
         Cow::Owned(format!("{CLIENT_API_V1_PREFIX}{path_with_slash}"))

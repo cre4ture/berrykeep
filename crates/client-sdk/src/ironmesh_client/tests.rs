@@ -61,6 +61,10 @@ fn normalize_client_api_path_prefixes_known_public_routes() {
         normalize_client_api_path("/media/thumbnail?key=gallery%2Fcat.png").as_ref(),
         "/api/v1/media/thumbnail?key=gallery%2Fcat.png"
     );
+    assert_eq!(
+        normalize_client_api_path("/maps/config").as_ref(),
+        "/api/v1/maps/config"
+    );
 }
 
 #[test]
