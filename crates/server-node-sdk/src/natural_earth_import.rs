@@ -3,6 +3,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -14,7 +15,9 @@ const NATURAL_EARTH_POPULATED_PLACES_10M_URL: &str =
     "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_populated_places.zip";
 const NATURAL_EARTH_BOUNDARIES_10M_URL: &str =
     "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_admin_0_boundary_lines_land.zip";
-const NATURAL_EARTH_IMPORT_MAX_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
+const NATURAL_EARTH_CROSS_BLENDED_HYPSO_10M_URL: &str =
+    "https://naciscdn.org/naturalearth/10m/raster/HYP_HR_SR_W.zip";
+const NATURAL_EARTH_IMPORT_MAX_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
 const NATURAL_EARTH_IMPORT_MAX_ARTIFACT_BYTES: usize = 512 * 1024 * 1024;
 const NATURAL_EARTH_IMPORT_PART_BYTES: usize = 256 * 1024 * 1024;
 const NATURAL_EARTH_COMMAND_TIMEOUT_SECS: u64 = 20 * 60;
@@ -22,9 +25,15 @@ const NATURAL_EARTH_COMMAND_OUTPUT_LIMIT: usize = 8 * 1024;
 const NATURAL_EARTH_COMMAND_LOG_OUTPUT_LIMIT: usize = 2 * 1024;
 const NATURAL_EARTH_IMPORT_LOG_MAX_ENTRIES: usize = 64;
 const WEB_MERCATOR_WORLD_METERS: &str = "20037508.342789244";
-const REQUIRED_MAP_IMPORT_COMMANDS: [(&str, &str); 5] = [
+const REQUIRED_PHYSICAL_IMPORT_COMMANDS: [(&str, &str); 5] = [
     ("unzip", "-v"),
     ("gdal_rasterize", "--version"),
+    ("gdalwarp", "--version"),
+    ("gdal_translate", "--version"),
+    ("gdaladdo", "--version"),
+];
+const REQUIRED_CROSS_BLENDED_HYPSO_IMPORT_COMMANDS: [(&str, &str); 4] = [
+    ("unzip", "-v"),
     ("gdalwarp", "--version"),
     ("gdal_translate", "--version"),
     ("gdaladdo", "--version"),
@@ -37,6 +46,7 @@ pub(crate) enum NaturalEarthImportProfile {
     #[default]
     Physical,
     PhysicalWithLabels,
+    CrossBlendedHypso,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +149,13 @@ struct NaturalEarthSourceArchive {
     description: &'static str,
 }
 
+struct RasterMbtilesConversion<'a> {
+    name: &'a str,
+    description: &'a str,
+    resampling: &'a str,
+    add_destination_alpha: bool,
+}
+
 pub(crate) async fn is_running(state: &ServerState) -> bool {
     let runtime = state.storage.natural_earth_import.lock().await;
     matches!(
@@ -234,6 +251,7 @@ async fn start_import(
     let base_variant_id = match profile {
         NaturalEarthImportProfile::Physical => "natural-earth-globe",
         NaturalEarthImportProfile::PhysicalWithLabels => "natural-earth-labels",
+        NaturalEarthImportProfile::CrossBlendedHypso => "natural-earth-hypso",
     };
     let target = map_config::resolve_import_target(
         &configuration.configuration,
@@ -269,7 +287,7 @@ async fn start_import(
         state: NaturalEarthImportState::Running,
         profile,
         phase: "Waiting for the Natural Earth conversion worker".to_string(),
-        source_url: NATURAL_EARTH_PHYSICAL_10M_URL.to_string(),
+        source_url: natural_earth_source_url(profile).to_string(),
         logical_key: target.logical_key,
         manifest_key: target.manifest_key,
         logical_size_bytes: 0,
@@ -326,6 +344,15 @@ async fn start_import(
     Ok(job)
 }
 
+fn natural_earth_source_url(profile: NaturalEarthImportProfile) -> &'static str {
+    match profile {
+        NaturalEarthImportProfile::Physical | NaturalEarthImportProfile::PhysicalWithLabels => {
+            NATURAL_EARTH_PHYSICAL_10M_URL
+        }
+        NaturalEarthImportProfile::CrossBlendedHypso => NATURAL_EARTH_CROSS_BLENDED_HYPSO_10M_URL,
+    }
+}
+
 async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Result<u64> {
     update_phase(state, "Checking GDAL and unzip dependencies").await;
     ensure_import_commands_available(state, job.profile).await?;
@@ -342,105 +369,14 @@ async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Res
     })?;
 
     let result = async {
-        let extracted_dir = staging_dir.join("source");
-        fs::create_dir_all(&extracted_dir).await?;
-        download_and_extract_natural_earth_archive(
-            state,
-            NaturalEarthSourceArchive {
-                url: NATURAL_EARTH_PHYSICAL_10M_URL,
-                archive_name: "natural-earth-physical.zip",
-                description: "Natural Earth physical archive",
-            },
-            &extracted_dir,
-            &staging_dir,
-        )
-        .await?;
-        let ocean = find_layer(&extracted_dir, "ne_10m_ocean.shp")?;
-        let land = find_layer(&extracted_dir, "ne_10m_land.shp")?;
-        let lakes = find_layer(&extracted_dir, "ne_10m_lakes.shp")?;
-        let rivers = find_layer(&extracted_dir, "ne_10m_rivers_lake_centerlines.shp")?;
-        let coastline = find_layer(&extracted_dir, "ne_10m_coastline.shp")?;
-        let source_raster = staging_dir.join("natural-earth-physical-wgs84.tif");
-        let mercator_raster = staging_dir.join("natural-earth-physical-mercator.tif");
-        let artifact_path = staging_dir.join("natural-earth-globe.mbtiles");
-        update_phase(state, "Rendering the physical world map").await;
-        rasterize_physical_map(
-            state,
-            PhysicalMapLayers {
-                ocean: &ocean,
-                land: &land,
-                lakes: &lakes,
-                rivers: &rivers,
-                coastline: &coastline,
-            },
-            &source_raster,
-            &staging_dir,
-        )
-        .await?;
-        update_phase(state, "Generating Web Mercator MBTiles").await;
-        project_and_create_mbtiles(
-            state,
-            &source_raster,
-            &mercator_raster,
-            &artifact_path,
-            &staging_dir,
-        )
-        .await?;
-        update_phase(state, "Validating generated MBTiles").await;
-        validate_generated_mbtiles(state, &artifact_path).await?;
-
-        let label_artifact_path = if job.profile == NaturalEarthImportProfile::PhysicalWithLabels {
-            let labels_source_dir = staging_dir.join("labels-source");
-            fs::create_dir_all(&labels_source_dir).await?;
-            for archive in [
-                NaturalEarthSourceArchive {
-                    url: NATURAL_EARTH_COUNTRIES_10M_URL,
-                    archive_name: "natural-earth-countries.zip",
-                    description: "Natural Earth countries archive",
-                },
-                NaturalEarthSourceArchive {
-                    url: NATURAL_EARTH_POPULATED_PLACES_10M_URL,
-                    archive_name: "natural-earth-populated-places.zip",
-                    description: "Natural Earth populated places archive",
-                },
-                NaturalEarthSourceArchive {
-                    url: NATURAL_EARTH_BOUNDARIES_10M_URL,
-                    archive_name: "natural-earth-boundaries.zip",
-                    description: "Natural Earth country boundaries archive",
-                },
-            ] {
-                download_and_extract_natural_earth_archive(
-                    state,
-                    archive,
-                    &labels_source_dir,
-                    &staging_dir,
-                )
-                .await?;
+        let (artifact_path, label_artifact_path) = match job.profile {
+            NaturalEarthImportProfile::CrossBlendedHypso => (
+                create_cross_blended_hypso_mbtiles(state, &staging_dir).await?,
+                None,
+            ),
+            NaturalEarthImportProfile::Physical | NaturalEarthImportProfile::PhysicalWithLabels => {
+                create_physical_map_mbtiles(state, job.profile, &staging_dir).await?
             }
-            let countries = find_layer(&labels_source_dir, "ne_10m_admin_0_countries.shp")?;
-            let populated_places = find_layer(&labels_source_dir, "ne_10m_populated_places.shp")?;
-            let boundaries =
-                find_layer(&labels_source_dir, "ne_10m_admin_0_boundary_lines_land.shp")?;
-            let label_geopackage = staging_dir.join("natural-earth-labels.gpkg");
-            let label_mbtiles = staging_dir.join("natural-earth-labels.mbtiles");
-            update_phase(state, "Preparing Natural Earth country and place labels").await;
-            create_natural_earth_label_overlay(
-                state,
-                NaturalEarthLabelLayers {
-                    countries: &countries,
-                    populated_places: &populated_places,
-                    boundaries: &boundaries,
-                },
-                &label_geopackage,
-                &label_mbtiles,
-                &staging_dir,
-            )
-            .await?;
-            update_phase(state, "Validating generated label overlay").await;
-            validate_generated_label_mbtiles(state, &label_mbtiles).await?;
-            Some(label_mbtiles)
-        } else {
-            None
         };
 
         update_phase(state, "Publishing generated map artifact").await;
@@ -469,6 +405,161 @@ async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Res
         warn!(path = %staging_dir.display(), error = %error, "failed cleaning Natural Earth import staging directory");
     }
     result
+}
+
+async fn create_cross_blended_hypso_mbtiles(
+    state: &ServerState,
+    staging_dir: &Path,
+) -> Result<PathBuf> {
+    let extracted_dir = staging_dir.join("source");
+    fs::create_dir_all(&extracted_dir).await?;
+    download_and_extract_natural_earth_archive(
+        state,
+        NaturalEarthSourceArchive {
+            url: NATURAL_EARTH_CROSS_BLENDED_HYPSO_10M_URL,
+            archive_name: "natural-earth-cross-blended-hypso.zip",
+            description: "Natural Earth cross-blended hypsometric relief archive",
+        },
+        &extracted_dir,
+        staging_dir,
+    )
+    .await?;
+    let source_raster = find_layer(&extracted_dir, "HYP_HR_SR_W.tif")?;
+    let mercator_raster = staging_dir.join("natural-earth-hypso-mercator.tif");
+    let artifact_path = staging_dir.join("natural-earth-hypso.mbtiles");
+    update_phase(state, "Rendering the cross-blended hypsometric relief map").await;
+    project_and_create_mbtiles(
+        state,
+        &source_raster,
+        &mercator_raster,
+        &artifact_path,
+        staging_dir,
+        RasterMbtilesConversion {
+            name: "Natural Earth Hypsometric Relief",
+            description: "Natural Earth 10m cross-blended hypsometric tints with shaded relief and water",
+            resampling: "bilinear",
+            add_destination_alpha: true,
+        },
+    )
+    .await?;
+    update_phase(state, "Validating generated relief MBTiles").await;
+    validate_generated_mbtiles(state, &artifact_path).await?;
+    Ok(artifact_path)
+}
+
+async fn create_physical_map_mbtiles(
+    state: &ServerState,
+    profile: NaturalEarthImportProfile,
+    staging_dir: &Path,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let extracted_dir = staging_dir.join("source");
+    fs::create_dir_all(&extracted_dir).await?;
+    download_and_extract_natural_earth_archive(
+        state,
+        NaturalEarthSourceArchive {
+            url: NATURAL_EARTH_PHYSICAL_10M_URL,
+            archive_name: "natural-earth-physical.zip",
+            description: "Natural Earth physical archive",
+        },
+        &extracted_dir,
+        staging_dir,
+    )
+    .await?;
+    let ocean = find_layer(&extracted_dir, "ne_10m_ocean.shp")?;
+    let land = find_layer(&extracted_dir, "ne_10m_land.shp")?;
+    let lakes = find_layer(&extracted_dir, "ne_10m_lakes.shp")?;
+    let rivers = find_layer(&extracted_dir, "ne_10m_rivers_lake_centerlines.shp")?;
+    let coastline = find_layer(&extracted_dir, "ne_10m_coastline.shp")?;
+    let source_raster = staging_dir.join("natural-earth-physical-wgs84.tif");
+    let mercator_raster = staging_dir.join("natural-earth-physical-mercator.tif");
+    let artifact_path = staging_dir.join("natural-earth-globe.mbtiles");
+    update_phase(state, "Rendering the physical world map").await;
+    rasterize_physical_map(
+        state,
+        PhysicalMapLayers {
+            ocean: &ocean,
+            land: &land,
+            lakes: &lakes,
+            rivers: &rivers,
+            coastline: &coastline,
+        },
+        &source_raster,
+        staging_dir,
+    )
+    .await?;
+    update_phase(state, "Generating Web Mercator MBTiles").await;
+    project_and_create_mbtiles(
+        state,
+        &source_raster,
+        &mercator_raster,
+        &artifact_path,
+        staging_dir,
+        RasterMbtilesConversion {
+            name: "Natural Earth Globe",
+            description: "Natural Earth Physical 10m",
+            resampling: "near",
+            add_destination_alpha: false,
+        },
+    )
+    .await?;
+    update_phase(state, "Validating generated MBTiles").await;
+    validate_generated_mbtiles(state, &artifact_path).await?;
+
+    let label_artifact_path = if profile == NaturalEarthImportProfile::PhysicalWithLabels {
+        Some(create_natural_earth_label_mbtiles(state, staging_dir).await?)
+    } else {
+        None
+    };
+    Ok((artifact_path, label_artifact_path))
+}
+
+async fn create_natural_earth_label_mbtiles(
+    state: &ServerState,
+    staging_dir: &Path,
+) -> Result<PathBuf> {
+    let labels_source_dir = staging_dir.join("labels-source");
+    fs::create_dir_all(&labels_source_dir).await?;
+    for archive in [
+        NaturalEarthSourceArchive {
+            url: NATURAL_EARTH_COUNTRIES_10M_URL,
+            archive_name: "natural-earth-countries.zip",
+            description: "Natural Earth countries archive",
+        },
+        NaturalEarthSourceArchive {
+            url: NATURAL_EARTH_POPULATED_PLACES_10M_URL,
+            archive_name: "natural-earth-populated-places.zip",
+            description: "Natural Earth populated places archive",
+        },
+        NaturalEarthSourceArchive {
+            url: NATURAL_EARTH_BOUNDARIES_10M_URL,
+            archive_name: "natural-earth-boundaries.zip",
+            description: "Natural Earth country boundaries archive",
+        },
+    ] {
+        download_and_extract_natural_earth_archive(state, archive, &labels_source_dir, staging_dir)
+            .await?;
+    }
+    let countries = find_layer(&labels_source_dir, "ne_10m_admin_0_countries.shp")?;
+    let populated_places = find_layer(&labels_source_dir, "ne_10m_populated_places.shp")?;
+    let boundaries = find_layer(&labels_source_dir, "ne_10m_admin_0_boundary_lines_land.shp")?;
+    let label_geopackage = staging_dir.join("natural-earth-labels.gpkg");
+    let label_mbtiles = staging_dir.join("natural-earth-labels.mbtiles");
+    update_phase(state, "Preparing Natural Earth country and place labels").await;
+    create_natural_earth_label_overlay(
+        state,
+        NaturalEarthLabelLayers {
+            countries: &countries,
+            populated_places: &populated_places,
+            boundaries: &boundaries,
+        },
+        &label_geopackage,
+        &label_mbtiles,
+        staging_dir,
+    )
+    .await?;
+    update_phase(state, "Validating generated label overlay").await;
+    validate_generated_label_mbtiles(state, &label_mbtiles).await?;
+    Ok(label_mbtiles)
 }
 
 async fn update_phase(state: &ServerState, phase: &str) {
@@ -589,7 +680,14 @@ async fn ensure_import_commands_available(
 fn required_import_commands(
     profile: NaturalEarthImportProfile,
 ) -> Vec<(&'static str, &'static str)> {
-    let mut commands = REQUIRED_MAP_IMPORT_COMMANDS.to_vec();
+    let mut commands = match profile {
+        NaturalEarthImportProfile::CrossBlendedHypso => {
+            REQUIRED_CROSS_BLENDED_HYPSO_IMPORT_COMMANDS.to_vec()
+        }
+        NaturalEarthImportProfile::Physical | NaturalEarthImportProfile::PhysicalWithLabels => {
+            REQUIRED_PHYSICAL_IMPORT_COMMANDS.to_vec()
+        }
+    };
     if profile == NaturalEarthImportProfile::PhysicalWithLabels {
         commands.extend(REQUIRED_LABEL_IMPORT_COMMANDS);
     }
@@ -625,19 +723,20 @@ async fn download_and_extract_natural_earth_archive(
             archive.description
         )
     }
-    let mut payload = Vec::with_capacity(
-        response
-            .content_length()
-            .unwrap_or_default()
-            .min(NATURAL_EARTH_IMPORT_MAX_DOWNLOAD_BYTES as u64) as usize,
-    );
+    let mut downloaded_bytes = 0usize;
+    let mut destination_file = fs::File::create(&destination).await.with_context(|| {
+        format!(
+            "failed creating {} {}",
+            archive.description,
+            destination.display()
+        )
+    })?;
     while let Some(chunk) = response
         .chunk()
         .await
         .context("failed reading Natural Earth physical archive response")?
     {
-        let next_size = payload
-            .len()
+        let next_size = downloaded_bytes
             .checked_add(chunk.len())
             .with_context(|| format!("{} size overflow", archive.description))?;
         if next_size > NATURAL_EARTH_IMPORT_MAX_DOWNLOAD_BYTES {
@@ -646,12 +745,18 @@ async fn download_and_extract_natural_earth_archive(
                 archive.description
             )
         }
-        payload.extend_from_slice(&chunk);
+        destination_file.write_all(&chunk).await.with_context(|| {
+            format!(
+                "failed writing {} {}",
+                archive.description,
+                destination.display()
+            )
+        })?;
+        downloaded_bytes = next_size;
     }
-    let downloaded_bytes = payload.len();
-    fs::write(&destination, payload).await.with_context(|| {
+    destination_file.flush().await.with_context(|| {
         format!(
-            "failed writing {} {}",
+            "failed flushing {} {}",
             archive.description,
             destination.display()
         )
@@ -769,30 +874,29 @@ async fn project_and_create_mbtiles(
     mercator: &Path,
     artifact: &Path,
     working_dir: &Path,
+    conversion: RasterMbtilesConversion<'_>,
 ) -> Result<()> {
-    run_command(
-        state,
-        "gdalwarp",
-        vec![
-            "-overwrite".into(),
-            "-t_srs".into(),
-            "EPSG:3857".into(),
-            "-te".into(),
-            format!("-{WEB_MERCATOR_WORLD_METERS}").into(),
-            format!("-{WEB_MERCATOR_WORLD_METERS}").into(),
-            WEB_MERCATOR_WORLD_METERS.into(),
-            WEB_MERCATOR_WORLD_METERS.into(),
-            "-ts".into(),
-            "8192".into(),
-            "8192".into(),
-            "-r".into(),
-            "near".into(),
-            source.as_os_str().to_owned(),
-            mercator.as_os_str().to_owned(),
-        ],
-        working_dir,
-    )
-    .await?;
+    let mut warp_arguments = vec![
+        "-overwrite".into(),
+        "-t_srs".into(),
+        "EPSG:3857".into(),
+        "-te".into(),
+        format!("-{WEB_MERCATOR_WORLD_METERS}").into(),
+        format!("-{WEB_MERCATOR_WORLD_METERS}").into(),
+        WEB_MERCATOR_WORLD_METERS.into(),
+        WEB_MERCATOR_WORLD_METERS.into(),
+        "-ts".into(),
+        "8192".into(),
+        "8192".into(),
+        "-r".into(),
+        conversion.resampling.into(),
+    ];
+    if conversion.add_destination_alpha {
+        warp_arguments.push("-dstalpha".into());
+    }
+    warp_arguments.push(source.as_os_str().to_owned());
+    warp_arguments.push(mercator.as_os_str().to_owned());
+    run_command(state, "gdalwarp", warp_arguments, working_dir).await?;
     run_command(
         state,
         "gdal_translate",
@@ -810,9 +914,9 @@ async fn project_and_create_mbtiles(
             "-colorinterp".into(),
             "red,green,blue,alpha".into(),
             "-co".into(),
-            "NAME=Natural Earth Globe".into(),
+            format!("NAME={}", conversion.name).into(),
             "-co".into(),
-            "DESCRIPTION=Natural Earth Physical 10m".into(),
+            format!("DESCRIPTION={}", conversion.description).into(),
             "-co".into(),
             "TYPE=baselayer".into(),
             "-co".into(),
@@ -1324,7 +1428,7 @@ mod tests {
     #[test]
     fn command_probes_use_unzip_version_flag() {
         assert_eq!(
-            REQUIRED_MAP_IMPORT_COMMANDS
+            REQUIRED_PHYSICAL_IMPORT_COMMANDS
                 .iter()
                 .find(|(command, _)| *command == "unzip"),
             Some(&("unzip", "-v"))
@@ -1348,6 +1452,22 @@ mod tests {
                 .iter()
                 .any(|(command, argument)| *command == "ogr2ogr" && *argument == "--version")
         );
+    }
+
+    #[test]
+    fn cross_blended_hypso_profile_uses_the_official_raster_source_without_vector_tools() {
+        assert_eq!(
+            natural_earth_source_url(NaturalEarthImportProfile::CrossBlendedHypso),
+            NATURAL_EARTH_CROSS_BLENDED_HYPSO_10M_URL
+        );
+        let commands = required_import_commands(NaturalEarthImportProfile::CrossBlendedHypso);
+        assert!(commands.iter().any(|(command, _)| *command == "gdalwarp"));
+        assert!(
+            !commands
+                .iter()
+                .any(|(command, _)| *command == "gdal_rasterize")
+        );
+        assert!(!commands.iter().any(|(command, _)| *command == "ogr2ogr"));
     }
 
     #[test]

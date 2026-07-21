@@ -112,6 +112,7 @@ pub(crate) fn default_configuration() -> ClusterMapConfiguration {
                 raster_manifest_key: Some("sys/maps/natural-earth-globe.mbtiles.manifest.json".to_string()),
                 vector_manifest_key: Some("sys/maps/natural-earth-labels.mbtiles.manifest.json".to_string()),
             },
+            natural_earth_hypso_variant(),
             ClusterMapVariant {
                 id: "openmaptiles-street".to_string(),
                 label: "OpenMapTiles Street".to_string(),
@@ -128,6 +129,21 @@ pub(crate) fn default_configuration() -> ClusterMapConfiguration {
         .into_iter()
         .chain(legacy_maptiler_variants())
         .collect(),
+    }
+}
+
+fn natural_earth_hypso_variant() -> ClusterMapVariant {
+    ClusterMapVariant {
+        id: "natural-earth-hypso".to_string(),
+        label: "Natural Earth Hypsometric Relief".to_string(),
+        mode_label: "Relief".to_string(),
+        description: "Cross-blended hypsometric tints with shaded relief and water. Enable after its relief raster is imported.".to_string(),
+        attribution: "Made with Natural Earth. Free vector and raster map data in the public domain.".to_string(),
+        kind: MapVariantKind::Raster,
+        style: MapVariantStyle::Raster,
+        enabled: false,
+        raster_manifest_key: Some("sys/maps/natural-earth-hypso.mbtiles.manifest.json".to_string()),
+        vector_manifest_key: None,
     }
 }
 
@@ -191,10 +207,10 @@ fn legacy_maptiler_variants() -> [ClusterMapVariant; 3] {
 }
 
 /// Configurations materialized by the initial profile release contain the
-/// three Natural Earth/OpenMapTiles entries but not the earlier MapTiler
-/// profiles. Add the compatibility entries on read, while leaving a wholly
+/// three Natural Earth/OpenMapTiles entries but not the later optional
+/// profiles. Add those compatibility entries on read, while leaving a wholly
 /// custom configuration untouched.
-fn add_legacy_maptiler_variants(
+fn add_default_map_variants(
     mut configuration: ClusterMapConfiguration,
 ) -> (ClusterMapConfiguration, bool) {
     let preceding_default_ids = [
@@ -212,7 +228,8 @@ fn add_legacy_maptiler_variants(
     }
 
     let mut changed = false;
-    for variant in legacy_maptiler_variants() {
+    for variant in std::iter::once(natural_earth_hypso_variant()).chain(legacy_maptiler_variants())
+    {
         if configuration
             .variants
             .iter()
@@ -394,7 +411,7 @@ pub(crate) async fn load_current_configuration(
     let stored_configuration = serde_json::from_slice::<ClusterMapConfiguration>(&payload)
         .context("failed parsing gallery map configuration")?;
     validate_configuration(&stored_configuration)?;
-    let (configuration, needs_persistence) = add_legacy_maptiler_variants(stored_configuration);
+    let (configuration, needs_persistence) = add_default_map_variants(stored_configuration);
     validate_configuration(&configuration)?;
     Ok(LoadedMapConfiguration {
         configuration,
@@ -670,6 +687,23 @@ mod tests {
     }
 
     #[test]
+    fn hypsometric_relief_variant_exposes_its_automatic_import_target() {
+        let configuration = default_configuration();
+        let target = resolve_import_target(
+            &configuration,
+            "natural-earth-hypso",
+            MapVariantAssetKind::Raster,
+        )
+        .expect("default Natural Earth relief target");
+
+        assert_eq!(target.logical_key, "sys/maps/natural-earth-hypso.mbtiles");
+        assert_eq!(
+            target.manifest_key,
+            "sys/maps/natural-earth-hypso.mbtiles.manifest.json"
+        );
+    }
+
+    #[test]
     fn configuration_rejects_a_disabled_active_variant() {
         let mut configuration = default_configuration();
         configuration.variants[0].enabled = false;
@@ -677,13 +711,13 @@ mod tests {
     }
 
     #[test]
-    fn previous_default_configuration_is_enriched_with_legacy_maptiler_profiles() {
+    fn previous_default_configuration_is_enriched_with_later_optional_profiles() {
         let mut previous_configuration = default_configuration();
-        previous_configuration
-            .variants
-            .retain(|variant| !variant.id.starts_with("maptiler-"));
+        previous_configuration.variants.retain(|variant| {
+            !variant.id.starts_with("maptiler-") && variant.id != "natural-earth-hypso"
+        });
 
-        let (configuration, changed) = add_legacy_maptiler_variants(previous_configuration);
+        let (configuration, changed) = add_default_map_variants(previous_configuration);
 
         assert!(changed);
         assert!(
@@ -704,11 +738,17 @@ mod tests {
                 .iter()
                 .any(|variant| variant.id == "maptiler-street")
         );
+        assert!(
+            configuration
+                .variants
+                .iter()
+                .any(|variant| variant.id == "natural-earth-hypso")
+        );
         assert!(validate_configuration(&configuration).is_ok());
     }
 
     #[test]
-    fn custom_configuration_is_not_changed_by_legacy_profile_migration() {
+    fn custom_configuration_is_not_changed_by_default_profile_migration() {
         let configuration = ClusterMapConfiguration {
             version: MAP_CONFIGURATION_VERSION,
             active_variant_id: "custom-globe".to_string(),
@@ -728,7 +768,7 @@ mod tests {
             }],
         };
 
-        let (migrated, changed) = add_legacy_maptiler_variants(configuration.clone());
+        let (migrated, changed) = add_default_map_variants(configuration.clone());
 
         assert!(!changed);
         assert_eq!(migrated, configuration);

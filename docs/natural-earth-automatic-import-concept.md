@@ -5,8 +5,9 @@
 The Gallery's normal map-dataset importer accepts an already prepared MBTiles
 file. Natural Earth publishes source Shapefiles, so its physical world map and
 labels overlay need controlled server-side conversion. This feature produces the
-existing `natural-earth-globe` raster variant and the `natural-earth-labels`
-hybrid variant from fixed official sources.
+existing `natural-earth-globe` raster variant, the `natural-earth-labels`
+hybrid variant, and the `natural-earth-hypso` relief raster variant from fixed
+official sources.
 
 ## Wizard workflow
 
@@ -16,14 +17,17 @@ wizard**. The first step chooses a map profile, not a low-level input format:
 - **Natural Earth physical world map** — a controlled raster conversion;
 - **Natural Earth physical world map + labels** — the physical conversion plus
   a controlled vector label overlay;
+- **Natural Earth hypsometric relief map** — a controlled conversion of
+  Natural Earth's Cross Blended Hypso raster with shaded relief and water;
 - **An existing MBTiles package** — the resumable HTTP MBTiles importer.
 
-The two Natural Earth profiles have fixed official sources and fixed configured
+The three Natural Earth profiles have fixed official sources and fixed configured
 destinations, so they only ask for confirmation. The labels profile publishes a
 raster and a vector artifact for `natural-earth-labels`; the raster-only profile
-publishes the `natural-earth-globe` artifact. The MBTiles profile asks for an
-HTTP source, a configured variant artifact, and its part size. Every final
-button starts a background job and returns immediately to its progress panel.
+publishes the `natural-earth-globe` artifact; the relief profile publishes the
+`natural-earth-hypso` artifact. The MBTiles profile asks for an HTTP source, a
+configured variant artifact, and its part size. Every final button starts a
+background job and returns immediately to its progress panel.
 
 New input adapters, such as PMTiles or controlled GeoPackage/Shapefile
 conversion, should be added as profiles with their own validation and review
@@ -71,6 +75,23 @@ the required `ne_places` and `ne_boundaries` metadata, before publishing either
 configured artifact. The active Gallery variant is not changed; an
 administrator can enable the Labels variant after the job succeeds.
 
+### Cross Blended Hypso relief raster
+
+The relief profile downloads the official large 10m archive from the Natural
+Earth CDN:
+
+```text
+https://naciscdn.org/naturalearth/10m/raster/HYP_HR_SR_W.zip
+```
+
+The archive contains the georeferenced `HYP_HR_SR_W.tif` raster. The importer
+does not restyle it or reconstruct its colors from vectors. It reprojects that
+raster to Web Mercator with bilinear resampling, adds an alpha channel for the
+PNG tile output, creates MBTiles overviews, validates the result, and only then
+publishes the configured `natural-earth-hypso` manifest. The source archive is
+about 379 MB, so the controlled source-download limit is 512 MiB; generated
+artifacts remain limited to 512 MiB.
+
 ## Operational behavior
 
 Only one map import runs at a time: the automatic job and the existing
@@ -83,7 +104,9 @@ command, exit status, and captured standard/error output.
 A failed conversion before publication never replaces a manifest, leaving the
 previously usable map in place. Each generated MBTiles artifact is limited to
 512 MiB and is split into at most 256 MiB parts. Every source archive is
-limited to 128 MiB. Staging data is removed when the job finishes, whether it
+limited to 512 MiB so the official Cross Blended Hypso archive is accepted.
+Downloads are streamed to the staging directory within that limit rather than
+held in memory. Staging data is removed when the job finishes, whether it
 succeeds or fails.
 
 ## Security and dependencies

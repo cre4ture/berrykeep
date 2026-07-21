@@ -93,7 +93,10 @@ export type StartAdminMapDatasetImportResponse = {
 
 export type NaturalEarthImportState = "running" | "ready" | "failed";
 
-export type NaturalEarthImportProfile = "physical" | "physical_with_labels";
+export type NaturalEarthImportProfile =
+  | "physical"
+  | "physical_with_labels"
+  | "cross_blended_hypso";
 
 export type NaturalEarthImportLogEntry = {
   timestamp_unix: number;
