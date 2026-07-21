@@ -135,8 +135,12 @@ class MainActivity : ComponentActivity() {
                 }
                 val onOpenWebConsole: () -> Unit = {
                     if (!state.loading) {
-                        openWebUiWhenReady = true
-                        vm.startWebUi()
+                        state.webUiSession?.let { session ->
+                            openWebUi(session, vm::setStatus)
+                        } ?: run {
+                            openWebUiWhenReady = true
+                            vm.startWebUi()
+                        }
                     }
                 }
                 val hasPhotoAccess = missingOriginalPhotoAccessPermissions(context).isEmpty()

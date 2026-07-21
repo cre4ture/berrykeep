@@ -16,6 +16,7 @@ import io.ironmesh.android.api.StoreIndexSortOrder
 import io.ironmesh.android.data.ConnectionRouteSnapshot
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.EmbeddedWebUiSession
+import io.ironmesh.android.data.EmbeddedWebUiSessionRegistry
 import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.AppConnectionStatus
@@ -170,24 +171,40 @@ data class MainUiState(
 class MainViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
+    private companion object {
+        const val WEB_UI_BACKGROUND_GRACE_PERIOD_MILLIS = 10_000L
+    }
 
     private val repository = IronmeshRepository()
     private var galleryRequestVersion = 0
     private var pinnedGalleryItemIndex: Int? = null
     private var connectionRoutesMonitorJob: Job? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
+        private set
+
+    private val webUiSessionBackgroundGrace = WebUiSessionBackgroundGrace(
+        scheduler = HandlerWebUiSessionStopScheduler(mainHandler),
+        gracePeriodMillis = WEB_UI_BACKGROUND_GRACE_PERIOD_MILLIS,
+        onGraceExpired = ::stopWebUiAfterBackgroundGrace,
+    )
+
     @Volatile
     private var processLifecycleObserverActive = true
     private var processLifecycleObserverRegistered = false
     private val processLifecycleObserver = LifecycleEventObserver { _, event ->
-        if (event == Lifecycle.Event.ON_STOP) {
-            repository.stopWebUi()
-            uiState.value = uiState.value.copy(webUiSession = null)
+        when (event) {
+            Lifecycle.Event.ON_START -> webUiSessionBackgroundGrace.cancelScheduledStop()
+            Lifecycle.Event.ON_STOP -> {
+                if (uiState.value.webUiSession != null) {
+                    webUiSessionBackgroundGrace.scheduleStop()
+                }
+            }
+
+            else -> Unit
         }
     }
-
-    var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
-        private set
 
     init {
         val persistedProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication())
@@ -217,6 +234,8 @@ class MainViewModel(
     override fun onCleared() {
         processLifecycleObserverActive = false
         unregisterProcessLifecycleObserver()
+        webUiSessionBackgroundGrace.cancelScheduledStop()
+        EmbeddedWebUiSessionRegistry.clear()
         repository.stopWebUi()
         super.onCleared()
     }
@@ -345,11 +364,6 @@ class MainViewModel(
     }
 
     fun selectSection(section: MainSection) {
-        val wasShowingGalleryMap = uiState.value.selectedSection == MainSection.GALLERY_MAP
-        if (wasShowingGalleryMap && section != MainSection.GALLERY_MAP) {
-            repository.stopWebUi()
-            uiState.value = uiState.value.copy(webUiSession = null)
-        }
         uiState.value = uiState.value.copy(selectedSection = section)
         if (section == MainSection.CONNECTIVITY) {
             startConnectionRoutesMonitor()
@@ -871,6 +885,12 @@ class MainViewModel(
     }
 
     fun startWebUi() {
+        webUiSessionBackgroundGrace.cancelScheduledStop()
+        uiState.value.webUiSession?.let { session ->
+            EmbeddedWebUiSessionRegistry.activate(session)
+            uiState.value = uiState.value.copy(status = "Web UI ready.")
+            return
+        }
         val deviceAuth = try {
             currentDeviceAuthState()
         } catch (error: DeviceIdentityStorageException) {
@@ -914,6 +934,7 @@ class MainViewModel(
                 }
             result
                 .onSuccess { session ->
+                    EmbeddedWebUiSessionRegistry.activate(session)
                     uiState.value = uiState.value.copy(
                         loading = false,
                         webUiSession = session,
@@ -927,6 +948,15 @@ class MainViewModel(
                     )
                 }
         }
+    }
+
+    private fun stopWebUiAfterBackgroundGrace() {
+        if (uiState.value.webUiSession == null) {
+            return
+        }
+        EmbeddedWebUiSessionRegistry.clear()
+        repository.stopWebUi()
+        uiState.value = uiState.value.copy(webUiSession = null)
     }
 
     fun enrollDevice() {
@@ -1003,6 +1033,7 @@ class MainViewModel(
             )
             try {
                 withContext(Dispatchers.IO) {
+                    EmbeddedWebUiSessionRegistry.clear()
                     repository.stopWebUi()
                     IronmeshPreferences.setDeviceAuthState(getApplication(), authState)
                 }
