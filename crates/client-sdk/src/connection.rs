@@ -593,16 +593,25 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
         bail!(diagnostic);
     }
 
-    let result = tokio::time::timeout(
-        STARTUP_PROBE_TIMEOUT,
-        client.run_latency_probe(LatencyProbeConfig {
-            sample_count: 1,
-            warmup_count: 0,
-            response_bytes: STARTUP_PROBE_RESPONSE_BYTES,
-            server_delay_ms: 0,
-            pause_between_samples_ms: 0,
-        }),
-    )
+    let probe_config = LatencyProbeConfig {
+        sample_count: 1,
+        warmup_count: 0,
+        response_bytes: STARTUP_PROBE_RESPONSE_BYTES,
+        server_delay_ms: 0,
+        pause_between_samples_ms: 0,
+    };
+    let result = tokio::time::timeout(STARTUP_PROBE_TIMEOUT, async {
+        let mut latest_result = None;
+        for _ in 0..2 {
+            let result = client.run_latency_probe(probe_config.clone()).await?;
+            let reached_target = result.summary.success_count > 0;
+            latest_result = Some(result);
+            if reached_target {
+                break;
+            }
+        }
+        latest_result.ok_or_else(|| anyhow!("startup signed latency probe did not run"))
+    })
     .await
     .with_context(|| {
         format!(

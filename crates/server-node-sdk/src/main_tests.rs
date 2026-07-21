@@ -7090,7 +7090,11 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
     )
     .await;
 
-    let client = bootstrap.build_client_with_identity(&identity).unwrap();
+    let client =
+        tokio::task::spawn_blocking(move || bootstrap.build_client_with_identity(&identity))
+            .await
+            .expect("client construction task should complete")
+            .expect("bootstrap should build an authenticated client");
     let response = client.get_json_path("/cluster/status").await.unwrap();
     assert_eq!(
         response
