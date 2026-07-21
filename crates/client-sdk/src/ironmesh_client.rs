@@ -33,9 +33,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
-    ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity, PeerIdentity,
-    RelayHttpHeader, RelayTunnelSourceSecurityConfig, RendezvousControlClient, TransportHeader,
-    TransportPathKind, TransportRequestHead, TransportStreamKind, build_signed_request_headers,
+    ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity,
+    HEADER_SERVER_PROCESSING_DURATION_US, HEADER_SERVER_RECEIVED_UNIX_MS,
+    HEADER_SERVER_RESPONDED_UNIX_MS, PeerIdentity, RelayHttpHeader,
+    RelayTunnelSourceSecurityConfig, RendezvousControlClient, TransportHeader, TransportPathKind,
+    TransportRequestHead, TransportStreamKind, build_signed_request_headers,
     read_buffered_transport_response, read_transport_response_head,
     write_buffered_transport_request, write_transport_request_head,
 };
@@ -57,7 +59,7 @@ const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
 const CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const CLIENT_ROUTE_RECENT_ATTEMPT_LIMIT: usize = 8;
+const CLIENT_ROUTE_RECENT_ATTEMPT_LIMIT: usize = 64;
 const CLIENT_DIRECT_MULTIPLEX_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
 
@@ -91,6 +93,36 @@ pub struct ClientConnectionAttempt {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     pub outcome: String,
+    #[serde(default)]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub total_duration_us: Option<u64>,
+    #[serde(default)]
+    pub server_processing_duration_us: Option<u64>,
+    #[serde(default)]
+    pub transport_overhead_us: Option<u64>,
+    #[serde(default)]
+    pub session_setup_duration_us: u64,
+    #[serde(default)]
+    pub relay_pairing_duration_us: u64,
+    #[serde(default)]
+    pub network_transfer_duration_us: Option<u64>,
+    #[serde(default)]
+    pub session_reused: bool,
+    #[serde(default)]
+    pub request_bytes: u64,
+    #[serde(default)]
+    pub response_bytes: u64,
+    #[serde(default)]
+    pub response_body_complete: bool,
+    #[serde(default)]
+    pub server_received_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub server_responded_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub clock_offset_us: Option<i64>,
+    #[serde(default)]
+    pub clock_uncertainty_us: Option<u64>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -182,6 +214,16 @@ struct ClientRequestAttemptContext<'a> {
     url: &'a Url,
     timeout: Option<Duration>,
     started_unix_ms: u64,
+    session_pool_before: TransportSessionPoolSnapshot,
+}
+
+struct ClientRequestSuccessMeasurement<'a> {
+    total_duration_ms: f64,
+    request_bytes: usize,
+    response_bytes: usize,
+    status: StatusCode,
+    response_headers: &'a HeaderMap,
+    response_body_complete: bool,
 }
 
 #[derive(Clone)]
@@ -277,6 +319,8 @@ pub struct ClientConnectionRouteEndpointSnapshot {
     pub last_error: Option<String>,
     #[serde(default)]
     pub recent_attempts: Vec<ClientConnectionAttempt>,
+    #[serde(default)]
+    pub transport_session_pool: TransportSessionPoolSnapshot,
 }
 
 #[derive(Debug)]
@@ -626,6 +670,7 @@ impl ClientEndpointRouter {
                     last_background_probe_unix_ms: state.last_background_probe_unix_ms,
                     last_error: state.last_error.clone(),
                     recent_attempts: state.recent_attempts.clone(),
+                    transport_session_pool: endpoint.transport.session_pool_snapshot(),
                 }
             })
             .collect();
@@ -642,23 +687,74 @@ impl ClientEndpointRouter {
         &self,
         index: usize,
         attempt: ClientRequestAttemptContext<'_>,
-        latency_ms: f64,
-        bytes_transferred: usize,
+        measurement: ClientRequestSuccessMeasurement<'_>,
     ) {
         let Some(endpoint) = self.endpoints.get(index) else {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
-        record_endpoint_success_sample(&mut state, latency_ms, bytes_transferred, false);
+        record_endpoint_success_sample(
+            &mut state,
+            measurement.total_duration_ms,
+            measurement.response_bytes,
+            false,
+        );
+        let finished_unix_ms = unix_ts_ms();
+        let total_duration_us = duration_ms_as_u64_micros(measurement.total_duration_ms);
+        let server_processing_duration_us = parse_header_u64(
+            measurement.response_headers,
+            HEADER_SERVER_PROCESSING_DURATION_US,
+        );
+        let transport_overhead_us = server_processing_duration_us
+            .map(|server_duration| total_duration_us.saturating_sub(server_duration));
+        let session_pool_after = endpoint.transport.session_pool_snapshot();
+        let session_setup_duration_us = session_pool_after
+            .connect_duration_us
+            .saturating_sub(attempt.session_pool_before.connect_duration_us);
+        let relay_pairing_duration_us = session_pool_after
+            .relay_pairing_duration_us
+            .saturating_sub(attempt.session_pool_before.relay_pairing_duration_us);
+        let network_transfer_duration_us = transport_overhead_us
+            .map(|overhead| overhead.saturating_sub(session_setup_duration_us));
+        let session_reused =
+            session_pool_after.reuse_count > attempt.session_pool_before.reuse_count;
+        let server_received_unix_ms =
+            parse_header_u64(measurement.response_headers, HEADER_SERVER_RECEIVED_UNIX_MS);
+        let server_responded_unix_ms = parse_header_u64(
+            measurement.response_headers,
+            HEADER_SERVER_RESPONDED_UNIX_MS,
+        );
+        let (clock_offset_us, clock_uncertainty_us) = estimate_clock_offset(
+            attempt.started_unix_ms,
+            finished_unix_ms,
+            server_received_unix_ms,
+            server_responded_unix_ms,
+            transport_overhead_us,
+        );
         record_endpoint_attempt(
             &mut state,
             ClientConnectionAttempt {
                 started_unix_ms: attempt.started_unix_ms,
-                finished_unix_ms: Some(unix_ts_ms()),
+                finished_unix_ms: Some(finished_unix_ms),
                 method: attempt.method.to_string(),
                 url: attempt_display_url(endpoint, attempt.url),
                 timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
                 outcome: "success".to_string(),
+                status_code: Some(measurement.status.as_u16()),
+                total_duration_us: Some(total_duration_us),
+                server_processing_duration_us,
+                transport_overhead_us,
+                session_setup_duration_us,
+                relay_pairing_duration_us,
+                network_transfer_duration_us,
+                session_reused,
+                request_bytes: usize_as_u64(measurement.request_bytes),
+                response_bytes: usize_as_u64(measurement.response_bytes),
+                response_body_complete: measurement.response_body_complete,
+                server_received_unix_ms,
+                server_responded_unix_ms,
+                clock_offset_us,
+                clock_uncertainty_us,
                 error: None,
             },
         );
@@ -676,6 +772,13 @@ impl ClientEndpointRouter {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
+        let session_pool_after = endpoint.transport.session_pool_snapshot();
+        let session_setup_duration_us = session_pool_after
+            .connect_duration_us
+            .saturating_sub(attempt.session_pool_before.connect_duration_us);
+        let relay_pairing_duration_us = session_pool_after
+            .relay_pairing_duration_us
+            .saturating_sub(attempt.session_pool_before.relay_pairing_duration_us);
         record_endpoint_failure_sample(&mut state, error, false);
         record_endpoint_attempt(
             &mut state,
@@ -686,7 +789,17 @@ impl ClientEndpointRouter {
                 url: attempt_display_url(endpoint, attempt.url),
                 timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
                 outcome: "failure".to_string(),
+                total_duration_us: Some(
+                    unix_ts_ms()
+                        .saturating_sub(attempt.started_unix_ms)
+                        .saturating_mul(1_000),
+                ),
+                session_setup_duration_us,
+                relay_pairing_duration_us,
+                session_reused: session_pool_after.reuse_count
+                    > attempt.session_pool_before.reuse_count,
                 error: Some(error.to_string()),
+                ..ClientConnectionAttempt::default()
             },
         );
     }
@@ -862,6 +975,55 @@ fn attempt_display_url(endpoint: &ClientEndpoint, url: &Url) -> String {
 
 fn duration_to_u64_ms(duration: Duration) -> Option<u64> {
     duration.as_millis().try_into().ok()
+}
+
+fn duration_ms_as_u64_micros(duration_ms: f64) -> u64 {
+    if !duration_ms.is_finite() || duration_ms <= 0.0 {
+        return 0;
+    }
+    (duration_ms * 1_000.0).round().min(u64::MAX as f64) as u64
+}
+
+fn usize_as_u64(value: usize) -> u64 {
+    value.try_into().unwrap_or(u64::MAX)
+}
+
+fn parse_header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn estimate_clock_offset(
+    client_started_unix_ms: u64,
+    client_finished_unix_ms: u64,
+    server_received_unix_ms: Option<u64>,
+    server_responded_unix_ms: Option<u64>,
+    transport_overhead_us: Option<u64>,
+) -> (Option<i64>, Option<u64>) {
+    let (Some(server_received_unix_ms), Some(server_responded_unix_ms)) =
+        (server_received_unix_ms, server_responded_unix_ms)
+    else {
+        return (None, None);
+    };
+    if server_responded_unix_ms < server_received_unix_ms {
+        return (None, None);
+    }
+
+    let t0 = i128::from(client_started_unix_ms) * 1_000;
+    let t1 = i128::from(server_received_unix_ms) * 1_000;
+    let t2 = i128::from(server_responded_unix_ms) * 1_000;
+    let t3 = i128::from(client_finished_unix_ms) * 1_000;
+    let offset = ((t1 - t0) + (t2 - t3)) / 2;
+    let offset = i64::try_from(offset).ok();
+    let uncertainty = transport_overhead_us.map(|duration| {
+        duration
+            .saturating_add(1)
+            .saturating_div(2)
+            .saturating_add(1_000)
+    });
+    (offset, uncertainty)
 }
 
 fn background_probe_due(state: &ClientEndpointState, now_unix_ms: u64) -> bool {
@@ -2378,6 +2540,7 @@ impl IronMeshClient {
                     continue;
                 }
             };
+            let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
             match execute_buffered_request_for_transport(
@@ -2402,6 +2565,7 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: direct_failover_timeout,
                             started_unix_ms,
+                            session_pool_before,
                         },
                         &format!("retryable HTTP {} ({endpoint_context})", response.status,),
                     );
@@ -2419,9 +2583,16 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: direct_failover_timeout,
                             started_unix_ms,
+                            session_pool_before,
                         },
-                        started_at.elapsed().as_secs_f64() * 1000.0,
-                        response.body.len(),
+                        ClientRequestSuccessMeasurement {
+                            total_duration_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+                            request_bytes: body.as_deref().unwrap_or_default().len(),
+                            response_bytes: response.body.len(),
+                            status: response.status,
+                            response_headers: &response.headers,
+                            response_body_complete: true,
+                        },
                     );
                     self.publish_connection_diagnostics();
                     return Ok(RoutedBufferedTransportResponse {
@@ -2438,6 +2609,7 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: direct_failover_timeout,
                             started_unix_ms,
+                            session_pool_before,
                         },
                         &format!("{error:#}"),
                     );
@@ -2501,6 +2673,7 @@ impl IronMeshClient {
                     continue;
                 }
             };
+            let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
             match execute_streaming_object_write_request_for_transport(
@@ -2527,6 +2700,7 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: direct_failover_timeout,
                             started_unix_ms,
+                            session_pool_before,
                         },
                         &format!(
                             "retryable HTTP {} from {}",
@@ -2548,9 +2722,16 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: direct_failover_timeout,
                             started_unix_ms,
+                            session_pool_before,
                         },
-                        started_at.elapsed().as_secs_f64() * 1000.0,
-                        candidate_response.body.len(),
+                        ClientRequestSuccessMeasurement {
+                            total_duration_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+                            request_bytes: payload.len(),
+                            response_bytes: candidate_response.body.len(),
+                            status: candidate_response.status,
+                            response_headers: &candidate_response.headers,
+                            response_body_complete: true,
+                        },
                     );
                     self.publish_connection_diagnostics();
                     return Ok(RoutedBufferedTransportResponse {
@@ -2566,6 +2747,7 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: direct_failover_timeout,
                             started_unix_ms,
+                            session_pool_before,
                         },
                         &error.to_string(),
                     );
@@ -3181,6 +3363,7 @@ impl IronMeshClient {
                     continue;
                 }
             };
+            let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
             match execute_streaming_read_request_for_transport(
@@ -3207,9 +3390,16 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: None,
                             started_unix_ms,
+                            session_pool_before,
                         },
-                        started_at.elapsed().as_secs_f64() * 1000.0,
-                        bytes_hint,
+                        ClientRequestSuccessMeasurement {
+                            total_duration_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+                            request_bytes: 0,
+                            response_bytes: bytes_hint,
+                            status: response.status,
+                            response_headers: &response.headers,
+                            response_body_complete: false,
+                        },
                     );
                     self.publish_connection_diagnostics();
                     return Ok(response);
@@ -3222,6 +3412,7 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: None,
                             started_unix_ms,
+                            session_pool_before,
                         },
                         &error.to_string(),
                     );
@@ -3278,6 +3469,7 @@ impl IronMeshClient {
                     continue;
                 }
             };
+            let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
             let Some(request_body_stream) = body_stream.take() else {
@@ -3302,9 +3494,16 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: None,
                             started_unix_ms,
+                            session_pool_before,
                         },
-                        started_at.elapsed().as_secs_f64() * 1000.0,
-                        response.body.len(),
+                        ClientRequestSuccessMeasurement {
+                            total_duration_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+                            request_bytes: 0,
+                            response_bytes: response.body.len(),
+                            status: response.status,
+                            response_headers: &response.headers,
+                            response_body_complete: true,
+                        },
                     );
                     self.publish_connection_diagnostics();
                     return Ok(RelativePathResponse {
@@ -3321,6 +3520,7 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: None,
                             started_unix_ms,
+                            session_pool_before,
                         },
                         &error.to_string(),
                     );
@@ -3701,6 +3901,7 @@ impl IronMeshClient {
                     continue;
                 }
             };
+            let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
             match execute_streaming_object_read_request_for_transport(
@@ -3721,9 +3922,16 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: None,
                             started_unix_ms,
+                            session_pool_before,
                         },
-                        started_at.elapsed().as_secs_f64() * 1000.0,
-                        candidate_response.bytes_written as usize,
+                        ClientRequestSuccessMeasurement {
+                            total_duration_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+                            request_bytes: 0,
+                            response_bytes: candidate_response.bytes_written as usize,
+                            status: candidate_response.status,
+                            response_headers: &candidate_response.headers,
+                            response_body_complete: true,
+                        },
                     );
                     self.publish_connection_diagnostics();
                     response = Some(candidate_response);
@@ -3737,6 +3945,7 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: None,
                             started_unix_ms,
+                            session_pool_before,
                         },
                         &error.to_string(),
                     );

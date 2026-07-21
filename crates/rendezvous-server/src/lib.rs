@@ -5,7 +5,7 @@ mod global_registration;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
@@ -27,8 +27,8 @@ use transport_sdk::{
     BufferedTransportRequest, CandidateKind, ClientBootstrapClaimRedeemRequest,
     ClientBootstrapClaimRedeemResponse, ConnectionCandidate, MultiplexConfig, MultiplexMode,
     PresenceRegistry, RelayTicket, RelayTicketRequest, RelayTunnelBroker,
-    RelayTunnelControlMessage, RelayTunnelFrame, RelayTunnelSessionKind, RelayWakeControlMessage,
-    RelayWakeRegistration, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
+    RelayTunnelControlMessage, RelayTunnelFrame, RelayTunnelPairingTiming, RelayTunnelSessionKind,
+    RelayWakeControlMessage, RelayWakeRegistration, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
     TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
     WakeRegistrationHandle, issue_relay_ticket as issue_runtime_relay_ticket,
     perform_transport_client_handshake, rank_candidates, read_buffered_transport_response,
@@ -862,6 +862,8 @@ async fn run_relay_tunnel_websocket(
     socket: &mut WebSocket,
     initial: RelayTunnelControlMessage,
 ) -> anyhow::Result<()> {
+    let relay_received_unix_ms = unix_ts_ms();
+    let relay_pairing_started = Instant::now();
     // Race the (potentially long-running, up to tens of seconds) broker wait against the
     // socket so that a peer that abandons this connection before pairing completes is
     // noticed immediately. Without this, `establish_relay_tunnel_endpoint` is a plain
@@ -903,6 +905,11 @@ async fn run_relay_tunnel_websocket(
         socket,
         &RelayTunnelControlMessage::Paired {
             session: endpoint.session().clone(),
+            timing: Some(RelayTunnelPairingTiming {
+                relay_received_unix_ms,
+                relay_paired_unix_ms: unix_ts_ms(),
+                relay_pairing_duration_us: duration_as_u64_micros(relay_pairing_started.elapsed()),
+            }),
         },
     )
     .await?;
@@ -996,6 +1003,19 @@ async fn run_relay_tunnel_websocket(
     }
 
     Ok(())
+}
+
+fn unix_ts_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn duration_as_u64_micros(duration: Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

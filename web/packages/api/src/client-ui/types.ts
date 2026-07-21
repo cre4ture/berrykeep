@@ -45,6 +45,33 @@ export type ClientConnectionRouteEndpointSnapshot = {
   background_probe_in_flight: boolean;
   last_background_probe_unix_ms?: number | null;
   last_error?: string | null;
+  recent_attempts?: ClientConnectionAttempt[];
+  transport_session_pool?: TransportSessionPoolSnapshot;
+};
+
+export type ClientConnectionAttempt = {
+  startedUnixMs: number;
+  finishedUnixMs?: number | null;
+  method: string;
+  url: string;
+  timeoutMs?: number | null;
+  outcome: string;
+  statusCode?: number | null;
+  totalDurationUs?: number | null;
+  serverProcessingDurationUs?: number | null;
+  transportOverheadUs?: number | null;
+  sessionSetupDurationUs: number;
+  relayPairingDurationUs: number;
+  networkTransferDurationUs?: number | null;
+  sessionReused: boolean;
+  requestBytes: number;
+  responseBytes: number;
+  responseBodyComplete: boolean;
+  serverReceivedUnixMs?: number | null;
+  serverRespondedUnixMs?: number | null;
+  clockOffsetUs?: number | null;
+  clockUncertaintyUs?: number | null;
+  error?: string | null;
 };
 
 export type ClientConnectionRouteSnapshot = {
@@ -91,6 +118,8 @@ export type TransportSessionPoolSnapshot = {
   connect_count: number;
   reuse_count: number;
   reset_count: number;
+  connect_duration_us?: number;
+  relay_pairing_duration_us?: number;
 };
 
 export type LatencyProbeResult = {

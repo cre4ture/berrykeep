@@ -1,6 +1,7 @@
 use super::{
     AdminControl, MetadataCommitMode, PeerHeartbeatConfig, RepairConfig, RepairExecutorState,
-    ServerNodeConfig, ServerState, StartupRepairStatus, await_repair_busy_threshold,
+    ServerNodeConfig, ServerRequestTiming, ServerState, StartupRepairStatus,
+    apply_server_timing_to_buffered_response, await_repair_busy_threshold,
     build_rendezvous_presence_registration, build_store_index_entries, cluster, constant_time_eq,
     jittered_backoff_secs, lock_store, new_store_rwlock, node_descriptor_from_presence_entry,
     plan_peer_transport, read_store,
@@ -57,6 +58,32 @@ use x509_parser::prelude::FromDer;
 
 const TEST_ADMIN_TOKEN: &str = "system-test-admin";
 type TestHmacSha256 = Hmac<Sha256>;
+
+#[test]
+fn multiplexed_response_includes_generic_server_timing_headers() {
+    let timing = ServerRequestTiming::start();
+    let mut response = transport_sdk::BufferedTransportResponse {
+        request_id: "timing-test".to_string(),
+        status: 200,
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+
+    apply_server_timing_to_buffered_response(&mut response, timing);
+
+    for name in [
+        transport_sdk::HEADER_SERVER_PROCESSING_DURATION_US,
+        transport_sdk::HEADER_SERVER_RECEIVED_UNIX_MS,
+        transport_sdk::HEADER_SERVER_RESPONDED_UNIX_MS,
+    ] {
+        let value = response
+            .headers
+            .iter()
+            .find(|header| header.name == name)
+            .unwrap_or_else(|| panic!("missing server timing header {name}"));
+        assert!(value.value.parse::<u64>().is_ok());
+    }
+}
 
 fn fresh_test_secret(label: &str) -> String {
     format!("{label}-{}", Uuid::now_v7())
@@ -18328,9 +18355,12 @@ async fn serve_cleanup_relay_tunnel_socket(
     };
     socket
         .send(axum::extract::ws::Message::Text(
-            serde_json::to_string(&transport_sdk::RelayTunnelControlMessage::Paired { session })
-                .expect("paired relay control should serialize")
-                .into(),
+            serde_json::to_string(&transport_sdk::RelayTunnelControlMessage::Paired {
+                session,
+                timing: None,
+            })
+            .expect("paired relay control should serialize")
+            .into(),
         ))
         .await
         .expect("paired relay response should send");

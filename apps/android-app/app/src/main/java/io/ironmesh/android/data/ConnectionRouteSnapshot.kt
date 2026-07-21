@@ -49,6 +49,21 @@ data class ConnectionRouteEndpointSnapshot(
     val lastError: String? = null,
     @Json(name = "recent_attempts")
     val recentAttempts: List<ConnectionRouteAttemptSnapshot> = emptyList(),
+    @Json(name = "transport_session_pool")
+    val transportSessionPool: TransportSessionPoolSnapshot = TransportSessionPoolSnapshot(),
+)
+
+data class TransportSessionPoolSnapshot(
+    @Json(name = "connect_count")
+    val connectCount: Long = 0L,
+    @Json(name = "reuse_count")
+    val reuseCount: Long = 0L,
+    @Json(name = "reset_count")
+    val resetCount: Long = 0L,
+    @Json(name = "connect_duration_us")
+    val connectDurationUs: Long = 0L,
+    @Json(name = "relay_pairing_duration_us")
+    val relayPairingDurationUs: Long = 0L,
 )
 
 data class ConnectionRouteAttemptSnapshot(
@@ -58,5 +73,20 @@ data class ConnectionRouteAttemptSnapshot(
     val url: String,
     val timeoutMs: Long? = null,
     val outcome: String,
+    val statusCode: Int? = null,
+    val totalDurationUs: Long? = null,
+    val serverProcessingDurationUs: Long? = null,
+    val transportOverheadUs: Long? = null,
+    val sessionSetupDurationUs: Long = 0L,
+    val relayPairingDurationUs: Long = 0L,
+    val networkTransferDurationUs: Long? = null,
+    val sessionReused: Boolean = false,
+    val requestBytes: Long = 0L,
+    val responseBytes: Long = 0L,
+    val responseBodyComplete: Boolean = false,
+    val serverReceivedUnixMs: Long? = null,
+    val serverRespondedUnixMs: Long? = null,
+    val clockOffsetUs: Long? = null,
+    val clockUncertaintyUs: Long? = null,
     val error: String? = null,
 )

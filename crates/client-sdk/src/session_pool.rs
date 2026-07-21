@@ -6,6 +6,7 @@ use iroh::endpoint::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tokio::sync::Mutex;
 use transport_sdk::{
     ClientIdentityMaterial, ConnectionCandidate, DEFAULT_DIRECT_QUIC_ALPN, DirectQuicEndpoint,
@@ -54,6 +55,10 @@ pub struct TransportSessionPoolSnapshot {
     pub connect_count: u64,
     pub reuse_count: u64,
     pub reset_count: u64,
+    #[serde(default)]
+    pub connect_duration_us: u64,
+    #[serde(default)]
+    pub relay_pairing_duration_us: u64,
 }
 
 #[derive(Default)]
@@ -61,6 +66,8 @@ struct TransportSessionPoolStats {
     connect_count: AtomicU64,
     reuse_count: AtomicU64,
     reset_count: AtomicU64,
+    connect_duration_us: AtomicU64,
+    relay_pairing_duration_us: AtomicU64,
     direct_connection_mode: AtomicU64,
 }
 
@@ -121,6 +128,8 @@ impl TransportSessionPool {
             connect_count: self.stats.connect_count.load(Ordering::Relaxed),
             reuse_count: self.stats.reuse_count.load(Ordering::Relaxed),
             reset_count: self.stats.reset_count.load(Ordering::Relaxed),
+            connect_duration_us: self.stats.connect_duration_us.load(Ordering::Relaxed),
+            relay_pairing_duration_us: self.stats.relay_pairing_duration_us.load(Ordering::Relaxed),
         }
     }
 
@@ -158,6 +167,8 @@ impl TransportSessionPool {
             self.stats.reuse_count.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::clone(&existing.session));
         }
+
+        let connect_started = Instant::now();
 
         let (multiplexed, handshake_context, target) = match &self.target {
             SessionPoolTarget::DirectHttps {
@@ -239,6 +250,10 @@ impl TransportSessionPool {
             _relay_session: None,
         });
         self.stats.connect_count.fetch_add(1, Ordering::Relaxed);
+        self.stats.connect_duration_us.fetch_add(
+            duration_as_u64_micros(connect_started.elapsed()),
+            Ordering::Relaxed,
+        );
         Ok(session)
     }
 
@@ -306,6 +321,8 @@ impl TransportSessionPool {
             return Ok(Arc::clone(&existing.session));
         }
 
+        let connect_started = Instant::now();
+
         let ticket = rendezvous
             .issue_relay_ticket(&RelayTicketRequest {
                 cluster_id: rendezvous.config().cluster_id,
@@ -331,6 +348,10 @@ impl TransportSessionPool {
                     target_node_id
                 )
             })?;
+        let relay_pairing_duration_us = relay_tunnel
+            .pairing_timing()
+            .map(|timing| timing.relay_pairing_duration_us)
+            .unwrap_or_default();
         let (relay_session, multiplexed) = relay_tunnel
             .into_secure_multiplexed_source_session(
                 source_security.clone(),
@@ -369,8 +390,19 @@ impl TransportSessionPool {
             _relay_session: Some(relay_session),
         });
         self.stats.connect_count.fetch_add(1, Ordering::Relaxed);
+        self.stats.connect_duration_us.fetch_add(
+            duration_as_u64_micros(connect_started.elapsed()),
+            Ordering::Relaxed,
+        );
+        self.stats
+            .relay_pairing_duration_us
+            .fetch_add(relay_pairing_duration_us, Ordering::Relaxed);
         Ok(session)
     }
+}
+
+fn duration_as_u64_micros(duration: std::time::Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
 
 fn relay_session_role_for_source(source: &PeerIdentity) -> TransportSessionRole {

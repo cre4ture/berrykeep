@@ -75,12 +75,14 @@ import { ConnectionPathsPage } from "../pages/ConnectionPathsPage";
 import { ExplorerPage as ClientExplorerPage } from "../pages/ExplorerPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { LogsPage } from "../pages/LogsPage";
+import { RequestTimingsPage } from "../pages/RequestTimingsPage";
 
 type PageId =
   | "overview"
   | "connectionPaths"
   | "rendezvous"
   | "latency"
+  | "requestTimings"
   | "store"
   | "explorer"
   | "gallery"
@@ -175,6 +177,12 @@ const pages = [
     label: "Latency",
     icon: IconActivity,
     description: "Probe current, direct, and relay transport latency through the embedded Rust client runtime."
+  },
+  {
+    id: "requestTimings" as const,
+    label: "Request timings",
+    icon: IconActivity,
+    description: "Inspect real request time split across server processing, transport, session setup, and relay pairing."
   },
   {
     id: "store" as const,
@@ -294,6 +302,8 @@ export function ClientShell() {
 
       {activePageId === "latency" ? <LatencyPage /> : null}
 
+      {activePageId === "requestTimings" ? <RequestTimingsPage /> : null}
+
       {activePageId === "store" ? <StorePage binaryUpload={binaryUpload} /> : null}
 
       {activePageId === "explorer" ? (
@@ -347,8 +357,10 @@ function resolveShellLaunchState(): ShellLaunchState {
 function parsePageId(value: string | null): PageId | null {
   switch (value) {
     case "overview":
+    case "connectionPaths":
     case "rendezvous":
     case "latency":
+    case "requestTimings":
     case "store":
     case "explorer":
     case "gallery":

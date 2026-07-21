@@ -54,14 +54,31 @@ pub struct RelayTunnelSession {
     pub security_mode: RelayTunnelSecurityMode,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayTunnelPairingTiming {
+    pub relay_received_unix_ms: u64,
+    pub relay_paired_unix_ms: u64,
+    pub relay_pairing_duration_us: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayTunnelControlMessage {
-    ConnectSource { ticket: RelayTicket },
-    AcceptTarget { request: RelayTunnelAcceptRequest },
-    Paired { session: RelayTunnelSession },
+    ConnectSource {
+        ticket: RelayTicket,
+    },
+    AcceptTarget {
+        request: RelayTunnelAcceptRequest,
+    },
+    Paired {
+        session: RelayTunnelSession,
+        #[serde(default)]
+        timing: Option<RelayTunnelPairingTiming>,
+    },
     CloseWrite,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +90,7 @@ pub enum RelayTunnelEvent {
 
 pub struct RelayTunnelClient {
     session: RelayTunnelSession,
+    pairing_timing: Option<RelayTunnelPairingTiming>,
     websocket: WebSocketStream<Box<dyn AsyncIo>>,
 }
 
@@ -149,6 +167,10 @@ impl RelayTunnelClient {
         &self.session
     }
 
+    pub fn pairing_timing(&self) -> Option<RelayTunnelPairingTiming> {
+        self.pairing_timing
+    }
+
     /// Converts a paired legacy plaintext tunnel directly into Yamux.
     ///
     /// This compatibility method is not production-safe for relay traffic. Use
@@ -163,7 +185,11 @@ impl RelayTunnelClient {
             RelayTunnelSecurityMode::LegacyPlaintext,
             "legacy plaintext conversion",
         )?;
-        let RelayTunnelClient { session, websocket } = self;
+        let RelayTunnelClient {
+            session,
+            pairing_timing: _,
+            websocket,
+        } = self;
         let transport = WebSocketByteStream::new(websocket);
         let multiplexed = MultiplexedSession::spawn(transport, mode, config)
             .context("failed creating multiplexed relay tunnel session")?;
@@ -200,7 +226,11 @@ impl RelayTunnelClient {
             RelayTunnelSecurityMode::InnerMtls,
             "secure source conversion",
         )?;
-        let RelayTunnelClient { session, websocket } = self;
+        let RelayTunnelClient {
+            session,
+            pairing_timing: _,
+            websocket,
+        } = self;
         validate_source_security_context(&session, &security)?;
 
         let transport = WebSocketByteStream::new(websocket).compat();
@@ -232,7 +262,11 @@ impl RelayTunnelClient {
             RelayTunnelSecurityMode::InnerMtls,
             "secure target conversion",
         )?;
-        let RelayTunnelClient { session, websocket } = self;
+        let RelayTunnelClient {
+            session,
+            pairing_timing: _,
+            websocket,
+        } = self;
         validate_target_security_context(&session, &security)?;
 
         let transport = WebSocketByteStream::new(websocket).compat();
@@ -325,7 +359,7 @@ impl RelayTunnelClient {
         .context("relay tunnel websocket handshake failed")?;
         send_control_message(&mut websocket, &control).await?;
 
-        let session = loop {
+        let (session, pairing_timing) = loop {
             let next = websocket
                 .next()
                 .await
@@ -335,9 +369,9 @@ impl RelayTunnelClient {
                     match serde_json::from_str::<RelayTunnelControlMessage>(&text)
                         .context("failed parsing relay tunnel pairing response")?
                     {
-                        RelayTunnelControlMessage::Paired { session } => {
+                        RelayTunnelControlMessage::Paired { session, timing } => {
                             session.validate()?;
-                            break session;
+                            break (session, timing);
                         }
                         RelayTunnelControlMessage::Error { message } => {
                             bail!("relay tunnel establishment failed: {message}");
@@ -365,7 +399,11 @@ impl RelayTunnelClient {
             }
         };
 
-        Ok(Self { session, websocket })
+        Ok(Self {
+            session,
+            pairing_timing,
+            websocket,
+        })
     }
 
     async fn send_control(&mut self, control: &RelayTunnelControlMessage) -> Result<()> {
@@ -570,6 +608,45 @@ mod tests {
         relay_task: JoinHandle<()>,
     }
 
+    #[test]
+    fn paired_control_timing_is_backward_compatible() {
+        let cluster_id = Uuid::now_v7();
+        let source = PeerIdentity::Device(Uuid::now_v7());
+        let target = PeerIdentity::Node(Uuid::now_v7());
+        let session = RelayTunnelSession {
+            cluster_id,
+            session_id: "relay-timing-test".to_string(),
+            source,
+            target,
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: RelayTunnelSecurityMode::InnerMtls,
+        };
+        let legacy = serde_json::json!({
+            "type": "paired",
+            "session": session,
+        });
+        let decoded: RelayTunnelControlMessage =
+            serde_json::from_value(legacy).expect("legacy paired message should decode");
+        assert!(matches!(
+            decoded,
+            RelayTunnelControlMessage::Paired { timing: None, .. }
+        ));
+
+        let encoded = serde_json::to_value(RelayTunnelControlMessage::Paired {
+            session,
+            timing: Some(RelayTunnelPairingTiming {
+                relay_received_unix_ms: 10,
+                relay_paired_unix_ms: 12,
+                relay_pairing_duration_us: 2_000,
+            }),
+        })
+        .expect("timed paired message should encode");
+        assert_eq!(
+            encoded["timing"]["relay_pairing_duration_us"],
+            serde_json::json!(2_000)
+        );
+    }
+
     fn issue_test_ca() -> TestCa {
         let key_pair = KeyPair::generate().expect("test CA key should generate");
         let mut params = CertificateParams::default();
@@ -720,10 +797,12 @@ mod tests {
         TestTunnel {
             source: RelayTunnelClient {
                 session: session.clone(),
+                pairing_timing: None,
                 websocket: source_websocket,
             },
             target: RelayTunnelClient {
                 session,
+                pairing_timing: None,
                 websocket: target_websocket,
             },
             binary_frames,
@@ -1165,6 +1244,7 @@ mod tests {
         };
         let client = RelayTunnelClient {
             session: session.clone(),
+            pairing_timing: None,
             websocket: client_ws,
         };
 

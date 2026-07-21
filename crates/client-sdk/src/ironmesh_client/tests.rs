@@ -2847,6 +2847,18 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
                 name: "content-length".to_string(),
                 value: br#"{"status":"ok","route":"direct-quic"}"#.len().to_string(),
             },
+            RelayHttpHeader {
+                name: transport_sdk::HEADER_SERVER_PROCESSING_DURATION_US.to_string(),
+                value: "1200".to_string(),
+            },
+            RelayHttpHeader {
+                name: transport_sdk::HEADER_SERVER_RECEIVED_UNIX_MS.to_string(),
+                value: unix_ts_ms().to_string(),
+            },
+            RelayHttpHeader {
+                name: transport_sdk::HEADER_SERVER_RESPONDED_UNIX_MS.to_string(),
+                value: unix_ts_ms().to_string(),
+            },
         ],
         br#"{"status":"ok","route":"direct-quic"}"#.to_vec(),
         target_node_id,
@@ -2905,6 +2917,26 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
                 }),
             "route snapshot should retain the completed request details"
         );
+        let timed_attempt = route_snapshot.endpoints[0]
+            .recent_attempts
+            .iter()
+            .find(|attempt| attempt.outcome == "success")
+            .expect("successful request timing should be retained");
+        assert_eq!(timed_attempt.status_code, Some(200));
+        assert_eq!(timed_attempt.server_processing_duration_us, Some(1_200));
+        assert!(timed_attempt.total_duration_us.is_some());
+        assert!(timed_attempt.transport_overhead_us.is_some());
+        assert!(timed_attempt.session_setup_duration_us > 0);
+        assert_eq!(timed_attempt.relay_pairing_duration_us, 0);
+        assert!(timed_attempt.network_transfer_duration_us.is_some());
+        assert!(!timed_attempt.session_reused);
+        assert!(timed_attempt.response_body_complete);
+        assert_eq!(
+            timed_attempt.response_bytes,
+            br#"{"status":"ok","route":"direct-quic"}"#.len() as u64
+        );
+        assert!(timed_attempt.clock_offset_us.is_some());
+        assert!(timed_attempt.clock_uncertainty_us.is_some());
         assert_eq!(client.transport_session_pool_snapshot().connect_count, 1);
         assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
 

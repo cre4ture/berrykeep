@@ -2,6 +2,7 @@
     <string name="app_name">BerryKeep</string>
     <string name="nav_home">Home</string>
     <string name="nav_connectivity">Routes</string>
+    <string name="nav_request_timings">Timing</string>
     <string name="nav_sync">Sync</string>
     <string name="nav_library">Library</string>
     <string name="nav_gallery_map">Gallery Map</string>
