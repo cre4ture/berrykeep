@@ -78,6 +78,10 @@ export function MapDatasetImportCard() {
     importTargets.find(
       (target) => target.variantId === "natural-earth-labels" && target.asset === "vector"
     ) ?? null;
+  const naturalEarthHypsoTarget =
+    importTargets.find(
+      (target) => target.variantId === "natural-earth-hypso" && target.asset === "raster"
+    ) ?? null;
   useEffect(() => {
     if (!selectedTargetKey || !importTargets.some((target) => target.key === selectedTargetKey)) {
       setSelectedTargetKey(importTargets[0]?.key ?? null);
@@ -167,7 +171,9 @@ export function MapDatasetImportCard() {
           canStartNaturalEarthImport &&
           naturalEarthLabelsRasterTarget !== null &&
           naturalEarthLabelsVectorTarget !== null
-      : canStartMapImport;
+        : selectedImportProfile === "natural-earth-cross-blended-hypso"
+          ? canStartNaturalEarthImport && naturalEarthHypsoTarget !== null
+          : canStartMapImport;
   const importControlsLocked =
     mapImportStatus?.can_start_new === false ||
     naturalEarthImportStatus?.can_start_new === false ||
@@ -186,6 +192,10 @@ export function MapDatasetImportCard() {
     }
     if (selectedImportProfile === "natural-earth-physical-with-labels") {
       void startNaturalEarthImportMutation.mutateAsync("physical_with_labels");
+      return;
+    }
+    if (selectedImportProfile === "natural-earth-cross-blended-hypso") {
+      void startNaturalEarthImportMutation.mutateAsync("cross_blended_hypso");
       return;
     }
     if (selectedImportProfile === "remote-mbtiles") {
@@ -235,6 +245,7 @@ export function MapDatasetImportCard() {
             naturalEarthTarget={naturalEarthTarget}
             naturalEarthLabelsRasterTarget={naturalEarthLabelsRasterTarget}
             naturalEarthLabelsVectorTarget={naturalEarthLabelsVectorTarget}
+            naturalEarthHypsoTarget={naturalEarthHypsoTarget}
             mapConfigurationLoading={mapConfigurationQuery.isLoading}
             controlsLocked={importControlsLocked}
             canStartImport={canStartSelectedImport}
@@ -304,24 +315,21 @@ function NaturalEarthImportStateBadge({ job }: { job: NaturalEarthImportJobView 
 
 function NaturalEarthImportProgress({ job }: { job: NaturalEarthImportJobView }) {
   const includesLabels = job.profile === "physical_with_labels";
+  const profileDetails = naturalEarthImportProfileDetails(job.profile);
   const artifacts = job.artifacts ?? [];
   return (
     <Card withBorder radius="md" padding="md">
       <Stack gap="sm">
         <Group justify="space-between" align="center">
           <Text fw={600}>
-            {includesLabels ? "Natural Earth physical world map + labels" : "Natural Earth physical world map"}
+            {profileDetails.title}
           </Text>
           <NaturalEarthImportStateBadge job={job} />
         </Group>
         <Text size="sm">{job.phase}</Text>
         <Group gap="xl" align="flex-start">
           <ImportDetail label="Source">
-            <Text size="sm">
-              {includesLabels
-                ? "Official Natural Earth 10m physical and cultural archives"
-                : "Official Natural Earth 10m physical archive"}
-            </Text>
+            <Text size="sm">{profileDetails.source}</Text>
           </ImportDetail>
           <ImportDetail label={artifacts.length > 1 ? "Published artifacts" : "Published artifact"}>
             <Stack gap={4}>
@@ -398,6 +406,29 @@ function NaturalEarthImportProgress({ job }: { job: NaturalEarthImportJobView })
       </Stack>
     </Card>
   );
+}
+
+function naturalEarthImportProfileDetails(profile: NaturalEarthImportProfile): {
+  title: string;
+  source: string;
+} {
+  switch (profile) {
+    case "physical":
+      return {
+        title: "Natural Earth physical world map",
+        source: "Official Natural Earth 10m physical archive"
+      };
+    case "physical_with_labels":
+      return {
+        title: "Natural Earth physical world map + labels",
+        source: "Official Natural Earth 10m physical and cultural archives"
+      };
+    case "cross_blended_hypso":
+      return {
+        title: "Natural Earth hypsometric relief map",
+        source: "Official Natural Earth 10m Cross Blended Hypso raster archive"
+      };
+  }
 }
 
 function MapDatasetImportProgress({ job }: { job: AdminMapDatasetImportJobView }) {

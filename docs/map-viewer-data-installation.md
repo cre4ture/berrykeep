@@ -17,6 +17,7 @@ admin UI is picked up by the client UI on its next configuration refresh.
 | --- | --- | --- |
 | `natural-earth-globe` | Small raster world overview based on Natural Earth | enabled and active |
 | `natural-earth-labels` | The Natural Earth base plus cities, borders, and optional roads | disabled until its overlay is imported |
+| `natural-earth-hypso` | Cross-blended hypsometric relief with shaded relief and water | disabled until its raster is imported |
 | `openmaptiles-street` | A detailed global vector street map | disabled until its larger artifact is imported |
 | `maptiler-satellite` | The original MapTiler Satellite 2017 planet package | disabled; retained for upgrades |
 | `maptiler-hybrid` | The original MapTiler satellite package with its OpenMapTiles overlay | disabled; retained for upgrades |
@@ -81,12 +82,14 @@ for a desired map outcome first and then adapts the remaining questions to that
 profile:
 
 1. choose **Natural Earth physical world map**, **Natural Earth physical world
-   map + labels**, or **An existing MBTiles package**;
+   map + labels**, **Natural Earth hypsometric relief map**, or **An existing
+   MBTiles package**;
 2. confirm the fixed official Natural Earth source, or paste one HTTP(S) URL
    (or a copied `wget -c ...` command) for an existing MBTiles package;
 3. confirm the fixed `natural-earth-globe` raster destination, the fixed
-   raster and vector destinations for the labels profile, or select the
-   configured variant artifact and part size for an MBTiles package;
+   raster and vector destinations for the labels profile, the fixed
+   `natural-earth-hypso` relief-raster destination, or select the configured
+   variant artifact and part size for an MBTiles package;
 4. review the source and destination, then start the background job.
 
 The source file name is never a destination. The selected cluster
@@ -130,6 +133,18 @@ Expand **Conversion log** on the Natural Earth job to inspect each conversion
 phase, dependency check, and executed converter command. Failed commands show
 their exact invocation, exit status, and bounded captured output in both the
 job error and the log.
+
+### Automatic hypsometric relief map
+
+Choose **Natural Earth hypsometric relief map** to import Natural Earth's 10m
+Cross Blended Hypso with Shaded Relief and Water dataset. The node downloads
+the fixed official `HYP_HR_SR_W.zip` archive, uses its georeferenced raster
+directly, reprojects it to Web Mercator with bilinear resampling, and publishes
+a validated PNG MBTiles package to the `natural-earth-hypso` artifact. This
+provides the shaded-relief and elevation-based color treatment without changing
+the standard `natural-earth-globe` or labels packages. The source archive is
+about 379 MB; as with the other automatic imports, it requires `unzip`,
+`gdalwarp`, `gdal_translate`, and `gdaladdo` on the server `PATH`.
 
 For the `natural_earth` vector style, the overlay uses this compact source-layer
 contract:
