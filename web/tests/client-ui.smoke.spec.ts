@@ -1,12 +1,27 @@
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
+import { registerGalleryMapContractTests } from "./gallery-map.contract";
 
 const API_V1_PREFIX = "/api/v1";
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
 }
+
+registerGalleryMapContractTests({
+  name: "client-ui",
+  setup: (page, options) =>
+    installClientUiMocks(page, {
+      mapConfiguration: options.mapConfiguration,
+      mapConfigurationStatus: options.mapConfigurationStatus
+    }),
+  openGallery: async (page) => {
+    await page.goto("/");
+    await page.getByText("Gallery", { exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  }
+});
 
 async function dispatchCtrlWheel(locator: Locator, deltaY: number): Promise<void> {
   await locator.evaluate((element, wheelDelta) => {
@@ -684,7 +699,33 @@ test("client-ui desktop navigation can collapse and scroll on short viewports", 
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
   mapMetadataStatus?: number;
+  mapConfigurationStatus?: number;
+  mapConfiguration?: MockGalleryMapConfiguration;
 };
+
+type MockGalleryMapConfiguration = {
+  active_variant_id: string;
+  variants: Array<Record<string, unknown>>;
+};
+
+function defaultGalleryMapConfiguration(): MockGalleryMapConfiguration {
+  return {
+    active_variant_id: "natural-earth-globe",
+    variants: [
+      {
+        id: "natural-earth-globe",
+        label: "Natural Earth Globe",
+        mode_label: "Globe",
+        description: "Small global overview map.",
+        attribution: "Made with Natural Earth.",
+        kind: "raster",
+        style: "raster",
+        enabled: true,
+        raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json"
+      }
+    ]
+  };
+}
 
 async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOptions) {
   const imageBody = tinyPngBuffer();
@@ -1059,25 +1100,18 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     }
 
     if (pathname === apiV1("/maps/config") && method === "GET") {
+      if (options?.mapConfigurationStatus) {
+        await route.fulfill({
+          status: options.mapConfigurationStatus,
+          contentType: "application/json",
+          body: JSON.stringify({ message: "mocked map configuration failure" })
+        });
+        return;
+      }
+
       return json(route, {
         stored: true,
-        configuration: {
-          version: 1,
-          active_variant_id: "natural-earth-globe",
-          variants: [
-            {
-              id: "natural-earth-globe",
-              label: "Natural Earth Globe",
-              mode_label: "Globe",
-              description: "Small global overview map.",
-              attribution: "Made with Natural Earth.",
-              kind: "raster",
-              style: "raster",
-              enabled: true,
-              raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json"
-            }
-          ]
-        }
+        configuration: options?.mapConfiguration ?? defaultGalleryMapConfiguration()
       });
     }
 
