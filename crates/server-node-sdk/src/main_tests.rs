@@ -8069,14 +8069,22 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
             .public_tls
             .as_ref()
             .map(|tls| tls.cert_path.to_string_lossy().into_owned()),
-        Some("tls/public.pem".to_string())
+        Some(
+            root.join("data/tls/public.pem")
+                .to_string_lossy()
+                .into_owned()
+        )
     );
     assert_eq!(
         config
             .public_ca_cert_path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
-        Some("tls/public-ca.pem".to_string())
+        Some(
+            root.join("data/tls/public-ca.pem")
+                .to_string_lossy()
+                .into_owned()
+        )
     );
     assert_eq!(
         config.enrollment_issuer_url.as_deref(),
@@ -18979,6 +18987,42 @@ fn embedded_rendezvous_restart_delay_backs_off_and_caps() {
     assert_eq!(
         super::embedded_rendezvous_restart_delay(999),
         Duration::from_secs(super::EMBEDDED_RENDEZVOUS_RESTART_MAX_DELAY_SECS)
+    );
+}
+
+#[test]
+fn configured_file_paths_must_stay_within_data_dir() {
+    let data_dir = std::env::temp_dir().join("ironmesh-configured-file-paths");
+    let relative = super::resolve_configured_file_path(
+        &data_dir,
+        PathBuf::from("tls/node.pem").as_path(),
+        "test file path",
+    )
+    .unwrap();
+    assert_eq!(relative, data_dir.join("tls/node.pem"));
+
+    let absolute_inside = data_dir.join("tls/cluster-ca.pem");
+    assert_eq!(
+        super::resolve_configured_file_path(&data_dir, &absolute_inside, "test file path",)
+            .unwrap(),
+        absolute_inside
+    );
+
+    assert!(
+        super::resolve_configured_file_path(
+            &data_dir,
+            PathBuf::from("../outside.pem").as_path(),
+            "test file path",
+        )
+        .is_err()
+    );
+    assert!(
+        super::resolve_configured_file_path(
+            &data_dir,
+            &data_dir.parent().unwrap().join("outside.pem"),
+            "test file path",
+        )
+        .is_err()
     );
 }
 

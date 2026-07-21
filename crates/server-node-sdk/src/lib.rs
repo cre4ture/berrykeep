@@ -3748,21 +3748,24 @@ fn normalize_non_traversing_path(path: &FsPath) -> PathBuf {
     normalized
 }
 
-fn resolve_materialized_path(data_dir: &FsPath, raw_path: &str) -> Result<PathBuf> {
+fn resolve_configured_file_path(
+    data_dir: &FsPath,
+    raw_path: &FsPath,
+    label: &str,
+) -> Result<PathBuf> {
     ensure_non_traversing_path(data_dir, "data directory")?;
     let normalized_data_dir = normalize_non_traversing_path(data_dir);
 
-    let candidate = FsPath::new(raw_path);
-    ensure_non_traversing_path(candidate, "materialized path")?;
-    let normalized_candidate = normalize_non_traversing_path(candidate);
+    ensure_non_traversing_path(raw_path, label)?;
+    let normalized_candidate = normalize_non_traversing_path(raw_path);
 
     if normalized_candidate.is_absolute() {
         if !normalized_data_dir.is_absolute() {
-            bail!("absolute materialized paths require an absolute data directory");
+            bail!("absolute {label}s require an absolute data directory");
         }
         if !normalized_candidate.starts_with(&normalized_data_dir) {
             bail!(
-                "materialized path {} must stay within {}",
+                "{label} {} must stay within {}",
                 normalized_candidate.display(),
                 normalized_data_dir.display()
             );
@@ -3771,6 +3774,10 @@ fn resolve_materialized_path(data_dir: &FsPath, raw_path: &str) -> Result<PathBu
     } else {
         Ok(normalized_data_dir.join(normalized_candidate))
     }
+}
+
+fn resolve_materialized_path(data_dir: &FsPath, raw_path: &str) -> Result<PathBuf> {
+    resolve_configured_file_path(data_dir, FsPath::new(raw_path), "materialized path")
 }
 
 fn tls_metadata_sidecar_path(cert_path: &FsPath) -> Result<PathBuf> {
@@ -5599,6 +5606,9 @@ impl ServerNodeConfig {
     pub fn from_enrollment_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let package = NodeEnrollmentPackage::from_path(path.as_ref())?;
         let mut config = Self::from_enrollment(package)?;
+        // The enrollment package is an operator-selected import artifact. It may live outside
+        // the runtime data directory; only the TLS paths carried by the package are confined
+        // before they are ever opened by the running node.
         config.node_enrollment_path = Some(path.as_ref().to_path_buf());
         config.node_enrollment_auto_renew_enabled = parse_enrollment_auto_renew_enabled(
             default_node_enrollment_auto_renew_enabled(&config),
@@ -5620,6 +5630,9 @@ impl ServerNodeConfig {
     pub fn from_bootstrap(bootstrap: TransportNodeBootstrap) -> Result<Self> {
         bootstrap.validate()?;
 
+        ensure_non_traversing_path(FsPath::new(&bootstrap.data_dir), "node data directory")?;
+        let data_dir = normalize_non_traversing_path(FsPath::new(&bootstrap.data_dir));
+
         let mode = ServerNodeMode::Cluster;
         let allow_insecure_public_http = env_flag_enabled(ALLOW_INSECURE_PUBLIC_HTTP_ENV);
         let allow_unauthenticated_clients = env_flag_enabled(ALLOW_UNAUTHENTICATED_CLIENTS_ENV);
@@ -5636,9 +5649,10 @@ impl ServerNodeConfig {
                     .context("node bootstrap internal_tls requires internal_bind_addr")?
                     .parse()
                     .context("invalid node bootstrap internal_bind_addr")?;
-                let ca_cert_path = PathBuf::from(internal_tls.ca_cert_path);
-                let cert_path = PathBuf::from(internal_tls.cert_path);
-                let key_path = PathBuf::from(internal_tls.key_path);
+                let ca_cert_path =
+                    resolve_materialized_path(&data_dir, &internal_tls.ca_cert_path)?;
+                let cert_path = resolve_materialized_path(&data_dir, &internal_tls.cert_path)?;
+                let key_path = resolve_materialized_path(&data_dir, &internal_tls.key_path)?;
                 Some(InternalTlsConfig {
                     bind_addr: internal_bind_addr,
                     internal_url: bootstrap.internal_url.clone(),
@@ -5650,15 +5664,23 @@ impl ServerNodeConfig {
             }
             None => None,
         };
-        let public_tls = bootstrap.public_tls.map(|public_tls| {
-            let cert_path = PathBuf::from(public_tls.cert_path);
-            let key_path = PathBuf::from(public_tls.key_path);
-            PublicTlsConfig {
-                metadata_path: existing_tls_metadata_sidecar_path(&cert_path),
-                cert_path,
-                key_path,
-            }
-        });
+        let public_tls = bootstrap
+            .public_tls
+            .map(|public_tls| {
+                let cert_path = resolve_materialized_path(&data_dir, &public_tls.cert_path)?;
+                let key_path = resolve_materialized_path(&data_dir, &public_tls.key_path)?;
+                Ok::<_, anyhow::Error>(PublicTlsConfig {
+                    metadata_path: existing_tls_metadata_sidecar_path(&cert_path),
+                    cert_path,
+                    key_path,
+                })
+            })
+            .transpose()?;
+        let public_ca_cert_path = bootstrap
+            .public_ca_cert_path
+            .as_deref()
+            .map(|path| resolve_materialized_path(&data_dir, path))
+            .transpose()?;
         let advertised_direct_endpoints = effective_direct_endpoints(
             bootstrap.public_url.as_deref(),
             bootstrap.internal_url.as_deref(),
@@ -5671,7 +5693,7 @@ impl ServerNodeConfig {
             mode,
             cluster_id: bootstrap.cluster_id,
             node_id: bootstrap.node_id,
-            data_dir: PathBuf::from(bootstrap.data_dir),
+            data_dir,
             metadata_backend: parse_metadata_backend(
                 std::env::var("IRONMESH_METADATA_BACKEND")
                     .unwrap_or_else(|_| "sqlite".to_string())
@@ -5687,7 +5709,7 @@ impl ServerNodeConfig {
             labels: bootstrap.labels,
             public_tls,
             allow_insecure_public_http,
-            public_ca_cert_path: bootstrap.public_ca_cert_path.map(PathBuf::from),
+            public_ca_cert_path,
             public_ca_key_path: None,
             bootstrap_trust_roots: Some(bootstrap.trust_roots),
             advertised_direct_endpoints,
