@@ -141,6 +141,8 @@ body {
   }
 
   .shell-navbar {
+    bottom: 0;
+    height: auto;
     padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
     max-width: min(86vw, 300px);
   }
