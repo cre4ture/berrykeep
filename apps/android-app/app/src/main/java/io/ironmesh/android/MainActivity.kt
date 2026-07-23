@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -197,6 +199,27 @@ class MainActivity : ComponentActivity() {
                         onSelectSection = vm::selectSection,
                         snackbarHostState = snackbarHostState,
                         deviceLabel = state.deviceAuthState.label,
+                        onNavigateBack = if (state.selectedSection == MainSection.CONNECTIVITY) {
+                            { vm.selectSection(MainSection.SETTINGS) }
+                        } else {
+                            null
+                        },
+                        topBarActions = {
+                            if (state.selectedSection == MainSection.CONNECTIVITY) {
+                                TextButton(
+                                    onClick = vm::refreshConnectionRoutes,
+                                    enabled = !state.connectionRoutesLoading,
+                                ) {
+                                    Text(
+                                        if (state.connectionRoutesLoading) {
+                                            getString(R.string.connection_paths_refreshing)
+                                        } else {
+                                            getString(R.string.connection_paths_refresh)
+                                        },
+                                    )
+                                }
+                            }
+                        },
                     ) { contentModifier ->
                         Box(modifier = contentModifier) {
                             when (state.selectedSection) {
@@ -259,6 +282,9 @@ class MainActivity : ComponentActivity() {
                                         }
                                     },
                                     onOpenFiles = { openFilesAtIronmeshRoot(vm) },
+                                    onOpenConnectionDiagnostics = {
+                                        vm.selectSection(MainSection.CONNECTIVITY)
+                                    },
                                     onOpenWebConsole = onOpenWebConsole,
                                     onThemeAccentColorChange = vm::updateThemeAccentColor,
                                     onKeyChange = vm::updateKey,

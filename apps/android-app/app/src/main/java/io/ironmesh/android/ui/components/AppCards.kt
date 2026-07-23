@@ -72,7 +72,10 @@ fun StatusHeroCard(
     }
     Card(
         modifier = modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = colors.first),
+        colors = CardDefaults.cardColors(
+            containerColor = colors.first,
+            contentColor = colors.second,
+        ),
         shape = RoundedCornerShape(28.dp),
     ) {
         Column(
