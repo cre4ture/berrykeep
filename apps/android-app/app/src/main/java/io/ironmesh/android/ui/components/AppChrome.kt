@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -23,6 +24,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -37,6 +39,8 @@ fun IronmeshAppShell(
     onSelectSection: (MainSection) -> Unit,
     snackbarHostState: SnackbarHostState,
     deviceLabel: String?,
+    onNavigateBack: (() -> Unit)? = null,
+    topBarActions: @Composable RowScope.() -> Unit = {},
     content: @Composable (Modifier) -> Unit,
 ) {
     BoxWithConstraints(
@@ -76,6 +80,8 @@ fun IronmeshAppShell(
                         IronmeshTopBar(
                             selectedSection = selectedSection,
                             deviceLabel = deviceLabel,
+                            onNavigateBack = onNavigateBack,
+                            actions = topBarActions,
                         )
                     },
                     snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
@@ -95,6 +101,8 @@ fun IronmeshAppShell(
                     IronmeshTopBar(
                         selectedSection = selectedSection,
                         deviceLabel = deviceLabel,
+                        onNavigateBack = onNavigateBack,
+                        actions = topBarActions,
                     )
                 },
                 bottomBar = {
@@ -128,6 +136,8 @@ fun IronmeshAppShell(
 private fun IronmeshTopBar(
     selectedSection: MainSection,
     deviceLabel: String?,
+    onNavigateBack: (() -> Unit)?,
+    actions: @Composable RowScope.() -> Unit,
 ) {
     TopAppBar(
         title = {
@@ -141,9 +151,17 @@ private fun IronmeshTopBar(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                    }
+                }
             }
         },
+        navigationIcon = {
+            if (onNavigateBack != null) {
+                TextButton(onClick = onNavigateBack) {
+                    Text(stringResource(R.string.navigate_back))
+                }
+            }
+        },
+        actions = actions,
     )
 }
 
@@ -154,7 +172,6 @@ private data class ShellItem(
 
 private fun shellItems(): List<ShellItem> = listOf(
     ShellItem(MainSection.HOME, R.string.nav_home),
-    ShellItem(MainSection.CONNECTIVITY, R.string.nav_connectivity),
     ShellItem(MainSection.REQUEST_TIMINGS, R.string.nav_request_timings),
     ShellItem(MainSection.SYNC, R.string.nav_sync),
     ShellItem(MainSection.LIBRARY, R.string.nav_library),
