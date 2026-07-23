@@ -767,6 +767,44 @@ test("client-ui desktop navigation can collapse and scroll on short viewports", 
   await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
 });
 
+test("client-ui mobile drawer reveals and navigates its menu items", async ({ page }) => {
+  await installClientUiMocks(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+
+  const mobileMenuToggle = page.getByRole("button", { name: "Toggle navigation menu" });
+  const primaryNavigation = page.getByLabel("Primary navigation");
+
+  await expect(mobileMenuToggle).toBeVisible();
+  await expect
+    .poll(async () => primaryNavigation.evaluate((node) => node.getBoundingClientRect().right))
+    .toBeLessThanOrEqual(0);
+
+  await mobileMenuToggle.click();
+
+  await expect
+    .poll(async () => primaryNavigation.evaluate((node) => node.getBoundingClientRect().right))
+    .toBeGreaterThan(0);
+  await expect
+    .poll(async () =>
+      primaryNavigation.evaluate((node) => {
+        const bounds = node.getBoundingClientRect();
+        return bounds.height / window.innerHeight;
+      })
+    )
+    .toBeGreaterThan(0.5);
+  await expect(primaryNavigation).toBeVisible();
+  await expect(primaryNavigation.getByText("Overview", { exact: true })).toBeVisible();
+  await expect(primaryNavigation.getByText("Connection paths", { exact: true })).toBeVisible();
+  await expect(primaryNavigation.getByText("Logs", { exact: true })).toBeVisible();
+
+  await primaryNavigation.getByText("Logs", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
+  await expect
+    .poll(async () => primaryNavigation.evaluate((node) => node.getBoundingClientRect().right))
+    .toBeLessThanOrEqual(0);
+});
+
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
   mapMetadataStatus?: number;
