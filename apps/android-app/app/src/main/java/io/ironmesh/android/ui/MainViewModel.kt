@@ -159,6 +159,9 @@ data class MainUiState(
     val connectionRoutesLoading: Boolean = false,
     val connectionRoutesError: String? = null,
     val connectionRoutesLastLoadedUnixMs: Long = 0L,
+    val timingMeasurementResetting: Boolean = false,
+    val timingStoreIndexTestRunning: Boolean = false,
+    val timingMeasurementStartedUnixMs: Long? = null,
     val webUiSession: EmbeddedWebUiSession? = null,
     val galleryMode: GalleryViewMode = GalleryViewMode.FLATTENED_ALL_IMAGES,
     val galleryCollection: GalleryCollectionState? = null,
@@ -171,6 +174,12 @@ data class MainUiState(
     val themeAccentColorHex: String = DEFAULT_IRONMESH_ACCENT_COLOR_HEX,
     val galleryLoading: Boolean = false,
     val loading: Boolean = false,
+)
+
+private data class TimingDiagnosticsCredentials(
+    val connectionInput: String,
+    val serverCaPem: String?,
+    val clientIdentityJson: String,
 )
 
 class MainViewModel(
@@ -405,6 +414,61 @@ class MainViewModel(
                 startConnectionRoutesMonitor()
             }
         }
+    }
+
+    fun resetTimingMeasurement() {
+        runTimingDiagnosticsOperation(
+            actionDescription = "reset timing measurements",
+            markInProgress = { current ->
+                current.copy(
+                    timingMeasurementResetting = true,
+                    connectionRoutesError = null,
+                )
+            },
+            request = { credentials ->
+                repository.resetConnectionTimingMeasurement(
+                    connectionInput = credentials.connectionInput,
+                    serverCaPem = credentials.serverCaPem,
+                    clientIdentityJson = credentials.clientIdentityJson,
+                )
+            },
+            onSuccess = { current, snapshot ->
+                current.copy(
+                    connectionRoutes = snapshot,
+                    connectionRoutesError = null,
+                    connectionRoutesLastLoadedUnixMs = System.currentTimeMillis(),
+                    timingMeasurementStartedUnixMs = System.currentTimeMillis(),
+                    status = "Timing measurement reset. Run an action to capture new requests.",
+                )
+            },
+        )
+    }
+
+    fun runTimingStoreIndexTest() {
+        runTimingDiagnosticsOperation(
+            actionDescription = "run the store-index timing test",
+            markInProgress = { current ->
+                current.copy(
+                    timingStoreIndexTestRunning = true,
+                    connectionRoutesError = null,
+                )
+            },
+            request = { credentials ->
+                repository.runConnectionTimingStoreIndexTest(
+                    connectionInput = credentials.connectionInput,
+                    serverCaPem = credentials.serverCaPem,
+                    clientIdentityJson = credentials.clientIdentityJson,
+                )
+            },
+            onSuccess = { current, snapshot ->
+                current.copy(
+                    connectionRoutes = snapshot,
+                    connectionRoutesError = null,
+                    connectionRoutesLastLoadedUnixMs = System.currentTimeMillis(),
+                    status = "Store-index timing test completed.",
+                )
+            },
+        )
     }
 
     fun refreshGallery() {
@@ -1412,6 +1476,85 @@ class MainViewModel(
 
     private fun currentServerCaPem(): String? {
         return currentDeviceAuthState().serverCaPem?.takeIf { it.isNotBlank() }
+    }
+
+    private fun runTimingDiagnosticsOperation(
+        actionDescription: String,
+        markInProgress: (MainUiState) -> MainUiState,
+        request: (TimingDiagnosticsCredentials) -> ConnectionRouteSnapshot,
+        onSuccess: (MainUiState, ConnectionRouteSnapshot) -> MainUiState,
+    ) {
+        stopConnectionRoutesMonitor()
+        uiState.value = markInProgress(uiState.value)
+        viewModelScope.launch {
+            val credentials = timingDiagnosticsCredentialsOrNull(actionDescription) ?: run {
+                finishTimingDiagnosticsOperation()
+                return@launch
+            }
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    request(credentials)
+                }
+            }
+                .onSuccess { snapshot ->
+                    uiState.value = onSuccess(uiState.value, snapshot)
+                }
+                .onFailure { error ->
+                    val detail = error.message ?: "unknown error"
+                    uiState.value = uiState.value.copy(
+                        connectionRoutesError = detail,
+                        status = "Failed to $actionDescription: $detail",
+                    )
+                }
+            finishTimingDiagnosticsOperation()
+        }
+    }
+
+    private fun timingDiagnosticsCredentialsOrNull(
+        actionDescription: String,
+    ): TimingDiagnosticsCredentials? {
+        val deviceAuth = timingDiagnosticsDeviceAuthOrNull() ?: return null
+        val connectionInput = deviceAuth.preferredConnectionInput()
+        val clientIdentityJson = deviceAuth.toClientIdentityJson()
+        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+            val message = "Enroll this device to $actionDescription."
+            uiState.value = uiState.value.copy(
+                connectionRoutesError = message,
+                status = message,
+            )
+            return null
+        }
+        return TimingDiagnosticsCredentials(
+            connectionInput = connectionInput,
+            serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+            clientIdentityJson = clientIdentityJson,
+        )
+    }
+
+    private fun timingDiagnosticsDeviceAuthOrNull(): DeviceAuthState? {
+        return try {
+            currentDeviceAuthState()
+        } catch (error: DeviceIdentityStorageException) {
+            uiState.value = uiState.value.copy(
+                connectionRoutesError = error.message,
+                status = "Device identity unavailable: ${error.message}",
+            )
+            null
+        }
+    }
+
+    private fun finishTimingDiagnosticsOperation() {
+        uiState.value = uiState.value.copy(
+            timingMeasurementResetting = false,
+            timingStoreIndexTestRunning = false,
+        )
+        resumeConnectionRoutesMonitorIfNeeded()
+    }
+
+    private fun resumeConnectionRoutesMonitorIfNeeded() {
+        if (uiState.value.selectedSection.isConnectionDiagnosticsSection()) {
+            startConnectionRoutesMonitor()
+        }
     }
 
     private fun startConnectionRoutesMonitor() {

@@ -77,6 +77,52 @@ fn normalize_connection_name_preserves_readable_role_segments() {
 }
 
 #[test]
+fn reset_timing_measurement_clears_attempts_and_uses_session_pool_baseline() {
+    let mut state = ClientEndpointState {
+        recent_attempts: vec![ClientConnectionAttempt {
+            method: "GET".to_string(),
+            ..ClientConnectionAttempt::default()
+        }],
+        total_successes: 11,
+        total_failures: 3,
+        ..ClientEndpointState::default()
+    };
+    let baseline = TransportSessionPoolSnapshot {
+        connect_count: 4,
+        reuse_count: 9,
+        reset_count: 2,
+        connect_duration_us: 700,
+        relay_pairing_duration_us: 300,
+    };
+
+    reset_endpoint_timing_measurement(&mut state, baseline);
+
+    assert!(state.recent_attempts.is_empty());
+    assert_eq!(state.timing_session_pool_baseline, baseline);
+    assert_eq!(state.total_successes, 11);
+    assert_eq!(state.total_failures, 3);
+    assert_eq!(
+        transport_session_pool_delta(
+            TransportSessionPoolSnapshot {
+                connect_count: 5,
+                reuse_count: 12,
+                reset_count: 3,
+                connect_duration_us: 900,
+                relay_pairing_duration_us: 360,
+            },
+            state.timing_session_pool_baseline,
+        ),
+        TransportSessionPoolSnapshot {
+            connect_count: 1,
+            reuse_count: 3,
+            reset_count: 1,
+            connect_duration_us: 200,
+            relay_pairing_duration_us: 60,
+        },
+    );
+}
+
+#[test]
 fn transport_stream_kind_classification_accepts_versioned_public_routes() {
     assert_eq!(
         transport_stream_kind_for_path("/api/v1/health"),

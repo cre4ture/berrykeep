@@ -56,6 +56,7 @@ fun SettingsScreen(
     onOpenLocationSettings: () -> Unit,
     onOpenFiles: () -> Unit,
     onOpenConnectionDiagnostics: () -> Unit,
+    onOpenTimingDiagnostics: () -> Unit,
     onOpenWebConsole: () -> Unit,
     onThemeAccentColorChange: (String) -> Unit,
     onKeyChange: (String) -> Unit,
@@ -138,6 +139,9 @@ fun SettingsScreen(
         SectionCard(title = stringResource(R.string.settings_advanced)) {
             OutlinedButton(onClick = onOpenConnectionDiagnostics) {
                 Text(stringResource(R.string.connection_diagnostics))
+            }
+            OutlinedButton(onClick = onOpenTimingDiagnostics) {
+                Text(stringResource(R.string.timing_diagnostics))
             }
             Button(onClick = onOpenWebConsole) {
                 Text(stringResource(R.string.open_web_console))

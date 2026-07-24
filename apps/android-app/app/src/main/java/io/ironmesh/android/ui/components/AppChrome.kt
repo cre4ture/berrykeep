@@ -172,7 +172,6 @@ private data class ShellItem(
 
 private fun shellItems(): List<ShellItem> = listOf(
     ShellItem(MainSection.HOME, R.string.nav_home),
-    ShellItem(MainSection.REQUEST_TIMINGS, R.string.nav_request_timings),
     ShellItem(MainSection.SYNC, R.string.nav_sync),
     ShellItem(MainSection.LIBRARY, R.string.nav_library),
     ShellItem(MainSection.GALLERY_MAP, R.string.nav_gallery_map),

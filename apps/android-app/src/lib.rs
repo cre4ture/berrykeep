@@ -1716,6 +1716,96 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_resetConnectionTimingMeasurement(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let snapshot =
+            cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?
+                .reset_connection_timing_measurement();
+        serde_json::to_string(&snapshot).context("failed to serialize connection timing snapshot")
+    })();
+
+    match result {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!(
+                        "rust resetConnectionTimingMeasurement failed to create java string: {err:#}"
+                    ),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust resetConnectionTimingMeasurement failed: {err:#}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_runConnectionTimingStoreIndexTest(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let sdk = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        runtime()?.block_on(sdk.store_index(None, 1, None))?;
+        serde_json::to_string(&sdk.connection_route_snapshot())
+            .context("failed to serialize connection timing snapshot")
+    })();
+
+    match result {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!(
+                        "rust runConnectionTimingStoreIndexTest failed to create java string: {err:#}"
+                    ),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust runConnectionTimingStoreIndexTest failed: {err:#}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enrollWithBootstrap(
     mut env: JNIEnv,
     _class: JClass,

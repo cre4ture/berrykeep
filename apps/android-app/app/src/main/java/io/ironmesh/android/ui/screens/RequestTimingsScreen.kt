@@ -12,12 +12,17 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.data.ConnectionRouteAttemptSnapshot
-import io.ironmesh.android.data.ConnectionRouteEndpointSnapshot
 import io.ironmesh.android.ui.MainUiState
 import io.ironmesh.android.ui.components.HeroTone
 import io.ironmesh.android.ui.components.MetricPill
@@ -27,61 +32,19 @@ import java.text.DateFormat
 import java.util.Date
 import kotlin.math.abs
 
-private data class TimedRequest(
-    val endpoint: ConnectionRouteEndpointSnapshot,
-    val attempt: ConnectionRouteAttemptSnapshot,
-)
-
-private data class SessionPoolTotals(
-    val connectCount: Long = 0L,
-    val reuseCount: Long = 0L,
-    val resetCount: Long = 0L,
-    val connectDurationUs: Long = 0L,
-    val relayPairingDurationUs: Long = 0L,
-)
-
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun RequestTimingsScreen(
     state: MainUiState,
     onRefresh: () -> Unit,
+    onResetMeasurement: () -> Unit,
+    onRunStoreIndexTest: () -> Unit,
 ) {
-    val snapshot = state.connectionRoutes
-    val requests = snapshot
-        ?.endpoints
-        .orEmpty()
-        .flatMap { endpoint -> endpoint.recentAttempts.map { attempt -> TimedRequest(endpoint, attempt) } }
-        .sortedByDescending { request -> request.attempt.finishedUnixMs ?: request.attempt.startedUnixMs }
-    val successful = requests.filter { request ->
-        request.attempt.outcome == "success" && request.attempt.totalDurationUs != null
-    }
-    val totalAverage = successful.mapNotNull { it.attempt.totalDurationUs }.averageOrNull()
-    val serverAverage = successful.mapNotNull { it.attempt.serverProcessingDurationUs }.averageOrNull()
-    val transportAverage = successful.mapNotNull { it.attempt.transportOverheadUs }.averageOrNull()
-    val networkAverage = successful.mapNotNull { it.attempt.networkTransferDurationUs }.averageOrNull()
-    val pool = snapshot?.endpoints.orEmpty().fold(SessionPoolTotals()) { total, endpoint ->
-        val stats = endpoint.transportSessionPool
-        total.copy(
-            connectCount = total.connectCount + stats.connectCount,
-            reuseCount = total.reuseCount + stats.reuseCount,
-            resetCount = total.resetCount + stats.resetCount,
-            connectDurationUs = total.connectDurationUs + stats.connectDurationUs,
-            relayPairingDurationUs = total.relayPairingDurationUs + stats.relayPairingDurationUs,
-        )
-    }
-    val relayConnectCount = snapshot?.endpoints.orEmpty()
-        .filter { endpoint -> endpoint.pathKind == "relay_tunnel" }
-        .sumOf { endpoint -> endpoint.transportSessionPool.connectCount }
-    val averageConnectUs = pool.connectDurationUs.takeIf { pool.connectCount > 0L }
-        ?.toDouble()
-        ?.div(pool.connectCount)
-    val averageRelayPairingUs = pool.relayPairingDurationUs.takeIf { relayConnectCount > 0L }
-        ?.toDouble()
-        ?.div(relayConnectCount)
-    val bestClockSample = successful
-        .map { request -> request.attempt }
-        .filter { attempt -> attempt.clockOffsetUs != null && attempt.clockUncertaintyUs != null }
-        .minByOrNull { attempt -> attempt.clockUncertaintyUs ?: Long.MAX_VALUE }
+    val measurement = timingMeasurementPresentation(state.connectionRoutes)
+    val busy = state.connectionRoutesLoading ||
+        state.timingMeasurementResetting ||
+        state.timingStoreIndexTestRunning
+    var expandedRequestStartedAt by rememberSaveable { mutableStateOf<Long?>(null) }
 
     Column(
         modifier = Modifier
@@ -90,13 +53,26 @@ fun RequestTimingsScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         StatusHeroCard(
-            title = if (requests.isEmpty()) "Waiting for remote requests" else "${requests.size} recent requests",
-            subtitle = state.connectionRoutesError
-                ?: "Live timings from the same cached Rust client used by the native gallery and embedded web UI.",
+            title = timingHeroTitle(state, measurement.requests.size),
+            subtitle = timingHeroSubtitle(state, measurement.requests.size),
             tone = if (state.connectionRoutesError == null) HeroTone.Neutral else HeroTone.Error,
         ) {
-            Button(onClick = onRefresh, enabled = !state.connectionRoutesLoading) {
-                Text(if (state.connectionRoutesLoading) "Refreshing..." else "Refresh snapshot")
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onResetMeasurement,
+                    enabled = !busy,
+                ) {
+                    Text(if (state.timingMeasurementResetting) "Resetting..." else "Reset measurement")
+                }
+                Button(
+                    onClick = onRunStoreIndexTest,
+                    enabled = !busy,
+                ) {
+                    Text(if (state.timingStoreIndexTestRunning) "Running test..." else "Run store-index test")
+                }
             }
         }
 
@@ -105,54 +81,83 @@ fun RequestTimingsScreen(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            MetricPill("Average total", formatDurationUs(totalAverage))
-            MetricPill("Average server", formatDurationUs(serverAverage))
-            MetricPill("Average transport", formatDurationUs(transportAverage))
-            MetricPill("Network / relay", formatDurationUs(networkAverage))
-            MetricPill("Session setup", formatDurationUs(averageConnectUs))
-            MetricPill("Relay pairing", formatDurationUs(averageRelayPairingUs))
-            MetricPill("Clock estimate", formatClock(bestClockSample))
+            MetricPill("Average total", formatDurationUs(measurement.averageTotalUs))
+            MetricPill("Average server", formatDurationUs(measurement.averageServerUs))
+            MetricPill("Average transport", formatDurationUs(measurement.averageTransportUs))
+            MetricPill("Session setup", formatDurationUs(measurement.averageSessionSetupUs))
+            measurement.bestClockSample?.let { sample ->
+                MetricPill("Clock estimate", formatClock(sample))
+            }
         }
 
-        SectionCard(
-            title = "Where time is measured",
-            supportingText = "Server processing uses the node's monotonic clock. Transport is total client time minus server time, so it includes upload, download, network queues, and relay forwarding.",
-        ) {
-            Text(
-                text = "The relay cannot inspect request boundaries inside the inner mTLS tunnel. It reports exact tunnel pairing/wait time; per-request relay cost remains part of end-to-end transport overhead.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                text = "Sessions: ${pool.connectCount} connected, ${pool.reuseCount} reused, ${pool.resetCount} reset.",
-                style = MaterialTheme.typography.bodySmall,
-            )
-        }
-
-        SectionCard(
-            title = "Recent real requests",
-            supportingText = "Up to 64 requests are retained for each direct or relay path.",
-        ) {
-            if (requests.isEmpty()) {
+        if (measurement.sessionPool.connectCount > 0L || measurement.sessionPool.reuseCount > 0L) {
+            SectionCard(
+                title = "Transport sessions",
+                supportingText = "Only session activity recorded after the last reset is shown.",
+            ) {
                 Text(
-                    text = "Open the gallery or another remote screen. Measurements will appear here automatically.",
+                    text = "${measurement.sessionPool.connectCount} connected, " +
+                        "${measurement.sessionPool.reuseCount} reused, " +
+                        "${measurement.sessionPool.resetCount} reset.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    text = "Average setup ${formatDurationUs(measurement.averageSessionSetupUs)}" +
+                        relayPairingSummary(measurement.averageRelayPairingUs),
+                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            requests.take(64).forEachIndexed { index, request ->
+        }
+
+        SectionCard(
+            title = "Captured requests",
+            supportingText = if (measurement.requests.isEmpty()) {
+                "Reset the measurement, then run the read-only test or use another remote screen. " +
+                    "Only requests after the reset will appear here."
+            } else {
+                "${measurement.successfulRequestCount} successful request(s) in the current measurement. " +
+                    "Tap a request for its full breakdown."
+            },
+        ) {
+            if (measurement.requests.isEmpty()) {
+                Text(
+                    text = "The store-index test only reads the top-level index and uses the same cached client as the app.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            measurement.requests.take(64).forEachIndexed { index, request ->
                 if (index > 0) {
                     HorizontalDivider()
                 }
-                RequestTimingRow(request)
+                RequestTimingRow(
+                    request = request,
+                    expanded = expandedRequestStartedAt == request.attempt.startedUnixMs,
+                    onToggle = {
+                        expandedRequestStartedAt = if (expandedRequestStartedAt == request.attempt.startedUnixMs) {
+                            null
+                        } else {
+                            request.attempt.startedUnixMs
+                        }
+                    },
+                )
             }
+        }
+
+        TextButton(onClick = onRefresh, enabled = !busy) {
+            Text(if (state.connectionRoutesLoading) "Refreshing..." else "Refresh snapshot")
         }
     }
 }
 
 @Composable
-private fun RequestTimingRow(request: TimedRequest) {
+private fun RequestTimingRow(
+    request: TimedRequest,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+) {
     val attempt = request.attempt
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -173,52 +178,91 @@ private fun RequestTimingRow(request: TimedRequest) {
             )
         }
         Text(
-            text = "${request.endpoint.pathKind} · ${request.endpoint.locator} · ${formatTimestampMs(attempt.startedUnixMs)}",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Text(
-            text = buildString {
-                append(
-                    if (attempt.outcome != "success") {
-                        "Failed after "
-                    } else if (attempt.responseBodyComplete) {
-                        "Total "
-                    } else {
-                        "Response head "
-                    },
-                )
-                append(formatDurationUs(attempt.totalDurationUs?.toDouble()))
-                append(" · Server ")
-                append(formatDurationUs(attempt.serverProcessingDurationUs?.toDouble()))
-                append(" · Transport ")
-                append(formatDurationUs(attempt.transportOverheadUs?.toDouble()))
-                append(" · Setup ")
-                append(formatDurationUs(attempt.sessionSetupDurationUs.toDouble()))
-                if (attempt.sessionReused) append(" reused")
-                if (attempt.relayPairingDurationUs > 0L) {
-                    append(" (relay ")
-                    append(formatDurationUs(attempt.relayPairingDurationUs.toDouble()))
-                    append(")")
-                }
-                append(" · Network/relay ")
-                append(formatDurationUs(attempt.networkTransferDurationUs?.toDouble()))
-            },
+            text = "${formatDurationUs(attempt.totalDurationUs?.toDouble())} total / " +
+                "${formatDurationUs(attempt.transportOverheadUs?.toDouble())} transport",
             style = MaterialTheme.typography.bodyMedium,
         )
         Text(
-            text = "Sent ${formatBytes(attempt.requestBytes)} · received ${formatBytes(attempt.responseBytes)} · clock ${formatClock(attempt)}",
+            text = "${request.endpoint.pathKind} / ${formatTimestampMs(attempt.startedUnixMs)}",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        TextButton(onClick = onToggle) {
+            Text(if (expanded) "Hide details" else "Details")
+        }
+        if (expanded) {
+            TimingDetails(request)
+        }
+    }
+}
+
+@Composable
+private fun TimingDetails(request: TimedRequest) {
+    val attempt = request.attempt
+    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        TimingDetail("Endpoint", request.endpoint.locator)
+        TimingDetail("Server processing", formatDurationUs(attempt.serverProcessingDurationUs?.toDouble()))
+        TimingDetail("Transport overhead", formatDurationUs(attempt.transportOverheadUs?.toDouble()))
+        TimingDetail("Network and relay", formatDurationUs(attempt.networkTransferDurationUs?.toDouble()))
+        TimingDetail(
+            "Session",
+            buildString {
+                append(formatDurationUs(attempt.sessionSetupDurationUs.toDouble()))
+                append(" setup")
+                if (attempt.sessionReused) append(", reused")
+                if (attempt.relayPairingDurationUs > 0L) {
+                    append(", ")
+                    append(formatDurationUs(attempt.relayPairingDurationUs.toDouble()))
+                    append(" relay pairing")
+                }
+            },
+        )
+        TimingDetail(
+            "Transfer",
+            "Sent ${formatBytes(attempt.requestBytes)}, received ${formatBytes(attempt.responseBytes)}",
+        )
+        TimingDetail("Clock estimate", formatClock(attempt))
         attempt.error?.takeIf { error -> error.isNotBlank() }?.let { error ->
             Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
         }
     }
 }
 
-private fun List<Long>.averageOrNull(): Double? {
-    return if (isEmpty()) null else average()
+@Composable
+private fun TimingDetail(label: String, value: String) {
+    Text(
+        text = "$label: $value",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+private fun timingHeroTitle(state: MainUiState, requestCount: Int): String {
+    return when {
+        state.connectionRoutesError != null -> "Timing measurement unavailable"
+        state.timingMeasurementResetting -> "Resetting timing measurement"
+        state.timingStoreIndexTestRunning -> "Running store-index test"
+        requestCount == 0 && state.timingMeasurementStartedUnixMs != null -> "Ready to measure"
+        requestCount == 0 -> "No current measurements"
+        else -> "$requestCount request(s) captured"
+    }
+}
+
+private fun timingHeroSubtitle(state: MainUiState, requestCount: Int): String {
+    return when {
+        state.connectionRoutesError != null -> state.connectionRoutesError
+        state.timingMeasurementResetting -> "Clearing recorded requests and starting a new measurement window."
+        state.timingStoreIndexTestRunning -> "Making a read-only store-index request through the app's cached Rust client."
+        requestCount == 0 && state.timingMeasurementStartedUnixMs != null ->
+            "Reset complete at ${formatTimestampMs(state.timingMeasurementStartedUnixMs)}. Run the test or perform the action you want to inspect."
+        requestCount == 0 ->
+            "Reset first when you want to isolate the timing of one action, then run that action."
+        else -> "These requests and session counters belong to the current measurement window."
+    }
+}
+
+private fun relayPairingSummary(averageRelayPairingUs: Double?): String {
+    return averageRelayPairingUs?.let { ", relay pairing ${formatDurationUs(it)}" }.orEmpty()
 }
 
 private fun formatDurationUs(value: Double?): String {
@@ -231,7 +275,10 @@ private fun formatClock(attempt: ConnectionRouteAttemptSnapshot?): String {
     val offset = attempt?.clockOffsetUs ?: return "n/a"
     val uncertainty = attempt.clockUncertaintyUs ?: return "n/a"
     val sign = if (offset >= 0L) "+" else "-"
-    return "$sign%.1f ± %.1f ms".format(abs(offset).toDouble() / 1_000.0, uncertainty.toDouble() / 1_000.0)
+    return "$sign%.1f +/- %.1f ms".format(
+        abs(offset).toDouble() / 1_000.0,
+        uncertainty.toDouble() / 1_000.0,
+    )
 }
 
 private fun formatBytes(value: Long): String {

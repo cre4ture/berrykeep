@@ -271,6 +271,7 @@ struct ClientEndpointState {
     last_background_probe_unix_ms: Option<u64>,
     last_error: Option<String>,
     recent_attempts: Vec<ClientConnectionAttempt>,
+    timing_session_pool_baseline: TransportSessionPoolSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -648,6 +649,7 @@ impl ClientEndpointRouter {
             .enumerate()
             .map(|(index, endpoint)| {
                 let state = lock_endpoint_state(&endpoint.state);
+                let session_pool = endpoint.transport.session_pool_snapshot();
                 ClientConnectionRouteEndpointSnapshot {
                     index,
                     path_kind: endpoint.transport.transport_path_kind(),
@@ -670,7 +672,10 @@ impl ClientEndpointRouter {
                     last_background_probe_unix_ms: state.last_background_probe_unix_ms,
                     last_error: state.last_error.clone(),
                     recent_attempts: state.recent_attempts.clone(),
-                    transport_session_pool: endpoint.transport.session_pool_snapshot(),
+                    transport_session_pool: transport_session_pool_delta(
+                        session_pool,
+                        state.timing_session_pool_baseline,
+                    ),
                 }
             })
             .collect();
@@ -680,6 +685,14 @@ impl ClientEndpointRouter {
             active_index,
             ranked_indices,
             endpoints,
+        }
+    }
+
+    fn reset_timing_measurement(&self) {
+        for endpoint in self.endpoints.iter() {
+            let session_pool_baseline = endpoint.transport.session_pool_snapshot();
+            let mut state = lock_endpoint_state(&endpoint.state);
+            reset_endpoint_timing_measurement(&mut state, session_pool_baseline);
         }
     }
 
@@ -962,6 +975,31 @@ fn record_endpoint_attempt(state: &mut ClientEndpointState, attempt: ClientConne
         state.recent_attempts.drain(0..drop_count);
     }
     state.recent_attempts.push(attempt);
+}
+
+fn reset_endpoint_timing_measurement(
+    state: &mut ClientEndpointState,
+    session_pool_baseline: TransportSessionPoolSnapshot,
+) {
+    state.recent_attempts.clear();
+    state.timing_session_pool_baseline = session_pool_baseline;
+}
+
+fn transport_session_pool_delta(
+    current: TransportSessionPoolSnapshot,
+    baseline: TransportSessionPoolSnapshot,
+) -> TransportSessionPoolSnapshot {
+    TransportSessionPoolSnapshot {
+        connect_count: current.connect_count.saturating_sub(baseline.connect_count),
+        reuse_count: current.reuse_count.saturating_sub(baseline.reuse_count),
+        reset_count: current.reset_count.saturating_sub(baseline.reset_count),
+        connect_duration_us: current
+            .connect_duration_us
+            .saturating_sub(baseline.connect_duration_us),
+        relay_pairing_duration_us: current
+            .relay_pairing_duration_us
+            .saturating_sub(baseline.relay_pairing_duration_us),
+    }
 }
 
 fn attempt_display_url(endpoint: &ClientEndpoint, url: &Url) -> String {
@@ -2334,6 +2372,12 @@ impl IronMeshClient {
 
     pub fn connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
         self.transport_router.snapshot()
+    }
+
+    /// Starts a fresh timing window without changing route selection or health state.
+    pub fn reset_connection_timing_measurement(&self) -> ClientConnectionRouteSnapshot {
+        self.transport_router.reset_timing_measurement();
+        self.connection_route_snapshot()
     }
 
     pub async fn refresh_connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
