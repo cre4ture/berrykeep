@@ -644,9 +644,12 @@ jobs:
           script: apps/android-app/gradlew --no-daemon -p apps/android-app :app:connectedDebugAndroidTest
 
   fuse-mount-build:
-    name: FUSE
-    runs-on: ubuntu-latest
+    name: Linux binaries
+    runs-on: ubuntu-24.04
     needs: workspace-check
+    # The release bundle is for manual package testing. Build it automatically
+    # on main and manual dispatches, but require an explicit opt-in on PRs.
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:debian-packages') }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
@@ -687,14 +690,79 @@ jobs:
         with:
           cache-targets: false
 
-      - name: Build Linux FUSE mount binary
-        run: cargo build --locked -p os-integration --bin ironmesh-os-integration --release
+      - name: Build Linux release binary bundle
+        run: |
+          cargo build --locked --release \
+            -p server-node \
+            -p cli-client \
+            -p ironmesh-config-app \
+            -p ironmesh-background-launcher \
+            -p ironmesh-folder-agent \
+            -p os-integration \
+            -p rendezvous-service
+          mkdir -p artifacts/linux-debian-binaries
+          install -m0755 target/release/ironmesh-server-node artifacts/linux-debian-binaries/
+          install -m0755 target/release/ironmesh-rendezvous-service artifacts/linux-debian-binaries/
+          install -m0755 target/release/ironmesh artifacts/linux-debian-binaries/
+          install -m0755 target/release/ironmesh-config-app artifacts/linux-debian-binaries/
+          install -m0755 target/release/ironmesh-background-launcher artifacts/linux-debian-binaries/
+          install -m0755 target/release/ironmesh-folder-agent artifacts/linux-debian-binaries/
+          install -m0755 target/release/ironmesh-os-integration artifacts/linux-debian-binaries/
 
       - name: Upload Linux FUSE mount binary
         uses: actions/upload-artifact@v4
         with:
           name: linux-fuse-mount-binary-ubuntu
           path: target/release/ironmesh-os-integration
+          if-no-files-found: error
+
+      - name: Upload Linux Debian binary bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-debian-binaries-ubuntu
+          path: artifacts/linux-debian-binaries/*
+          if-no-files-found: error
+
+  debian-package-build:
+    name: Debian packages
+    runs-on: ubuntu-24.04
+    needs: fuse-mount-build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Linux release binary bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-debian-binaries-ubuntu
+          path: ${{ runner.temp }}/linux-debian-binaries
+
+      - name: Install Debian packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends debhelper dh-sysuser dpkg-dev
+
+      - name: Package the prebuilt binaries
+        run: |
+          ./scripts/build-local-debs.sh \
+            --prebuilt-binaries "${RUNNER_TEMP}/linux-debian-binaries"
+
+      - name: Collect Debian package artifacts
+        run: |
+          set -euo pipefail
+          architecture="$(dpkg --print-architecture)"
+          mkdir -p artifacts
+          find .. -maxdepth 1 -type f \
+            \( -name "ironmesh-*_*_${architecture}.deb" \
+              -o -name "ironmesh_*_${architecture}.changes" \
+              -o -name "ironmesh_*_${architecture}.buildinfo" \) \
+            -exec cp -v {} artifacts/ \;
+
+      - name: Upload Debian packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages-ubuntu-amd64
+          path: artifacts/
           if-no-files-found: error
 
   windows-cfapi-check:

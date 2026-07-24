@@ -7,6 +7,21 @@ export CARGO_HOME := $(CURDIR)/debian/cargo-home
 export CARGO_TARGET_DIR := $(CURDIR)/target/debian
 export CARGO_NET_OFFLINE := true
 
+ifeq ($(IRONMESH_USE_PREBUILT_BINARIES),1)
+PACKAGE_BIN_DIR := $(IRONMESH_PREBUILT_BIN_DIR)
+else
+PACKAGE_BIN_DIR := $(CARGO_TARGET_DIR)/release
+endif
+
+PACKAGE_BINARIES := \
+	ironmesh-server-node \
+	ironmesh-rendezvous-service \
+	ironmesh \
+	ironmesh-config-app \
+	ironmesh-background-launcher \
+	ironmesh-folder-agent \
+	ironmesh-os-integration
+
 CARGO_BIN := $(firstword $(wildcard /usr/bin/cargo-1.91 /usr/bin/cargo-1.89 /usr/bin/cargo-1.85 /usr/bin/cargo $(HOME)/.cargo/bin/cargo))
 RUSTC_BIN := $(firstword $(wildcard /usr/bin/rustc-1.91 /usr/bin/rustc-1.89 /usr/bin/rustc-1.85 /usr/bin/rustc $(HOME)/.cargo/bin/rustc))
 CLANG_BIN := $(firstword $(wildcard /usr/bin/clang))
@@ -24,6 +39,18 @@ CLIENT_EXTENSION_ROOT := $(CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-s
 override_dh_clean:
 	dh_clean -XCargo.toml.orig
 
+ifeq ($(IRONMESH_USE_PREBUILT_BINARIES),1)
+override_dh_auto_configure:
+	test -n "$(PACKAGE_BIN_DIR)" || \
+		(echo "missing IRONMESH_PREBUILT_BIN_DIR" >&2; exit 1)
+	for binary in $(PACKAGE_BINARIES); do \
+		test -x "$(PACKAGE_BIN_DIR)/$$binary" || \
+			(echo "missing prebuilt package binary: $(PACKAGE_BIN_DIR)/$$binary" >&2; exit 1); \
+	done
+
+override_dh_auto_build:
+	:
+else
 override_dh_auto_configure:
 	test -n "$(CLANG_BIN)" || \
 		(echo "missing clang; install the Debian build dependencies" >&2; exit 1)
@@ -60,6 +87,7 @@ override_dh_auto_build:
 		-p ironmesh-folder-agent \
 		-p os-integration \
 		-p rendezvous-service
+endif
 
 override_dh_auto_test:
 	# Skip the repository's long-running integration-heavy test suites during
@@ -69,28 +97,28 @@ override_dh_auto_test:
 
 override_dh_auto_install:
 	install -d $(CURDIR)/debian/ironmesh-server-node/usr/bin
-	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-server-node \
+	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-server-node \
 		$(CURDIR)/debian/ironmesh-server-node/usr/bin/ironmesh-server-node
 	install -d $(CURDIR)/debian/ironmesh-server-node/etc/ironmesh
 	install -m0644 debian/ironmesh-server-node.env \
 		$(CURDIR)/debian/ironmesh-server-node/etc/ironmesh/server-node.env
 
 	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/usr/bin
-	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-rendezvous-service \
+	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-rendezvous-service \
 		$(CURDIR)/debian/ironmesh-rendezvous-service/usr/bin/ironmesh-rendezvous-service
 	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/etc/ironmesh
 	install -m0644 debian/ironmesh-rendezvous-service.env \
 		$(CURDIR)/debian/ironmesh-rendezvous-service/etc/ironmesh/rendezvous-service.env
 
 	install -d $(CLIENT_PACKAGE_ROOT)
-	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh $(CLIENT_PACKAGE_ROOT)/ironmesh
-	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-config-app \
+	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh $(CLIENT_PACKAGE_ROOT)/ironmesh
+	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-config-app \
 		$(CLIENT_PACKAGE_ROOT)/ironmesh-config-app
-	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-background-launcher \
+	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-background-launcher \
 		$(CLIENT_PACKAGE_ROOT)/ironmesh-background-launcher
-	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-folder-agent \
+	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-folder-agent \
 		$(CLIENT_PACKAGE_ROOT)/ironmesh-folder-agent
-	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-os-integration \
+	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-os-integration \
 		$(CLIENT_PACKAGE_ROOT)/ironmesh-os-integration
 
 	install -d $(CLIENT_EXTENSION_ROOT)
