@@ -7,6 +7,7 @@ ARTIFACT_DIR="$(cd "${ROOT_DIR}/.." && pwd)"
 RUN_PREPARE=true
 RUN_LINTIAN=false
 CHECK_BUILD_DEPENDENCIES=true
+PREBUILT_BINARIES_DIR=""
 DPKG_BUILD_ARGS=()
 
 log() {
@@ -36,6 +37,10 @@ Usage:
 Options:
   --no-prepare  Skip ./scripts/prepare-ppa-source.sh.
   --lintian     Run lintian on the generated .changes file after a successful build.
+  --prebuilt-binaries DIR
+                Package the seven release binaries already present in DIR
+                instead of preparing sources and compiling them. This skips
+                the build-dependency check and validates the binary bundle.
   --no-check-build-deps
                 Skip dpkg-checkbuilddeps and pass -d to dpkg-buildpackage.
                 This is for native builders that provide the required Rust
@@ -75,6 +80,27 @@ check_build_dependencies() {
   exit 1
 }
 
+validate_prebuilt_binaries() {
+  local binary
+  local -a expected_binaries=(
+    ironmesh-server-node
+    ironmesh-rendezvous-service
+    ironmesh
+    ironmesh-config-app
+    ironmesh-background-launcher
+    ironmesh-folder-agent
+    ironmesh-os-integration
+  )
+
+  for binary in "${expected_binaries[@]}"; do
+    if [[ ! -x "${PREBUILT_BINARIES_DIR}/${binary}" ]]; then
+      printf 'expected executable prebuilt binary not found: %s\n' \
+        "${PREBUILT_BINARIES_DIR}/${binary}" >&2
+      exit 1
+    fi
+  done
+}
+
 while (($# > 0)); do
   case "$1" in
     --no-prepare)
@@ -88,6 +114,16 @@ while (($# > 0)); do
     --no-check-build-deps)
       CHECK_BUILD_DEPENDENCIES=false
       shift
+      ;;
+    --prebuilt-binaries)
+      [[ $# -ge 2 ]] || {
+        printf '%s\n' '--prebuilt-binaries requires a directory' >&2
+        exit 1
+      }
+      PREBUILT_BINARIES_DIR="$2"
+      RUN_PREPARE=false
+      CHECK_BUILD_DEPENDENCIES=false
+      shift 2
       ;;
     -h|--help)
       usage
@@ -108,26 +144,45 @@ done
 
 require_command git
 require_command dpkg-buildpackage
-require_command dpkg-checkbuilddeps
 require_command dpkg-parsechangelog
 require_command dpkg
+
+if [[ "${CHECK_BUILD_DEPENDENCIES}" == true ]]; then
+  require_command dpkg-checkbuilddeps
+fi
 
 if [[ "${RUN_LINTIAN}" == true ]]; then
   require_command lintian
 fi
 
 require_clean_repository
-"${ROOT_DIR}/scripts/sync-debian-version.sh"
-if [[ "${CHECK_BUILD_DEPENDENCIES}" == true ]]; then
-  check_build_dependencies
-else
-  log "skipping dpkg build-dependency check"
-  DPKG_BUILD_ARGS=(-d "${DPKG_BUILD_ARGS[@]}")
-fi
+if [[ -n "${PREBUILT_BINARIES_DIR}" ]]; then
+  [[ -d "${PREBUILT_BINARIES_DIR}" ]] || {
+    printf 'prebuilt binary directory does not exist: %s\n' \
+      "${PREBUILT_BINARIES_DIR}" >&2
+    exit 1
+  }
+  PREBUILT_BINARIES_DIR="$(cd "${PREBUILT_BINARIES_DIR}" && pwd)"
 
-if [[ "${RUN_PREPARE}" == true ]]; then
-  log "preparing vendored crates and prebuilt web assets"
-  "${ROOT_DIR}/scripts/prepare-ppa-source.sh"
+  "${ROOT_DIR}/scripts/sync-debian-version.sh" --check
+  validate_prebuilt_binaries
+  export IRONMESH_PREBUILT_BIN_DIR="${PREBUILT_BINARIES_DIR}"
+  export IRONMESH_USE_PREBUILT_BINARIES=1
+  log "packaging prebuilt binaries from ${PREBUILT_BINARIES_DIR}"
+  DPKG_BUILD_ARGS=(-d "${DPKG_BUILD_ARGS[@]}")
+else
+  "${ROOT_DIR}/scripts/sync-debian-version.sh"
+  if [[ "${CHECK_BUILD_DEPENDENCIES}" == true ]]; then
+    check_build_dependencies
+  else
+    log "skipping dpkg build-dependency check"
+    DPKG_BUILD_ARGS=(-d "${DPKG_BUILD_ARGS[@]}")
+  fi
+
+  if [[ "${RUN_PREPARE}" == true ]]; then
+    log "preparing vendored crates and prebuilt web assets"
+    "${ROOT_DIR}/scripts/prepare-ppa-source.sh"
+  fi
 fi
 
 SOURCE_NAME="$(cd "${ROOT_DIR}" && dpkg-parsechangelog -SSource)"
