@@ -128,6 +128,20 @@ object RustClientBridge {
     ): String
 
     @JvmStatic
+    external fun resetConnectionTimingMeasurement(
+        connectionInput: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    ): String
+
+    @JvmStatic
+    external fun runConnectionTimingStoreIndexTest(
+        connectionInput: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    ): String
+
+    @JvmStatic
     external fun runFolderSyncOnce(
         connectionInput: String,
         localFolder: String,

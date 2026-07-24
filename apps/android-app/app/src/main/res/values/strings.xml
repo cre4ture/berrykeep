@@ -80,6 +80,7 @@
     <string name="settings_storage">Storage and files</string>
     <string name="settings_advanced">Advanced</string>
     <string name="connection_diagnostics">Connection diagnostics</string>
+    <string name="timing_diagnostics">Timing diagnostics</string>
     <string name="navigate_back">Back</string>
     <string name="rename_device_hint">Rename this device by updating its label and re-enrolling when needed.</string>
     <string name="open_files">Open Files</string>

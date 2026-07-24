@@ -200,16 +200,24 @@ class MainActivity : ComponentActivity() {
                         snackbarHostState = snackbarHostState,
                         deviceLabel = state.deviceAuthState.label,
                         titleLatencyStatus = state.titleLatencyStatus,
-                        onNavigateBack = if (state.selectedSection == MainSection.CONNECTIVITY) {
+                        onNavigateBack = if (
+                            state.selectedSection == MainSection.CONNECTIVITY ||
+                            state.selectedSection == MainSection.REQUEST_TIMINGS
+                        ) {
                             { vm.selectSection(MainSection.SETTINGS) }
                         } else {
                             null
                         },
                         topBarActions = {
-                            if (state.selectedSection == MainSection.CONNECTIVITY) {
+                            if (
+                                state.selectedSection == MainSection.CONNECTIVITY ||
+                                state.selectedSection == MainSection.REQUEST_TIMINGS
+                            ) {
                                 TextButton(
                                     onClick = vm::refreshConnectionRoutes,
-                                    enabled = !state.connectionRoutesLoading,
+                                    enabled = !state.connectionRoutesLoading &&
+                                        !state.timingMeasurementResetting &&
+                                        !state.timingStoreIndexTestRunning,
                                 ) {
                                     Text(
                                         if (state.connectionRoutesLoading) {
@@ -241,6 +249,8 @@ class MainActivity : ComponentActivity() {
                                 MainSection.REQUEST_TIMINGS -> RequestTimingsScreen(
                                     state = state,
                                     onRefresh = vm::refreshConnectionRoutes,
+                                    onResetMeasurement = vm::resetTimingMeasurement,
+                                    onRunStoreIndexTest = vm::runTimingStoreIndexTest,
                                 )
 
                                 MainSection.SYNC -> SyncScreen(
@@ -285,6 +295,9 @@ class MainActivity : ComponentActivity() {
                                     onOpenFiles = { openFilesAtIronmeshRoot(vm) },
                                     onOpenConnectionDiagnostics = {
                                         vm.selectSection(MainSection.CONNECTIVITY)
+                                    },
+                                    onOpenTimingDiagnostics = {
+                                        vm.selectSection(MainSection.REQUEST_TIMINGS)
                                     },
                                     onOpenWebConsole = onOpenWebConsole,
                                     onThemeAccentColorChange = vm::updateThemeAccentColor,

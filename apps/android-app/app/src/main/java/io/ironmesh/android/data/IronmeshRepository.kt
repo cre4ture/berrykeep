@@ -449,6 +449,36 @@ class IronmeshRepository {
         )
     }
 
+    fun resetConnectionTimingMeasurement(
+        connectionInput: String,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ): ConnectionRouteSnapshot {
+        return decodeJson(
+            RustClientBridge.resetConnectionTimingMeasurement(
+                normalizedConnectionInput(connectionInput),
+                serverCaPem,
+                normalizedClientIdentityJson(clientIdentityJson),
+            ),
+            ConnectionRouteSnapshot::class.java,
+        )
+    }
+
+    fun runConnectionTimingStoreIndexTest(
+        connectionInput: String,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ): ConnectionRouteSnapshot {
+        return decodeJson(
+            RustClientBridge.runConnectionTimingStoreIndexTest(
+                normalizedConnectionInput(connectionInput),
+                serverCaPem,
+                normalizedClientIdentityJson(clientIdentityJson),
+            ),
+            ConnectionRouteSnapshot::class.java,
+        )
+    }
+
     suspend fun runFolderSyncOnce(
         connectionInput: String,
         localFolder: String,
