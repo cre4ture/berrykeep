@@ -774,7 +774,9 @@ private struct IronmeshSettingsView: View {
                         "Measure connection latency",
                         isOn: Binding(
                             get: { model.titleLatencyMonitorSettings.enabled },
-                            set: model.updateTitleLatencyMonitorEnabled
+                            set: { enabled in
+                                model.updateTitleLatencyMonitorEnabled(enabled)
+                            }
                         )
                     )
 
