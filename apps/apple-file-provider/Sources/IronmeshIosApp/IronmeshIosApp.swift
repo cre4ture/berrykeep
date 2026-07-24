@@ -16,12 +16,32 @@ struct IronmeshIosApp: App {
 
     var body: some Scene {
         WindowGroup {
-            IronmeshIosRootView()
-                .environmentObject(model)
-                .task {
-                    model.activate()
-                }
+            if let session = IronmeshUiTestWebUiSession.fromLaunchEnvironment() {
+                IronmeshHostedWebView(session: session)
+            } else {
+                IronmeshIosRootView()
+                    .environmentObject(model)
+                    .task {
+                        model.activate()
+                    }
+            }
         }
+    }
+}
+
+private enum IronmeshUiTestWebUiSession {
+    static func fromLaunchEnvironment() -> AppleWebUiSession? {
+        guard let url = ProcessInfo.processInfo.environment["IRONMESH_UI_TEST_WEB_UI_URL"],
+              let data = try? JSONSerialization.data(
+                  withJSONObject: [
+                      "url": url,
+                      "authorization": "gallery-map-simulator-test",
+                  ]
+              ),
+              let responseJSON = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return try? AppleWebUiSession(responseJSON: responseJSON)
     }
 }
 
@@ -1188,6 +1208,7 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.accessibilityIdentifier = "ironmesh-hosted-web-ui"
         webView.allowsLinkPreview = false
         webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView

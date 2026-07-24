@@ -64,6 +64,17 @@
                ReferencedContainer = "container:IronmeshAppleFileProvider.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "E6B8629705EA69D7FB1A0F29"
+               BuildableName = "IronmeshIosUiTests.xctest"
+               BlueprintName = "IronmeshIosUiTests"
+               ReferencedContainer = "container:IronmeshAppleFileProvider.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
       <CommandLineArguments>
       </CommandLineArguments>
