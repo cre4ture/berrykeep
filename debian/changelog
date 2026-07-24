@@ -1,3 +1,15 @@
+ironmesh (1.0.37-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add Natural Earth map variants, dataset import workflows, and explorer
+    pagination improvements.
+  * Add Android connection-path and request-timing diagnostics plus mobile
+    title-latency and enrollment-persistence improvements.
+  * Extend hardware reliability telemetry with signal collection, anonymous
+    aggregation, retention controls, and server-admin configuration.
+  * Roll the workspace release to 1.0.37.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 24 Jul 2026 23:03:50 +0200
+
 ironmesh (1.0.36-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Harden global rendezvous registration, relay security, and legacy client
