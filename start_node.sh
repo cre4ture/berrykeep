@@ -137,6 +137,7 @@ wait_for_screen_session_exit() {
 start_node() {
   local node_name="$1"
   local session_name bind_addr url data_dir log_file start_command
+  local server_node_binary="$REPO_ROOT/target/release/ironmesh-server-node"
 
   require_screen
   mkdir -p "$ROOT"
@@ -159,7 +160,8 @@ start_node() {
   mkdir -p "$data_dir"
 
   local run_command
-  run_command="cargo run --locked --release -p server-node"
+  # Use the binary built above so starting the node cannot trigger a second build.
+  printf -v run_command '%q' "$server_node_binary"
   if [[ -n "$MEMORY_MAX" || -n "$MEMORY_HIGH" ]]; then
     require_systemd_run
 
@@ -228,6 +230,8 @@ stop_node() {
 restart_node() {
   local node_name="$1"
 
+  # Compile before stopping the current server so a failed build leaves it running.
+  ensure_server_node_built
   stop_node "$node_name"
   start_node "$node_name"
 }
