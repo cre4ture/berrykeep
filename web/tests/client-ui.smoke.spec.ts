@@ -41,6 +41,9 @@ async function dispatchCtrlWheel(locator: Locator, deltaY: number): Promise<void
 
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
   test.setTimeout(45_000);
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+    origin: "http://127.0.0.1:4174"
+  });
   const uploadMetrics = await installClientUiMocks(page);
   const pageErrors: string[] = [];
 
@@ -60,6 +63,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Direct", { exact: true })).toBeVisible();
   await expect(page.getByText("node-alpha", { exact: true })).toBeVisible();
   await expect(page.getByText("https://node-alpha.local", { exact: true })).toBeVisible();
+  expect(uploadMetrics.diagnosticContexts()).toHaveLength(1);
+  expect(uploadMetrics.diagnosticContexts()[0]).toMatch(/^overview-refresh-\d+-\d+$/);
+  expect(uploadMetrics.diagnosticContextRequestCount()).toBe(4);
   await page.getByText("Connection paths", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Connection Paths" })).toBeVisible();
   await expect(page.getByText("Overall search state")).toBeVisible();
@@ -79,6 +85,12 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     )
   ).toBeVisible();
   await expect(page.getByText("2023-11-14T22:13:22.000Z caused by: connection refused")).toBeVisible();
+
+  await page.getByText("Settings", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
+  await expect(page.getByText("Diagnostics", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Copy last 3 minutes" }).click();
+  await expect(page.getByRole("button", { name: "Diagnostic log copied" })).toBeVisible();
 
   await page.getByText("Store", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
@@ -406,6 +418,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
       apiV1("/cluster/status"),
       apiV1("/connection-routes"),
       apiV1("/logs"),
+      apiV1("/diagnostics/log-export"),
       apiV1("/rendezvous"),
       apiV1("/store/list"),
       apiV1("/store/uploads/start")
@@ -849,6 +862,8 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const activeUploadIds = new Set<string>();
   const deletedUploadSessionIds = new Set<string>();
   const requestedPaths = new Set<string>();
+  const diagnosticContexts = new Set<string>();
+  let diagnosticContextRequestCount = 0;
   const storeEntries = options?.storeEntries ?? createMockStoreEntries();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
@@ -971,6 +986,11 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     const { pathname, searchParams } = url;
     const method = route.request().method();
     requestedPaths.add(pathname);
+    const diagnosticContext = route.request().headers()["x-ironmesh-diagnostic-context"];
+    if (diagnosticContext) {
+      diagnosticContexts.add(diagnosticContext);
+      diagnosticContextRequestCount += 1;
+    }
 
     if (pathname === apiV1("/ping") && method === "GET") {
       return json(route, {
@@ -1017,6 +1037,23 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
               "ERROR web_ui_backend health request failed: failed connecting to https://node-alpha.local/api/v1/health",
               "caused by: connection refused"
             ].join("\n")
+          }
+        ]
+      });
+    }
+
+    if (pathname === apiV1("/diagnostics/log-export") && method === "GET") {
+      return json(route, {
+        generated_at_unix: 1_700_000_003,
+        requested_window_secs: Number(searchParams.get("window_secs") ?? 180),
+        entries: [
+          {
+            captured_at_unix: 1_700_000_000,
+            line: "INFO client_sdk client transport ready"
+          },
+          {
+            captured_at_unix: 1_700_000_002,
+            line: "INFO web_ui_backend upstream JSON request finished path=/health outcome=success duration_ms=18"
           }
         ]
       });
@@ -1455,6 +1492,8 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     maxConcurrentUploadIds: () => maxConcurrentUploadIds,
     deletedUploadSessionIds: () => Array.from(deletedUploadSessionIds),
     requestedPaths: () => Array.from(requestedPaths),
+    diagnosticContexts: () => Array.from(diagnosticContexts),
+    diagnosticContextRequestCount: () => diagnosticContextRequestCount,
     restoredVersions: () => restoredVersions.slice()
   };
 }

@@ -42,7 +42,10 @@ const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
 const WEB_LATENCY_PROBE_TIMEOUT_MIN_MS: u64 = 8_000;
 const WEB_LATENCY_PROBE_TIMEOUT_CONNECT_SLACK_MS: u64 = 3_000;
 const WEB_LATENCY_PROBE_TIMEOUT_PER_REQUEST_SLACK_MS: u64 = 3_000;
+const DEFAULT_DIAGNOSTIC_LOG_WINDOW_SECS: u64 = 3 * 60;
+const MAX_DIAGNOSTIC_LOG_WINDOW_SECS: u64 = 60 * 60;
 const WEB_API_V1_PREFIX: &str = "/api/v1";
+const DIAGNOSTIC_CONTEXT_HEADER: &str = "x-ironmesh-diagnostic-context";
 pub const EMBEDDED_WEB_UI_SESSION_HEADER: &str = "x-ironmesh-web-ui-session";
 const EMBEDDED_WEB_UI_SESSION_COOKIE: &str = "ironmesh_web_ui_session";
 const EMBEDDED_WEB_UI_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -360,7 +363,7 @@ pub fn router(config: WebUiConfig) -> Router {
     }
     let log_buffer = config
         .log_buffer
-        .unwrap_or_else(|| Arc::new(LogBuffer::new(500)));
+        .unwrap_or_else(|| Arc::new(LogBuffer::new(LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY)));
     let state = WebState {
         map_perf_logging_enabled,
         map_glyphs_root: resolve_map_glyphs_root(config.map_glyphs_root),
@@ -393,6 +396,7 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/maps/fonts/{fontstack}/{range}", get(web_map_font_range))
         .route("/health", get(web_health))
         .route("/logs", get(web_logs))
+        .route("/diagnostics/log-export", get(web_diagnostic_log_export))
         .route("/snapshots", get(web_snapshots))
         .route("/versions", get(web_versions))
         .route(
@@ -450,6 +454,10 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/api/health", get(web_health))
         .route("/api/logs", get(web_logs))
+        .route(
+            "/api/diagnostics/log-export",
+            get(web_diagnostic_log_export),
+        )
         .route("/api/snapshots", get(web_snapshots))
         .route("/api/versions", get(web_versions))
         .route(
@@ -592,6 +600,10 @@ fn unix_ts_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn unix_ts() -> u64 {
+    unix_ts_ms() / 1_000
 }
 
 #[derive(Debug, Deserialize)]
@@ -752,6 +764,18 @@ struct WebLogsResponse {
     entries: Vec<LogBufferEntry>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WebDiagnosticLogExportQuery {
+    window_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebDiagnosticLogExportResponse {
+    generated_at_unix: u64,
+    requested_window_secs: u64,
+    entries: Vec<LogBufferEntry>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct WebClientRendezvousView {
     available: bool,
@@ -855,7 +879,132 @@ fn logged_error_response(
 }
 
 async fn fetch_server_json(state: &WebState, path: &str) -> Result<serde_json::Value> {
-    current_sdk(state).await.get_json_path(path).await
+    fetch_server_json_with_diagnostic_context(state, path, None).await
+}
+
+async fn fetch_server_json_with_diagnostic_context(
+    state: &WebState,
+    path: &str,
+    diagnostic_context: Option<&str>,
+) -> Result<serde_json::Value> {
+    let request_started_unix_ms = unix_ts_ms();
+    let started_at = Instant::now();
+    let sdk = current_sdk(state).await;
+    let result = sdk.get_json_path(path).await;
+    let outcome = if result.is_ok() { "success" } else { "error" };
+    let transport_diagnostics = format_transport_attempt_diagnostics(
+        &sdk.connection_route_snapshot(),
+        path,
+        request_started_unix_ms,
+    );
+    let diagnostic_context = format_diagnostic_context(diagnostic_context);
+    push_runtime_log(
+        state,
+        "INFO",
+        format!(
+            "upstream JSON request finished{diagnostic_context} path={path} outcome={outcome} duration_ms={} {transport_diagnostics}",
+            started_at.elapsed().as_millis(),
+        ),
+    );
+    result
+}
+
+fn diagnostic_context_from_headers(headers: &HeaderMap) -> Option<String> {
+    let context = headers
+        .get(DIAGNOSTIC_CONTEXT_HEADER)?
+        .to_str()
+        .ok()?
+        .trim();
+    (!context.is_empty()
+        && context.len() <= 96
+        && context
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')))
+    .then(|| context.to_string())
+}
+
+fn format_diagnostic_context(diagnostic_context: Option<&str>) -> String {
+    diagnostic_context
+        .map(|context| format!(" context={context}"))
+        .unwrap_or_default()
+}
+
+fn format_transport_attempt_diagnostics(
+    snapshot: &ClientConnectionRouteSnapshot,
+    path: &str,
+    request_started_unix_ms: u64,
+) -> String {
+    let mut attempts = snapshot
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| {
+            endpoint
+                .recent_attempts
+                .iter()
+                .filter(move |attempt| {
+                    attempt.started_unix_ms >= request_started_unix_ms
+                        && attempt.method == "GET"
+                        && request_attempt_matches_path(&attempt.url, path)
+                })
+                .map(move |attempt| (endpoint, attempt))
+        })
+        .collect::<Vec<_>>();
+    attempts.sort_by_key(|(_, attempt)| attempt.started_unix_ms);
+
+    if attempts.is_empty() {
+        return "transport_attempts=none".to_string();
+    }
+
+    let details = attempts
+        .into_iter()
+        .map(|(endpoint, attempt)| {
+            format!(
+                "endpoint_index={} route_kind={:?} active={} outcome={} status_code={:?} total_us={:?} server_us={:?} transport_overhead_us={:?} network_transfer_us={:?} session_setup_us={} relay_pairing_us={} session_reused={} timeout_ms={:?} error={:?}",
+                endpoint.index,
+                endpoint.path_kind,
+                endpoint.active,
+                attempt.outcome,
+                attempt.status_code,
+                attempt.total_duration_us,
+                attempt.server_processing_duration_us,
+                attempt.transport_overhead_us,
+                attempt.network_transfer_duration_us,
+                attempt.session_setup_duration_us,
+                attempt.relay_pairing_duration_us,
+                attempt.session_reused,
+                attempt.timeout_ms,
+                attempt.error,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!("transport_attempts=[{details}]")
+}
+
+fn request_attempt_matches_path(attempt_url: &str, path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    Url::parse(attempt_url)
+        .map(|url| url.path().trim_end_matches('/').ends_with(path))
+        .unwrap_or_else(|_| attempt_url.contains(path))
+}
+
+fn log_local_diagnostic_request(
+    state: &WebState,
+    diagnostic_context: Option<&str>,
+    path: &str,
+    started_at: Instant,
+) {
+    let Some(diagnostic_context) = diagnostic_context else {
+        return;
+    };
+    push_runtime_log(
+        state,
+        "INFO",
+        format!(
+            "local web UI request finished context={diagnostic_context} path={path} duration_ms={}",
+            started_at.elapsed().as_millis()
+        ),
+    );
 }
 
 async fn current_sdk(state: &WebState) -> IronMeshClient {
@@ -1817,7 +1966,10 @@ async fn web_static_favicon() -> Response {
         .into_response()
 }
 
-async fn web_ping(State(state): State<WebState>) -> impl IntoResponse {
+async fn web_ping(State(state): State<WebState>, headers: HeaderMap) -> impl IntoResponse {
+    let started_at = Instant::now();
+    let diagnostic_context = diagnostic_context_from_headers(&headers);
+    log_local_diagnostic_request(&state, diagnostic_context.as_deref(), "/ping", started_at);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1844,8 +1996,39 @@ async fn web_logs(
         .into_response()
 }
 
-async fn web_health(State(state): State<WebState>) -> impl IntoResponse {
-    match fetch_server_json(&state, "/health").await {
+async fn web_diagnostic_log_export(
+    State(state): State<WebState>,
+    Query(query): Query<WebDiagnosticLogExportQuery>,
+) -> impl IntoResponse {
+    let requested_window_secs = query
+        .window_secs
+        .unwrap_or(DEFAULT_DIAGNOSTIC_LOG_WINDOW_SECS)
+        .clamp(1, MAX_DIAGNOSTIC_LOG_WINDOW_SECS);
+    let generated_at_unix = unix_ts();
+    let entries = state
+        .log_buffer
+        .recent_since(generated_at_unix.saturating_sub(requested_window_secs));
+
+    (
+        StatusCode::OK,
+        Json(WebDiagnosticLogExportResponse {
+            generated_at_unix,
+            requested_window_secs,
+            entries,
+        }),
+    )
+        .into_response()
+}
+
+async fn web_health(State(state): State<WebState>, headers: HeaderMap) -> impl IntoResponse {
+    let diagnostic_context = diagnostic_context_from_headers(&headers);
+    match fetch_server_json_with_diagnostic_context(
+        &state,
+        "/health",
+        diagnostic_context.as_deref(),
+    )
+    .await
+    {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => logged_error_response(
             &state,
@@ -2437,8 +2620,18 @@ fn is_safe_glyph_range_segment(value: &str) -> bool {
         && end.chars().all(|ch| ch.is_ascii_digit())
 }
 
-async fn web_cluster_status(State(state): State<WebState>) -> impl IntoResponse {
-    match fetch_server_json(&state, "/cluster/status").await {
+async fn web_cluster_status(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let diagnostic_context = diagnostic_context_from_headers(&headers);
+    match fetch_server_json_with_diagnostic_context(
+        &state,
+        "/cluster/status",
+        diagnostic_context.as_deref(),
+    )
+    .await
+    {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => logged_error_response(
             &state,
@@ -3139,8 +3332,17 @@ async fn web_store_stream_binary(
         .into_response()
 }
 
-async fn web_rendezvous(State(state): State<WebState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(build_rendezvous_view(&state).await)).into_response()
+async fn web_rendezvous(State(state): State<WebState>, headers: HeaderMap) -> impl IntoResponse {
+    let started_at = Instant::now();
+    let diagnostic_context = diagnostic_context_from_headers(&headers);
+    let view = build_rendezvous_view(&state).await;
+    log_local_diagnostic_request(
+        &state,
+        diagnostic_context.as_deref(),
+        "/rendezvous",
+        started_at,
+    );
+    (StatusCode::OK, Json(view)).into_response()
 }
 
 async fn web_connection_routes(State(state): State<WebState>) -> impl IntoResponse {
@@ -3366,13 +3568,15 @@ async fn web_update_rendezvous(
 #[cfg(test)]
 mod tests {
     use super::{
-        EMBEDDED_WEB_UI_SESSION_COOKIE, EMBEDDED_WEB_UI_SESSION_HEADER,
+        DIAGNOSTIC_CONTEXT_HEADER, EMBEDDED_WEB_UI_SESSION_COOKIE, EMBEDDED_WEB_UI_SESSION_HEADER,
         EmbeddedWebUiSessionAuthorization, ErrorResponseBody, WebUiConfig, error_response,
         normalize_store_restore_path, router, web_latency_probe_timeout,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use client_sdk::{IronMeshClient, LatencyProbeConfig};
+    use common::logging::LogBuffer;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::task::JoinHandle;
 
@@ -3545,5 +3749,104 @@ mod tests {
         assert_eq!(cookie_authenticated.status(), StatusCode::OK);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn diagnostic_log_export_returns_the_requested_retained_time_window() {
+        let buffer = Arc::new(LogBuffer::new(8));
+        let now = super::unix_ts();
+        buffer.push_with_timestamp(
+            now.saturating_sub(600),
+            "outside requested window".to_string(),
+        );
+        buffer.push_with_timestamp(now, "inside requested window".to_string());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have a local address");
+        let app = router(
+            WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
+                .with_log_buffer(Arc::clone(&buffer)),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "http://{address}/api/v1/diagnostics/log-export?window_secs=180"
+            ))
+            .send()
+            .await
+            .expect("diagnostic log export request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .expect("diagnostic log export should return JSON");
+        assert_eq!(payload["requested_window_secs"], 180);
+        assert_eq!(payload["entries"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["entries"][0]["line"], "inside requested window");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn health_diagnostic_log_includes_the_dashboard_context_and_transport_attempt() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream listener should have a local address");
+        let upstream = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/v1/health",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({ "ok": true })) }),
+            );
+            let _ = axum::serve(upstream_listener, app).await;
+        });
+
+        let buffer = Arc::new(LogBuffer::new(32));
+        let client = IronMeshClient::from_direct_base_url(format!("http://{upstream_address}"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web UI listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("web UI listener should have a local address");
+        let app = router(WebUiConfig::from_client(client).with_log_buffer(Arc::clone(&buffer)));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/api/v1/health"))
+            .header(DIAGNOSTIC_CONTEXT_HEADER, "overview-refresh-123")
+            .send()
+            .await
+            .expect("health request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let log_entry = buffer
+            .recent(32)
+            .into_iter()
+            .find(|entry| entry.line.contains("upstream JSON request finished"))
+            .expect("health request should create a transport diagnostic entry");
+        assert!(log_entry.line.contains("context=overview-refresh-123"));
+        assert!(log_entry.line.contains("path=/health"));
+        assert!(
+            log_entry
+                .line
+                .contains("transport_attempts=[endpoint_index=0")
+        );
+        assert!(log_entry.line.contains("total_us=Some("));
+
+        server.abort();
+        upstream.abort();
     }
 }

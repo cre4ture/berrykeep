@@ -51,6 +51,8 @@ pub struct LogBuffer {
 }
 
 impl LogBuffer {
+    pub const DEFAULT_DIAGNOSTIC_CAPACITY: usize = 2_000;
+
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: StdMutex::new(VecDeque::with_capacity(max_entries.max(1))),
@@ -86,6 +88,24 @@ impl LogBuffer {
         let keep = limit.max(1);
         let skip = entries.len().saturating_sub(keep);
         entries.iter().skip(skip).cloned().collect()
+    }
+
+    /// Returns every retained entry captured at or after `earliest_unix`.
+    ///
+    /// This intentionally does not apply an entry-count limit. Consumers that
+    /// export a diagnostic time window should receive the complete retained
+    /// context for that window, subject only to the buffer's bounded capacity.
+    pub fn recent_since(&self, earliest_unix: u64) -> Vec<LogBufferEntry> {
+        let entries = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        entries
+            .iter()
+            .filter(|entry| entry.captured_at_unix >= earliest_unix)
+            .cloned()
+            .collect()
     }
 }
 
@@ -149,4 +169,40 @@ fn unix_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LogBuffer;
+
+    #[test]
+    fn recent_since_returns_all_entries_in_the_requested_time_window() {
+        let buffer = LogBuffer::new(8);
+        buffer.push_with_timestamp(100, "before window".to_string());
+        buffer.push_with_timestamp(180, "at window start".to_string());
+        buffer.push_with_timestamp(240, "inside window".to_string());
+
+        let entries = buffer.recent_since(180);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].line, "at window start");
+        assert_eq!(entries[1].line, "inside window");
+    }
+
+    #[test]
+    fn diagnostic_capacity_keeps_a_larger_bounded_context() {
+        let buffer = LogBuffer::new(LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY);
+        for index in 0..=LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY {
+            buffer.push_with_timestamp(index as u64, index.to_string());
+        }
+
+        let entries = buffer.recent(LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY + 1);
+
+        assert_eq!(entries.len(), LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY);
+        assert_eq!(entries.first().map(|entry| entry.line.as_str()), Some("1"));
+        assert_eq!(
+            entries.last().map(|entry| entry.line.as_str()),
+            Some("2000")
+        );
+    }
 }

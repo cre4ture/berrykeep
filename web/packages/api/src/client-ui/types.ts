@@ -189,6 +189,12 @@ export type ClientRendezvousView = {
   endpoint_statuses: ClientRendezvousEndpointStatus[];
 };
 
+export type ClientDiagnosticLogExport = {
+  generated_at_unix: number;
+  requested_window_secs: number;
+  entries: ServerLogEntry[];
+};
+
 export type StorePutResponse = {
   key: string;
   size_bytes: number;

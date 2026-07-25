@@ -220,7 +220,11 @@ fn init_android_tracing() {
 
 fn android_web_log_buffer() -> Arc<common::logging::LogBuffer> {
     static LOG_BUFFER: OnceLock<Arc<common::logging::LogBuffer>> = OnceLock::new();
-    Arc::clone(LOG_BUFFER.get_or_init(|| Arc::new(common::logging::LogBuffer::new(500))))
+    Arc::clone(LOG_BUFFER.get_or_init(|| {
+        Arc::new(common::logging::LogBuffer::new(
+            common::logging::LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY,
+        ))
+    }))
 }
 
 struct WebUiServer {

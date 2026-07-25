@@ -3,6 +3,7 @@ import type { GalleryMapConfigurationResponse } from "../shared/map-config";
 import type { StoreIndexMedia } from "../shared/store-index";
 import type {
   ClientConnectionRouteSnapshot,
+  ClientDiagnosticLogExport,
   ClientLatencyTestResponse,
   ClientRendezvousView,
   ClientUiPingResponse,
@@ -40,13 +41,20 @@ export type BinaryUploadOptions = {
 };
 
 const API_V1_PREFIX = "/api/v1";
+const DIAGNOSTIC_CONTEXT_HEADER = "x-ironmesh-diagnostic-context";
+
+export type ClientDiagnosticRequestOptions = {
+  diagnosticContext?: string;
+};
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
 }
 
-export async function getClientPing(): Promise<ClientUiPingResponse> {
-  return fetchJson<ClientUiPingResponse>(apiV1("/ping"));
+export async function getClientPing(
+  options?: ClientDiagnosticRequestOptions
+): Promise<ClientUiPingResponse> {
+  return fetchJson<ClientUiPingResponse>(apiV1("/ping"), diagnosticRequestInit(options));
 }
 
 export async function getClientGalleryMapConfiguration(): Promise<GalleryMapConfigurationResponse> {
@@ -55,12 +63,12 @@ export async function getClientGalleryMapConfiguration(): Promise<GalleryMapConf
   });
 }
 
-export async function getClientHealth(): Promise<JsonObject> {
-  return fetchJson<JsonObject>(apiV1("/health"));
+export async function getClientHealth(options?: ClientDiagnosticRequestOptions): Promise<JsonObject> {
+  return fetchJson<JsonObject>(apiV1("/health"), diagnosticRequestInit(options));
 }
 
-export async function getClientClusterStatus(): Promise<JsonObject> {
-  return fetchJson<JsonObject>(apiV1("/cluster/status"));
+export async function getClientClusterStatus(options?: ClientDiagnosticRequestOptions): Promise<JsonObject> {
+  return fetchJson<JsonObject>(apiV1("/cluster/status"), diagnosticRequestInit(options));
 }
 
 export async function getClientConnectionRoutes(): Promise<ClientConnectionRouteSnapshot> {
@@ -81,14 +89,42 @@ export async function getClientRecentLogs(limit = 200): Promise<LogsResponse> {
   });
 }
 
-export async function getClientRendezvous(): Promise<ClientRendezvousView> {
-  return fetchJson<ClientRendezvousView>(apiV1("/rendezvous"));
+export async function exportClientDiagnosticLogs(windowSecs = 180): Promise<ClientDiagnosticLogExport> {
+  const resolvedWindowSecs = Number.isFinite(windowSecs)
+    ? Math.max(1, Math.min(3600, Math.trunc(windowSecs)))
+    : 180;
+  return fetchJson<ClientDiagnosticLogExport>(
+    `${apiV1("/diagnostics/log-export")}?window_secs=${resolvedWindowSecs}`,
+    {
+      credentials: "same-origin",
+      cache: "no-store"
+    }
+  );
+}
+
+export async function getClientRendezvous(
+  options?: ClientDiagnosticRequestOptions
+): Promise<ClientRendezvousView> {
+  return fetchJson<ClientRendezvousView>(apiV1("/rendezvous"), diagnosticRequestInit(options));
 }
 
 export async function refreshClientRendezvous(): Promise<ClientRendezvousView> {
   return fetchJson<ClientRendezvousView>(apiV1("/rendezvous/refresh"), {
     method: "POST"
   });
+}
+
+function diagnosticRequestInit(options?: ClientDiagnosticRequestOptions): RequestInit | undefined {
+  const diagnosticContext = options?.diagnosticContext?.trim();
+  if (!diagnosticContext) {
+    return undefined;
+  }
+
+  return {
+    headers: {
+      [DIAGNOSTIC_CONTEXT_HEADER]: diagnosticContext
+    }
+  };
 }
 
 export async function runClientLatencyTest(request?: {
