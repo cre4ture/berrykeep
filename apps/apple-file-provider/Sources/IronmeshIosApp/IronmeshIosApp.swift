@@ -16,12 +16,47 @@ struct IronmeshIosApp: App {
 
     var body: some Scene {
         WindowGroup {
-            IronmeshIosRootView()
-                .environmentObject(model)
-                .task {
-                    model.activate()
+            if let session = IronmeshUiTestWebUiSession.fromLaunchEnvironment() {
+                if IronmeshUiTestWebUiSession.embeddedSurface == .galleryMap {
+                    IronmeshGalleryMapContent(
+                        session: session,
+                        isStarting: false,
+                        statusMessage: "",
+                        onStart: {}
+                    )
+                } else {
+                    IronmeshHostedWebView(session: session)
                 }
+            } else {
+                IronmeshIosRootView()
+                    .environmentObject(model)
+                    .task {
+                        model.activate()
+                    }
+            }
         }
+    }
+}
+
+private enum IronmeshUiTestWebUiSession {
+    static var embeddedSurface: IronmeshEmbeddedSurface? {
+        IronmeshEmbeddedSurface(
+            rawValue: ProcessInfo.processInfo.environment["IRONMESH_UI_TEST_EMBEDDED_SURFACE"] ?? ""
+        )
+    }
+
+    static func fromLaunchEnvironment() -> AppleWebUiSession? {
+        guard let url = ProcessInfo.processInfo.environment["IRONMESH_UI_TEST_WEB_UI_URL"],
+              let data = try? JSONSerialization.data(
+                  withJSONObject: [
+                      "url": url,
+                      "authorization": "gallery-map-simulator-test",
+                  ]
+              ),
+              let responseJSON = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return try? AppleWebUiSession(responseJSON: responseJSON)
     }
 }
 
@@ -52,6 +87,7 @@ private struct IronmeshIosRootView: View {
         .onChange(of: scenePhase) { phase in
             if phase != .active {
                 model.closeWebUI()
+                model.closeGalleryMap()
             }
         }
     }
@@ -70,6 +106,11 @@ private struct IronmeshMainShellView: View {
                     Label("Library", systemImage: "books.vertical")
                 }
 
+            IronmeshGalleryMapView()
+                .tabItem {
+                    Label("Gallery Map", systemImage: "map")
+                }
+
             IronmeshFilesView()
                 .tabItem {
                     Label("Files", systemImage: "folder.badge.gearshape")
@@ -81,6 +122,94 @@ private struct IronmeshMainShellView: View {
                 }
         }
     }
+}
+
+private enum IronmeshEmbeddedSurface: String {
+    case galleryMap = "gallery_map"
+}
+
+private struct IronmeshGalleryMapView: View {
+    @EnvironmentObject private var model: IronmeshBrowserModel
+
+    var body: some View {
+        IronmeshGalleryMapContent(
+            session: model.galleryMapPresentation?.session,
+            isStarting: model.isBusy,
+            statusMessage: model.statusText,
+            onStart: model.openGalleryMap
+        )
+        .onDisappear {
+            model.closeGalleryMap()
+        }
+    }
+}
+
+private struct IronmeshGalleryMapContent: View {
+    let session: AppleWebUiSession?
+    let isStarting: Bool
+    let statusMessage: String
+    let onStart: () -> Void
+
+    var body: some View {
+        if let session, let galleryMapSession = galleryMapWebUiSession(from: session) {
+            IronmeshHostedWebView(session: galleryMapSession)
+                .ignoresSafeArea()
+        } else {
+            galleryMapStartCard
+        }
+    }
+
+    private var galleryMapStartCard: some View {
+        VStack {
+            Spacer()
+            IronmeshCard(
+                title: "Gallery Map",
+                subtitle: isStarting
+                    ? "Starting the embedded gallery map."
+                    : "Open the shared gallery map directly inside the app."
+            ) {
+                if !statusMessage.isEmpty {
+                    Text(statusMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                if isStarting {
+                    ProgressView()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Button("Open gallery map", action: onStart)
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            Spacer()
+        }
+        .padding(16)
+        .background(Color(uiColor: .systemGroupedBackground))
+        .accessibilityIdentifier("ironmesh-gallery-map-start")
+    }
+}
+
+private func galleryMapWebUiSession(from session: AppleWebUiSession) -> AppleWebUiSession? {
+    guard var components = URLComponents(url: session.url, resolvingAgainstBaseURL: false) else {
+        return nil
+    }
+    var queryItems = components.queryItems ?? []
+    queryItems.removeAll { $0.name == "embedded" }
+    queryItems.append(URLQueryItem(name: "embedded", value: IronmeshEmbeddedSurface.galleryMap.rawValue))
+    components.queryItems = queryItems
+
+    guard let url = components.url,
+          let data = try? JSONSerialization.data(
+              withJSONObject: [
+                  "url": url.absoluteString,
+                  "authorization": session.authorization,
+              ]
+          ),
+          let responseJSON = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+    return try? AppleWebUiSession(responseJSON: responseJSON)
 }
 
 private struct IronmeshOnboardingGateView: View {
@@ -1188,6 +1317,7 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.accessibilityIdentifier = "ironmesh-hosted-web-ui"
         webView.allowsLinkPreview = false
         webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView

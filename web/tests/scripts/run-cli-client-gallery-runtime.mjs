@@ -8,6 +8,7 @@ const repoRoot = resolve(process.cwd(), "..");
 const binaryPath = cargoDebugBinaryPath(repoRoot, "ironmesh");
 const webUiPort = 18081;
 const upstreamPort = 18082;
+const webUiBindAddress = process.env.IRONMESH_GALLERY_RUNTIME_BIND ?? "127.0.0.1";
 const upstreamOrigin = `http://127.0.0.1:${upstreamPort}`;
 const mapManifestKey = "sys/maps/runtime-gallery.mbtiles.manifest.json";
 const mapPartKey = "sys/maps/runtime-gallery.mbtiles.part-000000";
@@ -251,7 +252,7 @@ upstream.listen(upstreamPort, "127.0.0.1", () => {
       upstreamOrigin,
       "serve-web",
       "--bind",
-      `127.0.0.1:${webUiPort}`
+      `${webUiBindAddress}:${webUiPort}`
     ],
     {
       cwd: repoRoot,

@@ -97,6 +97,8 @@ type GalleryBasemapMapProps = {
   entries: GalleryBasemapMapEntry[];
   hiddenOnMapCount: number;
   isFullscreen: boolean;
+  allowFullscreenPortal: boolean;
+  fullscreenViewportHeight?: "100dvh";
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest | null;
   onSelectPath: (path: string, visiblePaths: string[]) => void;
@@ -161,6 +163,8 @@ export function GalleryBasemapMap({
   entries,
   hiddenOnMapCount,
   isFullscreen,
+  allowFullscreenPortal,
+  fullscreenViewportHeight,
   selectedPath,
   getMarkerRequest,
   onSelectPath,
@@ -173,7 +177,7 @@ export function GalleryBasemapMap({
   const cameraStateRef = useRef<MapCameraState | null>(null);
   const viewportFrameRef = useRef<number | null>(null);
   const fullscreenPortalTarget =
-    isFullscreen && typeof document !== "undefined" ? document.body : null;
+    isFullscreen && allowFullscreenPortal && typeof document !== "undefined" ? document.body : null;
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
@@ -570,7 +574,9 @@ export function GalleryBasemapMap({
         inset: isFullscreen ? 0 : undefined,
         zIndex: isFullscreen ? 150 : undefined,
         width: isFullscreen ? "100vw" : undefined,
-        height: isFullscreen ? "100dvh" : undefined,
+        // Android WebView can resolve viewport units to zero during this state.
+        // With no explicit height, the fixed element fills its `inset: 0` bounds.
+        height: isFullscreen ? fullscreenViewportHeight : undefined,
         aspectRatio: isFullscreen ? undefined : "16 / 9",
         overflow: "hidden",
         borderRadius: isFullscreen ? 0 : "calc(var(--mantine-radius-md) - 2px)",

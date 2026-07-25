@@ -11,6 +11,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import io.ironmesh.android.data.EmbeddedWebUiSession
 
 private const val EMBEDDED_WEB_UI_SESSION_HEADER = "X-IronMesh-Web-Ui-Session"
+private const val EMBEDDED_WEB_UI_CLIENT_PARAMETER = "embedded_client"
+private const val ANDROID_WEB_UI_CLIENT = "android"
 
 @Composable
 fun IronmeshEmbeddedWebUi(
@@ -18,17 +20,24 @@ fun IronmeshEmbeddedWebUi(
     modifier: Modifier = Modifier,
     onCreated: ((WebView) -> Unit)? = null,
 ) {
+    val embeddedSession = session.withUrl(
+        Uri.parse(session.url)
+            .buildUpon()
+            .appendQueryParameter(EMBEDDED_WEB_UI_CLIENT_PARAMETER, ANDROID_WEB_UI_CLIENT)
+            .build()
+            .toString(),
+    )
     AndroidView(
         modifier = modifier,
         factory = { context ->
             WebView(context).apply {
-                configureEmbeddedWebUi(session)
+                configureEmbeddedWebUi(embeddedSession)
                 onCreated?.invoke(this)
             }
         },
         update = { webView ->
-            if (webView.url != session.url) {
-                webView.loadEmbeddedWebUi(session)
+            if (webView.url != embeddedSession.url) {
+                webView.loadEmbeddedWebUi(embeddedSession)
             }
         },
     )

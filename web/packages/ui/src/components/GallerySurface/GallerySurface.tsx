@@ -2119,6 +2119,9 @@ function GalleryMapPanel({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const pushedFullscreenHistoryRef = useRef(false);
   const toggleFullscreen = () => setIsFullscreen((current) => !current);
+  const usesAndroidEmbeddedClient =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("embedded_client") === "android";
   const switchToGrid = () => {
     if (isFullscreen && pushedFullscreenHistoryRef.current && typeof window !== "undefined") {
       window.history.back();
@@ -2157,9 +2160,11 @@ function GalleryMapPanel({
             [GALLERY_MAP_FULLSCREEN_HISTORY_KEY]: true
           };
 
-    window.history.pushState(historyState, "", window.location.href);
-    pushedFullscreenHistoryRef.current = true;
-    document.body.style.overflow = "hidden";
+    if (!usesAndroidEmbeddedClient) {
+      window.history.pushState(historyState, "", window.location.href);
+      pushedFullscreenHistoryRef.current = true;
+      document.body.style.overflow = "hidden";
+    }
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("popstate", handlePopState);
 
@@ -2168,7 +2173,7 @@ function GalleryMapPanel({
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("popstate", handlePopState);
     };
-  }, [isFullscreen]);
+  }, [isFullscreen, usesAndroidEmbeddedClient]);
 
   if (!activeBasemap) {
     return (
@@ -2185,6 +2190,8 @@ function GalleryMapPanel({
       entries={entries}
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
+      allowFullscreenPortal={!usesAndroidEmbeddedClient}
+      fullscreenViewportHeight={usesAndroidEmbeddedClient ? undefined : "100dvh"}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
@@ -2199,6 +2206,8 @@ function GalleryMapPanel({
       entries={entries}
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
+      allowFullscreenPortal={!usesAndroidEmbeddedClient}
+      fullscreenViewportHeight={usesAndroidEmbeddedClient ? undefined : "100dvh"}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
@@ -2208,7 +2217,9 @@ function GalleryMapPanel({
     />
   );
   const fullscreenPortalTarget =
-    isFullscreen && typeof document !== "undefined" ? document.body : null;
+    isFullscreen && !usesAndroidEmbeddedClient && typeof document !== "undefined"
+      ? document.body
+      : null;
   const mapDisplayControls = (
     <Card data-gallery-map-display-controls="true" withBorder radius="md" padding="sm">
       <Group align="flex-end" gap="sm" wrap="wrap" role="group" aria-label="Gallery map display options">
@@ -2248,6 +2259,11 @@ function GalleryMapPanel({
             </Button>
           </Group>
         </Stack>
+        {isFullscreen && usesAndroidEmbeddedClient ? (
+          <Button variant="default" onClick={toggleFullscreen}>
+            Exit fullscreen map
+          </Button>
+        ) : null}
       </Group>
     </Card>
   );
@@ -2348,6 +2364,8 @@ type GalleryWorldMapProps = {
   entries: GalleryEntry[];
   hiddenOnMapCount: number;
   isFullscreen: boolean;
+  allowFullscreenPortal: boolean;
+  fullscreenViewportHeight?: "100dvh";
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
   onSelectPath: (path: string, visiblePaths: string[]) => void;
@@ -2358,6 +2376,8 @@ function GalleryWorldMap({
   entries,
   hiddenOnMapCount,
   isFullscreen,
+  allowFullscreenPortal,
+  fullscreenViewportHeight,
   selectedPath,
   getMarkerRequest,
   onSelectPath,
@@ -2367,7 +2387,7 @@ function GalleryWorldMap({
   const { ref: mapViewportRef, width: mapViewportWidth, height: mapViewportHeight } =
     useElementSize();
   const fullscreenPortalTarget =
-    isFullscreen && typeof document !== "undefined" ? document.body : null;
+    isFullscreen && allowFullscreenPortal && typeof document !== "undefined" ? document.body : null;
   const worldMapMarkerPoints = useMemo<GalleryWorldMarkerPoint[]>(() => {
     const width = mapViewportWidth > 0 ? mapViewportWidth : 1000;
     const height = mapViewportHeight > 0 ? mapViewportHeight : 560;
@@ -2412,7 +2432,9 @@ function GalleryWorldMap({
         inset: isFullscreen ? 0 : undefined,
         zIndex: isFullscreen ? 150 : undefined,
         width: isFullscreen ? "100vw" : undefined,
-        height: isFullscreen ? "100dvh" : undefined,
+        // Android WebView can resolve viewport units to zero during this state.
+        // With no explicit height, the fixed element fills its `inset: 0` bounds.
+        height: isFullscreen ? fullscreenViewportHeight : undefined,
         aspectRatio: isFullscreen ? undefined : "16 / 9",
         overflow: "hidden",
         borderRadius: isFullscreen ? 0 : "calc(var(--mantine-radius-md) - 2px)",

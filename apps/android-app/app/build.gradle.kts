@@ -396,6 +396,7 @@ dependencies {
     implementation("com.squareup.moshi:moshi-kotlin:1.15.1")
 
     androidTestImplementation("org.jetbrains.kotlin:kotlin-stdlib:1.9.24")
+    androidTestImplementation("androidx.test:core-ktx:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.1")
     testImplementation("junit:junit:4.13.2")
