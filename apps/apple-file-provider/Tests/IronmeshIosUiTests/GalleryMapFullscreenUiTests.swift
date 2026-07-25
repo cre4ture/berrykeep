@@ -2,10 +2,21 @@ import XCTest
 
 final class GalleryMapFullscreenUiTests: XCTestCase {
     @MainActor
+    func testFullscreenGalleryMapKeepsTheDirectEmbeddingVisible() {
+        let app = launchApp(embeddedSurface: "gallery_map")
+        let webView = app.webViews["ironmesh-hosted-web-ui"]
+        XCTAssertTrue(webView.waitForExistence(timeout: 45), "The directly embedded Gallery Map should load")
+
+        let fullscreenButton = element(in: webView, labelled: "Fullscreen map")
+        XCTAssertTrue(fullscreenButton.waitForExistence(timeout: 45), "The direct Gallery Map should expose fullscreen")
+        fullscreenButton.tap()
+
+        assertFullscreenMapRemainsVisible(in: webView)
+    }
+
+    @MainActor
     func testFullscreenGalleryMapKeepsTheClientWebUIVisible() {
-        let app = XCUIApplication()
-        app.launchEnvironment["IRONMESH_UI_TEST_WEB_UI_URL"] = galleryRuntimeURL
-        app.launch()
+        let app = launchApp()
 
         let webView = app.webViews["ironmesh-hosted-web-ui"]
         XCTAssertTrue(webView.waitForExistence(timeout: 45), "The embedded Client UI should load")
@@ -32,6 +43,22 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         }
         fullscreenButton.tap()
 
+        assertFullscreenMapRemainsVisible(in: webView)
+    }
+
+    @MainActor
+    private func launchApp(embeddedSurface: String? = nil) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchEnvironment["IRONMESH_UI_TEST_WEB_UI_URL"] = galleryRuntimeURL
+        if let embeddedSurface {
+            app.launchEnvironment["IRONMESH_UI_TEST_EMBEDDED_SURFACE"] = embeddedSurface
+        }
+        app.launch()
+        return app
+    }
+
+    @MainActor
+    private func assertFullscreenMapRemainsVisible(in webView: XCUIElement) {
         let fullscreenMap = element(in: webView, labelled: "Geotagged gallery map")
         XCTAssertTrue(fullscreenMap.waitForExistence(timeout: 45), "The fullscreen map should remain visible")
         XCTAssertGreaterThan(

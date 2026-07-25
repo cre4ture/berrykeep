@@ -146,6 +146,7 @@ final class IronmeshBrowserModel: ObservableObject {
     @Published var connectionRoutesErrorMessage: String?
     @Published var isRefreshingConnectionRoutes = false
     @Published var webUIPresentation: IronmeshWebUIPresentation?
+    @Published var galleryMapPresentation: IronmeshWebUIPresentation?
     @Published var titleLatencyMonitorSettings = AppleTitleLatencyMonitorSettings()
     @Published var titleLatencyStatus = AppleTitleLatencyStatus()
 
@@ -992,6 +993,9 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func openWebUI() {
+        if galleryMapPresentation != nil {
+            closeGalleryMap()
+        }
         guard let configuration = draft.connectionConfiguration else {
             let message = "A bootstrap bundle or direct route is required."
             lastErrorMessage = message
@@ -1021,7 +1025,57 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func closeWebUI() {
+        guard webUIPresentation != nil else {
+            return
+        }
         webUIPresentation = nil
+        do {
+            try remoteSession.stopWebUI()
+        } catch {
+            lastErrorMessage = error.localizedDescription
+        }
+    }
+
+    func openGalleryMap() {
+        guard galleryMapPresentation == nil else {
+            return
+        }
+        if webUIPresentation != nil {
+            closeWebUI()
+        }
+        guard let configuration = draft.connectionConfiguration else {
+            let message = "A bootstrap bundle or direct route is required."
+            lastErrorMessage = message
+            statusText = message
+            return
+        }
+
+        let remoteSession = remoteSession
+        beginOperation()
+        Task {
+            defer { endOperation() }
+
+            do {
+                let session = try await Task.detached(priority: .userInitiated) {
+                    try remoteSession.startWebUI(configuration: configuration)
+                }.value
+                galleryMapPresentation = IronmeshWebUIPresentation(session: session)
+                lastErrorMessage = nil
+                statusText = "Opened embedded gallery map."
+                addAction("Opened gallery map", detail: "Started isolated loopback session.")
+            } catch {
+                lastErrorMessage = error.localizedDescription
+                statusText = error.localizedDescription
+                addAction("Gallery map failed", detail: error.localizedDescription)
+            }
+        }
+    }
+
+    func closeGalleryMap() {
+        guard galleryMapPresentation != nil else {
+            return
+        }
+        galleryMapPresentation = nil
         do {
             try remoteSession.stopWebUI()
         } catch {
