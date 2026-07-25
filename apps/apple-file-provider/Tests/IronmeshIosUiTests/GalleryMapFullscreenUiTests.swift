@@ -17,25 +17,10 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
 
     @MainActor
     func testFullscreenGalleryMapKeepsTheClientWebUIVisible() {
-        let app = launchApp()
+        let app = launchApp(webUIURL: "\(galleryRuntimeURL)?page=gallery&gallery_view=map")
 
         let webView = app.webViews["ironmesh-hosted-web-ui"]
         XCTAssertTrue(webView.waitForExistence(timeout: 45), "The embedded Client UI should load")
-
-        let navigationMenu = webView.buttons["Toggle navigation menu"]
-        XCTAssertTrue(navigationMenu.waitForExistence(timeout: 45), "The Client UI navigation should load")
-        navigationMenu.tap()
-
-        let galleryNavigationItem = webView.staticTexts["Gallery"]
-        XCTAssertTrue(galleryNavigationItem.waitForExistence(timeout: 45), "The Gallery navigation item should load")
-        galleryNavigationItem.tap()
-
-        let mapButton = element(in: webView, labelled: "Map")
-        guard mapButton.waitForExistence(timeout: 45) else {
-            XCTFail("The Gallery map button should load")
-            return
-        }
-        mapButton.tap()
 
         let fullscreenButton = element(in: webView, labelled: "Fullscreen map")
         guard fullscreenButton.waitForExistence(timeout: 45) else {
@@ -49,9 +34,12 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
     }
 
     @MainActor
-    private func launchApp(embeddedSurface: String? = nil) -> XCUIApplication {
+    private func launchApp(
+        embeddedSurface: String? = nil,
+        webUIURL: String? = nil
+    ) -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchEnvironment["IRONMESH_UI_TEST_WEB_UI_URL"] = galleryRuntimeURL
+        app.launchEnvironment["IRONMESH_UI_TEST_WEB_UI_URL"] = webUIURL ?? galleryRuntimeURL
         if let embeddedSurface {
             app.launchEnvironment["IRONMESH_UI_TEST_EMBEDDED_SURFACE"] = embeddedSurface
         }

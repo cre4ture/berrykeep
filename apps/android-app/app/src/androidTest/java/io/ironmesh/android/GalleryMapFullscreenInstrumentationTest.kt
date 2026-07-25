@@ -228,7 +228,10 @@ class GalleryMapFullscreenInstrumentationTest {
     private fun hasButton(label: String): String =
         """
         (() => [...document.querySelectorAll('button')]
-          .some((button) => button.textContent?.trim() === '$label'))()
+          .some((button) =>
+            button.textContent?.trim() === '$label' ||
+            button.getAttribute('aria-label') === '$label'
+          ))()
         """.trimIndent()
 
     private fun clickButton(webView: WebView, label: String) {
@@ -237,7 +240,10 @@ class GalleryMapFullscreenInstrumentationTest {
             """
             (() => {
               const button = [...document.querySelectorAll('button')]
-                .find((candidate) => candidate.textContent?.trim() === '$label');
+                .find((candidate) =>
+                  candidate.textContent?.trim() === '$label' ||
+                  candidate.getAttribute('aria-label') === '$label'
+                );
               if (!button) return false;
               button.click();
               return true;
