@@ -2,9 +2,11 @@
 
 Official project language: English
 
-Prefer own worktree for each PR. Avoid using the default worktree.
+Prefer working on own worktree for each PR.
 
-This project is under heavy parallel development by multiple Agents on multiple seperate hosts. Before starting a new task, ensure you have the latest changes from remote main.
+Pull remote changes regularitly. Expect heavy parallel development on multiple seperate hosts.
+
+Prefer clean and generic solutions over specialized fast-fixes. Even if this is significantly more effort.
 
 Work pacing and delivery rules live in [PACE.md](PACE.md).
 
