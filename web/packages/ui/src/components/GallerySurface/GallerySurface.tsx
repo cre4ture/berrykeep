@@ -2119,6 +2119,9 @@ function GalleryMapPanel({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const pushedFullscreenHistoryRef = useRef(false);
   const toggleFullscreen = () => setIsFullscreen((current) => !current);
+  const usesAndroidEmbeddedClient =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("embedded_client") === "android";
   const switchToGrid = () => {
     if (isFullscreen && pushedFullscreenHistoryRef.current && typeof window !== "undefined") {
       window.history.back();
@@ -2157,8 +2160,10 @@ function GalleryMapPanel({
             [GALLERY_MAP_FULLSCREEN_HISTORY_KEY]: true
           };
 
-    window.history.pushState(historyState, "", window.location.href);
-    pushedFullscreenHistoryRef.current = true;
+    if (!usesAndroidEmbeddedClient) {
+      window.history.pushState(historyState, "", window.location.href);
+      pushedFullscreenHistoryRef.current = true;
+    }
     document.body.style.overflow = "hidden";
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("popstate", handlePopState);
@@ -2168,7 +2173,7 @@ function GalleryMapPanel({
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("popstate", handlePopState);
     };
-  }, [isFullscreen]);
+  }, [isFullscreen, usesAndroidEmbeddedClient]);
 
   if (!activeBasemap) {
     return (
@@ -2248,6 +2253,11 @@ function GalleryMapPanel({
             </Button>
           </Group>
         </Stack>
+        {isFullscreen ? (
+          <Button variant="default" onClick={toggleFullscreen}>
+            Exit fullscreen map
+          </Button>
+        ) : null}
       </Group>
     </Card>
   );
