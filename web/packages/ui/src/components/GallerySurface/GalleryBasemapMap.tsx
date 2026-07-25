@@ -1,10 +1,11 @@
-import { Alert, Badge, Button, Card, Center, Group, Loader, Modal, Stack, Text } from "@mantine/core";
+import { Alert, Badge, Button, Card, Center, Group, Loader, Stack, Text } from "@mantine/core";
 import { IconLayoutGrid, IconMapPin, IconRefresh } from "@tabler/icons-react";
 import maplibregl, { type LngLatLike, type StyleSpecification } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { createDbWorker, type WorkerHttpvfs } from "sql.js-httpvfs";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
 import {
   clusterScreenPoints,
   type ClusterableScreenPoint,
@@ -98,6 +99,7 @@ type GalleryBasemapMapProps = {
   hiddenOnMapCount: number;
   isFullscreen: boolean;
   allowFullscreenPortal: boolean;
+  usesEmbeddedViewport: boolean;
   fullscreenViewportHeight?: "100dvh";
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest | null;
@@ -164,6 +166,7 @@ export function GalleryBasemapMap({
   hiddenOnMapCount,
   isFullscreen,
   allowFullscreenPortal,
+  usesEmbeddedViewport,
   fullscreenViewportHeight,
   selectedPath,
   getMarkerRequest,
@@ -752,7 +755,9 @@ export function GalleryBasemapMap({
         </Stack>
       </Card>
 
-      <Modal
+      <EmbeddedViewportModal
+        data-gallery-map-cluster-dialog="true"
+        usesEmbeddedViewport={usesEmbeddedViewport}
         opened={clusterDialogEntries !== null}
         onClose={() => setClusterDialogEntries(null)}
         title={
@@ -766,25 +771,23 @@ export function GalleryBasemapMap({
           <Text size="sm" c="dimmed">
             Select an item from this cluster to open it in the gallery viewer.
           </Text>
-          <div style={{ maxHeight: "50vh", overflowY: "auto" }}>
-            <Stack gap="xs">
-              {clusterDialogEntries?.map((entry) => (
-                <Button
-                  key={entry.path}
-                  variant="default"
-                  fullWidth
-                  onClick={() => {
-                    setClusterDialogEntries(null);
-                    onSelectPath(entry.path, visibleSelectionPaths);
-                  }}
-                >
-                  {entry.path}
-                </Button>
-              ))}
-            </Stack>
-          </div>
+          <Stack gap="xs">
+            {clusterDialogEntries?.map((entry) => (
+              <Button
+                key={entry.path}
+                variant="default"
+                fullWidth
+                onClick={() => {
+                  setClusterDialogEntries(null);
+                  onSelectPath(entry.path, visibleSelectionPaths);
+                }}
+              >
+                {entry.path}
+              </Button>
+            ))}
+          </Stack>
         </Stack>
-      </Modal>
+      </EmbeddedViewportModal>
     </>
   );
 }

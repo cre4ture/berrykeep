@@ -46,6 +46,7 @@ import {
 } from "./gallery-marker-clusters";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
 import {
   MediaLightboxModal,
   type MediaLightboxItem,
@@ -2191,6 +2192,7 @@ function GalleryMapPanel({
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
       allowFullscreenPortal={!usesAndroidEmbeddedClient}
+      usesEmbeddedViewport={usesAndroidEmbeddedClient}
       fullscreenViewportHeight={usesAndroidEmbeddedClient ? undefined : "100dvh"}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
@@ -2207,6 +2209,7 @@ function GalleryMapPanel({
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
       allowFullscreenPortal={!usesAndroidEmbeddedClient}
+      usesEmbeddedViewport={usesAndroidEmbeddedClient}
       fullscreenViewportHeight={usesAndroidEmbeddedClient ? undefined : "100dvh"}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
@@ -2365,6 +2368,7 @@ type GalleryWorldMapProps = {
   hiddenOnMapCount: number;
   isFullscreen: boolean;
   allowFullscreenPortal: boolean;
+  usesEmbeddedViewport: boolean;
   fullscreenViewportHeight?: "100dvh";
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
@@ -2377,6 +2381,7 @@ function GalleryWorldMap({
   hiddenOnMapCount,
   isFullscreen,
   allowFullscreenPortal,
+  usesEmbeddedViewport,
   fullscreenViewportHeight,
   selectedPath,
   getMarkerRequest,
@@ -2655,7 +2660,9 @@ function GalleryWorldMap({
         </Stack>
       </Card>
 
-      <Modal
+      <EmbeddedViewportModal
+        data-gallery-map-cluster-dialog="true"
+        usesEmbeddedViewport={usesEmbeddedViewport}
         opened={clusterDialogEntries !== null}
         onClose={() => setClusterDialogEntries(null)}
         title={
@@ -2669,25 +2676,23 @@ function GalleryWorldMap({
           <Text size="sm" c="dimmed">
             This atlas view groups nearby markers. Select an item to open it in the gallery viewer.
           </Text>
-          <div style={{ maxHeight: "50vh", overflowY: "auto" }}>
-            <Stack gap="xs">
-              {clusterDialogEntries?.map((entry) => (
-                <Button
-                  key={entry.path}
-                  variant="default"
-                  fullWidth
-                  onClick={() => {
-                    setClusterDialogEntries(null);
-                    onSelectPath(entry.path, visiblePaths);
-                  }}
-                >
-                  {entry.path}
-                </Button>
-              ))}
-            </Stack>
-          </div>
+          <Stack gap="xs">
+            {clusterDialogEntries?.map((entry) => (
+              <Button
+                key={entry.path}
+                variant="default"
+                fullWidth
+                onClick={() => {
+                  setClusterDialogEntries(null);
+                  onSelectPath(entry.path, visiblePaths);
+                }}
+              >
+                {entry.path}
+              </Button>
+            ))}
+          </Stack>
         </Stack>
-      </Modal>
+      </EmbeddedViewportModal>
     </>
   );
 }
