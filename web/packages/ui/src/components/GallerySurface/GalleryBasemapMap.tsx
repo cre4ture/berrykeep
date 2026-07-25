@@ -97,6 +97,7 @@ type GalleryBasemapMapProps = {
   entries: GalleryBasemapMapEntry[];
   hiddenOnMapCount: number;
   isFullscreen: boolean;
+  allowFullscreenPortal: boolean;
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest | null;
   onSelectPath: (path: string, visiblePaths: string[]) => void;
@@ -161,6 +162,7 @@ export function GalleryBasemapMap({
   entries,
   hiddenOnMapCount,
   isFullscreen,
+  allowFullscreenPortal,
   selectedPath,
   getMarkerRequest,
   onSelectPath,
@@ -173,7 +175,7 @@ export function GalleryBasemapMap({
   const cameraStateRef = useRef<MapCameraState | null>(null);
   const viewportFrameRef = useRef<number | null>(null);
   const fullscreenPortalTarget =
-    isFullscreen && typeof document !== "undefined" ? document.body : null;
+    isFullscreen && allowFullscreenPortal && typeof document !== "undefined" ? document.body : null;
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);

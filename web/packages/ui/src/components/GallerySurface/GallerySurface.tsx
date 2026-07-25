@@ -2190,6 +2190,7 @@ function GalleryMapPanel({
       entries={entries}
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
+      allowFullscreenPortal={!usesAndroidEmbeddedClient}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
@@ -2204,6 +2205,7 @@ function GalleryMapPanel({
       entries={entries}
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
+      allowFullscreenPortal={!usesAndroidEmbeddedClient}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
@@ -2213,7 +2215,9 @@ function GalleryMapPanel({
     />
   );
   const fullscreenPortalTarget =
-    isFullscreen && typeof document !== "undefined" ? document.body : null;
+    isFullscreen && !usesAndroidEmbeddedClient && typeof document !== "undefined"
+      ? document.body
+      : null;
   const mapDisplayControls = (
     <Card data-gallery-map-display-controls="true" withBorder radius="md" padding="sm">
       <Group align="flex-end" gap="sm" wrap="wrap" role="group" aria-label="Gallery map display options">
@@ -2358,6 +2362,7 @@ type GalleryWorldMapProps = {
   entries: GalleryEntry[];
   hiddenOnMapCount: number;
   isFullscreen: boolean;
+  allowFullscreenPortal: boolean;
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
   onSelectPath: (path: string, visiblePaths: string[]) => void;
@@ -2368,6 +2373,7 @@ function GalleryWorldMap({
   entries,
   hiddenOnMapCount,
   isFullscreen,
+  allowFullscreenPortal,
   selectedPath,
   getMarkerRequest,
   onSelectPath,
@@ -2377,7 +2383,7 @@ function GalleryWorldMap({
   const { ref: mapViewportRef, width: mapViewportWidth, height: mapViewportHeight } =
     useElementSize();
   const fullscreenPortalTarget =
-    isFullscreen && typeof document !== "undefined" ? document.body : null;
+    isFullscreen && allowFullscreenPortal && typeof document !== "undefined" ? document.body : null;
   const worldMapMarkerPoints = useMemo<GalleryWorldMarkerPoint[]>(() => {
     const width = mapViewportWidth > 0 ? mapViewportWidth : 1000;
     const height = mapViewportHeight > 0 ? mapViewportHeight : 560;

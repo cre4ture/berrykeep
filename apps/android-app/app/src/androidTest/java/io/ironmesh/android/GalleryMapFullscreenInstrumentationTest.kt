@@ -76,15 +76,13 @@ class GalleryMapFullscreenInstrumentationTest {
             """
             (() => {
               const map = document.querySelector('[aria-label="Geotagged gallery map"]');
-              const controls = document.querySelector('[data-gallery-map-display-controls="true"]');
               const mapRect = map?.getBoundingClientRect();
               return Boolean(
                 map &&
                 mapRect &&
                 mapRect.width > 0 &&
                 mapRect.height > 0 &&
-                getComputedStyle(map).position === 'fixed' &&
-                controls?.parentElement?.parentElement?.tagName === 'BODY'
+                getComputedStyle(map).position === 'fixed'
               );
             })()
             """.trimIndent()
