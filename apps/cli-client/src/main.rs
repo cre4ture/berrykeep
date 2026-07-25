@@ -511,9 +511,11 @@ fn init_cli_tracing() {
 fn cli_web_log_buffer() -> std::sync::Arc<common::logging::LogBuffer> {
     static LOG_BUFFER: std::sync::OnceLock<std::sync::Arc<common::logging::LogBuffer>> =
         std::sync::OnceLock::new();
-    std::sync::Arc::clone(
-        LOG_BUFFER.get_or_init(|| std::sync::Arc::new(common::logging::LogBuffer::new(500))),
-    )
+    std::sync::Arc::clone(LOG_BUFFER.get_or_init(|| {
+        std::sync::Arc::new(common::logging::LogBuffer::new(
+            common::logging::LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY,
+        ))
+    }))
 }
 
 fn env_flag_is_truthy(name: &str) -> bool {

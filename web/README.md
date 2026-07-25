@@ -35,6 +35,10 @@ This workspace now owns the built frontend bundles for:
 
 The Rust crates still own the embedding/serving path, but the handwritten embedded HTML/JS assets are being retired in favor of the React apps here.
 
+## Support diagnostics
+
+The client UI Settings page can copy a timestamped diagnostic log export for the last three minutes. The export is backed by the embedded client's bounded process log buffer and includes client, SDK, transport, and web UI runtime entries that remain in that window. Dashboard refresh requests share a correlation ID; their log lines include the selected transport route, request result, server and transport durations, session setup, relay pairing, session reuse, and any failover error.
+
 The source-of-truth migration checklist is:
 
 - `docs/web-ui-migration-checklist.md`

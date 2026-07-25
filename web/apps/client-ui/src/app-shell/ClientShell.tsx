@@ -27,7 +27,8 @@ import {
   IconPlugConnected,
   IconPhoto,
   IconRefresh,
-  IconServer
+  IconServer,
+  IconSettings
 } from "@tabler/icons-react";
 import {
   ColorSchemeControl,
@@ -76,6 +77,7 @@ import { ExplorerPage as ClientExplorerPage } from "../pages/ExplorerPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { LogsPage } from "../pages/LogsPage";
 import { RequestTimingsPage } from "../pages/RequestTimingsPage";
+import { SettingsPage } from "../pages/SettingsPage";
 
 type PageId =
   | "overview"
@@ -87,7 +89,8 @@ type PageId =
   | "explorer"
   | "gallery"
   | "cluster"
-  | "logs";
+  | "logs"
+  | "settings";
 type EmbeddedSurface = "gallery_map";
 type GalleryLaunchViewMode = "grid" | "map";
 type ShellLaunchState = {
@@ -213,6 +216,12 @@ const pages = [
     label: "Logs",
     icon: IconFileText,
     description: "Inspect client runtime, SDK, and transport logs from this embedded client process."
+  },
+  {
+    id: "settings" as const,
+    label: "Settings",
+    icon: IconSettings,
+    description: "Client preferences and support diagnostics."
   }
 ];
 
@@ -225,6 +234,7 @@ export function ClientShell() {
   const [connectionStatus, setConnectionStatus] = useState<ClientRendezvousView | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(true);
   const [overviewError, setOverviewError] = useState<string | null>(null);
+  const overviewRefreshSequence = useRef(0);
   const binaryUpload = useBinaryUploadQueue();
 
   useEffect(() => {
@@ -238,12 +248,13 @@ export function ClientShell() {
   async function refreshOverview() {
     setOverviewLoading(true);
     setOverviewError(null);
+    const diagnosticContext = `overview-refresh-${Date.now()}-${++overviewRefreshSequence.current}`;
     try {
       const [nextPing, nextHealth, nextClusterStatus, nextConnectionStatus] = await Promise.all([
-        getClientPing(),
-        getClientHealth(),
-        getClientClusterStatus(),
-        getClientRendezvous()
+        getClientPing({ diagnosticContext }),
+        getClientHealth({ diagnosticContext }),
+        getClientClusterStatus({ diagnosticContext }),
+        getClientRendezvous({ diagnosticContext })
       ]);
       setPing(nextPing);
       setHealth(nextHealth);
@@ -329,6 +340,8 @@ export function ClientShell() {
       ) : null}
 
       {activePageId === "logs" ? <LogsPage /> : null}
+
+      {activePageId === "settings" ? <SettingsPage /> : null}
     </NavigationShell>
   );
 }
@@ -366,6 +379,7 @@ function parsePageId(value: string | null): PageId | null {
     case "gallery":
     case "cluster":
     case "logs":
+    case "settings":
       return value;
     default:
       return null;
