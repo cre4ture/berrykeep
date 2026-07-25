@@ -2163,8 +2163,8 @@ function GalleryMapPanel({
     if (!usesAndroidEmbeddedClient) {
       window.history.pushState(historyState, "", window.location.href);
       pushedFullscreenHistoryRef.current = true;
+      document.body.style.overflow = "hidden";
     }
-    document.body.style.overflow = "hidden";
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("popstate", handlePopState);
 
@@ -2191,6 +2191,7 @@ function GalleryMapPanel({
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
       allowFullscreenPortal={!usesAndroidEmbeddedClient}
+      fullscreenViewportHeight={usesAndroidEmbeddedClient ? "100vh" : "100dvh"}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
@@ -2206,6 +2207,7 @@ function GalleryMapPanel({
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
       allowFullscreenPortal={!usesAndroidEmbeddedClient}
+      fullscreenViewportHeight={usesAndroidEmbeddedClient ? "100vh" : "100dvh"}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
@@ -2257,7 +2259,7 @@ function GalleryMapPanel({
             </Button>
           </Group>
         </Stack>
-        {isFullscreen ? (
+        {isFullscreen && usesAndroidEmbeddedClient ? (
           <Button variant="default" onClick={toggleFullscreen}>
             Exit fullscreen map
           </Button>
@@ -2363,6 +2365,7 @@ type GalleryWorldMapProps = {
   hiddenOnMapCount: number;
   isFullscreen: boolean;
   allowFullscreenPortal: boolean;
+  fullscreenViewportHeight: "100vh" | "100dvh";
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
   onSelectPath: (path: string, visiblePaths: string[]) => void;
@@ -2374,6 +2377,7 @@ function GalleryWorldMap({
   hiddenOnMapCount,
   isFullscreen,
   allowFullscreenPortal,
+  fullscreenViewportHeight,
   selectedPath,
   getMarkerRequest,
   onSelectPath,
@@ -2428,7 +2432,7 @@ function GalleryWorldMap({
         inset: isFullscreen ? 0 : undefined,
         zIndex: isFullscreen ? 150 : undefined,
         width: isFullscreen ? "100vw" : undefined,
-        height: isFullscreen ? "100dvh" : undefined,
+        height: isFullscreen ? fullscreenViewportHeight : undefined,
         aspectRatio: isFullscreen ? undefined : "16 / 9",
         overflow: "hidden",
         borderRadius: isFullscreen ? 0 : "calc(var(--mantine-radius-md) - 2px)",
