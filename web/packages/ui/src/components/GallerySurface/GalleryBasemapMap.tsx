@@ -98,7 +98,7 @@ type GalleryBasemapMapProps = {
   hiddenOnMapCount: number;
   isFullscreen: boolean;
   allowFullscreenPortal: boolean;
-  fullscreenViewportHeight: "100vh" | "100dvh";
+  fullscreenViewportHeight?: "100dvh";
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest | null;
   onSelectPath: (path: string, visiblePaths: string[]) => void;
@@ -574,6 +574,8 @@ export function GalleryBasemapMap({
         inset: isFullscreen ? 0 : undefined,
         zIndex: isFullscreen ? 150 : undefined,
         width: isFullscreen ? "100vw" : undefined,
+        // Android WebView can resolve viewport units to zero during this state.
+        // With no explicit height, the fixed element fills its `inset: 0` bounds.
         height: isFullscreen ? fullscreenViewportHeight : undefined,
         aspectRatio: isFullscreen ? undefined : "16 / 9",
         overflow: "hidden",
