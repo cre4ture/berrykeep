@@ -72,25 +72,59 @@ class GalleryMapFullscreenInstrumentationTest {
         }
 
         clickButton(webView, "Fullscreen map")
-        waitForCondition(webView, "fullscreen gallery map should remain rendered") {
-            """
-            (() => {
-              const map = document.querySelector('[aria-label="Geotagged gallery map"]');
-              const mapRect = map?.getBoundingClientRect();
-              return Boolean(
-                map &&
-                mapRect &&
-                mapRect.width > 0 &&
-                mapRect.height > 0 &&
-                getComputedStyle(map).position === 'fixed'
-              );
-            })()
-            """.trimIndent()
+        try {
+            waitForCondition(webView, "fullscreen gallery map should remain rendered") {
+                """
+                (() => {
+                  const map = document.querySelector('[aria-label="Geotagged gallery map"]');
+                  const mapRect = map?.getBoundingClientRect();
+                  return Boolean(
+                    map &&
+                    mapRect &&
+                    mapRect.width > 0 &&
+                    mapRect.height > 0 &&
+                    getComputedStyle(map).position === 'fixed'
+                  );
+                })()
+                """.trimIndent()
+            }
+        } catch (error: AssertionError) {
+            throw AssertionError(
+                "${error.message}; fullscreen DOM state: ${fullscreenMapState(webView)}",
+                error,
+            )
         }
 
         assertEquals("Fullscreen must not finish the Web UI activity", Lifecycle.State.RESUMED, scenario.state)
         assertTrue("The embedded WebView must remain visible", webView.visibility == View.VISIBLE)
     }
+
+    private fun fullscreenMapState(webView: WebView): String =
+        try {
+            evaluateJavaScript(
+                webView,
+                """
+                (() => {
+                  const map = document.querySelector('[aria-label="Geotagged gallery map"]');
+                  const mapRect = map?.getBoundingClientRect();
+                  return JSON.stringify({
+                    href: window.location.href,
+                    hasExitControl: [...document.querySelectorAll('button')]
+                      .some((button) => button.textContent?.trim() === 'Exit fullscreen map'),
+                    mapCount: document.querySelectorAll('[aria-label="Geotagged gallery map"]').length,
+                    mapPosition: map ? getComputedStyle(map).position : null,
+                    mapDisplay: map ? getComputedStyle(map).display : null,
+                    mapWidth: mapRect?.width ?? null,
+                    mapHeight: mapRect?.height ?? null,
+                    mapParent: map?.parentElement?.tagName ?? null,
+                    bodyOverflow: document.body.style.overflow
+                  });
+                })()
+                """.trimIndent(),
+            )
+        } catch (diagnosticError: Throwable) {
+            "unavailable (${diagnosticError.message})"
+        }
 
     private fun hasButton(label: String): String =
         """
