@@ -16,6 +16,8 @@ data class ConnectionRouteEndpointSnapshot(
     val index: Int,
     @Json(name = "path_kind")
     val pathKind: String,
+    @Json(name = "hole_punching_mode")
+    val holePunchingMode: String? = null,
     val locator: String,
     @Json(name = "bootstrap_rank")
     val bootstrapRank: Int,

@@ -101,6 +101,13 @@ fun ConnectionPathsScreen(
                 supportingText = stringResource(R.string.connection_paths_relay_note_body),
             ) {}
         }
+
+        if (presentation.overview.state == ConnectionOverviewState.DIRECT_QUIC) {
+            SectionCard(
+                title = stringResource(R.string.connection_paths_direct_quic_note_title),
+                supportingText = stringResource(R.string.connection_paths_direct_quic_note_body),
+            ) {}
+        }
     }
 }
 
@@ -174,6 +181,7 @@ private fun overviewSubtitle(overview: ConnectionOverview): String {
             ConnectionOverviewState.UNAVAILABLE -> R.string.connection_paths_unavailable_body
             ConnectionOverviewState.ERROR -> R.string.connection_paths_error_body
             ConnectionOverviewState.DIRECT,
+            ConnectionOverviewState.DIRECT_QUIC,
             ConnectionOverviewState.RELAY,
             ConnectionOverviewState.IMPROVING,
             -> R.string.connection_paths_checking_body
@@ -185,6 +193,7 @@ private fun overviewTitle(state: ConnectionOverviewState): Int {
     return when (state) {
         ConnectionOverviewState.CHECKING -> R.string.connection_paths_checking_title
         ConnectionOverviewState.DIRECT -> R.string.connection_paths_direct_title
+        ConnectionOverviewState.DIRECT_QUIC -> R.string.connection_paths_direct_quic_title
         ConnectionOverviewState.RELAY -> R.string.connection_paths_relay_title
         ConnectionOverviewState.IMPROVING -> R.string.connection_paths_improving_title
         ConnectionOverviewState.UNAVAILABLE -> R.string.connection_paths_unavailable_title
@@ -195,6 +204,7 @@ private fun overviewTitle(state: ConnectionOverviewState): Int {
 private fun overviewHeroTone(state: ConnectionOverviewState): HeroTone {
     return when (state) {
         ConnectionOverviewState.DIRECT -> HeroTone.Good
+        ConnectionOverviewState.DIRECT_QUIC -> HeroTone.Good
         ConnectionOverviewState.RELAY,
         ConnectionOverviewState.IMPROVING,
         -> HeroTone.Warning

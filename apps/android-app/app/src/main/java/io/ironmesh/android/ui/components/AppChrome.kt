@@ -30,6 +30,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.R
 import io.ironmesh.android.ui.MainSection
@@ -181,15 +183,27 @@ private fun TitleLatencyIndicator(status: TitleLatencyProbeStatus) {
     val color = when {
         status.state == "failed" -> MaterialTheme.colorScheme.error
         status.state == "success" && status.connectionType == "direct" -> Color(0xFF16835A)
+        status.state == "success" && status.connectionType == "direct_quic" -> Color(0xFF0A6F8F)
         status.state == "success" && status.connectionType == "relay" -> Color(0xFFB85A00)
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
+    val description = stringResource(
+        when (status.connectionType) {
+            "direct" -> R.string.title_latency_indicator_direct
+            "direct_quic" -> R.string.title_latency_indicator_direct_quic
+            "relay" -> R.string.title_latency_indicator_relay
+            else -> R.string.title_latency_indicator_unknown
+        },
+        text,
+    )
 
     Text(
         text = text,
         style = MaterialTheme.typography.labelSmall,
         color = color,
-        modifier = Modifier.padding(end = 4.dp),
+        modifier = Modifier
+            .padding(end = 4.dp)
+            .semantics { contentDescription = description },
     )
 }
 
@@ -199,6 +213,7 @@ internal fun titleLatencyIndicatorText(status: TitleLatencyProbeStatus): String?
         "success" -> {
             val connectionPrefix = when (status.connectionType) {
                 "direct" -> "D"
+                "direct_quic" -> "Q"
                 "relay" -> "R"
                 else -> "?"
             }

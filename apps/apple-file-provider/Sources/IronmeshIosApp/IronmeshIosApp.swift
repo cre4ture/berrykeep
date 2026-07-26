@@ -654,8 +654,13 @@ struct IronmeshConnectionPathsView: View {
         Section("Overview") {
             IronmeshKeyValueRow(
                 label: "Selected path",
-                value: snapshot.activeEndpoint?.pathKind.displayName ?? "None"
+                value: snapshot.activeEndpoint?.connectionDisplayName ?? "None"
             )
+            if let explanation = snapshot.activeEndpoint?.connectionExplanation {
+                Text(explanation)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
             IronmeshKeyValueRow(label: "Candidates", value: "\(snapshot.endpoints.count)")
             IronmeshKeyValueRow(label: "Direct", value: "\(snapshot.directEndpointCount)")
             IronmeshKeyValueRow(label: "Relay", value: "\(snapshot.relayEndpointCount)")
@@ -682,7 +687,7 @@ private struct IronmeshConnectionPathRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                Label(endpoint.pathKind.displayName, systemImage: pathIcon)
+                Label(endpoint.connectionDisplayName, systemImage: pathIcon)
                     .font(.headline)
                 Spacer()
                 Text("#\(rank)")
@@ -693,6 +698,12 @@ private struct IronmeshConnectionPathRow: View {
             Text(endpoint.locator)
                 .font(.footnote.monospaced())
                 .textSelection(.enabled)
+
+            if let explanation = endpoint.connectionExplanation {
+                Text(explanation)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
 
             HStack(spacing: 8) {
                 if endpoint.active {
@@ -719,6 +730,9 @@ private struct IronmeshConnectionPathRow: View {
                     value: "\(endpoint.consecutiveFailures) consecutive, \(endpoint.totalFailures) total"
                 )
                 IronmeshKeyValueRow(label: "Bootstrap rank", value: "\(endpoint.bootstrapRank)")
+                if let holePunchingMode = endpoint.holePunchingMode {
+                    IronmeshKeyValueRow(label: "QUIC path", value: holePunchingMode.capitalized)
+                }
                 if let targetNodeId = endpoint.targetNodeId {
                     IronmeshKeyValueRow(label: "Target node", value: targetNodeId)
                 }
@@ -756,11 +770,16 @@ private struct IronmeshConnectionPathRow: View {
     }
 
     private var pathIcon: String {
+        if endpoint.usesRelayPath {
+            return "arrow.triangle.branch"
+        }
         switch endpoint.pathKind {
         case .directHTTPS:
             return "lock.shield"
         case .directQUIC:
-            return "bolt.horizontal"
+            return endpoint.isDirectQuicHolePunched
+                ? "point.3.connected.trianglepath.dotted"
+                : "bolt.horizontal"
         case .relayTunnel:
             return "arrow.triangle.branch"
         case .unknown:
@@ -799,6 +818,8 @@ struct IronmeshTitleLatencyToolbarItem: View {
         switch model.titleLatencyStatus.connectionType {
         case "direct":
             return "D"
+        case "direct_quic":
+            return "Q"
         case "relay":
             return "R"
         default:
@@ -825,6 +846,8 @@ struct IronmeshTitleLatencyToolbarItem: View {
         switch model.titleLatencyStatus.connectionType {
         case "direct":
             return .green
+        case "direct_quic":
+            return .teal
         case "relay":
             return .orange
         default:
@@ -835,11 +858,24 @@ struct IronmeshTitleLatencyToolbarItem: View {
     private var accessibilityLabel: String {
         switch model.titleLatencyStatus.state {
         case "success":
-            return "\(model.titleLatencyStatus.connectionType) connection latency \(label)"
+            return "\(connectionDescription) latency \(label)"
         case "pending":
-            return "Measuring \(model.titleLatencyStatus.connectionType) connection latency"
+            return "Measuring \(connectionDescription) latency"
         default:
-            return "\(model.titleLatencyStatus.connectionType) connection latency unavailable"
+            return "\(connectionDescription) latency unavailable"
+        }
+    }
+
+    private var connectionDescription: String {
+        switch model.titleLatencyStatus.connectionType {
+        case "direct":
+            return "direct connection"
+        case "direct_quic":
+            return "direct QUIC connection through NAT"
+        case "relay":
+            return "relay connection"
+        default:
+            return "connection"
         }
     }
 }

@@ -55,6 +55,54 @@ class ConnectionPathsPresentationTest {
     }
 
     @Test
+    fun reportsDirectQuicHolePunchingAsItsOwnDirectConnectionState() {
+        val directQuic = endpoint(
+            index = 5,
+            pathKind = "direct_quic",
+            holePunchingMode = "direct",
+            active = true,
+            totalSuccesses = 3L,
+        )
+
+        val presentation = connectionPathsPresentation(
+            snapshot = ConnectionRouteSnapshot(
+                generatedAtUnixMs = 1_000L,
+                activeIndex = directQuic.index,
+                rankedIndices = listOf(directQuic.index),
+                endpoints = listOf(directQuic),
+            ),
+            error = null,
+        )
+
+        assertEquals(ConnectionOverviewState.DIRECT_QUIC, presentation.overview.state)
+        assertEquals("Direct via NAT (QUIC)", routeDisplayLabel(directQuic))
+    }
+
+    @Test
+    fun reportsRelayWhenAQuicSessionUsesItsRelayPath() {
+        val relayedQuic = endpoint(
+            index = 6,
+            pathKind = "direct_quic",
+            holePunchingMode = "relay",
+            active = true,
+            totalSuccesses = 3L,
+        )
+
+        val presentation = connectionPathsPresentation(
+            snapshot = ConnectionRouteSnapshot(
+                generatedAtUnixMs = 1_000L,
+                activeIndex = relayedQuic.index,
+                rankedIndices = listOf(relayedQuic.index),
+                endpoints = listOf(relayedQuic),
+            ),
+            error = null,
+        )
+
+        assertEquals(ConnectionOverviewState.RELAY, presentation.overview.state)
+        assertEquals("QUIC via Relay", routeDisplayLabel(relayedQuic))
+    }
+
+    @Test
     fun keepsTransportFailureOutOfThePrimaryOverviewUntilDetailsAreOpened() {
         val presentation = connectionPathsPresentation(
             snapshot = ConnectionRouteSnapshot(
@@ -126,6 +174,7 @@ class ConnectionPathsPresentationTest {
     private fun endpoint(
         index: Int,
         pathKind: String = "direct_https",
+        holePunchingMode: String? = null,
         locator: String = "https://node.example",
         targetNodeId: String? = null,
         active: Boolean = false,
@@ -140,6 +189,7 @@ class ConnectionPathsPresentationTest {
         return ConnectionRouteEndpointSnapshot(
             index = index,
             pathKind = pathKind,
+            holePunchingMode = holePunchingMode,
             locator = locator,
             bootstrapRank = index,
             targetNodeId = targetNodeId,

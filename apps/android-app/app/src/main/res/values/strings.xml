@@ -119,6 +119,7 @@
     <string name="connection_paths_live">Live</string>
     <string name="connection_paths_checking_title">Checking connections</string>
     <string name="connection_paths_direct_title">Connected directly</string>
+    <string name="connection_paths_direct_quic_title">Connected directly via NAT (QUIC)</string>
     <string name="connection_paths_relay_title">Connected through relay</string>
     <string name="connection_paths_improving_title">Improving connection</string>
     <string name="connection_paths_unavailable_title">No working connection</string>
@@ -188,4 +189,10 @@
     <string name="connection_paths_technical_details">Technical details</string>
     <string name="connection_paths_relay_note_title">About relay</string>
     <string name="connection_paths_relay_note_body">Relay keeps this device connected when a direct route is not currently selected.</string>
+    <string name="connection_paths_direct_quic_note_title">About direct QUIC</string>
+    <string name="connection_paths_direct_quic_note_body">Rendezvous helped establish this connection. Your data travels directly between this device and the cluster.</string>
+    <string name="title_latency_indicator_direct">Direct connection latency: %1$s</string>
+    <string name="title_latency_indicator_direct_quic">Direct QUIC connection latency: %1$s</string>
+    <string name="title_latency_indicator_relay">Relay connection latency: %1$s</string>
+    <string name="title_latency_indicator_unknown">Connection latency: %1$s</string>
 </resources>
