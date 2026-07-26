@@ -10,6 +10,13 @@ function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
 }
 
+async function openMapConfiguration(page: Page): Promise<void> {
+  const mapConfigurationTab = page.getByRole("tab", { name: "Map configuration" });
+  await expect(mapConfigurationTab).toBeVisible();
+  await mapConfigurationTab.click();
+  await expect(mapConfigurationTab).toHaveAttribute("aria-selected", "true");
+}
+
 registerGalleryMapContractTests({
   name: "server-admin",
   setup: (page, options) =>
@@ -285,10 +292,13 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
 
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  await openMapConfiguration(page);
   await expect(page.getByRole("link", { name: "Open Natural Earth" })).toHaveAttribute(
     "href",
     "https://www.naturalearthdata.com/"
   );
+  await page.getByRole("tab", { name: "Gallery" }).click();
   await expect(page.getByText("2 photos", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Map" }).click();
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
@@ -460,6 +470,7 @@ test("server-admin creates a hybrid map from configured raster and vector artifa
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await page.getByText("Gallery", { exact: true }).click();
+  await openMapConfiguration(page);
 
   await expect(page.getByText("Create hybrid map variant", { exact: true })).toBeVisible();
   await page.getByRole("textbox", { name: "Raster background" }).click();
@@ -894,6 +905,17 @@ test("server-admin map import wizard starts the Natural Earth labels background 
   await page.keyboard.press("Escape");
   await page.getByText("Gallery", { exact: true }).click();
 
+  const galleryTab = page.getByRole("tab", { name: "Gallery" });
+  const mapConfigurationTab = page.getByRole("tab", { name: "Map configuration" });
+  await expect(galleryTab).toHaveAttribute("aria-selected", "true");
+  await expect(mapConfigurationTab).toHaveAttribute("aria-selected", "false");
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  await expect(page.getByText("Map dataset import wizard", { exact: true })).not.toBeVisible();
+
+  await mapConfigurationTab.click();
+  await expect(mapConfigurationTab).toHaveAttribute("aria-selected", "true");
+  await expect(galleryTab).toHaveAttribute("aria-selected", "false");
+  await expect(page.getByText("Gallery map variants", { exact: true })).toBeVisible();
   await expect(page.getByText("Map dataset import wizard", { exact: true })).toBeVisible();
   await page.getByRole("radio", { name: "Natural Earth physical world map + labels" }).check();
   await page.getByRole("button", { name: "Continue" }).click();
@@ -976,6 +998,7 @@ test("server-admin map import wizard starts the Natural Earth vector background 
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await page.getByText("Gallery", { exact: true }).click();
+  await openMapConfiguration(page);
 
   await page.getByRole("radio", { name: "Natural Earth vector world map" }).check();
   await page.getByRole("button", { name: "Continue" }).click();
@@ -1058,6 +1081,7 @@ test("server-admin map import wizard imports the Natural Earth hypsometric relie
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await page.getByText("Gallery", { exact: true }).click();
+  await openMapConfiguration(page);
 
   await page.getByRole("radio", { name: "Natural Earth hypsometric relief map" }).check();
   await page.getByRole("button", { name: "Continue" }).click();
@@ -1137,6 +1161,7 @@ test("server-admin map import wizard imports the Natural Earth I relief and wate
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await page.getByText("Gallery", { exact: true }).click();
+  await openMapConfiguration(page);
 
   await page.getByRole("radio", { name: "Natural Earth I relief and water map" }).check();
   await page.getByRole("button", { name: "Continue" }).click();
@@ -1195,6 +1220,7 @@ test("server-admin map import wizard forwards remote MBTiles details to its back
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await page.getByText("Gallery", { exact: true }).click();
+  await openMapConfiguration(page);
 
   await page.getByRole("radio", { name: "An existing MBTiles package" }).check();
   await page.getByRole("button", { name: "Continue" }).click();
