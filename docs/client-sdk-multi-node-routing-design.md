@@ -75,7 +75,8 @@ Ranking rules:
 - higher throughput is better,
 - recent failures apply a large penalty,
 - open circuits are skipped until their cooldown expires,
-- direct retains only a small static bias over relay so materially better relay paths can win.
+- relay carries a 500 ms static penalty, while the active route receives a 50 ms stability bonus;
+  this strongly favors direct paths while avoiding needless route flapping.
 
 ## Startup behavior
 

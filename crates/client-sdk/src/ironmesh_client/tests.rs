@@ -123,6 +123,31 @@ fn reset_timing_measurement_clears_attempts_and_uses_session_pool_baseline() {
 }
 
 #[test]
+fn route_score_strongly_prefers_direct_over_relay_and_stabilizes_active_route() {
+    let state = ClientEndpointState {
+        ewma_latency_ms: Some(100.0),
+        ..ClientEndpointState::default()
+    };
+    let direct = ClientEndpointDescriptor {
+        path_kind: ClientEndpointPathKind::Direct,
+        transport_path_kind: TransportPathKind::DirectHttps,
+        locator: "https://direct.example".to_string(),
+        bootstrap_rank: 0,
+    };
+    let relay = ClientEndpointDescriptor {
+        path_kind: ClientEndpointPathKind::Relay,
+        transport_path_kind: TransportPathKind::RelayTunnel,
+        locator: "relay://node@example".to_string(),
+        bootstrap_rank: 0,
+    };
+
+    assert_eq!(endpoint_score(0, None, &direct, &state), 100.0);
+    assert_eq!(endpoint_score(0, None, &relay, &state), 600.0);
+    assert_eq!(endpoint_score(0, Some(0), &direct, &state), 50.0);
+    assert_eq!(endpoint_score(0, Some(0), &relay, &state), 550.0);
+}
+
+#[test]
 fn transport_stream_kind_classification_accepts_versioned_public_routes() {
     assert_eq!(
         transport_stream_kind_for_path("/api/v1/health"),
