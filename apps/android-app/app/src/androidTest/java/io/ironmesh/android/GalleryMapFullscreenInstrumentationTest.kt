@@ -39,6 +39,7 @@ class GalleryMapFullscreenInstrumentationTest {
         ActivityScenario.launch<GalleryMapWebUiTestActivity>(intent).use { scenario ->
             assertFullscreenMapRemainsVisible(scenario)
             assertFullscreenMapClusterChooserIsVisible(scenario)
+            assertFullscreenMapLightboxIsVisible(scenario)
         }
     }
 
@@ -51,6 +52,7 @@ class GalleryMapFullscreenInstrumentationTest {
         ActivityScenario.launch<WebUiActivity>(WebUiActivity.intent(context, session)).use { scenario ->
             assertFullscreenMapRemainsVisible(scenario)
             assertFullscreenMapClusterChooserIsVisible(scenario)
+            assertFullscreenMapLightboxIsVisible(scenario)
         }
     }
 
@@ -137,6 +139,41 @@ class GalleryMapFullscreenInstrumentationTest {
         }
     }
 
+    private fun <T : Activity> assertFullscreenMapLightboxIsVisible(scenario: ActivityScenario<T>) {
+        val webView = waitForWebView(scenario)
+        clickButton(webView, "gallery/runtime-map-a.png")
+        try {
+            waitForCondition(webView, "fullscreen map photo lightbox should remain visible") {
+                """
+                (() => {
+                  const dialog = document.querySelector('[data-media-lightbox] [role="dialog"]');
+                  const dialogRect = dialog?.getBoundingClientRect();
+                  const image = dialog?.querySelector('img');
+                  const imageRect = image?.getBoundingClientRect();
+                  return Boolean(
+                    dialog &&
+                    dialogRect &&
+                    dialogRect.width > 0 &&
+                    dialogRect.height > 0 &&
+                    image &&
+                    imageRect &&
+                    imageRect.width > 0 &&
+                    imageRect.height > 0 &&
+                    dialog.textContent?.includes('gallery/runtime-map-a.png') &&
+                    dialog.textContent?.includes('image/png') &&
+                    dialog.textContent?.includes('Captured')
+                  );
+                })()
+                """.trimIndent()
+            }
+        } catch (error: AssertionError) {
+            throw AssertionError(
+                "${error.message}; media lightbox DOM state: ${mediaLightboxState(webView)}",
+                error,
+            )
+        }
+    }
+
     private fun fullscreenMapState(webView: WebView): String =
         try {
             evaluateJavaScript(
@@ -179,6 +216,32 @@ class GalleryMapFullscreenInstrumentationTest {
                     dialogMaxHeight: dialog ? getComputedStyle(dialog).maxHeight : null,
                     dialogChoices: [...(dialog?.querySelectorAll('button') ?? [])]
                       .map((button) => button.textContent?.trim())
+                  });
+                })()
+                """.trimIndent(),
+            )
+        } catch (diagnosticError: Throwable) {
+            "unavailable (${diagnosticError.message})"
+        }
+
+    private fun mediaLightboxState(webView: WebView): String =
+        try {
+            evaluateJavaScript(
+                webView,
+                """
+                (() => {
+                  const dialog = document.querySelector('[data-media-lightbox] [role="dialog"]');
+                  const dialogRect = dialog?.getBoundingClientRect();
+                  const image = dialog?.querySelector('img');
+                  const imageRect = image?.getBoundingClientRect();
+                  return JSON.stringify({
+                    dialogExists: Boolean(dialog),
+                    dialogWidth: dialogRect?.width ?? null,
+                    dialogHeight: dialogRect?.height ?? null,
+                    imageExists: Boolean(image),
+                    imageWidth: imageRect?.width ?? null,
+                    imageHeight: imageRect?.height ?? null,
+                    dialogText: dialog?.textContent?.trim() ?? null
                   });
                 })()
                 """.trimIndent(),
