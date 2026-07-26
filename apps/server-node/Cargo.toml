@@ -25,5 +25,8 @@ assert_cmd.workspace = true
 [target.'cfg(windows)'.build-dependencies]
 winres.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+
 [lints]
 workspace = true

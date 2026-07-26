@@ -6318,6 +6318,16 @@ fn runtime_log_filter_from_env(default_directive: &str) -> (EnvFilter, String) {
 }
 
 pub async fn run_from_env() -> Result<()> {
+    run_from_env_with_shutdown(shutdown_receiver_from_signal()).await
+}
+
+/// Starts a node from the process environment and stops it when `shutdown_rx`
+/// is triggered.
+///
+/// Platform hosts use this to forward their native lifecycle event into the
+/// node without having to synthesize a console signal. The ordinary CLI path
+/// continues to use Ctrl+C (and SIGTERM on Unix) through [`run_from_env`].
+pub async fn run_from_env_with_shutdown(shutdown_rx: watch::Receiver<bool>) -> Result<()> {
     let log_buffer = Arc::new(LogBuffer::new(500));
     let (env_filter, filter_expression) = runtime_log_filter_from_env("info");
     let (reload_layer, reload_handle) = reload::Layer::new(env_filter);
@@ -6332,10 +6342,10 @@ pub async fn run_from_env() -> Result<()> {
     ensure_rustls_crypto_provider_installed();
     match setup::load_startup_mode_from_env()? {
         setup::StartupMode::Runtime(config) => {
-            run_inner(config, Some(log_buffer), runtime_log_control).await
+            run_inner(config, Some(log_buffer), runtime_log_control, shutdown_rx).await
         }
         setup::StartupMode::Setup(config) => {
-            setup::run_setup_mode(config, log_buffer, runtime_log_control).await
+            setup::run_setup_mode(config, log_buffer, runtime_log_control, shutdown_rx).await
         }
     }
 }
@@ -6351,19 +6361,46 @@ pub async fn run_embedded_managed(config: EmbeddedManagedServerNodeConfig) -> Re
 
     match setup::load_managed_startup_mode(startup_config)? {
         setup::StartupMode::Runtime(runtime_config) => {
-            run_inner(runtime_config, Some(log_buffer), runtime_log_control).await
+            run_inner(
+                runtime_config,
+                Some(log_buffer),
+                runtime_log_control,
+                shutdown_receiver_from_signal(),
+            )
+            .await
         }
         setup::StartupMode::Setup(setup_config) => {
-            setup::run_setup_mode(setup_config, log_buffer, runtime_log_control).await
+            setup::run_setup_mode(
+                setup_config,
+                log_buffer,
+                runtime_log_control,
+                shutdown_receiver_from_signal(),
+            )
+            .await
         }
     }
 }
 
 pub async fn run(config: ServerNodeConfig) -> Result<()> {
-    run_inner(config, None, RuntimeLogControl::disabled("info")).await
+    run_inner(
+        config,
+        None,
+        RuntimeLogControl::disabled("info"),
+        shutdown_receiver_from_signal(),
+    )
+    .await
 }
 
-async fn wait_for_shutdown_trigger(mut shutdown_rx: watch::Receiver<bool>) {
+fn shutdown_receiver_from_signal() -> watch::Receiver<bool> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+    shutdown_rx
+}
+
+pub(crate) async fn wait_for_shutdown_trigger(mut shutdown_rx: watch::Receiver<bool>) {
     if *shutdown_rx.borrow() {
         return;
     }
@@ -6566,6 +6603,7 @@ async fn run_inner(
     config: ServerNodeConfig,
     log_buffer: Option<Arc<LogBuffer>>,
     runtime_log_control: RuntimeLogControl,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     ensure_rustls_crypto_provider_installed();
     config.validate_public_listener_security()?;
@@ -7188,7 +7226,7 @@ async fn run_inner(
         build_http_routers_phase_started_at,
     );
 
-    run_server_listeners(config, state, apps).await
+    run_server_listeners(config, state, apps, shutdown_rx).await
 }
 
 struct ServerApps {
@@ -7766,6 +7804,7 @@ async fn run_server_listeners(
     config: ServerNodeConfig,
     state: ServerState,
     apps: ServerApps,
+    service_shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let ServerApps {
         public_app,
@@ -7926,7 +7965,7 @@ async fn run_server_listeners(
         } => {
             outcome?;
         }
-        _ = shutdown_signal() => {
+        _ = wait_for_shutdown_trigger(service_shutdown_rx) => {
             info!(node_id = %state.node_id, "shutdown signal received");
             let _ = shutdown_tx.send(true);
             if let Some(handle) = public_server_handle.as_ref() {
