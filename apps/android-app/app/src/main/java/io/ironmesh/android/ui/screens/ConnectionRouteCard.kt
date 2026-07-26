@@ -57,6 +57,11 @@ internal fun ConnectionRouteCard(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    Text(
+                        text = routeSelectionSummary(route),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
                 RouteStateBadge(route.state, stateColors)
             }
@@ -84,6 +89,29 @@ private fun ConnectionRouteDetails(
 ) {
     val endpoint = route.endpoint
     val totalChecks = endpoint.totalSuccesses + endpoint.totalFailures
+
+    Text(
+        text = stringResource(R.string.connection_paths_selection_details_title),
+        style = MaterialTheme.typography.titleSmall,
+    )
+    Text(
+        text = routeSelectionReason(route),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    ConnectionDetail(
+        label = stringResource(R.string.connection_paths_selection_rank),
+        value = routeSelectionRankValue(route),
+    )
+    ConnectionDetail(
+        label = stringResource(R.string.connection_paths_route_score),
+        value = routeScoreValue(route.scoreBreakdown.total),
+    )
+    Text(
+        text = stringResource(R.string.connection_paths_score_breakdown_title),
+        style = MaterialTheme.typography.titleSmall,
+    )
+    ConnectionScoreBreakdown(route.scoreBreakdown)
 
     ConnectionDetail(
         label = stringResource(R.string.connection_paths_endpoint),
@@ -139,6 +167,112 @@ private fun ConnectionRouteDetails(
                 isError = true,
             )
         }
+}
+
+@Composable
+private fun ConnectionScoreBreakdown(score: RouteScoreBreakdown) {
+    ConnectionDetail(
+        label = stringResource(R.string.connection_paths_score_bootstrap_order),
+        value = scorePointsAdded(score.bootstrapOrderPoints),
+    )
+    ConnectionDetail(
+        label = stringResource(R.string.connection_paths_score_latency),
+        value = if (score.latencyIsEstimated) {
+            stringResource(R.string.connection_paths_score_latency_estimated, score.latencyPoints)
+        } else {
+            stringResource(R.string.connection_paths_score_latency_measured, score.latencyPoints)
+        },
+    )
+    ConnectionDetail(
+        label = stringResource(R.string.connection_paths_score_relay_penalty),
+        value = if (score.relayPenaltyPoints > 0.0) {
+            scorePointsAdded(score.relayPenaltyPoints)
+        } else {
+            stringResource(R.string.connection_paths_score_not_applied)
+        },
+    )
+    ConnectionDetail(
+        label = stringResource(R.string.connection_paths_score_failure_penalty),
+        value = if (score.failurePenaltyPoints > 0.0) {
+            scorePointsAdded(score.failurePenaltyPoints)
+        } else {
+            stringResource(R.string.connection_paths_score_no_penalty)
+        },
+    )
+    ConnectionDetail(
+        label = stringResource(R.string.connection_paths_score_throughput_credit),
+        value = if (score.throughputCreditPoints > 0.0) {
+            scorePointsCredited(score.throughputCreditPoints)
+        } else {
+            stringResource(R.string.connection_paths_score_no_credit)
+        },
+    )
+    ConnectionDetail(
+        label = stringResource(R.string.connection_paths_score_active_route_credit),
+        value = if (score.activeRouteCreditPoints > 0.0) {
+            scorePointsCredited(score.activeRouteCreditPoints)
+        } else {
+            stringResource(R.string.connection_paths_score_not_applied)
+        },
+    )
+}
+
+@Composable
+private fun routeSelectionSummary(route: ConnectionRouteItem): String {
+    return stringResource(
+        R.string.connection_paths_route_selection_summary,
+        route.selectionRank,
+        route.selectionCandidateCount,
+        route.scoreBreakdown.total,
+    )
+}
+
+@Composable
+private fun routeSelectionRankValue(route: ConnectionRouteItem): String {
+    return stringResource(
+        R.string.connection_paths_selection_rank_value,
+        route.selectionRank,
+        route.selectionCandidateCount,
+    )
+}
+
+@Composable
+private fun routeScoreValue(score: Double): String {
+    return stringResource(R.string.connection_paths_route_score_value, score)
+}
+
+@Composable
+private fun scorePointsAdded(points: Double): String {
+    return stringResource(R.string.connection_paths_score_points_added, points)
+}
+
+@Composable
+private fun scorePointsCredited(points: Double): String {
+    return stringResource(R.string.connection_paths_score_points_credited, points)
+}
+
+@Composable
+private fun routeSelectionReason(route: ConnectionRouteItem): String {
+    return when {
+        route.state == ConnectionRouteState.PAUSED -> {
+            stringResource(R.string.connection_paths_selection_reason_cooling_down)
+        }
+        route.endpoint.active && route.selectionRank == 1 -> {
+            stringResource(R.string.connection_paths_selection_reason_active_best)
+        }
+        route.endpoint.active -> {
+            stringResource(
+                R.string.connection_paths_selection_reason_active_ranked,
+                route.selectionRank,
+            )
+        }
+        route.selectionRank == 1 -> {
+            stringResource(R.string.connection_paths_selection_reason_preferred)
+        }
+        else -> {
+            stringResource(R.string.connection_paths_selection_reason_ranked_after)
+        }
+    }
 }
 
 @Composable
