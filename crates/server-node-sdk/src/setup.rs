@@ -193,6 +193,13 @@ struct SetupStatusResponse {
 struct SetupStartClusterRequest {
     admin_password: String,
     public_origin: String,
+    /// Setup-time reliability-telemetry disclosure choice
+    /// (`docs/server-node-hardware-reliability-telemetry-strategy.md` Section 4.4). The setup
+    /// wizard's disclosure step always sends this explicitly, pre-checked `true`; it defaults to
+    /// `true` here only so that opt-out remains the outcome for any non-UI caller that omits the
+    /// field entirely, consistent with the rest of the opt-out model.
+    #[serde(default = "default_setup_telemetry_enabled")]
+    telemetry_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,6 +214,14 @@ struct SetupImportEnrollmentRequest {
     // existing cluster member.
     admin_password: String,
     package_json: String,
+    /// See `SetupStartClusterRequest::telemetry_enabled` (doc Section 4.4); the join flow shows
+    /// the same disclosure step and defaults identically.
+    #[serde(default = "default_setup_telemetry_enabled")]
+    telemetry_enabled: bool,
+}
+
+fn default_setup_telemetry_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -618,6 +633,15 @@ async fn start_new_cluster(
         )
             .into_response();
     }
+    if let Err(err) =
+        apply_setup_telemetry_choice(&state.config.data_dir, request.telemetry_enabled).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
 
     let mut managed = state.managed_state.lock().await;
     managed.state = SetupLifecycleState::Online;
@@ -811,6 +835,15 @@ async fn import_node_enrollment_package(
 
     let runtime_enrollment_path = runtime_node_enrollment_path(&state.config.data_dir);
     if let Err(err) = package.write_to_path(&runtime_enrollment_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+    if let Err(err) =
+        apply_setup_telemetry_choice(&state.config.data_dir, request.telemetry_enabled).await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": err.to_string() })),
@@ -1080,6 +1113,19 @@ pub(crate) fn managed_rendezvous_cert_path(data_dir: &std::path::Path) -> PathBu
 
 pub(crate) fn managed_rendezvous_key_path(data_dir: &std::path::Path) -> PathBuf {
     managed_rendezvous_dir(data_dir).join("rendezvous.key")
+}
+
+/// Applies the operator's setup-time reliability-telemetry disclosure choice (doc Section 4.4) by
+/// writing through to the exact same persisted override the post-setup admin toggle uses
+/// (`ReliabilityTelemetryRuntime::set_enabled_override`, backing `PUT /api/v1/auth/telemetry/settings`).
+/// There is deliberately no separate "setup choice" storage: once this call persists, the choice is
+/// indistinguishable from an admin having flipped the toggle in `server-admin` right after setup.
+async fn apply_setup_telemetry_choice(
+    data_dir: &std::path::Path,
+    telemetry_enabled: bool,
+) -> Result<()> {
+    let mut runtime = reliability_telemetry::ReliabilityTelemetryRuntime::load(data_dir);
+    runtime.set_enabled_override(Some(telemetry_enabled)).await
 }
 
 fn ensure_managed_setup_state(path: &std::path::Path) -> Result<ManagedSetupState> {
@@ -2198,6 +2244,7 @@ mod tests {
             Json(SetupImportEnrollmentRequest {
                 admin_password: node_admin_password.to_string(),
                 package_json: package.to_json_pretty().unwrap(),
+                telemetry_enabled: true,
             }),
         )
         .await
@@ -2236,6 +2283,109 @@ mod tests {
             runtime_hash,
             issuer_admin_password
         ));
+    }
+
+    #[test]
+    fn setup_start_cluster_request_defaults_telemetry_enabled_when_omitted() {
+        // Non-UI callers (or older clients) that omit the field entirely must still land on the
+        // opt-out default, per doc Section 4.4.
+        let request: SetupStartClusterRequest = serde_json::from_str(
+            r#"{"admin_password":"a-very-strong-password","public_origin":"https://node-a.local:8443"}"#,
+        )
+        .unwrap();
+        assert!(request.telemetry_enabled);
+    }
+
+    #[test]
+    fn setup_start_cluster_request_respects_explicit_telemetry_enabled() {
+        let request: SetupStartClusterRequest = serde_json::from_str(
+            r#"{"admin_password":"a-very-strong-password","public_origin":"https://node-a.local:8443","telemetry_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(!request.telemetry_enabled);
+    }
+
+    #[test]
+    fn setup_import_enrollment_request_defaults_telemetry_enabled_when_omitted() {
+        let request: SetupImportEnrollmentRequest = serde_json::from_str(
+            r#"{"admin_password":"a-very-strong-password","package_json":"{}"}"#,
+        )
+        .unwrap();
+        assert!(request.telemetry_enabled);
+    }
+
+    #[tokio::test]
+    async fn start_new_cluster_applies_setup_telemetry_choice() {
+        let dir = temp_dir("start-cluster-telemetry");
+        let data_dir = dir.join("data");
+        let bind_addr = "127.0.0.1:18443".parse::<SocketAddr>().unwrap();
+        let config = managed_startup_bootstrap_config(data_dir.clone(), bind_addr).unwrap();
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        let state = SetupServerState {
+            config,
+            managed_state: Arc::new(Mutex::new(ManagedSetupState::default())),
+            completion_tx,
+        };
+
+        let response = start_new_cluster(
+            State(state.clone()),
+            Json(SetupStartClusterRequest {
+                admin_password: "a-very-strong-password".to_string(),
+                public_origin: "https://node-a.local:18443".to_string(),
+                telemetry_enabled: true,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let _completion = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .expect("runtime transition should be scheduled")
+            .expect("runtime transition channel should stay open");
+
+        // The setup-time choice must land in exactly the same persisted override the admin
+        // toggle uses, so a fresh load of the runtime sees it as an explicit override, not just
+        // the (also-true) env default.
+        let runtime = reliability_telemetry::ReliabilityTelemetryRuntime::load(&data_dir);
+        assert!(runtime.effective_enabled());
+        assert_eq!(runtime.enabled_source(), "admin_override");
+    }
+
+    #[tokio::test]
+    async fn import_node_enrollment_package_applies_disabled_setup_telemetry_choice() {
+        let dir = temp_dir("import-telemetry-disabled");
+        let data_dir = dir.join("data");
+        let bind_addr = "127.0.0.1:18443".parse::<SocketAddr>().unwrap();
+        let config = managed_startup_bootstrap_config(data_dir.clone(), bind_addr).unwrap();
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        let state = SetupServerState {
+            config,
+            managed_state: Arc::new(Mutex::new(ManagedSetupState::default())),
+            completion_tx,
+        };
+        let package = test_node_enrollment_package(&data_dir, bind_addr);
+
+        let response = import_node_enrollment_package(
+            State(state.clone()),
+            Json(SetupImportEnrollmentRequest {
+                admin_password: "a-very-strong-password".to_string(),
+                package_json: package.to_json_pretty().unwrap(),
+                telemetry_enabled: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let _completion = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .expect("runtime transition should be scheduled")
+            .expect("runtime transition channel should stay open");
+
+        let runtime = reliability_telemetry::ReliabilityTelemetryRuntime::load(&data_dir);
+        assert!(!runtime.effective_enabled());
+        assert_eq!(runtime.enabled_source(), "admin_override");
     }
 
     #[test]

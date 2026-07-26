@@ -914,6 +914,7 @@ export async function getSetupStatus(): Promise<SetupStatus> {
 export async function startSetupCluster(request: {
   admin_password: string;
   public_origin: string;
+  telemetry_enabled: boolean;
 }): Promise<SetupTransitionResponse> {
   return fetchJson<SetupTransitionResponse>("/setup/start-cluster", {
     method: "POST",
@@ -942,6 +943,7 @@ export async function generateSetupJoinRequest(request: {
 export async function importSetupEnrollmentPackage(request: {
   admin_password: string;
   package_json: string;
+  telemetry_enabled: boolean;
 }): Promise<SetupTransitionResponse> {
   return fetchJson<SetupTransitionResponse>("/setup/join/import", {
     method: "POST",
