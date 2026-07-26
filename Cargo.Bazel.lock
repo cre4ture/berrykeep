@@ -1,5 +1,5 @@
 {
-  "checksum": "ce1477573f1431fd82bbb6d83c506dc8c5027e65a5e4a27f1effa6d4c1178c0e",
+  "checksum": "979ca14e85f48374cf92ec46edd2abce69ccc011c772c41fdc968b8e54d77296",
   "crates": {
     "adapter-linux-fuse 1.0.37": {
       "name": "adapter-linux-fuse",
@@ -1004,14 +1004,7 @@
               "target": "utf8parse"
             }
           ],
-          "selects": {
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "anstyle-wincon 3.0.11",
-                "target": "anstyle_wincon"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2021",
         "version": "1.0.0"
@@ -2106,13 +2099,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "map_pharos",
-            "pharos"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -2122,10 +2108,6 @@
             {
               "id": "futures 0.3.33",
               "target": "futures"
-            },
-            {
-              "id": "pharos 0.5.3",
-              "target": "pharos"
             }
           ],
           "selects": {}
@@ -2982,83 +2964,23 @@
             "gloo-timers-sleep",
             "std",
             "std-blocking-sleep",
+            "tokio",
             "tokio-sleep"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "tokio"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "tokio"
-            ],
-            "wasm32-unknown-unknown": [
-              "gloo-timers"
-            ],
-            "wasm32-wasip1": [
-              "gloo-timers"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "tokio"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "tokio"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "tokio"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
             {
               "id": "fastrand 2.5.0",
               "target": "fastrand"
+            },
+            {
+              "id": "tokio 1.53.0",
+              "target": "tokio"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "tokio 1.53.0",
-                "target": "tokio"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "tokio 1.53.0",
-                "target": "tokio"
-              }
-            ],
-            "wasm32-unknown-unknown": [
-              {
-                "id": "gloo-timers 0.3.0",
-                "target": "gloo_timers"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "gloo-timers 0.3.0",
-                "target": "gloo_timers"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "tokio 1.53.0",
-                "target": "tokio"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "tokio 1.53.0",
-                "target": "tokio"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "tokio 1.53.0",
-                "target": "tokio"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2024",
         "version": "1.6.0"
@@ -3359,27 +3281,10 @@
           "**"
         ],
         "crate_features": {
-          "common": [],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "std"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "std"
-            ],
-            "wasm32-unknown-unknown": [
-              "std"
-            ],
-            "wasm32-wasip1": [
-              "std"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "std"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "std"
-            ]
-          }
+          "common": [
+            "std"
+          ],
+          "selects": {}
         },
         "edition": "2021",
         "version": "2.13.1"
@@ -3694,12 +3599,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "alloc"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -4267,36 +4166,15 @@
               "target": "jobserver"
             },
             {
+              "id": "libc 0.2.186",
+              "target": "libc"
+            },
+            {
               "id": "shlex 2.0.1",
               "target": "shlex"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2018",
         "version": "1.3.0"
@@ -4518,32 +4396,11 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "alloc",
-            "clock",
-            "iana-time-zone",
-            "now",
-            "serde",
-            "std",
-            "winapi",
-            "windows-link"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
               "id": "num-traits 0.2.19",
               "target": "num_traits"
-            },
-            {
-              "id": "serde 1.0.229",
-              "target": "serde"
-            },
-            {
-              "id": "windows-link 0.2.1",
-              "target": "windows_link"
             }
           ],
           "selects": {}
@@ -5691,13 +5548,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "link"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -5750,13 +5600,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "link"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -5809,13 +5652,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "link"
-          ],
-          "selects": {}
-        },
         "edition": "2018",
         "version": "0.8.7"
       },
@@ -6264,28 +6100,10 @@
         ],
         "crate_features": {
           "common": [
+            "default",
             "std"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "default"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "default"
-            ],
-            "wasm32-wasip1": [
-              "default"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "default"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "default"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "default"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -8344,34 +8162,11 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "alloc",
-            "block2",
-            "default",
-            "libc",
-            "objc2",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
               "id": "bitflags 2.13.1",
               "target": "bitflags"
-            },
-            {
-              "id": "block2 0.6.2",
-              "target": "block2"
-            },
-            {
-              "id": "libc 0.2.186",
-              "target": "libc"
-            },
-            {
-              "id": "objc2 0.6.4",
-              "target": "objc2"
             }
           ],
           "selects": {}
@@ -9413,22 +9208,10 @@
         ],
         "crate_features": {
           "common": [
+            "default",
             "std"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "default"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "default"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "default"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "default"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [],
@@ -11563,13 +11346,7 @@
           "common": [
             "std"
           ],
-          "selects": {
-            "wasm32-unknown-unknown": [
-              "js",
-              "js-sys",
-              "wasm-bindgen"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -11589,16 +11366,6 @@
               {
                 "id": "libc 0.2.186",
                 "target": "libc"
-              }
-            ],
-            "wasm32-unknown-unknown": [
-              {
-                "id": "js-sys 0.3.103",
-                "target": "js_sys"
-              },
-              {
-                "id": "wasm-bindgen 0.2.126",
-                "target": "wasm_bindgen"
               }
             ]
           }
@@ -11801,11 +11568,7 @@
             "std",
             "sys_rng"
           ],
-          "selects": {
-            "wasm32-unknown-unknown": [
-              "wasm_js"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -11875,12 +11638,6 @@
               {
                 "id": "libc 0.2.186",
                 "target": "libc"
-              }
-            ],
-            "wasm32-unknown-unknown": [
-              {
-                "id": "wasm-bindgen 0.2.126",
-                "target": "wasm_bindgen"
               }
             ]
           }
@@ -12150,25 +11907,8 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "futures",
-            "futures-channel",
-            "futures-core"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
-            {
-              "id": "futures-channel 0.3.33",
-              "target": "futures_channel"
-            },
-            {
-              "id": "futures-core 0.3.33",
-              "target": "futures_core"
-            },
             {
               "id": "js-sys 0.3.103",
               "target": "js_sys"
@@ -12282,27 +12022,10 @@
           "**"
         ],
         "crate_features": {
-          "common": [],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "stream"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "stream"
-            ],
-            "wasm32-wasip1": [
-              "stream"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "stream"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "stream"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "stream"
-            ]
-          }
+          "common": [
+            "stream"
+          ],
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -12922,20 +12645,7 @@
               "target": "tracing"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "system-configuration 0.7.0",
-                "target": "system_configuration"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "ipconfig 0.3.4",
-                "target": "ipconfig"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2021",
         "version": "0.26.1"
@@ -13486,35 +13196,12 @@
         "crate_features": {
           "common": [
             "http1",
-            "tls12"
+            "ring",
+            "tls12",
+            "webpki-roots",
+            "webpki-tokio"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "ring",
-              "webpki-roots",
-              "webpki-tokio"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "ring",
-              "webpki-roots",
-              "webpki-tokio"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "ring",
-              "webpki-roots",
-              "webpki-tokio"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "ring",
-              "webpki-roots",
-              "webpki-tokio"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "ring",
-              "webpki-roots",
-              "webpki-tokio"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -13545,40 +13232,13 @@
             {
               "id": "tower-service 0.3.3",
               "target": "tower_service"
+            },
+            {
+              "id": "webpki-roots 1.0.9",
+              "target": "webpki_roots"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "webpki-roots 1.0.9",
-                "target": "webpki_roots"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "webpki-roots 1.0.9",
-                "target": "webpki_roots"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "webpki-roots 1.0.9",
-                "target": "webpki_roots"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "webpki-roots 1.0.9",
-                "target": "webpki_roots"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "webpki-roots 1.0.9",
-                "target": "webpki_roots"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2021",
         "version": "0.27.9"
@@ -13622,6 +13282,9 @@
         ],
         "crate_features": {
           "common": [
+            "client",
+            "client-legacy",
+            "client-proxy",
             "default",
             "http1",
             "http2",
@@ -13630,44 +13293,25 @@
             "service",
             "tokio"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "client",
-              "client-legacy",
-              "client-proxy"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "client",
-              "client-legacy",
-              "client-proxy"
-            ],
-            "wasm32-wasip1": [
-              "client",
-              "client-legacy",
-              "client-proxy"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "client",
-              "client-legacy",
-              "client-proxy"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "client",
-              "client-legacy",
-              "client-proxy"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "client",
-              "client-legacy",
-              "client-proxy"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
             {
+              "id": "base64 0.22.1",
+              "target": "base64"
+            },
+            {
               "id": "bytes 1.12.1",
               "target": "bytes"
+            },
+            {
+              "id": "futures-channel 0.3.33",
+              "target": "futures_channel"
+            },
+            {
+              "id": "futures-util 0.3.33",
+              "target": "futures_util"
             },
             {
               "id": "http 1.4.2",
@@ -13682,8 +13326,24 @@
               "target": "hyper"
             },
             {
+              "id": "ipnet 2.12.0",
+              "target": "ipnet"
+            },
+            {
+              "id": "libc 0.2.186",
+              "target": "libc"
+            },
+            {
+              "id": "percent-encoding 2.3.2",
+              "target": "percent_encoding"
+            },
+            {
               "id": "pin-project-lite 0.2.17",
               "target": "pin_project_lite"
+            },
+            {
+              "id": "socket2 0.6.5",
+              "target": "socket2"
             },
             {
               "id": "tokio 1.53.0",
@@ -13692,214 +13352,13 @@
             {
               "id": "tower-service 0.3.3",
               "target": "tower_service"
+            },
+            {
+              "id": "tracing 0.1.44",
+              "target": "tracing"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "base64 0.22.1",
-                "target": "base64"
-              },
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "futures-util 0.3.33",
-                "target": "futures_util"
-              },
-              {
-                "id": "ipnet 2.12.0",
-                "target": "ipnet"
-              },
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "percent-encoding 2.3.2",
-                "target": "percent_encoding"
-              },
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              },
-              {
-                "id": "tracing 0.1.44",
-                "target": "tracing"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "base64 0.22.1",
-                "target": "base64"
-              },
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "futures-util 0.3.33",
-                "target": "futures_util"
-              },
-              {
-                "id": "ipnet 2.12.0",
-                "target": "ipnet"
-              },
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "percent-encoding 2.3.2",
-                "target": "percent_encoding"
-              },
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              },
-              {
-                "id": "tracing 0.1.44",
-                "target": "tracing"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "base64 0.22.1",
-                "target": "base64"
-              },
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "futures-util 0.3.33",
-                "target": "futures_util"
-              },
-              {
-                "id": "ipnet 2.12.0",
-                "target": "ipnet"
-              },
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "percent-encoding 2.3.2",
-                "target": "percent_encoding"
-              },
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              },
-              {
-                "id": "tracing 0.1.44",
-                "target": "tracing"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "base64 0.22.1",
-                "target": "base64"
-              },
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "futures-util 0.3.33",
-                "target": "futures_util"
-              },
-              {
-                "id": "ipnet 2.12.0",
-                "target": "ipnet"
-              },
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "percent-encoding 2.3.2",
-                "target": "percent_encoding"
-              },
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              },
-              {
-                "id": "tracing 0.1.44",
-                "target": "tracing"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "base64 0.22.1",
-                "target": "base64"
-              },
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "futures-util 0.3.33",
-                "target": "futures_util"
-              },
-              {
-                "id": "ipnet 2.12.0",
-                "target": "ipnet"
-              },
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "percent-encoding 2.3.2",
-                "target": "percent_encoding"
-              },
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              },
-              {
-                "id": "tracing 0.1.44",
-                "target": "tracing"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "base64 0.22.1",
-                "target": "base64"
-              },
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "futures-util 0.3.33",
-                "target": "futures_util"
-              },
-              {
-                "id": "ipnet 2.12.0",
-                "target": "ipnet"
-              },
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "percent-encoding 2.3.2",
-                "target": "percent_encoding"
-              },
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              },
-              {
-                "id": "tracing 0.1.44",
-                "target": "tracing"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2021",
         "version": "0.1.20"
@@ -15615,26 +15074,11 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "computer",
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
               "id": "ipconfig 0.3.4",
               "target": "build_script_build"
-            },
-            {
-              "id": "windows-registry 0.6.1",
-              "target": "windows_registry"
-            },
-            {
-              "id": "windows-result 0.4.1",
-              "target": "windows_result"
             }
           ],
           "selects": {
@@ -15707,69 +15151,19 @@
         "crate_features": {
           "common": [
             "default",
+            "serde",
             "std"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "serde"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "serde"
-            ],
-            "wasm32-wasip1": [
-              "serde"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "serde"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "serde"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "serde"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
-          "common": [],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "serde 1.0.229",
-                "target": "serde"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "serde 1.0.229",
-                "target": "serde"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "serde 1.0.229",
-                "target": "serde"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "serde 1.0.229",
-                "target": "serde"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "serde 1.0.229",
-                "target": "serde"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "serde 1.0.229",
-                "target": "serde"
-              }
-            ]
-          }
+          "common": [
+            {
+              "id": "serde 1.0.229",
+              "target": "serde"
+            }
+          ],
+          "selects": {}
         },
         "edition": "2018",
         "version": "2.12.0"
@@ -15935,6 +15329,10 @@
               "target": "portable_atomic"
             },
             {
+              "id": "portmapper 0.19.1",
+              "target": "portmapper"
+            },
+            {
               "id": "rand 0.10.2",
               "target": "rand"
             },
@@ -15989,18 +15387,6 @@
             }
           ],
           "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "portmapper 0.19.1",
-                "target": "portmapper"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "portmapper 0.19.1",
-                "target": "portmapper"
-              }
-            ],
             "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))": [
               {
                 "id": "getrandom 0.4.3",
@@ -16019,30 +15405,6 @@
               {
                 "id": "hickory-resolver 0.26.1",
                 "target": "hickory_resolver"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "portmapper 0.19.1",
-                "target": "portmapper"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "portmapper 0.19.1",
-                "target": "portmapper"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "portmapper 0.19.1",
-                "target": "portmapper"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "portmapper 0.19.1",
-                "target": "portmapper"
               }
             ]
           }
@@ -16156,14 +15518,7 @@
               "target": "zeroize"
             }
           ],
-          "selects": {
-            "wasm32-unknown-unknown": [
-              {
-                "id": "getrandom 0.4.3",
-                "target": "getrandom"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2024",
         "version": "1.0.2"
@@ -17641,23 +16996,11 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "std",
-            "unsafe-eval"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
               "id": "cfg-if 1.0.4",
               "target": "cfg_if"
-            },
-            {
-              "id": "futures-util 0.3.33",
-              "target": "futures_util"
             },
             {
               "id": "wasm-bindgen 0.2.126",
@@ -17908,28 +17251,10 @@
         "crate_features": {
           "common": [
             "default",
+            "extra_traits",
             "std"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "extra_traits"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "extra_traits"
-            ],
-            "wasm32-unknown-unknown": [
-              "extra_traits"
-            ],
-            "wasm32-wasip1": [
-              "extra_traits"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "extra_traits"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "extra_traits"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -20325,24 +19650,13 @@
         "crate_features": {
           "common": [
             "default",
+            "event",
             "feature",
             "fs",
+            "ioctl",
             "user"
           ],
-          "selects": {
-            "aarch64-unknown-linux-gnu": [
-              "event",
-              "ioctl"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "event",
-              "ioctl"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "event",
-              "ioctl"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -20438,26 +19752,11 @@
         "crate_features": {
           "common": [
             "feature",
+            "process",
+            "signal",
             "user"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "process",
-              "signal"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "process",
-              "signal"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "process",
-              "signal"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "process",
-              "signal"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -20659,28 +19958,10 @@
           "common": [
             "fast-apple-datapath",
             "ring",
+            "runtime-tokio",
             "rustls"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "runtime-tokio"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "runtime-tokio"
-            ],
-            "wasm32-wasip1": [
-              "runtime-tokio"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "runtime-tokio"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "runtime-tokio"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "runtime-tokio"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -20958,35 +20239,12 @@
         ],
         "crate_features": {
           "common": [
+            "default",
             "fast-apple-datapath",
-            "tracing"
+            "tracing",
+            "tracing-log"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "default",
-              "tracing-log"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "default",
-              "tracing-log"
-            ],
-            "wasm32-wasip1": [
-              "default",
-              "tracing-log"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "default",
-              "tracing-log"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "default",
-              "tracing-log"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "default",
-              "tracing-log"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -21160,12 +20418,6 @@
             }
           ],
           "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "fsevent-sys 4.1.0",
-                "target": "fsevent_sys"
-              }
-            ],
             "cfg(any(target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\", target_os = \"dragonflybsd\"))": [
               {
                 "id": "kqueue 1.2.0",
@@ -21250,13 +20502,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "user"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -21808,14 +21053,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "alloc",
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -21878,90 +21115,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "CFArray",
-            "CFAttributedString",
-            "CFAvailability",
-            "CFBag",
-            "CFBase",
-            "CFBinaryHeap",
-            "CFBitVector",
-            "CFBundle",
-            "CFByteOrder",
-            "CFCGTypes",
-            "CFCalendar",
-            "CFCharacterSet",
-            "CFData",
-            "CFDate",
-            "CFDateFormatter",
-            "CFDictionary",
-            "CFError",
-            "CFFileDescriptor",
-            "CFFileSecurity",
-            "CFLocale",
-            "CFMachPort",
-            "CFMessagePort",
-            "CFNotificationCenter",
-            "CFNumber",
-            "CFNumberFormatter",
-            "CFPlugIn",
-            "CFPlugInCOM",
-            "CFPreferences",
-            "CFPropertyList",
-            "CFRunLoop",
-            "CFSet",
-            "CFSocket",
-            "CFStream",
-            "CFString",
-            "CFStringEncodingExt",
-            "CFStringTokenizer",
-            "CFTimeZone",
-            "CFTree",
-            "CFURL",
-            "CFURLAccess",
-            "CFURLEnumerator",
-            "CFUUID",
-            "CFUserNotification",
-            "CFUtilities",
-            "CFXMLNode",
-            "CFXMLParser",
-            "alloc",
-            "bitflags",
-            "block2",
-            "default",
-            "dispatch2",
-            "libc",
-            "objc2",
-            "std"
-          ],
-          "selects": {}
-        },
-        "deps": {
-          "common": [
-            {
-              "id": "bitflags 2.13.1",
-              "target": "bitflags"
-            },
-            {
-              "id": "block2 0.6.2",
-              "target": "block2"
-            },
-            {
-              "id": "dispatch2 0.3.1",
-              "target": "dispatch2"
-            },
-            {
-              "id": "libc 0.2.186",
-              "target": "libc"
-            },
-            {
-              "id": "objc2 0.6.4",
-              "target": "objc2"
-            }
-          ],
-          "selects": {}
-        },
         "edition": "2021",
         "version": "0.3.2"
       },
@@ -22002,52 +21155,15 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "CWChannel",
-            "CWConfiguration",
-            "CWInterface",
-            "CWNetwork",
-            "CWNetworkProfile",
-            "CWWiFiClient",
-            "CoreWLANConstants",
-            "CoreWLANTypes",
-            "CoreWLANUtil",
-            "alloc",
-            "bitflags",
-            "default",
-            "objc2-core-foundation",
-            "objc2-security",
-            "objc2-security-foundation",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
-            {
-              "id": "bitflags 2.13.1",
-              "target": "bitflags"
-            },
             {
               "id": "objc2 0.6.4",
               "target": "objc2"
             },
             {
-              "id": "objc2-core-foundation 0.3.2",
-              "target": "objc2_core_foundation"
-            },
-            {
               "id": "objc2-foundation 0.3.2",
               "target": "objc2_foundation"
-            },
-            {
-              "id": "objc2-security 0.3.2",
-              "target": "objc2_security"
-            },
-            {
-              "id": "objc2-security-foundation 0.3.2",
-              "target": "objc2_security_foundation"
             }
           ],
           "selects": {}
@@ -22092,13 +21208,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "alloc",
-            "std"
-          ],
-          "selects": {}
-        },
         "edition": "2021",
         "version": "4.1.0"
       },
@@ -22137,209 +21246,11 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "FoundationErrors",
-            "FoundationLegacySwiftCompatibility",
-            "NSAffineTransform",
-            "NSAppleEventDescriptor",
-            "NSAppleEventManager",
-            "NSAppleScript",
-            "NSArchiver",
-            "NSArray",
-            "NSAttributedString",
-            "NSAutoreleasePool",
-            "NSBackgroundActivityScheduler",
-            "NSBundle",
-            "NSByteCountFormatter",
-            "NSByteOrder",
-            "NSCache",
-            "NSCalendar",
-            "NSCalendarDate",
-            "NSCharacterSet",
-            "NSClassDescription",
-            "NSCoder",
-            "NSComparisonPredicate",
-            "NSCompoundPredicate",
-            "NSConnection",
-            "NSData",
-            "NSDate",
-            "NSDateComponentsFormatter",
-            "NSDateFormatter",
-            "NSDateInterval",
-            "NSDateIntervalFormatter",
-            "NSDebug",
-            "NSDecimal",
-            "NSDecimalNumber",
-            "NSDictionary",
-            "NSDistantObject",
-            "NSDistributedLock",
-            "NSDistributedNotificationCenter",
-            "NSEnergyFormatter",
-            "NSEnumerator",
-            "NSError",
-            "NSException",
-            "NSExpression",
-            "NSExtensionContext",
-            "NSExtensionItem",
-            "NSExtensionRequestHandling",
-            "NSFileCoordinator",
-            "NSFileHandle",
-            "NSFileManager",
-            "NSFilePresenter",
-            "NSFileVersion",
-            "NSFileWrapper",
-            "NSFormatter",
-            "NSGarbageCollector",
-            "NSGeometry",
-            "NSHFSFileTypes",
-            "NSHTTPCookie",
-            "NSHTTPCookieStorage",
-            "NSHashTable",
-            "NSHost",
-            "NSISO8601DateFormatter",
-            "NSIndexPath",
-            "NSIndexSet",
-            "NSInflectionRule",
-            "NSInvocation",
-            "NSItemProvider",
-            "NSJSONSerialization",
-            "NSKeyValueCoding",
-            "NSKeyValueObserving",
-            "NSKeyValueSharedObservers",
-            "NSKeyedArchiver",
-            "NSLengthFormatter",
-            "NSLinguisticTagger",
-            "NSListFormatter",
-            "NSLocale",
-            "NSLocalizedNumberFormatRule",
-            "NSLock",
-            "NSMapTable",
-            "NSMassFormatter",
-            "NSMeasurement",
-            "NSMeasurementFormatter",
-            "NSMetadata",
-            "NSMetadataAttributes",
-            "NSMethodSignature",
-            "NSMorphology",
-            "NSNetServices",
-            "NSNotification",
-            "NSNotificationQueue",
-            "NSNull",
-            "NSNumberFormatter",
-            "NSObjCRuntime",
-            "NSObject",
-            "NSObjectScripting",
-            "NSOperation",
-            "NSOrderedCollectionChange",
-            "NSOrderedCollectionDifference",
-            "NSOrderedSet",
-            "NSOrthography",
-            "NSPathUtilities",
-            "NSPersonNameComponents",
-            "NSPersonNameComponentsFormatter",
-            "NSPointerArray",
-            "NSPointerFunctions",
-            "NSPort",
-            "NSPortCoder",
-            "NSPortMessage",
-            "NSPortNameServer",
-            "NSPredicate",
-            "NSProcessInfo",
-            "NSProgress",
-            "NSPropertyList",
-            "NSProtocolChecker",
-            "NSProxy",
-            "NSRange",
-            "NSRegularExpression",
-            "NSRelativeDateTimeFormatter",
-            "NSRunLoop",
-            "NSScanner",
-            "NSScriptClassDescription",
-            "NSScriptCoercionHandler",
-            "NSScriptCommand",
-            "NSScriptCommandDescription",
-            "NSScriptExecutionContext",
-            "NSScriptKeyValueCoding",
-            "NSScriptObjectSpecifiers",
-            "NSScriptStandardSuiteCommands",
-            "NSScriptSuiteRegistry",
-            "NSScriptWhoseTests",
-            "NSSet",
-            "NSSortDescriptor",
-            "NSSpellServer",
-            "NSStream",
-            "NSString",
-            "NSTask",
-            "NSTermOfAddress",
-            "NSTextCheckingResult",
-            "NSThread",
-            "NSTimeZone",
-            "NSTimer",
-            "NSURL",
-            "NSURLAuthenticationChallenge",
-            "NSURLCache",
-            "NSURLConnection",
-            "NSURLCredential",
-            "NSURLCredentialStorage",
-            "NSURLDownload",
-            "NSURLError",
-            "NSURLHandle",
-            "NSURLProtectionSpace",
-            "NSURLProtocol",
-            "NSURLRequest",
-            "NSURLResponse",
-            "NSURLSession",
-            "NSUUID",
-            "NSUbiquitousKeyValueStore",
-            "NSUndoManager",
-            "NSUnit",
-            "NSUserActivity",
-            "NSUserDefaults",
-            "NSUserNotification",
-            "NSUserScriptTask",
-            "NSValue",
-            "NSValueTransformer",
-            "NSXMLDTD",
-            "NSXMLDTDNode",
-            "NSXMLDocument",
-            "NSXMLElement",
-            "NSXMLNode",
-            "NSXMLNodeOptions",
-            "NSXMLParser",
-            "NSXPCConnection",
-            "NSZone",
-            "alloc",
-            "bitflags",
-            "block2",
-            "default",
-            "libc",
-            "objc2-core-foundation",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
-              "id": "bitflags 2.13.1",
-              "target": "bitflags"
-            },
-            {
-              "id": "block2 0.6.2",
-              "target": "block2"
-            },
-            {
-              "id": "libc 0.2.186",
-              "target": "libc"
-            },
-            {
               "id": "objc2 0.6.4",
               "target": "objc2"
-            },
-            {
-              "id": "objc2-core-foundation 0.3.2",
-              "target": "objc2_core_foundation"
             }
           ],
           "selects": {}
@@ -22382,21 +21293,8 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "alloc",
-            "hidsystem",
-            "libc",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
-            {
-              "id": "libc 0.2.186",
-              "target": "libc"
-            },
             {
               "id": "objc2-core-foundation 0.3.2",
               "target": "objc2_core_foundation"
@@ -22444,25 +21342,8 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "Authorization",
-            "SecBase",
-            "bitflags",
-            "objc2"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
-            {
-              "id": "bitflags 2.13.1",
-              "target": "bitflags"
-            },
-            {
-              "id": "objc2 0.6.4",
-              "target": "objc2"
-            },
             {
               "id": "objc2-core-foundation 0.3.2",
               "target": "objc2_core_foundation"
@@ -22510,12 +21391,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "SFAuthorization"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -22569,58 +21444,11 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "CaptiveNetwork",
-            "DHCPClientPreferences",
-            "SCDynamicStore",
-            "SCDynamicStoreCopyDHCPInfo",
-            "SCDynamicStoreCopySpecific",
-            "SCDynamicStoreKey",
-            "SCNetwork",
-            "SCNetworkConfiguration",
-            "SCNetworkConnection",
-            "SCNetworkReachability",
-            "SCPreferences",
-            "SCPreferencesPath",
-            "SCPreferencesSetSpecific",
-            "SCSchemaDefinitions",
-            "alloc",
-            "bitflags",
-            "default",
-            "dispatch2",
-            "libc",
-            "objc2",
-            "objc2-security",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
-              "id": "bitflags 2.13.1",
-              "target": "bitflags"
-            },
-            {
-              "id": "dispatch2 0.3.1",
-              "target": "dispatch2"
-            },
-            {
-              "id": "libc 0.2.186",
-              "target": "libc"
-            },
-            {
-              "id": "objc2 0.6.4",
-              "target": "objc2"
-            },
-            {
               "id": "objc2-core-foundation 0.3.2",
               "target": "objc2_core_foundation"
-            },
-            {
-              "id": "objc2-security 0.3.2",
-              "target": "objc2_security"
             }
           ],
           "selects": {}
@@ -22850,101 +21678,26 @@
         "crate_features": {
           "common": [
             "alloc",
+            "critical-section",
             "default",
+            "portable-atomic",
             "race",
             "std"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "critical-section",
-              "portable-atomic"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "critical-section",
-              "portable-atomic"
-            ],
-            "wasm32-wasip1": [
-              "critical-section",
-              "portable-atomic"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "critical-section",
-              "portable-atomic"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "critical-section",
-              "portable-atomic"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "critical-section",
-              "portable-atomic"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
-          "common": [],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "critical-section 1.2.0",
-                "target": "critical_section"
-              },
-              {
-                "id": "portable-atomic 1.14.0",
-                "target": "portable_atomic"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "critical-section 1.2.0",
-                "target": "critical_section"
-              },
-              {
-                "id": "portable-atomic 1.14.0",
-                "target": "portable_atomic"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "critical-section 1.2.0",
-                "target": "critical_section"
-              },
-              {
-                "id": "portable-atomic 1.14.0",
-                "target": "portable_atomic"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "critical-section 1.2.0",
-                "target": "critical_section"
-              },
-              {
-                "id": "portable-atomic 1.14.0",
-                "target": "portable_atomic"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "critical-section 1.2.0",
-                "target": "critical_section"
-              },
-              {
-                "id": "portable-atomic 1.14.0",
-                "target": "portable_atomic"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "critical-section 1.2.0",
-                "target": "critical_section"
-              },
-              {
-                "id": "portable-atomic 1.14.0",
-                "target": "portable_atomic"
-              }
-            ]
-          }
+          "common": [
+            {
+              "id": "critical-section 1.2.0",
+              "target": "critical_section"
+            },
+            {
+              "id": "portable-atomic 1.14.0",
+              "target": "portable_atomic"
+            }
+          ],
+          "selects": {}
         },
         "edition": "2021",
         "version": "1.21.4"
@@ -22985,12 +21738,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default"
-          ],
-          "selects": {}
-        },
         "edition": "2021",
         "version": "1.70.2"
       },
@@ -24330,13 +23077,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "serde"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -24350,10 +23090,6 @@
             {
               "id": "quick-xml 0.41.0",
               "target": "quick_xml"
-            },
-            {
-              "id": "serde 1.0.229",
-              "target": "serde"
             },
             {
               "id": "time 0.3.53",
@@ -25483,12 +24219,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -26110,6 +24840,10 @@
         "deps": {
           "common": [
             {
+              "id": "libc 0.2.186",
+              "target": "libc"
+            },
+            {
               "id": "rand_chacha 0.3.1",
               "target": "rand_chacha"
             },
@@ -26118,32 +24852,7 @@
               "target": "rand_core"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2018",
         "version": "0.8.7"
@@ -27179,6 +25888,10 @@
               "target": "bytes"
             },
             {
+              "id": "futures-channel 0.3.33",
+              "target": "futures_channel"
+            },
+            {
               "id": "futures-core 0.3.33",
               "target": "futures_core"
             },
@@ -27189,6 +25902,18 @@
             {
               "id": "http 1.4.2",
               "target": "http"
+            },
+            {
+              "id": "hyper-rustls 0.27.9",
+              "target": "hyper_rustls"
+            },
+            {
+              "id": "rustls 0.23.42",
+              "target": "rustls"
+            },
+            {
+              "id": "rustls-pki-types 1.15.0",
+              "target": "rustls_pki_types"
             },
             {
               "id": "serde 1.0.229",
@@ -27207,63 +25932,19 @@
               "target": "sync_wrapper"
             },
             {
+              "id": "tokio-rustls 0.26.4",
+              "target": "tokio_rustls"
+            },
+            {
               "id": "url 2.5.8",
               "target": "url"
+            },
+            {
+              "id": "webpki-roots 1.0.9",
+              "target": "webpki_roots"
             }
           ],
           "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "webpki-roots 1.0.9",
-                "target": "webpki_roots"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "webpki-roots 1.0.9",
-                "target": "webpki_roots"
-              }
-            ],
             "cfg(not(target_arch = \"wasm32\"))": [
               {
                 "id": "http-body 1.1.0",
@@ -27326,84 +26007,6 @@
               {
                 "id": "web-sys 0.3.103",
                 "target": "web_sys"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "webpki-roots 1.0.9",
-                "target": "webpki_roots"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "webpki-roots 1.0.9",
-                "target": "webpki_roots"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "futures-channel 0.3.33",
-                "target": "futures_channel"
-              },
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "webpki-roots 1.0.9",
-                "target": "webpki_roots"
               }
             ]
           }
@@ -27479,8 +26082,32 @@
               "target": "http"
             },
             {
+              "id": "hyper-rustls 0.27.9",
+              "target": "hyper_rustls"
+            },
+            {
+              "id": "rustls 0.23.42",
+              "target": "rustls"
+            },
+            {
+              "id": "rustls-pki-types 1.15.0",
+              "target": "rustls_pki_types"
+            },
+            {
+              "id": "rustls-platform-verifier 0.7.0",
+              "target": "rustls_platform_verifier"
+            },
+            {
               "id": "sync_wrapper 1.0.2",
               "target": "sync_wrapper"
+            },
+            {
+              "id": "tokio-rustls 0.26.4",
+              "target": "tokio_rustls"
+            },
+            {
+              "id": "tokio-util 0.7.18",
+              "target": "tokio_util"
             },
             {
               "id": "url 2.5.8",
@@ -27488,58 +26115,6 @@
             }
           ],
           "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "rustls-platform-verifier 0.7.0",
-                "target": "rustls_platform_verifier"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "tokio-util 0.7.18",
-                "target": "tokio_util"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "rustls-platform-verifier 0.7.0",
-                "target": "rustls_platform_verifier"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "tokio-util 0.7.18",
-                "target": "tokio_util"
-              }
-            ],
             "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))": [
               {
                 "id": "js-sys 0.3.103",
@@ -27602,116 +26177,6 @@
               {
                 "id": "tower-service 0.3.3",
                 "target": "tower_service"
-              }
-            ],
-            "wasm32-unknown-unknown": [
-              {
-                "id": "wasm-streams 0.5.0",
-                "target": "wasm_streams"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "rustls-platform-verifier 0.7.0",
-                "target": "rustls_platform_verifier"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "tokio-util 0.7.18",
-                "target": "tokio_util"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "rustls-platform-verifier 0.7.0",
-                "target": "rustls_platform_verifier"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "tokio-util 0.7.18",
-                "target": "tokio_util"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "rustls-platform-verifier 0.7.0",
-                "target": "rustls_platform_verifier"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "tokio-util 0.7.18",
-                "target": "tokio_util"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "hyper-rustls 0.27.9",
-                "target": "hyper_rustls"
-              },
-              {
-                "id": "rustls 0.23.42",
-                "target": "rustls"
-              },
-              {
-                "id": "rustls-pki-types 1.15.0",
-                "target": "rustls_pki_types"
-              },
-              {
-                "id": "rustls-platform-verifier 0.7.0",
-                "target": "rustls_platform_verifier"
-              },
-              {
-                "id": "tokio-rustls 0.26.4",
-                "target": "tokio_rustls"
-              },
-              {
-                "id": "tokio-util 0.7.18",
-                "target": "tokio_util"
               }
             ]
           }
@@ -27870,11 +26335,7 @@
             "default",
             "dev_urandom_fallback"
           ],
-          "selects": {
-            "wasm32-unknown-unknown": [
-              "wasm32_unknown_unknown_js"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -28228,17 +26689,6 @@
             }
           ],
           "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "errno 0.3.14",
-                "target": "errno",
-                "alias": "libc_errno"
-              },
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ],
             "cfg(all(any(target_os = \"linux\", target_os = \"android\"), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))": [
               {
                 "id": "linux-raw-sys 0.12.1",
@@ -28271,28 +26721,6 @@
               {
                 "id": "windows-sys 0.61.2",
                 "target": "windows_sys"
-              }
-            ],
-            "wasm32-unknown-unknown": [
-              {
-                "id": "errno 0.3.14",
-                "target": "errno",
-                "alias": "libc_errno"
-              },
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "errno 0.3.14",
-                "target": "errno",
-                "alias": "libc_errno"
-              },
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
               }
             ]
           }
@@ -28613,12 +27041,7 @@
             "default",
             "std"
           ],
-          "selects": {
-            "wasm32-unknown-unknown": [
-              "web",
-              "web-time"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -28627,14 +27050,7 @@
               "target": "zeroize"
             }
           ],
-          "selects": {
-            "wasm32-unknown-unknown": [
-              {
-                "id": "web-time 1.1.0",
-                "target": "web_time"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2021",
         "version": "1.15.0"
@@ -29266,15 +27682,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "OSX_10_14",
-            "alpn",
-            "default",
-            "session-tickets"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -29339,13 +27746,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "OSX_10_13",
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -29414,14 +27814,7 @@
               "target": "libc"
             }
           ],
-          "selects": {
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "windows-sys 0.61.2",
-                "target": "windows_sys"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2021",
         "version": "0.5.1"
@@ -32353,14 +30746,7 @@
             "objc2-io-kit",
             "system"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "objc2-core-foundation"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "windows"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -32370,30 +30756,10 @@
             }
           ],
           "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "objc2-core-foundation 0.3.2",
-                "target": "objc2_core_foundation"
-              },
-              {
-                "id": "objc2-io-kit 0.3.2",
-                "target": "objc2_io_kit"
-              }
-            ],
             "cfg(not(any(target_os = \"unknown\", target_arch = \"wasm32\")))": [
               {
                 "id": "libc 0.2.186",
                 "target": "libc"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "ntapi 0.4.3",
-                "target": "ntapi"
-              },
-              {
-                "id": "windows 0.62.2",
-                "target": "windows"
               }
             ]
           }
@@ -33018,30 +31384,12 @@
             "alloc",
             "default",
             "formatting",
+            "local-offset",
             "macros",
             "parsing",
             "std"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "local-offset"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "local-offset"
-            ],
-            "wasm32-unknown-unknown": [
-              "wasm-bindgen"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "local-offset"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "local-offset"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "local-offset"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -33050,8 +31398,16 @@
               "target": "deranged"
             },
             {
+              "id": "libc 0.2.186",
+              "target": "libc"
+            },
+            {
               "id": "num-conv 0.2.2",
               "target": "num_conv"
+            },
+            {
+              "id": "num_threads 0.1.7",
+              "target": "num_threads"
             },
             {
               "id": "powerfmt 0.2.0",
@@ -33062,54 +31418,7 @@
               "target": "time_core"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "num_threads 0.1.7",
-                "target": "num_threads"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "num_threads 0.1.7",
-                "target": "num_threads"
-              }
-            ],
-            "wasm32-unknown-unknown": [
-              {
-                "id": "js-sys 0.3.103",
-                "target": "js_sys"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "num_threads 0.1.7",
-                "target": "num_threads"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "num_threads 0.1.7",
-                "target": "num_threads"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2024",
         "proc_macro_deps": {
@@ -33488,36 +31797,21 @@
             "signal-hook-registry",
             "socket2",
             "sync",
+            "test-util",
             "time",
             "tokio-macros"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "test-util"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "test-util"
-            ],
-            "wasm32-wasip1": [
-              "test-util"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "test-util",
-              "windows-sys"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "test-util"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "test-util"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
             {
               "id": "bytes 1.12.1",
               "target": "bytes"
+            },
+            {
+              "id": "libc 0.2.186",
+              "target": "libc"
             },
             {
               "id": "mio 1.2.2",
@@ -33530,82 +31824,17 @@
             {
               "id": "pin-project-lite 0.2.17",
               "target": "pin_project_lite"
+            },
+            {
+              "id": "signal-hook-registry 1.4.8",
+              "target": "signal_hook_registry"
+            },
+            {
+              "id": "socket2 0.6.5",
+              "target": "socket2"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "signal-hook-registry 1.4.8",
-                "target": "signal_hook_registry"
-              },
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "signal-hook-registry 1.4.8",
-                "target": "signal_hook_registry"
-              },
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              },
-              {
-                "id": "windows-sys 0.61.2",
-                "target": "windows_sys"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "signal-hook-registry 1.4.8",
-                "target": "signal_hook_registry"
-              },
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "libc 0.2.186",
-                "target": "libc"
-              },
-              {
-                "id": "signal-hook-registry 1.4.8",
-                "target": "signal_hook_registry"
-              },
-              {
-                "id": "socket2 0.6.5",
-                "target": "socket2"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2021",
         "proc_macro_deps": {
@@ -33768,30 +31997,12 @@
           "common": [
             "aws_lc_rs",
             "default",
+            "early-data",
             "logging",
             "ring",
             "tls12"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "early-data"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "early-data"
-            ],
-            "wasm32-wasip1": [
-              "early-data"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "early-data"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "early-data"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "early-data"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -34135,6 +32346,7 @@
         ],
         "crate_features": {
           "common": [
+            "client",
             "getrandom",
             "rand",
             "ring",
@@ -34142,26 +32354,7 @@
             "server",
             "sha1_smol"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "client"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "client"
-            ],
-            "wasm32-wasip1": [
-              "client"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "client"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "client"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "client"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -34266,12 +32459,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -34496,37 +32683,14 @@
             "log",
             "make",
             "pin-project-lite",
+            "retry",
             "sync_wrapper",
+            "timeout",
             "tokio",
             "tracing",
             "util"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "retry",
-              "timeout"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "retry",
-              "timeout"
-            ],
-            "wasm32-wasip1": [
-              "retry",
-              "timeout"
-            ],
-            "x86_64-pc-windows-msvc": [
-              "retry",
-              "timeout"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "retry",
-              "timeout"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "retry",
-              "timeout"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -36000,48 +34164,15 @@
         "deps": {
           "common": [
             {
+              "id": "getrandom 0.4.3",
+              "target": "getrandom"
+            },
+            {
               "id": "serde_core 1.0.229",
               "target": "serde_core"
             }
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "getrandom 0.4.3",
-                "target": "getrandom"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "getrandom 0.4.3",
-                "target": "getrandom"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "getrandom 0.4.3",
-                "target": "getrandom"
-              }
-            ],
-            "x86_64-pc-windows-msvc": [
-              {
-                "id": "getrandom 0.4.3",
-                "target": "getrandom"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "getrandom 0.4.3",
-                "target": "getrandom"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "getrandom 0.4.3",
-                "target": "getrandom"
-              }
-            ]
-          }
+          "selects": {}
         },
         "edition": "2021",
         "version": "1.24.0"
@@ -36675,13 +34806,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
         "edition": "2018",
         "version": "0.11.1+wasi-snapshot-preview1"
       },
@@ -36781,13 +34905,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -36887,13 +35004,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -37202,62 +35312,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "AbortController",
-            "AbortSignal",
-            "Blob",
-            "BlobPropertyBag",
-            "EventTarget",
-            "File",
-            "FormData",
-            "Headers",
-            "ReadableStream",
-            "Request",
-            "RequestCache",
-            "RequestCredentials",
-            "RequestInit",
-            "RequestMode",
-            "Response",
-            "ServiceWorkerGlobalScope",
-            "Window",
-            "WorkerGlobalScope",
-            "default",
-            "std"
-          ],
-          "selects": {
-            "wasm32-unknown-unknown": [
-              "BinaryType",
-              "CloseEvent",
-              "DomException",
-              "Event",
-              "EventListener",
-              "MessageEvent",
-              "QueuingStrategy",
-              "ReadableByteStreamController",
-              "ReadableStreamByobReader",
-              "ReadableStreamByobRequest",
-              "ReadableStreamDefaultController",
-              "ReadableStreamDefaultReader",
-              "ReadableStreamGetReaderOptions",
-              "ReadableStreamReadResult",
-              "ReadableStreamReaderMode",
-              "ReadableStreamType",
-              "ReadableWritablePair",
-              "StreamPipeOptions",
-              "TransformStream",
-              "TransformStreamDefaultController",
-              "Transformer",
-              "UnderlyingSink",
-              "UnderlyingSource",
-              "WebSocket",
-              "WritableStream",
-              "WritableStreamDefaultController",
-              "WritableStreamDefaultWriter",
-              "console"
-            ]
-          }
-        },
         "deps": {
           "common": [
             {
@@ -37628,14 +35682,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "alloc",
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
         "edition": "2021",
         "version": "1.2.1"
       },
@@ -37687,25 +35733,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "cfg",
-            "evntrace",
-            "fileapi",
-            "handleapi",
-            "in6addr",
-            "inaddr",
-            "minwinbase",
-            "ntsecapi",
-            "processthreadsapi",
-            "std",
-            "winbase",
-            "windef",
-            "winerror",
-            "winioctl"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -38021,41 +36048,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "Foundation",
-            "Foundation_Collections",
-            "Storage",
-            "Storage_Provider",
-            "Storage_Search",
-            "Storage_Streams",
-            "Win32",
-            "Win32_Foundation",
-            "Win32_Security",
-            "Win32_Security_Authorization",
-            "Win32_Storage",
-            "Win32_Storage_CloudFilters",
-            "Win32_Storage_EnhancedStorage",
-            "Win32_Storage_FileSystem",
-            "Win32_System",
-            "Win32_System_Com",
-            "Win32_System_Com_StructuredStorage",
-            "Win32_System_CorrelationVector",
-            "Win32_System_IO",
-            "Win32_System_Ioctl",
-            "Win32_System_Memory",
-            "Win32_System_Ole",
-            "Win32_System_Search",
-            "Win32_System_SystemServices",
-            "Win32_System_Variant",
-            "Win32_UI",
-            "Win32_UI_Shell",
-            "Win32_UI_Shell_PropertiesSystem",
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -38120,50 +36112,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "Wdk",
-            "Wdk_System",
-            "Wdk_System_SystemInformation",
-            "Wdk_System_SystemServices",
-            "Wdk_System_Threading",
-            "Win32",
-            "Win32_Foundation",
-            "Win32_Graphics",
-            "Win32_Graphics_Gdi",
-            "Win32_NetworkManagement",
-            "Win32_NetworkManagement_IpHelper",
-            "Win32_NetworkManagement_Ndis",
-            "Win32_Networking",
-            "Win32_Networking_WinSock",
-            "Win32_Security",
-            "Win32_Security_Authorization",
-            "Win32_System",
-            "Win32_System_Com",
-            "Win32_System_Diagnostics",
-            "Win32_System_Diagnostics_Debug",
-            "Win32_System_Diagnostics_ToolHelp",
-            "Win32_System_Kernel",
-            "Win32_System_Memory",
-            "Win32_System_Ole",
-            "Win32_System_Performance",
-            "Win32_System_Power",
-            "Win32_System_ProcessStatus",
-            "Win32_System_Registry",
-            "Win32_System_RemoteDesktop",
-            "Win32_System_Rpc",
-            "Win32_System_SystemInformation",
-            "Win32_System_SystemServices",
-            "Win32_System_Threading",
-            "Win32_System_Variant",
-            "Win32_System_Wmi",
-            "Win32_UI",
-            "Win32_UI_Shell",
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -38272,12 +36220,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -38326,12 +36268,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -38401,13 +36337,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -38533,12 +36462,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -38837,12 +36760,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -38895,13 +36812,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -38958,12 +36868,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -39012,13 +36916,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "default",
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -39067,12 +36964,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -39121,12 +37012,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "std"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -39175,14 +37060,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "Win32",
-            "Win32_Globalization",
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [],
           "selects": {
@@ -39233,21 +37110,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "Win32",
-            "Win32_Foundation",
-            "Win32_Security",
-            "Win32_Storage",
-            "Win32_Storage_FileSystem",
-            "Win32_System",
-            "Win32_System_IO",
-            "Win32_System_Threading",
-            "Win32_System_WindowsProgramming",
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -39344,22 +37206,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "Win32",
-            "Win32_Foundation",
-            "Win32_Storage",
-            "Win32_Storage_FileSystem",
-            "Win32_System",
-            "Win32_System_IO",
-            "Win32_System_Ioctl",
-            "Win32_System_LibraryLoader",
-            "Win32_System_Performance",
-            "Win32_System_SystemServices",
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -39408,18 +37254,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "Win32",
-            "Win32_Foundation",
-            "Win32_Networking",
-            "Win32_Networking_WinSock",
-            "Win32_System",
-            "Win32_System_Console",
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -39468,51 +37302,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "Wdk",
-            "Wdk_Foundation",
-            "Wdk_Storage",
-            "Wdk_Storage_FileSystem",
-            "Wdk_System",
-            "Wdk_System_IO",
-            "Win32",
-            "Win32_Foundation",
-            "Win32_Graphics",
-            "Win32_Graphics_Gdi",
-            "Win32_NetworkManagement",
-            "Win32_NetworkManagement_IpHelper",
-            "Win32_NetworkManagement_Ndis",
-            "Win32_Networking",
-            "Win32_Networking_WinSock",
-            "Win32_Security",
-            "Win32_Security_Authentication",
-            "Win32_Security_Authentication_Identity",
-            "Win32_Security_Credentials",
-            "Win32_Security_Cryptography",
-            "Win32_Storage",
-            "Win32_Storage_CloudFilters",
-            "Win32_Storage_FileSystem",
-            "Win32_System",
-            "Win32_System_Console",
-            "Win32_System_CorrelationVector",
-            "Win32_System_IO",
-            "Win32_System_Kernel",
-            "Win32_System_LibraryLoader",
-            "Win32_System_Memory",
-            "Win32_System_Pipes",
-            "Win32_System_Registry",
-            "Win32_System_SystemInformation",
-            "Win32_System_SystemServices",
-            "Win32_System_Threading",
-            "Win32_System_WindowsProgramming",
-            "Win32_UI",
-            "Win32_UI_Shell",
-            "Win32_UI_WindowsAndMessaging",
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -42464,20 +40253,8 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "chrono",
-            "default"
-          ],
-          "selects": {}
-        },
         "deps": {
-          "common": [
-            {
-              "id": "chrono 0.4.45",
-              "target": "chrono"
-            }
-          ],
+          "common": [],
           "selects": {
             "cfg(target_os = \"windows\")": [
               {
@@ -43291,34 +41068,11 @@
         ],
         "crate_features": {
           "common": [
-            "simd"
+            "derive",
+            "simd",
+            "zerocopy-derive"
           ],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "derive",
-              "zerocopy-derive"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "derive",
-              "zerocopy-derive"
-            ],
-            "wasm32-unknown-unknown": [
-              "derive",
-              "zerocopy-derive"
-            ],
-            "wasm32-wasip1": [
-              "derive",
-              "zerocopy-derive"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "derive",
-              "zerocopy-derive"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "derive",
-              "zerocopy-derive"
-            ]
-          }
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -43331,51 +41085,13 @@
         },
         "edition": "2021",
         "proc_macro_deps": {
-          "common": [],
-          "selects": {
-            "aarch64-apple-darwin": [
-              {
-                "id": "zerocopy-derive 0.8.54",
-                "target": "zerocopy_derive"
-              }
-            ],
-            "aarch64-unknown-linux-gnu": [
-              {
-                "id": "zerocopy-derive 0.8.54",
-                "target": "zerocopy_derive"
-              }
-            ],
-            "cfg(any())": [
-              {
-                "id": "zerocopy-derive 0.8.54",
-                "target": "zerocopy_derive"
-              }
-            ],
-            "wasm32-unknown-unknown": [
-              {
-                "id": "zerocopy-derive 0.8.54",
-                "target": "zerocopy_derive"
-              }
-            ],
-            "wasm32-wasip1": [
-              {
-                "id": "zerocopy-derive 0.8.54",
-                "target": "zerocopy_derive"
-              }
-            ],
-            "x86_64-unknown-linux-gnu": [
-              {
-                "id": "zerocopy-derive 0.8.54",
-                "target": "zerocopy_derive"
-              }
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              {
-                "id": "zerocopy-derive 0.8.54",
-                "target": "zerocopy_derive"
-              }
-            ]
-          }
+          "common": [
+            {
+              "id": "zerocopy-derive 0.8.54",
+              "target": "zerocopy_derive"
+            }
+          ],
+          "selects": {}
         },
         "version": "0.8.54"
       },
@@ -44315,284 +42031,141 @@
     "windows-thumbnail-provider 1.0.37": "crates/windows-thumbnail-provider"
   },
   "conditions": {
-    "aarch64-apple-darwin": [
-      "aarch64-apple-darwin"
-    ],
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
     "aarch64-pc-windows-msvc": [],
-    "aarch64-unknown-linux-gnu": [
-      "aarch64-unknown-linux-gnu"
-    ],
     "aarch64-uwp-windows-msvc": [],
     "cfg(all(all(target_arch = \"aarch64\", target_endian = \"little\"), target_os = \"windows\"))": [],
-    "cfg(all(all(target_arch = \"aarch64\", target_endian = \"little\"), target_vendor = \"apple\", any(target_os = \"ios\", target_os = \"macos\", target_os = \"tvos\", target_os = \"visionos\", target_os = \"watchos\")))": [
-      "aarch64-apple-darwin"
-    ],
-    "cfg(all(any(all(target_arch = \"aarch64\", target_endian = \"little\"), all(target_arch = \"arm\", target_endian = \"little\")), any(target_os = \"android\", target_os = \"linux\")))": [
-      "aarch64-unknown-linux-gnu"
-    ],
-    "cfg(all(any(target_arch = \"x86_64\", target_arch = \"arm64ec\"), target_env = \"msvc\", not(windows_raw_dylib)))": [
-      "x86_64-pc-windows-msvc"
-    ],
+    "cfg(all(all(target_arch = \"aarch64\", target_endian = \"little\"), target_vendor = \"apple\", any(target_os = \"ios\", target_os = \"macos\", target_os = \"tvos\", target_os = \"visionos\", target_os = \"watchos\")))": [],
+    "cfg(all(any(all(target_arch = \"aarch64\", target_endian = \"little\"), all(target_arch = \"arm\", target_endian = \"little\")), any(target_os = \"android\", target_os = \"linux\")))": [],
+    "cfg(all(any(target_arch = \"x86_64\", target_arch = \"arm64ec\"), target_env = \"msvc\", not(windows_raw_dylib)))": [],
     "cfg(all(any(target_os = \"linux\", target_os = \"android\"), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))": [],
     "cfg(all(any(target_os = \"linux\", target_os = \"android\"), not(any(all(target_os = \"linux\", target_env = \"\"), getrandom_backend = \"custom\", getrandom_backend = \"linux_raw\", getrandom_backend = \"rdrand\", getrandom_backend = \"rndr\"))))": [
-      "aarch64-unknown-linux-gnu",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(all(not(curve25519_dalek_backend = \"fiat\"), not(curve25519_dalek_backend = \"serial\"), target_arch = \"x86_64\"))": [
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))": [
-      "aarch64-unknown-linux-gnu",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
-    "cfg(all(not(windows), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))": [
-      "aarch64-apple-darwin",
-      "wasm32-unknown-unknown",
-      "wasm32-wasip1"
-    ],
+    "cfg(all(not(windows), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))": [],
     "cfg(all(target_arch = \"aarch64\", target_env = \"msvc\", not(windows_raw_dylib)))": [],
     "cfg(all(target_arch = \"aarch64\", target_os = \"android\"))": [],
-    "cfg(all(target_arch = \"aarch64\", target_os = \"linux\"))": [
-      "aarch64-unknown-linux-gnu"
-    ],
-    "cfg(all(target_arch = \"aarch64\", target_vendor = \"apple\"))": [
-      "aarch64-apple-darwin"
-    ],
+    "cfg(all(target_arch = \"aarch64\", target_os = \"linux\"))": [],
+    "cfg(all(target_arch = \"aarch64\", target_vendor = \"apple\"))": [],
     "cfg(all(target_arch = \"loongarch64\", target_os = \"linux\"))": [],
-    "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))": [
-      "wasm32-unknown-unknown"
-    ],
-    "cfg(all(target_arch = \"wasm32\", target_os = \"unknown\"))": [
-      "wasm32-unknown-unknown"
-    ],
+    "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))": [],
+    "cfg(all(target_arch = \"wasm32\", target_os = \"unknown\"))": [],
     "cfg(all(target_arch = \"wasm32\", target_os = \"wasi\", target_env = \"p2\"))": [],
     "cfg(all(target_arch = \"x86\", target_env = \"gnu\", not(target_abi = \"llvm\"), not(windows_raw_dylib)))": [],
     "cfg(all(target_arch = \"x86\", target_env = \"gnu\", not(windows_raw_dylib)))": [],
     "cfg(all(target_arch = \"x86\", target_env = \"msvc\", not(windows_raw_dylib)))": [],
     "cfg(all(target_arch = \"x86_64\", target_env = \"gnu\", not(target_abi = \"llvm\"), not(windows_raw_dylib)))": [
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
-    "cfg(all(target_arch = \"x86_64\", target_env = \"msvc\", not(windows_raw_dylib)))": [
-      "x86_64-pc-windows-msvc"
-    ],
-    "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))": [
-      "wasm32-unknown-unknown"
-    ],
+    "cfg(all(target_arch = \"x86_64\", target_env = \"msvc\", not(windows_raw_dylib)))": [],
+    "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))": [],
     "cfg(all(target_os = \"uefi\", getrandom_backend = \"efi_rng\"))": [],
     "cfg(all(unix, not(target_os = \"android\"), not(target_vendor = \"apple\"), not(target_arch = \"wasm32\")))": [
-      "aarch64-unknown-linux-gnu",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(all(unix, not(target_os = \"macos\")))": [
-      "aarch64-unknown-linux-gnu",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(any())": [],
     "cfg(any(target_arch = \"aarch64\", target_arch = \"x86\", target_arch = \"x86_64\"))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(any(target_arch = \"x86\", target_arch = \"x86_64\"))": [
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))": [
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(any(target_os = \"android\", target_os = \"linux\"))": [
-      "aarch64-unknown-linux-gnu",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(any(target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"hurd\", target_os = \"illumos\", target_os = \"cygwin\", all(target_os = \"horizon\", target_arch = \"arm\")))": [],
     "cfg(any(target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\", target_os = \"dragonflybsd\"))": [],
     "cfg(any(target_os = \"haiku\", target_os = \"redox\", target_os = \"nto\", target_os = \"aix\"))": [],
     "cfg(any(target_os = \"ios\", target_os = \"visionos\", target_os = \"watchos\", target_os = \"tvos\"))": [],
     "cfg(any(target_os = \"linux\", target_os = \"android\"))": [
-      "aarch64-unknown-linux-gnu",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
-    "cfg(any(target_os = \"macos\", target_os = \"ios\"))": [
-      "aarch64-apple-darwin"
-    ],
-    "cfg(any(target_os = \"macos\", target_os = \"ios\", target_os = \"freebsd\"))": [
-      "aarch64-apple-darwin"
-    ],
-    "cfg(any(target_os = \"macos\", target_os = \"openbsd\", target_os = \"vita\", target_os = \"emscripten\"))": [
-      "aarch64-apple-darwin"
-    ],
-    "cfg(any(target_vendor = \"apple\"))": [
-      "aarch64-apple-darwin"
-    ],
+    "cfg(any(target_os = \"macos\", target_os = \"ios\"))": [],
+    "cfg(any(target_os = \"macos\", target_os = \"ios\", target_os = \"freebsd\"))": [],
+    "cfg(any(target_os = \"macos\", target_os = \"openbsd\", target_os = \"vita\", target_os = \"emscripten\"))": [],
+    "cfg(any(target_vendor = \"apple\"))": [],
     "cfg(any(unix, target_os = \"hermit\", target_os = \"wasi\"))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "wasm32-wasip1",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(any(unix, target_os = \"wasi\"))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "wasm32-wasip1",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(curve25519_dalek_backend = \"fiat\")": [],
     "cfg(loom)": [],
     "cfg(not(all(target_arch = \"arm\", target_os = \"none\")))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "wasm32-unknown-unknown",
-      "wasm32-wasip1",
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "wasm32-wasip1",
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(not(all(target_family = \"wasm\", target_os = \"unknown\")))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "wasm32-wasip1",
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(not(any(target_os = \"espidf\", all(target_family = \"wasm\", target_os = \"unknown\"))))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "wasm32-wasip1",
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(not(any(target_os = \"unknown\", target_arch = \"wasm32\")))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(not(target_arch = \"wasm32\"))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(not(windows))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "wasm32-unknown-unknown",
-      "wasm32-wasip1",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(not(windows_raw_dylib))": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "wasm32-unknown-unknown",
-      "wasm32-wasip1",
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
-    "cfg(target_arch = \"wasm32\")": [
-      "wasm32-unknown-unknown",
-      "wasm32-wasip1"
-    ],
+    "cfg(target_arch = \"wasm32\")": [],
     "cfg(target_arch = \"x86_64\")": [
-      "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "cfg(target_os = \"android\")": [],
     "cfg(target_os = \"haiku\")": [],
     "cfg(target_os = \"hermit\")": [],
     "cfg(target_os = \"ios\")": [],
     "cfg(target_os = \"linux\")": [
-      "aarch64-unknown-linux-gnu",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
-    "cfg(target_os = \"macos\")": [
-      "aarch64-apple-darwin"
-    ],
+    "cfg(target_os = \"macos\")": [],
     "cfg(target_os = \"netbsd\")": [],
     "cfg(target_os = \"redox\")": [],
     "cfg(target_os = \"solaris\")": [],
     "cfg(target_os = \"vxworks\")": [],
-    "cfg(target_os = \"wasi\")": [
-      "wasm32-wasip1"
-    ],
-    "cfg(target_os = \"windows\")": [
-      "x86_64-pc-windows-msvc"
-    ],
-    "cfg(target_vendor = \"apple\")": [
-      "aarch64-apple-darwin"
-    ],
+    "cfg(target_os = \"wasi\")": [],
+    "cfg(target_os = \"windows\")": [],
+    "cfg(target_vendor = \"apple\")": [],
     "cfg(unix)": [
-      "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
-    "cfg(windows)": [
-      "x86_64-pc-windows-msvc"
-    ],
+    "cfg(windows)": [],
     "cfg(windows_raw_dylib)": [],
     "i686-pc-windows-gnu": [],
     "i686-pc-windows-gnullvm": [],
     "i686-pc-windows-msvc": [],
     "i686-uwp-windows-gnu": [],
     "i686-uwp-windows-msvc": [],
-    "wasm32-unknown-unknown": [
-      "wasm32-unknown-unknown"
-    ],
-    "wasm32-wasip1": [
-      "wasm32-wasip1"
-    ],
     "x86_64-pc-windows-gnu": [],
     "x86_64-pc-windows-gnullvm": [],
-    "x86_64-pc-windows-msvc": [
-      "x86_64-pc-windows-msvc"
-    ],
+    "x86_64-pc-windows-msvc": [],
     "x86_64-unknown-linux-gnu": [
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-nixos-gnu"
-    ],
-    "x86_64-unknown-nixos-gnu": [
-      "x86_64-unknown-nixos-gnu"
+      "x86_64-unknown-linux-gnu"
     ],
     "x86_64-uwp-windows-gnu": [],
     "x86_64-uwp-windows-msvc": []

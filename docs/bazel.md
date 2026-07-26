@@ -63,8 +63,8 @@ must be supplied by a maintainer with access to the selected backend.
 
 1. Add native Rust libraries and unit tests, starting with leaf crates and
    moving toward their consumers.
-2. Model build scripts, binaries and platform targets once their inputs are
-   hermetic.
+2. Add platform triples as their native targets arrive, then model build
+   scripts, binaries and platform targets once their inputs are hermetic.
 3. Add frontend build and test targets, then Android and iOS.
 4. Move an existing CI check to Bazel only after its Bazel test suite is
    complete and observed to be equivalent.

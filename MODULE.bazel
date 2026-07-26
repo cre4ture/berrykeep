@@ -26,5 +26,8 @@ crate.from_cargo(
     cargo_lockfile = "//:Cargo.lock",
     lockfile = "//:Cargo.Bazel.lock",
     manifests = ["//:Cargo.toml"],
+    # The initial suite runs on GitHub's Linux x86_64 runner. Additional
+    # triples are added together with their first native Bazel targets.
+    supported_platform_triples = ["x86_64-unknown-linux-gnu"],
 )
 use_repo(crate, "crates")
