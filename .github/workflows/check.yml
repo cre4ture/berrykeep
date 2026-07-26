@@ -757,6 +757,7 @@ jobs:
           install -m0755 target/release/ironmesh-background-launcher artifacts/linux-debian-binaries/
           install -m0755 target/release/ironmesh-folder-agent artifacts/linux-debian-binaries/
           install -m0755 target/release/ironmesh-os-integration artifacts/linux-debian-binaries/
+          tar -C artifacts/linux-debian-binaries -czf artifacts/linux-debian-binaries.tar.gz .
 
       - name: Upload Linux FUSE mount binary
         uses: actions/upload-artifact@v4
@@ -769,7 +770,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-debian-binaries-ubuntu
-          path: artifacts/linux-debian-binaries/*
+          # GitHub artifact downloads do not reliably retain executable bits
+          # for individual files. Package the bundle first so dpkg receives
+          # executable binaries on the downstream runner.
+          path: artifacts/linux-debian-binaries.tar.gz
           if-no-files-found: error
 
   debian-package-build:
@@ -784,7 +788,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: linux-debian-binaries-ubuntu
-          path: ${{ runner.temp }}/linux-debian-binaries
+          path: ${{ runner.temp }}/linux-debian-binary-archive
+
+      - name: Extract Linux release binary bundle
+        run: |
+          mkdir -p "${RUNNER_TEMP}/linux-debian-binaries"
+          tar -xzf "${RUNNER_TEMP}/linux-debian-binary-archive/linux-debian-binaries.tar.gz" \
+            -C "${RUNNER_TEMP}/linux-debian-binaries"
 
       - name: Install Debian packaging tools
         run: |

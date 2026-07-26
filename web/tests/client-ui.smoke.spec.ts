@@ -433,6 +433,22 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   expect(requestedPaths).not.toContain("/api/maps/logical-file");
 });
 
+test("client-ui keeps the direct iOS gallery map inside the WebView viewport", async ({ page }) => {
+  await installClientUiMocks(page);
+  await page.goto("/?embedded=gallery_map&embedded_client=ios");
+
+  const fullscreenButton = page.getByRole("button", { name: "Fullscreen map" });
+  await expect(fullscreenButton).toBeVisible();
+  await fullscreenButton.click();
+
+  const fullscreenMap = page.getByLabel("Geotagged gallery map");
+  await expect
+    .poll(() =>
+      fullscreenMap.evaluate((element) => element.getBoundingClientRect().height / window.innerHeight)
+    )
+    .toBeGreaterThan(0.9);
+});
+
 test("client-ui gallery cards stay compact on narrow viewports", async ({ page }) => {
   test.setTimeout(45_000);
 

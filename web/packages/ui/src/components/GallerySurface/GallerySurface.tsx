@@ -2120,9 +2120,9 @@ function GalleryMapPanel({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const pushedFullscreenHistoryRef = useRef(false);
   const toggleFullscreen = () => setIsFullscreen((current) => !current);
-  const usesAndroidEmbeddedClient =
+  const usesEmbeddedClient =
     typeof window !== "undefined" &&
-    new URLSearchParams(window.location.search).get("embedded_client") === "android";
+    ["android", "ios"].includes(new URLSearchParams(window.location.search).get("embedded_client") ?? "");
   const switchToGrid = () => {
     if (isFullscreen && pushedFullscreenHistoryRef.current && typeof window !== "undefined") {
       window.history.back();
@@ -2161,7 +2161,7 @@ function GalleryMapPanel({
             [GALLERY_MAP_FULLSCREEN_HISTORY_KEY]: true
           };
 
-    if (!usesAndroidEmbeddedClient) {
+    if (!usesEmbeddedClient) {
       window.history.pushState(historyState, "", window.location.href);
       pushedFullscreenHistoryRef.current = true;
       document.body.style.overflow = "hidden";
@@ -2174,7 +2174,7 @@ function GalleryMapPanel({
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("popstate", handlePopState);
     };
-  }, [isFullscreen, usesAndroidEmbeddedClient]);
+  }, [isFullscreen, usesEmbeddedClient]);
 
   if (!activeBasemap) {
     return (
@@ -2191,9 +2191,9 @@ function GalleryMapPanel({
       entries={entries}
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
-      allowFullscreenPortal={!usesAndroidEmbeddedClient}
-      usesEmbeddedViewport={usesAndroidEmbeddedClient}
-      fullscreenViewportHeight={usesAndroidEmbeddedClient ? undefined : "100dvh"}
+      allowFullscreenPortal={!usesEmbeddedClient}
+      usesEmbeddedViewport={usesEmbeddedClient}
+      fullscreenViewportHeight={usesEmbeddedClient ? undefined : "100dvh"}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
@@ -2208,9 +2208,9 @@ function GalleryMapPanel({
       entries={entries}
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
-      allowFullscreenPortal={!usesAndroidEmbeddedClient}
-      usesEmbeddedViewport={usesAndroidEmbeddedClient}
-      fullscreenViewportHeight={usesAndroidEmbeddedClient ? undefined : "100dvh"}
+      allowFullscreenPortal={!usesEmbeddedClient}
+      usesEmbeddedViewport={usesEmbeddedClient}
+      fullscreenViewportHeight={usesEmbeddedClient ? undefined : "100dvh"}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
@@ -2220,7 +2220,7 @@ function GalleryMapPanel({
     />
   );
   const fullscreenPortalTarget =
-    isFullscreen && !usesAndroidEmbeddedClient && typeof document !== "undefined"
+    isFullscreen && !usesEmbeddedClient && typeof document !== "undefined"
       ? document.body
       : null;
   const mapDisplayControls = (
@@ -2262,7 +2262,7 @@ function GalleryMapPanel({
             </Button>
           </Group>
         </Stack>
-        {isFullscreen && usesAndroidEmbeddedClient ? (
+        {isFullscreen && usesEmbeddedClient ? (
           <Button variant="default" onClick={toggleFullscreen}>
             Exit fullscreen map
           </Button>
