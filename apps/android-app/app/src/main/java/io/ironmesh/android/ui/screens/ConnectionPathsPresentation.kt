@@ -6,6 +6,7 @@ import io.ironmesh.android.data.ConnectionRouteSnapshot
 internal enum class ConnectionOverviewState {
     CHECKING,
     DIRECT,
+    DIRECT_QUIC,
     RELAY,
     IMPROVING,
     UNAVAILABLE,
@@ -109,10 +110,24 @@ internal fun connectionOverview(
     val state = when {
         !hasSuccess && snapshot.endpoints.all { it.totalFailures == 0L } -> ConnectionOverviewState.CHECKING
         !hasSuccess -> ConnectionOverviewState.UNAVAILABLE
-        active?.pathKind == RELAY_TUNNEL_PATH_KIND && active.consecutiveFailures == 0 && !hasProbeInFlight -> {
+        active != null &&
+            isRelayPath(active) &&
+            active.consecutiveFailures == 0 &&
+            !hasProbeInFlight -> {
             ConnectionOverviewState.RELAY
         }
-        active != null && isDirectPath(active) && active.consecutiveFailures == 0 && !hasCoolingRoute && !hasProbeInFlight -> {
+        active != null &&
+            isDirectQuicPath(active) &&
+            active.consecutiveFailures == 0 &&
+            !hasCoolingRoute &&
+            !hasProbeInFlight -> {
+            ConnectionOverviewState.DIRECT_QUIC
+        }
+        active != null &&
+            isDirectPath(active) &&
+            active.consecutiveFailures == 0 &&
+            !hasCoolingRoute &&
+            !hasProbeInFlight -> {
             ConnectionOverviewState.DIRECT
         }
         else -> ConnectionOverviewState.IMPROVING
@@ -141,7 +156,11 @@ internal fun connectionRouteState(
 internal fun routeDisplayLabel(endpoint: ConnectionRouteEndpointSnapshot): String {
     val prefix = when (endpoint.pathKind) {
         RELAY_TUNNEL_PATH_KIND -> summarizeRelayLocator(endpoint.locator)?.let { "Relay via $it" } ?: "Relay"
-        "direct_quic" -> "Direct QUIC"
+        "direct_quic" -> when (endpoint.holePunchingMode) {
+            HOLE_PUNCHING_MODE_DIRECT -> "Direct via NAT (QUIC)"
+            HOLE_PUNCHING_MODE_RELAY -> "QUIC via Relay"
+            else -> "Direct QUIC"
+        }
         else -> "Direct HTTPS"
     }
     return endpoint.targetNodeId?.let { "$prefix to $it" } ?: prefix
@@ -199,7 +218,17 @@ private fun routeStatePriority(state: ConnectionRouteState): Int {
 }
 
 private fun isDirectPath(endpoint: ConnectionRouteEndpointSnapshot): Boolean {
-    return endpoint.pathKind == "direct_https" || endpoint.pathKind == "direct_quic"
+    return endpoint.pathKind == "direct_https" || isDirectQuicPath(endpoint)
+}
+
+private fun isDirectQuicPath(endpoint: ConnectionRouteEndpointSnapshot): Boolean {
+    return endpoint.pathKind == "direct_quic" &&
+        endpoint.holePunchingMode == HOLE_PUNCHING_MODE_DIRECT
+}
+
+private fun isRelayPath(endpoint: ConnectionRouteEndpointSnapshot): Boolean {
+    return endpoint.pathKind == RELAY_TUNNEL_PATH_KIND ||
+        (endpoint.pathKind == "direct_quic" && endpoint.holePunchingMode == HOLE_PUNCHING_MODE_RELAY)
 }
 
 private fun summarizeRelayLocator(locator: String): String? {
@@ -231,3 +260,5 @@ private const val ROUTE_FAILURE_PENALTY_POINTS = 250.0
 private const val ROUTE_THROUGHPUT_BYTES_PER_POINT = 250_000.0
 private const val ROUTE_MAX_THROUGHPUT_CREDIT_POINTS = 50.0
 private const val ROUTE_ACTIVE_ROUTE_CREDIT_POINTS = 50.0
+private const val HOLE_PUNCHING_MODE_DIRECT = "direct"
+private const val HOLE_PUNCHING_MODE_RELAY = "relay"

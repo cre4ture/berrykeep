@@ -34,6 +34,7 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
             {
               "index": 1,
               "path_kind": "direct_quic",
+              "hole_punching_mode": "direct",
               "locator": "node.example:4433",
               "bootstrap_rank": 1,
               "target_node_id": "018f7630-7b60-7000-8000-000000000001",
@@ -86,6 +87,13 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
         XCTAssertEqual(quic.ewmaLatencyMs, 8.5)
         XCTAssertEqual(quic.totalSuccesses, 30)
         XCTAssertTrue(quic.backgroundProbeInFlight)
+        XCTAssertTrue(quic.isDirectQuicHolePunched)
+        XCTAssertFalse(quic.usesRelayPath)
+        XCTAssertEqual(quic.connectionDisplayName, "Direct via NAT (QUIC)")
+        XCTAssertEqual(
+            quic.connectionExplanation,
+            "Rendezvous established this connection; data travels directly between this device and the cluster."
+        )
 
         let relay = try XCTUnwrap(snapshot.endpoints.first(where: { $0.pathKind == .relayTunnel }))
         XCTAssertTrue(relay.isCoolingDown(atUnixMs: snapshot.generatedAtUnixMs))
@@ -124,6 +132,43 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
 
         XCTAssertEqual(snapshot.endpoints.first?.pathKind, .unknown("future_mesh"))
         XCTAssertEqual(snapshot.endpoints.first?.pathKind.displayName, "Future Mesh")
+    }
+
+    func testTreatsRelayAssistedQuicAsARelayPath() {
+        let endpoint = AppleConnectionRouteEndpoint(
+            index: 0,
+            pathKind: .directQUIC,
+            holePunchingMode: "relay",
+            locator: "iroh://node.example",
+            bootstrapRank: 0,
+            targetNodeId: nil,
+            active: true,
+            score: 1,
+            ewmaLatencyMs: nil,
+            ewmaThroughputBytesPerSec: nil,
+            consecutiveFailures: 0,
+            totalFailures: 0,
+            totalSuccesses: 1,
+            lastMeasurementUnixMs: nil,
+            lastSuccessUnixMs: nil,
+            lastFailureUnixMs: nil,
+            circuitOpenUntilUnixMs: nil,
+            backgroundProbeInFlight: false,
+            lastBackgroundProbeUnixMs: nil,
+            lastError: nil
+        )
+        let snapshot = AppleConnectionRouteSnapshot(
+            generatedAtUnixMs: 1,
+            activeIndex: endpoint.index,
+            rankedIndices: [endpoint.index],
+            endpoints: [endpoint]
+        )
+
+        XCTAssertTrue(endpoint.usesRelayPath)
+        XCTAssertFalse(endpoint.isDirectQuicHolePunched)
+        XCTAssertEqual(endpoint.connectionDisplayName, "QUIC via Relay")
+        XCTAssertEqual(snapshot.directEndpointCount, 0)
+        XCTAssertEqual(snapshot.relayEndpointCount, 1)
     }
 
     private func decodeSnapshot(from json: String) throws -> AppleConnectionRouteSnapshot {

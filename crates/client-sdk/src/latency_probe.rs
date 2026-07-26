@@ -204,6 +204,7 @@ pub enum TitleLatencyProbeState {
 #[serde(rename_all = "snake_case")]
 pub enum TitleLatencyConnectionType {
     Direct,
+    DirectQuic,
     Relay,
     Unknown,
 }
@@ -347,10 +348,35 @@ fn replace_title_latency_status(
 }
 
 fn title_latency_connection_type(client: &IronMeshClient) -> TitleLatencyConnectionType {
-    if client.uses_relay_transport() {
-        TitleLatencyConnectionType::Relay
-    } else {
-        TitleLatencyConnectionType::Direct
+    let snapshot = client.connection_route_snapshot();
+    let active = snapshot
+        .active_index
+        .and_then(|index| snapshot.endpoints.get(index))
+        .or_else(|| snapshot.endpoints.iter().find(|endpoint| endpoint.active));
+
+    title_latency_connection_type_for_path(
+        active.map(|endpoint| (endpoint.path_kind, endpoint.hole_punching_mode.as_deref())),
+    )
+}
+
+fn title_latency_connection_type_for_path(
+    active_path: Option<(transport_sdk::TransportPathKind, Option<&str>)>,
+) -> TitleLatencyConnectionType {
+    match active_path {
+        Some((transport_sdk::TransportPathKind::RelayTunnel, _)) => {
+            TitleLatencyConnectionType::Relay
+        }
+        Some((transport_sdk::TransportPathKind::DirectQuic, Some("relay"))) => {
+            // QUIC can use its own relay-assisted path. Do not present that as
+            // a direct NAT traversal in the compact mobile indicator.
+            TitleLatencyConnectionType::Relay
+        }
+        Some((transport_sdk::TransportPathKind::DirectQuic, _)) => {
+            TitleLatencyConnectionType::DirectQuic
+        }
+        Some((transport_sdk::TransportPathKind::DirectHttps, _)) | None => {
+            TitleLatencyConnectionType::Direct
+        }
     }
 }
 
@@ -523,7 +549,6 @@ impl IronMeshClient {
     }
 
     pub async fn run_title_latency_probe(&self) -> TitleLatencyProbeStatus {
-        let connection_type = title_latency_connection_type(self);
         let config = LatencyProbeConfig {
             sample_count: 1,
             warmup_count: 0,
@@ -535,6 +560,7 @@ impl IronMeshClient {
         match self.run_latency_probe(config).await {
             Ok(result) => {
                 let checked_at_unix_ms = Some(result.generated_at_unix_ms);
+                let connection_type = title_latency_connection_type(self);
                 match result.samples.first() {
                     Some(sample) if sample.successful => TitleLatencyProbeStatus {
                         state: TitleLatencyProbeState::Success,
@@ -564,7 +590,7 @@ impl IronMeshClient {
             }
             Err(error) => TitleLatencyProbeStatus {
                 state: TitleLatencyProbeState::Failed,
-                connection_type,
+                connection_type: title_latency_connection_type(self),
                 latency_ms: None,
                 checked_at_unix_ms: Some(unix_ts_ms()),
                 error: Some(format!("{error:#}")),
@@ -873,6 +899,7 @@ mod tests {
     use axum::routing::get;
     use axum::{Router, body::Body};
     use serde::Deserialize;
+    use transport_sdk::{CandidateKind, ConnectionCandidate};
 
     #[derive(Debug, Deserialize)]
     struct ProbeQuery {
@@ -979,6 +1006,35 @@ mod tests {
             period_seconds: TITLE_LATENCY_PROBE_MAX_PERIOD_SECONDS + 1,
         };
         assert!(too_long.validate().is_err());
+    }
+
+    #[test]
+    fn title_latency_status_marks_a_direct_quic_candidate_distinctly() {
+        let client = IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+            ConnectionCandidate {
+                kind: CandidateKind::DirectQuic,
+                endpoint: "iroh://direct-quic-endpoint".to_string(),
+                rtt_ms: None,
+                transport_hints: None,
+            },
+            None,
+        );
+
+        assert_eq!(
+            title_latency_connection_type(&client),
+            TitleLatencyConnectionType::DirectQuic
+        );
+    }
+
+    #[test]
+    fn title_latency_status_marks_relay_assisted_quic_as_relay() {
+        assert_eq!(
+            title_latency_connection_type_for_path(Some((
+                transport_sdk::TransportPathKind::DirectQuic,
+                Some("relay"),
+            ))),
+            TitleLatencyConnectionType::Relay
+        );
     }
 
     #[tokio::test]
