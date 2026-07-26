@@ -38,6 +38,7 @@ class GalleryMapFullscreenInstrumentationTest {
 
         ActivityScenario.launch<GalleryMapWebUiTestActivity>(intent).use { scenario ->
             assertFullscreenMapRemainsVisible(scenario)
+            assertFullscreenMapClusterChooserIsVisible(scenario)
         }
     }
 
@@ -49,6 +50,7 @@ class GalleryMapFullscreenInstrumentationTest {
 
         ActivityScenario.launch<WebUiActivity>(WebUiActivity.intent(context, session)).use { scenario ->
             assertFullscreenMapRemainsVisible(scenario)
+            assertFullscreenMapClusterChooserIsVisible(scenario)
         }
     }
 
@@ -70,6 +72,10 @@ class GalleryMapFullscreenInstrumentationTest {
         waitForCondition(webView, "Gallery map should expose fullscreen") {
             hasButton("Fullscreen map")
         }
+        waitForMapCluster(
+            webView,
+            "gallery map should expose a two-item cluster before fullscreen",
+        )
 
         clickButton(webView, "Fullscreen map")
         try {
@@ -99,6 +105,38 @@ class GalleryMapFullscreenInstrumentationTest {
         assertTrue("The embedded WebView must remain visible", webView.visibility == View.VISIBLE)
     }
 
+    private fun <T : Activity> assertFullscreenMapClusterChooserIsVisible(scenario: ActivityScenario<T>) {
+        val webView = waitForWebView(scenario)
+        waitForMapCluster(webView, "fullscreen gallery map should retain a two-item cluster")
+
+        clickButton(webView, "Open map cluster with 2 items")
+        try {
+            waitForCondition(webView, "fullscreen map cluster chooser should remain visible") {
+                """
+                (() => {
+                  const dialog = document.querySelector('[data-gallery-map-cluster-dialog] [role="dialog"]');
+                  const dialogRect = dialog?.getBoundingClientRect();
+                  const choices = [...(dialog?.querySelectorAll('button') ?? [])]
+                    .map((button) => button.textContent?.trim());
+                  return Boolean(
+                    dialog &&
+                    dialogRect &&
+                    dialogRect.width > 0 &&
+                    dialogRect.height > 0 &&
+                    choices.includes('gallery/runtime-map-a.png') &&
+                    choices.includes('gallery/runtime-map-b.png')
+                  );
+                })()
+                """.trimIndent()
+            }
+        } catch (error: AssertionError) {
+            throw AssertionError(
+                "${error.message}; cluster dialog DOM state: ${clusterDialogState(webView)}",
+                error,
+            )
+        }
+    }
+
     private fun fullscreenMapState(webView: WebView): String =
         try {
             evaluateJavaScript(
@@ -126,10 +164,74 @@ class GalleryMapFullscreenInstrumentationTest {
             "unavailable (${diagnosticError.message})"
         }
 
+    private fun clusterDialogState(webView: WebView): String =
+        try {
+            evaluateJavaScript(
+                webView,
+                """
+                (() => {
+                  const dialog = document.querySelector('[data-gallery-map-cluster-dialog] [role="dialog"]');
+                  const dialogRect = dialog?.getBoundingClientRect();
+                  return JSON.stringify({
+                    dialogExists: Boolean(dialog),
+                    dialogWidth: dialogRect?.width ?? null,
+                    dialogHeight: dialogRect?.height ?? null,
+                    dialogMaxHeight: dialog ? getComputedStyle(dialog).maxHeight : null,
+                    dialogChoices: [...(dialog?.querySelectorAll('button') ?? [])]
+                      .map((button) => button.textContent?.trim())
+                  });
+                })()
+                """.trimIndent(),
+            )
+        } catch (diagnosticError: Throwable) {
+            "unavailable (${diagnosticError.message})"
+        }
+
+    private fun waitForMapCluster(webView: WebView, description: String) {
+        try {
+            waitForCondition(webView, description) {
+                hasButton("Open map cluster with 2 items")
+            }
+        } catch (error: AssertionError) {
+            throw AssertionError(
+                "${error.message}; map cluster DOM state: ${mapClusterState(webView)}",
+                error,
+            )
+        }
+    }
+
+    private fun mapClusterState(webView: WebView): String =
+        try {
+            evaluateJavaScript(
+                webView,
+                """
+                (() => {
+                  const map = document.querySelector('[aria-label="Geotagged gallery map"]');
+                  const mapRect = map?.getBoundingClientRect();
+                  return JSON.stringify({
+                    mapWidth: mapRect?.width ?? null,
+                    mapHeight: mapRect?.height ?? null,
+                    visibleButtons: [...document.querySelectorAll('button')]
+                      .filter((button) => button.getBoundingClientRect().width > 0)
+                      .map((button) => button.textContent?.trim()),
+                    hasBasemapLoader: document.body?.innerText.includes('Loading self-hosted basemap') ?? false,
+                    hasBasemapError: document.body?.innerText.includes('Could not load the self-hosted basemap') ?? false,
+                    canvasCount: map?.querySelectorAll('canvas').length ?? 0
+                  });
+                })()
+                """.trimIndent(),
+            )
+        } catch (diagnosticError: Throwable) {
+            "unavailable (${diagnosticError.message})"
+        }
+
     private fun hasButton(label: String): String =
         """
         (() => [...document.querySelectorAll('button')]
-          .some((button) => button.textContent?.trim() === '$label'))()
+          .some((button) =>
+            button.textContent?.trim() === '$label' ||
+            button.getAttribute('aria-label') === '$label'
+          ))()
         """.trimIndent()
 
     private fun clickButton(webView: WebView, label: String) {
@@ -138,7 +240,10 @@ class GalleryMapFullscreenInstrumentationTest {
             """
             (() => {
               const button = [...document.querySelectorAll('button')]
-                .find((candidate) => candidate.textContent?.trim() === '$label');
+                .find((candidate) =>
+                  candidate.textContent?.trim() === '$label' ||
+                  candidate.getAttribute('aria-label') === '$label'
+                );
               if (!button) return false;
               button.click();
               return true;

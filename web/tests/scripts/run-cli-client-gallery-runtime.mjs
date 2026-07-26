@@ -1,5 +1,4 @@
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { cargoDebugBinaryPath } from "./cargo-target.mjs";
@@ -10,31 +9,15 @@ const webUiPort = 18081;
 const upstreamPort = 18082;
 const webUiBindAddress = process.env.IRONMESH_GALLERY_RUNTIME_BIND ?? "127.0.0.1";
 const upstreamOrigin = `http://127.0.0.1:${upstreamPort}`;
-const mapManifestKey = "sys/maps/runtime-gallery.mbtiles.manifest.json";
-const mapPartKey = "sys/maps/runtime-gallery.mbtiles.part-000000";
-const mapPartBody = readFileSync(resolve(process.cwd(), "tests", "fixtures", "smoke.mbtiles"));
+const fallbackMapManifestKey = "sys/maps/runtime-gallery-fallback.mbtiles.manifest.json";
 const tinyPngBody = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlH7u8AAAAASUVORK5CYII=",
   "base64"
 );
 
-const mapManifest = {
-  manifest_version: 1,
-  type: "split_logical_file",
-  logical_format: "mbtiles",
-  logical_key: "sys/maps/runtime-gallery.mbtiles",
-  logical_size_bytes: mapPartBody.length,
-  parts_count: 1,
-  parts: [
-    {
-      part_id: "part-000000",
-      key: mapPartKey,
-      offset_bytes: 0,
-      size_bytes: mapPartBody.length
-    }
-  ]
-};
-
+// Android's software WebView emulator does not initialize MapLibre reliably.
+// The mobile fullscreen regression is renderer-independent, so exercise the
+// built-in atlas fallback and its shared fullscreen/modal behavior here.
 const mapConfiguration = {
   stored: true,
   configuration: {
@@ -50,7 +33,7 @@ const mapConfiguration = {
         kind: "raster",
         style: "raster",
         enabled: true,
-        raster_manifest_key: mapManifestKey
+        raster_manifest_key: fallbackMapManifestKey
       },
       {
         id: "natural-earth-labels",
@@ -61,7 +44,7 @@ const mapConfiguration = {
         kind: "raster",
         style: "raster",
         enabled: true,
-        raster_manifest_key: mapManifestKey
+        raster_manifest_key: fallbackMapManifestKey
       },
       {
         id: "openmaptiles-street",
@@ -72,7 +55,7 @@ const mapConfiguration = {
         kind: "raster",
         style: "raster",
         enabled: true,
-        raster_manifest_key: mapManifestKey
+        raster_manifest_key: fallbackMapManifestKey
       }
     ]
   }
@@ -81,30 +64,30 @@ const mapConfiguration = {
 const galleryIndex = {
   prefix: "",
   depth: 4,
-  entry_count: 1,
-  total_entry_count: 1,
+  entry_count: 2,
+  total_entry_count: 2,
   offset: 0,
   limit: 24,
   has_more: false,
   media_summary: {
-    ready_count: 1,
+    ready_count: 2,
     pending_count: 0,
     incomplete_count: 0,
-    image_count: 1,
+    image_count: 2,
     video_count: 0,
-    geotagged_count: 1
+    geotagged_count: 2
   },
   entries: [
     {
-      path: "gallery/runtime-map.png",
+      path: "gallery/runtime-map-a.png",
       entry_type: "key",
-      version: "runtime-map-001",
-      content_hash: "runtime-map-hash",
+      version: "runtime-map-a-001",
+      content_hash: "runtime-map-a-hash",
       size_bytes: 68,
       modified_at_unix: 1712345678,
       media: {
         status: "ready",
-        content_fingerprint: "runtime-map-fingerprint",
+        content_fingerprint: "runtime-map-a-fingerprint",
         media_type: "image",
         mime_type: "image/png",
         width: 1,
@@ -115,7 +98,38 @@ const galleryIndex = {
           longitude: 8.5417
         },
         thumbnail: {
-          url: "/media/thumbnail?key=gallery%2Fruntime-map.png",
+          url: "/media/thumbnail?key=gallery%2Fruntime-map-a.png",
+          profile: "grid",
+          width: 1,
+          height: 1,
+          format: "png",
+          size_bytes: 68
+        }
+      }
+    },
+    {
+      path: "gallery/runtime-map-b.png",
+      entry_type: "key",
+      version: "runtime-map-b-001",
+      content_hash: "runtime-map-b-hash",
+      size_bytes: 68,
+      modified_at_unix: 1712345678,
+      media: {
+        status: "ready",
+        content_fingerprint: "runtime-map-b-fingerprint",
+        media_type: "image",
+        mime_type: "image/png",
+        width: 1,
+        height: 1,
+        taken_at_unix: 1712345678,
+        // Identical coordinates intentionally exercise the direct cluster
+        // chooser instead of the basemap's zoom-to-bounds behavior.
+        gps: {
+          latitude: 47.3769,
+          longitude: 8.5417
+        },
+        thumbnail: {
+          url: "/media/thumbnail?key=gallery%2Fruntime-map-b.png",
           profile: "grid",
           width: 1,
           height: 1,
@@ -144,44 +158,6 @@ function binary(response, status, body, contentType) {
   response.end(body);
 }
 
-function rangeBinary(request, response, body, contentType) {
-  const range = request.headers.range;
-  if (!range) {
-    if (request.method === "HEAD") {
-      response.writeHead(200, {
-        "content-type": contentType,
-        "content-length": String(body.length),
-        "accept-ranges": "bytes"
-      });
-      response.end();
-      return;
-    }
-    binary(response, 200, body, contentType);
-    return;
-  }
-
-  const match = /^bytes=(\d+)-(\d+)?$/i.exec(range);
-  const start = Number(match?.[1] ?? "-1");
-  const end = Math.min(Number(match?.[2] ?? String(body.length - 1)), body.length - 1);
-  if (!match || start < 0 || start > end) {
-    response.writeHead(416, {
-      "accept-ranges": "bytes",
-      "content-range": `bytes */${body.length}`
-    });
-    response.end();
-    return;
-  }
-
-  const selected = body.subarray(start, end + 1);
-  response.writeHead(206, {
-    "content-type": contentType,
-    "content-length": String(selected.length),
-    "content-range": `bytes ${start}-${end}/${body.length}`,
-    "accept-ranges": "bytes"
-  });
-  response.end(request.method === "HEAD" ? undefined : selected);
-}
-
 function upstreamRequest(request, response) {
   const url = new URL(request.url ?? "/", upstreamOrigin);
   if (request.method === "GET" && url.pathname === "/api/v1/maps/config") {
@@ -200,22 +176,6 @@ function upstreamRequest(request, response) {
     binary(response, 200, tinyPngBody, "image/png");
     return;
   }
-  if (
-    (request.method === "GET" || request.method === "HEAD") &&
-    url.pathname.startsWith("/api/v1/store/")
-  ) {
-    const key = decodeURIComponent(url.pathname.slice("/api/v1/store/".length));
-    if (key === mapManifestKey) {
-      const body = Buffer.from(JSON.stringify(mapManifest));
-      binary(response, 200, body, "application/json; charset=utf-8");
-      return;
-    }
-    if (key === mapPartKey) {
-      rangeBinary(request, response, mapPartBody, "application/octet-stream");
-      return;
-    }
-  }
-
   json(response, 404, { message: `runtime fixture has no route for ${request.method} ${url.pathname}` });
 }
 

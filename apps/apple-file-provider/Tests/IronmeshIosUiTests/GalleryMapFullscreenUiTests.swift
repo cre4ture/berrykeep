@@ -12,29 +12,15 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         fullscreenButton.tap()
 
         assertFullscreenMapRemainsVisible(in: webView)
+        assertFullscreenMapClusterChooserIsVisible(in: webView)
     }
 
     @MainActor
     func testFullscreenGalleryMapKeepsTheClientWebUIVisible() {
-        let app = launchApp()
+        let app = launchApp(webUIURL: "\(galleryRuntimeURL)?page=gallery&gallery_view=map")
 
         let webView = app.webViews["ironmesh-hosted-web-ui"]
         XCTAssertTrue(webView.waitForExistence(timeout: 45), "The embedded Client UI should load")
-
-        let navigationMenu = webView.buttons["Toggle navigation menu"]
-        XCTAssertTrue(navigationMenu.waitForExistence(timeout: 45), "The Client UI navigation should load")
-        navigationMenu.tap()
-
-        let galleryNavigationItem = webView.staticTexts["Gallery"]
-        XCTAssertTrue(galleryNavigationItem.waitForExistence(timeout: 45), "The Gallery navigation item should load")
-        galleryNavigationItem.tap()
-
-        let mapButton = element(in: webView, labelled: "Map")
-        guard mapButton.waitForExistence(timeout: 45) else {
-            XCTFail("The Gallery map button should load")
-            return
-        }
-        mapButton.tap()
 
         let fullscreenButton = element(in: webView, labelled: "Fullscreen map")
         guard fullscreenButton.waitForExistence(timeout: 45) else {
@@ -44,12 +30,16 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         fullscreenButton.tap()
 
         assertFullscreenMapRemainsVisible(in: webView)
+        assertFullscreenMapClusterChooserIsVisible(in: webView)
     }
 
     @MainActor
-    private func launchApp(embeddedSurface: String? = nil) -> XCUIApplication {
+    private func launchApp(
+        embeddedSurface: String? = nil,
+        webUIURL: String? = nil
+    ) -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchEnvironment["IRONMESH_UI_TEST_WEB_UI_URL"] = galleryRuntimeURL
+        app.launchEnvironment["IRONMESH_UI_TEST_WEB_UI_URL"] = webUIURL ?? galleryRuntimeURL
         if let embeddedSurface {
             app.launchEnvironment["IRONMESH_UI_TEST_EMBEDDED_SURFACE"] = embeddedSurface
         }
@@ -59,12 +49,36 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
 
     @MainActor
     private func assertFullscreenMapRemainsVisible(in webView: XCUIElement) {
-        let fullscreenMap = element(in: webView, labelled: "Geotagged gallery map")
+        let fullscreenMap = largestElement(in: webView, labelled: "Geotagged gallery map")
         XCTAssertTrue(fullscreenMap.waitForExistence(timeout: 45), "The fullscreen map should remain visible")
-        XCTAssertGreaterThan(
-            fullscreenMap.frame.height,
-            webView.frame.height * 0.9,
+        let requiredHeight = webView.frame.height * 0.9
+        let fullscreenHeightExpectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in fullscreenMap.frame.height > requiredHeight },
+            object: fullscreenMap
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [fullscreenHeightExpectation], timeout: 45),
+            .completed,
             "The embedded Client UI should render the map at fullscreen height"
+        )
+    }
+
+    @MainActor
+    private func assertFullscreenMapClusterChooserIsVisible(in webView: XCUIElement) {
+        let cluster = element(in: webView, labelled: "Open map cluster with 2 items")
+        XCTAssertTrue(cluster.waitForExistence(timeout: 45), "The fullscreen map should expose the clustered image bubble")
+        cluster.tap()
+
+        let chooser = element(in: webView, labelled: "2 items in map cluster")
+        XCTAssertTrue(chooser.waitForExistence(timeout: 45), "Selecting a map bubble should open its image chooser")
+        XCTAssertGreaterThan(chooser.frame.height, 0, "The image chooser must have a visible height")
+        XCTAssertTrue(
+            element(in: webView, labelled: "gallery/runtime-map-a.png").waitForExistence(timeout: 10),
+            "The first clustered image should be selectable"
+        )
+        XCTAssertTrue(
+            element(in: webView, labelled: "gallery/runtime-map-b.png").waitForExistence(timeout: 10),
+            "The second clustered image should be selectable"
         )
     }
 
@@ -75,9 +89,19 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
 
     @MainActor
     private func element(in webView: XCUIElement, labelled label: String) -> XCUIElement {
+        elements(in: webView, labelled: label).firstMatch
+    }
+
+    @MainActor
+    private func largestElement(in webView: XCUIElement, labelled label: String) -> XCUIElement {
+        let matches = elements(in: webView, labelled: label).allElementsBoundByIndex
+        return matches.max(by: { $0.frame.height < $1.frame.height }) ?? element(in: webView, labelled: label)
+    }
+
+    @MainActor
+    private func elements(in webView: XCUIElement, labelled label: String) -> XCUIElementQuery {
         webView
             .descendants(matching: .any)
             .matching(NSPredicate(format: "label == %@", label))
-            .firstMatch
     }
 }

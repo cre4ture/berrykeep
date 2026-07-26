@@ -11,7 +11,7 @@ test("client-ui runtime loads configured gallery map styles through the client p
 
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
-  await expect(page.getByText("gallery/runtime-map.png", { exact: true })).toBeVisible();
+  await expect(page.getByText("gallery/runtime-map-a.png", { exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "Map" }).click();
   const mapDisplay = page.getByRole("textbox", { name: "Map display", exact: true });
@@ -21,4 +21,19 @@ test("client-ui runtime loads configured gallery map styles through the client p
   await expect(page.getByRole("option", { name: "OpenMapTiles Street" })).toBeVisible();
   await expect(page.getByText("Gallery map styles are unavailable")).toHaveCount(0);
   expect(pageErrors).toEqual([]);
+});
+
+test("client-ui runtime keeps a gallery cluster chooser visible", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  const cluster = page.getByRole("button", { name: "Open map cluster with 2 items" });
+  await expect(cluster).toBeVisible();
+  await cluster.click();
+
+  const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
+  await expect(chooser).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/runtime-map-a.png" })).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/runtime-map-b.png" })).toBeVisible();
 });
