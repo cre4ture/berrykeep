@@ -3568,7 +3568,7 @@ async fn background_probe_reprioritizes_recovered_relay_endpoint() {
             },
         ],
         fallback_body,
-        125,
+        750,
     )
     .await;
 
