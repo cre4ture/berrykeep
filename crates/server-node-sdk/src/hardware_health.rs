@@ -126,7 +126,7 @@ pub(crate) struct HardwareStorageDevice {
 pub(crate) struct HardwareStorageSmartInfo {
     smart_available: bool,
     pub(crate) smart_passed: Option<bool>,
-    temperature_celsius: Option<f32>,
+    pub(crate) temperature_celsius: Option<f32>,
     pub(crate) power_on_hours: Option<u64>,
     power_cycle_count: Option<u64>,
     unsafe_shutdown_count: Option<u64>,
@@ -389,6 +389,17 @@ async fn refresh_hardware_health_once(state: &ServerState) {
                     .context("failed to serialize persisted hardware-health state");
                 (report, runtime.state_path.clone(), persisted_bytes)
             };
+
+            // Feed this sample into the reliability-telemetry rolling accumulator (doc Section 8:
+            // node-side aggregation instead of per-sample raw values). This runs on every 5-minute
+            // refresh, independent of the much rarer telemetry send interval, so the accumulator
+            // has many samples by the time a batch is actually sent. Non-fatal: a failure here must
+            // never affect the primary hardware-health refresh path.
+            if let Err(err) =
+                reliability_telemetry::record_hardware_health_sample(state, &payload).await
+            {
+                warn!(error = %err, "failed to record reliability-telemetry rolling sample");
+            }
 
             match persisted_bytes {
                 Ok(bytes) => {

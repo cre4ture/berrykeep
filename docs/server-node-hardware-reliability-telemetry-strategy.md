@@ -27,6 +27,18 @@ The core of this strategy is implemented across the node and a new central colle
   `GET /v1/stats/summary` (Section 4.3), admin-token-guarded GDPR access/erasure endpoints
   (Section 4.5), a retention sweeper (Section 4.6), and a server-side country-derivation seam
   (Section 4.2).
+- **Node-side temperature aggregation** (Section 8, resolved in favor of daily/rolling
+  aggregation): `crates/server-node-sdk/src/reliability_telemetry.rs` accumulates a per-storage-device
+  `temperature_celsius` min/max/mean/count window, fed by every 5-minute `hardware_health` refresh
+  and persisted alongside the rest of the reliability-telemetry state so it survives restarts across
+  the 6-24h send interval. The window resets after each successful send. The outbound payload's
+  `TelemetryStorageSmart` now carries `temperature_celsius_min/_max/_mean` instead of a raw
+  instantaneous reading, reducing both bandwidth and the per-device fingerprinting risk of a
+  fine-grained continuous time series. The other SMART fields (`power_on_hours`,
+  `reallocated_sector_count`, `media_errors`, `percentage_used`, `smart_passed`) remain simple
+  instantaneous latest-value fields, since they are monotonically non-decreasing counters (or a
+  boolean verdict) for which min/max/mean over a window adds no information beyond the latest
+  reading.
 
 Deliberately **deferred** (documented at their respective sections, not blockers for the above):
 
@@ -37,8 +49,7 @@ Deliberately **deferred** (documented at their respective sections, not blockers
   API key/account required) all ship in `crates/stats-collector-server/src/country.rs` behind the
   `bundled-country-db` Cargo feature; wiring it up at deployment time is still a deployment concern.
 - Network interface error-rate metrics (Section 2.5), `telemetry_subject_id` rotation (Section 8),
-  node-side daily SMART aggregation (Section 8), and an anonymous ingestion token (Section 5.2) —
-  optional later stages.
+  and an anonymous ingestion token (Section 5.2) — optional later stages.
 - Production TLS termination / deployment wiring for the collector at `creax.de:44044` — a
   deployment concern, not hardcoded in the crate.
 - The legal review of the opt-out-by-default posture (Section 4.4/8) remains a prerequisite before
@@ -481,7 +492,12 @@ timer and event-driven, debounced updates):
         "power_on_hours": 5011,
         "reallocated_sector_count": 0,
         "media_errors": 0,
-        "percentage_used": 12
+        "percentage_used": 12,
+        // temperature_celsius is reduced node-side to a rolling min/max/mean over the window
+        // since the last successful send (Section 8), not a raw instantaneous reading:
+        "temperature_celsius_min": 31.0,
+        "temperature_celsius_max": 44.5,
+        "temperature_celsius_mean": 36.2
       }
     }
   ],
@@ -515,6 +531,15 @@ Resolved based on project-owner feedback on the initial draft:
   availability (see Section 2.4).
 - ~~Cluster- vs. node-granularity of the opt-out~~ — confirmed as a per-node setting for now, consistent
   with all other node env-var toggles (see Section 3).
+- ~~Granularity of temperature/SMART time series~~ — resolved in favor of node-side aggregation:
+  `temperature_celsius` (the only field of the current schema that genuinely fluctuates rather than
+  monotonically accumulating) is reduced node-side to a `{min, max, mean}` triple over a rolling
+  window spanning the interval since the last successful send, fed by the existing 5-minute
+  `hardware_health` refresh cycle and persisted so the window survives restarts. Other SMART fields
+  are monotonic counters (or a boolean verdict) and are left as instantaneous latest-value
+  passthroughs, since aggregating a monotonic counter over a window adds no information beyond the
+  latest reading. See `crates/server-node-sdk/src/reliability_telemetry.rs`
+  (`TemperatureAccumulator`, `TelemetryStorageSmart`).
 
 Still open:
 
@@ -527,9 +552,6 @@ Still open:
 - **Abuse protection without identity:** how is spoofing/spam at the non-authenticated ingestion
   endpoint prevented, without introducing a de-anonymization risk via an auth token? An anonymous
   issuance token (Section 5.2) vs. pure IP rate limiting is still open.
-- **Granularity of temperature/SMART time series:** should raw values be transmitted per batch, or
-  already reduced node-side to daily aggregates (min/max/mean), to both save bandwidth and reduce the
-  fingerprinting risk of individual devices via fine-grained time series?
 - **Relationship to the existing `/api/v1/auth/hardware/health` endpoint:** should the payload to be
   sent strictly be a derived, one-way projection from the existing `hardware_health_report` (a
   converter, not a second independent collection), to avoid drift between the node-local and centrally
