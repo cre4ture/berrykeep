@@ -179,26 +179,12 @@ private fun IronmeshTopBar(
 
 @Composable
 private fun TitleLatencyIndicator(status: TitleLatencyProbeStatus) {
-    if (status.state == "disabled") {
-        return
-    }
-
-    val connectionPrefix = when (status.connectionType) {
-        "direct" -> "D"
-        "direct_quic" -> "Q"
-        "relay" -> "R"
-        else -> "?"
-    }
-    val text = when (status.state) {
-        "success" -> "${connectionPrefix} ${status.latencyMs?.roundToInt() ?: "?"} ms"
-        "pending" -> "$connectionPrefix ..."
-        else -> "$connectionPrefix --"
-    }
+    val text = titleLatencyIndicatorText(status) ?: return
     val color = when {
         status.state == "failed" -> MaterialTheme.colorScheme.error
-        status.connectionType == "direct" -> Color(0xFF16835A)
-        status.connectionType == "direct_quic" -> Color(0xFF0A6F8F)
-        status.connectionType == "relay" -> Color(0xFFB85A00)
+        status.state == "success" && status.connectionType == "direct" -> Color(0xFF16835A)
+        status.state == "success" && status.connectionType == "direct_quic" -> Color(0xFF0A6F8F)
+        status.state == "success" && status.connectionType == "relay" -> Color(0xFFB85A00)
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     val description = stringResource(
@@ -219,6 +205,23 @@ private fun TitleLatencyIndicator(status: TitleLatencyProbeStatus) {
             .padding(end = 4.dp)
             .semantics { contentDescription = description },
     )
+}
+
+internal fun titleLatencyIndicatorText(status: TitleLatencyProbeStatus): String? {
+    return when (status.state) {
+        "disabled" -> null
+        "success" -> {
+            val connectionPrefix = when (status.connectionType) {
+                "direct" -> "D"
+                "direct_quic" -> "Q"
+                "relay" -> "R"
+                else -> "?"
+            }
+            "$connectionPrefix ${status.latencyMs?.roundToInt() ?: "?"} ms"
+        }
+        "pending" -> "..."
+        else -> "--"
+    }
 }
 
 private data class ShellItem(

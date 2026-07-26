@@ -48,6 +48,22 @@ fn object_url_builder_escapes_segments() {
 }
 
 #[test]
+fn client_clones_keep_the_same_connection_runtime_id() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let clone = client.clone();
+    let rebuilt = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+
+    assert_eq!(
+        client.connection_runtime_id(),
+        clone.connection_runtime_id()
+    );
+    assert_ne!(
+        client.connection_runtime_id(),
+        rebuilt.connection_runtime_id()
+    );
+}
+
+#[test]
 fn normalize_client_api_path_prefixes_known_public_routes() {
     assert_eq!(
         normalize_client_api_path("/cluster/status").as_ref(),
@@ -3248,6 +3264,18 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
         assert_eq!(fallback["route"], "relay");
         assert!(client.uses_relay_transport());
         assert_eq!(client.relay_target_node_id(), Some(target_node_id));
+
+        let title_status = client.run_title_latency_probe().await;
+        assert_eq!(
+            title_status.state,
+            crate::TitleLatencyProbeState::Success,
+            "title latency probe should succeed on the recovered relay route: {:?}",
+            title_status.error,
+        );
+        assert_eq!(
+            title_status.connection_type,
+            crate::TitleLatencyConnectionType::Relay,
+        );
         assert!(direct_state.cluster_status_hits.load(Ordering::SeqCst) >= 1);
         assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
         assert!(relay_state.issued_ticket_count.load(Ordering::SeqCst) >= 1);
