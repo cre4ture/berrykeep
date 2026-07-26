@@ -894,6 +894,17 @@ test("server-admin map import wizard starts the Natural Earth labels background 
   await page.keyboard.press("Escape");
   await page.getByText("Gallery", { exact: true }).click();
 
+  const galleryTab = page.getByRole("tab", { name: "Gallery" });
+  const mapConfigurationTab = page.getByRole("tab", { name: "Map configuration" });
+  await expect(galleryTab).toHaveAttribute("aria-selected", "true");
+  await expect(mapConfigurationTab).toHaveAttribute("aria-selected", "false");
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  await expect(page.getByText("Map dataset import wizard", { exact: true })).not.toBeVisible();
+
+  await mapConfigurationTab.click();
+  await expect(mapConfigurationTab).toHaveAttribute("aria-selected", "true");
+  await expect(galleryTab).toHaveAttribute("aria-selected", "false");
+  await expect(page.getByText("Gallery map variants", { exact: true })).toBeVisible();
   await expect(page.getByText("Map dataset import wizard", { exact: true })).toBeVisible();
   await page.getByRole("radio", { name: "Natural Earth physical world map + labels" }).check();
   await page.getByRole("button", { name: "Continue" }).click();

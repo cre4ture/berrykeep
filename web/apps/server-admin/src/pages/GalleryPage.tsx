@@ -13,7 +13,7 @@ import {
   type GalleryLoadEntriesOptions,
   type GalleryMediaRequests
 } from "@ironmesh/ui";
-import { Stack } from "@mantine/core";
+import { Stack, Tabs } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { useCallback } from "react";
 import { MapDatasetImportCard } from "../components/MapDatasetImportCard";
@@ -103,34 +103,45 @@ export function GalleryPage() {
     [normalizedAdminTokenOverride]
   );
   return (
-    <Stack gap="lg">
-      <MapVariantConfigurationCard
-        configuration={mapConfiguration?.configuration ?? null}
-        stored={mapConfiguration?.stored ?? null}
-        loading={mapConfigurationQuery.isLoading}
-        error={mapConfigurationQuery.error}
-      />
-      <MapDatasetImportCard />
+    <Tabs defaultValue="gallery">
+      <Tabs.List aria-label="Gallery sections">
+        <Tabs.Tab value="gallery">Gallery</Tabs.Tab>
+        <Tabs.Tab value="map-configuration">Map configuration</Tabs.Tab>
+      </Tabs.List>
 
-      <GallerySurface
-        intro="Browse the node-side store index through admin-authenticated snapshot, index, and media routes. The gallery stays shared with the client surface and uses the current admin session for protected previews."
-        previewHint="Only indexed thumbnail URLs are used for gallery cards and movie posters. Missing thumbnails stay visible in the UI so pending or failed media processing is obvious."
-        allowedMediaKinds={["image", "video"]}
-        basemaps={basemaps}
-        preferredBasemapId={mapConfiguration?.configuration.active_variant_id}
-        basemapConfigurationLoading={mapConfigurationQuery.isLoading}
-        basemapConfigurationError={mapConfigurationError}
-        retryBasemapConfiguration={() => void mapConfigurationQuery.refetch()}
-        loadSnapshots={loadSnapshots}
-        loadEntries={loadEntries}
-        getMediaRequests={getMediaRequests}
-        loadVersions={loadVersions}
-        restoreVersion={(key, versionId, targetPath) =>
-          restoreAdminStoreVersion(key, versionId, targetPath)
-        }
-        retryMediaEntry={retryMediaEntry}
-      />
-    </Stack>
+      <Tabs.Panel value="gallery" pt="lg">
+        <GallerySurface
+          intro="Browse the node-side store index through admin-authenticated snapshot, index, and media routes. The gallery stays shared with the client surface and uses the current admin session for protected previews."
+          previewHint="Only indexed thumbnail URLs are used for gallery cards and movie posters. Missing thumbnails stay visible in the UI so pending or failed media processing is obvious."
+          allowedMediaKinds={["image", "video"]}
+          basemaps={basemaps}
+          preferredBasemapId={mapConfiguration?.configuration.active_variant_id}
+          basemapConfigurationLoading={mapConfigurationQuery.isLoading}
+          basemapConfigurationError={mapConfigurationError}
+          retryBasemapConfiguration={() => void mapConfigurationQuery.refetch()}
+          loadSnapshots={loadSnapshots}
+          loadEntries={loadEntries}
+          getMediaRequests={getMediaRequests}
+          loadVersions={loadVersions}
+          restoreVersion={(key, versionId, targetPath) =>
+            restoreAdminStoreVersion(key, versionId, targetPath)
+          }
+          retryMediaEntry={retryMediaEntry}
+        />
+      </Tabs.Panel>
+
+      <Tabs.Panel value="map-configuration" pt="lg">
+        <Stack gap="lg">
+          <MapVariantConfigurationCard
+            configuration={mapConfiguration?.configuration ?? null}
+            stored={mapConfiguration?.stored ?? null}
+            loading={mapConfigurationQuery.isLoading}
+            error={mapConfigurationQuery.error}
+          />
+          <MapDatasetImportCard />
+        </Stack>
+      </Tabs.Panel>
+    </Tabs>
   );
 }
 
