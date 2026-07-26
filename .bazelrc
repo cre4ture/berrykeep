@@ -1,0 +1,6 @@
+# The remote-cache endpoint is intentionally supplied by CI or a developer's
+# user bazelrc. Keeping it out of this file prevents credentials or a specific
+# hosting provider from becoming a repository dependency.
+common --enable_bzlmod
+build --remote_download_toplevel
+test --test_output=errors

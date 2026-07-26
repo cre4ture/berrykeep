@@ -1,0 +1,30 @@
+module(
+    name = "berrykeep",
+    version = "1.0.37",
+)
+
+# Rust rules are kept in lock-step with the initial Bazel toolchain. Cargo
+# remains the source of truth for third-party dependency versions.
+bazel_dep(name = "rules_rust", version = "0.71.3")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.88.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# Crate Universe translates the checked-in Cargo workspace and lockfile into
+# Bazel targets. Cargo.Bazel.lock records the renderer state, not a second set
+# of package versions; update it with `CARGO_BAZEL_REPIN=1 bazel build
+# //:unit` after changing Cargo dependencies.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:Cargo.Bazel.lock",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "crates")

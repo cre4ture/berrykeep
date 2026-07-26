@@ -1,0 +1,76 @@
+name: Bazel
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.bazelrc'
+      - '.bazelversion'
+      - 'BUILD.bazel'
+      - 'Cargo.Bazel.lock'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'MODULE.bazel'
+      - 'MODULE.bazel.lock'
+      - 'crates/**'
+      - '.github/workflows/bazel.yml'
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - '.bazelrc'
+      - '.bazelversion'
+      - 'BUILD.bazel'
+      - 'Cargo.Bazel.lock'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'MODULE.bazel'
+      - 'MODULE.bazel.lock'
+      - 'crates/**'
+      - '.github/workflows/bazel.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Bazel unit
+    runs-on: ubuntu-latest
+    env:
+      # Configure these in the repository settings once a Bazel remote-cache
+      # backend is available. Fork PRs receive neither secrets nor cache
+      # access; trusted PRs and main can populate the shared cache.
+      BAZEL_REMOTE_CACHE_URL: ${{ vars.BAZEL_REMOTE_CACHE_URL }}
+      BAZEL_REMOTE_CACHE_TOKEN: ${{ secrets.BAZEL_REMOTE_CACHE_TOKEN }}
+      REMOTE_CACHE_WRITABLE: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+
+      - name: Test native Bazel targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_args=()
+          # Require the credential as well as the endpoint. This makes fork
+          # PRs fall back to local execution instead of failing against a
+          # private cache without a secret.
+          if [ -n "${BAZEL_REMOTE_CACHE_URL}" ] && [ -n "${BAZEL_REMOTE_CACHE_TOKEN}" ]; then
+            cache_args+=("--remote_cache=${BAZEL_REMOTE_CACHE_URL}")
+            cache_args+=("--remote_header=Authorization=Bearer ${BAZEL_REMOTE_CACHE_TOKEN}")
+            if [ "${REMOTE_CACHE_WRITABLE}" != "true" ]; then
+              cache_args+=("--remote_upload_local_results=false")
+            fi
+          fi
+          bazel test //:unit "${cache_args[@]}"

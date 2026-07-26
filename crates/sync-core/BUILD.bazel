@@ -1,0 +1,28 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# This is the first native Bazel target in the workspace. It deliberately uses
+# the dependency information generated from Cargo.toml so that Cargo remains
+# the single source of truth while Bazel owns the action graph and cache keys.
+rust_library(
+    name = "sync_core",
+    aliases = aliases(),
+    crate_name = "sync_core",
+    crate_root = "src/lib.rs",
+    edition = crate_edition(),
+    srcs = glob(["src/**/*.rs"]),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_test",
+    crate = ":sync_core",
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    edition = crate_edition(),
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    size = "small",
+)
