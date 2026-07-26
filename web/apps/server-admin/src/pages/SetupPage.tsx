@@ -22,6 +22,7 @@ import {
 } from "@mantine/core";
 import { useCallback, useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
+import { SetupTelemetryDisclosure } from "../components/SetupTelemetryDisclosure";
 
 export function SetupPage() {
   const { login } = useAdminAccess();
@@ -30,7 +31,9 @@ export function SetupPage() {
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [startPassword, setStartPassword] = useState("");
+  const [startTelemetryEnabled, setStartTelemetryEnabled] = useState(true);
   const [nodeAdminPassword, setNodeAdminPassword] = useState("");
+  const [joinTelemetryEnabled, setJoinTelemetryEnabled] = useState(true);
   const [enrollmentJson, setEnrollmentJson] = useState("");
   const [joinRequestOutput, setJoinRequestOutput] = useState<Record<string, unknown> | null>(null);
   const [transitionOutput, setTransitionOutput] = useState<SetupTransitionResponse | null>(null);
@@ -69,7 +72,8 @@ export function SetupPage() {
     try {
       const payload = await startSetupCluster({
         admin_password: startPassword,
-        public_origin: window.location.origin
+        public_origin: window.location.origin,
+        telemetry_enabled: startTelemetryEnabled
       });
       setTransitionOutput(payload);
       await waitForRuntimeTransition(startPassword, login);
@@ -111,7 +115,8 @@ export function SetupPage() {
     try {
       const payload = await importSetupEnrollmentPackage({
         admin_password: nodeAdminPassword,
-        package_json: enrollmentJson
+        package_json: enrollmentJson,
+        telemetry_enabled: joinTelemetryEnabled
       });
       setTransitionOutput(payload);
       await waitForRuntimeTransition(nodeAdminPassword, login);
@@ -204,6 +209,10 @@ export function SetupPage() {
                 value={startPassword}
                 onChange={(event) => setStartPassword(event.currentTarget.value)}
               />
+              <SetupTelemetryDisclosure
+                enabled={startTelemetryEnabled}
+                onChange={setStartTelemetryEnabled}
+              />
               <Group>
                 <Button onClick={() => void handleStartCluster()} loading={pendingAction === "start"}>
                   Start a new cluster
@@ -255,6 +264,10 @@ export function SetupPage() {
             value={enrollmentJson}
             onChange={(event) => setEnrollmentJson(event.currentTarget.value)}
             placeholder='{"bootstrap": ...}'
+          />
+          <SetupTelemetryDisclosure
+            enabled={joinTelemetryEnabled}
+            onChange={setJoinTelemetryEnabled}
           />
           <Group>
             <Button onClick={() => void handleImportEnrollment()} loading={pendingAction === "import"}>
