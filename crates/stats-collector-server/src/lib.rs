@@ -10,9 +10,12 @@
 //! collector cannot tell which cluster/operator a given record came from (Section 5.2). Abuse
 //! protection is via rate limiting (see [`rate_limit`]) rather than authentication.
 //!
+//! A real, offline IP-to-country [`country::CountryResolver`] is available opt-in via the
+//! `bundled-country-db` Cargo feature ([`country::BundledCountryResolver`]); the default
+//! ([`country::NoopCountryResolver`]) resolves nothing, so no extra dependency is pulled in unless
+//! a deployment opts in (Section 4.2).
+//!
 //! Left for later work (seams are in place):
-//! - a real geo-IP-backed [`country::CountryResolver`] (the default [`country::NoopCountryResolver`]
-//!   resolves nothing, so no GeoIP database is bundled here — Section 4.2),
 //! - moving the on-request aggregation to a periodic batch job if the fleet ever outgrows it,
 //! - production TLS/deployment wiring (this crate binds a plain HTTP listener; terminating TLS at
 //!   `creax.de:44044` is a deployment concern, not something hardcoded here).

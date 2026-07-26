@@ -32,8 +32,10 @@ Deliberately **deferred** (documented at their respective sections, not blockers
 
 - The first-run bootstrap consent screen (Section 4.4) — the opt-out env/admin toggle is live, but
   the guided setup-time disclosure is left to the `zero-touch-cluster-setup` work.
-- A production GeoIP-backed `CountryResolver` (Section 4.2) — the seam and no-op resolver ship
-  here; no GeoIP database dependency is bundled.
+- Deploying a real `CountryResolver` in production (Section 4.2) — the seam, the no-op default,
+  and an opt-in `BundledCountryResolver` (RIR-delegated-stats-backed, via the `iptocc` crate, no
+  API key/account required) all ship in `crates/stats-collector-server/src/country.rs` behind the
+  `bundled-country-db` Cargo feature; wiring it up at deployment time is still a deployment concern.
 - Network interface error-rate metrics (Section 2.5), `telemetry_subject_id` rotation (Section 8),
   node-side daily SMART aggregation (Section 8), and an anonymous ingestion token (Section 5.2) —
   optional later stages.
