@@ -23,8 +23,29 @@ test("client-ui runtime loads configured gallery map styles through the client p
   expect(pageErrors).toEqual([]);
 });
 
-test("client-ui runtime keeps a gallery cluster chooser visible", async ({ page }) => {
-  await page.goto("/");
+test("client-ui runtime keeps the map photo viewer visible in an embedded viewport", async ({ page }) => {
+  await page.addInitScript((forcedQuery) => {
+    const originalMatchMedia = window.matchMedia.bind(window);
+    window.matchMedia = (query: string) => {
+      const result = originalMatchMedia(query);
+      if (query !== forcedQuery) {
+        return result;
+      }
+
+      return {
+        matches: true,
+        media: result.media,
+        onchange: result.onchange,
+        addListener: result.addListener?.bind(result) ?? (() => undefined),
+        removeListener: result.removeListener?.bind(result) ?? (() => undefined),
+        addEventListener: result.addEventListener.bind(result),
+        removeEventListener: result.removeEventListener.bind(result),
+        dispatchEvent: result.dispatchEvent.bind(result)
+      } as MediaQueryList;
+    };
+  }, "(max-width: 48em) and (pointer: coarse)");
+
+  await page.goto("/?embedded_client=android");
   await page.getByText("Gallery", { exact: true }).click();
   await page.getByRole("button", { name: "Map" }).click();
 
@@ -36,4 +57,14 @@ test("client-ui runtime keeps a gallery cluster chooser visible", async ({ page 
   await expect(chooser).toBeVisible();
   await expect(chooser.getByRole("button", { name: "gallery/runtime-map-a.png" })).toBeVisible();
   await expect(chooser.getByRole("button", { name: "gallery/runtime-map-b.png" })).toBeVisible();
+
+  await chooser.getByRole("button", { name: "gallery/runtime-map-a.png" }).click();
+  const lightbox = page.getByRole("dialog", { name: "runtime-map-a.png (1 of 2)" });
+  await expect(lightbox).toBeVisible();
+  await expect(
+    lightbox
+      .getByTitle("Hold Ctrl and scroll to zoom this image")
+      .locator('img[src*="profile=mobile_viewer"]')
+  ).toBeVisible();
+  await expect(lightbox).toContainText("Captured");
 });
