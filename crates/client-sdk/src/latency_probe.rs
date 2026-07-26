@@ -18,7 +18,7 @@ const MAX_LATENCY_PROBE_SERVER_DELAY_MS: u64 = 5_000;
 const MAX_LATENCY_PROBE_PAUSE_MS: u64 = 5_000;
 const LATENCY_PROBE_REQUEST_TIMEOUT_SLACK_MS: u64 = 3_000;
 pub const TITLE_LATENCY_PROBE_DEFAULT_PERIOD_SECONDS: u64 = 30;
-pub const TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS: u64 = 5;
+pub const TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS: u64 = 1;
 pub const TITLE_LATENCY_PROBE_MAX_PERIOD_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -962,6 +962,12 @@ mod tests {
 
     #[test]
     fn title_latency_probe_config_rejects_out_of_range_periods() {
+        let minimum = TitleLatencyProbeConfig {
+            enabled: true,
+            period_seconds: TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS,
+        };
+        assert!(minimum.validate().is_ok());
+
         let too_short = TitleLatencyProbeConfig {
             enabled: true,
             period_seconds: TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS - 1,

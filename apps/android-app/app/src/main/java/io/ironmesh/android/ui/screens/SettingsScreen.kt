@@ -249,13 +249,13 @@ private fun TitleLatencyMonitorSettingsEditor(
                 Slider(
                     value = pendingPeriodSeconds,
                     onValueChange = { value ->
-                        pendingPeriodSeconds = (value / 5f).roundToInt().times(5).toFloat()
+                        pendingPeriodSeconds = value.roundToInt().toFloat()
                     },
                     onValueChangeFinished = {
                         onPeriodSecondsChange(pendingPeriodSeconds.roundToInt().toLong())
                     },
-                    valueRange = 5f..300f,
-                    steps = 58,
+                    valueRange = 1f..300f,
+                    steps = 298,
                 )
             }
         }
