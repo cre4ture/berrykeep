@@ -3,7 +3,7 @@ package io.ironmesh.android.data
 import com.squareup.moshi.Json
 
 private const val TITLE_LATENCY_DEFAULT_PERIOD_SECONDS = 30L
-private const val TITLE_LATENCY_MIN_PERIOD_SECONDS = 5L
+private const val TITLE_LATENCY_MIN_PERIOD_SECONDS = 1L
 private const val TITLE_LATENCY_MAX_PERIOD_SECONDS = 3_600L
 
 data class TitleLatencyMonitorSettings(
