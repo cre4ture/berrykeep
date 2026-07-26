@@ -59,6 +59,7 @@ public enum AppleConnectionRoutePathKind: Hashable, Sendable, Codable {
 public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Sendable {
     public var index: Int
     public var pathKind: AppleConnectionRoutePathKind
+    public var holePunchingMode: String?
     public var locator: String
     public var bootstrapRank: Int
     public var targetNodeId: String?
@@ -78,6 +79,36 @@ public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Se
     public var lastError: String?
 
     public var id: Int { index }
+
+    public var usesRelayPath: Bool {
+        pathKind == .relayTunnel ||
+            (pathKind == .directQUIC && holePunchingMode == "relay")
+    }
+
+    public var isDirectQuicHolePunched: Bool {
+        pathKind == .directQUIC && holePunchingMode == "direct"
+    }
+
+    public var connectionDisplayName: String {
+        switch pathKind {
+        case .directQUIC where isDirectQuicHolePunched:
+            return "Direct via NAT (QUIC)"
+        case .directQUIC where usesRelayPath:
+            return "QUIC via Relay"
+        default:
+            return pathKind.displayName
+        }
+    }
+
+    public var connectionExplanation: String? {
+        if isDirectQuicHolePunched {
+            return "Rendezvous established this connection; data travels directly between this device and the cluster."
+        }
+        if pathKind == .directQUIC && usesRelayPath {
+            return "This QUIC session is currently carried through a relay."
+        }
+        return nil
+    }
 
     public func isCoolingDown(atUnixMs timestamp: UInt64) -> Bool {
         guard let circuitOpenUntilUnixMs else {
@@ -122,10 +153,10 @@ public struct AppleConnectionRouteSnapshot: Codable, Equatable, Sendable {
     }
 
     public var directEndpointCount: Int {
-        endpoints.filter { $0.pathKind.isDirect }.count
+        endpoints.filter { $0.pathKind.isDirect && !$0.usesRelayPath }.count
     }
 
     public var relayEndpointCount: Int {
-        endpoints.filter { $0.pathKind == .relayTunnel }.count
+        endpoints.filter(\.usesRelayPath).count
     }
 }
