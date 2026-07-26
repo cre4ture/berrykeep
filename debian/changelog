@@ -1,3 +1,13 @@
+ironmesh (1.0.38-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Improve client route selection and recovery diagnostics, including
+    exportable correlated client logs.
+  * Improve the Android and iOS gallery map experience and its coverage.
+  * Strengthen cross-platform CI and Debian package artifact validation.
+  * Roll the workspace release to 1.0.38.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 26 Jul 2026 18:46:38 +0200
+
 ironmesh (1.0.37-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add Natural Earth map variants, dataset import workflows, and explorer
