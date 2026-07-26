@@ -1,0 +1,46 @@
+#!/bin/bash
+
+set -euo pipefail
+
+readonly CONFIG_PATH="/Library/Application Support/Ironmesh/server-node.env"
+readonly SERVER_BINARY="/Library/Application Support/Ironmesh/bin/ironmesh-server-node"
+
+fail() {
+  printf 'ironmesh-server-node launcher: %s\n' "$*" >&2
+  exit 64
+}
+
+is_supported_key() {
+  [[ "$1" =~ ^IRONMESH_[A-Z0-9_]+$ || "$1" == "RUST_LOG" ]]
+}
+
+load_configuration() {
+  local line key value
+
+  [[ -f "${CONFIG_PATH}" ]] || fail "configuration file is missing: ${CONFIG_PATH}"
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    # Accept files edited on Windows without passing a carriage return to the
+    # process environment.
+    line="${line%$'\r'}"
+
+    case "${line}" in
+      ''|'#'*)
+        continue
+        ;;
+      *=*)
+        key="${line%%=*}"
+        value="${line#*=}"
+        is_supported_key "${key}" \
+          || fail "unsupported configuration key: ${key}"
+        export "${key}=${value}"
+        ;;
+      *)
+        fail "invalid configuration line: ${line}"
+        ;;
+    esac
+  done < "${CONFIG_PATH}"
+}
+
+load_configuration
+exec "${SERVER_BINARY}"

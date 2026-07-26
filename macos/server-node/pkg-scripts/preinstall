@@ -1,0 +1,23 @@
+#!/bin/bash
+
+set -euo pipefail
+
+readonly LABEL="io.ironmesh.server-node"
+readonly PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
+
+# Package Installer passes the target volume as its third argument. A package
+# installed onto a non-running volume must not attempt to modify this Mac's
+# launchd domain.
+if [[ "${3:-/}" != "/" ]]; then
+  exit 0
+fi
+
+if launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+  launchctl bootout "system/${LABEL}" || true
+fi
+
+# A stale registration can remain after an interrupted package update even
+# when `launchctl print` did not find a running job.
+if [[ -f "${PLIST_PATH}" ]]; then
+  launchctl bootout system "${PLIST_PATH}" >/dev/null 2>&1 || true
+fi

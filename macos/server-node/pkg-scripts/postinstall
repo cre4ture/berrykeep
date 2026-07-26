@@ -1,0 +1,85 @@
+#!/bin/bash
+
+set -euo pipefail
+
+readonly LABEL="io.ironmesh.server-node"
+readonly SERVICE_USER="_ironmesh"
+readonly SERVICE_GROUP="staff"
+readonly SERVICE_ROOT="/Library/Application Support/Ironmesh"
+readonly DATA_DIR="${SERVICE_ROOT}/server-node"
+readonly CONFIG_PATH="${SERVICE_ROOT}/server-node.env"
+readonly CONFIG_TEMPLATE_PATH="${SERVICE_ROOT}/server-node.env.example"
+readonly LOG_DIR="/Library/Logs/Ironmesh"
+readonly PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
+
+fail() {
+  printf 'ironmesh-server-node installer: %s\n' "$*" >&2
+  exit 1
+}
+
+user_exists() {
+  dscl . -read "/Users/${SERVICE_USER}" >/dev/null 2>&1
+}
+
+uid_is_available() {
+  ! dscl . -list /Users UniqueID 2>/dev/null \
+    | awk -v candidate="$1" '$2 == candidate { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+create_service_user() {
+  local uid
+
+  user_exists && return
+
+  # Keep the non-login service account in the system-account range while
+  # avoiding a fixed UID that may already belong to a managed Mac account.
+  uid=499
+  while ((uid >= 300)); do
+    if uid_is_available "${uid}"; then
+      break
+    fi
+    ((uid -= 1))
+  done
+  ((uid >= 300)) || fail "could not allocate a system UID for ${SERVICE_USER}"
+
+  dscl . -create "/Users/${SERVICE_USER}"
+  dscl . -create "/Users/${SERVICE_USER}" RealName "Ironmesh Server Node"
+  dscl . -create "/Users/${SERVICE_USER}" UniqueID "${uid}"
+  dscl . -create "/Users/${SERVICE_USER}" PrimaryGroupID 20
+  dscl . -create "/Users/${SERVICE_USER}" NFSHomeDirectory /var/empty
+  dscl . -create "/Users/${SERVICE_USER}" UserShell /usr/bin/false
+  dscl . -create "/Users/${SERVICE_USER}" IsHidden 1
+  dscl . -create "/Users/${SERVICE_USER}" Password '*'
+}
+
+if [[ "${3:-/}" != "/" ]]; then
+  exit 0
+fi
+
+create_service_user
+
+install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0750 "${DATA_DIR}"
+install -d -o root -g wheel -m 0755 "${LOG_DIR}"
+
+if [[ ! -e "${CONFIG_PATH}" ]]; then
+  install -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0600 \
+    "${CONFIG_TEMPLATE_PATH}" "${CONFIG_PATH}"
+fi
+
+chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${DATA_DIR}"
+chown root:wheel "${SERVICE_ROOT}/bin/ironmesh-server-node" \
+  "${SERVICE_ROOT}/bin/ironmesh-server-node-launcher" \
+  "${CONFIG_TEMPLATE_PATH}" \
+  "${PLIST_PATH}"
+chmod 0755 "${SERVICE_ROOT}/bin/ironmesh-server-node" \
+  "${SERVICE_ROOT}/bin/ironmesh-server-node-launcher"
+chmod 0644 "${CONFIG_TEMPLATE_PATH}" "${PLIST_PATH}"
+chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_PATH}"
+chmod 0600 "${CONFIG_PATH}"
+
+touch "${LOG_DIR}/server-node.stdout.log" "${LOG_DIR}/server-node.stderr.log"
+chown root:wheel "${LOG_DIR}/server-node.stdout.log" "${LOG_DIR}/server-node.stderr.log"
+chmod 0640 "${LOG_DIR}/server-node.stdout.log" "${LOG_DIR}/server-node.stderr.log"
+
+launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+launchctl bootstrap system "${PLIST_PATH}"
