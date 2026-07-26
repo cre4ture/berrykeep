@@ -445,6 +445,9 @@ jobs:
           xcodebuild -version
           xcrun simctl list devices available
 
+      - name: Validate macOS server-node package structure
+        run: ./scripts/test-macos-server-node-package.sh
+
       - name: Run iOS Rust facade tests
         run: cargo test --locked -p ios-app
 

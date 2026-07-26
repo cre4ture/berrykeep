@@ -182,6 +182,15 @@ sudo chown -R ironmesh-server-node:ironmesh-server-node /var/lib/ironmesh-server
 sudo systemctl restart ironmesh-server-node.service
 ```
 
+## Install On macOS
+
+The headless macOS server-node package installs a native `launchd`
+`LaunchDaemon`, which runs at boot under a dedicated non-login service account.
+It is separate from the Ubuntu `systemd` package above and does not depend on
+an interactive desktop login. Build, code-sign, install, configure, operate,
+and remove the package according to the
+[macOS server-node package guide](docs/macos-server-node.md).
+
 ## Manual Cluster Initialisation Steps
 
 For fresh clusters that should support the gallery map view, initialize the

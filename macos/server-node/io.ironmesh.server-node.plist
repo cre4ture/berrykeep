@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.ironmesh.server-node</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Application Support/Ironmesh/bin/ironmesh-server-node-launcher</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Library/Application Support/Ironmesh/server-node</string>
+
+    <key>UserName</key>
+    <string>_ironmesh</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/Ironmesh/server-node.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/Ironmesh/server-node.stderr.log</string>
+</dict>
+</plist>
