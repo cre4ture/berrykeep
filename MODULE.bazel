@@ -16,9 +16,9 @@ use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")
 
-# Crate Universe's lockfile captures the Cargo and rustc versions used to
-# render it. Pin its host tools to the same Rust release as the toolchain so
-# its checksum is reproducible between developer machines and CI.
+# Crate Universe resolves Cargo metadata while evaluating the module. Pin its
+# host tools to the same Rust release as the toolchain so that resolution is
+# consistent between developer machines and CI.
 host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
 host_tools.host_tools(
     name = "berrykeep_rust_host_tools",
@@ -27,15 +27,13 @@ host_tools.host_tools(
 use_repo(host_tools, "berrykeep_rust_host_tools")
 
 # Crate Universe translates the checked-in Cargo workspace and lockfile into
-# Bazel targets. Cargo.Bazel.lock records the renderer state, not a second set
-# of package versions; update it with `CARGO_BAZEL_REPIN=1 bazel build
-# //:unit` after changing Cargo dependencies.
+# Bazel targets. Cargo.lock remains the single dependency lockfile during this
+# incremental migration.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",
     host_tools = "@berrykeep_rust_host_tools",
-    lockfile = "//:Cargo.Bazel.lock",
     manifests = ["//:Cargo.toml"],
     # The initial suite runs on GitHub's Linux x86_64 runner. Additional
     # triples are added together with their first native Bazel targets.
