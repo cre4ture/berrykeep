@@ -120,7 +120,11 @@
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="BerryKeepProgramData" Name="BerryKeep">
         <Directory Id="ServerNodeProgramData" Name="ServerNode">
-          <Component Id="ServerNodeState" Guid="0B58FE76-5165-46FC-B8B1-A5EA35683A88" Permanent="yes">
+          <Component
+            Id="ServerNodeState"
+            Guid="0B58FE76-5165-46FC-B8B1-A5EA35683A88"
+            Permanent="yes"
+            NeverOverwrite="yes">
             <CreateFolder>
               <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)" />
             </CreateFolder>
@@ -128,7 +132,6 @@
               Id="ServerNodeEnvironmentFile"
               Source="$(var.ServiceEnvironmentFile)"
               Name="server-node.env"
-              NeverOverwrite="yes"
               KeyPath="yes">
               <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)" />
             </File>
