@@ -4,7 +4,7 @@ Official project language: English
 
 Prefer working on own worktree for each PR.
 
-Pull remote changes regularitly. Expect heavy parallel development on multiple seperate hosts.
+Pull remote changes regularily. Expect heavy parallel development on multiple seperate hosts.
 
 Prefer clean and generic solutions over specialized fast-fixes. Even if this is significantly more effort.
 
