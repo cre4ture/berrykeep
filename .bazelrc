@@ -2,6 +2,5 @@
 # user bazelrc. Keeping it out of this file prevents credentials or a specific
 # hosting provider from becoming a repository dependency.
 common --enable_bzlmod
-common --lockfile_mode=error
 build --remote_download_toplevel
 test --test_output=errors

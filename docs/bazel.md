@@ -28,9 +28,8 @@ Crate Universe state is tracked by Bazel's standard `MODULE.bazel.lock`, rather
 than a separate `Cargo.Bazel.lock`. Crate Universe's Cargo and rustc host tools
 are pinned to Rust 1.88.0 for consistent resolution in CI.
 
-The checked-in Bzlmod lockfile is enforced for normal builds. After changing
-`Cargo.toml`, `Cargo.lock`, or `MODULE.bazel`, update it and commit it with the
-source change:
+After changing `Cargo.toml`, `Cargo.lock`, or `MODULE.bazel`, refresh the
+checked-in Bzlmod lockfile and commit it with the source change:
 
 ```bash
 bazel mod tidy --lockfile_mode=update
