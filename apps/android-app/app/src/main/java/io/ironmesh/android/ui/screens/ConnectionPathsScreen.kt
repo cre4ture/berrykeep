@@ -60,6 +60,19 @@ fun ConnectionPathsScreen(
             ) {}
         } else {
             SectionCard(
+                title = stringResource(R.string.connection_paths_selection_title),
+                supportingText = stringResource(R.string.connection_paths_selection_body),
+            ) {
+                Text(
+                    text = stringResource(R.string.connection_paths_selection_score_additions),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
+                    text = stringResource(R.string.connection_paths_selection_score_credits),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            SectionCard(
                 title = stringResource(R.string.connection_paths_routes_title),
                 supportingText = stringResource(R.string.connection_paths_routes_body),
             ) {

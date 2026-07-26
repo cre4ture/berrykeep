@@ -31,7 +31,21 @@ internal data class ConnectionOverview(
 internal data class ConnectionRouteItem(
     val endpoint: ConnectionRouteEndpointSnapshot,
     val state: ConnectionRouteState,
+    val selectionRank: Int,
+    val selectionCandidateCount: Int,
+    val scoreBreakdown: RouteScoreBreakdown,
     val lastCheckedUnixMs: Long? = null,
+)
+
+internal data class RouteScoreBreakdown(
+    val total: Double,
+    val bootstrapOrderPoints: Double,
+    val latencyPoints: Double,
+    val latencyIsEstimated: Boolean,
+    val relayPenaltyPoints: Double,
+    val failurePenaltyPoints: Double,
+    val throughputCreditPoints: Double,
+    val activeRouteCreditPoints: Double,
 )
 
 internal data class ConnectionPathsPresentation(
@@ -44,11 +58,17 @@ internal fun connectionPathsPresentation(
     error: String?,
 ): ConnectionPathsPresentation {
     val orderedEndpoints = rankedConnectionEndpoints(snapshot)
+    val selectionRanks = orderedEndpoints
+        .mapIndexed { position, endpoint -> endpoint.index to position + 1 }
+        .toMap()
     val routes = orderedEndpoints
         .map { endpoint ->
             ConnectionRouteItem(
                 endpoint = endpoint,
                 state = connectionRouteState(endpoint, snapshot?.generatedAtUnixMs),
+                selectionRank = requireNotNull(selectionRanks[endpoint.index]),
+                selectionCandidateCount = orderedEndpoints.size,
+                scoreBreakdown = routeScoreBreakdown(endpoint),
                 lastCheckedUnixMs = endpoint.lastMeasurementUnixMs
                     ?: endpoint.lastSuccessUnixMs
                     ?: endpoint.lastFailureUnixMs,
@@ -127,6 +147,28 @@ internal fun routeDisplayLabel(endpoint: ConnectionRouteEndpointSnapshot): Strin
     return endpoint.targetNodeId?.let { "$prefix to $it" } ?: prefix
 }
 
+internal fun routeScoreBreakdown(endpoint: ConnectionRouteEndpointSnapshot): RouteScoreBreakdown {
+    val latencyIsEstimated = endpoint.ewmaLatencyMs == null
+    return RouteScoreBreakdown(
+        total = endpoint.score,
+        bootstrapOrderPoints = endpoint.bootstrapRank.toDouble(),
+        latencyPoints = endpoint.ewmaLatencyMs ?: ROUTE_UNKNOWN_LATENCY_POINTS,
+        latencyIsEstimated = latencyIsEstimated,
+        relayPenaltyPoints = if (endpoint.pathKind == RELAY_TUNNEL_PATH_KIND) {
+            ROUTE_RELAY_PENALTY_POINTS
+        } else {
+            0.0
+        },
+        failurePenaltyPoints = endpoint.consecutiveFailures * ROUTE_FAILURE_PENALTY_POINTS,
+        throughputCreditPoints = endpoint.ewmaThroughputBytesPerSec?.let { throughput ->
+            (throughput / ROUTE_THROUGHPUT_BYTES_PER_POINT)
+                .coerceAtMost(ROUTE_MAX_THROUGHPUT_CREDIT_POINTS)
+        }
+            ?: 0.0,
+        activeRouteCreditPoints = if (endpoint.active) ROUTE_ACTIVE_ROUTE_CREDIT_POINTS else 0.0,
+    )
+}
+
 internal fun isCoolingDown(
     endpoint: ConnectionRouteEndpointSnapshot,
     snapshotUnixMs: Long?,
@@ -183,3 +225,9 @@ private fun summarizeUrl(value: String): String {
 }
 
 private const val RELAY_TUNNEL_PATH_KIND = "relay_tunnel"
+private const val ROUTE_UNKNOWN_LATENCY_POINTS = 75.0
+private const val ROUTE_RELAY_PENALTY_POINTS = 500.0
+private const val ROUTE_FAILURE_PENALTY_POINTS = 250.0
+private const val ROUTE_THROUGHPUT_BYTES_PER_POINT = 250_000.0
+private const val ROUTE_MAX_THROUGHPUT_CREDIT_POINTS = 50.0
+private const val ROUTE_ACTIVE_ROUTE_CREDIT_POINTS = 50.0
