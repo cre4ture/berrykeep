@@ -23,7 +23,9 @@ checks until its Bazel equivalents are present and have demonstrated parity.
 Install [Bazelisk](https://github.com/bazelbuild/bazelisk) as `bazel`; it
 selects the pinned version from `.bazelversion`. Bazel uses `MODULE.bazel` and
 `rules_rust`'s Crate Universe to read the root `Cargo.toml` and `Cargo.lock`.
-The Cargo files remain the source of truth for Rust dependencies.
+The Cargo files remain the source of truth for Rust dependencies. Crate
+Universe's Cargo and rustc host tools are pinned to Rust 1.88.0, which makes
+the generated renderer lockfile reproducible in CI.
 
 After changing `Cargo.toml` or `Cargo.lock`, regenerate the renderer lockfile
 and commit it with the Cargo changes:

@@ -1,5 +1,5 @@
 {
-  "checksum": "979ca14e85f48374cf92ec46edd2abce69ccc011c772c41fdc968b8e54d77296",
+  "checksum": "1e94dacb97996313dfe126608ce86f3e218f0a8cbfd3c0a5cd6cf76978db54db",
   "crates": {
     "adapter-linux-fuse 1.0.37": {
       "name": "adapter-linux-fuse",
