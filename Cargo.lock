@@ -2928,6 +2928,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "iptocc"
+version = "1.4.85"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c10d38bdc2fbf922cc2b796c52e30dae9fe4b40a8d99e4cf4dea51af1ca6fb6d"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "iroh"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5809,6 +5818,7 @@ version = "1.0.38"
 dependencies = [
  "anyhow",
  "axum",
+ "iptocc",
  "rusqlite",
  "serde",
  "serde_json",
