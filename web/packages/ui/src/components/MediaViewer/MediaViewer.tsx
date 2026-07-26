@@ -4,7 +4,6 @@ import {
   Center,
   Group,
   Loader,
-  Modal,
   Stack,
   Text,
   ThemeIcon
@@ -25,6 +24,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode
 } from "react";
+import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
 
 export type MediaPreviewRequest = {
   url: string;
@@ -147,6 +147,7 @@ export function MediaLightboxModal({
   renderDetails
 }: MediaLightboxModalProps) {
   const [isSlideshowMode, setIsSlideshowMode] = useState(false);
+  const usesEmbeddedViewport = usesEmbeddedWebUiViewport();
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < itemCount - 1;
   const selectedItemPreviewSignature = selectedItem
@@ -206,7 +207,10 @@ export function MediaLightboxModal({
   ]);
 
   return (
-    <Modal
+    <EmbeddedViewportModal
+      data-media-lightbox="true"
+      usesEmbeddedViewport={usesEmbeddedViewport}
+      fillEmbeddedViewport={usesEmbeddedViewport}
       opened={opened}
       onClose={onClose}
       title={
@@ -218,25 +222,47 @@ export function MediaLightboxModal({
       }
       withCloseButton={!isSlideshowMode}
       closeOnEscape={!isSlideshowMode}
-      fullScreen
-      styles={{
-        content: {
-          background: isSlideshowMode ? "var(--mantine-color-dark-9)" : undefined
-        },
-        header: {
-          display: isSlideshowMode ? "none" : undefined
-        },
-        body: {
-          padding: isSlideshowMode ? 0 : undefined,
-          paddingTop: 0
-        }
+      fullScreen={!usesEmbeddedViewport}
+      size={usesEmbeddedViewport ? "100%" : undefined}
+      contentStyle={{
+        background: isSlideshowMode ? "var(--mantine-color-dark-9)" : undefined,
+        display: usesEmbeddedViewport ? "flex" : undefined,
+        flexDirection: usesEmbeddedViewport ? "column" : undefined
+      }}
+      headerStyle={{
+        display: isSlideshowMode ? "none" : undefined
+      }}
+      bodyStyle={{
+        padding: isSlideshowMode ? 0 : undefined,
+        paddingTop: 0,
+        display: usesEmbeddedViewport ? "flex" : undefined,
+        flexDirection: usesEmbeddedViewport ? "column" : undefined,
+        flex: usesEmbeddedViewport ? 1 : undefined,
+        minHeight: usesEmbeddedViewport ? 0 : undefined,
+        overflowY: usesEmbeddedViewport ? "auto" : undefined
       }}
     >
       {selectedItem ? (
-        <Stack gap={isSlideshowMode ? 0 : "md"}>
+        <Stack
+          gap={isSlideshowMode ? 0 : "md"}
+          style={
+            usesEmbeddedViewport
+              ? {
+                  flex: 1,
+                  minHeight: 0
+                }
+              : undefined
+          }
+        >
           <div
             style={{
-              height: isSlideshowMode ? "100dvh" : "calc(100vh - 21rem)",
+              height: isSlideshowMode
+                ? usesEmbeddedViewport
+                  ? "100%"
+                  : "100dvh"
+                : usesEmbeddedViewport
+                  ? "calc(100% - 21rem)"
+                  : "calc(100vh - 21rem)",
               minHeight: isSlideshowMode ? undefined : "20rem"
             }}
           >
@@ -327,8 +353,17 @@ export function MediaLightboxModal({
           ) : null}
         </Stack>
       ) : null}
-    </Modal>
+    </EmbeddedViewportModal>
   );
+}
+
+function usesEmbeddedWebUiViewport(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const embeddedClient = new URLSearchParams(window.location.search).get("embedded_client");
+  return embeddedClient === "android" || embeddedClient === "ios";
 }
 
 export function MediaThumbnailPreview({

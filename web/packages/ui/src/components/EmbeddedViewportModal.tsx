@@ -7,18 +7,14 @@ type EmbeddedViewportModalProps = Omit<ModalProps, "styles"> & {
    * fullscreen surface is active. Mantine's default modal height uses dvh.
    */
   usesEmbeddedViewport?: boolean;
-};
-
-const embeddedViewportModalStyles = {
-  root: {
-    "--modal-y-offset": "16px",
-    "--modal-x-offset": "16px"
-  } as CSSProperties,
-  // The modal inner container is fixed with top and bottom bounds, so this
-  // percentage is resolved from the actual WebView bounds instead of dvh.
-  content: {
-    maxHeight: "calc(100% - 32px)"
-  }
+  /**
+   * Fill the embedded WebView without passing Mantine's `fullScreen` prop,
+   * which itself relies on a dynamic viewport height.
+   */
+  fillEmbeddedViewport?: boolean;
+  contentStyle?: CSSProperties;
+  headerStyle?: CSSProperties;
+  bodyStyle?: CSSProperties;
 };
 
 /**
@@ -28,7 +24,34 @@ const embeddedViewportModalStyles = {
  */
 export function EmbeddedViewportModal({
   usesEmbeddedViewport = false,
+  fillEmbeddedViewport = false,
+  contentStyle,
+  headerStyle,
+  bodyStyle,
   ...props
 }: EmbeddedViewportModalProps) {
-  return <Modal {...props} styles={usesEmbeddedViewport ? embeddedViewportModalStyles : undefined} />;
+  const fillsViewport = usesEmbeddedViewport && fillEmbeddedViewport;
+
+  return (
+    <Modal
+      {...props}
+      styles={{
+        root: usesEmbeddedViewport
+          ? {
+              "--modal-y-offset": fillsViewport ? "0px" : "16px",
+              "--modal-x-offset": fillsViewport ? "0px" : "16px"
+            }
+          : undefined,
+        // The modal inner container is fixed with top and bottom bounds, so
+        // percentages resolve from the actual WebView bounds instead of dvh.
+        content: {
+          maxHeight: fillsViewport ? "100%" : usesEmbeddedViewport ? "calc(100% - 32px)" : undefined,
+          height: fillsViewport ? "100%" : undefined,
+          ...contentStyle
+        },
+        header: headerStyle,
+        body: bodyStyle
+      }}
+    />
+  );
 }
