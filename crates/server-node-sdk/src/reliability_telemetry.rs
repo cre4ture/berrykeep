@@ -75,8 +75,22 @@ pub(crate) struct TelemetryStorageDevice {
     smart: Option<TelemetryStorageSmart>,
 }
 
-/// Allow-listed projection of `hardware_health::HardwareStorageSmartInfo` - only the five SMART
-/// fields sketched in doc Section 7, not the full SMART struct.
+/// Allow-listed projection of `hardware_health::HardwareStorageSmartInfo` - only the SMART fields
+/// sketched in doc Section 7, not the full SMART struct.
+///
+/// Field-by-field aggregation choice (doc Section 8's "granularity of temperature/SMART time
+/// series" question, resolved here in favor of node-side aggregation): `smart_passed`,
+/// `power_on_hours`, `reallocated_sector_count`, `media_errors`, and `percentage_used` are all
+/// either a boolean verdict or a **monotonically non-decreasing counter** over the life of the
+/// device (uptime hours only grow; reallocated sectors, media errors, and SSD wear percentage only
+/// accumulate). For monotonic counters, min/max/mean over a send window adds no information beyond
+/// the latest reading - the min is just the oldest sample, the max/mean are within noise of the
+/// latest value - so these stay simple instantaneous "latest snapshot" values, same as before.
+/// `temperature_celsius`, by contrast, genuinely fluctuates up and down with workload/ambient
+/// conditions, so a single instantaneous reading is a noisy, easily-fingerprintable per-device
+/// signal (doc Section 8's stated concern) - it is therefore the one field reduced node-side to
+/// `{min, max, mean}` over the rolling accumulation window since the last successful send
+/// (see [`TemperatureAccumulator`]), rather than sent as a raw per-sample time series.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TelemetryStorageSmart {
     smart_passed: Option<bool>,
@@ -84,6 +98,14 @@ pub(crate) struct TelemetryStorageSmart {
     reallocated_sector_count: Option<u64>,
     media_errors: Option<u64>,
     percentage_used: Option<u64>,
+    /// Lowest temperature sampled during the accumulation window. `None` if no samples were
+    /// recorded (e.g. the device lacks a temperature sensor, or no `hardware_health` refresh has
+    /// completed yet since the last send).
+    temperature_celsius_min: Option<f32>,
+    /// Highest temperature sampled during the accumulation window.
+    temperature_celsius_max: Option<f32>,
+    /// Arithmetic mean over all samples in the accumulation window.
+    temperature_celsius_mean: Option<f32>,
 }
 
 /// RAM ECC counters projected from the node-local EDAC collector
@@ -110,30 +132,78 @@ pub(crate) struct TelemetryCollectorStatus {
     available: bool,
 }
 
+/// Rolling min/max/mean/count accumulator for one storage device's `temperature_celsius`,
+/// fed by every node-local `hardware_health` refresh (every
+/// `hardware_health::HARDWARE_HEALTH_REFRESH_INTERVAL_SECS`, currently 5 minutes) since the last
+/// successful telemetry send, and reduced into the outbound payload's
+/// `temperature_celsius_{min,max,mean}` fields (see [`TelemetryStorageSmart`]). Persisted
+/// node-locally alongside the rest of `PersistedReliabilityTelemetryState` so the window survives a
+/// restart across the much longer 6-24h send interval, then reset after each successful send (see
+/// [`ReliabilityTelemetryRuntime::record_send_success`]).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub(crate) struct TemperatureAccumulator {
+    sample_count: u64,
+    sum_celsius: f64,
+    min_celsius: f32,
+    max_celsius: f32,
+}
+
+impl TemperatureAccumulator {
+    fn record(&mut self, celsius: f32) {
+        if self.sample_count == 0 {
+            self.min_celsius = celsius;
+            self.max_celsius = celsius;
+        } else {
+            self.min_celsius = self.min_celsius.min(celsius);
+            self.max_celsius = self.max_celsius.max(celsius);
+        }
+        self.sum_celsius += f64::from(celsius);
+        self.sample_count += 1;
+    }
+
+    fn mean_celsius(&self) -> f32 {
+        (self.sum_celsius / self.sample_count as f64) as f32
+    }
+}
+
 /// Pure converter: derives the reduced, pseudonymized telemetry payload from the existing
 /// node-local `hardware_health_report`. Per doc "Open Questions" recommendation, this stays a
 /// one-way projection of the existing report rather than a second independent collector, so the
 /// node-local and centrally-sent views cannot drift apart.
+///
+/// `temperature_accumulators` is a snapshot of the rolling per-device temperature window
+/// accumulated since the last successful send (keyed by `component_instance_id`), obtained via
+/// [`ReliabilityTelemetryRuntime::temperature_accumulators_snapshot`]. It is passed in rather than
+/// looked up internally because it lives under a different lock
+/// (`ServerState::reliability_telemetry_runtime`) than the hardware-health report, and this
+/// function must stay a pure, lock-free converter.
 pub(crate) fn build_reliability_telemetry_payload(
     report: &hardware_health::HardwareHealthReport,
     telemetry_subject_id: String,
     generated_at_unix: u64,
+    temperature_accumulators: &HashMap<String, TemperatureAccumulator>,
 ) -> ReliabilityTelemetryPayload {
     let storage_devices = report
         .inventory
         .storage_devices
         .iter()
-        .map(|device| TelemetryStorageDevice {
-            component_instance_id: device.component_instance_id.clone(),
-            is_rotational: device.is_rotational,
-            interface_type: device.interface_type.clone(),
-            smart: device.smart.as_ref().map(|smart| TelemetryStorageSmart {
-                smart_passed: smart.smart_passed,
-                power_on_hours: smart.power_on_hours,
-                reallocated_sector_count: smart.reallocated_sector_count,
-                media_errors: smart.media_errors,
-                percentage_used: smart.percentage_used,
-            }),
+        .map(|device| {
+            let temperature = temperature_accumulators.get(&device.component_instance_id);
+            TelemetryStorageDevice {
+                component_instance_id: device.component_instance_id.clone(),
+                is_rotational: device.is_rotational,
+                interface_type: device.interface_type.clone(),
+                smart: device.smart.as_ref().map(|smart| TelemetryStorageSmart {
+                    smart_passed: smart.smart_passed,
+                    power_on_hours: smart.power_on_hours,
+                    reallocated_sector_count: smart.reallocated_sector_count,
+                    media_errors: smart.media_errors,
+                    percentage_used: smart.percentage_used,
+                    temperature_celsius_min: temperature.map(|acc| acc.min_celsius),
+                    temperature_celsius_max: temperature.map(|acc| acc.max_celsius),
+                    temperature_celsius_mean: temperature.map(TemperatureAccumulator::mean_celsius),
+                }),
+            }
         })
         .collect();
 
@@ -271,6 +341,11 @@ struct PersistedReliabilityTelemetryState {
     /// Bounded ring of the most recent sent payloads for the transparency UI.
     #[serde(default)]
     sent_history: Vec<SentHistoryEntry>,
+    /// Rolling per-storage-device temperature accumulation window, keyed by
+    /// `component_instance_id`, since the last successful send (doc Section 8). Reset to empty
+    /// after each successful send (see `record_send_success`) so a new window starts immediately.
+    #[serde(default)]
+    temperature_accumulators: HashMap<String, TemperatureAccumulator>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -357,6 +432,10 @@ impl ReliabilityTelemetryRuntime {
         self.persisted.last_sent_at_unix = Some(sent_at_unix);
         self.persisted.last_send_error = None;
         self.persisted.last_sent_fingerprint = Some(fingerprint);
+        // Start a fresh accumulation window now that this one has been transmitted (doc Section
+        // 8): the next batch's min/max/mean must reflect only samples gathered *after* this send,
+        // not a window that keeps growing forever.
+        self.persisted.temperature_accumulators.clear();
         let payload_json = serde_json::to_value(payload)
             .context("failed to serialize telemetry payload for sent history")?;
         self.persisted.sent_history.push(SentHistoryEntry {
@@ -376,6 +455,58 @@ impl ReliabilityTelemetryRuntime {
     async fn record_send_failure(&mut self, error: String) -> Result<()> {
         self.persisted.last_send_error = Some(error);
         self.persist().await
+    }
+
+    /// Feeds one `hardware_health` refresh sample into the rolling per-device temperature
+    /// accumulator (doc Section 8). Called from every 5-minute `hardware_health` refresh cycle
+    /// (`hardware_health::refresh_hardware_health_once`), independent of the much rarer telemetry
+    /// send timer, so the window has accumulated many samples by the time a batch is actually
+    /// built and sent. Devices no longer present in the current report have their accumulator
+    /// entries pruned, so a replaced drive's stale window cannot linger indefinitely in the
+    /// persisted state.
+    pub(crate) async fn record_hardware_health_sample(
+        &mut self,
+        report: &hardware_health::HardwareHealthReport,
+    ) -> Result<()> {
+        let current_device_ids: HashSet<&str> = report
+            .inventory
+            .storage_devices
+            .iter()
+            .map(|device| device.component_instance_id.as_str())
+            .collect();
+        self.persisted
+            .temperature_accumulators
+            .retain(|id, _| current_device_ids.contains(id.as_str()));
+
+        let mut changed = false;
+        for device in &report.inventory.storage_devices {
+            if let Some(celsius) = device
+                .smart
+                .as_ref()
+                .and_then(|smart| smart.temperature_celsius)
+            {
+                self.persisted
+                    .temperature_accumulators
+                    .entry(device.component_instance_id.clone())
+                    .or_default()
+                    .record(celsius);
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.persist().await?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot of the current per-device temperature accumulation window, for
+    /// [`build_reliability_telemetry_payload`] to reduce into `{min, max, mean}` at send/preview
+    /// time.
+    pub(crate) fn temperature_accumulators_snapshot(
+        &self,
+    ) -> HashMap<String, TemperatureAccumulator> {
+        self.persisted.temperature_accumulators.clone()
     }
 
     /// Persists (or sets to `None`, reverting to the env var default) an explicit admin
@@ -622,9 +753,15 @@ pub(crate) async fn telemetry_preview_get(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let temperature_accumulators = runtime.temperature_accumulators_snapshot();
     drop(runtime);
 
-    let payload = build_reliability_telemetry_payload(&report, telemetry_subject_id, unix_ts());
+    let payload = build_reliability_telemetry_payload(
+        &report,
+        telemetry_subject_id,
+        unix_ts(),
+        &temperature_accumulators,
+    );
 
     append_admin_audit(
         &state,
@@ -667,6 +804,19 @@ fn telemetry_payload_fingerprint(payload: &ReliabilityTelemetryPayload) -> Resul
     Ok(hex_encode(&hasher.finalize()))
 }
 
+/// Entry point called from `hardware_health::refresh_hardware_health_once` on every 5-minute
+/// `hardware_health` refresh (doc Section 8): feeds the freshly collected report into the rolling
+/// per-device temperature accumulator. Kept as a free function (rather than requiring
+/// `hardware_health.rs` to reach into `ReliabilityTelemetryRuntime`'s internals directly) so the
+/// locking pattern for `state.reliability_telemetry_runtime` stays local to this module.
+pub(crate) async fn record_hardware_health_sample(
+    state: &ServerState,
+    report: &hardware_health::HardwareHealthReport,
+) -> Result<()> {
+    let mut runtime = state.reliability_telemetry_runtime.lock().await;
+    runtime.record_hardware_health_sample(report).await
+}
+
 /// Background sender (doc Section 6): on a rare timer, project the latest hardware-health report
 /// into a reduced pseudonymized batch and POST it to the central collector, unless telemetry is
 /// disabled or nothing material changed since the last successful send.
@@ -701,18 +851,27 @@ async fn send_reliability_telemetry_once(state: &ServerState) -> bool {
         return false;
     };
 
-    let telemetry_subject_id = {
+    let (telemetry_subject_id, temperature_accumulators) = {
         let mut runtime = state.reliability_telemetry_runtime.lock().await;
-        match runtime.telemetry_subject_id(state.node_id).await {
+        let telemetry_subject_id = match runtime.telemetry_subject_id(state.node_id).await {
             Ok(id) => id,
             Err(err) => {
                 warn!(error = %err, "failed to derive telemetry subject id for send");
                 return false;
             }
-        }
+        };
+        (
+            telemetry_subject_id,
+            runtime.temperature_accumulators_snapshot(),
+        )
     };
 
-    let payload = build_reliability_telemetry_payload(&report, telemetry_subject_id, unix_ts());
+    let payload = build_reliability_telemetry_payload(
+        &report,
+        telemetry_subject_id,
+        unix_ts(),
+        &temperature_accumulators,
+    );
     let fingerprint = match telemetry_payload_fingerprint(&payload) {
         Ok(fingerprint) => fingerprint,
         Err(err) => {
@@ -883,6 +1042,7 @@ mod tests {
             &report,
             "test-subject-id".to_string(),
             1_700_000_000,
+            &HashMap::new(),
         );
 
         assert_eq!(payload.schema_version, 1);
@@ -896,6 +1056,11 @@ mod tests {
         let smart = device.smart.as_ref().expect("smart data expected");
         assert_eq!(smart.power_on_hours, Some(1234));
         assert_eq!(smart.reallocated_sector_count, Some(0));
+        // No accumulated samples were passed in, so the rolling temperature aggregate must be
+        // absent rather than defaulting to some misleading zero.
+        assert_eq!(smart.temperature_celsius_min, None);
+        assert_eq!(smart.temperature_celsius_max, None);
+        assert_eq!(smart.temperature_celsius_mean, None);
 
         // Data-minimization: serialize and confirm no disallowed keys or raw identifiers leak
         // through, since a future field added to HardwareStorageDevice must not silently widen
@@ -944,7 +1109,140 @@ mod tests {
 
     fn sample_payload(generated_at_unix: u64) -> ReliabilityTelemetryPayload {
         let report = hardware_health::test_support::sample_report_for_telemetry_tests();
-        build_reliability_telemetry_payload(&report, "subject".to_string(), generated_at_unix)
+        build_reliability_telemetry_payload(
+            &report,
+            "subject".to_string(),
+            generated_at_unix,
+            &HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn temperature_accumulator_reduces_to_min_max_mean_over_recorded_samples() {
+        let mut acc = TemperatureAccumulator::default();
+        acc.record(30.0);
+        acc.record(40.0);
+        acc.record(35.0);
+
+        assert_eq!(acc.sample_count, 3);
+        assert_eq!(acc.min_celsius, 30.0);
+        assert_eq!(acc.max_celsius, 40.0);
+        assert_eq!(acc.mean_celsius(), 35.0);
+    }
+
+    #[test]
+    fn converter_reduces_accumulated_temperature_samples_into_min_max_mean() {
+        let report = hardware_health::test_support::sample_report_for_telemetry_tests();
+        let component_instance_id = report.inventory.storage_devices[0]
+            .component_instance_id
+            .clone();
+
+        let mut acc = TemperatureAccumulator::default();
+        for celsius in [30.0, 45.0, 33.0] {
+            acc.record(celsius);
+        }
+        let mut accumulators = HashMap::new();
+        accumulators.insert(component_instance_id, acc);
+
+        let payload = build_reliability_telemetry_payload(
+            &report,
+            "subject".to_string(),
+            1_700_000_000,
+            &accumulators,
+        );
+
+        let smart = payload.storage_devices[0]
+            .smart
+            .as_ref()
+            .expect("smart data expected");
+        assert_eq!(smart.temperature_celsius_min, Some(30.0));
+        assert_eq!(smart.temperature_celsius_max, Some(45.0));
+        assert_eq!(smart.temperature_celsius_mean, Some(36.0));
+        // Monotonic counters must stay simple instantaneous latest-value passthroughs, unaffected
+        // by the presence of a temperature accumulator.
+        assert_eq!(smart.power_on_hours, Some(1234));
+        assert_eq!(smart.reallocated_sector_count, Some(0));
+    }
+
+    #[tokio::test]
+    async fn record_hardware_health_sample_accumulates_across_calls_and_persists() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ironmesh-reliability-telemetry-accum-test-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
+        let report = hardware_health::test_support::sample_report_for_telemetry_tests();
+        let component_instance_id = report.inventory.storage_devices[0]
+            .component_instance_id
+            .clone();
+
+        runtime
+            .record_hardware_health_sample(&report)
+            .await
+            .unwrap();
+        runtime
+            .record_hardware_health_sample(&report)
+            .await
+            .unwrap();
+
+        let snapshot = runtime.temperature_accumulators_snapshot();
+        let acc = snapshot
+            .get(&component_instance_id)
+            .expect("expected an accumulator entry for the sampled device");
+        assert_eq!(acc.sample_count, 2);
+        // Both samples came from the same fixture report (35.0 C), so min/max/mean coincide.
+        assert_eq!(acc.min_celsius, 35.0);
+        assert_eq!(acc.max_celsius, 35.0);
+        assert_eq!(acc.mean_celsius(), 35.0);
+
+        // Reload from disk: the accumulation window must survive a restart, since it is meant to
+        // span the multi-hour send interval reliably.
+        let reloaded = ReliabilityTelemetryRuntime::load(&tmp);
+        let reloaded_snapshot = reloaded.temperature_accumulators_snapshot();
+        let reloaded_acc = reloaded_snapshot
+            .get(&component_instance_id)
+            .expect("expected the accumulator to survive a reload");
+        assert_eq!(reloaded_acc.sample_count, 2);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn record_send_success_resets_the_temperature_accumulation_window() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ironmesh-reliability-telemetry-reset-test-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
+        let report = hardware_health::test_support::sample_report_for_telemetry_tests();
+        runtime
+            .record_hardware_health_sample(&report)
+            .await
+            .unwrap();
+        assert!(!runtime.temperature_accumulators_snapshot().is_empty());
+
+        let payload = build_reliability_telemetry_payload(
+            &report,
+            "subject".to_string(),
+            1_700_000_000,
+            &runtime.temperature_accumulators_snapshot(),
+        );
+        let fingerprint = telemetry_payload_fingerprint(&payload).unwrap();
+        runtime
+            .record_send_success(1_700_000_000, &payload, fingerprint)
+            .await
+            .unwrap();
+
+        assert!(
+            runtime.temperature_accumulators_snapshot().is_empty(),
+            "a successful send must start a fresh accumulation window"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
     #[test]
