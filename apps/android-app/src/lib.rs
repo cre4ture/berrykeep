@@ -206,8 +206,9 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
 fn init_android_tracing() {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
     TRACING_INIT.call_once(|| {
-        let env_filter =
-            common::logging::env_filter_from_default_env("info,ironmesh_android_connection=debug");
+        let env_filter = common::logging::env_filter_from_default_env(
+            "info,ironmesh_android_connection=debug,ironmesh_title_latency=debug",
+        );
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with(common::logging::compact_fmt_layer())

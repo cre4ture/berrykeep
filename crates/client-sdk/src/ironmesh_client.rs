@@ -204,6 +204,7 @@ struct ClientRelayTransport {
 
 #[derive(Clone)]
 struct ClientEndpointRouter {
+    runtime_id: Uuid,
     endpoints: Arc<Vec<ClientEndpoint>>,
     active_index: Arc<AtomicUsize>,
 }
@@ -526,9 +527,14 @@ impl ClientEndpointRouter {
     fn new(endpoints: Vec<ClientEndpoint>) -> Self {
         let initial_active = if endpoints.is_empty() { usize::MAX } else { 0 };
         Self {
+            runtime_id: Uuid::now_v7(),
             endpoints: Arc::new(endpoints),
             active_index: Arc::new(AtomicUsize::new(initial_active)),
         }
+    }
+
+    fn runtime_id(&self) -> Uuid {
+        self.runtime_id
     }
 
     fn endpoint(&self, index: usize) -> Option<&ClientEndpoint> {
@@ -2372,6 +2378,14 @@ impl IronMeshClient {
 
     pub fn connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
         self.transport_router.snapshot()
+    }
+
+    /// Stable identifier for this client's shared transport router.
+    ///
+    /// Clones of a client keep this identifier because they share route and
+    /// transport state. A rebuilt client receives a new identifier.
+    pub fn connection_runtime_id(&self) -> Uuid {
+        self.transport_router.runtime_id()
     }
 
     /// Starts a fresh timing window without changing route selection or health state.
