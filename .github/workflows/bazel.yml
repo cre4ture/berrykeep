@@ -51,6 +51,8 @@ jobs:
       BAZEL_REMOTE_CACHE_URL: ${{ vars.BAZEL_REMOTE_CACHE_URL }}
       BAZEL_REMOTE_CACHE_TOKEN: ${{ secrets.BAZEL_REMOTE_CACHE_TOKEN }}
       REMOTE_CACHE_WRITABLE: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+      # Temporary diagnostic output for the Crate Universe lockfile digest.
+      CARGO_BAZEL_DEBUG: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
