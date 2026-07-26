@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,6 +21,8 @@ const LATENCY_PROBE_REQUEST_TIMEOUT_SLACK_MS: u64 = 3_000;
 pub const TITLE_LATENCY_PROBE_DEFAULT_PERIOD_SECONDS: u64 = 30;
 pub const TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS: u64 = 1;
 pub const TITLE_LATENCY_PROBE_MAX_PERIOD_SECONDS: u64 = 3_600;
+
+static TITLE_LATENCY_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyProbeConfig {
@@ -232,10 +235,10 @@ impl TitleLatencyProbeStatus {
         }
     }
 
-    fn pending(connection_type: TitleLatencyConnectionType) -> Self {
+    fn pending() -> Self {
         Self {
             state: TitleLatencyProbeState::Pending,
-            connection_type,
+            connection_type: TitleLatencyConnectionType::Unknown,
             latency_ms: None,
             checked_at_unix_ms: None,
             error: None,
@@ -269,10 +272,7 @@ impl TitleLatencyMonitor {
             return Ok(Self::disabled());
         }
 
-        let connection_type = title_latency_connection_type(&client);
-        let status = Arc::new(Mutex::new(TitleLatencyProbeStatus::pending(
-            connection_type,
-        )));
+        let status = Arc::new(Mutex::new(TitleLatencyProbeStatus::pending()));
         let worker_status = Arc::clone(&status);
         let (stop_tx, stop_rx) = mpsc::channel();
         let period = Duration::from_secs(config.period_seconds);
@@ -289,7 +289,7 @@ impl TitleLatencyMonitor {
                             &worker_status,
                             TitleLatencyProbeStatus {
                                 state: TitleLatencyProbeState::Failed,
-                                connection_type,
+                                connection_type: TitleLatencyConnectionType::Unknown,
                                 latency_ms: None,
                                 checked_at_unix_ms: Some(unix_ts_ms()),
                                 error: Some(format!(
@@ -378,6 +378,66 @@ fn title_latency_connection_type_for_path(
             TitleLatencyConnectionType::Direct
         }
     }
+}
+
+struct TitleLatencyRouteLog {
+    active_index: Option<usize>,
+    active_path_kind: Option<String>,
+    active_locator: Option<String>,
+    ranked_indices: Vec<usize>,
+}
+
+impl std::fmt::Display for TitleLatencyRouteLog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "active_index={} path_kind={} locator={} ranked_indices={:?}",
+            self.active_index
+                .map(|index| index.to_string())
+                .as_deref()
+                .unwrap_or("<none>"),
+            self.active_path_kind.as_deref().unwrap_or("<none>"),
+            self.active_locator.as_deref().unwrap_or("<none>"),
+            self.ranked_indices,
+        )
+    }
+}
+
+fn title_latency_route_log(client: &IronMeshClient) -> TitleLatencyRouteLog {
+    let snapshot = client.connection_route_snapshot();
+    let active = snapshot.active_index.and_then(|index| {
+        snapshot
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.index == index)
+    });
+    TitleLatencyRouteLog {
+        active_index: snapshot.active_index,
+        active_path_kind: active.map(|endpoint| format!("{:?}", endpoint.path_kind)),
+        active_locator: active.map(|endpoint| endpoint.locator.clone()),
+        ranked_indices: snapshot.ranked_indices,
+    }
+}
+
+fn log_title_latency_probe_result(
+    client: &IronMeshClient,
+    probe_id: u64,
+    route_before: &TitleLatencyRouteLog,
+    status: &TitleLatencyProbeStatus,
+) {
+    let route_after = title_latency_route_log(client);
+    tracing::debug!(
+        target: "ironmesh_title_latency",
+        runtime_id = %client.connection_runtime_id(),
+        probe_id,
+        state = ?status.state,
+        successful_connection_type = ?status.connection_type,
+        latency_ms = ?status.latency_ms,
+        error = status.error.as_deref().unwrap_or("<none>"),
+        route_before = %route_before,
+        route_after = %route_after,
+        "completed title latency probe"
+    );
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -549,6 +609,15 @@ impl IronMeshClient {
     }
 
     pub async fn run_title_latency_probe(&self) -> TitleLatencyProbeStatus {
+        let probe_id = TITLE_LATENCY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let route_before = title_latency_route_log(self);
+        tracing::debug!(
+            target: "ironmesh_title_latency",
+            runtime_id = %self.connection_runtime_id(),
+            probe_id,
+            route_before = %route_before,
+            "starting title latency probe"
+        );
         let config = LatencyProbeConfig {
             sample_count: 1,
             warmup_count: 0,
@@ -557,21 +626,23 @@ impl IronMeshClient {
             pause_between_samples_ms: 0,
         };
 
-        match self.run_latency_probe(config).await {
+        let status = match self.run_latency_probe(config).await {
             Ok(result) => {
                 let checked_at_unix_ms = Some(result.generated_at_unix_ms);
-                let connection_type = title_latency_connection_type(self);
                 match result.samples.first() {
                     Some(sample) if sample.successful => TitleLatencyProbeStatus {
                         state: TitleLatencyProbeState::Success,
-                        connection_type,
+                        // A successful routed request promotes its endpoint to active.
+                        // Read the router only now so the indicator reflects the
+                        // transport that actually returned the latency sample.
+                        connection_type: title_latency_connection_type(self),
                         latency_ms: Some(sample.total_duration_ms),
                         checked_at_unix_ms,
                         error: None,
                     },
                     Some(sample) => TitleLatencyProbeStatus {
                         state: TitleLatencyProbeState::Failed,
-                        connection_type,
+                        connection_type: TitleLatencyConnectionType::Unknown,
                         latency_ms: None,
                         checked_at_unix_ms,
                         error: sample
@@ -581,7 +652,7 @@ impl IronMeshClient {
                     },
                     None => TitleLatencyProbeStatus {
                         state: TitleLatencyProbeState::Failed,
-                        connection_type,
+                        connection_type: TitleLatencyConnectionType::Unknown,
                         latency_ms: None,
                         checked_at_unix_ms,
                         error: Some("title latency probe returned no sample".to_string()),
@@ -590,12 +661,14 @@ impl IronMeshClient {
             }
             Err(error) => TitleLatencyProbeStatus {
                 state: TitleLatencyProbeState::Failed,
-                connection_type: title_latency_connection_type(self),
+                connection_type: TitleLatencyConnectionType::Unknown,
                 latency_ms: None,
                 checked_at_unix_ms: Some(unix_ts_ms()),
                 error: Some(format!("{error:#}")),
             },
-        }
+        };
+        log_title_latency_probe_result(self, probe_id, &route_before, &status);
+        status
     }
 }
 
@@ -950,6 +1023,25 @@ mod tests {
         (format!("http://{addr}"), server)
     }
 
+    async fn spawn_failed_probe_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    LATENCY_PROBE_ROUTE,
+                    get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+                ),
+            )
+            .await
+            .expect("failed probe server should run");
+        });
+        (format!("http://{addr}"), server)
+    }
+
     async fn spawn_slow_probe_server(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1068,6 +1160,22 @@ mod tests {
         assert!(status.error.is_none());
 
         drop(monitor);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn title_latency_probe_only_labels_a_successful_route() {
+        let (base_url, server) = spawn_failed_probe_server().await;
+        let client = IronMeshClient::from_direct_base_url(base_url);
+
+        let status = client.run_title_latency_probe().await;
+
+        assert_eq!(status.state, TitleLatencyProbeState::Failed);
+        assert_eq!(status.connection_type, TitleLatencyConnectionType::Unknown);
+        assert!(status.latency_ms.is_none());
+        assert!(status.error.is_some());
+
         server.abort();
         let _ = server.await;
     }
