@@ -2327,10 +2327,13 @@ mod tests {
             completion_tx,
         };
 
+        // Generated rather than a literal so static analysis doesn't mistake this test-only
+        // value for a hard-coded credential (CodeQL rust/hard-coded-cryptographic-value).
+        let admin_password = format!("test-admin-password-{}", Uuid::now_v7());
         let response = start_new_cluster(
             State(state.clone()),
             Json(SetupStartClusterRequest {
-                admin_password: "a-very-strong-password".to_string(),
+                admin_password,
                 public_origin: "https://node-a.local:18443".to_string(),
                 telemetry_enabled: true,
             }),
@@ -2366,10 +2369,13 @@ mod tests {
         };
         let package = test_node_enrollment_package(&data_dir, bind_addr);
 
+        // Generated rather than a literal so static analysis doesn't mistake this test-only
+        // value for a hard-coded credential (CodeQL rust/hard-coded-cryptographic-value).
+        let admin_password = format!("test-admin-password-{}", Uuid::now_v7());
         let response = import_node_enrollment_package(
             State(state.clone()),
             Json(SetupImportEnrollmentRequest {
-                admin_password: "a-very-strong-password".to_string(),
+                admin_password,
                 package_json: package.to_json_pretty().unwrap(),
                 telemetry_enabled: false,
             }),
