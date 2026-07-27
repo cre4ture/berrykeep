@@ -571,7 +571,7 @@ class FolderSyncForegroundService : Service() {
         scope.launch {
             withContext(Dispatchers.IO) {
                 val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
-                val connectionInput = deviceAuth.preferredConnectionInput()
+                val connectionInput = deviceAuth.connectionBootstrapJson()
                 val clientIdentityJson = deviceAuth.toClientIdentityJson()
                 if (connectionInput.isNotBlank() && !clientIdentityJson.isNullOrBlank()) {
                     repository.notifyNetworkChanged(

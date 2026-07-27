@@ -1018,7 +1018,7 @@ final class IronmeshBrowserModel: ObservableObject {
                 updatedDraft.clientIdentityJSON = renewedIdentity
                 try settingsStore.save(
                     updatedDraft.appliedConnectionState(
-                        defaultConnectionInput: bundleDefaults.directConnectionInput
+                        defaultBootstrapInput: bundleDefaults.bootstrapInput
                     )
                 )
                 draft = updatedDraft
