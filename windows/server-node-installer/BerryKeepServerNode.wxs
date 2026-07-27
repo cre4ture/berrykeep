@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix
+  xmlns="http://wixtoolset.org/schemas/v4/wxs"
+  xmlns:firewall="http://wixtoolset.org/schemas/v4/wxs/firewall"
+  xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package
+    Name="BerryKeep Server Node"
+    Manufacturer="BerryKeep"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="55F49272-DA74-4C76-9E1D-358BB3B95ACA"
+    Scope="perMachine"
+    InstallerVersion="500">
+    <SummaryInformation
+      Description="BerryKeep self-hosted storage server node"
+      Keywords="BerryKeep,IronMesh,server,node,storage" />
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of BerryKeep Server Node is already installed."
+      Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Feature Id="ServerNodeFeature" Title="BerryKeep Server Node" Level="1">
+      <ComponentRef Id="ServerNodeService" />
+      <ComponentRef Id="ServerNodeState" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="BerryKeepProgramFiles" Name="BerryKeep">
+        <Directory Id="ServerNodeProgramFiles" Name="Server Node">
+          <Component Id="ServerNodeService" Guid="84842F64-678E-4E34-BBAA-C9B8A0689B76" Bitness="always64">
+            <File
+              Id="ServerNodeExecutable"
+              Source="$(var.ServerNodeExecutable)"
+              KeyPath="yes" />
+            <ServiceInstall
+              Id="BerryKeepServerNodeService"
+              Name="BerryKeepServerNode"
+              DisplayName="BerryKeep Server Node"
+              Description="BerryKeep self-hosted storage server node"
+              Type="ownProcess"
+              Start="auto"
+              ErrorControl="normal"
+              Account="NT AUTHORITY\LocalService"
+              Arguments="--windows-service"
+              Vital="yes">
+              <util:ServiceConfig
+                FirstFailureActionType="restart"
+                SecondFailureActionType="restart"
+                ThirdFailureActionType="restart"
+                RestartServiceDelayInSeconds="5"
+                ResetPeriodInDays="1" />
+            </ServiceInstall>
+            <ServiceControl
+              Id="BerryKeepServerNodeServiceControl"
+              Name="BerryKeepServerNode"
+              Start="install"
+              Stop="both"
+              Remove="uninstall"
+              Wait="yes" />
+            <firewall:FirewallException
+              Id="BerryKeepServerNodePublicDomainFirewall"
+              Name="BerryKeep Server Node (HTTPS setup and client access, domain)"
+              Description="Allows BerryKeep Server Node HTTPS setup and client access from the local network."
+              Program="[#ServerNodeExecutable]"
+              Port="8443"
+              Protocol="tcp"
+              Scope="localSubnet"
+              Profile="domain" />
+            <firewall:FirewallException
+              Id="BerryKeepServerNodePublicPrivateFirewall"
+              Name="BerryKeep Server Node (HTTPS setup and client access, private)"
+              Description="Allows BerryKeep Server Node HTTPS setup and client access from the local network."
+              Program="[#ServerNodeExecutable]"
+              Port="8443"
+              Protocol="tcp"
+              Scope="localSubnet"
+              Profile="private" />
+            <firewall:FirewallException
+              Id="BerryKeepServerNodeInternalDomainFirewall"
+              Name="BerryKeep Server Node (cluster transport, domain)"
+              Description="Allows BerryKeep Server Node cluster transport from the local network."
+              Program="[#ServerNodeExecutable]"
+              Port="18443"
+              Protocol="tcp"
+              Scope="localSubnet"
+              Profile="domain" />
+            <firewall:FirewallException
+              Id="BerryKeepServerNodeInternalPrivateFirewall"
+              Name="BerryKeep Server Node (cluster transport, private)"
+              Description="Allows BerryKeep Server Node cluster transport from the local network."
+              Program="[#ServerNodeExecutable]"
+              Port="18443"
+              Protocol="tcp"
+              Scope="localSubnet"
+              Profile="private" />
+            <firewall:FirewallException
+              Id="BerryKeepServerNodeRendezvousDomainFirewall"
+              Name="BerryKeep Server Node (rendezvous, domain)"
+              Description="Allows the BerryKeep managed rendezvous endpoint from the local network."
+              Program="[#ServerNodeExecutable]"
+              Port="9443"
+              Protocol="tcp"
+              Scope="localSubnet"
+              Profile="domain" />
+            <firewall:FirewallException
+              Id="BerryKeepServerNodeRendezvousPrivateFirewall"
+              Name="BerryKeep Server Node (rendezvous, private)"
+              Description="Allows the BerryKeep managed rendezvous endpoint from the local network."
+              Program="[#ServerNodeExecutable]"
+              Port="9443"
+              Protocol="tcp"
+              Scope="localSubnet"
+              Profile="private" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="BerryKeepProgramData" Name="BerryKeep">
+        <Directory Id="ServerNodeProgramData" Name="ServerNode">
+          <Component
+            Id="ServerNodeState"
+            Guid="0B58FE76-5165-46FC-B8B1-A5EA35683A88"
+            Permanent="yes"
+            NeverOverwrite="yes">
+            <CreateFolder>
+              <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;LS)" />
+            </CreateFolder>
+            <File
+              Id="ServerNodeEnvironmentFile"
+              Source="$(var.ServiceEnvironmentFile)"
+              Name="server-node.env"
+              KeyPath="yes">
+              <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)" />
+            </File>
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+  </Fragment>
+</Wix>

@@ -18,6 +18,7 @@ web/test-results
 ironmesh-client-*.json
 map/
 windows/thumbnail-provider/out/
+windows/server-node-installer/out/
 .claude
 apps/apple-file-provider/.build
 apps/apple-file-provider/.swiftpm/

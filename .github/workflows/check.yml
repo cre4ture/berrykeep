@@ -873,3 +873,52 @@ jobs:
 
       - name: Run Windows workspace clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  windows-server-node-msi:
+    name: Win Server MSI
+    runs-on: windows-latest
+    needs: workspace-check
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install web workspace dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+
+      - name: Build Windows Server Node MSI
+        run: powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Build-Msi.ps1
+
+      - name: Upload unsigned MSI validation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: berrykeep-server-node-msi-x64
+          path: windows/server-node-installer/out/**/*.msi
+          if-no-files-found: error

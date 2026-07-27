@@ -375,6 +375,7 @@ pub(crate) async fn run_setup_mode(
     config: SetupBootstrapConfig,
     log_buffer: Arc<LogBuffer>,
     runtime_log_control: RuntimeLogControl,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let initial_state =
         ensure_managed_setup_state(&config.state_path).context("failed preparing setup state")?;
@@ -410,7 +411,18 @@ pub(crate) async fn run_setup_mode(
         "server node bootstrap setup listener"
     );
 
-    let completion = completion_rx.recv().await;
+    let completion = tokio::select! {
+        completion = completion_rx.recv() => completion,
+        _ = wait_for_shutdown_trigger(shutdown_rx.clone()) => {
+            info!("server node bootstrap setup listener received shutdown request");
+            handle.graceful_shutdown(Some(Duration::from_secs(5)));
+            let outcome = server_task
+                .await
+                .context("bootstrap setup server task join failure")?;
+            outcome.context("bootstrap setup server exited during shutdown")?;
+            return Ok(());
+        }
+    };
     if completion.is_none() {
         let outcome = server_task
             .await
@@ -425,7 +437,13 @@ pub(crate) async fn run_setup_mode(
     outcome.context("bootstrap setup server exited during transition")?;
 
     let completion = completion.expect("checked is_some above");
-    run_inner(completion.config, Some(log_buffer), runtime_log_control).await
+    run_inner(
+        completion.config,
+        Some(log_buffer),
+        runtime_log_control,
+        shutdown_rx,
+    )
+    .await
 }
 
 async fn setup_health(State(state): State<SetupServerState>) -> impl IntoResponse {
@@ -1026,12 +1044,15 @@ fn transition_managed_setup_state_to_recovery(
 
 fn default_setup_bootstrap_config() -> Result<SetupBootstrapConfig> {
     let data_dir = PathBuf::from(
-        std::env::var("IRONMESH_DATA_DIR").unwrap_or_else(|_| "./data/server-node".to_string()),
+        std::env::var("BERRYKEEP_SERVER_NODE_DATA_DIR")
+            .or_else(|_| std::env::var("IRONMESH_DATA_DIR"))
+            .unwrap_or_else(|_| "./data/server-node".to_string()),
     );
-    let bind_addr: SocketAddr = std::env::var("IRONMESH_SERVER_BIND")
+    let bind_addr: SocketAddr = std::env::var("BERRYKEEP_SERVER_NODE_BIND")
+        .or_else(|_| std::env::var("IRONMESH_SERVER_BIND"))
         .unwrap_or_else(|_| "0.0.0.0:8443".to_string())
         .parse()
-        .context("invalid IRONMESH_SERVER_BIND for bootstrap setup mode")?;
+        .context("invalid server-node bind address for bootstrap setup mode")?;
     managed_startup_bootstrap_config(data_dir, bind_addr)
 }
 

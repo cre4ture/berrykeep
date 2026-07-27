@@ -73,6 +73,28 @@ BerryKeep is also a test of what is now possible for an individual builder. AI c
   </a>
 </p>
 
+## Install A Server Node On Windows
+
+The native Windows x64 path is a separate MSI package for the **BerryKeep
+Server Node**. It installs an automatic Windows service that starts at boot,
+preserves node state under `C:\ProgramData\BerryKeep\ServerNode`, and opens
+the first-run setup UI on `https://localhost:8443/`.
+
+Build the package on a Windows machine with the .NET SDK and Rust MSVC build
+prerequisites:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Build-Msi.ps1
+```
+
+Install the resulting MSI from an elevated PowerShell, then use the setup UI to
+start a cluster or join an existing one. Detailed build, signing, firewall, and
+operational instructions are in
+[windows/server-node-installer/README.md](windows/server-node-installer/README.md).
+
+The Windows server package is intentionally separate from the Store/MSIX
+desktop-client package: the server must run without a signed-in desktop user.
+
 ## Install On Ubuntu
 
 BerryKeep Ubuntu packages are published from the signed APT repository at:
