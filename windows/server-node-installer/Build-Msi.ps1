@@ -16,6 +16,9 @@ param(
     [string]$SigningCertificatePath = "",
     [string]$SigningCertificatePassword = "",
     [string]$TimestampUrl = "",
+    [string]$UpdateManifestUri = "https://github.com/cre4ture/berrykeep/releases/latest/download/berrykeep-server-node-stable.json",
+    [string]$UpdateManifestSignatureUri = "https://github.com/cre4ture/berrykeep/releases/latest/download/berrykeep-server-node-stable.json.p7s",
+    [string]$SigningCertificateThumbprint = "",
     [switch]$SkipCargoBuild
 )
 
@@ -54,6 +57,24 @@ function Assert-MsiVersion {
     }
 }
 
+function Assert-HttpsUri {
+    param(
+        [string]$Value,
+        [string]$ParameterName
+    )
+
+    $uri = $null
+    if (-not [Uri]::TryCreate($Value, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne "https") {
+        throw "$ParameterName must be an absolute HTTPS URI. Received: '$Value'."
+    }
+}
+
+function Normalize-Thumbprint {
+    param([string]$Value)
+
+    return ($Value -replace '\s', '').ToUpperInvariant()
+}
+
 function Find-SignTool {
     $command = Get-Command signtool.exe -ErrorAction SilentlyContinue
     if ($command) {
@@ -77,6 +98,8 @@ $repoRoot = Split-Path -Parent (Split-Path -Parent $installerRoot)
 $cargoTomlPath = Join-Path $repoRoot "Cargo.toml"
 $projectPath = Join-Path $installerRoot "BerryKeepServerNode.wixproj"
 $environmentTemplate = Join-Path $installerRoot "server-node.env"
+$updateConfigurationTemplate = Join-Path $installerRoot "server-node-update.json.in"
+$updateConfigurationFile = Join-Path ([System.IO.Path]::GetTempPath()) ("berrykeep-server-node-update-{0}.json" -f [Guid]::NewGuid())
 
 if ([string]::IsNullOrWhiteSpace($ProductVersion)) {
     $ProductVersion = Get-WorkspaceVersion -CargoTomlPath $cargoTomlPath
@@ -96,6 +119,32 @@ if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
 if (-not (Test-Path -LiteralPath $environmentTemplate)) {
     throw "Service environment template was not found: $environmentTemplate"
 }
+if (-not (Test-Path -LiteralPath $updateConfigurationTemplate)) {
+    throw "Server Node update configuration template was not found: $updateConfigurationTemplate"
+}
+Assert-HttpsUri -Value $UpdateManifestUri -ParameterName "-UpdateManifestUri"
+Assert-HttpsUri -Value $UpdateManifestSignatureUri -ParameterName "-UpdateManifestSignatureUri"
+
+$SigningCertificateThumbprint = Normalize-Thumbprint -Value $SigningCertificateThumbprint
+if (-not [string]::IsNullOrWhiteSpace($SigningCertificateThumbprint) -and $SigningCertificateThumbprint -notmatch '^[0-9A-F]{40}$') {
+    throw "-SigningCertificateThumbprint must be a SHA-1 certificate thumbprint. Received: '$SigningCertificateThumbprint'."
+}
+if (-not [string]::IsNullOrWhiteSpace($SigningCertificatePath)) {
+    $signingCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($SigningCertificatePath, $SigningCertificatePassword)
+    $actualSigningThumbprint = Normalize-Thumbprint -Value $signingCertificate.Thumbprint
+    if ([string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
+        $SigningCertificateThumbprint = $actualSigningThumbprint
+    }
+    elseif ($SigningCertificateThumbprint -ne $actualSigningThumbprint) {
+        throw "-SigningCertificateThumbprint does not match -SigningCertificatePath."
+    }
+}
+
+$updateConfiguration = Get-Content -LiteralPath $updateConfigurationTemplate -Raw
+$updateConfiguration = $updateConfiguration.Replace("__UPDATE_MANIFEST_URI__", $UpdateManifestUri)
+$updateConfiguration = $updateConfiguration.Replace("__UPDATE_MANIFEST_SIGNATURE_URI__", $UpdateManifestSignatureUri)
+$updateConfiguration = $updateConfiguration.Replace("__SIGNING_CERTIFICATE_THUMBPRINT__", $SigningCertificateThumbprint)
+[System.IO.File]::WriteAllText($updateConfigurationFile, $updateConfiguration, [System.Text.UTF8Encoding]::new($false))
 
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
@@ -124,6 +173,7 @@ try {
         "-p:ProductVersion=$ProductVersion" `
         "-p:ServerNodeExecutable=$serverNodeExecutable" `
         "-p:ServiceEnvironmentFile=$environmentTemplate" `
+        "-p:UpdateConfigurationFile=$updateConfigurationFile" `
         "-p:OutputPath=$OutputDirectory\"
     if ($LASTEXITCODE -ne 0) {
         throw "WiX build failed with exit code $LASTEXITCODE"
@@ -131,6 +181,7 @@ try {
 }
 finally {
     Pop-Location
+    Remove-Item -LiteralPath $updateConfigurationFile -Force -ErrorAction SilentlyContinue
 }
 
 $msiPath = Join-Path $OutputDirectory "BerryKeepServerNode.msi"

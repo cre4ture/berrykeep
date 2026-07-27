@@ -1,0 +1,4 @@
+interface:
+  display_name: "Production Deploy"
+  short_description: "Deploy a released artifact safely"
+  default_prompt: "Use $production-deploy to deploy a released BerryKeep artifact."
