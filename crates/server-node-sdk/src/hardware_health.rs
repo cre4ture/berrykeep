@@ -39,7 +39,7 @@ pub(crate) struct HardwareInventory {
     cpu_packages: Vec<HardwareCpuPackage>,
     memory: HardwareMemoryInfo,
     pub(crate) storage_devices: Vec<HardwareStorageDevice>,
-    network_interfaces: Vec<HardwareNetworkInterface>,
+    pub(crate) network_interfaces: Vec<HardwareNetworkInterface>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,9 +144,9 @@ pub(crate) struct HardwareStorageSmartInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HardwareNetworkInterface {
+pub(crate) struct HardwareNetworkInterface {
     component_ref: String,
-    component_instance_id: String,
+    pub(crate) component_instance_id: String,
     lifecycle: HardwareComponentLifecycle,
     interface_name: String,
     oper_state: Option<String>,
@@ -156,6 +156,16 @@ struct HardwareNetworkInterface {
     pci_slot: Option<String>,
     vendor_id: Option<String>,
     device_id: Option<String>,
+    /// Lifetime-cumulative kernel counters from `/sys/class/net/<iface>/statistics/*` (doc
+    /// Section 2.5). Like the storage SMART counters above, these are reset only on interface
+    /// reset/reboot, not periodically - never re-zeroed on a schedule. Node-local only: fine to
+    /// keep alongside the identifying fields on this struct, but `reliability_telemetry.rs` must
+    /// only project these four counters, never `interface_name`/`driver`/`pci_slot`/`vendor_id`/
+    /// `device_id`.
+    pub(crate) rx_errors: Option<u64>,
+    pub(crate) tx_errors: Option<u64>,
+    pub(crate) rx_dropped: Option<u64>,
+    pub(crate) rx_crc_errors: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1722,6 +1732,14 @@ fn collect_network_interfaces_linux() -> Vec<HardwareNetworkInterface> {
             pci_slot,
             vendor_id: read_trimmed_file(device_link.join("vendor")),
             device_id: read_trimmed_file(device_link.join("device")),
+            rx_errors: read_trimmed_file(sys_path.join("statistics").join("rx_errors"))
+                .and_then(|raw| raw.parse::<u64>().ok()),
+            tx_errors: read_trimmed_file(sys_path.join("statistics").join("tx_errors"))
+                .and_then(|raw| raw.parse::<u64>().ok()),
+            rx_dropped: read_trimmed_file(sys_path.join("statistics").join("rx_dropped"))
+                .and_then(|raw| raw.parse::<u64>().ok()),
+            rx_crc_errors: read_trimmed_file(sys_path.join("statistics").join("rx_crc_errors"))
+                .and_then(|raw| raw.parse::<u64>().ok()),
         });
     }
 
@@ -2347,6 +2365,28 @@ pub(crate) mod test_support {
             }),
         };
 
+        let network_interface = HardwareNetworkInterface {
+            component_ref: "net:eth0".to_string(),
+            component_instance_id: "ci9876543210fedcba".to_string(),
+            lifecycle: HardwareComponentLifecycle {
+                first_seen_at_unix: 0,
+                last_seen_at_unix: 0,
+                sighting_count: 1,
+            },
+            interface_name: "eth0".to_string(),
+            oper_state: Some("up".to_string()),
+            carrier: Some(true),
+            speed_mbps: Some(1000),
+            driver: Some("e1000e".to_string()),
+            pci_slot: Some("0000:02:00.0".to_string()),
+            vendor_id: Some("0x8086".to_string()),
+            device_id: Some("0x10d3".to_string()),
+            rx_errors: Some(3),
+            tx_errors: Some(1),
+            rx_dropped: Some(7),
+            rx_crc_errors: Some(2),
+        };
+
         let findings = vec![
             HardwareHealthFinding {
                 source: "ironmesh_scrub".to_string(),
@@ -2447,7 +2487,7 @@ pub(crate) mod test_support {
                     details_complete: false,
                 },
                 storage_devices: vec![storage_device],
-                network_interfaces: Vec::new(),
+                network_interfaces: vec![network_interface],
             },
             node_lifecycle: HardwareNodeLifecycle {
                 node_first_seen_at_unix: 0,

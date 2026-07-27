@@ -39,6 +39,16 @@ The core of this strategy is implemented across the node and a new central colle
   instantaneous latest-value fields, since they are monotonically non-decreasing counters (or a
   boolean verdict) for which min/max/mean over a window adds no information beyond the latest
   reading.
+- **Network interface error-rate metrics** (Section 2.5): `HardwareNetworkInterface` in
+  `crates/server-node-sdk/src/hardware_health.rs` now also reads `rx_errors`, `tx_errors`,
+  `rx_dropped`, and `rx_crc_errors` per interface from `/sys/class/net/<iface>/statistics/*`.
+  `reliability_telemetry.rs` projects these through a new allow-listed `TelemetryNetworkInterface`
+  (only `component_instance_id` plus the four counters — never `interface_name`, `driver`,
+  `pci_slot`, `vendor_id`, or `device_id`), carried on a new top-level `network_interfaces` array
+  on the outbound payload (additive schema evolution, existing fields untouched). Like the SMART
+  counters, these are treated as simple instantaneous latest-value passthroughs rather than run
+  through a rolling accumulator, since they are monotonically non-decreasing lifetime counters
+  (reset only on interface reset/reboot), not a fluctuating signal like temperature.
 
 Deliberately **deferred** (documented at their respective sections, not blockers for the above):
 
@@ -48,8 +58,8 @@ Deliberately **deferred** (documented at their respective sections, not blockers
   and an opt-in `BundledCountryResolver` (RIR-delegated-stats-backed, via the `iptocc` crate, no
   API key/account required) all ship in `crates/stats-collector-server/src/country.rs` behind the
   `bundled-country-db` Cargo feature; wiring it up at deployment time is still a deployment concern.
-- Network interface error-rate metrics (Section 2.5), `telemetry_subject_id` rotation (Section 8),
-  and an anonymous ingestion token (Section 5.2) — optional later stages.
+- `telemetry_subject_id` rotation (Section 8) and an anonymous ingestion token (Section 5.2) —
+  optional later stages.
 - Production TLS termination / deployment wiring for the collector at `creax.de:44044` — a
   deployment concern, not hardcoded in the crate.
 - The legal review of the opt-out-by-default posture (Section 4.4/8) remains a prerequisite before
@@ -168,13 +178,20 @@ need to be selected, not newly collected.
   enough across the fleet's hardware diversity to justify the effort at this stage, unlike ECC where
   the interface is uniform and simply reports "unsupported" where absent.
 
-### 2.5 Network Error Rates (not implemented, low additional effort)
+### 2.5 Network Error Rates (implemented)
 
 - `rx_errors`, `tx_errors`, `rx_dropped`, `rx_crc_errors` per interface are directly readable on Linux
   via `/sys/class/net/<iface>/statistics/*` (no root, no extra tooling needed). Effort: low. Benefit:
   medium — mainly as a correlation signal for replication/transport problems, less so as a standalone
-  "hardware reliability" indicator. Planned as an optional, low-priority addition for the first rollout
-  stage, not part of the minimal core schema (Section 7).
+  "hardware reliability" indicator.
+- ~~Planned as an optional, low-priority addition for the first rollout stage, not part of the
+  minimal core schema~~ — implemented as an additive extension to the Section 7 schema: the four
+  counters are read into `HardwareNetworkInterface` in `hardware_health.rs`, then projected through
+  an allow-listed `TelemetryNetworkInterface` (`component_instance_id` plus the four counters only)
+  onto a new top-level `network_interfaces` array. Like the monotonic SMART counters (Section 8),
+  these are lifetime-cumulative kernel counters, not a fluctuating signal, so they are sent as
+  simple instantaneous latest-value passthroughs rather than aggregated through a rolling
+  min/max/mean accumulator.
 
 ### 2.6 Deliberately Excluded
 
@@ -506,6 +523,18 @@ timer and event-driven, debounced updates):
     "correctable_error_count": 0,
     "uncorrectable_error_count": 0
   },
+  "network_interfaces": [
+    {
+      "component_instance_id": "ci-...", // already hashed, see hardware-health document
+      // Lifetime-cumulative kernel counters from /sys/class/net/<iface>/statistics/* (Section
+      // 2.5); reset only on interface reset/reboot, so - like the SMART counters above - these
+      // are sent as instantaneous latest values, not min/max/mean over a window:
+      "rx_errors": 0,
+      "tx_errors": 0,
+      "rx_dropped": 0,
+      "rx_crc_errors": 0
+    }
+  ],
   "reliability_findings_summary": [
     { "finding_code": "chunk_hash_mismatch", "occurrence_count": 2 }
   ],

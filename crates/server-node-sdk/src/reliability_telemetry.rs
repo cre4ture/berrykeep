@@ -50,6 +50,10 @@ pub(crate) struct ReliabilityTelemetryPayload {
     memory_ecc: TelemetryMemoryEcc,
     reliability_findings_summary: Vec<TelemetryFindingSummary>,
     collectors: Vec<TelemetryCollectorStatus>,
+    /// Additive schema evolution (doc Section 7): a new top-level field, not part of the original
+    /// `schema_version: 1` sketch. Existing fields are untouched, and `stats-collector-server`'s
+    /// tolerant ingestion already ignores unknown fields, so no central-side change is required.
+    network_interfaces: Vec<TelemetryNetworkInterface>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +122,30 @@ pub(crate) struct TelemetryMemoryEcc {
     available: bool,
     correctable_error_count: Option<u64>,
     uncorrectable_error_count: Option<u64>,
+}
+
+/// Allow-listed projection of `hardware_health::HardwareNetworkInterface` (doc Section 2.5).
+/// Deliberately excludes `interface_name`, `driver`, `pci_slot`, `vendor_id`, and `device_id` -
+/// exactly like [`TelemetryStorageDevice`] excludes `block_device_name`/`vendor`/`model`/`driver`
+/// for storage, only `component_instance_id` plus the four error/drop counters are copied here,
+/// per doc Section 2.6's minimization rules.
+///
+/// Aggregation choice: unlike `temperature_celsius` (which genuinely fluctuates and is therefore
+/// reduced to a rolling `{min, max, mean}` via [`TemperatureAccumulator`]), `rx_errors`,
+/// `tx_errors`, `rx_dropped`, and `rx_crc_errors` are lifetime-cumulative kernel counters from
+/// `/sys/class/net/<iface>/statistics/*` - monotonically non-decreasing until an interface
+/// reset/reboot, the same shape as `power_on_hours`/`reallocated_sector_count` on
+/// [`TelemetryStorageSmart`]. As documented there, aggregating a monotonic counter's min/max/mean
+/// over a short send window adds no information beyond the latest reading (the min is just the
+/// oldest sample, the max/mean are within noise of the latest value), so these stay simple
+/// instantaneous latest-value passthroughs rather than going through a rolling accumulator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TelemetryNetworkInterface {
+    component_instance_id: String,
+    rx_errors: Option<u64>,
+    tx_errors: Option<u64>,
+    rx_dropped: Option<u64>,
+    rx_crc_errors: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +235,19 @@ pub(crate) fn build_reliability_telemetry_payload(
         })
         .collect();
 
+    let network_interfaces = report
+        .inventory
+        .network_interfaces
+        .iter()
+        .map(|iface| TelemetryNetworkInterface {
+            component_instance_id: iface.component_instance_id.clone(),
+            rx_errors: iface.rx_errors,
+            tx_errors: iface.tx_errors,
+            rx_dropped: iface.rx_dropped,
+            rx_crc_errors: iface.rx_crc_errors,
+        })
+        .collect();
+
     let mut finding_counts: BTreeMap<String, u64> = BTreeMap::new();
     for finding in &report.findings {
         *finding_counts
@@ -253,6 +294,7 @@ pub(crate) fn build_reliability_telemetry_payload(
         },
         reliability_findings_summary,
         collectors,
+        network_interfaces,
     }
 }
 
@@ -1035,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn converter_produces_only_allow_listed_storage_fields_and_aggregates_findings() {
+    fn converter_produces_only_allow_listed_storage_and_network_fields_and_aggregates_findings() {
         let report = hardware_health::test_support::sample_report_for_telemetry_tests();
 
         let payload = build_reliability_telemetry_payload(
@@ -1087,6 +1129,43 @@ mod tests {
         assert!(!serialized.to_string().contains("component_ref"));
         assert!(!serialized.to_string().contains("block_device_name"));
         assert!(!serialized.to_string().contains("serial"));
+
+        // Network interfaces (doc Section 2.5): only the pseudonymized component id plus the four
+        // error/drop counters are allow-listed through - never the identifying inventory fields
+        // (`interface_name`, `driver`, `pci_slot`, `vendor_id`, `device_id`), same minimization
+        // rule as storage devices above.
+        assert_eq!(payload.network_interfaces.len(), 1);
+        let iface = &payload.network_interfaces[0];
+        assert_eq!(iface.rx_errors, Some(3));
+        assert_eq!(iface.tx_errors, Some(1));
+        assert_eq!(iface.rx_dropped, Some(7));
+        assert_eq!(iface.rx_crc_errors, Some(2));
+
+        let iface_json = &serialized["network_interfaces"][0];
+        let mut iface_keys: Vec<&str> = iface_json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        iface_keys.sort_unstable();
+        assert_eq!(
+            iface_keys,
+            vec![
+                "component_instance_id",
+                "rx_crc_errors",
+                "rx_dropped",
+                "rx_errors",
+                "tx_errors",
+            ]
+        );
+        assert!(!serialized.to_string().contains("interface_name"));
+        assert!(!serialized.to_string().contains("\"driver\""));
+        assert!(!serialized.to_string().contains("pci_slot"));
+        assert!(!serialized.to_string().contains("vendor_id"));
+        assert!(!serialized.to_string().contains("device_id"));
+        assert!(!serialized.to_string().contains("eth0"));
+        assert!(!serialized.to_string().contains("e1000e"));
 
         // Findings from two different sightings of the same finding_code must be summed, not
         // duplicated as separate entries.
