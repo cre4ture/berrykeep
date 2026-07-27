@@ -12,10 +12,13 @@ The current native targets are:
 
 - `//crates/sync-core:unit_test`
 - `//crates/common:unit_test`
+- `//crates/transport-sdk:unit_test`
 
-`common` is a dependency-free workspace leaf and the foundation for later
-`transport-sdk`, `rendezvous-server`, and `client-sdk` targets. Run the current
-Bazel unit suite with:
+`transport-sdk` consumes the native `//crates/common:common` target, so changes
+to the shared workspace crate invalidate its Bazel actions without introducing
+a duplicate generated crate. This establishes the dependency layer needed for
+the next `rendezvous-server` and `client-sdk` targets. Run the current Bazel
+unit suite with:
 
 ```bash
 bazel test //:unit
@@ -32,7 +35,8 @@ selects the pinned version from `.bazelversion`. Bazel uses `MODULE.bazel` and
 Those files remain the source of truth for Rust dependencies. The generated
 Crate Universe state is tracked by Bazel's standard `MODULE.bazel.lock`, rather
 than a separate `Cargo.Bazel.lock`. Crate Universe's Cargo and rustc host tools
-are pinned to Rust 1.88.0 for consistent resolution in CI.
+are pinned to Rust 1.89.0 for consistent resolution in CI and parity with the
+minimum compiler required by the current transport dependency graph.
 
 After changing `Cargo.toml`, `Cargo.lock`, or `MODULE.bazel`, refresh the
 checked-in Bzlmod lockfile and commit it with the source change:
@@ -45,8 +49,11 @@ bazel test //:unit
 Adding a first-party Rust package follows the pattern in
 `crates/sync-core/BUILD.bazel`: use `crate_edition`, `aliases`, and
 `all_crate_deps` from `@crates//:defs.bzl`, then add its test target to the
-smallest appropriate root test suite. This lets Cargo define dependencies while
-Bazel can invalidate only direct and transitive consumers of changed sources.
+smallest appropriate root test suite. Crate Universe intentionally leaves
+first-party workspace dependencies out of `all_crate_deps`; add their native
+Bazel labels directly, as `transport-sdk` does for `//crates/common`. This lets
+Cargo define dependencies while Bazel can invalidate only direct and transitive
+consumers of changed sources.
 
 ## Remote cache setup
 
