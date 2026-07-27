@@ -5,5 +5,6 @@ test_suite(
     tests = [
         "//crates/common:unit_test",
         "//crates/sync-core:unit_test",
+        "//crates/transport-sdk:unit_test",
     ],
 )
