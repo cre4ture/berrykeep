@@ -365,7 +365,7 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
 
     public func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
         let bootstrapJSON = try validatedBootstrapJSON(configuration)
-        try AppleWebUiSession(responseJSON: ffi.startWebUI(
+        return try AppleWebUiSession(responseJSON: ffi.startWebUI(
             connectionInput: bootstrapJSON,
             serverCAPem: configuration.serverCAPem,
             clientIdentityJSON: configuration.clientIdentityJSON
