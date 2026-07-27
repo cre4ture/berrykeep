@@ -992,6 +992,45 @@ final class IronmeshBrowserModel: ObservableObject {
         }
     }
 
+    /// The app lifecycle owns the foreground hint and secure persistence only.
+    /// Shared Rust code decides whether discovery, identity renewal, or route
+    /// retirement is necessary.
+    func notifyForegrounded() {
+        guard let configuration = draft.connectionConfiguration else {
+            return
+        }
+
+        let remoteSession = remoteSession
+        Task {
+            do {
+                let renewedIdentity = try await Task.detached(priority: .utility) {
+                    try remoteSession.notifyForegrounded(configuration: configuration)
+                }.value
+
+                guard let renewedIdentity = renewedIdentity?.nilIfBlank else {
+                    return
+                }
+
+                var updatedDraft = draft
+                guard updatedDraft.clientIdentityJSON != renewedIdentity else {
+                    return
+                }
+                updatedDraft.clientIdentityJSON = renewedIdentity
+                try settingsStore.save(
+                    updatedDraft.appliedConnectionState(
+                        defaultConnectionInput: bundleDefaults.directConnectionInput
+                    )
+                )
+                draft = updatedDraft
+                addAction("Renewed device identity", detail: "Persisted the active Rendezvous identity.")
+            } catch {
+                // A foreground refresh is advisory. Keep existing static routes and
+                // surface the failure in the activity history without disrupting UI.
+                addAction("Foreground route refresh deferred", detail: error.localizedDescription)
+            }
+        }
+    }
+
     func openWebUI() {
         if galleryMapPresentation != nil {
             closeGalleryMap()
@@ -1397,6 +1436,14 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         try connectIfNeeded(configuration)
         let json = try bridge.connectionRouteSnapshotJSON(refresh: refresh)
         return try decode(AppleConnectionRouteSnapshot.self, from: json)
+    }
+
+    func notifyForegrounded(
+        configuration: AppleConnectionConfiguration
+    ) throws -> String? {
+        try connectIfNeeded(configuration)
+        try bridge.notifyForegrounded()
+        return try bridge.takeClientIdentityUpdateJSON().nilIfBlank
     }
 
     func configureTitleLatencyMonitor(

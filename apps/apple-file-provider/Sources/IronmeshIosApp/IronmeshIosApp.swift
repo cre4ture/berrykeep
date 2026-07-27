@@ -85,7 +85,9 @@ private struct IronmeshIosRootView: View {
             IronmeshHostedWebView(session: presentation.session)
         }
         .onChange(of: scenePhase) { phase in
-            if phase != .active {
+            if phase == .active {
+                model.notifyForegrounded()
+            } else {
                 model.closeWebUI()
                 model.closeGalleryMap()
             }

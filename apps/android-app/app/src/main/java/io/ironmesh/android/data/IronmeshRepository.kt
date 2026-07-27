@@ -442,6 +442,22 @@ class IronmeshRepository {
         )
     }
 
+    /**
+     * A connectivity callback is only a hint. Route discovery, candidate
+     * validation, and failover remain in the shared Rust client.
+     */
+    fun notifyNetworkChanged(
+        connectionInput: String,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ) {
+        RustClientBridge.notifyNetworkChanged(
+            normalizedConnectionInput(connectionInput),
+            serverCaPem,
+            normalizedClientIdentityJson(clientIdentityJson),
+        )
+    }
+
     fun resetConnectionTimingMeasurement(
         connectionInput: String,
         serverCaPem: String? = null,

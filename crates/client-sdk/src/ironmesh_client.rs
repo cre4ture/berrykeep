@@ -28,7 +28,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
@@ -183,6 +182,7 @@ enum ClientTransport {
     DirectQuic {
         request_base_url: String,
         target_node_id: Option<NodeId>,
+        route_identity: String,
         session_pool: TransportSessionPool,
     },
     Relay(ClientRelayTransport),
@@ -205,8 +205,12 @@ struct ClientRelayTransport {
 #[derive(Clone)]
 struct ClientEndpointRouter {
     runtime_id: Uuid,
-    endpoints: Arc<Vec<ClientEndpoint>>,
-    active_index: Arc<AtomicUsize>,
+    /// Route membership changes after Rendezvous discovery. Readers always copy the
+    /// small immutable endpoint list before doing network I/O, so reconciliation
+    /// never holds this lock across a request or a probe.
+    endpoints: Arc<RwLock<Vec<ClientEndpoint>>>,
+    active_route_key: Arc<RwLock<Option<String>>>,
+    transport_failure_refresh_observer: Arc<TransportFailureRefreshObserverSlot>,
 }
 
 #[derive(Clone, Copy)]
@@ -236,6 +240,7 @@ struct ClientEndpoint {
 
 #[derive(Debug, Clone)]
 struct ClientEndpointDescriptor {
+    route_key: String,
     path_kind: ClientEndpointPathKind,
     transport_path_kind: TransportPathKind,
     locator: String,
@@ -460,6 +465,7 @@ impl ClientEndpoint {
     fn new(transport: ClientTransport, bootstrap_rank: usize) -> Self {
         Self {
             descriptor: ClientEndpointDescriptor {
+                route_key: stable_route_key(&transport),
                 path_kind: transport.path_kind(),
                 transport_path_kind: transport.transport_path_kind(),
                 locator: transport.endpoint_locator(),
@@ -489,6 +495,8 @@ impl ClientEndpoint {
 type ConnectionDiagnosticsObserver =
     Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>;
 type ConnectionDiagnosticsObserverSlot = RwLock<Option<ConnectionDiagnosticsObserver>>;
+type TransportFailureRefreshObserver = Arc<dyn Fn() + Send + Sync + 'static>;
+type TransportFailureRefreshObserverSlot = RwLock<Option<TransportFailureRefreshObserver>>;
 
 fn connection_diagnostics_observer() -> &'static ConnectionDiagnosticsObserverSlot {
     static OBSERVER: OnceLock<ConnectionDiagnosticsObserverSlot> = OnceLock::new();
@@ -525,11 +533,14 @@ impl UploadSessionAffinity {
 
 impl ClientEndpointRouter {
     fn new(endpoints: Vec<ClientEndpoint>) -> Self {
-        let initial_active = if endpoints.is_empty() { usize::MAX } else { 0 };
+        let initial_active = endpoints
+            .first()
+            .map(|endpoint| endpoint.descriptor.route_key.clone());
         Self {
             runtime_id: Uuid::now_v7(),
-            endpoints: Arc::new(endpoints),
-            active_index: Arc::new(AtomicUsize::new(initial_active)),
+            endpoints: Arc::new(RwLock::new(endpoints)),
+            active_route_key: Arc::new(RwLock::new(initial_active)),
+            transport_failure_refresh_observer: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -537,27 +548,49 @@ impl ClientEndpointRouter {
         self.runtime_id
     }
 
-    fn endpoint(&self, index: usize) -> Option<&ClientEndpoint> {
-        self.endpoints.get(index)
+    fn endpoints_snapshot(&self) -> Vec<ClientEndpoint> {
+        self.endpoints
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn endpoint(&self, index: usize) -> Option<ClientEndpoint> {
+        self.endpoints_snapshot().get(index).cloned()
+    }
+
+    fn active_route_key(&self) -> Option<String> {
+        self.active_route_key
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn active_index(&self) -> Option<usize> {
-        let active_index = self.active_index.load(Ordering::Relaxed);
-        (active_index < self.endpoints.len()).then_some(active_index)
+        let active_route_key = self.active_route_key()?;
+        self.endpoints_snapshot()
+            .iter()
+            .position(|endpoint| endpoint.descriptor.route_key == active_route_key)
     }
 
-    fn current_endpoint(&self) -> Option<&ClientEndpoint> {
+    fn current_endpoint(&self) -> Option<ClientEndpoint> {
         self.active_index()
-            .and_then(|index| self.endpoints.get(index))
+            .and_then(|index| self.endpoint(index))
             .or_else(|| {
                 self.best_ranked_index()
-                    .and_then(|index| self.endpoints.get(index))
+                    .and_then(|index| self.endpoint(index))
             })
-            .or_else(|| self.endpoints.first())
+            .or_else(|| self.endpoints_snapshot().into_iter().next())
     }
 
     fn set_active_index(&self, index: usize) {
-        self.active_index.store(index, Ordering::Relaxed);
+        let route_key = self
+            .endpoint(index)
+            .map(|endpoint| endpoint.descriptor.route_key.clone());
+        *self
+            .active_route_key
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = route_key;
     }
 
     fn best_ranked_index(&self) -> Option<usize> {
@@ -569,8 +602,9 @@ impl ClientEndpointRouter {
         let active_index = self.active_index();
         let mut available = Vec::new();
         let mut cooling = Vec::new();
+        let endpoints = self.endpoints_snapshot();
 
-        for (index, endpoint) in self.endpoints.iter().enumerate() {
+        for (index, endpoint) in endpoints.iter().enumerate() {
             let state = lock_endpoint_state(&endpoint.state);
             let score = endpoint_score(index, active_index, &endpoint.descriptor, &state);
             if let Some(until_unix_ms) = state
@@ -598,7 +632,8 @@ impl ClientEndpointRouter {
     }
 
     fn claim_background_probe_candidates(&self) -> Vec<(usize, ClientEndpoint)> {
-        if self.endpoints.len() <= 1 {
+        let endpoints = self.endpoints_snapshot();
+        if endpoints.len() <= 1 {
             return Vec::new();
         }
 
@@ -606,7 +641,7 @@ impl ClientEndpointRouter {
         let active_index = self.active_index();
         let mut claimed = Vec::new();
 
-        for (index, endpoint) in self.endpoints.iter().enumerate() {
+        for (index, endpoint) in endpoints.iter().enumerate() {
             if Some(index) == active_index {
                 continue;
             }
@@ -623,15 +658,18 @@ impl ClientEndpointRouter {
     }
 
     fn record_failure(&self, index: usize, error: &str) {
-        let Some(endpoint) = self.endpoints.get(index) else {
+        let Some(endpoint) = self.endpoint(index) else {
             return;
         };
+        let had_selectable_route = self.has_selectable_route();
         let mut state = lock_endpoint_state(&endpoint.state);
         record_endpoint_failure_sample(&mut state, error, false);
+        drop(state);
+        self.notify_transport_failure_when_exhausted(had_selectable_route);
     }
 
     fn record_background_probe_success(&self, index: usize, latency_ms: f64) {
-        let Some(endpoint) = self.endpoints.get(index) else {
+        let Some(endpoint) = self.endpoint(index) else {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
@@ -639,7 +677,7 @@ impl ClientEndpointRouter {
     }
 
     fn record_background_probe_failure(&self, index: usize, error: &str) {
-        let Some(endpoint) = self.endpoints.get(index) else {
+        let Some(endpoint) = self.endpoint(index) else {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
@@ -650,7 +688,7 @@ impl ClientEndpointRouter {
         let active_index = self.active_index();
         let ranked_indices = self.rank_indices();
         let endpoints = self
-            .endpoints
+            .endpoints_snapshot()
             .iter()
             .enumerate()
             .map(|(index, endpoint)| {
@@ -695,7 +733,7 @@ impl ClientEndpointRouter {
     }
 
     fn reset_timing_measurement(&self) {
-        for endpoint in self.endpoints.iter() {
+        for endpoint in self.endpoints_snapshot() {
             let session_pool_baseline = endpoint.transport.session_pool_snapshot();
             let mut state = lock_endpoint_state(&endpoint.state);
             reset_endpoint_timing_measurement(&mut state, session_pool_baseline);
@@ -708,7 +746,7 @@ impl ClientEndpointRouter {
         attempt: ClientRequestAttemptContext<'_>,
         measurement: ClientRequestSuccessMeasurement<'_>,
     ) {
-        let Some(endpoint) = self.endpoints.get(index) else {
+        let Some(endpoint) = self.endpoint(index) else {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
@@ -756,7 +794,7 @@ impl ClientEndpointRouter {
                 started_unix_ms: attempt.started_unix_ms,
                 finished_unix_ms: Some(finished_unix_ms),
                 method: attempt.method.to_string(),
-                url: attempt_display_url(endpoint, attempt.url),
+                url: attempt_display_url(&endpoint, attempt.url),
                 timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
                 outcome: "success".to_string(),
                 status_code: Some(measurement.status.as_u16()),
@@ -787,9 +825,10 @@ impl ClientEndpointRouter {
         attempt: ClientRequestAttemptContext<'_>,
         error: &str,
     ) {
-        let Some(endpoint) = self.endpoints.get(index) else {
+        let Some(endpoint) = self.endpoint(index) else {
             return;
         };
+        let had_selectable_route = self.has_selectable_route();
         let mut state = lock_endpoint_state(&endpoint.state);
         let session_pool_after = endpoint.transport.session_pool_snapshot();
         let session_setup_duration_us = session_pool_after
@@ -805,7 +844,7 @@ impl ClientEndpointRouter {
                 started_unix_ms: attempt.started_unix_ms,
                 finished_unix_ms: Some(unix_ts_ms()),
                 method: attempt.method.to_string(),
-                url: attempt_display_url(endpoint, attempt.url),
+                url: attempt_display_url(&endpoint, attempt.url),
                 timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
                 outcome: "failure".to_string(),
                 total_duration_us: Some(
@@ -821,12 +860,53 @@ impl ClientEndpointRouter {
                 ..ClientConnectionAttempt::default()
             },
         );
+        drop(state);
+        self.notify_transport_failure_when_exhausted(had_selectable_route);
+    }
+
+    fn set_transport_failure_refresh_observer(
+        &self,
+        observer: Option<TransportFailureRefreshObserver>,
+    ) {
+        *self
+            .transport_failure_refresh_observer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
+    }
+
+    fn has_selectable_route(&self) -> bool {
+        let now_unix_ms = unix_ts_ms();
+        self.endpoints_snapshot().iter().any(|endpoint| {
+            let state = lock_endpoint_state(&endpoint.state);
+            state
+                .circuit_open_until_unix_ms
+                .is_none_or(|until_unix_ms| until_unix_ms <= now_unix_ms)
+        })
+    }
+
+    /// Request one managed discovery pass precisely when the last selectable
+    /// route enters its circuit-breaker window. The observer is weakly owned by
+    /// the managed controller, so normal static clients keep no extra task or
+    /// policy attached.
+    fn notify_transport_failure_when_exhausted(&self, had_selectable_route: bool) {
+        if !had_selectable_route || self.has_selectable_route() {
+            return;
+        }
+
+        let observer = self
+            .transport_failure_refresh_observer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            observer();
+        }
     }
 
     fn diagnostics_snapshot(&self) -> ClientConnectionDiagnostics {
         let active_index = self.active_index();
         let endpoints = self
-            .endpoints
+            .endpoints_snapshot()
             .iter()
             .enumerate()
             .map(|(index, endpoint)| {
@@ -860,6 +940,93 @@ impl ClientEndpointRouter {
             last_success_unix_ms,
         }
     }
+
+    /// Replace route membership while preserving the endpoint object (and therefore
+    /// its circuit-breaker state and live session pool) for every stable route key
+    /// that is still desired. The caller builds replacement endpoints before taking
+    /// this lock, so no network I/O is performed here.
+    fn reconcile(
+        &self,
+        desired: Vec<ClientEndpoint>,
+        preserve_existing: bool,
+    ) -> (usize, usize, usize) {
+        let mut routes = self
+            .endpoints
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_by_key = routes
+            .iter()
+            .cloned()
+            .map(|endpoint| (endpoint.descriptor.route_key.clone(), endpoint))
+            .collect::<HashMap<_, _>>();
+        let mut retained = 0usize;
+        let mut added = 0usize;
+        let mut next = Vec::with_capacity(desired.len());
+        let mut desired_keys = BTreeSet::new();
+
+        for endpoint in desired {
+            let route_key = endpoint.descriptor.route_key.clone();
+            if !desired_keys.insert(route_key.clone()) {
+                continue;
+            }
+            if preserve_existing && let Some(existing) = old_by_key.get(&route_key) {
+                retained = retained.saturating_add(1);
+                next.push(existing.with_bootstrap_rank(endpoint.descriptor.bootstrap_rank));
+            } else {
+                added = added.saturating_add(1);
+                next.push(endpoint);
+            }
+        }
+
+        let removed = old_by_key.len().saturating_sub(retained);
+        let active_is_retained = self
+            .active_route_key()
+            .is_some_and(|route_key| desired_keys.contains(&route_key));
+        if !active_is_retained {
+            *self
+                .active_route_key
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = next
+                .first()
+                .map(|endpoint| endpoint.descriptor.route_key.clone());
+        }
+        *routes = next;
+        (added, removed, retained)
+    }
+}
+
+fn stable_route_key(transport: &ClientTransport) -> String {
+    let target_node_id = transport
+        .target_node_id()
+        .map(|node_id| node_id.to_string())
+        .unwrap_or_default();
+    let route_identity = match transport {
+        ClientTransport::DirectQuic { route_identity, .. } => route_identity.clone(),
+        ClientTransport::DirectHttp { .. } | ClientTransport::Relay(_) => {
+            transport.endpoint_locator()
+        }
+    };
+    format!(
+        "{:?}#{target_node_id}#{route_identity}",
+        transport.transport_path_kind()
+    )
+}
+
+fn direct_quic_route_identity(candidate: &ConnectionCandidate) -> String {
+    let hints = candidate.transport_hints.as_ref();
+    let transport_id = hints
+        .and_then(|hints| hints.transport_id.as_deref())
+        .unwrap_or_default();
+    let alpn = hints
+        .and_then(|hints| hints.alpn.as_deref())
+        .unwrap_or(transport_sdk::DEFAULT_DIRECT_QUIC_ALPN);
+    let relay_url = hints
+        .and_then(|hints| hints.relay_url.as_deref())
+        .unwrap_or_default();
+    format!(
+        "{}#{transport_id}#{alpn}#{relay_url}",
+        candidate.endpoint.trim().trim_end_matches('/')
+    )
 }
 
 fn lock_endpoint_state(
@@ -2290,11 +2457,13 @@ impl IronMeshClient {
         target_node_id: Option<NodeId>,
     ) -> Self {
         let request_base_url = candidate.endpoint.trim().trim_end_matches('/').to_string();
+        let route_identity = direct_quic_route_identity(&candidate);
         Self {
             transport_router: ClientEndpointRouter::new(vec![ClientEndpoint::new(
                 ClientTransport::DirectQuic {
                     request_base_url,
                     target_node_id,
+                    route_identity,
                     session_pool: TransportSessionPool::new_direct_quic(candidate, target_node_id),
                 },
                 0,
@@ -2351,9 +2520,9 @@ impl IronMeshClient {
 
             let endpoint = client
                 .transport_router
-                .endpoints
-                .first()
-                .cloned()
+                .endpoints_snapshot()
+                .into_iter()
+                .next()
                 .ok_or_else(|| anyhow!("cannot combine an empty client transport router"))?;
             endpoints.push(endpoint.with_bootstrap_rank(bootstrap_rank));
         }
@@ -2364,6 +2533,28 @@ impl IronMeshClient {
             connection_name: None,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Reconciles this client's route registry with a freshly constructed set of
+    /// transport targets. Clones of this client retain the same router, so callers
+    /// never have to replace their public client handle after discovery.
+    pub(crate) fn reconcile_transport_membership(
+        &self,
+        refreshed: &IronMeshClient,
+        preserve_existing: bool,
+    ) -> (usize, usize, usize) {
+        self.transport_router.reconcile(
+            refreshed.transport_router.endpoints_snapshot(),
+            preserve_existing,
+        )
+    }
+
+    pub(crate) fn set_transport_failure_refresh_observer(
+        &self,
+        observer: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) {
+        self.transport_router
+            .set_transport_failure_refresh_observer(observer);
     }
 
     pub fn with_client_identity(mut self, identity: ClientIdentityMaterial) -> Self {
@@ -2397,9 +2588,8 @@ impl IronMeshClient {
     pub async fn refresh_connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
         let tasks = self
             .transport_router
-            .endpoints
-            .iter()
-            .cloned()
+            .endpoints_snapshot()
+            .into_iter()
             .enumerate()
             .map(|(index, endpoint)| {
                 let auth = self.auth.clone();
@@ -2460,10 +2650,15 @@ impl IronMeshClient {
             .and_then(|endpoint| endpoint.transport.relay_target_node_id())
     }
 
-    pub fn direct_server_base_url(&self) -> Option<&str> {
+    pub fn direct_server_base_url(&self) -> Option<String> {
         self.transport_router
             .current_endpoint()
-            .and_then(|endpoint| endpoint.transport.direct_server_base_url())
+            .and_then(|endpoint| {
+                endpoint
+                    .transport
+                    .direct_server_base_url()
+                    .map(ToString::to_string)
+            })
     }
 
     pub fn rendezvous_client(&self) -> Option<RendezvousControlClient> {
@@ -2479,10 +2674,10 @@ impl IronMeshClient {
             .unwrap_or_default()
     }
 
-    fn server_base_url(&self) -> &str {
+    fn server_base_url(&self) -> String {
         self.transport_router
             .current_endpoint()
-            .map(|endpoint| endpoint.transport.request_base_url())
+            .map(|endpoint| endpoint.transport.request_base_url().to_string())
             .expect("ironmesh client must contain at least one transport endpoint")
     }
 
@@ -2538,7 +2733,7 @@ impl IronMeshClient {
             .filter(|index| {
                 self.transport_router
                     .endpoint(*index)
-                    .is_some_and(|endpoint| affinity.matches_endpoint(endpoint))
+                    .is_some_and(|endpoint| affinity.matches_endpoint(&endpoint))
             })
             .collect::<Vec<_>>();
 
@@ -2566,7 +2761,7 @@ impl IronMeshClient {
 
         self.remember_upload_session_affinity(
             upload_id,
-            UploadSessionAffinity::from_endpoint(endpoint),
+            UploadSessionAffinity::from_endpoint(&endpoint),
         );
     }
 
@@ -2593,7 +2788,7 @@ impl IronMeshClient {
 
         let mut last_error = None;
         for &index in route_indices {
-            let Some(endpoint) = self.transport_router.endpoint(index).cloned() else {
+            let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
             let endpoint_context = self.endpoint_context_for_route(index);
@@ -2728,7 +2923,7 @@ impl IronMeshClient {
         auth_headers.append(&mut operation_headers);
         let mut last_error = None;
         for &route_index in route_indices {
-            let Some(endpoint) = self.transport_router.endpoint(route_index).cloned() else {
+            let Some(endpoint) = self.transport_router.endpoint(route_index) else {
                 continue;
             };
             let endpoint_url = endpoint
@@ -3418,7 +3613,7 @@ impl IronMeshClient {
         let mut last_error = None;
 
         for index in self.transport_router.rank_indices() {
-            let Some(endpoint) = self.transport_router.endpoint(index).cloned() else {
+            let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
             let endpoint_url = endpoint
@@ -3524,7 +3719,7 @@ impl IronMeshClient {
         let mut body_stream = Some(Box::pin(body_stream) as RequestBodyStream);
 
         for index in self.transport_router.rank_indices() {
-            let Some(endpoint) = self.transport_router.endpoint(index).cloned() else {
+            let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
             let endpoint_url = endpoint
@@ -3956,7 +4151,7 @@ impl IronMeshClient {
         let mut last_error = None;
         let mut response = None;
         for index in self.transport_router.rank_indices() {
-            let Some(endpoint) = self.transport_router.endpoint(index).cloned() else {
+            let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
             let endpoint_url = endpoint
@@ -4912,8 +5107,9 @@ impl IronMeshClient {
     }
 
     fn client_api_base_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let server_base_url = self.server_base_url();
+        let mut url = reqwest::Url::parse(&server_base_url)
+            .with_context(|| format!("invalid server URL: {server_base_url}"))?;
 
         {
             let mut segments = url
@@ -4946,8 +5142,9 @@ impl IronMeshClient {
         }
 
         let normalized_path = normalize_client_api_path(path);
-        let base_url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let server_base_url = self.server_base_url();
+        let base_url = reqwest::Url::parse(&server_base_url)
+            .with_context(|| format!("invalid server URL: {server_base_url}"))?;
         base_url
             .join(normalized_path.trim_start_matches('/'))
             .with_context(|| {

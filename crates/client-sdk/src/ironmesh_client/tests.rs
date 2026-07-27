@@ -24,14 +24,15 @@ use std::sync::{
 use std::task::{Context, Poll};
 use tokio::sync::Mutex;
 use transport_sdk::{
-    BufferedTransportResponse as MultiplexBufferedTransportResponse, ConnectionCandidate,
-    DecodedWebSocketMessage, DirectQuicEndpoint, DirectQuicEndpointConfig, MultiplexConfig,
-    MultiplexMode, MultiplexedSession, PeerIdentity, RelayHttpHeader, RelayTunnelAcceptRequest,
-    RelayTunnelSecurityMode, RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig,
-    RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity, RendezvousClientConfig,
-    RendezvousControlClient, TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportResponseHead,
-    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind, WebSocketByteStream,
-    WebSocketMessageCodec, perform_transport_server_handshake, read_buffered_transport_request,
+    BufferedTransportResponse as MultiplexBufferedTransportResponse, CandidateKind,
+    ConnectionCandidate, DecodedWebSocketMessage, DirectQuicEndpoint, DirectQuicEndpointConfig,
+    MultiplexConfig, MultiplexMode, MultiplexedSession, PeerIdentity, RelayHttpHeader,
+    RelayTunnelAcceptRequest, RelayTunnelSecurityMode, RelayTunnelSessionKind,
+    RelayTunnelSourceSecurityConfig, RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity,
+    RendezvousClientConfig, RendezvousControlClient, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
+    TransportResponseHead, TransportSessionControlMessage, TransportSessionRole,
+    TransportStreamKind, WebSocketByteStream, WebSocketMessageCodec,
+    perform_transport_server_handshake, read_buffered_transport_request,
     write_buffered_transport_response, write_transport_response_head,
 };
 
@@ -61,6 +62,84 @@ fn client_clones_keep_the_same_connection_runtime_id() {
         client.connection_runtime_id(),
         rebuilt.connection_runtime_id()
     );
+}
+
+#[test]
+fn route_reconciliation_preserves_static_state_and_retires_dynamic_routes() {
+    let static_client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let original_endpoint = static_client
+        .transport_router
+        .endpoint(0)
+        .expect("static endpoint should exist");
+    let dynamic_quic = IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+        ConnectionCandidate {
+            kind: CandidateKind::DirectQuic,
+            endpoint: "iroh://dynamic-node-key".to_string(),
+            rtt_ms: None,
+            transport_hints: None,
+        },
+        Some(NodeId::new_v4()),
+    );
+    let refreshed = IronMeshClient::combine(vec![
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/"),
+        dynamic_quic,
+    ])
+    .expect("refreshed routes should combine");
+
+    let runtime_id = static_client.connection_runtime_id();
+    let (added, removed, retained) = static_client.reconcile_transport_membership(&refreshed, true);
+    assert_eq!((added, removed, retained), (1, 0, 1));
+    assert_eq!(static_client.connection_runtime_id(), runtime_id);
+    let retained_endpoint = static_client
+        .transport_router
+        .endpoint(0)
+        .expect("static endpoint should remain");
+    assert!(Arc::ptr_eq(
+        &original_endpoint.state,
+        &retained_endpoint.state
+    ));
+    assert!(
+        static_client
+            .connection_route_snapshot()
+            .endpoints
+            .iter()
+            .any(|route| route.path_kind == TransportPathKind::DirectQuic)
+    );
+
+    let static_only = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let (added, removed, retained) =
+        static_client.reconcile_transport_membership(&static_only, true);
+    assert_eq!((added, removed, retained), (0, 1, 1));
+    assert_eq!(static_client.connection_route_snapshot().endpoints.len(), 1);
+}
+
+#[test]
+fn exhausted_route_set_notifies_managed_refresh_once() {
+    let client = IronMeshClient::combine(vec![
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/"),
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18081/"),
+    ])
+    .expect("combined routes should build");
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let observed_refreshes = refreshes.clone();
+    client.set_transport_failure_refresh_observer(Some(Arc::new(move || {
+        observed_refreshes.fetch_add(1, Ordering::SeqCst);
+    })));
+
+    client
+        .transport_router
+        .record_failure(0, "first route is unavailable");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+
+    client
+        .transport_router
+        .record_failure(1, "last route is unavailable");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+
+    client
+        .transport_router
+        .record_failure(0, "already exhausted");
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -145,12 +224,14 @@ fn route_score_strongly_prefers_direct_over_relay_and_stabilizes_active_route() 
         ..ClientEndpointState::default()
     };
     let direct = ClientEndpointDescriptor {
+        route_key: "direct-route".to_string(),
         path_kind: ClientEndpointPathKind::Direct,
         transport_path_kind: TransportPathKind::DirectHttps,
         locator: "https://direct.example".to_string(),
         bootstrap_rank: 0,
     };
     let relay = ClientEndpointDescriptor {
+        route_key: "relay-route".to_string(),
         path_kind: ClientEndpointPathKind::Relay,
         transport_path_kind: TransportPathKind::RelayTunnel,
         locator: "relay://node@example".to_string(),
@@ -3191,7 +3272,7 @@ async fn combined_direct_transports_fail_over_to_second_endpoint() {
     assert_eq!(first["status"], "ok");
     assert_eq!(second["status"], "ok");
     assert_eq!(
-        client.direct_server_base_url(),
+        client.direct_server_base_url().as_deref(),
         Some(direct_state.public_url.as_str())
     );
     assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
@@ -3468,7 +3549,10 @@ async fn background_probe_reprioritizes_recovered_direct_endpoint() {
         .await
         .expect("first request should fall back to the healthy route");
     assert_eq!(first["route"], "fallback");
-    assert_eq!(client.direct_server_base_url(), Some(fallback_url.as_str()));
+    assert_eq!(
+        client.direct_server_base_url().as_deref(),
+        Some(fallback_url.as_str())
+    );
 
     let (_primary_url, primary_state, primary_server) =
         spawn_direct_http_route_server_at(primary_addr, 0, "primary").await;
@@ -3491,7 +3575,10 @@ async fn background_probe_reprioritizes_recovered_direct_endpoint() {
         .await
         .expect("third request should use the reprobed primary route");
     assert_eq!(third["route"], "primary");
-    assert_eq!(client.direct_server_base_url(), Some(primary_url.as_str()));
+    assert_eq!(
+        client.direct_server_base_url().as_deref(),
+        Some(primary_url.as_str())
+    );
     assert!(primary_state.health_hits.load(Ordering::SeqCst) >= 1);
     assert_eq!(primary_state.cluster_status_hits.load(Ordering::SeqCst), 1);
     assert_eq!(fallback_state.cluster_status_hits.load(Ordering::SeqCst), 2);

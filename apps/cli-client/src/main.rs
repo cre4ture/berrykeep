@@ -10,10 +10,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
     IronMeshClient, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,
-    build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
-    build_http_client_from_planned_targets, build_http_client_with_identity_from_pem,
-    build_http_client_with_identity_from_planned_targets, compare_direct_and_relay_latency,
-    enroll_connection_input_blocking, normalize_server_base_url,
+    ManagedClientOptions, build_client_with_optional_identity_from_planned_target,
+    build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    compare_direct_and_relay_latency, enroll_connection_input_blocking, normalize_server_base_url,
 };
 use futures_util::TryStreamExt;
 use serde::Serialize;
@@ -586,7 +585,7 @@ async fn enroll_from_bootstrap(
 
 fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient> {
     let client_identity_path = configured_client_identity_path(cli);
-    let mut client_identity = read_client_identity_from_cli(cli)?;
+    let client_identity = read_client_identity_from_cli(cli)?;
     let server_ca_override = read_server_ca_override_from_cli(cli)?;
     let authenticated = client_identity.is_some();
     let client_device_id = client_identity
@@ -604,65 +603,36 @@ fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient
             "building authenticated client from bootstrap"
         );
         let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
-        if let Some(identity) = client_identity.as_mut()
-            && bootstrap.renew_rendezvous_identity_if_needed(identity)?
-        {
-            match persist_renewed_client_identity(client_identity_path.as_deref(), identity) {
-                Ok(()) => info!(
-                    client_identity_file = path_for_log(client_identity_path.as_deref()),
-                    "persisted renewed rendezvous client identity"
-                ),
-                Err(error) => warn!(
-                    error = %error,
-                    client_identity_file = path_for_log(client_identity_path.as_deref()),
-                    "renewed rendezvous client identity could not be persisted; continuing with the in-memory identity"
-                ),
-            }
-        }
-        let refreshed_targets = match bootstrap
-            .refresh_dynamic_targets_blocking(client_identity.as_ref())
-        {
-            Ok(targets) => {
-                info!(
-                    refreshed_target_count = targets.len(),
-                    "refreshed bootstrap targets from rendezvous discovery"
-                );
-                Some(targets)
-            }
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "failed to refresh bootstrap targets from rendezvous discovery; falling back to static bootstrap targets"
-                );
-                None
-            }
-        };
-        let client = if let Some(targets) = refreshed_targets.as_ref() {
-            match client_identity.as_ref() {
-                Some(identity) => {
-                    build_http_client_with_identity_from_planned_targets(targets, identity)
-                }
-                None => {
-                    let has_direct_target = targets
-                        .iter()
-                        .any(|target| target.server_base_url.is_some());
-                    if !has_direct_target
-                        && targets
-                            .iter()
-                            .any(|target| target.server_base_url.is_none())
-                    {
-                        bootstrap.build_client()
-                    } else {
-                        build_http_client_from_planned_targets(targets)
+        let client = match client_identity.as_ref() {
+            Some(identity) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to build managed CLI client runtime")?;
+                let managed = runtime.block_on(bootstrap.build_managed_client_with_identity(
+                    identity.clone(),
+                    ManagedClientOptions::default(),
+                ))?;
+                if let Some(renewed_identity) = managed.take_identity_update() {
+                    match persist_renewed_client_identity(
+                        client_identity_path.as_deref(),
+                        &renewed_identity,
+                    ) {
+                        Ok(()) => info!(
+                            client_identity_file = path_for_log(client_identity_path.as_deref()),
+                            "persisted renewed rendezvous client identity"
+                        ),
+                        Err(error) => warn!(
+                            error = %error,
+                            client_identity_file = path_for_log(client_identity_path.as_deref()),
+                            "renewed rendezvous client identity could not be persisted; continuing with the in-memory identity"
+                        ),
                     }
                 }
+                managed.client()
             }
-        } else {
-            match client_identity.as_ref() {
-                Some(identity) => bootstrap.build_client_with_identity(identity),
-                None => bootstrap.build_client(),
-            }
-        }?;
+            None => bootstrap.build_client()?,
+        };
         log_client_transport_ready("build_authenticated_sdk_from_cli_blocking", &client);
         return Ok(client);
     }

@@ -115,6 +115,7 @@ mod tests {
             Ok(ConfiguredAndroidSdk {
                 client: ConnectionBootstrap::from_json_str(&bootstrap_a)?.build_client()?,
                 client_identity: None,
+                managed_client: None,
             })
         })
         .expect("first client configuration should be cached");
@@ -123,6 +124,7 @@ mod tests {
             Ok(ConfiguredAndroidSdk {
                 client: ConnectionBootstrap::from_json_str(&bootstrap_b)?.build_client()?,
                 client_identity: None,
+                managed_client: None,
             })
         })
         .expect("matching client configuration should use the cache");
@@ -142,6 +144,7 @@ mod tests {
             Ok(ConfiguredAndroidSdk {
                 client: ConnectionBootstrap::from_json_str(&bootstrap_b)?.build_client()?,
                 client_identity: None,
+                managed_client: None,
             })
         })
         .expect("changed client configuration should rebuild the client");
@@ -189,9 +192,9 @@ mod tests {
 use client_sdk::{
     ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent, ClientIdentityMaterial,
     ClientNode, ConnectionBootstrap, EnrolledClientConnection, IronMeshClient,
-    StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView,
-    TitleLatencyMonitor, TitleLatencyProbeConfig, enroll_client_connection_blocking,
-    set_connection_diagnostics_observer,
+    ManagedClientOptions, ManagedIronMeshClient, StoreIndexMediaFilter, StoreIndexRequestOptions,
+    StoreIndexSortOrder, StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig,
+    enroll_client_connection_blocking, set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -1418,6 +1421,7 @@ fn normalized_bootstrap_json(bootstrap_json: impl Into<String>) -> Result<String
 struct ConfiguredAndroidSdk {
     client: IronMeshClient,
     client_identity: Option<ClientIdentityMaterial>,
+    managed_client: Option<ManagedIronMeshClient>,
 }
 
 fn configured_sdk_build(
@@ -1443,11 +1447,17 @@ fn configured_sdk_build(
     }
 
     match parsed_identity {
-        Some(mut identity) => {
+        Some(identity) => {
             let original_identity = identity.clone();
-            let client = bootstrap.build_client_with_identity_renewing(&mut identity)?;
-            if identity != original_identity
-                && let Err(err) = persist_android_client_identity(&identity)
+            let managed_client = runtime()?.block_on(
+                bootstrap
+                    .build_managed_client_with_identity(identity, ManagedClientOptions::default()),
+            )?;
+            let client_identity = managed_client
+                .take_identity_update()
+                .unwrap_or(original_identity.clone());
+            if client_identity != original_identity
+                && let Err(err) = persist_android_client_identity(&client_identity)
             {
                 tracing::warn!(
                     error = %err,
@@ -1455,13 +1465,15 @@ fn configured_sdk_build(
                 );
             }
             Ok(ConfiguredAndroidSdk {
-                client,
-                client_identity: Some(identity),
+                client: managed_client.client(),
+                client_identity: Some(client_identity),
+                managed_client: Some(managed_client),
             })
         }
         None => Ok(ConfiguredAndroidSdk {
             client: bootstrap.build_client()?,
             client_identity: None,
+            managed_client: None,
         }),
     }
 }
@@ -1832,6 +1844,46 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
             );
             std::ptr::null_mut()
         }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_notifyNetworkChanged(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+) {
+    let result = (|| -> Result<()> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let configured =
+            cached_configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?;
+        let Some(managed_client) = configured.managed_client else {
+            return Ok(());
+        };
+        runtime()?.spawn(async move {
+            let _ = managed_client.notify_network_changed_async().await;
+            if let Some(identity) = managed_client.take_identity_update()
+                && let Err(error) = persist_android_client_identity(&identity)
+            {
+                tracing::warn!(error = %error, "failed to persist rendezvous identity after Android network hint");
+            }
+        });
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        throw_java_error(
+            &mut env,
+            format!("rust notifyNetworkChanged failed: {err:#}"),
+        );
     }
 }
 

@@ -1416,6 +1416,7 @@ async fn build_rendezvous_view(state: &WebState) -> WebClientRendezvousView {
     let direct_url = runtime
         .sdk
         .direct_server_base_url()
+        .as_deref()
         .map(normalize_runtime_url);
     let direct_target_node_id = runtime.rendezvous.as_ref().and_then(|config| {
         let direct_url = direct_url.as_ref()?;

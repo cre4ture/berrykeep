@@ -56,18 +56,18 @@ class FolderSyncForegroundService : Service() {
     private var networkCallbackRegistered = false
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            requestReconcile("network available")
+            notifyManagedClientNetworkChanged("network available")
         }
 
         override fun onLost(network: Network) {
-            requestReconcile("network lost")
+            notifyManagedClientNetworkChanged("network lost")
         }
 
         override fun onCapabilitiesChanged(
             network: Network,
             networkCapabilities: NetworkCapabilities,
         ) {
-            requestReconcile("network capabilities changed")
+            notifyManagedClientNetworkChanged("network capabilities changed")
         }
     }
 
@@ -564,6 +564,24 @@ class FolderSyncForegroundService : Service() {
             if (started) {
                 startStatusLoop()
             }
+        }
+    }
+
+    private fun notifyManagedClientNetworkChanged(reason: String) {
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
+                val connectionInput = deviceAuth.preferredConnectionInput()
+                val clientIdentityJson = deviceAuth.toClientIdentityJson()
+                if (connectionInput.isNotBlank() && !clientIdentityJson.isNullOrBlank()) {
+                    repository.notifyNetworkChanged(
+                        connectionInput = connectionInput,
+                        serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() },
+                        clientIdentityJson = clientIdentityJson,
+                    )
+                }
+            }
+            requestReconcile(reason)
         }
     }
 

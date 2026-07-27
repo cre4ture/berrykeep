@@ -1,14 +1,14 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
-# This is the first native Bazel target in the workspace. It deliberately uses
-# the dependency information generated from Cargo.toml so that Cargo remains
-# the single source of truth while Bazel owns the action graph and cache keys.
+# Keep Cargo.toml as the dependency source of truth while exposing this leaf
+# crate to Bazel's action graph. Downstream workspace crates can depend on this
+# target as they are migrated.
 rust_library(
-    name = "sync_core",
+    name = "common",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
-    crate_name = "sync_core",
+    crate_name = "common",
     crate_root = "src/lib.rs",
     edition = crate_edition(),
     deps = all_crate_deps(normal = True),
@@ -21,7 +21,7 @@ rust_test(
         normal_dev = True,
         proc_macro_dev = True,
     ),
-    crate = ":sync_core",
+    crate = ":common",
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True),

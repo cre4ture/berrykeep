@@ -119,6 +119,10 @@ const CLIENT_MUTATION_OPERATION_TTL_SECS: u64 = 15 * 60;
 const DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 10;
 const GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED_ENV: &str =
     "IRONMESH_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED";
+/// Comma-separated iroh-compatible relay URLs used by this node's Direct QUIC
+/// endpoint. The existing IronMesh HTTP relay is intentionally not substituted
+/// here; it remains the independent fallback transport.
+const DIRECT_QUIC_RELAY_URLS_ENV: &str = "IRONMESH_DIRECT_QUIC_RELAY_URLS";
 const GLOBAL_RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 10;
 const GLOBAL_RENDEZVOUS_REGISTRATION_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 use x509_parser::extensions::ParsedExtension;
@@ -127,6 +131,7 @@ use x509_parser::prelude::FromDer;
 mod cluster;
 mod embedded_rendezvous;
 mod hardware_health;
+mod host_storage;
 mod listing;
 mod map_config;
 mod map_dataset_import;
@@ -225,6 +230,7 @@ use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
     ReplicationPlan, ReplicationPolicy,
 };
+use host_storage::PrepareHostStorageDirectoryRequest;
 use setup::{
     ManagedRendezvousFailoverDeploymentTarget, ManagedRendezvousFailoverExportParams,
     ManagedRendezvousFailoverPackage, ManagedSignerBackup,
@@ -4537,12 +4543,16 @@ async fn try_start_direct_quic_runtime(
         }
     };
 
-    match DirectQuicEndpoint::bind(DirectQuicEndpointConfig::new(secret_key)).await {
+    let mut endpoint_config = DirectQuicEndpointConfig::new(secret_key);
+    endpoint_config.relay_urls = direct_quic_relay_urls_from_env();
+    let configured_relay_urls = endpoint_config.relay_urls.clone();
+    match DirectQuicEndpoint::bind(endpoint_config).await {
         Ok(endpoint) => {
             let endpoint_id = endpoint.endpoint_id();
             info!(
                 node_id = %config.node_id,
                 endpoint_id = %endpoint_id,
+                direct_quic_relay_urls = ?configured_relay_urls,
                 secret_key_path = %secret_key_path.display(),
                 "server node direct QUIC endpoint started"
             );
@@ -4561,6 +4571,21 @@ async fn try_start_direct_quic_runtime(
             None
         }
     }
+}
+
+fn direct_quic_relay_urls_from_env() -> Vec<String> {
+    parse_direct_quic_relay_urls(std::env::var(DIRECT_QUIC_RELAY_URLS_ENV).ok().as_deref())
+}
+
+fn parse_direct_quic_relay_urls(raw: Option<&str>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    raw.into_iter()
+        .flat_map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .filter_map(|url| {
+            let url = url.trim().trim_end_matches('/').to_string();
+            (!url.is_empty() && seen.insert(url.clone())).then_some(url)
+        })
+        .collect()
 }
 
 fn current_advertised_direct_endpoints(state: &ServerState) -> Vec<BootstrapEndpoint> {
@@ -7445,6 +7470,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             post(validate_storage_pool_config_handler),
         )
         .route("/auth/storage/pool/rebalance", post(rebalance_storage_pool))
+        .route("/auth/storage/host/volumes", get(host_storage_volumes))
+        .route(
+            "/auth/storage/host/volumes/prepare",
+            post(prepare_host_storage_directory),
+        )
         .route("/auth/versions/{key}", get(list_versions_admin))
         .route(
             "/auth/versions/{key}/restore/{version_id}",
@@ -24233,6 +24263,81 @@ async fn storage_pool_status(
         }
     };
     (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn host_storage_volumes(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "storage_host_volumes_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    (StatusCode::OK, Json(host_storage::inventory())).into_response()
+}
+
+async fn prepare_host_storage_directory(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<PrepareHostStorageDirectoryRequest>,
+) -> impl IntoResponse {
+    let action = "storage_host_directory_prepare";
+    let audit_details = json!({
+        "mount_path": request.mount_path,
+        "directory_name": request.directory_name,
+    });
+    let authz =
+        match authorize_admin_request(&state, &headers, action, false, true, audit_details.clone())
+            .await
+        {
+            Ok(request) => request,
+            Err(status) => return status.into_response(),
+        };
+
+    match host_storage::prepare_directory(&request).await {
+        Ok(response) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                false,
+                true,
+                "success",
+                json!({
+                    "mount_path": response.mount_path,
+                    "path": response.path,
+                    "directory_created": response.directory_created,
+                }),
+            )
+            .await;
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(error) => {
+            let message = error.to_string();
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                false,
+                true,
+                "preflight_failed",
+                json!({ "error": message, "request": audit_details }),
+            )
+            .await;
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+        }
+    }
 }
 
 async fn validate_storage_pool_config_handler(
