@@ -722,6 +722,22 @@ impl ConnectionBootstrap {
         &self,
         identity: Option<&ClientIdentityMaterial>,
     ) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
+        let bootstrap = self.clone();
+        let identity = identity.cloned();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build rendezvous discovery runtime")?
+            .block_on(async move { bootstrap.refresh_dynamic_targets(identity.as_ref()).await })
+    }
+
+    /// Fetches the currently trusted Rendezvous candidate set without creating a
+    /// Tokio runtime. Async callers (including FFI runtimes) must use this method;
+    /// the blocking compatibility wrapper above is retained for older CLI callers.
+    pub async fn refresh_dynamic_targets(
+        &self,
+        identity: Option<&ClientIdentityMaterial>,
+    ) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
         self.validate()?;
         if let Some(identity) = identity {
             identity.validate()?;
@@ -738,11 +754,7 @@ impl ConnectionBootstrap {
             return self.planned_targets();
         }
 
-        let discovery = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to build rendezvous discovery runtime")?
-            .block_on(self.fetch_dynamic_discovery(identity))?;
+        let discovery = self.fetch_dynamic_discovery(identity).await?;
         self.build_refreshed_targets(&discovery)
     }
 
@@ -2319,11 +2331,10 @@ mod tests {
 
         let bootstrap =
             refreshable_bootstrap(cluster_id, format!("http://{seed_addr}"), target_node_id);
-        let targets =
-            tokio::task::spawn_blocking(move || bootstrap.refresh_dynamic_targets_blocking(None))
-                .await
-                .expect("refresh task should not panic")
-                .expect("dynamic target refresh should succeed");
+        let targets = bootstrap
+            .refresh_dynamic_targets(None)
+            .await
+            .expect("async dynamic target refresh should succeed");
 
         assert_eq!(
             seed_calls
@@ -2529,7 +2540,7 @@ mod tests {
             .build_client()
             .expect("direct bootstrap client should build inside an async context");
         let uses_relay = client.uses_relay_transport();
-        let direct_url = client.direct_server_base_url().map(str::to_string);
+        let direct_url = client.direct_server_base_url();
 
         assert!(!uses_relay);
         assert_eq!(direct_url.as_deref(), Some(fast_url.as_str()));
