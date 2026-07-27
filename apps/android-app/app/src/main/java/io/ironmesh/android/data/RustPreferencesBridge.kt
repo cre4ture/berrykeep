@@ -30,7 +30,7 @@ object RustPreferencesBridge {
         val current = IronmeshPreferences.getDeviceAuthState(context)
         IronmeshPreferences.setDeviceAuthState(
             context,
-            current.copy(connectionBootstrapJson = bootstrapJson.trim()),
+            current.copy(connectionInput = bootstrapJson.trim()),
         )
     }
 

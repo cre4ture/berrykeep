@@ -153,6 +153,7 @@ public struct AppleWebUiSession: Equatable, Sendable, CustomStringConvertible, C
 public enum AppleManualCBridgeError: Error, Sendable, Equatable, LocalizedError {
     case notConnected
     case unsupportedIdentifier(String)
+    case invalidConfiguration(String)
     case invalidResponse(String)
 
     public var errorDescription: String? {
@@ -161,6 +162,8 @@ public enum AppleManualCBridgeError: Error, Sendable, Equatable, LocalizedError 
             return "The Apple Rust bridge is not connected."
         case .unsupportedIdentifier(let identifier):
             return "The Apple Rust bridge cannot resolve identifier '\(identifier)' yet."
+        case .invalidConfiguration(let message):
+            return "The Apple connection configuration is invalid: \(message)"
         case .invalidResponse(let message):
             return "The Apple Rust bridge returned an invalid response: \(message)"
         }
@@ -181,8 +184,9 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     }
 
     public func connect(_ configuration: AppleConnectionConfiguration) throws -> AppleBridgeSession {
+        let bootstrapJSON = try validatedBootstrapJSON(configuration)
         let newHandle = try ffi.createHandle(
-            connectionInput: configuration.normalizedConnectionInput,
+            connectionInput: bootstrapJSON,
             serverCAPem: configuration.serverCAPem,
             clientIdentityJSON: configuration.clientIdentityJSON
         )
@@ -198,7 +202,7 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
 
         return AppleBridgeSession(
             sessionID: UUID().uuidString,
-            domainIdentifier: configuration.normalizedConnectionInput,
+            domainIdentifier: bootstrapJSON,
             rootPath: "/"
         )
     }
@@ -360,8 +364,9 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     }
 
     public func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
+        let bootstrapJSON = try validatedBootstrapJSON(configuration)
         try AppleWebUiSession(responseJSON: ffi.startWebUI(
-            connectionInput: configuration.normalizedConnectionInput,
+            connectionInput: bootstrapJSON,
             serverCAPem: configuration.serverCAPem,
             clientIdentityJSON: configuration.clientIdentityJSON
         ))
@@ -380,6 +385,20 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
         if let existingHandle {
             ffi.freeHandle(existingHandle)
         }
+    }
+
+    private func validatedBootstrapJSON(
+        _ configuration: AppleConnectionConfiguration
+    ) throws -> String {
+        let bootstrapJSON = configuration.normalizedConnectionInput
+        guard let data = bootstrapJSON.data(using: .utf8),
+              (try? JSONSerialization.jsonObject(with: data)) is [String: Any]
+        else {
+            throw AppleManualCBridgeError.invalidConfiguration(
+                "a connection bootstrap JSON object is required; direct server URLs are no longer supported"
+            )
+        }
+        return bootstrapJSON
     }
 
     private func withHandle<T>(_ body: (AppleRustHandle) throws -> T) throws -> T {

@@ -11,6 +11,23 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         }
     }
 
+    func testBridgeRejectsLegacyDirectServerURL() {
+        let bridge = AppleCFacadeBridge(ffi: MockFFI())
+
+        XCTAssertThrowsError(
+            try bridge.connect(
+                AppleConnectionConfiguration(connectionInput: "https://storage.example.test")
+            )
+        ) { error in
+            guard let bridgeError = error as? AppleManualCBridgeError,
+                  case .invalidConfiguration(let message) = bridgeError
+            else {
+                return XCTFail("expected invalid configuration, got \(error)")
+            }
+            XCTAssertTrue(message.contains("direct server URLs are no longer supported"))
+        }
+    }
+
     func testBridgeMapsRustListResponseIntoBridgeItems() throws {
         let ffi = MockFFI()
         ffi.listResponseJSON = """
@@ -38,7 +55,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         """
 
         let bridge = AppleCFacadeBridge(ffi: ffi)
-        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
         let items = try bridge.list(path: "docs", depth: 1)
 
         XCTAssertEqual(items.count, 2)
@@ -54,7 +71,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
 
     func testBridgeRejectsObjectIdentifierLookupsUntilRustSupportsThem() throws {
         let bridge = AppleCFacadeBridge(ffi: MockFFI())
-        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
 
         XCTAssertThrowsError(try bridge.metadata(pathOrIdentifier: "file:object:obj-123")) { error in
             XCTAssertEqual(
@@ -90,7 +107,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         ffi.fetchResponseData = Data("hello".utf8)
 
         let bridge = AppleCFacadeBridge(ffi: ffi)
-        let session = try bridge.connect(AppleConnectionConfiguration(connectionInput: "http://127.0.0.1:18080"))
+        let session = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
         XCTAssertEqual(session.rootPath, "/")
 
         let metadata = try bridge.metadata(pathOrIdentifier: "docs/readme.txt")
@@ -121,7 +138,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
     func testDeletePreservesDirectoryMarkerForRecursiveDeletes() throws {
         let ffi = MockFFI()
         let bridge = AppleCFacadeBridge(ffi: ffi)
-        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
 
         let delete = try bridge.delete(path: "docs/archive/", expectedRevision: nil)
 
@@ -141,7 +158,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         }
         """
         let bridge = AppleCFacadeBridge(ffi: ffi)
-        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
 
         let result = try bridge.upload(
             path: "docs/readme.txt",
@@ -165,7 +182,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         let ffi = MockFFI()
         ffi.routeSnapshotResponseJSON = #"{"ranked_indices":[0],"endpoints":[]}"#
         let bridge = AppleCFacadeBridge(ffi: ffi)
-        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
 
         let response = try bridge.connectionRouteSnapshotJSON(refresh: true)
 
@@ -177,7 +194,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         let ffi = MockFFI()
         ffi.titleLatencyStatusResponseJSON = #"{"state":"pending","connection_type":"direct"}"#
         let bridge = AppleCFacadeBridge(ffi: ffi)
-        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
 
         let response = try bridge.configureTitleLatencyMonitorJSON(
             settings: AppleTitleLatencyMonitorSettings(enabled: true, periodSeconds: 45)
@@ -224,7 +241,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         ffi.relativeResponseData = Data("thumbnail".utf8)
 
         let bridge = AppleCFacadeBridge(ffi: ffi)
-        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
         let response = try bridge.storeIndex(
             AppleStoreIndexRequest(
                 prefix: "photos",

@@ -8,7 +8,7 @@ use client_sdk::{
     ObjectHeadInfo, StoreIndexEntry, StoreIndexMediaFilter, StoreIndexRequestOptions,
     StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, TitleLatencyMonitor,
     TitleLatencyProbeConfig, TitleLatencyProbeStatus, VersionGraphSummary,
-    enroll_client_connection_blocking, normalize_server_base_url,
+    enroll_client_connection_blocking,
 };
 use common::StorageObjectMeta;
 use serde::{Deserialize, Serialize};
@@ -245,7 +245,7 @@ impl IosStorageApp {
         client_identity_json: Option<String>,
         connection_name: Option<String>,
     ) -> Result<Self> {
-        let connection_input = normalized_connection_input_string(connection_input)?;
+        let bootstrap_json = normalized_bootstrap_json(connection_input)?;
         let server_ca_pem = normalize_optional_string(server_ca_pem);
         let client_identity_json = normalize_optional_string(client_identity_json);
         let connection_name = normalize_optional_string(connection_name);
@@ -255,28 +255,14 @@ impl IosStorageApp {
             .transpose()
             .context("failed to parse iOS client identity JSON")?;
 
-        let mut sdk = if connection_input.starts_with('{') {
-            let mut bootstrap = ConnectionBootstrap::from_json_str(&connection_input)
-                .context("failed to parse iOS connection bootstrap JSON")?;
-            if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-                bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
-            }
-            match client_identity.as_ref() {
-                Some(identity) => bootstrap.build_client_with_identity(identity)?,
-                None => bootstrap.build_client()?,
-            }
-        } else {
-            match client_identity.as_ref() {
-                Some(identity) => client_sdk::build_http_client_with_identity_from_pem(
-                    server_ca_pem.as_deref(),
-                    &connection_input,
-                    identity,
-                )?,
-                None => client_sdk::build_http_client_from_pem(
-                    server_ca_pem.as_deref(),
-                    &connection_input,
-                )?,
-            }
+        let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
+            .context("failed to parse iOS connection bootstrap JSON")?;
+        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
+        }
+        let mut sdk = match client_identity.as_ref() {
+            Some(identity) => bootstrap.build_client_with_identity(identity)?,
+            None => bootstrap.build_client()?,
         };
 
         if let Some(name) = connection_name.as_ref() {
@@ -291,18 +277,6 @@ impl IosStorageApp {
         client_identity_json: Option<String>,
     ) -> Result<Self> {
         Self::configured(bootstrap_json, None, client_identity_json, None)
-    }
-
-    pub fn with_client(client: ClientNode) -> Result<Self> {
-        let sdk = client_sdk::IronMeshClient::from_direct_base_url("http://127.0.0.1:0/");
-        Ok(Self {
-            runtime: build_runtime()?,
-            sdk,
-            client,
-            client_identity: None,
-            connection_name: None,
-            title_latency_monitor: Mutex::new(TitleLatencyMonitor::disabled()),
-        })
     }
 
     pub fn with_sdk(
@@ -574,12 +548,12 @@ fn web_ui_server_state() -> &'static Mutex<Option<WebUiServer>> {
 }
 
 fn start_embedded_web_ui(
-    connection_input: String,
+    bootstrap_json: String,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
 ) -> Result<EmbeddedWebUiLaunch> {
     let runtime = web_ui_runtime()?;
-    let connection_input = normalized_connection_input_string(connection_input)?;
+    let bootstrap_json = normalized_bootstrap_json(bootstrap_json)?;
     let server_ca_pem = normalize_optional_string(server_ca_pem);
     let client_identity_json = normalize_optional_string(client_identity_json);
 
@@ -599,21 +573,19 @@ fn start_embedded_web_ui(
     let local_url = format!("http://127.0.0.1:{}/", address.port());
 
     let configured = IosStorageApp::configured(
-        connection_input.clone(),
+        bootstrap_json.clone(),
         server_ca_pem.clone(),
         client_identity_json.clone(),
         Some("ios-web-ui".to_string()),
     )?;
     let mut web_ui_config = web_ui_backend::WebUiConfig::from_client(configured.sdk.clone())
         .with_service_name("ironmesh-ios");
-    if connection_input.starts_with('{') {
-        let mut bootstrap = ConnectionBootstrap::from_json_str(&connection_input)
-            .context("failed to parse iOS bootstrap for embedded web ui")?;
-        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
-        }
-        web_ui_config = web_ui_config.with_connection_bootstrap(bootstrap);
+    let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
+        .context("failed to parse iOS bootstrap for embedded web ui")?;
+    if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+        bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
     }
+    web_ui_config = web_ui_config.with_connection_bootstrap(bootstrap);
     if let Some(identity) = configured.client_identity.clone() {
         web_ui_config = web_ui_config.with_client_identity(identity);
     }
@@ -1332,18 +1304,17 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
-fn normalized_connection_input_string(connection_input: impl Into<String>) -> Result<String> {
-    let connection_input = connection_input.into();
-    let trimmed = connection_input.trim();
+fn normalized_bootstrap_json(bootstrap_json: impl Into<String>) -> Result<String> {
+    let bootstrap_json = bootstrap_json.into();
+    let trimmed = bootstrap_json.trim();
     if trimmed.is_empty() {
-        anyhow::bail!("iOS client requires a non-empty connection input");
+        anyhow::bail!("iOS client requires a non-empty connection bootstrap");
     }
 
-    if trimmed.starts_with('{') {
-        return Ok(trimmed.to_string());
-    }
-
-    Ok(normalize_server_base_url(trimmed)?.to_string())
+    ConnectionBootstrap::from_json_str(trimmed)
+        .context("failed to parse iOS connection bootstrap JSON")?
+        .to_json_pretty()
+        .context("failed to normalize iOS connection bootstrap JSON")
 }
 
 fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>> {
@@ -1886,10 +1857,13 @@ mod tests {
     }
 
     fn create_handle_for_server(addr: SocketAddr) -> *mut c_void {
-        let url = format!("http://{addr}");
-        let url = CString::new(url).expect("url should be valid");
+        let bootstrap = build_test_bootstrap(format!("http://{addr}"), common::ClusterId::now_v7())
+            .to_json_pretty()
+            .expect("bootstrap should serialize");
+        let bootstrap = CString::new(bootstrap).expect("bootstrap should be valid");
         let mut error = ptr::null_mut();
-        let handle = ironmesh_ios_facade_create(url.as_ptr(), ptr::null(), ptr::null(), &mut error);
+        let handle =
+            ironmesh_ios_facade_create(bootstrap.as_ptr(), ptr::null(), ptr::null(), &mut error);
         if !error.is_null() {
             let message = unsafe { CStr::from_ptr(error).to_string_lossy().into_owned() };
             unsafe { ironmesh_ios_string_free(error) };
@@ -1938,6 +1912,18 @@ mod tests {
             device_label: Some("iphone".to_string()),
             device_id: None,
         }
+    }
+
+    #[test]
+    fn ios_client_rejects_legacy_direct_server_url() {
+        let error = normalized_bootstrap_json("https://storage.example.test")
+            .expect_err("a direct server URL must not be accepted as app configuration");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse iOS connection bootstrap JSON")
+        );
     }
 
     #[test]

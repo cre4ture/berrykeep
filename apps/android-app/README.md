@@ -1,14 +1,12 @@
 # Ironmesh Android (initial MVP)
 
-This is a standalone Kotlin Android app scaffold for local testing of `server-node`.
+This is the IronMesh Android app.
 
 ## Features (MVP)
 
-- Set server base URL
-- Health check (`GET /health`)
-- Replication plan summary (`GET /cluster/replication/plan`)
-- Upload/download via Rust `client-sdk` bridge when native library is available
-- Fallback HTTP/Retrofit path remains enabled if native bridge is not loaded
+- Enroll with a connection-bootstrap claim or import a connection-bootstrap bundle
+- Connect through the Rust `client-sdk` using the routes advertised by that bundle
+- Upload/download via the Rust `client-sdk` bridge
 - Open the client Web UI in a browser-powered Custom Tab when available, with fallback to an in-app `WebView`
 - Configure multiple folder-sync profiles (remote prefix <-> local folder)
 - Automatic periodic background folder sync (WorkManager) + manual "Sync Now"
@@ -45,18 +43,6 @@ Prerequisites for native bridge builds:
 - `IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD`
 
 In GitHub Actions, store the keystore itself as base64 in `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64`, decode it to a file, then export `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE` for Gradle before running `:app:assembleRelease`.
-
-## Local server notes
-
-For Android emulator, use:
-
-- `http://10.0.2.2:18080`
-
-For a physical device, use your host machine LAN IP.
-
-## Cleartext HTTP
-
-The app currently allows cleartext traffic (`usesCleartextTraffic=true`) for local development.
 
 ## Rust bridge notes
 

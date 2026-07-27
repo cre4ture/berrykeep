@@ -50,7 +50,7 @@ class RendezvousCertificateRenewalInstrumentationTest {
 
         val authBeforeRequest = IronmeshPreferences.getDeviceAuthState(appContext)
         val responseJson = RustClientBridge.storeIndex(
-            authBeforeRequest.preferredConnectionInput(),
+            authBeforeRequest.connectionBootstrapJson(),
             null,
             1,
             null,
@@ -147,8 +147,7 @@ class RendezvousCertificateRenewalInstrumentationTest {
             clusterId = json.requiredTrimmedString("cluster_id"),
             deviceId = json.requiredTrimmedString("device_id"),
             label = json.optionalTrimmedString("label"),
-            connectionBootstrapJson = connectionBootstrapJson.trim(),
-            directServerBaseUrl = "",
+            connectionInput = connectionBootstrapJson.trim(),
             serverCaPem = null,
             publicKeyPem = json.requiredTrimmedString("public_key_pem"),
             privateKeyPem = json.requiredTrimmedString("private_key_pem"),

@@ -227,7 +227,7 @@ class DeviceAuthStatePersistenceTest {
             events = events,
         )
         val persistence = DeviceAuthStatePersistence(preferences, secretStore, codec)
-        val bootstrapOnlyState = DeviceAuthState(connectionBootstrapJson = "{\"version\":2}")
+        val bootstrapOnlyState = DeviceAuthState(connectionInput = "{\"version\":2}")
 
         assertThrows(TestFailure::class.java) {
             persistence.save(bootstrapOnlyState)
@@ -342,8 +342,7 @@ class DeviceAuthStatePersistenceTest {
             clusterId = "cluster-1",
             deviceId = deviceId,
             label = "Phone",
-            connectionBootstrapJson = "{\"version\":1}",
-            directServerBaseUrl = "https://storage.example.test/",
+            connectionInput = "{\"version\":1}",
             serverCaPem = "demo-ca",
             publicKeyPem = "public-key",
             privateKeyPem = privateKeyPem,
