@@ -804,6 +804,33 @@ export type StoragePoolRebalanceReport = {
   skipped_invalid_entries: number;
 };
 
+export type HostStorageVolume = {
+  name: string;
+  mount_path: string;
+  file_system: string;
+  total_bytes: number;
+  available_bytes: number;
+  removable: boolean;
+  read_only: boolean;
+};
+
+export type HostStorageInventoryResponse = {
+  platform: string;
+  volumes: HostStorageVolume[];
+};
+
+export type PrepareHostStorageDirectoryRequest = {
+  mount_path: string;
+  directory_name: string;
+};
+
+export type PrepareHostStorageDirectoryResponse = {
+  mount_path: string;
+  path: string;
+  directory_created: boolean;
+  write_check: "passed";
+};
+
 export type StorageStatsCurrentResponse = {
   sample?: StorageStatsSample | null;
   collecting: boolean;

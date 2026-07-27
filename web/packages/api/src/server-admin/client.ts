@@ -30,6 +30,9 @@ import type {
   DataScrubTriggerResponse,
   HardwareHealthCurrentResponse,
   HostDependencyReport,
+  HostStorageInventoryResponse,
+  PrepareHostStorageDirectoryRequest,
+  PrepareHostStorageDirectoryResponse,
   LogsResponse,
   ManagedControlPlanePromotionPackage,
   ManagedRendezvousFailoverImportResponse,
@@ -849,6 +852,28 @@ export async function rebalanceStoragePool(
     method: "POST",
     adminTokenOverride
   });
+}
+
+export async function getHostStorageVolumes(
+  adminTokenOverride?: string
+): Promise<HostStorageInventoryResponse> {
+  return fetchAdminJson<HostStorageInventoryResponse>(apiV1("/auth/storage/host/volumes"), {
+    adminTokenOverride
+  });
+}
+
+export async function prepareHostStorageDirectory(
+  request: PrepareHostStorageDirectoryRequest,
+  adminTokenOverride?: string
+): Promise<PrepareHostStorageDirectoryResponse> {
+  return fetchAdminJson<PrepareHostStorageDirectoryResponse>(
+    apiV1("/auth/storage/host/volumes/prepare"),
+    {
+      method: "POST",
+      body: request,
+      adminTokenOverride
+    }
+  );
 }
 
 export async function getProcessStatsCurrent(

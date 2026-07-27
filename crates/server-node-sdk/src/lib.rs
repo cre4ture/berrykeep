@@ -127,6 +127,7 @@ use x509_parser::prelude::FromDer;
 mod cluster;
 mod embedded_rendezvous;
 mod hardware_health;
+mod host_storage;
 mod listing;
 mod map_config;
 mod map_dataset_import;
@@ -225,6 +226,7 @@ use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
     ReplicationPlan, ReplicationPolicy,
 };
+use host_storage::PrepareHostStorageDirectoryRequest;
 use setup::{
     ManagedRendezvousFailoverDeploymentTarget, ManagedRendezvousFailoverExportParams,
     ManagedRendezvousFailoverPackage, ManagedSignerBackup,
@@ -7445,6 +7447,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             post(validate_storage_pool_config_handler),
         )
         .route("/auth/storage/pool/rebalance", post(rebalance_storage_pool))
+        .route("/auth/storage/host/volumes", get(host_storage_volumes))
+        .route(
+            "/auth/storage/host/volumes/prepare",
+            post(prepare_host_storage_directory),
+        )
         .route("/auth/versions/{key}", get(list_versions_admin))
         .route(
             "/auth/versions/{key}/restore/{version_id}",
@@ -24233,6 +24240,81 @@ async fn storage_pool_status(
         }
     };
     (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn host_storage_volumes(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "storage_host_volumes_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    (StatusCode::OK, Json(host_storage::inventory())).into_response()
+}
+
+async fn prepare_host_storage_directory(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<PrepareHostStorageDirectoryRequest>,
+) -> impl IntoResponse {
+    let action = "storage_host_directory_prepare";
+    let audit_details = json!({
+        "mount_path": request.mount_path,
+        "directory_name": request.directory_name,
+    });
+    let authz =
+        match authorize_admin_request(&state, &headers, action, false, true, audit_details.clone())
+            .await
+        {
+            Ok(request) => request,
+            Err(status) => return status.into_response(),
+        };
+
+    match host_storage::prepare_directory(&request).await {
+        Ok(response) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                false,
+                true,
+                "success",
+                json!({
+                    "mount_path": response.mount_path,
+                    "path": response.path,
+                    "directory_created": response.directory_created,
+                }),
+            )
+            .await;
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(error) => {
+            let message = error.to_string();
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                false,
+                true,
+                "preflight_failed",
+                json!({ "error": message, "request": audit_details }),
+            )
+            .await;
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+        }
+    }
 }
 
 async fn validate_storage_pool_config_handler(
