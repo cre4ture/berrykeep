@@ -10,15 +10,16 @@ can benefit from Bazel's dependency-aware cache.
 
 The current native targets are:
 
-- `//crates/sync-core:unit_test`
 - `//crates/common:unit_test`
+- `//crates/rendezvous-server:unit_test`
+- `//crates/sync-core:unit_test`
 - `//crates/transport-sdk:unit_test`
 
-`transport-sdk` consumes the native `//crates/common:common` target, so changes
-to the shared workspace crate invalidate its Bazel actions without introducing
-a duplicate generated crate. This establishes the dependency layer needed for
-the next `rendezvous-server` and `client-sdk` targets. Run the current Bazel
-unit suite with:
+`transport-sdk` consumes the native `//crates/common:common` target, while
+`rendezvous-server` consumes both native targets. Changes to either dependency
+therefore invalidate the server's Bazel actions without introducing duplicate
+generated crates. This establishes the dependency layer needed for the next
+`client-sdk` target. Run the current Bazel unit suite with:
 
 ```bash
 bazel test //:unit
