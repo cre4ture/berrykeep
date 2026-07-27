@@ -44,24 +44,33 @@ Bazel can invalidate only direct and transitive consumers of changed sources.
 
 ## Remote cache setup
 
-The `Bazel` workflow operates without a remote cache, but consumes one as soon
-as the following repository settings exist:
+The `Bazel` workflow uses
+[`cre4ture/bazel-github-actions-cache-v2`](https://github.com/cre4ture/bazel-github-actions-cache-v2)
+at an immutable commit SHA. The action starts an HTTP cache on the runner's
+loopback interface and stores each validated Bazel AC/CAS object in GitHub
+Actions cache v2. It therefore needs no external server, repository secret, or
+manual repository setting.
 
-1. Provision an HTTPS or `grpcs` endpoint that implements Bazel's remote-cache
-   protocol (for example a managed service or a maintained `bazel-remote`
-   deployment).
-2. Add its endpoint as the repository variable `BAZEL_REMOTE_CACHE_URL`.
-3. If authentication is required, add a bearer token as the repository secret
-   `BAZEL_REMOTE_CACHE_TOKEN`.
-4. Grant the token read/write access only to trusted repository CI. PRs from
-   forks do not receive repository secrets and deliberately fall back to local
-   execution, preventing cache poisoning.
-5. Set retention and a storage quota at the cache backend. The cache is shared
-   across revisions by action-content hash, so do not partition it by branch.
+The normal trust policy is automatic:
 
-The workflow deliberately does not include a cache URL, credential or hosted
-service choice. Those are infrastructure decisions outside the repository and
-must be supplied by a maintainer with access to the selected backend.
+- a push to the default branch can publish cache entries;
+- pull requests, including same-repository PRs, are read-only;
+- fork pull requests remain read-only even if a workflow requests writes;
+- a maintainer can explicitly select `write_cache` in a manual workflow run to
+  seed that branch's cache before merge.
+
+GitHub's cache scope rules make entries written on the default branch readable
+from later pull requests. Different revisions do not replace one shared
+archive: Bazel objects have immutable content/action keys and coexist until
+GitHub's repository quota or eviction policy removes cold entries.
+
+This adapter is intentionally experimental. GitHub does not promise its runner
+cache-v2 upload/download protocol as a stable public API. The current adapter
+also maps one Bazel object to one GitHub cache entry and rate-limits
+publication, so a conventional remote cache remains the better option for a
+large build graph. Cache misses and backend failures are fail-open by default
+and never affect build correctness. See the action's README for current
+protocol, quota, compression, and runner-platform limitations.
 
 ## Migration order
 

@@ -30,6 +30,12 @@ on:
       - 'crates/**'
       - '.github/workflows/bazel.yml'
   workflow_dispatch:
+    inputs:
+      write_cache:
+        description: Seed the branch-scoped Bazel cache from this trusted run
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -42,13 +48,6 @@ jobs:
   unit:
     name: Bazel unit
     runs-on: ubuntu-latest
-    env:
-      # Configure these in the repository settings once a Bazel remote-cache
-      # backend is available. Fork PRs receive neither secrets nor cache
-      # access; trusted PRs and main can populate the shared cache.
-      BAZEL_REMOTE_CACHE_URL: ${{ vars.BAZEL_REMOTE_CACHE_URL }}
-      BAZEL_REMOTE_CACHE_TOKEN: ${{ secrets.BAZEL_REMOTE_CACHE_TOKEN }}
-      REMOTE_CACHE_WRITABLE: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,19 +55,22 @@ jobs:
       - name: Set up Bazel
         uses: bazel-contrib/setup-bazel@0.19.0
 
+      - name: Start GitHub-backed Bazel cache
+        id: bazel-cache
+        uses: cre4ture/bazel-github-actions-cache-v2@389eae8501ff832fd7f51bbf0950ca7302750983 # v0.1.0
+        with:
+          # Default-branch pushes publish; PRs are read-only. A maintainer can
+          # explicitly seed the selected branch from workflow_dispatch.
+          write: ${{ github.event_name == 'workflow_dispatch' && inputs.write_cache && 'true' || 'auto' }}
+          key-prefix: ironmesh-bazel-v1
+
       - name: Test native Bazel targets
         shell: bash
+        env:
+          BAZEL_REMOTE_CACHE_URL: ${{ steps.bazel-cache.outputs.url }}
+          BAZEL_REMOTE_CACHE_WRITABLE: ${{ steps.bazel-cache.outputs.writable }}
         run: |
           set -euo pipefail
-          cache_args=()
-          # Require the credential as well as the endpoint. This makes fork
-          # PRs fall back to local execution instead of failing against a
-          # private cache without a secret.
-          if [ -n "${BAZEL_REMOTE_CACHE_URL}" ] && [ -n "${BAZEL_REMOTE_CACHE_TOKEN}" ]; then
-            cache_args+=("--remote_cache=${BAZEL_REMOTE_CACHE_URL}")
-            cache_args+=("--remote_header=Authorization=Bearer ${BAZEL_REMOTE_CACHE_TOKEN}")
-            if [ "${REMOTE_CACHE_WRITABLE}" != "true" ]; then
-              cache_args+=("--remote_upload_local_results=false")
-            fi
-          fi
-          bazel test //:unit "${cache_args[@]}"
+          bazel test //:unit \
+            "--remote_cache=${BAZEL_REMOTE_CACHE_URL}" \
+            "--remote_upload_local_results=${BAZEL_REMOTE_CACHE_WRITABLE}"
