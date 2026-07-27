@@ -1,18 +1,21 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
-# This is the first native Bazel target in the workspace. It deliberately uses
-# the dependency information generated from Cargo.toml so that Cargo remains
-# the single source of truth while Bazel owns the action graph and cache keys.
+# First-party workspace dependencies are native targets because Crate Universe
+# deliberately omits them from all_crate_deps.
 rust_library(
-    name = "sync_core",
+    name = "client_sdk",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
-    crate_name = "sync_core",
+    crate_name = "client_sdk",
     crate_root = "src/lib.rs",
     edition = crate_edition(),
     visibility = ["//crates:__subpackages__"],
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + [
+        "//crates/common",
+        "//crates/sync-core:sync_core",
+        "//crates/transport-sdk:transport_sdk",
+    ],
 )
 
 rust_test(
@@ -22,8 +25,10 @@ rust_test(
         normal_dev = True,
         proc_macro_dev = True,
     ),
-    crate = ":sync_core",
+    crate = ":client_sdk",
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
-    deps = all_crate_deps(normal_dev = True),
+    deps = all_crate_deps(normal_dev = True) + [
+        "//crates/rendezvous-server:rendezvous_server",
+    ],
 )
