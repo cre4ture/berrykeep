@@ -173,6 +173,19 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(ffi.lastRouteSnapshotRefresh, true)
     }
 
+    func testForegroundNotificationForwardsRenewedIdentityForPersistence() throws {
+        let ffi = MockFFI()
+        ffi.clientIdentityUpdateJSON = #"{"device_id":"renewed-device"}"#
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+
+        try bridge.notifyForegrounded()
+        let update = try bridge.takeClientIdentityUpdateJSON()
+
+        XCTAssertEqual(ffi.foregroundNotificationCount, 1)
+        XCTAssertEqual(update, ffi.clientIdentityUpdateJSON)
+    }
+
     func testTitleLatencyMonitorForwardsConfiguredPeriod() throws {
         let ffi = MockFFI()
         ffi.titleLatencyStatusResponseJSON = #"{"state":"pending","connection_type":"direct"}"#
@@ -276,8 +289,10 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var relativeResponseData = Data()
     var diagnosticsResponseJSON = #"{"endpoints":[]}"#
     var routeSnapshotResponseJSON = #"{"ranked_indices":[],"endpoints":[]}"#
+    var clientIdentityUpdateJSON = ""
     var webUIURL = #"{"url":"http://127.0.0.1:4100/","authorization":"test-session"}"#
     var lastRouteSnapshotRefresh: Bool?
+    var foregroundNotificationCount = 0
     var lastTitleLatencyEnabled: Bool?
     var lastTitleLatencyPeriodSeconds: UInt64?
     var titleLatencyStatusResponseJSON = #"{"state":"disabled","connection_type":"unknown"}"#
@@ -406,6 +421,16 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = handle
         lastRouteSnapshotRefresh = refresh
         return routeSnapshotResponseJSON
+    }
+
+    func notifyForegrounded(handle: AppleRustHandle) throws {
+        _ = handle
+        foregroundNotificationCount += 1
+    }
+
+    func takeClientIdentityUpdateJSON(handle: AppleRustHandle) throws -> String {
+        _ = handle
+        return clientIdentityUpdateJSON
     }
 
     func configureTitleLatencyMonitorJSON(

@@ -5,6 +5,7 @@ pub mod content_addressed_client_cache;
 pub mod device_auth;
 pub mod ironmesh_client;
 pub mod latency_probe;
+mod managed_client;
 pub mod remote_sync;
 mod session_pool;
 
@@ -48,6 +49,10 @@ pub use latency_probe::{
     TITLE_LATENCY_PROBE_MAX_PERIOD_SECONDS, TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS,
     TitleLatencyConnectionType, TitleLatencyMonitor, TitleLatencyProbeConfig,
     TitleLatencyProbeState, TitleLatencyProbeStatus, compare_direct_and_relay_latency,
+};
+pub use managed_client::{
+    ManagedClientOptions, ManagedIronMeshClient, RouteDiscoveryError, RouteRefreshOutcome,
+    RouteRefreshReason,
 };
 pub use remote_sync::{
     RemoteSnapshotFetchProgress, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,

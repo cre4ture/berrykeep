@@ -857,8 +857,14 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "slow unfinished candidates must not hold up startup"
         );
-        assert_eq!(ordered[0].direct_server_base_url(), Some(fast_url.as_str()));
-        assert_eq!(ordered[1].direct_server_base_url(), Some(slow_url.as_str()));
+        assert_eq!(
+            ordered[0].direct_server_base_url().as_deref(),
+            Some(fast_url.as_str())
+        );
+        assert_eq!(
+            ordered[1].direct_server_base_url().as_deref(),
+            Some(slow_url.as_str())
+        );
         fast_server.join().expect("fast server should finish");
         slow_server.join().expect("slow server should finish");
     }

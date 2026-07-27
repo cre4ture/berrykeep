@@ -315,6 +315,28 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return consumeString(jsonPointer)
     }
 
+    func notifyForegrounded(handle: AppleRustHandle) throws {
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_notify_foregrounded(handle, &errorPointer)
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+    }
+
+    func takeClientIdentityUpdateJSON(handle: AppleRustHandle) throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_take_client_identity_update_json(
+            handle,
+            &jsonPointer,
+            &errorPointer
+        )
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no client identity update JSON.")
+        }
+        return consumeString(jsonPointer)
+    }
+
     func configureTitleLatencyMonitorJSON(
         handle: AppleRustHandle,
         enabled: Bool,

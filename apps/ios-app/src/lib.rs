@@ -5,10 +5,10 @@ use client_sdk::EnrolledClientConnection;
 use client_sdk::{
     ClientConnectionAttempt, ClientConnectionDiagnostics, ClientConnectionRouteSnapshot,
     ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    ObjectHeadInfo, StoreIndexEntry, StoreIndexMediaFilter, StoreIndexRequestOptions,
-    StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, TitleLatencyMonitor,
-    TitleLatencyProbeConfig, TitleLatencyProbeStatus, VersionGraphSummary,
-    enroll_client_connection_blocking, normalize_server_base_url,
+    ManagedClientOptions, ManagedIronMeshClient, ObjectHeadInfo, StoreIndexEntry,
+    StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder,
+    StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig, TitleLatencyProbeStatus,
+    VersionGraphSummary, enroll_client_connection_blocking, normalize_server_base_url,
 };
 use common::StorageObjectMeta;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ const FFI_ERR: c_int = 1;
 pub struct IosStorageApp {
     runtime: Runtime,
     sdk: client_sdk::IronMeshClient,
+    managed_client: Option<ManagedIronMeshClient>,
     client: ClientNode,
     client_identity: Option<ClientIdentityMaterial>,
     connection_name: Option<String>,
@@ -255,27 +256,49 @@ impl IosStorageApp {
             .transpose()
             .context("failed to parse iOS client identity JSON")?;
 
-        let mut sdk = if connection_input.starts_with('{') {
+        let runtime = build_runtime()?;
+        let (mut sdk, client_identity, managed_client) = if connection_input.starts_with('{') {
             let mut bootstrap = ConnectionBootstrap::from_json_str(&connection_input)
                 .context("failed to parse iOS connection bootstrap JSON")?;
             if let Some(server_ca_pem) = server_ca_pem.as_ref() {
                 bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
             }
-            match client_identity.as_ref() {
-                Some(identity) => bootstrap.build_client_with_identity(identity)?,
-                None => bootstrap.build_client()?,
+            match client_identity {
+                Some(identity) => {
+                    let managed_client =
+                        runtime.block_on(bootstrap.build_managed_client_with_identity(
+                            identity.clone(),
+                            ManagedClientOptions::default(),
+                        ))?;
+                    let updated_identity =
+                        managed_client.latest_identity_update().unwrap_or(identity);
+                    (
+                        managed_client.client(),
+                        Some(updated_identity),
+                        Some(managed_client),
+                    )
+                }
+                None => (bootstrap.build_client()?, None, None),
             }
         } else {
-            match client_identity.as_ref() {
-                Some(identity) => client_sdk::build_http_client_with_identity_from_pem(
-                    server_ca_pem.as_deref(),
-                    &connection_input,
-                    identity,
-                )?,
-                None => client_sdk::build_http_client_from_pem(
-                    server_ca_pem.as_deref(),
-                    &connection_input,
-                )?,
+            match client_identity {
+                Some(identity) => (
+                    client_sdk::build_http_client_with_identity_from_pem(
+                        server_ca_pem.as_deref(),
+                        &connection_input,
+                        &identity,
+                    )?,
+                    Some(identity),
+                    None,
+                ),
+                None => (
+                    client_sdk::build_http_client_from_pem(
+                        server_ca_pem.as_deref(),
+                        &connection_input,
+                    )?,
+                    None,
+                    None,
+                ),
             }
         };
 
@@ -283,7 +306,13 @@ impl IosStorageApp {
             sdk = sdk.with_connection_name(name.clone());
         }
 
-        Self::with_sdk(sdk, client_identity, connection_name)
+        Self::with_configured_sdk(
+            runtime,
+            sdk,
+            client_identity,
+            connection_name,
+            managed_client,
+        )
     }
 
     pub fn configured_from_bootstrap(
@@ -298,6 +327,7 @@ impl IosStorageApp {
         Ok(Self {
             runtime: build_runtime()?,
             sdk,
+            managed_client: None,
             client,
             client_identity: None,
             connection_name: None,
@@ -310,10 +340,27 @@ impl IosStorageApp {
         client_identity: Option<ClientIdentityMaterial>,
         connection_name: Option<String>,
     ) -> Result<Self> {
+        Self::with_configured_sdk(
+            build_runtime()?,
+            sdk,
+            client_identity,
+            connection_name,
+            None,
+        )
+    }
+
+    fn with_configured_sdk(
+        runtime: Runtime,
+        sdk: client_sdk::IronMeshClient,
+        client_identity: Option<ClientIdentityMaterial>,
+        connection_name: Option<String>,
+        managed_client: Option<ManagedIronMeshClient>,
+    ) -> Result<Self> {
         let client = ClientNode::with_client(sdk.clone());
         Ok(Self {
-            runtime: build_runtime()?,
+            runtime,
             sdk,
+            managed_client,
             client,
             client_identity,
             connection_name,
@@ -412,11 +459,31 @@ impl IosStorageApp {
 
     pub fn connection_route_snapshot(&self, refresh: bool) -> ClientConnectionRouteSnapshot {
         if refresh {
+            if let Some(managed_client) = self.managed_client.as_ref() {
+                let _ = self.runtime.block_on(
+                    managed_client
+                        .refresh_routes(client_sdk::RouteRefreshReason::ExplicitDiagnosticRequest),
+                );
+            }
             self.runtime
                 .block_on(self.sdk.refresh_connection_route_snapshot())
         } else {
             self.sdk.connection_route_snapshot()
         }
+    }
+
+    pub fn notify_foregrounded(&self) {
+        if let Some(managed_client) = self.managed_client.as_ref() {
+            let _ = self.runtime.block_on(managed_client.notify_foregrounded());
+        }
+    }
+
+    pub fn take_client_identity_update_json(&self) -> Result<Option<String>> {
+        self.managed_client
+            .as_ref()
+            .and_then(ManagedIronMeshClient::take_identity_update)
+            .map(|identity| identity.to_json_pretty())
+            .transpose()
     }
 
     pub fn configure_title_latency_monitor(
@@ -810,6 +877,19 @@ fn connection_route_snapshot_json(handle: *mut c_void, refresh: bool) -> Result<
 }
 
 #[allow(unsafe_code)]
+fn notify_foregrounded(handle: *mut c_void) -> Result<()> {
+    let app = unsafe { handle_to_app(handle)? };
+    app.notify_foregrounded();
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn take_client_identity_update_json(handle: *mut c_void) -> Result<String> {
+    let app = unsafe { handle_to_app(handle)? };
+    Ok(app.take_client_identity_update_json()?.unwrap_or_default())
+}
+
+#[allow(unsafe_code)]
 fn configure_title_latency_monitor_json(
     handle: *mut c_void,
     enabled: bool,
@@ -1035,6 +1115,41 @@ pub extern "C" fn ironmesh_ios_facade_connection_route_snapshot_json(
     clear_error(out_error);
     run_ffi_string_result(out_json, out_error, || {
         connection_route_snapshot_json(handle, refresh != 0)
+    })
+}
+
+/// Gives a suspended iOS client an opportunistic shared-route refresh when the
+/// app returns to the foreground. It does not create a permanent background task.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_notify_foregrounded(
+    handle: *mut c_void,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_error(out_error);
+    match notify_foregrounded(handle) {
+        Ok(()) => FFI_OK,
+        Err(error) => {
+            write_error(out_error, error);
+            FFI_ERR
+        }
+    }
+}
+
+/// Returns a renewed serialized identity once for the Swift/App Group owner to
+/// persist. An empty string means that no renewal has occurred since the previous
+/// call; the in-memory managed client remains usable either way.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_take_client_identity_update_json(
+    handle: *mut c_void,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        take_client_identity_update_json(handle)
     })
 }
 

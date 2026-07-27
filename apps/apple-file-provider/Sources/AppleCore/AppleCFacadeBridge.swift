@@ -51,6 +51,8 @@ public protocol AppleManualCBridgeFFI: Sendable {
     ) throws
     func connectionDiagnosticsJSON(handle: AppleRustHandle) throws -> String
     func connectionRouteSnapshotJSON(handle: AppleRustHandle, refresh: Bool) throws -> String
+    func notifyForegrounded(handle: AppleRustHandle) throws
+    func takeClientIdentityUpdateJSON(handle: AppleRustHandle) throws -> String
     func configureTitleLatencyMonitorJSON(
         handle: AppleRustHandle,
         enabled: Bool,
@@ -338,6 +340,18 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     public func connectionRouteSnapshotJSON(refresh: Bool) throws -> String {
         try withHandle { handle in
             try ffi.connectionRouteSnapshotJSON(handle: handle, refresh: refresh)
+        }
+    }
+
+    public func notifyForegrounded() throws {
+        try withHandle { handle in
+            try ffi.notifyForegrounded(handle: handle)
+        }
+    }
+
+    public func takeClientIdentityUpdateJSON() throws -> String {
+        try withHandle { handle in
+            try ffi.takeClientIdentityUpdateJSON(handle: handle)
         }
     }
 

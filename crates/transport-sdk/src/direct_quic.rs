@@ -299,14 +299,8 @@ pub fn direct_quic_endpoint_url(endpoint_id: &str) -> String {
 }
 
 pub fn endpoint_id_from_candidate(candidate: &ConnectionCandidate) -> Result<String> {
-    if let Some(transport_id) = candidate
-        .transport_hints
-        .as_ref()
-        .and_then(|hints| hints.transport_id.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(transport_id.to_string());
+    if candidate.kind != CandidateKind::DirectQuic {
+        bail!("endpoint id extraction requires a direct QUIC candidate");
     }
 
     let url = reqwest::Url::parse(candidate.endpoint.trim())
@@ -314,8 +308,8 @@ pub fn endpoint_id_from_candidate(candidate: &ConnectionCandidate) -> Result<Str
     if url.scheme() != DIRECT_QUIC_ENDPOINT_SCHEME {
         bail!("direct QUIC candidate endpoint must use {DIRECT_QUIC_ENDPOINT_SCHEME}:// scheme");
     }
-
-    url.host_str()
+    let endpoint_id = url
+        .host_str()
         .map(ToString::to_string)
         .or_else(|| {
             let value = candidate
@@ -325,7 +319,22 @@ pub fn endpoint_id_from_candidate(candidate: &ConnectionCandidate) -> Result<Str
                 .trim_matches('/');
             (!value.is_empty()).then_some(value.to_string())
         })
-        .ok_or_else(|| anyhow!("direct QUIC candidate endpoint is missing endpoint id"))
+        .ok_or_else(|| anyhow!("direct QUIC candidate endpoint is missing endpoint id"))?;
+
+    if let Some(transport_id) = candidate
+        .transport_hints
+        .as_ref()
+        .and_then(|hints| hints.transport_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && transport_id != endpoint_id
+    {
+        bail!(
+            "direct QUIC candidate transport_id {transport_id} does not match endpoint id {endpoint_id}"
+        );
+    }
+
+    Ok(endpoint_id)
 }
 
 pub fn endpoint_addr_from_candidate(candidate: &ConnectionCandidate) -> Result<EndpointAddr> {
@@ -411,6 +420,23 @@ fn write_error_to_io_error(error: iroh::endpoint::WriteError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_candidate_with_mismatched_authenticated_transport_id() {
+        let candidate = ConnectionCandidate {
+            kind: CandidateKind::DirectQuic,
+            endpoint: "iroh://endpoint-key-a".to_string(),
+            rtt_ms: None,
+            transport_hints: Some(ConnectionCandidateTransportHints {
+                transport_id: Some("endpoint-key-b".to_string()),
+                ..ConnectionCandidateTransportHints::default()
+            }),
+        };
+
+        let error = endpoint_id_from_candidate(&candidate)
+            .expect_err("mismatched endpoint ids must be rejected");
+        assert!(error.to_string().contains("does not match"));
+    }
 
     #[test]
     fn snapshot_serializes_to_direct_quic_candidate() {
