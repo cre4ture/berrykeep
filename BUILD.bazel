@@ -4,6 +4,7 @@ test_suite(
     name = "unit",
     tests = [
         "//crates/common:unit_test",
+        "//crates/rendezvous-server:unit_test",
         "//crates/sync-core:unit_test",
         "//crates/transport-sdk:unit_test",
     ],
