@@ -56,6 +56,28 @@ powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Build-M
   -TimestampUrl https://<approved-rfc3161-timestamp-service>
 ```
 
+## Automatic updates
+
+Release MSIs embed a pinned release-signing certificate thumbprint and an
+initially disabled stable-release manifest URL. An administrator can opt in to
+a daily `SYSTEM` scheduled task that downloads only a CMS-signed manifest and
+a matching Authenticode-signed MSI during a local maintenance window:
+
+```powershell
+& "${env:ProgramFiles}\BerryKeep\Server Node\Enable-ServerNodeAutoUpdate.ps1" `
+  -MaintenanceWindowStart "03:00" `
+  -MaintenanceWindowEnd "05:00"
+```
+
+Disable it with:
+
+```powershell
+& "${env:ProgramFiles}\BerryKeep\Server Node\Disable-ServerNodeAutoUpdate.ps1"
+```
+
+See [Automatic update operations](../../docs/windows-server-node-auto-update.md)
+for the signer checks, release assets, and failure handling.
+
 ## Install and first-run setup
 
 Run the generated package from an elevated PowerShell:

@@ -2,7 +2,7 @@
   <PropertyGroup>
     <OutputType>Package</OutputType>
     <InstallerPlatform>x64</InstallerPlatform>
-    <DefineConstants>$(DefineConstants);ProductVersion=$(ProductVersion);ServerNodeExecutable=$(ServerNodeExecutable);ServiceEnvironmentFile=$(ServiceEnvironmentFile)</DefineConstants>
+    <DefineConstants>$(DefineConstants);ProductVersion=$(ProductVersion);ServerNodeExecutable=$(ServerNodeExecutable);ServiceEnvironmentFile=$(ServiceEnvironmentFile);UpdateConfigurationFile=$(UpdateConfigurationFile)</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>

@@ -1,5 +1,22 @@
 # CI runbook
 
+## Signed Windows Server Node releases
+
+Pushing an annotated stable `vX.Y.Z` tag whose value matches
+`[workspace.package].version` starts the `Release` workflow. It builds the
+Windows Server Node MSI again from the tagged source, signs and timestamps it
+inside the protected `release-signing` environment, then publishes the MSI,
+signed stable manifest, and `SHA256SUMS` on the matching GitHub Release page.
+
+Configure these protected-environment values before tagging:
+
+- secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64` - base64-encoded PFX;
+- secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD` - PFX password;
+- variable `BERRYKEEP_WINDOWS_TIMESTAMP_URL` - approved RFC-3161 endpoint.
+
+The normal `Win Server MSI` CI job remains intentionally unsigned and uploads
+only a short-lived validation artifact. Never publish that artifact.
+
 ## Android release builds on pull requests
 
 Pull requests run the Android debug checks by default. To request the signed

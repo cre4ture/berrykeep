@@ -24,6 +24,7 @@ Read [references/ironmesh-release-facts.md](references/ironmesh-release-facts.md
 9. Update the release files.
 10. Commit, tag, and push using the repo's current release convention.
 11. Verify the pushed release commit on GitHub Actions.
+12. After pushing the annotated `vX.Y.Z` tag, use [../release-publish/SKILL.md](../release-publish/SKILL.md) to verify the signed release assets before declaring the release complete.
 
 ## Verify The Release Base First
 
@@ -66,3 +67,4 @@ Read [references/ironmesh-release-facts.md](references/ironmesh-release-facts.md
 - Push both the release commit and the release tag.
 - Confirm that the tag points at the intended commit.
 - Inspect the pushed release commit on GitHub Actions before declaring the release cut complete.
+- Confirm that the release workflow published the tag-matched GitHub release, its `SHA256SUMS`, and the signed Windows Server Node MSI when that installer is part of the release.

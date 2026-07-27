@@ -26,6 +26,19 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  workflow-lint:
+    name: Workflow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: Lint GitHub Actions workflows
+        run: '"$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml'
+
   workspace-check:
     name: Check
     runs-on: ubuntu-latest
@@ -915,6 +928,9 @@ jobs:
 
       - name: Build Windows Server Node MSI
         run: powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Build-Msi.ps1
+
+      - name: Test Windows Server Node updater scripts
+        run: powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Test-UpdateScripts.ps1
 
       - name: Upload unsigned MSI validation artifact
         uses: actions/upload-artifact@v4

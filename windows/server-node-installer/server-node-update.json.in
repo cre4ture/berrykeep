@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "enabled": false,
+  "manifestUri": "__UPDATE_MANIFEST_URI__",
+  "signatureUri": "__UPDATE_MANIFEST_SIGNATURE_URI__",
+  "signerThumbprint": "__SIGNING_CERTIFICATE_THUMBPRINT__",
+  "maintenanceWindow": {
+    "startLocal": "03:00",
+    "endLocal": "05:00"
+  }
+}

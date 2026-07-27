@@ -21,6 +21,7 @@
     <Feature Id="ServerNodeFeature" Title="BerryKeep Server Node" Level="1">
       <ComponentRef Id="ServerNodeService" />
       <ComponentRef Id="ServerNodeState" />
+      <ComponentRef Id="ServerNodeUpdateConfiguration" />
     </Feature>
   </Package>
 
@@ -33,6 +34,18 @@
               Id="ServerNodeExecutable"
               Source="$(var.ServerNodeExecutable)"
               KeyPath="yes" />
+            <File
+              Id="ServerNodeUpdateModule"
+              Source="ServerNodeUpdate.psm1" />
+            <File
+              Id="ServerNodeUpdateScript"
+              Source="Update-ServerNode.ps1" />
+            <File
+              Id="ServerNodeUpdateEnableScript"
+              Source="Enable-ServerNodeAutoUpdate.ps1" />
+            <File
+              Id="ServerNodeUpdateDisableScript"
+              Source="Disable-ServerNodeAutoUpdate.ps1" />
             <ServiceInstall
               Id="BerryKeepServerNodeService"
               Name="BerryKeepServerNode"
@@ -112,6 +125,19 @@
               Protocol="tcp"
               Scope="localSubnet"
               Profile="private" />
+          </Component>
+          <Component
+            Id="ServerNodeUpdateConfiguration"
+            Guid="BCB96D74-B390-48B7-AB82-72391903B7BD"
+            Permanent="yes"
+            NeverOverwrite="yes">
+            <File
+              Id="ServerNodeUpdateConfigurationFile"
+              Source="$(var.UpdateConfigurationFile)"
+              Name="server-node-update.json"
+              KeyPath="yes">
+              <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)" />
+            </File>
           </Component>
         </Directory>
       </Directory>

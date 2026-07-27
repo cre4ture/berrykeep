@@ -15,6 +15,8 @@ Work pacing and delivery rules live in [PACE.md](PACE.md).
 Project-specific skills live in [skills/](skills/). Each subdirectory is a skill with its own `SKILL.md`. Read the relevant `SKILL.md` before performing the corresponding task.
 
 Available skills:
+- [skills/release-publish/](skills/release-publish/) - publishing a signed GitHub release
+- [skills/production-deploy/](skills/production-deploy/) - deploying a released artifact
 - [skills/pr-followup/](skills/pr-followup/) — following up on a pull request
 - [skills/release-commit/](skills/release-commit/) — creating a release commit
 - [skills/windows-ci-access/](skills/windows-ci-access/) — accessing the Windows CI environment

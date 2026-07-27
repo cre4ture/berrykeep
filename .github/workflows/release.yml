@@ -1,0 +1,207 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated vX.Y.Z tag to publish
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Validate annotated release tag and workspace version
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RELEASE_TAG" =~ ^v([1-9][0-9]*)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Release tags must use the stable vX.Y.Z form; received '$RELEASE_TAG'." >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -t "$RELEASE_TAG")" != "tag" ]; then
+            echo "Release tags must be annotated." >&2
+            exit 1
+          fi
+          workspace_version="$(python3 - <<'PY'
+          import tomllib
+          with open('Cargo.toml', 'rb') as cargo_toml:
+              print(tomllib.load(cargo_toml)['workspace']['package']['version'])
+          PY
+          )"
+          if [ "v$workspace_version" != "$RELEASE_TAG" ]; then
+            echo "Tag '$RELEASE_TAG' does not match workspace version '$workspace_version'." >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$workspace_version" >> "$GITHUB_OUTPUT"
+
+  windows-server-node:
+    name: Windows Server Node release
+    needs: validate
+    runs-on: windows-latest
+    environment: release-signing
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64: ${{ secrets.BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64 }}
+      BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+      BERRYKEEP_WINDOWS_TIMESTAMP_URL: ${{ vars.BERRYKEEP_WINDOWS_TIMESTAMP_URL }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install web workspace dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+
+      - name: Build, sign, and verify Windows Server Node MSI
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64) -or [string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD) -or [string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_TIMESTAMP_URL)) {
+            throw "The release-signing environment must provide the certificate, certificate password, and RFC-3161 timestamp URL."
+          }
+
+          $certificatePath = Join-Path $env:RUNNER_TEMP "berrykeep-release-signing.pfx"
+          [System.IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64))
+          $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($certificatePath, $env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD)
+          if (-not $certificate.HasPrivateKey) {
+            throw "The configured release certificate has no private key."
+          }
+
+          try {
+            & .\windows\server-node-installer\Build-Msi.ps1 `
+              -ProductVersion $env:RELEASE_VERSION `
+              -SigningCertificatePath $certificatePath `
+              -SigningCertificatePassword $env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD `
+              -SigningCertificateThumbprint $certificate.Thumbprint `
+              -TimestampUrl $env:BERRYKEEP_WINDOWS_TIMESTAMP_URL
+
+            $msi = Get-ChildItem -LiteralPath .\windows\server-node-installer\out -Filter *.msi -File -Recurse | Select-Object -First 1
+            if ($null -eq $msi) {
+              throw "The signed MSI build produced no MSI file."
+            }
+            $signature = Get-AuthenticodeSignature -LiteralPath $msi.FullName
+            if ($signature.Status -ne "Valid" -or $null -eq $signature.SignerCertificate -or (($signature.SignerCertificate.Thumbprint -replace '\s', '').ToUpperInvariant() -ne ($certificate.Thumbprint -replace '\s', '').ToUpperInvariant())) {
+              throw "The release MSI does not have the expected valid Authenticode signature."
+            }
+
+            $assetDirectory = Join-Path $env:RUNNER_TEMP "release-assets"
+            New-Item -ItemType Directory -Path $assetDirectory -Force | Out-Null
+            $assetName = "berrykeep-server-node-$($env:RELEASE_VERSION)-windows-x64.msi"
+            $assetPath = Join-Path $assetDirectory $assetName
+            Copy-Item -LiteralPath $msi.FullName -Destination $assetPath
+            $installerUri = "https://github.com/${{ github.repository }}/releases/download/$($env:RELEASE_TAG)/$assetName"
+            & .\windows\server-node-installer\New-ReleaseManifest.ps1 `
+              -MsiPath $assetPath `
+              -Version $env:RELEASE_VERSION `
+              -InstallerUri $installerUri `
+              -SigningCertificatePath $certificatePath `
+              -SigningCertificatePassword $env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD `
+              -OutputDirectory $assetDirectory
+          }
+          finally {
+            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Test Windows Server Node updater scripts
+        run: powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Test-UpdateScripts.ps1
+
+      - name: Upload release assets for publication
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-server-node
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub release
+    needs: [validate, windows-server-node]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Download signed release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows-server-node
+          path: release-assets
+
+      - name: Create release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum berrykeep-server-node-*.msi berrykeep-server-node-stable.json berrykeep-server-node-stable.json.p7s > SHA256SUMS
+
+      - name: Create or update GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --draft \
+              --title "BerryKeep $RELEASE_VERSION" \
+              --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
