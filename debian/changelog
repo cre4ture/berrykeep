@@ -1,3 +1,13 @@
+ironmesh (1.0.39-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add managed mobile Rendezvous routes and direct QUIC connection status.
+  * Extend server-node telemetry, storage administration, and Windows/macOS
+    server-node distribution support.
+  * Expand Bazel-based SDK validation and release CI coverage.
+  * Roll the workspace release to 1.0.39.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 27 Jul 2026 23:10:11 +0200
+
 ironmesh (1.0.38-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Improve client route selection and recovery diagnostics, including
