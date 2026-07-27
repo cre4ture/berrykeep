@@ -9,9 +9,6 @@ data class DeviceAuthState(
     val label: String? = null,
     @Json(name = "connectionInput")
     val connectionInput: String = "",
-    val connectionBootstrapJson: String = "",
-    @Json(name = "serverBaseUrl")
-    val directServerBaseUrl: String = "",
     val serverCaPem: String? = null,
     val publicKeyPem: String? = null,
     val privateKeyPem: String? = null,
@@ -28,24 +25,7 @@ data class DeviceAuthState(
                 !privateKeyPem.isNullOrBlank() &&
                 !credentialPem.isNullOrBlank())
 
-    fun preferredConnectionInput(): String {
-        val normalizedConnectionInput = connectionInput.trim()
-        if (normalizedConnectionInput.isNotEmpty()) {
-            return normalizedConnectionInput
-        }
-
-        val bootstrapJson = connectionBootstrapJson.trim()
-        if (bootstrapJson.isNotEmpty()) {
-            return bootstrapJson
-        }
-
-        val directBaseUrl = directServerBaseUrl.trim()
-        if (directBaseUrl.isNotEmpty()) {
-            return directBaseUrl
-        }
-
-        return ""
-    }
+    fun connectionBootstrapJson(): String = connectionInput.trim()
 
     fun toClientIdentityJson(): String? {
         clientIdentityJson?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }

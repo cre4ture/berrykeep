@@ -18,8 +18,6 @@
     <string>0.1</string>
     <key>CFBundleVersion</key>
     <string>1</string>
-    <key>IronmeshConnectionInput</key>
-    <string>127.0.0.1:18080</string>
     <key>IronmeshAppGroupIdentifier</key>
     <string>group.dev.ironmesh.apple.shared</string>
     <key>IronmeshKeychainAccessGroup</key>

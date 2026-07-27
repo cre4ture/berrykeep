@@ -17,19 +17,19 @@ final class IronmeshIosProjectTests: XCTestCase {
     }
 
     func testSharedPackageTypesAreAvailableToTheXcodeProject() {
-        let configuration = AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080")
+        let bootstrapJSON = #"{"version":1}"#
+        let configuration = AppleConnectionConfiguration(connectionInput: bootstrapJSON)
         let item = AppleFileProviderItem.file(
             path: "docs/readme.txt",
             objectID: "demo-object-id"
         )
 
-        XCTAssertEqual(configuration.normalizedConnectionInput, "http://127.0.0.1:18080/")
+        XCTAssertEqual(configuration.normalizedConnectionInput, bootstrapJSON)
         XCTAssertEqual(item.identifier.serialized, "file:object:demo-object-id")
     }
 
     func testBootstrapPayloadTakesPrecedenceForEffectiveConnection() {
         let draft = IronmeshConnectionDraft(
-            directConnectionInput: "10.0.0.8:8080",
             bootstrapInput: "{\"cluster\":true}"
         )
 
@@ -46,24 +46,23 @@ final class IronmeshIosProjectTests: XCTestCase {
         )
     }
 
-    func testApplyScannedCodeStoresDirectRouteWhenNeeded() {
+    func testApplyScannedCodeRejectsLegacyDirectServerURL() {
         var draft = IronmeshConnectionDraft()
 
         let applied = draft.applyScannedCode("storage.internal:9443")
 
-        XCTAssertTrue(applied)
-        XCTAssertEqual(draft.directConnectionInput, "storage.internal:9443")
-        XCTAssertEqual(draft.normalizedConnectionInput, "http://storage.internal:9443/")
+        XCTAssertFalse(applied)
+        XCTAssertFalse(draft.isConfigured)
     }
 
     func testEnrollmentSummaryReflectsIdentityAndBootstrap() {
-        let directOnly = IronmeshConnectionDraft(directConnectionInput: "127.0.0.1:8080")
+        let empty = IronmeshConnectionDraft()
         let bootstrapAndIdentity = IronmeshConnectionDraft(
             bootstrapInput: "{\"claim\":true}",
             clientIdentityJSON: "{\"device_id\":\"ios-demo\"}"
         )
 
-        XCTAssertEqual(directOnly.enrollmentSummary, "Direct route configured.")
+        XCTAssertEqual(empty.enrollmentSummary, "No bootstrap bundle configured yet.")
         XCTAssertEqual(
             bootstrapAndIdentity.enrollmentSummary,
             "Bootstrap bundle imported and client identity attached."

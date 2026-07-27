@@ -22,7 +22,7 @@ class IronmeshThumbnailStreamerTest {
         val output = ByteArrayOutputStream()
 
         streamer.streamTo(
-            connectionInput = "https://example.invalid/",
+            connectionInput = "{\"bootstrap\":true}",
             entry = sampleImageEntry(),
             output = output,
         )

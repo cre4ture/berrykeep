@@ -6,7 +6,7 @@ import Foundation
 extension IronmeshConnectionDraft {
     init(bundleConfiguration: IronmeshBundleConfiguration) {
         self.init(
-            directConnectionInput: bundleConfiguration.connectionInput,
+            bootstrapInput: bundleConfiguration.bootstrapJSON,
             domainIdentifier: bundleConfiguration.domainIdentifier,
             domainDisplayName: bundleConfiguration.domainDisplayName
         )
@@ -15,8 +15,9 @@ extension IronmeshConnectionDraft {
     init(bundleConfiguration: IronmeshBundleConfiguration, storedState: AppleStoredConnectionState) {
         self.init(
             deviceLabel: storedState.deviceLabel ?? "",
-            directConnectionInput: storedState.connectionInput ?? bundleConfiguration.connectionInput,
-            bootstrapInput: storedState.bootstrapInputDraft ?? "",
+            bootstrapInput: storedState.bootstrapInputDraft
+                ?? storedState.connectionInput
+                ?? bundleConfiguration.bootstrapJSON,
             serverCAPem: storedState.serverCAPem ?? "",
             clientIdentityJSON: storedState.clientIdentityJSON ?? "",
             enrolledDeviceID: storedState.deviceID ?? "",
@@ -377,7 +378,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
     func completeOnboarding() {
         guard draft.isConfigured else {
-            let message = "A bootstrap bundle or direct route is required."
+            let message = "A connection bootstrap bundle is required."
             lastErrorMessage = message
             statusText = message
             addAction("Onboarding blocked", detail: message)
@@ -414,7 +415,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
     func applyConnectionSettings() {
         guard draft.isConfigured else {
-            let message = "A bootstrap bundle or direct route is required."
+            let message = "A connection bootstrap bundle is required."
             lastErrorMessage = message
             statusText = message
             addAction("Settings blocked", detail: message)
@@ -750,7 +751,7 @@ final class IronmeshBrowserModel: ObservableObject {
         do {
             try settingsStore.save(
                 bundleDefaults.appliedConnectionState(
-                    defaultConnectionInput: bundleDefaults.directConnectionInput
+                    defaultBootstrapInput: bundleDefaults.bootstrapInput
                 )
             )
         } catch {
@@ -809,7 +810,7 @@ final class IronmeshBrowserModel: ObservableObject {
         do {
             try settingsStore.save(
                 clearedDraft.appliedConnectionState(
-                    defaultConnectionInput: bundleDefaults.directConnectionInput
+                    defaultBootstrapInput: bundleDefaults.bootstrapInput
                 )
             )
         } catch {
@@ -832,11 +833,11 @@ final class IronmeshBrowserModel: ObservableObject {
         if draft.applyScannedCode(scannedValue) {
             lastErrorMessage = nil
             statusText = "Imported scanned connection payload."
-            addAction("Imported QR payload", detail: draft.hasBootstrapPayload ? "Bootstrap bundle" : "Direct route")
+            addAction("Imported QR payload", detail: "Bootstrap bundle")
             return
         }
 
-        let message = "The scanned code did not contain a usable bootstrap or route."
+        let message = "The scanned code did not contain a usable connection bootstrap."
         lastErrorMessage = message
         statusText = message
         addAction("Ignored QR payload", detail: message)
@@ -883,8 +884,7 @@ final class IronmeshBrowserModel: ObservableObject {
                 }.value
 
                 var updatedDraft = draft
-                updatedDraft.directConnectionInput = enrollment.connectionInput
-                updatedDraft.bootstrapInput = ""
+                updatedDraft.bootstrapInput = enrollment.connectionInput
                 updatedDraft.serverCAPem = enrollment.serverCAPem ?? updatedDraft.serverCAPem
                 updatedDraft.clientIdentityJSON = enrollment.clientIdentityJSON
                 updatedDraft.enrolledDeviceID = enrollment.deviceID
@@ -919,7 +919,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
     func refreshConnectionDiagnostics() {
         guard let configuration = draft.connectionConfiguration else {
-            let message = "A bootstrap bundle or direct route is required."
+            let message = "A connection bootstrap bundle is required."
             lastErrorMessage = message
             statusText = message
             return
@@ -949,7 +949,7 @@ final class IronmeshBrowserModel: ObservableObject {
     func refreshConnectionPaths() {
         guard let configuration = draft.connectionConfiguration else {
             invalidateConnectionRouteState()
-            let message = "A bootstrap bundle or direct route is required."
+            let message = "A connection bootstrap bundle is required."
             connectionRoutesErrorMessage = message
             statusText = message
             return
@@ -1018,7 +1018,7 @@ final class IronmeshBrowserModel: ObservableObject {
                 updatedDraft.clientIdentityJSON = renewedIdentity
                 try settingsStore.save(
                     updatedDraft.appliedConnectionState(
-                        defaultConnectionInput: bundleDefaults.directConnectionInput
+                        defaultBootstrapInput: bundleDefaults.bootstrapInput
                     )
                 )
                 draft = updatedDraft
@@ -1036,7 +1036,7 @@ final class IronmeshBrowserModel: ObservableObject {
             closeGalleryMap()
         }
         guard let configuration = draft.connectionConfiguration else {
-            let message = "A bootstrap bundle or direct route is required."
+            let message = "A connection bootstrap bundle is required."
             lastErrorMessage = message
             statusText = message
             return
@@ -1083,7 +1083,7 @@ final class IronmeshBrowserModel: ObservableObject {
             closeWebUI()
         }
         guard let configuration = draft.connectionConfiguration else {
-            let message = "A bootstrap bundle or direct route is required."
+            let message = "A connection bootstrap bundle is required."
             lastErrorMessage = message
             statusText = message
             return
@@ -1291,7 +1291,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
     private func loadDirectory(request: AppleDirectoryLoadRequest, actionTitle: String) {
         guard let configuration = draft.connectionConfiguration else {
-            let message = "A bootstrap bundle or direct route is required."
+            let message = "A connection bootstrap bundle is required."
             lastErrorMessage = message
             statusText = message
             if directoryLoadCoordinator.acceptsCurrentDirectory(request), request.updatesCurrentPath {
@@ -1366,7 +1366,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
     private func syncSharedSettingsFromDraft() throws {
         try settingsStore.save(
-            draft.appliedConnectionState(defaultConnectionInput: bundleDefaults.directConnectionInput)
+            draft.appliedConnectionState(defaultBootstrapInput: bundleDefaults.bootstrapInput)
         )
     }
 

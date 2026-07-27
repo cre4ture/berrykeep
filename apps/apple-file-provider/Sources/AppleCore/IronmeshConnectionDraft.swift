@@ -2,7 +2,6 @@ import Foundation
 
 public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
     public var deviceLabel: String
-    public var directConnectionInput: String
     public var bootstrapInput: String
     public var serverCAPem: String
     public var clientIdentityJSON: String
@@ -12,7 +11,6 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
 
     public init(
         deviceLabel: String = "",
-        directConnectionInput: String = "",
         bootstrapInput: String = "",
         serverCAPem: String = "",
         clientIdentityJSON: String = "",
@@ -21,7 +19,6 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
         domainDisplayName: String = "BerryKeep"
     ) {
         self.deviceLabel = deviceLabel
-        self.directConnectionInput = directConnectionInput
         self.bootstrapInput = bootstrapInput
         self.serverCAPem = serverCAPem
         self.clientIdentityJSON = clientIdentityJSON
@@ -32,7 +29,6 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case deviceLabel
-        case directConnectionInput
         case bootstrapInput
         case serverCAPem
         case clientIdentityJSON
@@ -47,10 +43,6 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
             deviceLabel: try container.decodeIfPresent(
                 String.self,
                 forKey: .deviceLabel
-            ) ?? "",
-            directConnectionInput: try container.decodeIfPresent(
-                String.self,
-                forKey: .directConnectionInput
             ) ?? "",
             bootstrapInput: try container.decodeIfPresent(
                 String.self,
@@ -83,7 +75,6 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
         // Decode the legacy identity for migration, but never encode it again.
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(deviceLabel, forKey: .deviceLabel)
-        try container.encode(directConnectionInput, forKey: .directConnectionInput)
         try container.encode(bootstrapInput, forKey: .bootstrapInput)
         try container.encode(serverCAPem, forKey: .serverCAPem)
         try container.encode(enrolledDeviceID, forKey: .enrolledDeviceID)
@@ -92,7 +83,7 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
     }
 
     public var effectiveConnectionInput: String {
-        bootstrapInput.nilIfBlank ?? directConnectionInput.nilIfBlank ?? ""
+        bootstrapInput.nilIfBlank ?? ""
     }
 
     public var isConfigured: Bool {
@@ -115,9 +106,7 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
         // A claim is only an enrollment input, never a reconnectable client configuration. Keep
         // a partially persisted claim on the onboarding screen even if a Keychain write from an
         // interrupted enrollment left an identity behind.
-        if Self.looksLikeBootstrapClaim(bootstrapInput) ||
-            Self.looksLikeBootstrapClaim(directConnectionInput)
-        {
+        if Self.looksLikeBootstrapClaim(bootstrapInput) {
             return true
         }
         return hasBootstrapPayload && !hasClientIdentity
@@ -139,25 +128,12 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
         connectionConfiguration?.normalizedConnectionInput
     }
 
-    public var directConnectionURL: URL? {
-        guard let directConnectionInput = directConnectionInput.nilIfBlank else {
-            return nil
-        }
-
-        let normalized = AppleConnectionConfiguration(connectionInput: directConnectionInput)
-            .normalizedConnectionInput
-        return URL(string: normalized)
-    }
-
     public var setupSummary: String {
-        if let normalizedConnectionInput {
-            if hasBootstrapPayload {
-                return "Bootstrap bundle ready for \(domainDisplayName.nilIfBlank ?? "BerryKeep")."
-            }
-            return "Direct route \(normalizedConnectionInput)"
+        if normalizedConnectionInput != nil {
+            return "Bootstrap bundle ready for \(domainDisplayName.nilIfBlank ?? "BerryKeep")."
         }
 
-        return "Add a bootstrap bundle or direct route to continue."
+        return "Add a bootstrap bundle to continue."
     }
 
     public var enrollmentSummary: String {
@@ -168,16 +144,15 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
             return "Enrolled device \(enrolledDeviceID)."
         }
 
-        switch (hasBootstrapPayload, hasClientIdentity) {
-        case (true, true):
+        if hasBootstrapPayload && hasClientIdentity {
             return "Bootstrap bundle imported and client identity attached."
-        case (true, false):
-            return "Bootstrap bundle imported. Enroll this device to mint client identity material."
-        case (false, true):
-            return "Direct route configured with client identity."
-        case (false, false):
-            return isConfigured ? "Direct route configured." : "No connection target configured yet."
         }
+        if hasBootstrapPayload {
+            return "Bootstrap bundle imported. Enroll this device to mint client identity material."
+        }
+        return hasClientIdentity
+            ? "Client identity attached. Import a bootstrap bundle to connect."
+            : "No bootstrap bundle configured yet."
     }
 
     public var identitySummary: String {
@@ -187,9 +162,9 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
         return hasClientIdentity ? "Client identity attached." : "No client identity attached."
     }
 
-    public func appliedConnectionState(defaultConnectionInput: String) -> AppleStoredConnectionState {
+    public func appliedConnectionState(defaultBootstrapInput: String) -> AppleStoredConnectionState {
         AppleStoredConnectionState(
-            connectionInput: effectiveConnectionInput.nilIfBlank ?? defaultConnectionInput,
+            connectionInput: effectiveConnectionInput.nilIfBlank ?? defaultBootstrapInput,
             serverCAPem: serverCAPem.nilIfBlank,
             clientIdentityJSON: clientIdentityJSON.nilIfBlank,
             deviceID: enrolledDeviceID.nilIfBlank,
@@ -204,12 +179,11 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
             return false
         }
 
-        if Self.looksLikeBootstrap(payload) {
-            bootstrapInput = payload
-        } else {
-            directConnectionInput = payload
+        guard Self.looksLikeBootstrap(payload) else {
+            return false
         }
 
+        bootstrapInput = payload
         return true
     }
 
@@ -224,7 +198,7 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
            scheme == "ironmesh",
            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         {
-            let preferredQueryNames = ["bootstrap", "payload", "connection", "url"]
+            let preferredQueryNames = ["bootstrap", "payload", "connection"]
             for name in preferredQueryNames {
                 if let value = components.queryItems?
                     .first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame })?.value,
@@ -266,17 +240,17 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
             return nil
         }
 
-        if trimmed.hasPrefix("{") || trimmed.contains("://") {
+        if trimmed.hasPrefix("{") {
             return trimmed
         }
 
         if let decoded = trimmed.removingPercentEncoding,
            decoded != trimmed,
-           (decoded.hasPrefix("{") || decoded.contains("://"))
+           decoded.hasPrefix("{")
         {
             return decoded
         }
 
-        return trimmed
+        return nil
     }
 }

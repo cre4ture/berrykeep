@@ -48,7 +48,7 @@ class FolderSyncWorker(
             )
             return@withContext Result.failure(workDataOf(OUTPUT_ERROR to message))
         }
-        val connectionInput = deviceAuth.preferredConnectionInput()
+        val connectionInput = deviceAuth.connectionBootstrapJson()
         val clientIdentityJson = deviceAuth.toClientIdentityJson()
         val serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() }
         val profiles = IronmeshPreferences

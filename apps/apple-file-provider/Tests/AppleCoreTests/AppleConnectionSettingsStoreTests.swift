@@ -50,7 +50,7 @@ final class AppleConnectionSettingsStoreTests: XCTestCase {
     func testConnectionDraftEncodingNeverPersistsClientIdentity() throws {
         let identity = #"{"private_key_pem":"sensitive"}"#
         let draft = IronmeshConnectionDraft(
-            directConnectionInput: "storage.example.test:443",
+            bootstrapInput: #"{"version":1}"#,
             clientIdentityJSON: identity
         )
 
@@ -78,7 +78,7 @@ final class AppleConnectionSettingsStoreTests: XCTestCase {
         let appliedIdentity = #"{"private_key_pem":"applied-secret"}"#
         let draftIdentity = #"{"private_key_pem":"unapplied-draft-secret"}"#
         let legacyState = AppleStoredConnectionState(
-            connectionInput: "storage.example.test:443",
+            connectionInput: #"{"version":1}"#,
             clientIdentityJSON: appliedIdentity,
             deviceID: "device-1"
         )
@@ -247,7 +247,7 @@ final class AppleConnectionSettingsStoreTests: XCTestCase {
         try JSONSerialization.data(
             withJSONObject: [
                 "clientIdentityJSON": identity,
-                "directConnectionInput": "storage.example.test:443",
+                "bootstrapInput": #"{"version":1}"#,
             ],
             options: [.sortedKeys]
         )

@@ -102,8 +102,10 @@ mod tests {
         clear_android_client_cache_for_test();
 
         let build_count = AtomicUsize::new(0);
+        let bootstrap_a = test_connection_bootstrap("http://127.0.0.1:18080");
+        let bootstrap_b = test_connection_bootstrap("http://127.0.0.1:18081");
         let key = AndroidClientCacheKey {
-            connection_input: "http://127.0.0.1:18080".to_string(),
+            connection_input: bootstrap_a.clone(),
             server_ca_pem: None,
             client_identity_json: None,
         };
@@ -111,7 +113,7 @@ mod tests {
         let first = cached_configured_sdk_build_for_key(key.clone(), |_| {
             build_count.fetch_add(1, Ordering::SeqCst);
             Ok(ConfiguredAndroidSdk {
-                client: IronMeshClient::from_direct_base_url("http://127.0.0.1:18080"),
+                client: ConnectionBootstrap::from_json_str(&bootstrap_a)?.build_client()?,
                 client_identity: None,
                 managed_client: None,
             })
@@ -120,7 +122,7 @@ mod tests {
         let second = cached_configured_sdk_build_for_key(key.clone(), |_| {
             build_count.fetch_add(1, Ordering::SeqCst);
             Ok(ConfiguredAndroidSdk {
-                client: IronMeshClient::from_direct_base_url("http://127.0.0.1:18081"),
+                client: ConnectionBootstrap::from_json_str(&bootstrap_b)?.build_client()?,
                 client_identity: None,
                 managed_client: None,
             })
@@ -134,13 +136,13 @@ mod tests {
         );
 
         let changed_key = AndroidClientCacheKey {
-            connection_input: "http://127.0.0.1:18081".to_string(),
+            connection_input: bootstrap_b.clone(),
             ..key
         };
         let changed = cached_configured_sdk_build_for_key(changed_key, |_| {
             build_count.fetch_add(1, Ordering::SeqCst);
             Ok(ConfiguredAndroidSdk {
-                client: IronMeshClient::from_direct_base_url("http://127.0.0.1:18081"),
+                client: ConnectionBootstrap::from_json_str(&bootstrap_b)?.build_client()?,
                 client_identity: None,
                 managed_client: None,
             })
@@ -155,13 +157,43 @@ mod tests {
 
         clear_android_client_cache_for_test();
     }
+
+    #[test]
+    fn android_client_rejects_legacy_direct_server_url() {
+        let error = normalized_bootstrap_json("https://storage.example.test")
+            .expect_err("a direct server URL must not be accepted as app configuration");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse android connection bootstrap JSON")
+        );
+    }
+
+    fn test_connection_bootstrap(server_url: &str) -> String {
+        format!(
+            r#"{{
+                "version": 1,
+                "cluster_id": "019d04a8-3099-75bc-8ff5-f5bd9a78bb83",
+                "rendezvous_urls": [],
+                "direct_endpoints": [
+                    {{
+                        "url": "{server_url}",
+                        "usage": "public_api",
+                        "node_id": "019d04a8-3099-75bc-8ff5-f5bd9a78bb84"
+                    }}
+                ],
+                "relay_mode": "disabled",
+                "trust_roots": {{}}
+            }}"#
+        )
+    }
 }
 use client_sdk::{
     ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent, ClientIdentityMaterial,
     ClientNode, ConnectionBootstrap, EnrolledClientConnection, IronMeshClient,
     ManagedClientOptions, ManagedIronMeshClient, StoreIndexMediaFilter, StoreIndexRequestOptions,
     StoreIndexSortOrder, StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig,
-    build_http_client_from_pem, build_http_client_with_identity_from_pem,
     enroll_client_connection_blocking, set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
@@ -606,7 +638,7 @@ fn android_folder_sync_state_root() -> Result<PathBuf> {
 }
 
 fn folder_sync_modification_history_json(
-    connection_input: String,
+    bootstrap_json: String,
     local_folder: String,
     local_tree_uri: Option<String>,
     prefix: Option<String>,
@@ -614,14 +646,11 @@ fn folder_sync_modification_history_json(
     before_id: Option<i64>,
     operation: Option<ModificationOperation>,
 ) -> Result<String> {
-    let normalized_connection_input = normalized_connection_input_string(connection_input)?;
+    let bootstrap_json = normalized_bootstrap_json(bootstrap_json)?;
     let normalized_local_tree_uri = normalize_optional_string(local_tree_uri);
     let normalized_prefix = normalize_optional_string(prefix);
-    let (server_base_url, client_bootstrap_json) =
-        split_connection_input(normalized_connection_input)?;
-    let connection_target =
-        describe_connection_target(server_base_url.as_deref(), client_bootstrap_json.as_deref())
-            .context("failed to derive connection target for folder sync modification history")?;
+    let connection_target = describe_connection_target(None, Some(&bootstrap_json))
+        .context("failed to derive connection target for folder sync modification history")?;
     let scope = PathScope::new(normalized_prefix);
     let local_folder_path = PathBuf::from(local_folder);
     let identity_root = normalized_local_tree_uri
@@ -1097,12 +1126,12 @@ fn current_folder_sync_status_json() -> Result<String> {
 }
 
 fn start_embedded_web_ui(
-    connection_input: String,
+    bootstrap_json: String,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
 ) -> Result<EmbeddedWebUiLaunch> {
     let rt = runtime()?;
-    let connection_input = normalized_connection_input_string(connection_input)?;
+    let bootstrap_json = normalized_bootstrap_json(bootstrap_json)?;
     let server_ca_pem = normalize_optional_string(server_ca_pem);
     let client_identity_json = normalize_optional_string(client_identity_json);
     let mut state = web_ui_server_state()
@@ -1121,27 +1150,24 @@ fn start_embedded_web_ui(
         .context("failed to read embedded web ui listener address")?;
     let local_url = format!("http://127.0.0.1:{}/", address.port());
     let configured = cached_configured_sdk_build(
-        connection_input.clone(),
+        bootstrap_json.clone(),
         server_ca_pem.clone(),
         client_identity_json.clone(),
     )?;
     let client = configured.client.with_connection_name("android web ui");
     let mut web_ui_config =
         web_ui_backend::WebUiConfig::from_client(client).with_service_name("ironmesh-android");
-    let (_, client_bootstrap_json) = split_connection_input(connection_input.clone())?;
-    if let Some(raw_bootstrap) = client_bootstrap_json {
-        let mut bootstrap = ConnectionBootstrap::from_json_str(&raw_bootstrap)
-            .context("failed to parse android bootstrap for embedded web ui")?;
-        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
-        }
-        web_ui_config = web_ui_config
-            .with_connection_bootstrap(bootstrap)
-            .with_connection_bootstrap_persistence(web_ui_backend::WebUiBootstrapPersistence::new(
-                "android_preferences",
-                persist_android_connection_bootstrap,
-            ));
+    let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
+        .context("failed to parse android bootstrap for embedded web ui")?;
+    if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+        bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
     }
+    web_ui_config = web_ui_config
+        .with_connection_bootstrap(bootstrap)
+        .with_connection_bootstrap_persistence(web_ui_backend::WebUiBootstrapPersistence::new(
+            "android_preferences",
+            persist_android_connection_bootstrap,
+        ));
     if let Some(identity) = configured.client_identity {
         web_ui_config = web_ui_config.with_client_identity(identity);
     }
@@ -1316,17 +1342,17 @@ pub struct AndroidStorageApp {
 }
 
 impl AndroidStorageApp {
-    pub fn new(connection_input: impl Into<String>) -> Result<Self> {
-        Self::configured(connection_input, None, None)
+    pub fn new(bootstrap_json: impl Into<String>) -> Result<Self> {
+        Self::configured(bootstrap_json, None, None)
     }
 
     pub fn configured(
-        connection_input: impl Into<String>,
+        bootstrap_json: impl Into<String>,
         server_ca_pem: Option<String>,
         client_identity_json: Option<String>,
     ) -> Result<Self> {
         Ok(Self::with_client(configured_client_node(
-            connection_input,
+            bootstrap_json,
             server_ca_pem,
             client_identity_json,
         )?))
@@ -1378,29 +1404,17 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn normalized_connection_input_string(connection_input: impl Into<String>) -> Result<String> {
-    let connection_input = connection_input.into();
-    let trimmed = connection_input.trim();
+fn normalized_bootstrap_json(bootstrap_json: impl Into<String>) -> Result<String> {
+    let bootstrap_json = bootstrap_json.into();
+    let trimmed = bootstrap_json.trim();
     if trimmed.is_empty() {
-        anyhow::bail!("android client requires a non-empty connection input");
+        anyhow::bail!("android client requires a non-empty connection bootstrap");
     }
 
-    if trimmed.starts_with('{') {
-        return Ok(trimmed.to_string());
-    }
-
-    Ok(client_sdk::normalize_server_base_url(trimmed)?.to_string())
-}
-
-fn split_connection_input(
-    connection_input: impl Into<String>,
-) -> Result<(Option<String>, Option<String>)> {
-    let normalized = normalized_connection_input_string(connection_input)?;
-    if normalized.starts_with('{') {
-        Ok((None, Some(normalized)))
-    } else {
-        Ok((Some(normalized), None))
-    }
+    ConnectionBootstrap::from_json_str(trimmed)
+        .context("failed to parse android connection bootstrap JSON")?
+        .to_json_pretty()
+        .context("failed to normalize android connection bootstrap JSON")
 }
 
 #[derive(Clone)]
@@ -1411,13 +1425,13 @@ struct ConfiguredAndroidSdk {
 }
 
 fn configured_sdk_build(
-    connection_input: impl Into<String>,
+    bootstrap_json: impl Into<String>,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
 ) -> Result<ConfiguredAndroidSdk> {
     let server_ca_pem = normalize_optional_string(server_ca_pem);
     let client_identity_json = normalize_optional_string(client_identity_json);
-    let (server_base_url, client_bootstrap_json) = split_connection_input(connection_input)?;
+    let bootstrap_json = normalized_bootstrap_json(bootstrap_json)?;
     let parsed_identity = client_identity_json
         .as_deref()
         .map(|raw| {
@@ -1426,62 +1440,42 @@ fn configured_sdk_build(
         })
         .transpose()?;
 
-    if let Some(raw_bootstrap) = client_bootstrap_json.as_deref() {
-        let mut bootstrap = ConnectionBootstrap::from_json_str(raw_bootstrap)
-            .context("failed to parse android connection bootstrap JSON")?;
-        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
-        }
-
-        return match parsed_identity {
-            Some(identity) => {
-                let original_identity = identity.clone();
-                let managed_client =
-                    runtime()?.block_on(bootstrap.build_managed_client_with_identity(
-                        identity,
-                        ManagedClientOptions::default(),
-                    ))?;
-                let client_identity = managed_client
-                    .take_identity_update()
-                    .unwrap_or(original_identity.clone());
-                if client_identity != original_identity
-                    && let Err(err) = persist_android_client_identity(&client_identity)
-                {
-                    tracing::warn!(
-                        error = %err,
-                        "failed to persist renewed android client identity"
-                    );
-                }
-                Ok(ConfiguredAndroidSdk {
-                    client: managed_client.client(),
-                    client_identity: Some(client_identity),
-                    managed_client: Some(managed_client),
-                })
-            }
-            None => Ok(ConfiguredAndroidSdk {
-                client: bootstrap.build_client()?,
-                client_identity: None,
-                managed_client: None,
-            }),
-        };
+    let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
+        .context("failed to parse android connection bootstrap JSON")?;
+    if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+        bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
     }
 
-    let server_base_url = server_base_url
-        .ok_or_else(|| anyhow::anyhow!("missing server_base_url or client_bootstrap_json"))?;
-    let client = match parsed_identity.as_ref() {
-        Some(identity) => build_http_client_with_identity_from_pem(
-            server_ca_pem.as_deref(),
-            &server_base_url,
-            identity,
-        )?,
-        None => build_http_client_from_pem(server_ca_pem.as_deref(), &server_base_url)?,
-    };
-
-    Ok(ConfiguredAndroidSdk {
-        client,
-        client_identity: parsed_identity,
-        managed_client: None,
-    })
+    match parsed_identity {
+        Some(identity) => {
+            let original_identity = identity.clone();
+            let managed_client = runtime()?.block_on(
+                bootstrap
+                    .build_managed_client_with_identity(identity, ManagedClientOptions::default()),
+            )?;
+            let client_identity = managed_client
+                .take_identity_update()
+                .unwrap_or(original_identity.clone());
+            if client_identity != original_identity
+                && let Err(err) = persist_android_client_identity(&client_identity)
+            {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist renewed android client identity"
+                );
+            }
+            Ok(ConfiguredAndroidSdk {
+                client: managed_client.client(),
+                client_identity: Some(client_identity),
+                managed_client: Some(managed_client),
+            })
+        }
+        None => Ok(ConfiguredAndroidSdk {
+            client: bootstrap.build_client()?,
+            client_identity: None,
+            managed_client: None,
+        }),
+    }
 }
 
 fn configured_sdk(
@@ -1680,12 +1674,12 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
     client_identity_json: jstring,
 ) -> jstring {
     let result = (|| -> Result<String> {
-        let connection_input: String = env.get_string(&connection_input)?.into();
+        let bootstrap_json: String = env.get_string(&connection_input)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
         serde_json::to_string(&start_embedded_web_ui(
-            connection_input,
+            bootstrap_json,
             server_ca_pem,
             client_identity_json,
         )?)
@@ -1737,14 +1731,14 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_con
     period_seconds: jlong,
 ) -> jstring {
     let result = (|| -> Result<String> {
-        let connection_input: String = env.get_string(&connection_input)?.into();
+        let bootstrap_json: String = env.get_string(&connection_input)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let period_seconds = u64::try_from(period_seconds)
             .context("title latency monitor period must be non-negative")?;
         initialize_android_preferences_bridge(&mut env)?;
         configure_android_title_latency_monitor(
-            connection_input,
+            bootstrap_json,
             server_ca_pem,
             client_identity_json,
             enabled != 0,
@@ -1817,11 +1811,11 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
     refresh: jboolean,
 ) -> jstring {
     let result = (|| -> Result<String> {
-        let connection_input: String = env.get_string(&connection_input)?.into();
+        let bootstrap_json: String = env.get_string(&connection_input)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
-        let sdk = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        let sdk = cached_configured_sdk(bootstrap_json, server_ca_pem, client_identity_json)?;
         let snapshot = if refresh != 0 {
             runtime()?.block_on(sdk.refresh_connection_route_snapshot())
         } else {
@@ -2421,13 +2415,13 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
     let result = (|| -> Result<()> {
         init_android_tracing();
 
-        let connection_input: String = env.get_string(&connection_input)?.into();
+        let bootstrap_json: String = env.get_string(&connection_input)?.into();
         let local_folder: String = env.get_string(&local_folder)?.into();
         let local_tree_uri = optional_jstring(&mut env, local_tree_uri)?;
         let prefix = optional_jstring(&mut env, prefix)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
-        let (server_base_url, client_bootstrap_json) = split_connection_input(connection_input)?;
+        let bootstrap_json = normalized_bootstrap_json(bootstrap_json)?;
         initialize_android_preferences_bridge(&mut env)?;
 
         if local_tree_uri.is_some() {
@@ -2439,8 +2433,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
             state_root_dir: Some(android_folder_sync_state_root()?),
             connection_name: Some("android sync run once".to_string()),
             local_tree_uri,
-            server_base_url,
-            client_bootstrap_json,
+            server_base_url: None,
+            client_bootstrap_json: Some(bootstrap_json),
             server_ca_pem,
             client_identity_json,
             persist_client_identity: Some(persist_android_client_identity),
@@ -2491,13 +2485,13 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
 
         let profile_id: String = env.get_string(&profile_id)?.into();
         let label: String = env.get_string(&label)?.into();
-        let connection_input: String = env.get_string(&connection_input)?.into();
+        let bootstrap_json: String = env.get_string(&connection_input)?.into();
         let local_folder: String = env.get_string(&local_folder)?.into();
         let local_tree_uri = optional_jstring(&mut env, local_tree_uri)?;
         let prefix = optional_jstring(&mut env, prefix)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
-        let (server_base_url, client_bootstrap_json) = split_connection_input(connection_input)?;
+        let bootstrap_json = normalized_bootstrap_json(bootstrap_json)?;
         initialize_android_preferences_bridge(&mut env)?;
 
         if local_tree_uri.is_some() {
@@ -2509,8 +2503,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
             state_root_dir: Some(android_folder_sync_state_root()?),
             connection_name: Some(format!("android sync {}", label)),
             local_tree_uri,
-            server_base_url,
-            client_bootstrap_json,
+            server_base_url: None,
+            client_bootstrap_json: Some(bootstrap_json),
             server_ca_pem,
             client_identity_json,
             persist_client_identity: Some(persist_android_client_identity),

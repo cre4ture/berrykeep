@@ -107,9 +107,9 @@ final class AppleCoreTests: XCTestCase {
         XCTAssertTrue(coordinator.acceptsSharedState(rootRequest))
     }
 
-    func testConnectionInputNormalizationAddsHttpSchemeAndSlash() {
-        let configuration = AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080")
-        XCTAssertEqual(configuration.normalizedConnectionInput, "http://127.0.0.1:18080/")
+    func testConnectionInputNormalizationTrimsBootstrapJson() {
+        let configuration = AppleConnectionConfiguration(connectionInput: "  {\"version\":1} \n")
+        XCTAssertEqual(configuration.normalizedConnectionInput, "{\"version\":1}")
     }
 
     func testConnectionInputKeepsBootstrapJsonUntouched() {
@@ -146,12 +146,13 @@ final class AppleCoreTests: XCTestCase {
     }
 
     func testStoredConnectionStateFallsBackToBundleDefaults() {
-        let fallback = AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080")
+        let fallbackJSON = #"{"version":1}"#
+        let fallback = AppleConnectionConfiguration(connectionInput: fallbackJSON)
         let stored = AppleStoredConnectionState(clientIdentityJSON: #"{"device_id":"abc"}"#)
 
         let effective = stored.effectiveConfiguration(fallback: fallback)
 
-        XCTAssertEqual(effective.connectionInput, "127.0.0.1:18080")
+        XCTAssertEqual(effective.connectionInput, fallbackJSON)
         XCTAssertEqual(effective.clientIdentityJSON, #"{"device_id":"abc"}"#)
     }
 

@@ -358,7 +358,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     }
 
     private fun resolveConnectionInput(): String {
-        return resolveDeviceAuthState().preferredConnectionInput()
+        return resolveDeviceAuthState().connectionBootstrapJson()
     }
 
     private fun resolveClientIdentityJson(): String? {

@@ -225,15 +225,12 @@ private struct IronmeshOnboardingGateView: View {
                 VStack(spacing: 18) {
                     IronmeshHeroCard(
                         title: "Connect this iPhone",
-                        body: "Import a bootstrap bundle or enter a direct route. Files integration stays separate, so the shell can stay honest about what the app can already browse."
+                        body: "Import a connection bootstrap bundle. Files integration stays separate, so the shell can stay honest about what the app can already browse."
                     )
 
-                    IronmeshCard(title: "Quick setup", subtitle: "The app browser can use a direct route or a bootstrap bundle.") {
+                    IronmeshCard(title: "Quick setup", subtitle: "Import the routes and trust material advertised by your cluster.") {
                         TextField("Device label (optional)", text: draftBinding(\.deviceLabel))
                             .textInputAutocapitalization(.words)
-                        TextField("Direct route", text: draftBinding(\.directConnectionInput), axis: .vertical)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
 
                         if model.draft.requiresEnrollment {
                             VStack(alignment: .leading, spacing: 8) {
@@ -884,19 +881,16 @@ struct IronmeshTitleLatencyToolbarItem: View {
 
 private struct IronmeshSettingsView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
-    @Environment(\.openURL) private var openURL
     @State private var showsScanner = false
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Connection") {
-                    TextField("Direct route", text: draftBinding(\.directConnectionInput), axis: .vertical)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-
                     if let normalizedConnectionInput = model.draft.normalizedConnectionInput {
                         IronmeshInlineNote(text: normalizedConnectionInput)
+                    } else {
+                        IronmeshInlineNote(text: "Import a connection bootstrap bundle below.")
                     }
 
                     if model.draft.requiresEnrollment {
@@ -927,7 +921,7 @@ private struct IronmeshSettingsView: View {
                     IronmeshMultilineEditor(
                         title: "Server CA PEM",
                         text: draftBinding(\.serverCAPem),
-                        prompt: "Optional PEM for direct routes."
+                        prompt: "Optional CA override for bootstrap-advertised HTTPS routes."
                     )
 
                     if model.draft.hasClientIdentity || model.draft.serverCAPem.nilIfBlank != nil {
@@ -1001,12 +995,6 @@ private struct IronmeshSettingsView: View {
                     TextField("Domain identifier", text: draftBinding(\.domainIdentifier))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-
-                    if let directConnectionURL = model.draft.directConnectionURL {
-                        Button("Open direct route in Safari") {
-                            openURL(directConnectionURL)
-                        }
-                    }
 
                     Button("Open web UI") {
                         model.openWebUI()
@@ -1422,7 +1410,7 @@ private struct IronmeshScannerSheet: View {
                 IronmeshMultilineEditor(
                     title: "Manual payload",
                     text: $manualPayload,
-                    prompt: "Paste bootstrap JSON or a direct route."
+                    prompt: "Paste connection bootstrap JSON."
                 )
 
                 Button("Use pasted payload") {

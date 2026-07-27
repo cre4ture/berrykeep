@@ -173,13 +173,5 @@ public extension String {
 }
 
 func normalizedConnectionInputString(_ value: String) -> String {
-    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else {
-        return trimmed
-    }
-    if trimmed.hasPrefix("{") || trimmed.contains("://") {
-        return trimmed
-    }
-    let withScheme = "http://\(trimmed)"
-    return withScheme.hasSuffix("/") ? withScheme : "\(withScheme)/"
+    value.trimmingCharacters(in: .whitespacesAndNewlines)
 }

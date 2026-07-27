@@ -52,17 +52,10 @@ class IronmeshRepository {
 
     private fun normalizedConnectionInput(connectionInput: String): String {
         val trimmed = connectionInput.trim()
-        return if (trimmed.startsWith("{")) trimmed else sanitizeBaseUrl(trimmed)
-    }
-
-    fun sanitizeBaseUrl(input: String): String {
-        val trimmed = input.trim()
-        val withScheme = if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-            trimmed
-        } else {
-            "http://$trimmed"
+        require(trimmed.startsWith("{")) {
+            "A connection bootstrap JSON is required; direct server URLs are no longer supported."
         }
-        return if (withScheme.endsWith('/')) withScheme else "$withScheme/"
+        return trimmed
     }
 
     private fun <T> decodeJson(json: String, clazz: Class<T>): T {
@@ -96,7 +89,7 @@ class IronmeshRepository {
     suspend fun verifyEnrollmentAccess(
         authState: DeviceAuthState,
     ): EnrollmentAccessVerification {
-        val connectionInput = authState.preferredConnectionInput()
+        val connectionInput = authState.connectionBootstrapJson()
         check(connectionInput.isNotBlank()) {
             "enrollment did not return a usable connection target"
         }

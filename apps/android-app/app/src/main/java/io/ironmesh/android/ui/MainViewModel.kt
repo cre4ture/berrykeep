@@ -1003,7 +1003,7 @@ class MainViewModel(
             )
             return
         }
-        val connectionInput = deviceAuth.preferredConnectionInput()
+        val connectionInput = deviceAuth.connectionBootstrapJson()
         val clientIdentityJson = deviceAuth.toClientIdentityJson()
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
             uiState.value = uiState.value.copy(
@@ -1506,7 +1506,7 @@ class MainViewModel(
     }
 
     private fun currentConnectionInput(): String {
-        return currentDeviceAuthState().preferredConnectionInput()
+        return currentDeviceAuthState().connectionBootstrapJson()
     }
 
     private fun currentServerCaPem(): String? {
@@ -1549,7 +1549,7 @@ class MainViewModel(
         actionDescription: String,
     ): TimingDiagnosticsCredentials? {
         val deviceAuth = timingDiagnosticsDeviceAuthOrNull() ?: return null
-        val connectionInput = deviceAuth.preferredConnectionInput()
+        val connectionInput = deviceAuth.connectionBootstrapJson()
         val clientIdentityJson = deviceAuth.toClientIdentityJson()
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
             val message = "Enroll this device to $actionDescription."
@@ -1597,7 +1597,7 @@ class MainViewModel(
 
         val settings = uiState.value.titleLatencyMonitorSettings
         val deviceAuth = runCatching { currentDeviceAuthState() }.getOrNull()
-        val connectionInput = deviceAuth?.preferredConnectionInput().orEmpty()
+        val connectionInput = deviceAuth?.connectionBootstrapJson().orEmpty()
         val clientIdentityJson = deviceAuth?.toClientIdentityJson()
 
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
@@ -1685,7 +1685,7 @@ class MainViewModel(
                 val routes = withContext(Dispatchers.IO) {
                     runCatching {
                         repository.getConnectionRouteSnapshot(
-                            connectionInput = authState.preferredConnectionInput(),
+                            connectionInput = authState.connectionBootstrapJson(),
                             serverCaPem = authState.serverCaPem?.takeIf { it.isNotBlank() },
                             clientIdentityJson = authState.toClientIdentityJson(),
                             refresh = false,
@@ -1742,7 +1742,7 @@ class MainViewModel(
             )
             return
         }
-        val connectionInput = deviceAuth.preferredConnectionInput()
+        val connectionInput = deviceAuth.connectionBootstrapJson()
         val clientIdentityJson = deviceAuth.toClientIdentityJson()
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
             uiState.value = uiState.value.copy(
