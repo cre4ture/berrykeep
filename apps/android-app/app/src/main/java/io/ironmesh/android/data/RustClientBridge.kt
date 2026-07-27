@@ -128,6 +128,13 @@ object RustClientBridge {
     ): String
 
     @JvmStatic
+    external fun notifyNetworkChanged(
+        connectionInput: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    )
+
+    @JvmStatic
     external fun resetConnectionTimingMeasurement(
         connectionInput: String,
         serverCaPem: String?,
