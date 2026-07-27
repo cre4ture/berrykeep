@@ -572,11 +572,50 @@ impl ReliabilityTelemetryRuntime {
             return Ok(bytes);
         }
 
-        let mut salt = vec![0_u8; 32];
-        rand::thread_rng().fill_bytes(&mut salt);
+        let salt = Self::generate_random_salt();
         self.persisted.local_random_salt_b64 = Some(BASE64_STANDARD.encode(&salt));
         self.persist().await?;
         Ok(salt)
+    }
+
+    /// Generates a fresh cryptographically random 32-byte salt. Pulled out of `ensure_salt` so
+    /// [`Self::rotate_identity`] can reuse the exact same RNG logic rather than duplicating it -
+    /// the only difference between the two call sites is whether an existing salt is reused
+    /// (`ensure_salt`, first-use generation) or unconditionally overwritten
+    /// (`rotate_identity`, explicit admin-triggered rotation).
+    fn generate_random_salt() -> Vec<u8> {
+        let mut salt = vec![0_u8; 32];
+        rand::thread_rng().fill_bytes(&mut salt);
+        salt
+    }
+
+    /// Explicit admin-triggered rotation of the pseudonymization identity (doc Section 8,
+    /// resolved in favor of the user-controlled "reset button" option over automatic time-based
+    /// rotation): generates a brand new local salt and persists it, so the very next
+    /// [`Self::telemetry_subject_id`] call derives a `telemetry_subject_id` with no relationship
+    /// to the previous one - not even derivable without the old salt, which is overwritten here
+    /// and never retained. This is a deliberate action performed only when an operator explicitly
+    /// asks for it (never on a timer), and it irreversibly breaks this node's longitudinal
+    /// fleet-side statistics continuity going forward (doc Section 4.1/8's "this does break
+    /// existing time series" trade-off) - callers must not invoke this casually.
+    ///
+    /// This also clears `last_sent_fingerprint`. That fingerprint exists purely to let the send
+    /// path skip a transmission when "nothing material changed since the last send" (doc Section
+    /// 6 deduplication) - but that reasoning is scoped to a single identity. After rotation, the
+    /// central collector has never seen *any* batch under the new `telemetry_subject_id`, so a
+    /// byte-identical payload must still go out as the first sighting of the new pseudonym;
+    /// leaving the old fingerprint in place would wrongly skip that "first" send just because the
+    /// underlying hardware state happens to look unchanged. `last_sent_at_unix`,
+    /// `last_send_error`, `sent_history`, and `temperature_accumulators` are deliberately left
+    /// untouched: they describe real past events/observations that remain historically accurate
+    /// node-local records regardless of which pseudonym they were (or will be) reported under -
+    /// rotation invalidates the *subject id* used going forward, not this node's own memory of
+    /// what it previously did or observed.
+    pub(crate) async fn rotate_identity(&mut self) -> Result<()> {
+        let salt = Self::generate_random_salt();
+        self.persisted.local_random_salt_b64 = Some(BASE64_STANDARD.encode(&salt));
+        self.persisted.last_sent_fingerprint = None;
+        self.persist().await
     }
 
     async fn persist(&self) -> Result<()> {
@@ -730,6 +769,78 @@ pub(crate) async fn telemetry_settings_put(
         true,
         "success",
         json!({ "enabled": response.enabled, "source": response.enabled_source }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Rotates the local pseudonymization salt, so the `telemetry_subject_id` the node reports going
+/// forward is unrelated to (and not derivable from) the one used until now (doc Section 8,
+/// resolved in favor of a user-controlled "reset" action). This is a mutating, security/privacy
+/// relevant action - authorized and audited exactly like `telemetry_settings_put`
+/// (`dry_run: false`, not the read-only `true` used by the GET/preview handlers) - and returns the
+/// same `TelemetrySettingsResponse` shape as GET/PUT so the admin UI gets the fresh
+/// `telemetry_subject_id` back immediately, without a separate follow-up round-trip.
+pub(crate) async fn telemetry_rotate_identity_post(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/telemetry/rotate-identity";
+    let authz =
+        match authorize_admin_request(&state, &headers, action, false, true, json!({})).await {
+            Ok(request) => request,
+            Err(status) => return status.into_response(),
+        };
+
+    let mut runtime = state.reliability_telemetry_runtime.lock().await;
+    if let Err(err) = runtime.rotate_identity().await {
+        warn!(error = %err, "failed to rotate reliability telemetry identity");
+        drop(runtime);
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            false,
+            true,
+            "error",
+            json!({}),
+        )
+        .await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let response = match build_settings_response(&mut runtime, state.node_id).await {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(error = %err, "failed to derive telemetry subject id after rotation");
+            drop(runtime);
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                false,
+                true,
+                "error",
+                json!({}),
+            )
+            .await;
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    drop(runtime);
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        false,
+        true,
+        "success",
+        json!({ "rotated": true }),
     )
     .await;
 
@@ -1072,6 +1183,99 @@ mod tests {
         assert!(!reloaded.effective_enabled());
         let subject_id_second = reloaded.telemetry_subject_id(node_id).await.unwrap();
         assert_eq!(subject_id_first, subject_id_second);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_identity_changes_the_subject_id_and_is_not_derivable_from_the_old_salt() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ironmesh-reliability-telemetry-rotate-test-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
+        let node_id = NodeId::from_u128(99);
+
+        let subject_id_before = runtime.telemetry_subject_id(node_id).await.unwrap();
+        let salt_before = runtime
+            .persisted
+            .local_random_salt_b64
+            .clone()
+            .expect("salt should have been generated on first use");
+
+        runtime.rotate_identity().await.unwrap();
+
+        let salt_after = runtime
+            .persisted
+            .local_random_salt_b64
+            .clone()
+            .expect("salt should still be present after rotation");
+        assert_ne!(
+            salt_before, salt_after,
+            "rotation must replace the local salt"
+        );
+
+        let subject_id_after = runtime.telemetry_subject_id(node_id).await.unwrap();
+        assert_ne!(
+            subject_id_before, subject_id_after,
+            "rotation must change the derived telemetry_subject_id"
+        );
+
+        // The old subject id must not be reachable again from the *new* salt: recomputing with
+        // the new persisted salt always yields the post-rotation id, never the pre-rotation one,
+        // i.e. the old id is only derivable via the discarded salt.
+        let recomputed_with_new_salt =
+            compute_telemetry_subject_id(&BASE64_STANDARD.decode(&salt_after).unwrap(), node_id);
+        assert_eq!(recomputed_with_new_salt, subject_id_after);
+        assert_ne!(recomputed_with_new_salt, subject_id_before);
+
+        // Reload from disk to confirm the rotated salt (and thus the new subject id) was
+        // actually persisted, not just held in memory.
+        let mut reloaded = ReliabilityTelemetryRuntime::load(&tmp);
+        let subject_id_reloaded = reloaded.telemetry_subject_id(node_id).await.unwrap();
+        assert_eq!(subject_id_reloaded, subject_id_after);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn rotate_identity_clears_the_dedup_fingerprint_so_the_next_send_is_not_skipped() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ironmesh-reliability-telemetry-rotate-fingerprint-test-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
+        let report = hardware_health::test_support::sample_report_for_telemetry_tests();
+        let payload = build_reliability_telemetry_payload(
+            &report,
+            "subject".to_string(),
+            1_700_000_000,
+            &HashMap::new(),
+        );
+        let fingerprint = telemetry_payload_fingerprint(&payload).unwrap();
+        runtime
+            .record_send_success(1_700_000_000, &payload, fingerprint.clone())
+            .await
+            .unwrap();
+        assert_eq!(runtime.last_sent_fingerprint(), Some(fingerprint.as_str()));
+
+        runtime.rotate_identity().await.unwrap();
+
+        assert_eq!(
+            runtime.last_sent_fingerprint(),
+            None,
+            "rotation must clear the dedup fingerprint so an unchanged payload is still sent \
+             under the new identity"
+        );
+
+        // Historical send bookkeeping unrelated to the *identity* itself must survive rotation
+        // unchanged, since it records real past events, not something rotation should erase.
+        assert_eq!(runtime.last_sent_at_unix(), Some(1_700_000_000));
+        assert_eq!(runtime.sent_history().len(), 1);
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
