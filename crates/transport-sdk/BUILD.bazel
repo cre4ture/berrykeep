@@ -1,18 +1,20 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
-# Keep Cargo.toml as the dependency source of truth while exposing this leaf
-# crate to Bazel's action graph. Downstream workspace crates can depend on this
-# target as they are migrated.
+# Crate Universe deliberately omits first-party workspace dependencies from
+# all_crate_deps. Model them with native targets so Bazel sees the source edge
+# without inventing a duplicate generated external crate.
 rust_library(
-    name = "common",
+    name = "transport_sdk",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
-    crate_name = "common",
+    crate_name = "transport_sdk",
     crate_root = "src/lib.rs",
     edition = crate_edition(),
     visibility = ["//crates:__subpackages__"],
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + [
+        "//crates/common",
+    ],
 )
 
 rust_test(
@@ -22,7 +24,7 @@ rust_test(
         normal_dev = True,
         proc_macro_dev = True,
     ),
-    crate = ":common",
+    crate = ":transport_sdk",
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True),

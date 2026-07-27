@@ -1,6 +1,6 @@
 module(
     name = "berrykeep",
-    version = "1.0.37",
+    version = "1.0.38",
 )
 
 # Rust rules are kept in lock-step with the initial Bazel toolchain. Cargo
@@ -10,7 +10,7 @@ bazel_dep(name = "rules_rust", version = "0.71.3")
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
-    versions = ["1.88.0"],
+    versions = ["1.89.0"],
 )
 use_repo(rust, "rust_toolchains")
 
@@ -22,7 +22,7 @@ register_toolchains("@rust_toolchains//:all")
 host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
 host_tools.host_tools(
     name = "berrykeep_rust_host_tools",
-    version = "1.88.0",
+    version = "1.89.0",
 )
 use_repo(host_tools, "berrykeep_rust_host_tools")
 
