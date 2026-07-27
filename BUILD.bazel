@@ -3,6 +3,7 @@ package(default_visibility = ["//visibility:public"])
 test_suite(
     name = "unit",
     tests = [
+        "//crates/common:unit_test",
         "//crates/sync-core:unit_test",
     ],
 )

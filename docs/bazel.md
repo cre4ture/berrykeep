@@ -8,7 +8,13 @@ can benefit from Bazel's dependency-aware cache.
 
 ## Current scope
 
-`//crates/sync-core:unit_test` is the first native target. Run the current
+The current native targets are:
+
+- `//crates/sync-core:unit_test`
+- `//crates/common:unit_test`
+
+`common` is a dependency-free workspace leaf and the foundation for later
+`transport-sdk`, `rendezvous-server`, and `client-sdk` targets. Run the current
 Bazel unit suite with:
 
 ```bash
