@@ -1,6 +1,6 @@
 # Dynamic Rendezvous-Discovered QUIC Routes for Mobile Clients
 
-Status: proposed implementation plan
+Status: implemented in PR #221
 
 Audience: an implementation agent working on a macOS host, with responsibility
 for the shared Rust stack and the Android/iOS bindings
@@ -11,6 +11,26 @@ Related documents:
 - `docs/rendezvous-dynamic-reachability-proposal.md`
 - `docs/client-sdk-multi-node-routing-design.md`
 - `docs/nat-traversal-rendezvous-strategy.md`
+- `docs/iroh-relay-companion-operations.md`
+
+## Implementation record
+
+This plan is implemented by the following shared and platform changes:
+
+- `client-sdk` now owns asynchronous discovery, managed route refresh,
+  stable-key reconciliation, route retirement, identity renewal, and
+  all-route-failure refresh triggers.
+- CLI, Android, and iOS construct that managed client; Kotlin and Swift only
+  forward lifecycle/network hints and persist a renewed identity through their
+  existing secure stores.
+- Direct QUIC candidates validate their authenticated transport identity, while
+  server nodes accept `IRONMESH_DIRECT_QUIC_RELAY_URLS` and advertise the
+  configured iroh relay metadata through Rendezvous.
+
+An iroh-compatible relay must still be deployed and health-checked in each
+production environment before relying on relay-assisted NAT traversal. The
+operational procedure is in `docs/iroh-relay-companion-operations.md`; this
+repository cannot deploy environment-owned relay infrastructure itself.
 
 ## 1. Decision summary
 

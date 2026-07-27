@@ -4,7 +4,7 @@ use super::{
     apply_server_timing_to_buffered_response, await_repair_busy_threshold,
     build_rendezvous_presence_registration, build_store_index_entries, cluster, constant_time_eq,
     jittered_backoff_secs, lock_store, new_store_rwlock, node_descriptor_from_presence_entry,
-    plan_peer_transport, read_store,
+    parse_direct_quic_relay_urls, plan_peer_transport, read_store,
     replication::{build_replication_bundle_push_path, build_replication_export_path},
     resolve_peer_base_url, run_startup_replication_repair_once,
     should_trigger_autonomous_post_write_replication, token_matches,
@@ -27,6 +27,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::fs;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
+
+#[test]
+fn direct_quic_relay_urls_are_trimmed_and_deduplicated() {
+    assert_eq!(
+        parse_direct_quic_relay_urls(Some(
+            " https://relay-a.example/ ,https://relay-b.example,https://relay-a.example/ ,, ",
+        )),
+        vec![
+            "https://relay-a.example".to_string(),
+            "https://relay-b.example".to_string(),
+        ]
+    );
+    assert!(parse_direct_quic_relay_urls(None).is_empty());
+}
 
 use super::storage::{
     DataScrubRunTestHook, PersistentStore, PutOptions, S3ObjectVersionRecord, StoragePathConfig,

@@ -119,6 +119,10 @@ const CLIENT_MUTATION_OPERATION_TTL_SECS: u64 = 15 * 60;
 const DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 10;
 const GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED_ENV: &str =
     "IRONMESH_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED";
+/// Comma-separated iroh-compatible relay URLs used by this node's Direct QUIC
+/// endpoint. The existing IronMesh HTTP relay is intentionally not substituted
+/// here; it remains the independent fallback transport.
+const DIRECT_QUIC_RELAY_URLS_ENV: &str = "IRONMESH_DIRECT_QUIC_RELAY_URLS";
 const GLOBAL_RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 10;
 const GLOBAL_RENDEZVOUS_REGISTRATION_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 use x509_parser::extensions::ParsedExtension;
@@ -4539,12 +4543,16 @@ async fn try_start_direct_quic_runtime(
         }
     };
 
-    match DirectQuicEndpoint::bind(DirectQuicEndpointConfig::new(secret_key)).await {
+    let mut endpoint_config = DirectQuicEndpointConfig::new(secret_key);
+    endpoint_config.relay_urls = direct_quic_relay_urls_from_env();
+    let configured_relay_urls = endpoint_config.relay_urls.clone();
+    match DirectQuicEndpoint::bind(endpoint_config).await {
         Ok(endpoint) => {
             let endpoint_id = endpoint.endpoint_id();
             info!(
                 node_id = %config.node_id,
                 endpoint_id = %endpoint_id,
+                direct_quic_relay_urls = ?configured_relay_urls,
                 secret_key_path = %secret_key_path.display(),
                 "server node direct QUIC endpoint started"
             );
@@ -4563,6 +4571,21 @@ async fn try_start_direct_quic_runtime(
             None
         }
     }
+}
+
+fn direct_quic_relay_urls_from_env() -> Vec<String> {
+    parse_direct_quic_relay_urls(std::env::var(DIRECT_QUIC_RELAY_URLS_ENV).ok().as_deref())
+}
+
+fn parse_direct_quic_relay_urls(raw: Option<&str>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    raw.into_iter()
+        .flat_map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .filter_map(|url| {
+            let url = url.trim().trim_end_matches('/').to_string();
+            (!url.is_empty() && seen.insert(url.clone())).then_some(url)
+        })
+        .collect()
 }
 
 fn current_advertised_direct_endpoints(state: &ServerState) -> Vec<BootstrapEndpoint> {
