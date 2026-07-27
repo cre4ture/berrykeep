@@ -1,0 +1,8 @@
+package(default_visibility = ["//visibility:public"])
+
+test_suite(
+    name = "unit",
+    tests = [
+        "//crates/sync-core:unit_test",
+    ],
+)

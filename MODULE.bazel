@@ -1,0 +1,42 @@
+module(
+    name = "berrykeep",
+    version = "1.0.37",
+)
+
+# Rust rules are kept in lock-step with the initial Bazel toolchain. Cargo
+# remains the source of truth for third-party dependency versions.
+bazel_dep(name = "rules_rust", version = "0.71.3")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.88.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# Crate Universe resolves Cargo metadata while evaluating the module. Pin its
+# host tools to the same Rust release as the toolchain so that resolution is
+# consistent between developer machines and CI.
+host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
+host_tools.host_tools(
+    name = "berrykeep_rust_host_tools",
+    version = "1.88.0",
+)
+use_repo(host_tools, "berrykeep_rust_host_tools")
+
+# Crate Universe translates the checked-in Cargo workspace and lockfile into
+# Bazel targets. Cargo.lock remains the single dependency lockfile during this
+# incremental migration.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    host_tools = "@berrykeep_rust_host_tools",
+    manifests = ["//:Cargo.toml"],
+    # The initial suite runs on GitHub's Linux x86_64 runner. Additional
+    # triples are added together with their first native Bazel targets.
+    supported_platform_triples = ["x86_64-unknown-linux-gnu"],
+)
+use_repo(crate, "crates")

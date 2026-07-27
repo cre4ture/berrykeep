@@ -27,3 +27,4 @@ apps/apple-file-provider/.DS_Store
 apps/apple-file-provider/**/xcuserdata/
 .codex-remote-attachments/
 .tmp/
+bazel-*

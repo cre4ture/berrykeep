@@ -1,0 +1,76 @@
+name: Bazel
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.bazelrc'
+      - '.bazelversion'
+      - 'BUILD.bazel'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'MODULE.bazel'
+      - 'MODULE.bazel.lock'
+      - 'crates/**'
+      - '.github/workflows/bazel.yml'
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - '.bazelrc'
+      - '.bazelversion'
+      - 'BUILD.bazel'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'MODULE.bazel'
+      - 'MODULE.bazel.lock'
+      - 'crates/**'
+      - '.github/workflows/bazel.yml'
+  workflow_dispatch:
+    inputs:
+      write_cache:
+        description: Seed the branch-scoped Bazel cache from this trusted run
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Bazel unit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
+
+      - name: Start GitHub-backed Bazel cache
+        id: bazel-cache
+        uses: cre4ture/bazel-github-actions-cache-v2@389eae8501ff832fd7f51bbf0950ca7302750983 # v0.1.0
+        with:
+          # Default-branch pushes publish; PRs are read-only. A maintainer can
+          # explicitly seed the selected branch from workflow_dispatch.
+          write: ${{ github.event_name == 'workflow_dispatch' && inputs.write_cache && 'true' || 'auto' }}
+          key-prefix: ironmesh-bazel-v1
+
+      - name: Test native Bazel targets
+        shell: bash
+        env:
+          BAZEL_REMOTE_CACHE_URL: ${{ steps.bazel-cache.outputs.url }}
+          BAZEL_REMOTE_CACHE_WRITABLE: ${{ steps.bazel-cache.outputs.writable }}
+        run: |
+          set -euo pipefail
+          bazel test //:unit \
+            "--remote_cache=${BAZEL_REMOTE_CACHE_URL}" \
+            "--remote_upload_local_results=${BAZEL_REMOTE_CACHE_WRITABLE}"
