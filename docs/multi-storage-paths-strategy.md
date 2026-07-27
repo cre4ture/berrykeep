@@ -74,6 +74,36 @@ Beim ersten Einsatz wird in jedem Pfad ein Marker
 Pfad-ID, damit versehentlich gemeinsam verwendete oder vertauschte Mounts beim
 Start auffallen.
 
+## Geführte Konfiguration und Host-Storage-Agent
+
+Die Server-Admin-Oberfläche führt durch die Konfiguration eines weiteren
+Storage-Pfads. Sie kann vorhandene Pfade weiterhin direkt bearbeiten und hält
+die Roh-JSON-Ansicht als bewusst als „Erweitert“ markierte Option vor.
+
+Der in den Server-Node integrierte Host-Storage-Agent erkennt dazu die vom
+Betriebssystem bereits eingehängten Volumes. Er läuft mit derselben
+Dienst-Identität wie der Node und kann einen sicheren Unterordner auf dem
+ausgewählten Volume anlegen und mit Erstellen, Schreiben, Synchronisieren und
+Löschen einer Prüfdatei testen. Damit gilt das Ergebnis unter macOS, Linux und
+Windows für genau die Berechtigungen, mit denen der Node später arbeitet.
+
+Der Agent führt absichtlich keine privilegierten Host-Aktionen aus: Er hängt
+keine Volumes ein oder aus, formatiert keine Datenträger und startet keine
+Dienste neu. Diese Schritte bleiben beim Betriebssystem und dessen
+administrativer Oberfläche. Die UI erklärt bei fehlenden Volumes,
+schreibgeschützten Dateisystemen, Berechtigungsfehlern, überlappenden Pfaden
+und fehlenden aktiven Zielen jeweils die sichere nächste Maßnahme.
+
+Die geschützten Admin-Endpunkte dafür sind:
+
+- `GET /api/v1/auth/storage/host/volumes` für die aktuelle Volume-Inventur,
+- `POST /api/v1/auth/storage/host/volumes/prepare` für das Anlegen und den
+  Schreibtest eines einzelnen Unterordners.
+
+Ein erfolgreicher Schreibtest konfiguriert noch nichts automatisch. Der Pfad
+wird erst als Entwurf in den Storage-Pool übernommen, serverseitig validiert,
+atomar gespeichert und nach einem kontrollierten Neustart aktiviert.
+
 ### Umstellung eines bestehenden Ein-Pfad-Nodes
 
 Der bisherige Datenpfad bleibt lesbar, auch wenn keine Konfigurationsdatei

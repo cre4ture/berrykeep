@@ -528,7 +528,7 @@ test("server-admin explorer restores snapshot entries", async ({ page }) => {
   await expect(page.getByRole("cell", { name: "restored/readme-restored.txt" })).toBeVisible();
 });
 
-test("server-admin validates and saves storage-pool configuration with Cockpit guidance", async ({ page }) => {
+test("server-admin prepares, validates, and saves a host-checked storage path with recovery guidance", async ({ page }) => {
   const mockState = await installServerAdminMocks(page, { cockpitStatus: "optional" });
 
   await page.goto("/");
@@ -544,31 +544,23 @@ test("server-admin validates and saves storage-pool configuration with Cockpit g
     .filter({ hasText: "Metadata" })
     .first()
     .click();
-  const configuration = page.getByLabel("Storage-pool JSON");
-  await expect(configuration).toHaveValue(/"id": "primary"/);
+  await expect(page.getByText(/Prepare an attached volume/)).toBeVisible();
+  await expect(page.getByText("If a storage check fails", { exact: true })).toBeVisible();
 
-  await configuration.fill("{");
-  await page.getByRole("button", { name: "Validate configuration" }).click();
-  await expect(page.getByText("Invalid JSON", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Reset to running configuration" }).click();
-  await expect(configuration).toHaveValue(/"id": "primary"/);
-
-  await configuration.fill(
-    JSON.stringify({
-      version: 1,
-      paths: [
-        {
-          id: "rejected",
-          path: "/srv/ironmesh/primary",
-          state: "active",
-          weight: 1,
-          reserve_bytes: 0
-        }
-      ]
-    })
-  );
+  await page.getByLabel("Path ID").fill("rejected");
   await page.getByRole("button", { name: "Validate configuration" }).click();
   await expect(page.getByText(/mocked storage-pool validation failure/)).toBeVisible();
+  await expect(page.getByText("Review before retrying", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Reset to running configuration" }).click();
+
+  await page.getByRole("textbox", { name: "Mounted volume" }).click();
+  await page.getByRole("option", { name: /External USB/ }).click();
+  await page.getByLabel("Storage subfolder").fill("ironmesh-data");
+  await page.getByRole("button", { name: "Prepare and check storage" }).click();
+  await expect(page.getByText("Directory is writable by the node service", { exact: true })).toBeVisible();
+  await page.getByLabel("Stable storage-path ID").fill("secondary");
+  await page.getByRole("button", { name: "Add checked path" }).click();
+  await expect(page.getByText("Checked path added to the draft", { exact: true })).toBeVisible();
 
   const nextConfig = {
     version: 1,
@@ -582,14 +574,17 @@ test("server-admin validates and saves storage-pool configuration with Cockpit g
       },
       {
         id: "secondary",
-        path: "/mnt/storage/ironmesh",
+        path: "/Volumes/External USB/ironmesh-data",
         state: "active",
         weight: 2,
-        reserve_bytes: 4096
+        reserve_bytes: 2 * 1024 ** 3
       }
     ]
   };
-  await configuration.fill(JSON.stringify(nextConfig));
+  const weightInputs = page.getByLabel("Placement weight");
+  await weightInputs.nth(1).fill("2");
+  const reserveInputs = page.getByLabel("Reserved space (GiB)");
+  await reserveInputs.nth(1).fill("2");
   await page.getByRole("button", { name: "Validate configuration" }).click();
   await expect(page.getByText("Configuration is valid", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Save configuration" }).click();
@@ -1793,6 +1788,36 @@ async function installServerAdminMocks(
 
     if (pathname === apiV1("/auth/storage/pool") && method === "GET") {
       return json(route, storagePoolStatus(storagePoolConfig));
+    }
+
+    if (pathname === apiV1("/auth/storage/host/volumes") && method === "GET") {
+      return json(route, {
+        platform: "macos",
+        volumes: [
+          {
+            name: "External USB",
+            mount_path: "/Volumes/External USB",
+            file_system: "APFS",
+            total_bytes: 2_000_000_000,
+            available_bytes: 1_500_000_000,
+            removable: true,
+            read_only: false
+          }
+        ]
+      });
+    }
+
+    if (pathname === apiV1("/auth/storage/host/volumes/prepare") && method === "POST") {
+      expect(route.request().postDataJSON()).toEqual({
+        mount_path: "/Volumes/External USB",
+        directory_name: "ironmesh-data"
+      });
+      return json(route, {
+        mount_path: "/Volumes/External USB",
+        path: "/Volumes/External USB/ironmesh-data",
+        directory_created: true,
+        write_check: "passed"
+      });
     }
 
     if (pathname === apiV1("/auth/storage/pool/config/validate") && method === "POST") {
