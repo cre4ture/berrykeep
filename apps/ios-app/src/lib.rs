@@ -15,12 +15,37 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 const FFI_OK: c_int = 0;
 const FFI_ERR: c_int = 1;
+
+fn ios_diagnostic_log_buffer() -> Arc<common::logging::LogBuffer> {
+    static LOG_BUFFER: OnceLock<Arc<common::logging::LogBuffer>> = OnceLock::new();
+    Arc::clone(LOG_BUFFER.get_or_init(|| {
+        Arc::new(common::logging::LogBuffer::new(
+            common::logging::LogBuffer::MOBILE_DIAGNOSTIC_CAPACITY,
+        ))
+    }))
+}
+
+fn init_ios_tracing() {
+    static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+    TRACING_INIT.call_once(|| {
+        let env_filter = common::logging::env_filter_from_default_env("info");
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(common::logging::compact_fmt_layer())
+            .with(common::logging::LogCaptureLayer::new(
+                ios_diagnostic_log_buffer(),
+            ))
+            .try_init();
+    });
+}
 
 pub struct IosStorageApp {
     runtime: Runtime,
@@ -246,6 +271,7 @@ impl IosStorageApp {
         client_identity_json: Option<String>,
         connection_name: Option<String>,
     ) -> Result<Self> {
+        init_ios_tracing();
         let bootstrap_json = normalized_bootstrap_json(connection_input)?;
         let server_ca_pem = normalize_optional_string(server_ca_pem);
         let client_identity_json = normalize_optional_string(client_identity_json);
@@ -609,6 +635,7 @@ fn start_embedded_web_ui(
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
 ) -> Result<EmbeddedWebUiLaunch> {
+    init_ios_tracing();
     let runtime = web_ui_runtime()?;
     let bootstrap_json = normalized_bootstrap_json(bootstrap_json)?;
     let server_ca_pem = normalize_optional_string(server_ca_pem);
@@ -877,6 +904,7 @@ pub fn enroll_connection_input_json(
     device_id_override: Option<&str>,
     device_label_override: Option<&str>,
 ) -> Result<String> {
+    init_ios_tracing();
     let connection = enroll_client_connection_blocking(
         connection_input.as_ref(),
         device_id_override,
@@ -915,6 +943,7 @@ pub extern "C" fn ironmesh_ios_facade_create_named(
     connection_name: *const c_char,
     out_error: *mut *mut c_char,
 ) -> *mut c_void {
+    init_ios_tracing();
     clear_error(out_error);
     let result = (|| -> Result<*mut c_void> {
         let connection_input = required_c_string(connection_input, "connection_input")?;
@@ -970,6 +999,20 @@ pub extern "C" fn ironmesh_ios_bytes_free(value: IronmeshIosBytes) {
     unsafe {
         drop(Vec::from_raw_parts(value.data, value.len, value.capacity));
     }
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_diagnostic_log(
+    out_log: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    init_ios_tracing();
+    clear_string_out(out_log);
+    clear_error(out_error);
+    run_ffi_string_result(out_log, out_error, || {
+        Ok(ios_diagnostic_log_buffer().render_text())
+    })
 }
 
 #[allow(unsafe_code)]
