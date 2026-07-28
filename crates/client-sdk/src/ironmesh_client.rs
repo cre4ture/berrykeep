@@ -6142,9 +6142,9 @@ async fn execute_direct_multiplex_buffered_request(
 
     match tokio::time::timeout(
         timeout,
-        execute_direct_multiplex_buffered_request_without_timeout(
+        Box::pin(execute_direct_multiplex_buffered_request_without_timeout(
             direct, method, url, headers, body,
-        ),
+        )),
     )
     .await
     {
@@ -6244,9 +6244,9 @@ async fn execute_relay_multiplex_buffered_request(
 
     match tokio::time::timeout(
         timeout,
-        execute_relay_multiplex_buffered_request_without_timeout(
+        Box::pin(execute_relay_multiplex_buffered_request_without_timeout(
             &relay, method, url, headers, body,
-        ),
+        )),
     )
     .await
     {
