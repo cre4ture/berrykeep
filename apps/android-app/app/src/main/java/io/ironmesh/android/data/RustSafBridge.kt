@@ -12,7 +12,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.DocumentsContract
 import android.provider.MediaStore
-import android.util.Log
+import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import android.webkit.MimeTypeMap
 import androidx.core.content.ContextCompat
 import org.json.JSONArray

@@ -5,7 +5,6 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -28,6 +27,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
+import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.data.RustPreferencesBridge
 import io.ironmesh.android.data.RustSafBridge
@@ -43,6 +43,9 @@ import io.ironmesh.android.ui.screens.RequestTimingsScreen
 import io.ironmesh.android.ui.screens.SettingsScreen
 import io.ironmesh.android.ui.screens.SyncScreen
 import io.ironmesh.android.ui.theme.IronmeshTheme
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -112,6 +115,11 @@ class MainActivity : ComponentActivity() {
                         },
                         onError = vm::setStatus,
                     )
+                }
+                val diagnosticLogLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.CreateDocument("text/plain"),
+                ) { destination ->
+                    destination?.let(vm::exportDiagnosticLog)
                 }
 
                 val onScanQr: () -> Unit = {
@@ -200,6 +208,13 @@ class MainActivity : ComponentActivity() {
                         snackbarHostState = snackbarHostState,
                         deviceLabel = state.deviceAuthState.label,
                         titleLatencyStatus = state.titleLatencyStatus,
+                        onExportDiagnosticLog = {
+                            runCatching {
+                                diagnosticLogLauncher.launch(diagnosticLogFileName())
+                            }.onFailure { error ->
+                                vm.setStatus("Unable to open the diagnostic log save dialog: ${error.message}")
+                            }
+                        },
                         onNavigateBack = if (
                             state.selectedSection == MainSection.CONNECTIVITY ||
                             state.selectedSection == MainSection.REQUEST_TIMINGS
@@ -367,4 +382,12 @@ class MainActivity : ComponentActivity() {
             vm.setStatus("No compatible Files app found on this device")
         }
     }
+}
+
+internal fun diagnosticLogFileName(now: Instant = Instant.now()): String {
+    val timestamp = DateTimeFormatter
+        .ofPattern("yyyyMMdd-HHmmss")
+        .withZone(ZoneOffset.UTC)
+        .format(now)
+    return "berrykeep-diagnostic-$timestamp.log"
 }
