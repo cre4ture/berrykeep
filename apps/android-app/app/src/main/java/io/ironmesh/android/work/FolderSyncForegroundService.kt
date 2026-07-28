@@ -10,10 +10,10 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.ironmesh.android.data.RustSafBridge
+import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.APP_CONNECTION_STATE_CONNECTED
 import io.ironmesh.android.data.APP_CONNECTION_STATE_CONNECTING
 import io.ironmesh.android.data.APP_CONNECTION_STATE_RECONNECTING

@@ -43,6 +43,8 @@ separate Files domain backed by the shared enrolled device connection.
   **Keep Downloaded** action; iOS has no provider-level per-profile eager-retention API.
 - The iOS app shell can optionally run the Rust-backed title latency monitor while the app is
   executing. Its configurable direct (`D`) or relay (`R`) result is shown in each main navigation bar.
+- The neighboring export button opens the system document exporter and writes retained app actions,
+  current connection state, and Rust tracing output to a user-selected text file.
 - File mutations carry File Provider's base version to a server-side preferred-head compare-and-swap.
   Concurrent content edits are preserved under a deterministic visible conflict-copy name. A
   directory deletion is recursive and enabled in Files. A concurrent child mutation may be

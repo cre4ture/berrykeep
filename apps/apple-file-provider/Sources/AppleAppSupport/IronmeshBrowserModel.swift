@@ -164,12 +164,14 @@ final class IronmeshBrowserModel: ObservableObject {
     private let onboardingStorageKey = "IronmeshIosApp.hasCompletedOnboarding"
     private let titleLatencyMonitorSettingsStorageKey = "IronmeshIosApp.titleLatencyMonitorSettings"
     private let recentActionLimit = 6
+    private let diagnosticActionLimit = 10_000
 
     private var didActivate = false
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
     private var titleLatencyStatusTask: Task<Void, Never>?
+    private var diagnosticActions: [IronmeshRecentAction] = []
 
     var isSyncProfileMutationInProgress: Bool {
         syncProfileOperationState.isMutationInProgress
@@ -243,6 +245,7 @@ final class IronmeshBrowserModel: ObservableObject {
            ) {
             titleLatencyMonitorSettings = settings
         }
+        addAction("Started app", detail: statusText)
     }
 
     var shouldShowOnboarding: Bool {
@@ -273,6 +276,65 @@ final class IronmeshBrowserModel: ObservableObject {
             return lastErrorMessage
         }
         return draft.setupSummary
+    }
+
+    func diagnosticLogText() -> String {
+        addAction("Exported diagnostic log", detail: "Prepared app and Rust logs for file export.")
+        let generatedAt = Date()
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let activeRoute = connectionRouteSnapshot?.activeEndpoint
+        let shortVersion = (
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        )?.nilIfBlank
+        let buildVersion = (
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        )?.nilIfBlank
+        let normalizedAppVersion = switch (shortVersion, buildVersion) {
+        case let (.some(shortVersion), .some(buildVersion)):
+            "\(shortVersion) (build \(buildVersion))"
+        case let (.some(shortVersion), .none):
+            shortVersion
+        case let (.none, .some(buildVersion)):
+            "build \(buildVersion)"
+        case (.none, .none):
+            "unavailable"
+        }
+        let rustLog: String
+        do {
+            rustLog = try IronmeshRustFFIAdapter(
+                connectionName: "ios diagnostic export"
+            ).diagnosticLog()
+        } catch {
+            rustLog = "Rust diagnostic log unavailable: \(error.localizedDescription)\n"
+        }
+        let applicationLog = diagnosticActions
+            .map { action in
+                "\(formatter.string(from: action.timestamp)) INFO/IronmeshIosApp: \(action.title) — \(action.detail)"
+            }
+            .joined(separator: "\n")
+
+        return """
+        BerryKeep mobile diagnostic log
+        Generated: \(formatter.string(from: generatedAt))
+        This file can contain server addresses, device identifiers, paths, and error details.
+        App version: \(normalizedAppVersion)
+        Platform: \(appleDiagnosticPlatformName()) \(ProcessInfo.processInfo.operatingSystemVersionString)
+        Device ID: \(draft.enrolledDeviceID.nilIfBlank ?? "unavailable")
+        Device label: \(draft.deviceLabel.nilIfBlank ?? "unavailable")
+        Domain: \(draft.domainIdentifier.nilIfBlank ?? "unavailable")
+        UI status: \(statusText.replacingOccurrences(of: "\n", with: " "))
+        Last error: \(lastErrorMessage?.replacingOccurrences(of: "\n", with: " ") ?? "none")
+        Active route: \(activeRoute.map { "\($0.pathKind.rawValue): \($0.locator)" } ?? "unavailable")
+        Title latency: state=\(titleLatencyStatus.state) route=\(titleLatencyStatus.connectionType) latency_ms=\(titleLatencyStatus.latencyMs.map { String($0) } ?? "unavailable") error=\(titleLatencyStatus.error ?? "none")
+        Sync profile count: \(syncProfiles.count)
+
+        === Apple application log ===
+        \(applicationLog.isEmpty ? "(no Apple application entries retained)" : applicationLog)
+
+        === Rust tracing log ===
+        \(rustLog.isEmpty ? "(no Rust tracing entries retained)" : rustLog)
+        """
     }
 
     var rootDirectoryCount: Int {
@@ -1378,12 +1440,14 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     private func addAction(_ title: String, detail: String) {
-        recentActions.insert(
-            IronmeshRecentAction(title: title, detail: detail, timestamp: Date()),
-            at: 0
-        )
+        let action = IronmeshRecentAction(title: title, detail: detail, timestamp: Date())
+        recentActions.insert(action, at: 0)
         if recentActions.count > recentActionLimit {
             recentActions.removeLast(recentActions.count - recentActionLimit)
+        }
+        diagnosticActions.append(action)
+        if diagnosticActions.count > diagnosticActionLimit {
+            diagnosticActions.removeFirst(diagnosticActions.count - diagnosticActionLimit)
         }
     }
 
@@ -1396,6 +1460,16 @@ final class IronmeshBrowserModel: ObservableObject {
         pendingOperations = max(0, pendingOperations - 1)
         isBusy = pendingOperations > 0
     }
+}
+
+private func appleDiagnosticPlatformName() -> String {
+#if os(iOS)
+    "iOS"
+#elseif os(macOS)
+    "macOS"
+#else
+    "Apple"
+#endif
 }
 
 final class IronmeshRemoteSession: @unchecked Sendable {

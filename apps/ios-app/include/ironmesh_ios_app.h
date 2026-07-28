@@ -37,6 +37,8 @@ void ironmesh_ios_string_free(char *value);
 
 void ironmesh_ios_bytes_free(struct IronmeshIosBytes value);
 
+int ironmesh_ios_diagnostic_log(char **out_log, char **out_error);
+
 int ironmesh_ios_facade_list_json(void *handle,
                                   const char *prefix,
                                   uintptr_t depth,

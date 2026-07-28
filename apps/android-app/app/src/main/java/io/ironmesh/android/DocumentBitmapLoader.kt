@@ -7,7 +7,7 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Build
-import android.util.Log
+import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import java.io.File
 
 object DocumentBitmapLoader {

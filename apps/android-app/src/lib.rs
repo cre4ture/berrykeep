@@ -258,7 +258,7 @@ fn android_web_log_buffer() -> Arc<common::logging::LogBuffer> {
     static LOG_BUFFER: OnceLock<Arc<common::logging::LogBuffer>> = OnceLock::new();
     Arc::clone(LOG_BUFFER.get_or_init(|| {
         Arc::new(common::logging::LogBuffer::new(
-            common::logging::LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY,
+            common::logging::LogBuffer::MOBILE_DIAGNOSTIC_CAPACITY,
         ))
     }))
 }
@@ -1802,6 +1802,27 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getDiagnosticLog(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    init_android_tracing();
+    match env.new_string(android_web_log_buffer().render_text()) {
+        Ok(value) => value.into_raw(),
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust getDiagnosticLog failed to create java string: {err:#}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getConnectionRouteSnapshot(
     mut env: JNIEnv,
     _class: JClass,
@@ -1988,6 +2009,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enr
     device_id: jstring,
     label: jstring,
 ) -> jstring {
+    init_android_tracing();
     let result = (|| -> Result<String> {
         let bootstrap_json: String = env.get_string(&bootstrap_json)?.into();
         let device_id = normalize_optional_string(optional_jstring(&mut env, device_id)?);
