@@ -5,11 +5,17 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -23,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.R
 import io.ironmesh.android.ui.MainUiState
@@ -41,6 +48,22 @@ fun ConnectionPathsScreen(
     val clipboardManager = LocalClipboardManager.current
     var expandedRouteIndex by rememberSaveable { mutableStateOf<Int?>(null) }
 
+    if (presentation.routes.isNotEmpty()) {
+        ConnectionRoutesList(
+            presentation = presentation,
+            expandedRouteIndex = expandedRouteIndex,
+            refreshing = state.connectionRoutesLoading,
+            onRefresh = onRefresh,
+            onToggleDetails = { routeIndex ->
+                expandedRouteIndex = if (expandedRouteIndex == routeIndex) null else routeIndex
+            },
+            onCopyEndpoint = { endpoint ->
+                clipboardManager.setText(AnnotatedString(endpoint))
+            },
+        )
+        return
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -53,15 +76,54 @@ fun ConnectionPathsScreen(
             refreshing = state.connectionRoutesLoading,
         )
 
-        if (presentation.routes.isEmpty()) {
-            SectionCard(
-                title = stringResource(R.string.connection_paths_empty_title),
-                supportingText = stringResource(R.string.connection_paths_empty_body),
-            ) {}
-        } else {
+        SectionCard(
+            title = stringResource(R.string.connection_paths_empty_title),
+            supportingText = stringResource(R.string.connection_paths_empty_body),
+        ) {}
+    }
+}
+
+@Composable
+private fun ConnectionRoutesList(
+    presentation: ConnectionPathsPresentation,
+    expandedRouteIndex: Int?,
+    refreshing: Boolean,
+    onRefresh: () -> Unit,
+    onToggleDetails: (Int) -> Unit,
+    onCopyEndpoint: (String) -> Unit,
+) {
+    LazyColumn(modifier = Modifier.fillMaxSize()) {
+        item(key = "connection-overview") {
+            CompactConnectionOverview(presentation)
+        }
+        items(
+            items = presentation.routes,
+            key = { route -> route.endpoint.index },
+        ) { route ->
+            ConnectionRouteCard(
+                route = route,
+                expanded = expandedRouteIndex == route.endpoint.index,
+                onToggleDetails = { onToggleDetails(route.endpoint.index) },
+                onCopyEndpoint = { onCopyEndpoint(route.endpoint.locator) },
+            )
+        }
+        if (
+            presentation.overview.state == ConnectionOverviewState.ERROR ||
+            presentation.overview.state == ConnectionOverviewState.UNAVAILABLE
+        ) {
+            item(key = "connection-issue") {
+                ConnectionIssueCard(
+                    overview = presentation.overview,
+                    refreshing = refreshing,
+                    onRefresh = onRefresh,
+                )
+            }
+        }
+        item(key = "selection-explanation") {
             SectionCard(
                 title = stringResource(R.string.connection_paths_selection_title),
                 supportingText = stringResource(R.string.connection_paths_selection_body),
+                modifier = Modifier.padding(top = 12.dp),
             ) {
                 Text(
                     text = stringResource(R.string.connection_paths_selection_score_additions),
@@ -72,41 +134,114 @@ fun ConnectionPathsScreen(
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-            SectionCard(
-                title = stringResource(R.string.connection_paths_routes_title),
-                supportingText = stringResource(R.string.connection_paths_routes_body),
-            ) {
-                presentation.routes.forEach { route ->
-                    ConnectionRouteCard(
-                        route = route,
-                        expanded = expandedRouteIndex == route.endpoint.index,
-                        onToggleDetails = {
-                            expandedRouteIndex = if (expandedRouteIndex == route.endpoint.index) {
-                                null
-                            } else {
-                                route.endpoint.index
-                            }
-                        },
-                        onCopyEndpoint = {
-                            clipboardManager.setText(AnnotatedString(route.endpoint.locator))
-                        },
-                    )
-                }
+        }
+        if (presentation.overview.state == ConnectionOverviewState.RELAY) {
+            item(key = "relay-note") {
+                SectionCard(
+                    title = stringResource(R.string.connection_paths_relay_note_title),
+                    supportingText = stringResource(R.string.connection_paths_relay_note_body),
+                    modifier = Modifier.padding(top = 12.dp),
+                ) {}
             }
         }
-
-        if (presentation.overview.state == ConnectionOverviewState.RELAY) {
-            SectionCard(
-                title = stringResource(R.string.connection_paths_relay_note_title),
-                supportingText = stringResource(R.string.connection_paths_relay_note_body),
-            ) {}
-        }
-
         if (presentation.overview.state == ConnectionOverviewState.DIRECT_QUIC) {
-            SectionCard(
-                title = stringResource(R.string.connection_paths_direct_quic_note_title),
-                supportingText = stringResource(R.string.connection_paths_direct_quic_note_body),
-            ) {}
+            item(key = "direct-quic-note") {
+                SectionCard(
+                    title = stringResource(R.string.connection_paths_direct_quic_note_title),
+                    supportingText = stringResource(R.string.connection_paths_direct_quic_note_body),
+                    modifier = Modifier.padding(top = 12.dp),
+                ) {}
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompactConnectionOverview(presentation: ConnectionPathsPresentation) {
+    val overview = presentation.overview
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 36.dp)
+                .padding(horizontal = 8.dp, vertical = 3.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(overviewTitle(overview.state)),
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = compactOverviewSubtitle(overview),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                text = stringResource(
+                    R.string.connection_paths_compact_route_count,
+                    presentation.routes.size,
+                ),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun compactOverviewSubtitle(overview: ConnectionOverview): String {
+    val activeRoute = overview.activeRoute
+    if (
+        activeRoute != null &&
+        overview.state != ConnectionOverviewState.ERROR &&
+        overview.state != ConnectionOverviewState.UNAVAILABLE
+    ) {
+        val parts = mutableListOf(compactRouteDisplayLabel(activeRoute))
+        activeRoute.ewmaLatencyMs?.let { latency ->
+            parts += formatConnectionLatency(latency)
+        }
+        return parts.joinToString(" · ")
+    }
+    return stringResource(
+        when (overview.state) {
+            ConnectionOverviewState.ERROR -> R.string.connection_paths_error_body
+            ConnectionOverviewState.UNAVAILABLE -> R.string.connection_paths_unavailable_body
+            else -> R.string.connection_paths_checking_body
+        },
+    )
+}
+
+@Composable
+private fun ConnectionIssueCard(
+    overview: ConnectionOverview,
+    refreshing: Boolean,
+    onRefresh: () -> Unit,
+) {
+    SectionCard(
+        title = stringResource(overviewTitle(overview.state)),
+        supportingText = compactOverviewSubtitle(overview),
+        modifier = Modifier.padding(top = 12.dp),
+    ) {
+        overview.error
+            ?.takeIf { it.isNotBlank() }
+            ?.let { error ->
+                SelectionContainer {
+                    Text(error, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        Button(onClick = onRefresh, enabled = !refreshing) {
+            Text(stringResource(R.string.connection_paths_try_again))
         }
     }
 }

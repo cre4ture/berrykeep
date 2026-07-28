@@ -100,6 +100,34 @@ public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Se
         }
     }
 
+    public var compactConnectionDisplayName: String {
+        let prefix: String
+        switch pathKind {
+        case .directHTTPS:
+            prefix = "HTTPS"
+        case .directQUIC where isDirectQuicHolePunched:
+            prefix = "QUIC NAT"
+        case .directQUIC where usesRelayPath:
+            prefix = "QUIC relay"
+        case .directQUIC:
+            prefix = "QUIC"
+        case .relayTunnel:
+            prefix = "Relay"
+        case .unknown:
+            prefix = pathKind.displayName
+        }
+
+        let destination: String?
+        if pathKind == .relayTunnel {
+            destination = compactRouteLocator(locator)
+                ?? targetNodeId.map(compactRouteIdentifier)
+        } else {
+            destination = targetNodeId.map(compactRouteIdentifier)
+                ?? compactRouteLocator(locator)
+        }
+        return destination.map { "\(prefix) · \($0)" } ?? prefix
+    }
+
     public var connectionExplanation: String? {
         if isDirectQuicHolePunched {
             return "Rendezvous established this connection; data travels directly between this device and the cluster."
@@ -116,6 +144,34 @@ public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Se
         }
         return circuitOpenUntilUnixMs > timestamp
     }
+}
+
+private func compactRouteIdentifier(_ value: String) -> String {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count > 16 else {
+        return trimmed
+    }
+    return "\(trimmed.prefix(8))…\(trimmed.suffix(4))"
+}
+
+private func compactRouteLocator(_ locator: String) -> String? {
+    var value = locator.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty else {
+        return nil
+    }
+    if let atIndex = value.lastIndex(of: "@") {
+        value = String(value[value.index(after: atIndex)...])
+    }
+    if let schemeRange = value.range(of: "://") {
+        value = String(value[schemeRange.upperBound...])
+    }
+    if let slashIndex = value.firstIndex(of: "/") {
+        value = String(value[..<slashIndex])
+    }
+    guard !value.isEmpty else {
+        return nil
+    }
+    return compactRouteIdentifier(value)
 }
 
 public struct AppleConnectionRouteSnapshot: Codable, Equatable, Sendable {
