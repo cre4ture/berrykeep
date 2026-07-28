@@ -1,3 +1,13 @@
+ironmesh (1.0.40-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Embed an authenticated Iroh relay on the Rendezvous endpoint and port.
+  * Add anonymous reliability-telemetry ingestion tokens with node registration
+    and user-controlled identity rotation.
+  * Harden CI against corrupt Bazel remote-cache entries.
+  * Roll the workspace release to 1.0.40.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 28 Jul 2026 17:22:03 +0200
+
 ironmesh (1.0.39-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add managed mobile Rendezvous routes and direct QUIC connection status.
