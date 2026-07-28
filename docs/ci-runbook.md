@@ -158,6 +158,20 @@ Useful per-lane shortcuts:
 - `just ci-web-smoke`
 - `just test-system-nightly`
 
+## GitHub Actions cache scope
+
+Pull-request workflows restore `Swatinem/rust-cache` entries from the default
+branch but do not publish new archive entries into the pull request's isolated
+merge-ref scope. Trusted `push`, `schedule`, and `workflow_dispatch` runs still
+refresh those archives. This prevents short-lived pull-request archives from
+evicting reusable default-branch cache entries.
+
+The `Cache cleanup` workflow runs when a pull request closes and deletes up to
+the 100 largest remaining entries under its `refs/pull/<number>/merge` scope.
+This also reclaims entries written by cache clients that do not support a
+restore-only mode. The cleanup job never checks out or executes pull-request
+code and has only `actions: write` plus `contents: read` permission.
+
 ## Nightly lane fails, stable lanes pass
 
 This usually means the failure is isolated to `tests/system-tests` and/or nightly `bindeps` behavior.

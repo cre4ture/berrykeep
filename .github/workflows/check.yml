@@ -78,6 +78,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Run workspace check
         run: cargo check --locked --workspace
@@ -96,6 +97,8 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -140,6 +143,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -182,6 +186,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Run unit tests
         run: cargo test --locked --workspace
@@ -241,6 +246,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install Playwright browser
         working-directory: web
@@ -454,6 +460,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Show Xcode version
         run: |
@@ -756,6 +763,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build Linux release binary bundle
         run: |
@@ -882,6 +890,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Check Windows CFAPI adapter crate
         run: cargo check --locked -p adapter-windows-cfapi --all-targets
@@ -927,6 +936,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build Windows Server Node MSI
         run: powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Build-Msi.ps1

@@ -75,6 +75,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Run system tests
         run: cargo -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml
