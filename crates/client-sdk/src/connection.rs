@@ -25,6 +25,8 @@ use crate::{IronMeshClient, PlannedConnectionBootstrapTarget};
 const RELAY_REQUEST_BASE_URL: &str = "https://relay.invalid/";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_PROBE_RESPONSE_BYTES: usize = 64;
+const STARTUP_PROBE_WARMUP_COUNT: usize = 1;
+const STARTUP_PROBE_SAMPLE_COUNT: usize = 3;
 const STARTUP_PROBE_FAILURE_PENALTY_MS: f64 = 500.0;
 const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_PROBE_SUCCESS_GRACE: Duration = Duration::from_millis(250);
@@ -657,8 +659,8 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
     }
 
     let probe_config = LatencyProbeConfig {
-        sample_count: 1,
-        warmup_count: 0,
+        sample_count: STARTUP_PROBE_SAMPLE_COUNT,
+        warmup_count: STARTUP_PROBE_WARMUP_COUNT,
         response_bytes: STARTUP_PROBE_RESPONSE_BYTES,
         server_delay_ms: 0,
         pause_between_samples_ms: 0,
@@ -702,23 +704,32 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
 
 async fn probe_direct_client_startup_quality(client: &IronMeshClient) -> Result<f64> {
     let target_label = startup_probe_target_label(client);
-    let started_at = Instant::now();
-    let response = tokio::time::timeout(STARTUP_PROBE_TIMEOUT, client.get_relative_path("/health"))
-        .await
-        .with_context(|| {
-            format!(
-                "startup direct health probe timed out after {:?} for {target_label}",
-                STARTUP_PROBE_TIMEOUT
-            )
-        })??;
-    if !response.status.is_success() {
-        bail!(
-            "health probe returned {} for {}",
-            response.status,
-            target_label
-        );
-    }
-    Ok(started_at.elapsed().as_secs_f64() * 1000.0)
+    tokio::time::timeout(STARTUP_PROBE_TIMEOUT, async {
+        let total_probe_count = STARTUP_PROBE_WARMUP_COUNT + STARTUP_PROBE_SAMPLE_COUNT;
+        let mut latency_samples_ms = Vec::with_capacity(STARTUP_PROBE_SAMPLE_COUNT);
+        for probe_index in 0..total_probe_count {
+            let started_at = Instant::now();
+            let response = client.get_relative_path("/health").await?;
+            if !response.status.is_success() {
+                bail!(
+                    "health probe returned {} for {}",
+                    response.status,
+                    target_label
+                );
+            }
+            if probe_index >= STARTUP_PROBE_WARMUP_COUNT {
+                latency_samples_ms.push(started_at.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        Ok(latency_samples_ms.iter().sum::<f64>() / latency_samples_ms.len() as f64)
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "startup direct health probe timed out after {:?} for {target_label}",
+            STARTUP_PROBE_TIMEOUT
+        )
+    })?
 }
 
 fn startup_probe_target_label(client: &IronMeshClient) -> String {
@@ -886,12 +897,17 @@ mod tests {
             .local_addr()
             .expect("fast test listener address should resolve");
         let fast_server = std::thread::spawn(move || {
-            let (mut socket, _) = fast_listener.accept().expect("fast probe should connect");
-            let mut request = [0_u8; 1024];
-            let _ = socket.read(&mut request);
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-                .expect("fast probe response should write");
+            let probe_count = STARTUP_PROBE_WARMUP_COUNT + STARTUP_PROBE_SAMPLE_COUNT;
+            for _ in 0..probe_count {
+                let (mut socket, _) = fast_listener.accept().expect("fast probe should connect");
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .expect("fast probe response should write");
+            }
         });
 
         let slow_listener =

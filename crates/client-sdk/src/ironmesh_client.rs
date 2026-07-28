@@ -58,6 +58,8 @@ const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
 const CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT: usize = 1;
+const CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT: usize = 3;
 const CLIENT_ROUTE_RECENT_ATTEMPT_LIMIT: usize = 64;
 const CLIENT_DIRECT_MULTIPLEX_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
@@ -668,12 +670,22 @@ impl ClientEndpointRouter {
         self.notify_transport_failure_when_exhausted(had_selectable_route);
     }
 
-    fn record_background_probe_success(&self, index: usize, latency_ms: f64) {
+    fn record_background_probe_successes(&self, index: usize, latency_samples_ms: &[f64]) {
         let Some(endpoint) = self.endpoint(index) else {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
-        record_endpoint_success_sample(&mut state, latency_ms, 0, true);
+        for (sample_index, latency_ms) in latency_samples_ms.iter().copied().enumerate() {
+            record_endpoint_success_sample(
+                &mut state,
+                latency_ms,
+                0,
+                sample_index + 1 == latency_samples_ms.len(),
+            );
+        }
+        if latency_samples_ms.is_empty() {
+            state.background_probe_in_flight = false;
+        }
     }
 
     fn record_background_probe_failure(&self, index: usize, error: &str) {
@@ -750,12 +762,6 @@ impl ClientEndpointRouter {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
-        record_endpoint_success_sample(
-            &mut state,
-            measurement.total_duration_ms,
-            measurement.response_bytes,
-            false,
-        );
         let finished_unix_ms = unix_ts_ms();
         let total_duration_us = duration_ms_as_u64_micros(measurement.total_duration_ms);
         let server_processing_duration_us = parse_header_u64(
@@ -773,6 +779,17 @@ impl ClientEndpointRouter {
             .saturating_sub(attempt.session_pool_before.relay_pairing_duration_us);
         let network_transfer_duration_us = transport_overhead_us
             .map(|overhead| overhead.saturating_sub(session_setup_duration_us));
+        let route_latency_us = route_latency_duration_us(
+            total_duration_us,
+            server_processing_duration_us,
+            session_setup_duration_us,
+        );
+        record_endpoint_success_sample(
+            &mut state,
+            route_latency_us as f64 / 1_000.0,
+            measurement.response_bytes,
+            false,
+        );
         let session_reused =
             session_pool_after.reuse_count > attempt.session_pool_before.reuse_count;
         let server_received_unix_ms =
@@ -1197,6 +1214,16 @@ fn duration_ms_as_u64_micros(duration_ms: f64) -> u64 {
         return 0;
     }
     (duration_ms * 1_000.0).round().min(u64::MAX as f64) as u64
+}
+
+fn route_latency_duration_us(
+    total_duration_us: u64,
+    server_processing_duration_us: Option<u64>,
+    session_setup_duration_us: u64,
+) -> u64 {
+    total_duration_us
+        .saturating_sub(server_processing_duration_us.unwrap_or_default())
+        .saturating_sub(session_setup_duration_us)
 }
 
 fn usize_as_u64(value: usize) -> u64 {
@@ -1897,7 +1924,7 @@ async fn probe_endpoint_background_quality(
     endpoint: &ClientEndpoint,
     auth: &ClientRequestAuth,
     connection_name: Option<&str>,
-) -> Result<f64> {
+) -> Result<Vec<f64>> {
     let base_url = Url::parse(endpoint.transport.request_base_url()).with_context(|| {
         format!(
             "invalid background probe base URL for endpoint {}",
@@ -1913,36 +1940,44 @@ async fn probe_endpoint_background_quality(
                 endpoint.descriptor.locator
             )
         })?;
-    let headers = request_auth_headers_for_auth(auth, &method, &url, connection_name)?;
-    let started_at = std::time::Instant::now();
-    let response = tokio::time::timeout(
-        CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
-        execute_buffered_request_for_transport(
-            &endpoint.transport,
-            auth,
-            TransportRequestOptions::new(connection_name, None),
-            &method,
-            &url,
-            &headers,
-            &[],
-        ),
-    )
-    .await
-    .map_err(|_| {
-        anyhow!(
-            "background health probe timed out after {} ms for {}",
-            CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
-            endpoint.descriptor.locator
+    let mut latency_samples_ms = Vec::with_capacity(CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT);
+    let total_probe_count =
+        CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT + CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT;
+    for probe_index in 0..total_probe_count {
+        let headers = request_auth_headers_for_auth(auth, &method, &url, connection_name)?;
+        let started_at = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
+            execute_buffered_request_for_transport(
+                &endpoint.transport,
+                auth,
+                TransportRequestOptions::new(connection_name, None),
+                &method,
+                &url,
+                &headers,
+                &[],
+            ),
         )
-    })??;
-    if !response.status.is_success() {
-        bail!(
-            "background health probe returned {} from {}",
-            response.status,
-            endpoint.descriptor.locator
-        );
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "background health probe timed out after {} ms for {}",
+                CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
+                endpoint.descriptor.locator
+            )
+        })??;
+        if !response.status.is_success() {
+            bail!(
+                "background health probe returned {} from {}",
+                response.status,
+                endpoint.descriptor.locator
+            );
+        }
+        if probe_index >= CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT {
+            latency_samples_ms.push(started_at.elapsed().as_secs_f64() * 1000.0);
+        }
     }
-    Ok(started_at.elapsed().as_secs_f64() * 1000.0)
+    Ok(latency_samples_ms)
 }
 
 fn blocking_runtime() -> Result<&'static tokio::runtime::Runtime> {
@@ -2625,9 +2660,46 @@ impl IronMeshClient {
 
         for (index, result) in join_all(tasks).await {
             match result {
-                Ok(latency_ms) => self
+                Ok(latency_samples_ms) => self
                     .transport_router
-                    .record_background_probe_success(index, latency_ms),
+                    .record_background_probe_successes(index, &latency_samples_ms),
+                Err(error) => self
+                    .transport_router
+                    .record_background_probe_failure(index, &error.to_string()),
+            }
+        }
+
+        self.connection_route_snapshot()
+    }
+
+    /// Reprobes only inactive routes whose health data is missing, failed, or stale.
+    ///
+    /// Unlike [`Self::refresh_connection_route_snapshot`], this is cheap to call from a
+    /// periodic status poll because recently measured routes are skipped.
+    pub async fn refresh_due_connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
+        let tasks = self
+            .transport_router
+            .claim_background_probe_candidates()
+            .into_iter()
+            .map(|(index, endpoint)| {
+                let auth = self.auth.clone();
+                let connection_name = self.connection_name.clone();
+                async move {
+                    let result = probe_endpoint_background_quality(
+                        &endpoint,
+                        &auth,
+                        connection_name.as_deref(),
+                    )
+                    .await;
+                    (index, result)
+                }
+            });
+
+        for (index, result) in join_all(tasks).await {
+            match result {
+                Ok(latency_samples_ms) => self
+                    .transport_router
+                    .record_background_probe_successes(index, &latency_samples_ms),
                 Err(error) => self
                     .transport_router
                     .record_background_probe_failure(index, &error.to_string()),
@@ -2720,8 +2792,9 @@ impl IronMeshClient {
                 )
                 .await
                 {
-                    Ok(latency_ms) => {
-                        transport_router.record_background_probe_success(index, latency_ms);
+                    Ok(latency_samples_ms) => {
+                        transport_router
+                            .record_background_probe_successes(index, &latency_samples_ms);
                     }
                     Err(error) => {
                         transport_router.record_background_probe_failure(index, &error.to_string());
