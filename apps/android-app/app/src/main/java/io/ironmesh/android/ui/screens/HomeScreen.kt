@@ -39,13 +39,14 @@ fun HomeScreen(
 ) {
     val status = state.folderSyncStatus
     val connectionStatus = state.appConnectionStatus
+    val connectionHealthNow = rememberConnectionHealthNow(connectionStatus)
     val hasProfiles = state.syncProfiles.isNotEmpty()
     val heroTone = when {
         status.errorProfileCount > 0L -> HeroTone.Error
-        !connectionStatus.isConnected() -> HeroTone.Warning
+        !connectionStatus.isConnected(connectionHealthNow) -> HeroTone.Warning
         else -> HeroTone.Good
     }
-    val heroTitle = appConnectionHeadline(connectionStatus)
+    val heroTitle = appConnectionHeadline(connectionStatus, connectionHealthNow)
     val heroBody = appConnectionSummary(connectionStatus)
 
     androidx.compose.foundation.layout.Column(
@@ -63,7 +64,7 @@ fun HomeScreen(
                 Button(onClick = onRunSyncNow) {
                     Text(stringResource(R.string.sync_now))
                 }
-                if (shouldShowRetryConnectionAction(connectionStatus, hasProfiles)) {
+                if (shouldShowRetryConnectionAction(connectionStatus, hasProfiles, connectionHealthNow)) {
                     OutlinedButton(onClick = onRetryConnection) {
                         Text(stringResource(R.string.retry_connection))
                     }

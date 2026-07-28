@@ -19,7 +19,8 @@ class DeviceAuthStatePersistence(
 ) {
     @Synchronized
     fun load(): DeviceAuthState {
-        val persistedState = preferences.read()?.let(codec::decode) ?: DeviceAuthState()
+        val decodedState = preferences.read()?.let(codec::decodeWithMigration)
+        val persistedState = decodedState?.state ?: DeviceAuthState()
         val protectedSecret = secretStore.load()
         val hasLegacySecret = persistedState.hasSensitiveIdentityMaterial()
         val legacySecret = if (protectedSecret == null && hasLegacySecret) {
@@ -36,6 +37,10 @@ class DeviceAuthStatePersistence(
 
         if (effectiveSecret == null && persistedState.hasIdentityMetadata()) {
             throw DeviceIdentityRecoveryRequiredException()
+        }
+
+        if (!hasLegacySecret && decodedState?.requiresPersistence == true) {
+            preferences.write(codec.encode(persistedState.withoutSensitiveIdentityMaterial()))
         }
 
         val sanitizedState = persistedState.withoutSensitiveIdentityMaterial()
@@ -100,14 +105,37 @@ class DeviceAuthStateCodec(
         .build()
         .adapter(DeviceAuthState::class.java),
 ) {
+    private val legacyBootstrapAdapter: JsonAdapter<LegacyConnectionBootstrapState> = Moshi.Builder()
+        .add(KotlinJsonAdapterFactory())
+        .build()
+        .adapter(LegacyConnectionBootstrapState::class.java)
+
     fun encode(state: DeviceAuthState): String = adapter.toJson(state)
 
-    fun decode(raw: String): DeviceAuthState =
+    fun decode(raw: String): DeviceAuthState = decodeWithMigration(raw).state
+
+    internal fun decodeWithMigration(raw: String): DecodedDeviceAuthState =
         try {
-            adapter.fromJson(raw)
+            val state = adapter.fromJson(raw)
                 ?: throw DeviceIdentityStorageException(
                     "Stored device authentication settings are empty. Clear local enrollment and enroll again.",
                 )
+            val legacyBootstrap = legacyBootstrapAdapter.fromJson(raw)
+                ?.connectionBootstrapJson
+                .orEmpty()
+                .trim()
+            val migratedState = if (
+                !state.connectionInput.isConnectionBootstrapJson() &&
+                    legacyBootstrap.isConnectionBootstrapJson()
+            ) {
+                state.copy(connectionInput = legacyBootstrap)
+            } else {
+                state
+            }
+            DecodedDeviceAuthState(
+                state = migratedState,
+                requiresPersistence = migratedState != state,
+            )
         } catch (error: DeviceIdentityStorageException) {
             throw error
         } catch (error: Exception) {
@@ -117,3 +145,14 @@ class DeviceAuthStateCodec(
             )
         }
 }
+
+internal data class DecodedDeviceAuthState(
+    val state: DeviceAuthState,
+    val requiresPersistence: Boolean,
+)
+
+private data class LegacyConnectionBootstrapState(
+    val connectionBootstrapJson: String? = null,
+)
+
+private fun String.isConnectionBootstrapJson(): Boolean = trim().startsWith("{")

@@ -11,6 +11,7 @@ const val APP_CONNECTION_STATE_ERROR = "error"
 
 private const val RETRY_BASE_DELAY_MS = 2_000L
 private const val RETRY_MAX_DELAY_MS = 60_000L
+internal const val APP_CONNECTION_HEALTH_MAX_AGE_MS = 60 * 60 * 1_000L
 
 // App-wide connection status shared by sync, gallery, and other foreground requests.
 data class AppConnectionStatus(
@@ -56,6 +57,8 @@ fun AppConnectionStatus.isRetryPending(): Boolean {
     return state == APP_CONNECTION_STATE_RETRY_SCHEDULED || nextRetryUnixMs != null
 }
 
-fun AppConnectionStatus.isConnected(): Boolean {
-    return state == APP_CONNECTION_STATE_CONNECTED
+fun AppConnectionStatus.isConnected(nowUnixMs: Long = System.currentTimeMillis()): Boolean {
+    val lastSuccessUnixMs = lastSuccessfulConnectionUnixMs ?: return false
+    return state == APP_CONNECTION_STATE_CONNECTED &&
+        lastSuccessUnixMs in (nowUnixMs - APP_CONNECTION_HEALTH_MAX_AGE_MS)..nowUnixMs
 }

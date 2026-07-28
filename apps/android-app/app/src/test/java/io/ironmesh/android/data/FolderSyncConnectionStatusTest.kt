@@ -27,4 +27,22 @@ class AppConnectionStatusTest {
         assertTrue(pending.isRetryPending())
         assertFalse(idle.isRetryPending())
     }
+
+    @Test
+    fun connectedStatusRequiresASuccessWithinTheLastHour() {
+        val nowUnixMs = 1_750_000_000_000L
+        val fresh = AppConnectionStatus(
+            state = APP_CONNECTION_STATE_CONNECTED,
+            lastSuccessfulConnectionUnixMs = nowUnixMs - APP_CONNECTION_HEALTH_MAX_AGE_MS,
+        )
+        val stale = fresh.copy(
+            lastSuccessfulConnectionUnixMs = nowUnixMs - APP_CONNECTION_HEALTH_MAX_AGE_MS - 1L,
+        )
+        val future = fresh.copy(lastSuccessfulConnectionUnixMs = nowUnixMs + 1L)
+
+        assertTrue(fresh.isConnected(nowUnixMs))
+        assertFalse(stale.isConnected(nowUnixMs))
+        assertFalse(future.isConnected(nowUnixMs))
+        assertFalse(AppConnectionStatus(state = APP_CONNECTION_STATE_CONNECTED).isConnected(nowUnixMs))
+    }
 }

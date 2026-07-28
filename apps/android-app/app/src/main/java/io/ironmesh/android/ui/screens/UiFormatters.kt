@@ -1,5 +1,11 @@
 package io.ironmesh.android.ui.screens
 
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.AppFailedConnectionAttempt
@@ -13,9 +19,12 @@ import io.ironmesh.android.data.APP_CONNECTION_STATE_RECONNECTING
 import io.ironmesh.android.data.APP_CONNECTION_STATE_RETRY_SCHEDULED
 import io.ironmesh.android.data.APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT
 import io.ironmesh.android.data.APP_CONNECTION_STATE_WAITING_FOR_NETWORK
+import io.ironmesh.android.data.APP_CONNECTION_HEALTH_MAX_AGE_MS
 import io.ironmesh.android.data.formatAllowedWifiSsidsInput
+import io.ironmesh.android.data.isConnected
 import io.ironmesh.android.data.isRetryPending
 import io.ironmesh.android.ui.FolderSyncActivityFilter
+import kotlinx.coroutines.delay
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -38,6 +47,7 @@ fun displayStatusToken(value: String): String {
 
 fun appConnectionHeadline(
     connectionStatus: AppConnectionStatus,
+    nowUnixMs: Long = System.currentTimeMillis(),
 ): String {
     return when (connectionStatus.state) {
         APP_CONNECTION_STATE_CONNECTING -> "Connecting app"
@@ -45,8 +55,42 @@ fun appConnectionHeadline(
         APP_CONNECTION_STATE_RETRY_SCHEDULED -> "Retry scheduled"
         APP_CONNECTION_STATE_WAITING_FOR_NETWORK -> "Waiting for network"
         APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT -> "Enrollment needed"
-        APP_CONNECTION_STATE_CONNECTED -> "App connection is healthy"
+        APP_CONNECTION_STATE_CONNECTED -> {
+            if (connectionStatus.isConnected(nowUnixMs)) {
+                "App connection is healthy"
+            } else {
+                "App connection status is stale"
+            }
+        }
         else -> "App connection is idle"
+    }
+}
+
+@Composable
+fun rememberConnectionHealthNow(connectionStatus: AppConnectionStatus): Long {
+    var nowUnixMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(connectionStatus.state, connectionStatus.lastSuccessfulConnectionUnixMs) {
+        nowUnixMs = System.currentTimeMillis()
+        if (!connectionStatus.isConnected(nowUnixMs)) {
+            return@LaunchedEffect
+        }
+
+        val expiresAtUnixMs = requireNotNull(connectionStatus.lastSuccessfulConnectionUnixMs) +
+            APP_CONNECTION_HEALTH_MAX_AGE_MS
+        delay((expiresAtUnixMs - nowUnixMs + 1L).coerceAtLeast(0L))
+        nowUnixMs = System.currentTimeMillis()
+    }
+    return nowUnixMs
+}
+
+fun appConnectionStatusBadge(
+    connectionStatus: AppConnectionStatus,
+    nowUnixMs: Long = System.currentTimeMillis(),
+): String {
+    return when {
+        connectionStatus.isConnected(nowUnixMs) -> "Healthy"
+        connectionStatus.state == APP_CONNECTION_STATE_CONNECTED -> "Stale"
+        else -> displayStatusToken(connectionStatus.state)
     }
 }
 
@@ -107,11 +151,12 @@ fun syncOverviewSummary(serviceStatus: FolderSyncServiceStatus): String {
 fun shouldShowRetryConnectionAction(
     connectionStatus: AppConnectionStatus,
     hasProfiles: Boolean,
+    nowUnixMs: Long = System.currentTimeMillis(),
 ): Boolean {
     if (!hasProfiles) {
         return false
     }
-    return connectionStatus.state != APP_CONNECTION_STATE_CONNECTED ||
+    return !connectionStatus.isConnected(nowUnixMs) ||
         connectionStatus.isRetryPending()
 }
 

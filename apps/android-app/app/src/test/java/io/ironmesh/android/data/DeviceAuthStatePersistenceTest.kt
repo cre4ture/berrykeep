@@ -64,6 +64,34 @@ class DeviceAuthStatePersistenceTest {
     }
 
     @Test
+    fun loadReplacesLegacyDirectConnectionInputWithSavedBootstrap() {
+        val bootstrap = "{\"version\":1,\"cluster_id\":\"cluster-1\"}"
+        val legacyState = completeState().copy(connectionInput = "https://storage.example.test/")
+        val rawLegacyState = """
+            {
+              "clusterId": "cluster-1",
+              "deviceId": "device-1",
+              "label": "Phone",
+              "connectionInput": "https://storage.example.test/",
+              "connectionBootstrapJson": "{\"version\":1,\"cluster_id\":\"cluster-1\"}",
+              "serverCaPem": "demo-ca"
+            }
+        """.trimIndent()
+        val preferences = InMemoryDeviceAuthPreferences(raw = rawLegacyState)
+        val secretStore = InMemoryDeviceIdentitySecretStore(
+            secret = requireNotNull(DeviceIdentitySecret.fromState(legacyState)),
+        )
+        val persistence = DeviceAuthStatePersistence(preferences, secretStore, codec)
+
+        val loaded = persistence.load()
+
+        assertEquals(bootstrap, loaded.connectionInput)
+        assertEquals(bootstrap, codec.decode(preferences.raw.orEmpty()).connectionInput)
+        assertFalse(preferences.raw.orEmpty().contains("connectionBootstrapJson"))
+        assertFalse(preferences.raw.orEmpty().contains("storage.example.test"))
+    }
+
+    @Test
     fun loadRejectsLegacyPrivateKeyWithoutCredentialBeforeMigration() {
         val legacyState = completeState().copy(credentialPem = null)
         val rawLegacyState = codec.encode(legacyState)
