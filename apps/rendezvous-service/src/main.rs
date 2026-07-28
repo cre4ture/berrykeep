@@ -1,9 +1,8 @@
 mod config;
-mod embedded_iroh_relay;
 mod failover;
 
 use crate::config::RendezvousServiceConfig;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rendezvous_server::{RendezvousAppState, serve as serve_rendezvous};
 use tracing::info;
 
@@ -35,37 +34,16 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
         "rendezvous service listening"
     );
 
-    let state = RendezvousAppState::new(config.server_config())?;
-    let Some(iroh_relay_config) = config.iroh_relay.as_ref() else {
-        return serve_rendezvous(state).await;
-    };
-
-    let mut iroh_relay = embedded_iroh_relay::spawn(iroh_relay_config).await?;
-    info!(
-        bind_addr = %iroh_relay_config.bind_addr,
-        public_urls = ?iroh_relay_config.public_urls,
-        client_rx_bytes_per_second = iroh_relay_config.client_rx_bytes_per_second,
-        "embedded authenticated iroh relay listening"
-    );
-
-    let rendezvous = serve_rendezvous(state);
-    tokio::pin!(rendezvous);
-    tokio::select! {
-        rendezvous_result = &mut rendezvous => {
-            iroh_relay
-                .shutdown()
-                .await
-                .map_err(|error| anyhow::anyhow!("embedded iroh relay shutdown failed: {error}"))?;
-            rendezvous_result
-        }
-        relay_result = iroh_relay.join() => {
-            match relay_result {
-                Ok(Ok(())) => bail!("embedded iroh relay stopped unexpectedly"),
-                Ok(Err(error)) => bail!("embedded iroh relay failed: {error}"),
-                Err(error) => bail!("embedded iroh relay supervisor task failed: {error}"),
-            }
-        }
+    if let Some(iroh_relay) = config.iroh_relay.as_ref() {
+        info!(
+            public_urls = ?iroh_relay.public_urls,
+            client_rx_bytes_per_second = iroh_relay.client_rx_bytes_per_second,
+            ticket_ttl_secs = iroh_relay.ticket_ttl.as_secs(),
+            "embedded authenticated iroh relay enabled on rendezvous listener"
+        );
     }
+
+    serve_rendezvous(RendezvousAppState::new(config.server_config())?).await
 }
 
 #[cfg(test)]
@@ -99,25 +77,39 @@ mod tests {
     #[tokio::test]
     async fn embedded_iroh_relay_carries_direct_quic_when_direct_addresses_are_removed() {
         init_test_tracing();
+        let ca = issue_test_ca().expect("test CA should generate");
+        let cluster_id = Uuid::now_v7();
+        let node_id = Uuid::now_v7();
+        let rendezvous_dir = fresh_test_dir("same-port-iroh-relay-rendezvous");
         let rendezvous_bind_addr = free_bind_addr();
-        let relay_bind_addr = free_bind_addr();
-        let rendezvous_public_url = format!("http://{rendezvous_bind_addr}");
-        let relay_public_url = format!("http://{relay_bind_addr}");
-        let relay_auth_token = "test-auth-token-that-is-longer-than-32-characters".to_string();
+        let rendezvous_public_url = format!("https://{rendezvous_bind_addr}");
+        let (rendezvous_ca_path, rendezvous_cert_path, rendezvous_key_path) = write_tls_material(
+            &rendezvous_dir,
+            &ca.ca_pem,
+            &issue_server_cert(&ca).expect("rendezvous server cert should issue"),
+        )
+        .expect("rendezvous TLS material should write");
         let rendezvous_config = RendezvousServiceConfig {
             bind_addr: rendezvous_bind_addr,
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
-            iroh_relay: Some(config::EmbeddedIrohRelayConfig {
-                bind_addr: relay_bind_addr,
-                public_urls: vec![relay_public_url.clone()],
-                auth_token: relay_auth_token.clone(),
+            iroh_relay: Some(config::IrohRelayServerConfig {
+                public_urls: vec![rendezvous_public_url.clone()],
+                ticket_ttl: Duration::from_secs(300),
                 client_rx_bytes_per_second: 16 * 1024 * 1024,
                 client_rx_max_burst_bytes: 32 * 1024 * 1024,
             }),
             peer_rendezvous_urls: Vec::new(),
-            mtls: None,
-            allow_insecure_http: true,
+            mtls: Some(config::RendezvousMtlsConfig {
+                client_ca: config::RendezvousClientCa::File {
+                    cert_path: rendezvous_ca_path.clone(),
+                },
+                server_identity: config::RendezvousServerTlsIdentity::Files {
+                    cert_path: rendezvous_cert_path,
+                    key_path: rendezvous_key_path,
+                },
+            }),
+            allow_insecure_http: false,
             failover_package: None,
         };
         let rendezvous_handle = tokio::spawn(async move {
@@ -126,7 +118,17 @@ mod tests {
                 .expect("rendezvous and embedded relay should run");
         });
 
-        let http = reqwest::Client::new();
+        let node_dir = fresh_test_dir("same-port-iroh-relay-node");
+        let node_tls =
+            issue_node_cert(&ca, cluster_id, node_id).expect("node client cert should issue");
+        let node_tls_paths = write_tls_material(&node_dir, &ca.ca_pem, &node_tls)
+            .expect("node TLS material should write");
+        let http = build_https_client_with_identity(
+            &rendezvous_ca_path,
+            &node_tls_paths.1,
+            &node_tls_paths.2,
+        )
+        .expect("rendezvous mTLS client should build");
         wait_for_http_status(
             &http,
             &format!("{rendezvous_public_url}/health"),
@@ -134,29 +136,51 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        wait_for_http_status(
-            &http,
-            &format!("{relay_public_url}/healthz"),
-            StatusCode::OK,
-            Duration::from_secs(5),
-        )
-        .await;
+        let probe = http
+            .get(format!("{rendezvous_public_url}/ping"))
+            .send()
+            .await
+            .expect("same-port iroh relay probe should respond");
+        assert_eq!(probe.status(), StatusCode::OK);
+        assert_eq!(probe.version(), reqwest::Version::HTTP_2);
+        assert_eq!(
+            probe
+                .headers()
+                .get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
 
-        let cluster_id = Uuid::now_v7();
-        let node_id = Uuid::now_v7();
+        let unauthenticated_http = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(ca.ca_pem.as_bytes()).expect("test CA should parse"),
+            )
+            .build()
+            .expect("unauthenticated HTTPS client should build");
+        let unauthorized = unauthenticated_http
+            .post(format!("{rendezvous_public_url}/control/iroh-relay/ticket"))
+            .json(&transport_sdk::IrohRelayTicketRequest {
+                cluster_id,
+                endpoint_id: SecretKey::generate().public().to_string(),
+            })
+            .send()
+            .await
+            .expect("unauthenticated ticket request should receive a response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let node_identity_pem = format!("{}\n{}", node_tls.0, node_tls.1);
         let control = RendezvousControlClient::new(
             RendezvousClientConfig {
                 cluster_id,
-                rendezvous_urls: vec![rendezvous_public_url],
+                rendezvous_urls: vec![rendezvous_public_url.clone()],
                 heartbeat_interval_secs: 15,
             },
-            None,
-            None,
+            Some(&ca.ca_pem),
+            Some(node_identity_pem.as_bytes()),
         )
         .expect("rendezvous control client should build");
-        let server = DirectQuicEndpoint::bind(DirectQuicEndpointConfig::new(SecretKey::generate()))
-            .await
-            .expect("server direct QUIC endpoint should bind");
+        let server =
+            bind_ticketed_direct_quic_endpoint(&control, SecretKey::generate(), &ca.ca_pem).await;
         let initial_registration = transport_sdk::PresenceRegistration {
             cluster_id,
             identity: transport_sdk::PeerIdentity::Node(node_id),
@@ -181,25 +205,21 @@ mod tests {
         let advertisement = registration_response
             .iroh_relay
             .expect("presence response should advertise the embedded relay");
-        assert_eq!(advertisement.public_urls, vec![relay_public_url.clone()]);
         assert_eq!(
-            advertisement.auth_token.as_deref(),
-            Some(relay_auth_token.as_str())
+            advertisement.public_urls,
+            vec![rendezvous_public_url.clone()]
         );
-        let advertised_relays = advertisement
-            .public_urls
-            .iter()
-            .map(|url| DirectQuicRelayConfig {
-                url: url.clone(),
-                auth_token: advertisement.auth_token.clone(),
-            })
-            .collect::<Vec<_>>();
+        assert_eq!(advertisement.auth_token, None);
         assert_eq!(
-            server
-                .reconcile_dynamic_relays(&advertised_relays)
-                .await
-                .expect("server should accept the rendezvous relay advertisement"),
-            1
+            registration_response
+                .entry
+                .registration
+                .direct_candidates
+                .first()
+                .and_then(|candidate| candidate.transport_hints.as_ref())
+                .and_then(|hints| hints.relay_auth_token.as_deref()),
+            None,
+            "endpoint-bound server ticket must not be stored in presence"
         );
         tokio::time::timeout(Duration::from_secs(10), server.wait_until_online())
             .await
@@ -230,26 +250,14 @@ mod tests {
                 .relay_url
                 .as_deref()
                 .map(|url| url.trim_end_matches('/')),
-            Some(relay_public_url.as_str())
+            Some(rendezvous_public_url.as_str())
         );
-        assert_eq!(
-            hints.relay_auth_token.as_deref(),
-            Some(relay_auth_token.as_str())
-        );
+        assert_eq!(hints.relay_auth_token, None);
         hints.direct_socket_addrs.clear();
         hints.observed_socket_addrs.clear();
 
-        let mut client_config = DirectQuicEndpointConfig::new(SecretKey::generate());
-        client_config.relay_urls = vec![
-            hints
-                .relay_url
-                .clone()
-                .expect("discovery should provide the relay URL"),
-        ];
-        client_config.relay_auth_token = hints.relay_auth_token.clone();
-        let client = DirectQuicEndpoint::bind(client_config)
-            .await
-            .expect("client direct QUIC endpoint should bind");
+        let client =
+            bind_ticketed_direct_quic_endpoint(&control, SecretKey::generate(), &ca.ca_pem).await;
         tokio::time::timeout(Duration::from_secs(10), client.wait_until_online())
             .await
             .expect("client endpoint should become relay-reachable");
@@ -276,10 +284,41 @@ mod tests {
         server.close().await;
         rendezvous_handle.abort();
         let _ = rendezvous_handle.await;
+        let _ = std::fs::remove_dir_all(&rendezvous_dir);
+        let _ = std::fs::remove_dir_all(&node_dir);
+    }
+
+    async fn bind_ticketed_direct_quic_endpoint(
+        control: &RendezvousControlClient,
+        secret_key: SecretKey,
+        relay_ca_pem: &str,
+    ) -> DirectQuicEndpoint {
+        let ticket = control
+            .issue_iroh_relay_ticket(&secret_key.public().to_string())
+            .await
+            .expect("endpoint-bound relay ticket should issue");
+        let mut config = DirectQuicEndpointConfig::new(secret_key);
+        config.relay_ca_pem = Some(relay_ca_pem.to_string());
+        let endpoint = DirectQuicEndpoint::bind(config)
+            .await
+            .expect("direct QUIC endpoint should bind");
+        let relays = ticket
+            .public_urls
+            .iter()
+            .map(|url| DirectQuicRelayConfig {
+                url: url.clone(),
+                auth_token: Some(ticket.auth_token.clone()),
+            })
+            .collect::<Vec<_>>();
+        endpoint
+            .reconcile_dynamic_relays(&relays)
+            .await
+            .expect("endpoint-bound relay ticket should apply");
+        endpoint
     }
 
     #[tokio::test]
-    async fn relay_required_replication_flows_through_rendezvous() {
+    async fn relay_required_replication_coexists_with_same_port_iroh_relay() {
         init_test_tracing();
         let rendezvous_bind_addr = free_bind_addr();
         let rendezvous_public_url = format!("http://{rendezvous_bind_addr}");
@@ -287,7 +326,12 @@ mod tests {
             bind_addr: rendezvous_bind_addr,
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
-            iroh_relay: None,
+            iroh_relay: Some(config::IrohRelayServerConfig {
+                public_urls: vec![rendezvous_public_url.clone()],
+                ticket_ttl: Duration::from_secs(300),
+                client_rx_bytes_per_second: 16 * 1024 * 1024,
+                client_rx_max_burst_bytes: 32 * 1024 * 1024,
+            }),
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
             allow_insecure_http: true,

@@ -16,7 +16,7 @@ use std::time::Instant;
 use transport_sdk::{
     ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity,
     RelayTunnelSourceSecurityConfig, RelayTunnelTlsIdentity, RendezvousClientConfig,
-    TransportPathKind,
+    RendezvousControlClient, TransportPathKind,
 };
 
 use crate::latency_probe::LatencyProbeConfig;
@@ -229,13 +229,24 @@ pub fn build_http_client_with_identity_from_planned_target(
         }
         TransportPathKind::DirectQuic => {
             let candidate = planned_target_direct_quic_candidate(target)?;
-            return Ok(
-                IronMeshClient::from_direct_quic_candidate_with_target_node_id(
-                    candidate.clone(),
-                    target.target_node_id,
-                )
-                .with_client_identity(identity.clone()),
-            );
+            let rendezvous = if candidate_uses_rendezvous_relay(candidate, &target.rendezvous_urls)
+            {
+                Some(build_rendezvous_control_client_for_target(
+                    target, identity,
+                )?)
+            } else {
+                None
+            };
+            return Ok(IronMeshClient::from_direct_quic_candidate_with_rendezvous(
+                candidate.clone(),
+                target.target_node_id,
+                rendezvous,
+                target
+                    .rendezvous_ca_pem
+                    .clone()
+                    .or_else(|| target.cluster_ca_pem.clone()),
+            )
+            .with_client_identity(identity.clone()));
         }
         TransportPathKind::RelayTunnel => {}
     }
@@ -267,7 +278,50 @@ pub fn build_http_client_with_identity_from_planned_target(
         cluster_ca_pem: cluster_ca_pem.as_bytes().to_vec(),
         identity: RelayTunnelTlsIdentity::from_combined_pem(rendezvous_client_identity_pem),
     };
-    let rendezvous = transport_sdk::RendezvousControlClient::new(
+    let rendezvous = build_rendezvous_control_client_for_target(target, identity)?;
+
+    Ok(IronMeshClient::with_relay_transport(
+        RELAY_REQUEST_BASE_URL,
+        rendezvous,
+        target_node_id,
+        relay_security,
+    )
+    .with_client_identity(identity.clone()))
+}
+
+fn candidate_uses_rendezvous_relay(
+    candidate: &ConnectionCandidate,
+    rendezvous_urls: &[String],
+) -> bool {
+    let Some(relay_url) = candidate
+        .transport_hints
+        .as_ref()
+        .and_then(|hints| hints.relay_url.as_deref())
+        .and_then(|url| Url::parse(url).ok())
+    else {
+        return false;
+    };
+    rendezvous_urls.iter().any(|url| {
+        Url::parse(url).ok().is_some_and(|rendezvous_url| {
+            relay_url.scheme() == rendezvous_url.scheme()
+                && relay_url.host_str() == rendezvous_url.host_str()
+                && relay_url.port_or_known_default() == rendezvous_url.port_or_known_default()
+        })
+    })
+}
+
+fn build_rendezvous_control_client_for_target(
+    target: &PlannedConnectionBootstrapTarget,
+    identity: &ClientIdentityMaterial,
+) -> Result<RendezvousControlClient> {
+    let rendezvous_client_identity_pem = identity
+        .rendezvous_client_identity_pem
+        .as_deref()
+        .filter(|pem| !pem.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!("rendezvous-backed transport requires rendezvous_client_identity_pem")
+        })?;
+    transport_sdk::RendezvousControlClient::new(
         RendezvousClientConfig {
             cluster_id: target.cluster_id,
             rendezvous_urls: target.rendezvous_urls.clone(),
@@ -278,15 +332,7 @@ pub fn build_http_client_with_identity_from_planned_target(
             .as_deref()
             .or(target.cluster_ca_pem.as_deref()),
         Some(rendezvous_client_identity_pem.as_bytes()),
-    )?;
-
-    Ok(IronMeshClient::with_relay_transport(
-        RELAY_REQUEST_BASE_URL,
-        rendezvous,
-        target_node_id,
-        relay_security,
     )
-    .with_client_identity(identity.clone()))
 }
 
 pub fn build_http_client_with_identity_from_planned_targets(
@@ -1085,6 +1131,28 @@ mod tests {
             client.connection_diagnostics().endpoints[0].locator,
             "iroh://peer-key-1"
         );
+    }
+
+    #[test]
+    fn only_same_origin_direct_quic_relays_use_rendezvous_tickets() {
+        let candidate = ConnectionCandidate {
+            kind: CandidateKind::DirectQuic,
+            endpoint: "iroh://peer-key-1".to_string(),
+            rtt_ms: None,
+            transport_hints: Some(ConnectionCandidateTransportHints {
+                relay_url: Some("https://rendezvous.example:443".to_string()),
+                ..ConnectionCandidateTransportHints::default()
+            }),
+        };
+
+        assert!(candidate_uses_rendezvous_relay(
+            &candidate,
+            &["https://rendezvous.example".to_string()]
+        ));
+        assert!(!candidate_uses_rendezvous_relay(
+            &candidate,
+            &["https://other.example".to_string()]
+        ));
     }
 
     #[test]

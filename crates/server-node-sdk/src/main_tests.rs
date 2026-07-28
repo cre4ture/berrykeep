@@ -3,9 +3,9 @@ use super::{
     ServerNodeConfig, ServerRequestTiming, ServerState, StartupRepairStatus,
     apply_server_timing_to_buffered_response, await_repair_busy_threshold,
     build_rendezvous_presence_registration, build_store_index_entries, cluster, constant_time_eq,
-    direct_quic_relay_configs_from_advertisements, jittered_backoff_secs, lock_store,
-    new_store_rwlock, node_descriptor_from_presence_entry, parse_direct_quic_relay_urls,
-    plan_peer_transport, read_store,
+    direct_quic_relay_configs_from_tickets, jittered_backoff_secs, lock_store, new_store_rwlock,
+    node_descriptor_from_presence_entry, parse_direct_quic_relay_urls, plan_peer_transport,
+    read_store,
     replication::{build_replication_bundle_push_path, build_replication_export_path},
     resolve_peer_base_url, run_startup_replication_repair_once,
     should_trigger_autonomous_post_write_replication, token_matches,
@@ -44,32 +44,34 @@ fn direct_quic_relay_urls_are_trimmed_and_deduplicated() {
 }
 
 #[test]
-fn rendezvous_iroh_relay_advertisements_are_merged_deterministically() {
-    let advertisements = HashMap::from([
+fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
+    let tickets = HashMap::from([
         (
             "https://rendezvous-b.example".to_string(),
-            transport_sdk::IrohRelayAdvertisement {
+            transport_sdk::IrohRelayTicket {
                 public_urls: vec![
                     "https://relay-b.example/".to_string(),
                     "https://shared-relay.example".to_string(),
                 ],
-                auth_token: Some("token-b".to_string()),
+                auth_token: "token-b".to_string(),
+                expires_at_unix: 10_000,
             },
         ),
         (
             "https://rendezvous-a.example".to_string(),
-            transport_sdk::IrohRelayAdvertisement {
+            transport_sdk::IrohRelayTicket {
                 public_urls: vec![
                     "https://relay-a.example".to_string(),
                     "https://shared-relay.example/".to_string(),
                 ],
-                auth_token: Some("token-a".to_string()),
+                auth_token: "token-a".to_string(),
+                expires_at_unix: 10_000,
             },
         ),
     ]);
 
     assert_eq!(
-        direct_quic_relay_configs_from_advertisements(&advertisements),
+        direct_quic_relay_configs_from_tickets(&tickets),
         vec![
             transport_sdk::DirectQuicRelayConfig {
                 url: "https://relay-a.example".to_string(),

@@ -46,6 +46,61 @@ impl std::fmt::Debug for IrohRelayAdvertisement {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IrohRelayTicketRequest {
+    pub cluster_id: ClusterId,
+    pub endpoint_id: String,
+}
+
+impl IrohRelayTicketRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.cluster_id.is_nil() {
+            bail!("iroh relay ticket request must include a non-nil cluster_id");
+        }
+        self.endpoint_id
+            .trim()
+            .parse::<iroh::EndpointId>()
+            .with_context(|| {
+                format!("invalid iroh relay ticket endpoint_id {}", self.endpoint_id)
+            })?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IrohRelayTicket {
+    pub public_urls: Vec<String>,
+    pub auth_token: String,
+    pub expires_at_unix: u64,
+}
+
+impl std::fmt::Debug for IrohRelayTicket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IrohRelayTicket")
+            .field("public_urls", &self.public_urls)
+            .field("auth_token", &"[REDACTED]")
+            .field("expires_at_unix", &self.expires_at_unix)
+            .finish()
+    }
+}
+
+impl IrohRelayTicket {
+    pub fn validate(&self) -> Result<()> {
+        if self.public_urls.is_empty() {
+            bail!("iroh relay ticket must include at least one public URL");
+        }
+        validate_url_list("iroh relay ticket public_urls", &self.public_urls)?;
+        if self.auth_token.trim().is_empty() {
+            bail!("iroh relay ticket auth_token must not be blank");
+        }
+        if self.expires_at_unix == 0 {
+            bail!("iroh relay ticket expires_at_unix must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportCapability {
@@ -383,6 +438,19 @@ impl RendezvousControlClient {
                 request.security_mode
             );
         }
+        Ok(ticket)
+    }
+
+    pub async fn issue_iroh_relay_ticket(&self, endpoint_id: &str) -> Result<IrohRelayTicket> {
+        let request = IrohRelayTicketRequest {
+            cluster_id: self.config.cluster_id,
+            endpoint_id: endpoint_id.trim().to_string(),
+        };
+        request.validate()?;
+        let ticket: IrohRelayTicket = self
+            .post_json("/control/iroh-relay/ticket", &request)
+            .await?;
+        ticket.validate()?;
         Ok(ticket)
     }
 
@@ -1052,6 +1120,38 @@ mod tests {
             .self_signed(&key_pair)
             .expect("test identity certificate should issue");
         format!("{}{}", certificate.pem(), key_pair.serialize_pem())
+    }
+
+    #[test]
+    fn iroh_relay_ticket_types_validate_and_redact_credentials() {
+        let endpoint_id = iroh::SecretKey::generate().public().to_string();
+        IrohRelayTicketRequest {
+            cluster_id: ClusterId::now_v7(),
+            endpoint_id,
+        }
+        .validate()
+        .expect("valid endpoint-bound request should pass");
+
+        let ticket = IrohRelayTicket {
+            public_urls: vec!["https://rendezvous.example".to_string()],
+            auth_token: "sensitive-endpoint-ticket".to_string(),
+            expires_at_unix: 10_000,
+        };
+        ticket.validate().expect("valid relay ticket should pass");
+        let debug = format!("{ticket:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("sensitive-endpoint-ticket"));
+    }
+
+    #[test]
+    fn iroh_relay_ticket_request_rejects_invalid_endpoint_id() {
+        let error = IrohRelayTicketRequest {
+            cluster_id: ClusterId::now_v7(),
+            endpoint_id: "not-an-iroh-endpoint".to_string(),
+        }
+        .validate()
+        .expect_err("invalid endpoint ID should fail");
+        assert!(error.to_string().contains("endpoint_id"));
     }
 
     #[tokio::test]

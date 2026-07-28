@@ -12,6 +12,11 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 cap-std = "4"
 common = { path = "../common" }
+hmac = "0.12"
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
+iroh = "1.0.2"
+iroh-relay = { version = "1.0.2", features = ["server"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }
 rand = "0.8"

@@ -10,8 +10,11 @@ use std::task::{Context as TaskContext, Poll};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use iroh::endpoint::{RecvStream, SendStream, presets};
+use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use iroh_relay::{RelayConfig, RelayMap};
+use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -26,6 +29,7 @@ pub struct DirectQuicEndpointConfig {
     pub secret_key: SecretKey,
     pub relay_urls: Vec<String>,
     pub relay_auth_token: Option<String>,
+    pub relay_ca_pem: Option<String>,
     pub alpn: String,
 }
 
@@ -39,6 +43,7 @@ impl std::fmt::Debug for DirectQuicEndpointConfig {
                 "relay_auth_token",
                 &self.relay_auth_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("relay_ca_pem_configured", &self.relay_ca_pem.is_some())
             .field("alpn", &self.alpn)
             .finish()
     }
@@ -103,6 +108,7 @@ impl DirectQuicEndpointConfig {
             secret_key,
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            relay_ca_pem: None,
             alpn: DEFAULT_DIRECT_QUIC_ALPN.to_string(),
         }
     }
@@ -127,6 +133,9 @@ impl DirectQuicEndpointConfig {
         if self.relay_urls.is_empty() && self.relay_auth_token.is_some() {
             bail!("direct QUIC relay auth token requires at least one relay URL");
         }
+        if let Some(relay_ca_pem) = self.relay_ca_pem.as_deref() {
+            relay_ca_config(relay_ca_pem)?;
+        }
         Ok(())
     }
 }
@@ -149,10 +158,14 @@ impl DirectQuicEndpoint {
         // insert_relay calls cannot bring the endpoint online.
         let relay_mode = RelayMode::Custom(relay_map(&configured_relays)?);
 
-        let endpoint = Endpoint::builder(presets::Minimal)
+        let mut endpoint_builder = Endpoint::builder(presets::Minimal)
             .secret_key(config.secret_key)
             .relay_mode(relay_mode)
-            .alpns(vec![config.alpn.as_bytes().to_vec()])
+            .alpns(vec![config.alpn.as_bytes().to_vec()]);
+        if let Some(relay_ca_pem) = config.relay_ca_pem.as_deref() {
+            endpoint_builder = endpoint_builder.ca_tls_config(relay_ca_config(relay_ca_pem)?);
+        }
+        let endpoint = endpoint_builder
             .bind()
             .await
             .context("failed binding direct QUIC endpoint")?;
@@ -274,9 +287,7 @@ impl DirectQuicEndpoint {
             .as_ref()
             .and_then(|hints| hints.relay_url.as_deref())
             .and_then(|relay_url| {
-                self.configured_relays
-                    .lock()
-                    .expect("direct QUIC relay config mutex poisoned")
+                self.static_relays
                     .get(normalize_relay_url(relay_url))
                     .cloned()
                     .flatten()
@@ -419,6 +430,17 @@ fn validate_relay_config(relay: &DirectQuicRelayConfig) -> Result<()> {
 
 fn normalize_relay_url(url: &str) -> &str {
     url.trim().trim_end_matches('/')
+}
+
+fn relay_ca_config(pem: &str) -> Result<CaTlsConfig> {
+    let mut reader = std::io::BufReader::new(pem.as_bytes());
+    let roots = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed parsing direct QUIC relay CA certificate")?;
+    if roots.is_empty() {
+        bail!("direct QUIC relay CA PEM must contain at least one certificate");
+    }
+    Ok(CaTlsConfig::embedded().with_extra_roots(roots))
 }
 
 impl IrohBiStream {
@@ -679,6 +701,14 @@ mod tests {
                 .await
                 .expect("relay should be added"),
             1
+        );
+        assert_eq!(
+            endpoint
+                .candidate()
+                .transport_hints
+                .and_then(|hints| hints.relay_auth_token),
+            None,
+            "endpoint-bound dynamic tickets must never be advertised as candidate metadata"
         );
         assert_eq!(
             endpoint

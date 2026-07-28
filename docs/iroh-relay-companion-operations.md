@@ -1,99 +1,76 @@
 # Embedded Iroh Relay Operations
 
-Direct QUIC uses an iroh-compatible relay for NAT traversal and, when a direct
+Direct QUIC uses an Iroh-compatible relay for NAT traversal and, when a direct
 path cannot be established, encrypted packet forwarding. It is not
 interchangeable with the BerryKeep HTTPS/WebSocket relay tunnel. That tunnel
 remains the independent fallback for UDP-hostile networks and mixed-version
 deployments.
 
-`ironmesh-rendezvous-service` can run the upstream iroh relay protocol in the
-same process. It deliberately uses a separate internal listener: iroh upgrades
-and Rendezvous mTLS have different connection-level requirements. A reverse
-proxy terminates public TLS and forwards the relay hostname to this listener.
-The Rendezvous process owns relay startup, failure detection, rate limits, and
-shutdown.
+`ironmesh-rendezvous-service` runs the upstream Iroh relay protocol on its
+existing public origin and listener. Rendezvous control requests and Iroh
+`GET /relay` upgrades therefore use the same host, port, TLS certificate, and
+firewall rule. No relay-specific listener, reverse proxy route, public URL, or
+static shared token is required.
 
-## Enable the embedded relay
+The implementation and security model are summarized in
+[Embedded Iroh Relay: Same-Port Access Design](embedded-iroh-relay-same-port-design.md).
 
-Set the following on the Rendezvous service:
+## Default behavior
 
-```bash
-IRONMESH_IROH_RELAY_BIND=127.0.0.1:19091
-IRONMESH_IROH_RELAY_PUBLIC_URLS=https://iroh-relay.example.net
-IRONMESH_IROH_RELAY_AUTH_TOKEN=<at-least-32-random-characters>
-```
+The embedded relay is enabled automatically. Its public origin is derived from
+`IRONMESH_RENDEZVOUS_PUBLIC_URL`, and its TLS behavior follows the Rendezvous
+listener.
 
-Generate and persist the token in the deployment secret store, for example
-with `openssl rand -hex 32`. It is used only for relay admission and is never
-logged. Rendezvous returns it over its authenticated control API to registered
-nodes and enrolled clients. Do not put the token into a mobile application or
-bootstrap JSON.
+Authenticated clients request short-lived relay tickets through the Rendezvous
+control API. Every ticket is bound to one Iroh endpoint ID. The relay checks
+that binding during Iroh's endpoint-key handshake and disconnects the
+connection when the ticket expires. Server nodes and client SDKs refresh their
+own tickets automatically; discovery advertises the origin but never another
+endpoint's ticket.
 
-The listener is plain HTTP by design because public TLS is normally terminated
-by the reverse proxy. Keep it on loopback or a protected container network. A
-dedicated relay hostname can proxy all paths:
+Plain HTTP is accepted only with
+`IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` for local development and tests.
+It does not provide the production mTLS authorization boundary.
 
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:19091;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_buffering off;
-    proxy_read_timeout 1d;
-    proxy_send_timeout 1d;
-}
-```
+## Optional controls
 
-The public URL must use HTTPS. Plain HTTP is accepted only together with
-`IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` for local tests. Multiple
-comma-separated public URLs may point to the same listener during DNS or proxy
-migrations.
-
-Per-client ingress defaults to 16 MiB/s with a 32 MiB burst. Override these
-limits when required:
+No relay-specific configuration is required for a normal production
+deployment. Advanced settings are:
 
 ```bash
+# Disable only when the deployment intentionally provides no embedded relay.
+IRONMESH_IROH_RELAY_ENABLED=true
+
+# Defaults: one-hour tickets, 16 MiB/s receive rate, 32 MiB burst.
+IRONMESH_IROH_RELAY_TICKET_TTL_SECS=3600
 IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND=16777216
 IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES=33554432
 ```
 
-Partial configuration, a short/missing token, a non-origin public URL, or a
-bind collision with the Rendezvous listener fails startup. This prevents a
-misconfigured service from silently becoming an open relay.
+Ticket lifetime must be between 300 and 86400 seconds. Receive limits are
+applied per Iroh relay connection.
 
-## Automatic node and client configuration
-
-No relay setting is required on ordinary server nodes. Each successful
-authenticated presence registration returns the active embedded relay
-advertisement. The node reconciles additions, token rotations, and removals in
-its live iroh endpoint and republishes its current Direct QUIC candidate.
-Authenticated discovery adds the matching token to client-side candidate
-metadata. The shared client SDK consumes it when creating the ephemeral mobile
-iroh endpoint.
-
-`IRONMESH_DIRECT_QUIC_RELAY_URLS` remains supported for an external relay or a
-controlled migration. If that external relay requires the same static bearer
-token, set `IRONMESH_DIRECT_QUIC_RELAY_AUTH_TOKEN` on the node. Explicit node
-configuration remains authoritative when its URL overlaps a discovered relay.
+`IRONMESH_DIRECT_QUIC_RELAY_URLS` and
+`IRONMESH_DIRECT_QUIC_RELAY_AUTH_TOKEN` remain supported on server nodes for an
+operator-managed external relay. Those settings are independent of the
+embedded same-port relay and remain authoritative for overlapping URLs.
 
 ## Health and rollout checks
 
-1. Check `https://iroh-relay.example.net/healthz`.
-2. Check the Rendezvous `/health` response; `iroh_relay_public_urls` must list
-   the configured public origins.
-3. Confirm a node logs `reconciled direct QUIC endpoint from
+1. Check the normal Rendezvous `/health` endpoint and the Iroh-compatible
+   `/ping` probe on the same origin. The health response's
+   `iroh_relay_public_urls` field should contain the Rendezvous public origin.
+2. Confirm a node logs `reconciled direct QUIC endpoint from
    rendezvous-provided iroh relays`.
-4. Inspect authenticated `/control/discovery`: a `direct_quic` candidate must
-   carry the endpoint ID, ALPN, `relay_url`, and a non-empty
-   `relay_auth_token`.
-5. Test from outside the server LAN. The route snapshot distinguishes
-   `direct_quic` from `relay_tunnel`; after a connection,
+3. Inspect authenticated `/control/discovery`: a `direct_quic` candidate should
+   contain the endpoint ID, ALPN, and `relay_url`. It must not contain a relay
+   ticket.
+4. Test from outside the server LAN. The route snapshot distinguishes
+   `direct_quic` from `relay_tunnel`; after connection,
    `hole_punching_mode` reports `direct`, `relay`, or `unknown`.
-6. Block UDP and confirm direct HTTPS or the BerryKeep `relay_tunnel` still
+5. Block UDP and confirm direct HTTPS or the BerryKeep `relay_tunnel` still
    completes the same request.
 
 Do not remove direct HTTPS or the existing relay tunnel during rollout. They
-are the recovery paths for relay outages, restrictive networks, and
-partially-upgraded installations.
+remain the recovery paths for relay outages, restrictive networks, and
+partially upgraded installations.

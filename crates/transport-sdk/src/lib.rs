@@ -76,11 +76,11 @@ pub use relay_wake::{
     RelayWakeClient, RelayWakeControlMessage, RelayWakeEvent, RelayWakeRegistration,
 };
 pub use rendezvous::{
-    DiscoveryResponse, IrohRelayAdvertisement, PresenceEntry, PresenceListResponse,
-    PresenceRegistration, RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse,
-    RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
-    RendezvousEndpointStatus, RendezvousRuntimeState, TransportCapability,
-    is_expected_idle_relay_tunnel_accept_timeout,
+    DiscoveryResponse, IrohRelayAdvertisement, IrohRelayTicket, IrohRelayTicketRequest,
+    PresenceEntry, PresenceListResponse, PresenceRegistration,
+    RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse, RendezvousClientConfig,
+    RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
+    RendezvousRuntimeState, TransportCapability, is_expected_idle_relay_tunnel_accept_timeout,
     rendezvous_client_identity_has_expected_cluster_uri_san,
     rendezvous_client_identity_is_expired_at, rendezvous_client_identity_needs_renewal_at,
     rendezvous_client_identity_not_after_unix,

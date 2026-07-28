@@ -275,7 +275,7 @@ where
     }
 }
 
-fn authenticated_peer_from_tls_stream<T>(
+pub(crate) fn authenticated_peer_from_tls_stream<T>(
     tls_stream: &TlsStream<T>,
 ) -> Result<Option<AuthenticatedPeer>> {
     let (_, conn) = tls_stream.get_ref();

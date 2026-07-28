@@ -2460,6 +2460,15 @@ impl IronMeshClient {
         candidate: ConnectionCandidate,
         target_node_id: Option<NodeId>,
     ) -> Self {
+        Self::from_direct_quic_candidate_with_rendezvous(candidate, target_node_id, None, None)
+    }
+
+    pub(crate) fn from_direct_quic_candidate_with_rendezvous(
+        candidate: ConnectionCandidate,
+        target_node_id: Option<NodeId>,
+        rendezvous: Option<RendezvousControlClient>,
+        relay_ca_pem: Option<String>,
+    ) -> Self {
         let request_base_url = candidate.endpoint.trim().trim_end_matches('/').to_string();
         let route_identity = direct_quic_route_identity(&candidate);
         Self {
@@ -2468,7 +2477,12 @@ impl IronMeshClient {
                     request_base_url,
                     target_node_id,
                     route_identity,
-                    session_pool: TransportSessionPool::new_direct_quic(candidate, target_node_id),
+                    session_pool: TransportSessionPool::new_direct_quic(
+                        candidate,
+                        target_node_id,
+                        rendezvous,
+                        relay_ca_pem,
+                    ),
                 },
                 0,
             )]),

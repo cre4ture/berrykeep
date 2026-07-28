@@ -1,6 +1,7 @@
 mod auth;
 mod cluster_registry;
 mod global_registration;
+mod iroh_relay;
 
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -12,7 +13,8 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::http::Uri;
-use axum::http::header::CACHE_CONTROL;
+use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use common::{ClusterId, DeviceId, NodeId};
@@ -20,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use transport_sdk::peer::PeerIdentity;
 use transport_sdk::rendezvous::{
-    DiscoveryResponse, IrohRelayAdvertisement, PresenceListResponse, PresenceRegistration,
-    RegisterPresenceResponse, RendezvousClientConfig, RendezvousControlClient,
-    RendezvousRuntimeState,
+    DiscoveryResponse, IrohRelayAdvertisement, IrohRelayTicket, IrohRelayTicketRequest,
+    PresenceListResponse, PresenceRegistration, RegisterPresenceResponse, RendezvousClientConfig,
+    RendezvousControlClient, RendezvousRuntimeState,
 };
 use transport_sdk::{
     BufferedTransportRequest, CandidateKind, ClientBootstrapClaimRedeemRequest,
@@ -42,9 +44,11 @@ use crate::auth::{
     ensure_authenticated_peer_identity, require_any_authenticated_peer,
 };
 use crate::global_registration::GlobalRegistrationState;
+use crate::iroh_relay::IrohRelayRuntime;
 
 pub use crate::auth::GlobalClusterClientCertVerifier;
 pub use crate::cluster_registry::{ClusterCaRecord, ClusterCaRegistry, cluster_ca_fingerprint};
+pub use crate::iroh_relay::IrohRelayServerConfig;
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -177,7 +181,7 @@ pub struct RendezvousServerConfig {
     pub bind_addr: SocketAddr,
     pub public_url: String,
     pub relay_public_urls: Vec<String>,
-    pub iroh_relay: Option<IrohRelayAdvertisement>,
+    pub iroh_relay: Option<IrohRelayServerConfig>,
     pub peer_rendezvous_urls: Vec<String>,
     pub mtls: Option<RendezvousMtlsConfig>,
 }
@@ -189,6 +193,7 @@ pub struct RendezvousAppState {
     pub relay_tunnel: RelayTunnelBroker,
     pub mesh_peers: Option<RendezvousControlClient>,
     pub(crate) global_registration: Option<GlobalRegistrationState>,
+    iroh_relay: Option<IrohRelayRuntime>,
 }
 
 impl RendezvousAppState {
@@ -202,12 +207,18 @@ impl RendezvousAppState {
                 GlobalRegistrationState::new(registry.clone(), registration.clone())
             })
             .transpose()?;
+        let iroh_relay = config
+            .iroh_relay
+            .clone()
+            .map(IrohRelayRuntime::new)
+            .transpose()?;
         Ok(Self {
             mesh_peers: build_mesh_probe_client(&config)?,
             config,
             presence: PresenceRegistry::new(),
             relay_tunnel: RelayTunnelBroker::new(),
             global_registration,
+            iroh_relay,
         })
     }
 }
@@ -228,10 +239,12 @@ pub fn build_router(state: RendezvousAppState) -> Router {
 
     let router = Router::new()
         .route("/health", get(health))
+        .route(::iroh_relay::http::RELAY_PROBE_PATH, get(iroh_relay_probe))
         .route("/control/mesh", get(mesh_status))
         .route("/control/discovery", get(discovery))
         .route("/control/presence", get(list_presence))
         .route("/control/presence/register", post(register_presence))
+        .route("/control/iroh-relay/ticket", post(issue_iroh_relay_ticket))
         .route("/control/relay/ticket", post(issue_relay_ticket))
         .route("/bootstrap-claims/redeem", post(redeem_bootstrap_claim))
         .merge(relay_router);
@@ -264,27 +277,41 @@ pub async fn serve(state: RendezvousAppState) -> Result<()> {
     let bind_addr = state.config.bind_addr;
     let app = build_router(state.clone());
     spawn_mesh_probe_task(state.mesh_peers.clone());
+    let relay_service = state.iroh_relay.as_ref().map(IrohRelayRuntime::service);
 
-    if let Some(mtls) = state.config.mtls.as_ref() {
+    let tls_config = if let Some(mtls) = state.config.mtls.as_ref() {
         let tls_config = if let Some(global) = mtls.global_mtls_config() {
             global.build_rustls_config()?
         } else {
             build_mtls_rustls_config(mtls)?
         };
+        Some(tls_config)
+    } else {
+        None
+    };
+
+    let result = if let Some(relay_service) = relay_service.as_ref() {
+        iroh_relay::serve_same_port(bind_addr, app, tls_config, relay_service.clone()).await
+    } else if let Some(tls_config) = tls_config {
         axum_server::bind(bind_addr)
             .acceptor(MtlsAuthenticatedPeerAcceptor::new(tls_config))
             .serve(app.into_make_service())
-            .await?;
-        Ok(())
+            .await
+            .map_err(anyhow::Error::from)
     } else {
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .await?;
-        Ok(())
+        .await
+        .map_err(anyhow::Error::from)
+    };
+    if let Some(relay_service) = relay_service {
+        relay_service.shutdown().await;
     }
+    result?;
+    Ok(())
 }
 
 async fn health(State(state): State<RendezvousAppState>) -> Json<HealthResponse> {
@@ -292,14 +319,20 @@ async fn health(State(state): State<RendezvousAppState>) -> Json<HealthResponse>
         status: "ok",
         public_url: state.config.public_url,
         iroh_relay_public_urls: state
-            .config
             .iroh_relay
             .as_ref()
-            .map(|relay| relay.public_urls.clone())
+            .map(|relay| relay.public_urls().to_vec())
             .unwrap_or_default(),
         registered_endpoints: state.presence.len(),
         software_version: PACKAGE_VERSION,
     })
+}
+
+async fn iroh_relay_probe(State(state): State<RendezvousAppState>) -> Response {
+    if state.iroh_relay.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    ([(ACCESS_CONTROL_ALLOW_ORIGIN, "*")], "").into_response()
 }
 
 async fn mesh_status(
@@ -378,10 +411,43 @@ async fn register_presence(
     Ok(Json(RegisterPresenceResponse {
         accepted: true,
         software_version: Some(PACKAGE_VERSION.to_string()),
-        iroh_relay: state.config.iroh_relay.clone(),
+        iroh_relay: iroh_relay_advertisement(&state),
         updated_at_unix: entry.updated_at_unix,
         entry,
     }))
+}
+
+async fn issue_iroh_relay_ticket(
+    State(state): State<RendezvousAppState>,
+    authenticated_peer: MaybeAuthenticatedPeer,
+    Json(request): Json<IrohRelayTicketRequest>,
+) -> std::result::Result<Json<IrohRelayTicket>, (StatusCode, String)> {
+    request
+        .validate()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
+        .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+    ensure_authenticated_peer_cluster(
+        state.config.mtls.is_some(),
+        &authenticated_peer,
+        request.cluster_id,
+        "iroh relay ticket request",
+    )
+    .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+    let runtime = state.iroh_relay.as_ref().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "embedded iroh relay is disabled".to_string(),
+        )
+    })?;
+    let peer = authenticated_peer
+        .0
+        .as_ref()
+        .map(|authenticated| authenticated.identity.clone());
+    let ticket = runtime
+        .issue_ticket(request.cluster_id, peer, &request.endpoint_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(ticket))
 }
 
 async fn list_presence(
@@ -599,9 +665,9 @@ fn discovery_response(
         })
         .unwrap_or((None, false));
     if let (Some(candidates), Some(relay)) =
-        (node_candidates.as_mut(), state.config.iroh_relay.as_ref())
+        (node_candidates.as_mut(), iroh_relay_advertisement(state))
     {
-        advertise_iroh_relay_on_direct_quic_candidates(candidates, relay);
+        advertise_iroh_relay_on_direct_quic_candidates(candidates, &relay);
     }
 
     DiscoveryResponse {
@@ -609,6 +675,16 @@ fn discovery_response(
         node_candidates,
         node_relay_capable,
     }
+}
+
+fn iroh_relay_advertisement(state: &RendezvousAppState) -> Option<IrohRelayAdvertisement> {
+    state
+        .iroh_relay
+        .as_ref()
+        .map(|relay| IrohRelayAdvertisement {
+            public_urls: relay.public_urls().to_vec(),
+            auth_token: None,
+        })
 }
 
 fn advertise_iroh_relay_on_direct_quic_candidates(
