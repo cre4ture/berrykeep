@@ -1,0 +1,39 @@
+name: Cache cleanup
+
+on:
+  pull_request:
+    types:
+      - closed
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  closed-pull-request:
+    name: Closed PR cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete the largest pull-request-scoped caches
+        env:
+          CACHE_REF: refs/pull/${{ github.event.pull_request.number }}/merge
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -t cache_ids < <(
+            gh cache list \
+              --ref "${CACHE_REF}" \
+              --limit 100 \
+              --sort size_in_bytes \
+              --order desc \
+              --json id \
+              --jq '.[].id'
+          )
+
+          echo "Deleting ${#cache_ids[@]} caches for ${CACHE_REF}"
+          for cache_id in "${cache_ids[@]}"; do
+            if ! gh cache delete "${cache_id}"; then
+              echo "::warning::Cache ${cache_id} disappeared before cleanup completed"
+            fi
+          done
