@@ -14,6 +14,13 @@ const TELEMETRY_HMAC_DOMAIN: &[u8] = b"ironmesh-telemetry-v1";
 /// Overridable via `IRONMESH_RELIABILITY_TELEMETRY_COLLECTOR_URL` (chiefly so tests can point the
 /// sender at a local listener).
 const DEFAULT_COLLECTOR_URL: &str = "https://creax.de:44044/v1/ingest/hardware-reliability";
+/// Path suffix of the ingest URL, stripped off to derive the registration endpoint's base URL
+/// (see `registration_url`). Kept in sync with `stats-collector-server`'s route.
+const INGEST_URL_PATH_SUFFIX: &str = "/v1/ingest/hardware-reliability";
+/// Ingestion token header (doc Section 5.2/8), matching `stats-collector-server`'s
+/// `INGESTION_TOKEN_HEADER` constant exactly. Sent only when this node has successfully completed
+/// the registration handshake; omitted otherwise (see `send_reliability_telemetry_once`).
+const INGESTION_TOKEN_HEADER: &str = "x-ironmesh-ingestion-token";
 /// Default send cadence: rare batching (doc Section 6), well inside the recommended 6-24h band.
 const DEFAULT_SEND_INTERVAL_SECS: u64 = 12 * 60 * 60;
 const SEND_INTERVAL_MIN_SECS: u64 = 6 * 60 * 60;
@@ -343,6 +350,24 @@ fn collector_url() -> String {
         .unwrap_or_else(|| DEFAULT_COLLECTOR_URL.to_string())
 }
 
+/// Derives the registration endpoint URL from the configured ingest URL (doc Section 5.2/8), by
+/// replacing the known `/v1/ingest/hardware-reliability` suffix with
+/// `/v1/register/{telemetry_subject_id}`. Kept derived from the ingest URL - rather than a second,
+/// independently configurable env var - so tests (and deployments) that override
+/// `IRONMESH_RELIABILITY_TELEMETRY_COLLECTOR_URL` to point at a local/alternate listener
+/// automatically get a matching registration URL on the same origin, without a second setting to
+/// keep in sync.
+fn registration_url(ingest_url: &str, telemetry_subject_id: &str) -> String {
+    let base = ingest_url
+        .strip_suffix(INGEST_URL_PATH_SUFFIX)
+        .unwrap_or(ingest_url);
+    let encoded_subject_id = percent_encoding::utf8_percent_encode(
+        telemetry_subject_id,
+        percent_encoding::NON_ALPHANUMERIC,
+    );
+    format!("{base}/v1/register/{encoded_subject_id}")
+}
+
 /// Effective send interval, clamped into the doc Section 6 recommended 6-24h band.
 fn send_interval_secs() -> u64 {
     std::env::var("IRONMESH_RELIABILITY_TELEMETRY_SEND_INTERVAL_SECS")
@@ -388,6 +413,14 @@ struct PersistedReliabilityTelemetryState {
     /// after each successful send (see `record_send_success`) so a new window starts immediately.
     #[serde(default)]
     temperature_accumulators: HashMap<String, TemperatureAccumulator>,
+    /// Opaque ingestion token issued by the collector's registration handshake (doc Section 5.2/8),
+    /// scoped to the `telemetry_subject_id` derived from `local_random_salt_b64` at the time it was
+    /// issued. `None` until registration has succeeded at least once; cleared on
+    /// [`ReliabilityTelemetryRuntime::rotate_identity`] since a rotated salt yields a new subject
+    /// id the old token was never scoped to. Never transmitted anywhere except back to the
+    /// collector itself, as the `X-Ironmesh-Ingestion-Token` header on ingest requests.
+    #[serde(default)]
+    ingestion_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -551,6 +584,19 @@ impl ReliabilityTelemetryRuntime {
         self.persisted.temperature_accumulators.clone()
     }
 
+    /// The currently persisted ingestion token, if registration has ever succeeded (doc Section
+    /// 5.2/8). `None` means: no token yet, or it was cleared by [`Self::rotate_identity`].
+    pub(crate) fn ingestion_token(&self) -> Option<String> {
+        self.persisted.ingestion_token.clone()
+    }
+
+    /// Persists a freshly issued ingestion token (doc Section 5.2/8), so subsequent sends can
+    /// attach it without repeating the registration handshake.
+    pub(crate) async fn set_ingestion_token(&mut self, token: String) -> Result<()> {
+        self.persisted.ingestion_token = Some(token);
+        self.persist().await
+    }
+
     /// Persists (or sets to `None`, reverting to the env var default) an explicit admin
     /// override for the enabled toggle.
     pub(crate) async fn set_enabled_override(&mut self, enabled: Option<bool>) -> Result<()> {
@@ -611,10 +657,18 @@ impl ReliabilityTelemetryRuntime {
     /// node-local records regardless of which pseudonym they were (or will be) reported under -
     /// rotation invalidates the *subject id* used going forward, not this node's own memory of
     /// what it previously did or observed.
+    ///
+    /// It also clears the persisted `ingestion_token` (doc Section 5.2/8): that token was issued
+    /// by the collector's registration handshake scoped specifically to the *old*
+    /// `telemetry_subject_id`. Once rotation takes effect, the collector has no record of this new
+    /// subject id at all, so the old token would simply fail to match on the next send (rejected
+    /// as a mismatch) - clearing it here instead means the send path lazily re-registers under the
+    /// new identity on its next opportunity, rather than needlessly bouncing off a 401 first.
     pub(crate) async fn rotate_identity(&mut self) -> Result<()> {
         let salt = Self::generate_random_salt();
         self.persisted.local_random_salt_b64 = Some(BASE64_STANDARD.encode(&salt));
         self.persisted.last_sent_fingerprint = None;
+        self.persisted.ingestion_token = None;
         self.persist().await
     }
 
@@ -1043,7 +1097,42 @@ async fn send_reliability_telemetry_once(state: &ServerState) -> bool {
     }
 
     let url = collector_url();
-    match post_telemetry_batch(&url, &payload).await {
+
+    // Lazily complete the registration handshake if this node doesn't have an ingestion token yet
+    // (doc Section 5.2/8). This is deliberately best-effort and never blocks or breaks the main
+    // send path: an older collector without this endpoint, or a transient network blip, just
+    // means this send goes out without a token (still accepted per the collector's tolerant
+    // policy) and registration is retried lazily on a later cycle, not queued or forced here.
+    let ingestion_token = {
+        let existing = {
+            let runtime = state.reliability_telemetry_runtime.lock().await;
+            runtime.ingestion_token()
+        };
+        match existing {
+            Some(token) => Some(token),
+            None => {
+                let register_url = registration_url(&url, &payload.telemetry_subject_id);
+                match register_for_ingestion_token(&register_url).await {
+                    Ok(token) => {
+                        let mut runtime = state.reliability_telemetry_runtime.lock().await;
+                        if let Err(err) = runtime.set_ingestion_token(token.clone()).await {
+                            warn!(error = %err, "failed to persist newly issued ingestion token");
+                        }
+                        Some(token)
+                    }
+                    Err(err) => {
+                        info!(
+                            error = %err,
+                            "failed to register for an ingestion token; sending without one this cycle"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    };
+
+    match post_telemetry_batch(&url, &payload, ingestion_token.as_deref()).await {
         Ok(()) => {
             let sent_at_unix = unix_ts();
             let mut runtime = state.reliability_telemetry_runtime.lock().await;
@@ -1075,7 +1164,16 @@ async fn send_reliability_telemetry_once(state: &ServerState) -> bool {
 /// POSTs one batch with a bounded retry budget (doc Section 6: limited retries, never an unbounded
 /// queue). The whole batch is dropped after the last attempt fails; the next timer tick will build
 /// a fresh batch from current state rather than replaying a stale one.
-async fn post_telemetry_batch(url: &str, payload: &ReliabilityTelemetryPayload) -> Result<()> {
+///
+/// `ingestion_token`, if present, is attached as the `X-Ironmesh-Ingestion-Token` header (doc
+/// Section 5.2/8) - never as part of the JSON body, so it cannot end up embedded in any stored
+/// payload on the collector side. `None` simply omits the header; the collector's tolerant policy
+/// still accepts the request either way (see `stats-collector-server`'s ingest handler).
+async fn post_telemetry_batch(
+    url: &str,
+    payload: &ReliabilityTelemetryPayload,
+    ingestion_token: Option<&str>,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(SEND_HTTP_TIMEOUT_SECS))
         .build()
@@ -1083,9 +1181,11 @@ async fn post_telemetry_batch(url: &str, payload: &ReliabilityTelemetryPayload) 
 
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=SEND_MAX_ATTEMPTS {
-        match client
-            .post(url)
-            .json(payload)
+        let mut request = client.post(url).json(payload);
+        if let Some(token) = ingestion_token {
+            request = request.header(INGESTION_TOKEN_HEADER, token);
+        }
+        match request
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
@@ -1100,6 +1200,34 @@ async fn post_telemetry_batch(url: &str, payload: &ReliabilityTelemetryPayload) 
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("telemetry send failed")))
+}
+
+/// Completes the one-time registration handshake (doc Section 5.2/8) and returns the issued (or
+/// already-registered - the collector's registration endpoint is idempotent) ingestion token. This
+/// proves only "this caller previously completed registration for this subject id" to the
+/// collector, nothing more; it carries no real-world identity and is never derived from anything
+/// but the collector's own random token generation.
+async fn register_for_ingestion_token(register_url: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct RegisterResponse {
+        token: String,
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(SEND_HTTP_TIMEOUT_SECS))
+        .build()
+        .context("failed to build registration http client")?;
+    let response = client
+        .post(register_url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .context("registration request failed")?;
+    let parsed: RegisterResponse = response
+        .json()
+        .await
+        .context("failed to parse registration response")?;
+    Ok(parsed.token)
 }
 
 #[cfg(test)]
@@ -1575,9 +1703,163 @@ mod tests {
         });
 
         let url = format!("http://{addr}/v1/ingest/hardware-reliability");
-        post_telemetry_batch(&url, &sample_payload(1_000))
+        post_telemetry_batch(&url, &sample_payload(1_000), None)
             .await
             .expect("send should succeed against a 202 collector");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn post_telemetry_batch_attaches_the_ingestion_token_header_when_present() {
+        use axum::Json;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Mutex as TokioMutex;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let seen_token: Arc<TokioMutex<Option<String>>> = Arc::new(TokioMutex::new(None));
+        let seen_token_for_route = seen_token.clone();
+        let app = axum::Router::new().route(
+            "/v1/ingest/hardware-reliability",
+            post(
+                move |headers: HeaderMap, Json(_body): Json<serde_json::Value>| {
+                    let hits = hits_for_route.clone();
+                    let seen_token = seen_token_for_route.clone();
+                    async move {
+                        let token = headers
+                            .get(INGESTION_TOKEN_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        *seen_token.lock().await = token;
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::ACCEPTED
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/v1/ingest/hardware-reliability");
+        post_telemetry_batch(&url, &sample_payload(1_000), Some("test-token-value"))
+            .await
+            .expect("send should succeed against a 202 collector");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(seen_token.lock().await.as_deref(), Some("test-token-value"));
+    }
+
+    #[test]
+    fn registration_url_replaces_the_ingest_suffix_with_register_plus_subject_id() {
+        let ingest_url = "https://creax.de:44044/v1/ingest/hardware-reliability";
+        let url = registration_url(ingest_url, "abc123");
+        assert_eq!(url, "https://creax.de:44044/v1/register/abc123");
+    }
+
+    #[test]
+    fn registration_url_percent_encodes_the_subject_id() {
+        let ingest_url = "http://127.0.0.1:9999/v1/ingest/hardware-reliability";
+        let url = registration_url(ingest_url, "has space/slash");
+        assert!(url.starts_with("http://127.0.0.1:9999/v1/register/"));
+        assert!(!url.contains(' '));
+    }
+
+    #[tokio::test]
+    async fn register_for_ingestion_token_returns_the_issued_token() {
+        use axum::Json;
+        use axum::extract::Path;
+        use axum::routing::post;
+
+        let app = axum::Router::new().route(
+            "/v1/register/{telemetry_subject_id}",
+            post(|Path(telemetry_subject_id): Path<String>| async move {
+                Json(serde_json::json!({
+                    "telemetry_subject_id": telemetry_subject_id,
+                    "token": "issued-token-abc",
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/v1/register/subject-xyz");
+        let token = register_for_ingestion_token(&url)
+            .await
+            .expect("registration should succeed");
+        assert_eq!(token, "issued-token-abc");
+    }
+
+    #[tokio::test]
+    async fn register_for_ingestion_token_fails_gracefully_against_a_404() {
+        // Simulates an older collector that doesn't have the registration endpoint yet - this
+        // must surface as an `Err`, not a panic, so the caller can continue without a token.
+        let app = axum::Router::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/v1/register/subject-xyz");
+        let result = register_for_ingestion_token(&url).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rotate_identity_clears_the_persisted_ingestion_token() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ironmesh-reliability-telemetry-rotate-token-test-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
+        runtime
+            .set_ingestion_token("some-token".to_string())
+            .await
+            .unwrap();
+        assert_eq!(runtime.ingestion_token(), Some("some-token".to_string()));
+
+        runtime.rotate_identity().await.unwrap();
+
+        assert_eq!(
+            runtime.ingestion_token(),
+            None,
+            "rotation must clear the ingestion token, since it was scoped to the old subject id"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn ingestion_token_round_trips_through_load_and_save() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ironmesh-reliability-telemetry-token-persist-test-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
+        assert_eq!(runtime.ingestion_token(), None);
+        runtime
+            .set_ingestion_token("persisted-token".to_string())
+            .await
+            .unwrap();
+
+        let reloaded = ReliabilityTelemetryRuntime::load(&tmp);
+        assert_eq!(
+            reloaded.ingestion_token(),
+            Some("persisted-token".to_string())
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

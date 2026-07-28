@@ -61,6 +61,27 @@ The core of this strategy is implemented across the node and a new central colle
   confirmation-gated "Reset telemetry identity" button (reusing the existing `window.confirm`
   destructive-action pattern from `CertificatesPage`/`S3ControlPlanePage`), with inline copy
   warning that this breaks longitudinal fleet-side trend continuity for the node going forward.
+- **Anonymous ingestion token / abuse protection without identity** (Section 5.2/8, resolved in
+  favor of an identity-blind per-subject registration token layered *on top of* IP/subject rate
+  limiting, not instead of it): a new idempotent `POST /v1/register/{telemetry_subject_id}` on
+  `stats-collector-server` issues (or, on a repeat call for the same subject id, returns unchanged)
+  a random 256-bit token, stored in a new `ingestion_tokens` table keyed by
+  `telemetry_subject_id` — a table never joined into `admin_raw_records`/`StoredRecord`, since the
+  token is a bearer secret, not telemetry content. The node
+  (`crates/server-node-sdk/src/reliability_telemetry.rs`) persists the issued token alongside the
+  rest of its reliability-telemetry state and attaches it as an `X-Ironmesh-Ingestion-Token` header
+  (deliberately a header, not a payload field, so it never ends up inside the stored
+  `raw_payload_json` blob) on every subsequent ingest request. `ingest_hardware_reliability`
+  rejects (401) a request whose token doesn't match what's on file for that subject id (a
+  forgery/spoofing signal) but still *accepts* a request with no token at all (doc Section 7's
+  tolerance-first stance: older/non-upgraded nodes have nothing to present yet), subjecting only
+  that tokenless traffic to an additional, stricter per-subject rate limit as a mild incentive to
+  register. The registration endpoint itself is covered by the same shared per-IP limiter used for
+  ingestion, plus its own dedicated, tighter per-IP limiter (minting a credential is far cheaper per
+  request than a full plausibility-checked ingestion batch). Registration on the node side is
+  best-effort and lazy: it never blocks or breaks the main send path, and a rotated
+  `telemetry_subject_id` (`rotate_identity`) clears the persisted token, since it was scoped to the
+  subject id that no longer applies going forward.
 
 Deliberately **deferred** (documented at their respective sections, not blockers for the above):
 
@@ -70,9 +91,6 @@ Deliberately **deferred** (documented at their respective sections, not blockers
   and an opt-in `BundledCountryResolver` (RIR-delegated-stats-backed, via the `iptocc` crate, no
   API key/account required) all ship in `crates/stats-collector-server/src/country.rs` behind the
   `bundled-country-db` Cargo feature; wiring it up at deployment time is still a deployment concern.
-- An anonymous ingestion token (Section 5.2) — optional later stage; automatic time-based
-  `telemetry_subject_id` rotation was considered and deliberately not implemented (see Section 8) in
-  favor of the user-controlled reset above.
 - Production TLS termination / deployment wiring for the collector at `creax.de:44044` — a
   deployment concern, not hardcoded in the crate.
 - The legal review of the opt-out-by-default posture (Section 4.4/8) remains a prerequisite before
@@ -444,8 +462,27 @@ telemetry would unnecessarily complicate their security boundaries.
   - no client identity proof beyond the `telemetry_subject_id` that is already part of the payload,
   - abuse protection via rate limiting per source IP and per `telemetry_subject_id` (not via
     login/token), plus a simple plausibility check of the payload schema,
-  - optionally (open question, Section 8): an anonymous ingestion token issued once on first
-    activation, to make spam/forgery harder without exposing identity.
+  - ~~optionally (open question, Section 8): an anonymous ingestion token issued once on first
+    activation, to make spam/forgery harder without exposing identity~~ — resolved (Section 8): an
+    **identity-blind ingestion token**, layered strictly *on top of* the IP/subject rate limiting
+    above rather than replacing any of it. `POST /v1/register/{telemetry_subject_id}` (idempotent —
+    a repeat call for an already-registered subject id returns the same token, never mints a new
+    one) issues a random 256-bit token that proves only "this caller previously completed the
+    registration handshake for this specific pseudonymous subject id" — it is never derived from,
+    or linkable to, any real node/cluster/operator identity. The node attaches it as an
+    `X-Ironmesh-Ingestion-Token` header (not a payload field, so it never lands in stored
+    `raw_payload_json`) on ingest requests. A request presenting a token that doesn't match what's
+    on file for that subject id (including "nothing on file at all") is rejected with 401 as a
+    forgery signal; a request presenting *no* token is still accepted (tolerance-first, Section 7:
+    older/non-upgraded nodes have nothing to present yet), but is subject to an additional,
+    stricter per-subject rate limit than tokened traffic, as an incentive to register without a
+    hard cutover. The registration endpoint is covered by the same shared per-IP limiter as
+    ingestion, plus its own dedicated, tighter per-IP limiter, since minting a credential is far
+    cheaper per request than a full plausibility-checked ingestion batch. See
+    `crates/stats-collector-server/src/registration.rs` and `storage.rs`'s `ingestion_tokens`
+    table, and `crates/server-node-sdk/src/reliability_telemetry.rs`'s lazy, best-effort
+    registration call (never blocks the main send path, and is cleared on `rotate_identity` since
+    the token is scoped to the subject id that no longer applies after rotation).
 - Endpoint shape: `POST https://creax.de:44044/v1/ingest/hardware-reliability` with the versioned
   payload sketched in Section 7.
 
@@ -605,15 +642,26 @@ Resolved based on project-owner feedback on the initial draft:
   impose the continuity/privacy trade-off on every installation by default without an operator
   actively deciding they want it. See Section 4.1 and
   `crates/server-node-sdk/src/reliability_telemetry.rs` (`rotate_identity`).
+- ~~Abuse protection without identity~~ — resolved in favor of an **identity-blind, per-subject
+  registration token layered strictly on top of the existing IP/subject rate limiting**, not a
+  replacement for it and not pure rate limiting alone: `POST /v1/register/{telemetry_subject_id}`
+  (idempotent) issues a random 256-bit token proving only "this caller previously completed the
+  registration handshake for this pseudonymous subject id" — never anything linkable to a real
+  node/cluster/operator. The node attaches it as an `X-Ironmesh-Ingestion-Token` header (kept out
+  of the stored payload). A mismatched/unregistered token is rejected (401) as a forgery signal; a
+  *missing* token is still accepted, per Section 7's tolerance-first stance toward
+  older/non-upgraded nodes, but is held to a stricter, dedicated per-subject rate limit than
+  tokened traffic as a soft incentive to register. The registration endpoint itself reuses the
+  shared per-IP ingestion limiter and adds its own tighter, dedicated one, since minting a
+  credential is far cheaper per request than a full plausibility-checked ingestion batch. See
+  Section 5.2, `crates/stats-collector-server/src/registration.rs`/`storage.rs`, and
+  `crates/server-node-sdk/src/reliability_telemetry.rs`'s lazy, best-effort registration call.
 
 Still open:
 
 - **Legal review before rollout:** is "enabled by default + opt-out", combined with the bootstrap
   confirmation step from Section 4.4, legally sufficient in the relevant jurisdictions (especially
   EU/GDPR)? Should be clarified before implementation, not just before release.
-- **Abuse protection without identity:** how is spoofing/spam at the non-authenticated ingestion
-  endpoint prevented, without introducing a de-anonymization risk via an auth token? An anonymous
-  issuance token (Section 5.2) vs. pure IP rate limiting is still open.
 - **Relationship to the existing `/api/v1/auth/hardware/health` endpoint:** should the payload to be
   sent strictly be a derived, one-way projection from the existing `hardware_health_report` (a
   converter, not a second independent collection), to avoid drift between the node-local and centrally
