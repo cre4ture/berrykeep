@@ -58,6 +58,7 @@ fun SyncScreen(
 ) {
     val profileStatuses = state.folderSyncStatus.profiles.associateBy { it.profileId }
     val connectionStatus = state.appConnectionStatus
+    val connectionHealthNow = rememberConnectionHealthNow(connectionStatus)
     val hasProfiles = state.syncProfiles.isNotEmpty()
     var showCreateSheet by rememberSaveable { mutableStateOf(false) }
     var detailProfileId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -66,7 +67,7 @@ fun SyncScreen(
     val editingProfile = state.syncProfiles.firstOrNull { it.id == editingProfileId }
     val heroTone = when {
         state.folderSyncStatus.errorProfileCount > 0L -> HeroTone.Error
-        !connectionStatus.isConnected() -> HeroTone.Warning
+        !connectionStatus.isConnected(connectionHealthNow) -> HeroTone.Warning
         else -> HeroTone.Good
     }
 
@@ -85,7 +86,7 @@ fun SyncScreen(
                 Button(onClick = { showCreateSheet = true }) {
                     Text(stringResource(R.string.new_profile))
                 }
-                if (shouldShowRetryConnectionAction(connectionStatus, hasProfiles)) {
+                if (shouldShowRetryConnectionAction(connectionStatus, hasProfiles, connectionHealthNow)) {
                     OutlinedButton(onClick = vm::retryFolderSyncConnection) {
                         Text(stringResource(R.string.retry_connection))
                     }
@@ -101,7 +102,7 @@ fun SyncScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                SyncBadge(displayStatusToken(connectionStatus.state))
+                SyncBadge(appConnectionStatusBadge(connectionStatus, connectionHealthNow))
                 if (connectionStatus.retryAttemptCount > 0L) {
                     SyncBadge("Retry ${connectionStatus.retryAttemptCount}")
                 }

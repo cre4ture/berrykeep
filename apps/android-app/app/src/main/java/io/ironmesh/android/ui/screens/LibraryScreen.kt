@@ -98,6 +98,7 @@ fun LibraryScreen(
     vm: MainViewModel,
 ) {
     val connectionStatus = state.appConnectionStatus
+    val connectionHealthNow = rememberConnectionHealthNow(connectionStatus)
     val totalGalleryItems = state.galleryCollection?.totalItemCount ?: 0
     var fullscreenIndex by remember(state.galleryMode, state.galleryCurrentDirectoryPath, totalGalleryItems) {
         mutableStateOf<Int?>(null)
@@ -200,7 +201,7 @@ fun LibraryScreen(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Text(
-                            text = appConnectionHeadline(connectionStatus),
+                            text = appConnectionHeadline(connectionStatus, connectionHealthNow),
                             style = MaterialTheme.typography.titleSmall,
                         )
                         Text(
