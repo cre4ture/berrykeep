@@ -272,6 +272,18 @@ fn route_score_strongly_prefers_direct_over_relay_and_stabilizes_active_route() 
 }
 
 #[test]
+fn route_latency_excludes_server_work_and_cold_session_setup() {
+    assert_eq!(
+        route_latency_duration_us(30_250_000, Some(50_000), 30_000_000),
+        200_000
+    );
+    assert_eq!(
+        route_latency_duration_us(30_200_000, None, 30_000_000),
+        200_000
+    );
+}
+
+#[test]
 fn transport_stream_kind_classification_accepts_versioned_public_routes() {
     assert_eq!(
         transport_stream_kind_for_path("/api/v1/health"),
@@ -3653,7 +3665,10 @@ async fn refresh_connection_route_snapshot_times_out_stalled_probe() {
         .expect("healthy endpoint should appear in the snapshot");
 
     assert_eq!(stalled_state.health_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(healthy_state.health_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        healthy_state.health_hits.load(Ordering::SeqCst),
+        CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT + CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT
+    );
     assert_eq!(stalled_endpoint.total_failures, 1);
     assert!(!stalled_endpoint.background_probe_in_flight);
     assert!(
@@ -3664,13 +3679,64 @@ async fn refresh_connection_route_snapshot_times_out_stalled_probe() {
         "stalled endpoint should record a timeout error, got {:?}",
         stalled_endpoint.last_error
     );
-    assert_eq!(healthy_endpoint.total_successes, 1);
+    assert_eq!(
+        healthy_endpoint.total_successes,
+        CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT as u64
+    );
     assert!(healthy_endpoint.last_error.is_none());
 
     stalled_server.abort();
     let _ = stalled_server.await;
     healthy_server.abort();
     let _ = healthy_server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn due_route_refresh_reprobes_only_stale_inactive_endpoint_with_warm_samples() {
+    let (active_url, active_state, active_server) =
+        spawn_direct_http_route_server(0, "active").await;
+    let (inactive_url, inactive_state, inactive_server) =
+        spawn_direct_http_route_server(0, "inactive").await;
+    let client = IronMeshClient::combine(vec![
+        IronMeshClient::from_direct_base_url(active_url),
+        IronMeshClient::from_direct_base_url(inactive_url),
+    ])
+    .expect("combined direct client should build");
+
+    let inactive_endpoint = client
+        .transport_router
+        .endpoint(1)
+        .expect("inactive endpoint should exist");
+    {
+        let mut state = lock_endpoint_state(&inactive_endpoint.state);
+        record_endpoint_success_sample(&mut state, 12.0, 0, false);
+    }
+
+    client.refresh_due_connection_route_snapshot().await;
+    assert_eq!(active_state.health_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(inactive_state.health_hits.load(Ordering::SeqCst), 0);
+
+    {
+        let mut state = lock_endpoint_state(&inactive_endpoint.state);
+        state.last_measurement_unix_ms =
+            Some(unix_ts_ms().saturating_sub(CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS));
+    }
+    let snapshot = client.refresh_due_connection_route_snapshot().await;
+
+    assert_eq!(active_state.health_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        inactive_state.health_hits.load(Ordering::SeqCst),
+        CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT + CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT
+    );
+    assert_eq!(
+        snapshot.endpoints[1].total_successes,
+        1 + CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT as u64
+    );
+
+    active_server.abort();
+    let _ = active_server.await;
+    inactive_server.abort();
+    let _ = inactive_server.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
