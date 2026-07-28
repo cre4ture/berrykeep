@@ -78,3 +78,17 @@ jobs:
 
       - name: Run system tests
         run: cargo -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml
+
+  required-system-tests:
+    name: Required system tests
+    if: ${{ always() }}
+    needs: system-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required system-test results
+        env:
+          REQUIRED_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq --exit-status '
+            all(.[]; .result == "success" or .result == "skipped")
+          ' <<<"${REQUIRED_RESULTS}"

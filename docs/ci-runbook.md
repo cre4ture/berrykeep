@@ -31,22 +31,35 @@ workflow, so the release legs remain unavailable there by design.
 
 ## Required checks (branch protection alignment)
 
-For branch `main`, require these status checks:
+For branch `main`, require these stable aggregate status checks:
 
-- `workspace-check`
-- `rustfmt`
-- `clippy`
-- `unit-tests`
-- `ios-build`
-- `coverage`
-- `system-tests`
+- `Required CI`
+- `Required coverage`
+- `Required system tests`
+
+The aggregate jobs are the branch-protection contract. `Required CI` covers
+`workspace-check`, `rustfmt`, `clippy`, `unit-tests`, and `ios-build`;
+`Required coverage` covers the coverage lane; and `Required system tests`
+covers every operating-system entry in the system-test matrix. The aggregate
+jobs always report a terminal result and accept an intentionally skipped
+dependency. This keeps branch protection stable when a future impact gate
+skips a lane that cannot be affected by the pull request.
+
+Do not require the implementation job names directly. Matrix expansion and
+future job-level impact conditions may change those names or skip those jobs,
+while the three aggregate names above remain stable. `Bazel unit` remains
+advisory until the native Bazel suite has parity with the required Cargo unit
+test lane and its workflow reports a result for every pull request.
 
 Optional (recommended separately):
 
 - `cargo-audit`
 - `cargo-deny`
 
-Why: CI lanes are intentionally split between stable and nightly. Requiring exactly these checks prevents accidental bypass (missing nightly lane) or false blocking (obsolete check names).
+Why: CI lanes are intentionally split between stable and nightly. Requiring
+exactly these aggregate checks prevents accidental bypass (missing nightly
+lane) or false blocking (obsolete, matrix-expanded, or intentionally skipped
+implementation checks).
 
 ## Local required-check reproduction
 

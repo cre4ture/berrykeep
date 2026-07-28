@@ -75,3 +75,17 @@ jobs:
             --summary-only \
             --ignore-filename-regex 'crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)' \
             --fail-under-lines 68
+
+  required-coverage:
+    name: Required coverage
+    if: ${{ always() }}
+    needs: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required coverage result
+        env:
+          REQUIRED_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq --exit-status '
+            all(.[]; .result == "success" or .result == "skipped")
+          ' <<<"${REQUIRED_RESULTS}"
