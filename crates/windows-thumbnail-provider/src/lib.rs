@@ -663,9 +663,19 @@ struct ThumbnailIdentityLoad {
 #[derive(Clone)]
 struct ThumbnailClientBuild {
     client: client_sdk::IronMeshClient,
+    /// Keeps the shared route controller and its executor alive while this
+    /// cached Explorer client is in use.
+    managed_client: client_sdk::ManagedIronMeshClient,
     auth_mode: &'static str,
     candidate_paths: Vec<PathBuf>,
     selected_path: Option<PathBuf>,
+}
+
+impl ThumbnailClientBuild {
+    fn uses_managed_routes(&self) -> bool {
+        let _ = &self.managed_client;
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -809,10 +819,11 @@ fn build_thumbnail_client(
                 .get(&cache_key)
             {
                 append_diagnostic_log(&format!(
-                    "thumbnail-client-cache hit bootstrap_path={} identity_path={} auth_mode={}",
+                    "thumbnail-client-cache hit bootstrap_path={} identity_path={} auth_mode={} managed_routes={}",
                     resolved.bootstrap_path.display(),
                     selected_path,
-                    cached.auth_mode
+                    cached.auth_mode,
+                    cached.uses_managed_routes(),
                 ));
                 return Ok(cached);
             }
@@ -829,13 +840,14 @@ fn build_thumbnail_client(
                     identity.label.as_deref().unwrap_or("-"),
                     candidate_paths
                 ));
-                match resolved
-                    .build_client(Some(identity))
-                    .map(|client| client.with_connection_name(connection_name.clone()))
-                {
-                    Ok(client) => {
+                match resolved.build_managed_client(Some(identity)) {
+                    Ok(managed_client) => {
+                        let client = managed_client
+                            .client()
+                            .with_connection_name(connection_name.clone());
                         let build = ThumbnailClientBuild {
                             client,
+                            managed_client,
                             auth_mode: "client-identity",
                             candidate_paths: identity_load.candidate_paths.clone(),
                             selected_path: identity_load.selected_path.clone(),
@@ -873,9 +885,14 @@ fn build_thumbnail_client(
                 ));
             }
 
-            let client = resolved
-                .build_client(None)
-                .map(|client| client.with_connection_name(connection_name))
+            let (managed_client, client) = resolved
+                .build_managed_client(None)
+                .map(|managed_client| {
+                    let client = managed_client
+                        .client()
+                        .with_connection_name(connection_name);
+                    (managed_client, client)
+                })
                 .map_err(ThumbnailProviderError::permanent)
                 .map_err(|error| {
                     error.with_context(format!(
@@ -885,6 +902,7 @@ fn build_thumbnail_client(
                 })?;
             let build = ThumbnailClientBuild {
                 client,
+                managed_client,
                 auth_mode: "anonymous",
                 candidate_paths: identity_load.candidate_paths,
                 selected_path: identity_load.selected_path,
@@ -928,16 +946,21 @@ fn build_thumbnail_client(
                 .get(&cache_key)
             {
                 append_diagnostic_log(&format!(
-                    "thumbnail-client-cache hit bootstrap_path={} identity_path={} auth_mode={}",
+                    "thumbnail-client-cache hit bootstrap_path={} identity_path={} auth_mode={} managed_routes={}",
                     resolved.bootstrap_path.display(),
                     selected_path,
-                    cached.auth_mode
+                    cached.auth_mode,
+                    cached.uses_managed_routes(),
                 ));
                 return Ok(cached);
             }
 
-            let client = resolved
-                .build_client(None)
+            let (managed_client, client) = resolved
+                .build_managed_client(None)
+                .map(|managed_client| {
+                    let client = managed_client.client();
+                    (managed_client, client)
+                })
                 .map_err(ThumbnailProviderError::permanent)
                 .map_err(|error| {
                     error.with_context(format!(
@@ -947,6 +970,7 @@ fn build_thumbnail_client(
                 })?;
             let build = ThumbnailClientBuild {
                 client,
+                managed_client,
                 auth_mode: "anonymous",
                 candidate_paths: discovery.candidate_paths,
                 selected_path: discovery.selected_path,
