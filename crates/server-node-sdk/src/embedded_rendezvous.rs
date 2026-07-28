@@ -22,6 +22,7 @@ impl EmbeddedRendezvousConfig {
             bind_addr: self.bind_addr,
             public_url: self.public_url.clone(),
             relay_public_urls: vec![self.public_url.clone()],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: Some(RendezvousMtlsConfig {
                 client_ca: RendezvousClientCa::File {

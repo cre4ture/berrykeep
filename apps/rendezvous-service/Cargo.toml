@@ -22,6 +22,7 @@ blake3.workspace = true
 clap.workspace = true
 common = { path = "../../crates/common" }
 git-version.workspace = true
+iroh-relay = { version = "1.0.2", features = ["server"] }
 pbkdf2 = "0.12"
 rendezvous-server = { path = "../../crates/rendezvous-server" }
 rustls = { version = "0.23", features = ["ring"] }
@@ -29,6 +30,7 @@ rustls-pki-types = { version = "1.9", features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+subtle = "2"
 tokio.workspace = true
 tokio-rustls = "0.26"
 tower = "0.5"
@@ -41,6 +43,8 @@ x509-parser = "0.16"
 [dev-dependencies]
 assert_cmd.workspace = true
 client-sdk = { path = "../../crates/client-sdk" }
+http = "1"
+iroh = "1.0.2"
 reqwest.workspace = true
 rcgen = "0.14"
 server-node-sdk = { path = "../../crates/server-node-sdk" }

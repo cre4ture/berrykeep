@@ -1023,8 +1023,12 @@ fn direct_quic_route_identity(candidate: &ConnectionCandidate) -> String {
     let relay_url = hints
         .and_then(|hints| hints.relay_url.as_deref())
         .unwrap_or_default();
+    let relay_auth_identity = hints
+        .and_then(|hints| hints.relay_auth_token.as_deref())
+        .map(|token| blake3::hash(token.as_bytes()).to_hex().to_string())
+        .unwrap_or_default();
     format!(
-        "{}#{transport_id}#{alpn}#{relay_url}",
+        "{}#{transport_id}#{alpn}#{relay_url}#{relay_auth_identity}",
         candidate.endpoint.trim().trim_end_matches('/')
     )
 }

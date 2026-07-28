@@ -1060,6 +1060,7 @@ mod tests {
                     transport_hints: Some(ConnectionCandidateTransportHints {
                         transport_id: Some("peer-key-1".to_string()),
                         relay_url: Some("https://relay.example".to_string()),
+                        relay_auth_token: None,
                         alpn: Some(DEFAULT_DIRECT_QUIC_ALPN.to_string()),
                         direct_socket_addrs: vec!["127.0.0.1:7000".to_string()],
                         observed_socket_addrs: Vec::new(),

@@ -26,6 +26,26 @@ use crate::relay_wake::{RelayWakeClient, RelayWakeRegistration};
 
 const MAX_RENDEZVOUS_ERROR_RESPONSE_BYTES: usize = 1024;
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IrohRelayAdvertisement {
+    pub public_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+}
+
+impl std::fmt::Debug for IrohRelayAdvertisement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IrohRelayAdvertisement")
+            .field("public_urls", &self.public_urls)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportCapability {
@@ -80,6 +100,8 @@ pub struct RegisterPresenceResponse {
     pub accepted: bool,
     #[serde(default)]
     pub software_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh_relay: Option<IrohRelayAdvertisement>,
     pub updated_at_unix: u64,
     pub entry: PresenceEntry,
 }

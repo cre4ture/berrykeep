@@ -434,6 +434,10 @@ async fn ensure_direct_quic_endpoint(
     {
         config.relay_urls.push(relay_url);
     }
+    config.relay_auth_token = candidate
+        .transport_hints
+        .as_ref()
+        .and_then(|hints| hints.relay_auth_token.clone());
 
     let endpoint = DirectQuicEndpoint::bind(config).await.with_context(|| {
         format!(

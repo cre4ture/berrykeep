@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use transport_sdk::peer::PeerIdentity;
 use transport_sdk::rendezvous::{
-    DiscoveryResponse, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
-    RendezvousClientConfig, RendezvousControlClient, RendezvousRuntimeState,
+    DiscoveryResponse, IrohRelayAdvertisement, PresenceListResponse, PresenceRegistration,
+    RegisterPresenceResponse, RendezvousClientConfig, RendezvousControlClient,
+    RendezvousRuntimeState,
 };
 use transport_sdk::{
     BufferedTransportRequest, CandidateKind, ClientBootstrapClaimRedeemRequest,
@@ -176,6 +177,7 @@ pub struct RendezvousServerConfig {
     pub bind_addr: SocketAddr,
     pub public_url: String,
     pub relay_public_urls: Vec<String>,
+    pub iroh_relay: Option<IrohRelayAdvertisement>,
     pub peer_rendezvous_urls: Vec<String>,
     pub mtls: Option<RendezvousMtlsConfig>,
 }
@@ -214,6 +216,7 @@ impl RendezvousAppState {
 struct HealthResponse {
     status: &'static str,
     public_url: String,
+    iroh_relay_public_urls: Vec<String>,
     registered_endpoints: usize,
     software_version: &'static str,
 }
@@ -288,6 +291,12 @@ async fn health(State(state): State<RendezvousAppState>) -> Json<HealthResponse>
     Json(HealthResponse {
         status: "ok",
         public_url: state.config.public_url,
+        iroh_relay_public_urls: state
+            .config
+            .iroh_relay
+            .as_ref()
+            .map(|relay| relay.public_urls.clone())
+            .unwrap_or_default(),
         registered_endpoints: state.presence.len(),
         software_version: PACKAGE_VERSION,
     })
@@ -369,6 +378,7 @@ async fn register_presence(
     Ok(Json(RegisterPresenceResponse {
         accepted: true,
         software_version: Some(PACKAGE_VERSION.to_string()),
+        iroh_relay: state.config.iroh_relay.clone(),
         updated_at_unix: entry.updated_at_unix,
         entry,
     }))
@@ -571,7 +581,7 @@ fn discovery_response(
         .unwrap_or_else(empty_rendezvous_runtime_state)
         .endpoint_statuses;
 
-    let (node_candidates, node_relay_capable) = cluster_id
+    let (mut node_candidates, node_relay_capable) = cluster_id
         .zip(node_id)
         .and_then(|(cluster_id, node_id)| {
             state
@@ -588,12 +598,49 @@ fn discovery_response(
             (Some(entry.registration.direct_candidates), relay_capable)
         })
         .unwrap_or((None, false));
+    if let (Some(candidates), Some(relay)) =
+        (node_candidates.as_mut(), state.config.iroh_relay.as_ref())
+    {
+        advertise_iroh_relay_on_direct_quic_candidates(candidates, relay);
+    }
 
     DiscoveryResponse {
         rendezvous_peers,
         node_candidates,
         node_relay_capable,
     }
+}
+
+fn advertise_iroh_relay_on_direct_quic_candidates(
+    candidates: &mut [ConnectionCandidate],
+    relay: &IrohRelayAdvertisement,
+) {
+    let Some(default_relay_url) = relay.public_urls.first() else {
+        return;
+    };
+    for candidate in candidates {
+        if candidate.kind != CandidateKind::DirectQuic {
+            continue;
+        }
+        let hints = candidate.transport_hints.get_or_insert_default();
+        if hints.relay_url.is_none() {
+            hints.relay_url = Some(default_relay_url.clone());
+        }
+        if hints
+            .relay_url
+            .as_deref()
+            .is_some_and(|url| relay_url_is_advertised(url, &relay.public_urls))
+        {
+            hints.relay_auth_token = relay.auth_token.clone();
+        }
+    }
+}
+
+fn relay_url_is_advertised(url: &str, advertised_urls: &[String]) -> bool {
+    let url = url.trim().trim_end_matches('/');
+    advertised_urls
+        .iter()
+        .any(|advertised| advertised.trim().trim_end_matches('/') == url)
 }
 
 async fn issue_relay_ticket(
@@ -1445,6 +1492,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
             public_url: "https://rendezvous.example".to_string(),
             relay_public_urls: vec!["https://rendezvous.example".to_string()],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: Some(RendezvousMtlsConfig {
                 client_ca: RendezvousClientCa::InlinePem {
@@ -1464,6 +1512,57 @@ mod tests {
             identity,
             cluster_id: Some(cluster_id),
         }))
+    }
+
+    #[test]
+    fn embedded_iroh_relay_is_added_only_to_matching_direct_quic_candidates() {
+        let mut candidates = vec![
+            ConnectionCandidate {
+                kind: CandidateKind::DirectQuic,
+                endpoint: "iroh://endpoint-a".to_string(),
+                rtt_ms: None,
+                transport_hints: None,
+            },
+            ConnectionCandidate {
+                kind: CandidateKind::DirectQuic,
+                endpoint: "iroh://endpoint-b".to_string(),
+                rtt_ms: None,
+                transport_hints: Some(
+                    transport_sdk::candidates::ConnectionCandidateTransportHints {
+                        relay_url: Some("https://external-relay.example".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            },
+        ];
+        let relay = IrohRelayAdvertisement {
+            public_urls: vec!["https://embedded-relay.example/".to_string()],
+            auth_token: Some("cluster-authorized-relay-token".to_string()),
+        };
+
+        advertise_iroh_relay_on_direct_quic_candidates(&mut candidates, &relay);
+
+        let default_hints = candidates[0]
+            .transport_hints
+            .as_ref()
+            .expect("missing relay hints should be populated");
+        assert_eq!(
+            default_hints.relay_url.as_deref(),
+            Some("https://embedded-relay.example/")
+        );
+        assert_eq!(
+            default_hints.relay_auth_token.as_deref(),
+            Some("cluster-authorized-relay-token")
+        );
+        let external_hints = candidates[1]
+            .transport_hints
+            .as_ref()
+            .expect("external relay hints should remain");
+        assert_eq!(
+            external_hints.relay_url.as_deref(),
+            Some("https://external-relay.example")
+        );
+        assert_eq!(external_hints.relay_auth_token, None);
     }
 
     #[tokio::test]
@@ -1677,6 +1776,7 @@ mod tests {
             bind_addr,
             public_url: "http://rendezvous.example".to_string(),
             relay_public_urls: Vec::new(),
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })
@@ -1758,6 +1858,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
             public_url: "http://rendezvous.example".to_string(),
             relay_public_urls: Vec::new(),
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })
@@ -1812,6 +1913,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
             public_url: "http://rendezvous.example".to_string(),
             relay_public_urls: Vec::new(),
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })
@@ -2080,6 +2182,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
             public_url: "http://rendezvous.example".to_string(),
             relay_public_urls: Vec::new(),
+            iroh_relay: None,
             peer_rendezvous_urls: vec![format!("http://{peer_addr}")],
             mtls: None,
         })
@@ -2133,6 +2236,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
             public_url: "http://rendezvous.example".to_string(),
             relay_public_urls: Vec::new(),
+            iroh_relay: None,
             peer_rendezvous_urls: vec![format!("http://{peer_addr}")],
             mtls: None,
         })
@@ -2216,6 +2320,7 @@ mod tests {
             bind_addr,
             public_url: format!("http://{bind_addr}"),
             relay_public_urls: vec![format!("http://{bind_addr}")],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })
@@ -2346,6 +2451,7 @@ mod tests {
             bind_addr,
             public_url: format!("http://{bind_addr}"),
             relay_public_urls: vec![format!("http://{bind_addr}")],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })

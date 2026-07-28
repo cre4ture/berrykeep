@@ -8,6 +8,7 @@ pub use rendezvous_server::{
     ClusterCaRegistry, GlobalClusterRegistrationConfig, RendezvousClientCa, RendezvousMtlsConfig,
     RendezvousServerConfig, RendezvousServerTlsIdentity,
 };
+use transport_sdk::IrohRelayAdvertisement;
 
 use crate::failover::{
     DecryptedRendezvousFailoverPackage, load_rendezvous_failover_package, normalize_public_url,
@@ -56,11 +57,37 @@ pub struct LoadedRendezvousFailoverMetadata {
     pub target_node_id: Option<NodeId>,
 }
 
+#[derive(Clone)]
+pub struct EmbeddedIrohRelayConfig {
+    pub bind_addr: SocketAddr,
+    pub public_urls: Vec<String>,
+    pub auth_token: String,
+    pub client_rx_bytes_per_second: u32,
+    pub client_rx_max_burst_bytes: u32,
+}
+
+impl std::fmt::Debug for EmbeddedIrohRelayConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddedIrohRelayConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("public_urls", &self.public_urls)
+            .field("auth_token", &"[REDACTED]")
+            .field(
+                "client_rx_bytes_per_second",
+                &self.client_rx_bytes_per_second,
+            )
+            .field("client_rx_max_burst_bytes", &self.client_rx_max_burst_bytes)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RendezvousServiceConfig {
     pub bind_addr: SocketAddr,
     pub public_url: String,
     pub relay_public_urls: Vec<String>,
+    pub iroh_relay: Option<EmbeddedIrohRelayConfig>,
     pub peer_rendezvous_urls: Vec<String>,
     pub mtls: Option<RendezvousMtlsConfig>,
     pub allow_insecure_http: bool,
@@ -175,6 +202,15 @@ impl RendezvousServiceConfig {
         let allow_insecure_http = lookup_env("IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP")
             .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
+        let iroh_relay = build_embedded_iroh_relay_config(&lookup_env, allow_insecure_http)?;
+        if iroh_relay
+            .as_ref()
+            .is_some_and(|relay| relay.bind_addr == bind_addr)
+        {
+            bail!(
+                "IRONMESH_IROH_RELAY_BIND must differ from IRONMESH_RENDEZVOUS_BIND because the protocols use separate listeners"
+            );
+        }
         let global_registration_enabled =
             lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED")
                 .map(|value| {
@@ -224,6 +260,7 @@ impl RendezvousServiceConfig {
             bind_addr,
             public_url,
             relay_public_urls,
+            iroh_relay,
             peer_rendezvous_urls,
             mtls,
             allow_insecure_http,
@@ -276,10 +313,116 @@ impl RendezvousServiceConfig {
             bind_addr: self.bind_addr,
             public_url: self.public_url.clone(),
             relay_public_urls: self.relay_public_urls.clone(),
+            iroh_relay: self
+                .iroh_relay
+                .as_ref()
+                .map(|relay| IrohRelayAdvertisement {
+                    public_urls: relay.public_urls.clone(),
+                    auth_token: Some(relay.auth_token.clone()),
+                }),
             peer_rendezvous_urls: self.peer_rendezvous_urls.clone(),
             mtls: self.mtls.clone(),
         }
     }
+}
+
+fn build_embedded_iroh_relay_config<F>(
+    lookup_env: &F,
+    allow_insecure_http: bool,
+) -> Result<Option<EmbeddedIrohRelayConfig>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    const PUBLIC_URLS_ENV: &str = "IRONMESH_IROH_RELAY_PUBLIC_URLS";
+    const BIND_ENV: &str = "IRONMESH_IROH_RELAY_BIND";
+    const AUTH_TOKEN_ENV: &str = "IRONMESH_IROH_RELAY_AUTH_TOKEN";
+    const RATE_ENV: &str = "IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND";
+    const BURST_ENV: &str = "IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES";
+
+    let configured_public_urls = lookup_env(PUBLIC_URLS_ENV);
+    let configured_bind = lookup_env(BIND_ENV);
+    let configured_auth_token = lookup_env(AUTH_TOKEN_ENV);
+    let configured_rate = lookup_env(RATE_ENV);
+    let configured_burst = lookup_env(BURST_ENV);
+    let settings_present = configured_public_urls.is_some()
+        || configured_bind.is_some()
+        || configured_auth_token.is_some()
+        || configured_rate.is_some()
+        || configured_burst.is_some();
+    if !settings_present {
+        return Ok(None);
+    }
+
+    let public_urls = configured_public_urls
+        .ok_or_else(|| {
+            anyhow::anyhow!("{PUBLIC_URLS_ENV} is required to enable the embedded relay")
+        })?
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if public_urls.is_empty() {
+        bail!("{PUBLIC_URLS_ENV} must contain at least one URL");
+    }
+    for public_url in &public_urls {
+        validate_iroh_relay_public_url(public_url, allow_insecure_http)?;
+    }
+
+    let bind_addr = configured_bind
+        .unwrap_or_else(|| "127.0.0.1:19091".to_string())
+        .parse()
+        .context("invalid IRONMESH_IROH_RELAY_BIND")?;
+    let auth_token = configured_auth_token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{AUTH_TOKEN_ENV} is required so the embedded relay cannot be used as an open public relay"
+            )
+        })?;
+    if auth_token.len() < 32 {
+        bail!("{AUTH_TOKEN_ENV} must contain at least 32 characters");
+    }
+
+    let client_rx_bytes_per_second =
+        parse_positive_env_u32(RATE_ENV, configured_rate, 16 * 1024 * 1024)?;
+    let client_rx_max_burst_bytes =
+        parse_positive_env_u32(BURST_ENV, configured_burst, 32 * 1024 * 1024)?;
+
+    Ok(Some(EmbeddedIrohRelayConfig {
+        bind_addr,
+        public_urls,
+        auth_token,
+        client_rx_bytes_per_second,
+        client_rx_max_burst_bytes,
+    }))
+}
+
+fn validate_iroh_relay_public_url(value: &str, allow_insecure_http: bool) -> Result<()> {
+    let uri = value
+        .parse::<axum::http::Uri>()
+        .with_context(|| format!("invalid IRONMESH_IROH_RELAY_PUBLIC_URLS entry {value:?}"))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| anyhow::anyhow!("iroh relay public URL must include a scheme: {value}"))?;
+    if uri.authority().is_none() {
+        bail!("iroh relay public URL must include a host: {value}");
+    }
+    if !(scheme.eq_ignore_ascii_case("https")
+        || allow_insecure_http && scheme.eq_ignore_ascii_case("http"))
+    {
+        bail!(
+            "iroh relay public URL must use HTTPS; plain HTTP is allowed only with IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true"
+        );
+    }
+    if uri.path() != "/" && !uri.path().is_empty() {
+        bail!("iroh relay public URL must be an origin without a path: {value}");
+    }
+    if uri.query().is_some() {
+        bail!("iroh relay public URL must not contain a query: {value}");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -503,6 +646,7 @@ mod tests {
             bind_addr: "127.0.0.1:19090".parse().expect("bind addr should parse"),
             public_url: "http://127.0.0.1:19090".to_string(),
             relay_public_urls: vec!["http://127.0.0.1:19090".to_string()],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
             allow_insecure_http: false,
@@ -521,6 +665,7 @@ mod tests {
             bind_addr: "127.0.0.1:19090".parse().expect("bind addr should parse"),
             public_url: "http://127.0.0.1:19090".to_string(),
             relay_public_urls: vec!["http://127.0.0.1:19090".to_string()],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
             allow_insecure_http: true,
@@ -530,6 +675,103 @@ mod tests {
         config
             .validate_startup_security()
             .expect("explicit dev/test insecure HTTP should be allowed");
+    }
+
+    #[test]
+    fn from_lookup_builds_authenticated_embedded_iroh_relay() {
+        let cli = RendezvousServiceCliConfig::default();
+        let env = HashMap::from([
+            (
+                "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
+                "https://rendezvous.example".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_TLS_CERT".to_string(),
+                "/tmp/rendezvous.pem".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_TLS_KEY".to_string(),
+                "/tmp/rendezvous.key".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
+                "/tmp/client-ca.pem".to_string(),
+            ),
+            (
+                "IRONMESH_IROH_RELAY_PUBLIC_URLS".to_string(),
+                " https://relay-a.example,https://relay-b.example/ ".to_string(),
+            ),
+            (
+                "IRONMESH_IROH_RELAY_AUTH_TOKEN".to_string(),
+                "relay-token-that-is-at-least-32-characters".to_string(),
+            ),
+        ]);
+
+        let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
+            .expect("embedded relay config should load");
+        let relay = config
+            .iroh_relay
+            .as_ref()
+            .expect("embedded relay should be enabled");
+        assert_eq!(
+            relay.public_urls,
+            vec![
+                "https://relay-a.example".to_string(),
+                "https://relay-b.example/".to_string()
+            ]
+        );
+        assert_eq!(
+            relay.bind_addr,
+            "127.0.0.1:19091"
+                .parse::<SocketAddr>()
+                .expect("default bind should parse")
+        );
+        assert_eq!(relay.client_rx_bytes_per_second, 16 * 1024 * 1024);
+        assert_eq!(relay.client_rx_max_burst_bytes, 32 * 1024 * 1024);
+
+        let advertised = config
+            .server_config()
+            .iroh_relay
+            .expect("relay should be advertised");
+        assert_eq!(advertised.public_urls, relay.public_urls);
+        assert_eq!(
+            advertised.auth_token.as_deref(),
+            Some("relay-token-that-is-at-least-32-characters")
+        );
+    }
+
+    #[test]
+    fn from_lookup_rejects_partial_or_insecure_embedded_iroh_relay_config() {
+        let cli = RendezvousServiceCliConfig::default();
+        let missing_token = HashMap::from([
+            (
+                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IRONMESH_IROH_RELAY_PUBLIC_URLS".to_string(),
+                "http://127.0.0.1:19091".to_string(),
+            ),
+        ]);
+        let error =
+            RendezvousServiceConfig::from_lookup(&cli, |key| missing_token.get(key).cloned())
+                .expect_err("relay without an auth token must fail");
+        assert!(error.to_string().contains("IRONMESH_IROH_RELAY_AUTH_TOKEN"));
+
+        let insecure_public_url = HashMap::from([
+            (
+                "IRONMESH_IROH_RELAY_PUBLIC_URLS".to_string(),
+                "http://relay.example".to_string(),
+            ),
+            (
+                "IRONMESH_IROH_RELAY_AUTH_TOKEN".to_string(),
+                "relay-token-that-is-at-least-32-characters".to_string(),
+            ),
+        ]);
+        let error =
+            RendezvousServiceConfig::from_lookup(&cli, |key| insecure_public_url.get(key).cloned())
+                .expect_err("plain HTTP relay must require the explicit development override");
+        assert!(error.to_string().contains("must use HTTPS"));
     }
 
     #[test]
