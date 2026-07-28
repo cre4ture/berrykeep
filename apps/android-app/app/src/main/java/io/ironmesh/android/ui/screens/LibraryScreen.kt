@@ -6,9 +6,9 @@ import android.graphics.Bitmap
 import android.graphics.Point
 import android.net.Uri
 import android.provider.DocumentsContract
-import android.util.Log
 import android.util.LruCache
 import androidx.activity.compose.BackHandler
+import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background

@@ -120,6 +120,9 @@ object RustClientBridge {
     external fun getTitleLatencyStatus(): String
 
     @JvmStatic
+    external fun getDiagnosticLog(): String
+
+    @JvmStatic
     external fun getConnectionRouteSnapshot(
         connectionInput: String,
         serverCaPem: String?,

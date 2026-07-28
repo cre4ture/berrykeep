@@ -200,4 +200,5 @@
     <string name="title_latency_indicator_direct_quic">Direct QUIC connection latency: %1$s</string>
     <string name="title_latency_indicator_relay">Relay connection latency: %1$s</string>
     <string name="title_latency_indicator_unknown">Connection latency: %1$s</string>
+    <string name="export_diagnostic_log">Log</string>
 </resources>
