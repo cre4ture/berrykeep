@@ -7588,6 +7588,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             "/auth/telemetry/preview",
             get(reliability_telemetry::telemetry_preview_get),
         )
+        .route(
+            "/auth/telemetry/rotate-identity",
+            post(reliability_telemetry::telemetry_rotate_identity_post),
+        )
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
     let public_maps_api = Router::new()

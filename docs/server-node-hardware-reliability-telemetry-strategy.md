@@ -49,6 +49,18 @@ The core of this strategy is implemented across the node and a new central colle
   counters, these are treated as simple instantaneous latest-value passthroughs rather than run
   through a rolling accumulator, since they are monotonically non-decreasing lifetime counters
   (reset only on interface reset/reboot), not a fluctuating signal like temperature.
+- **`telemetry_subject_id` rotation** (Section 4.1/8, resolved in favor of a user-controlled
+  "reset" action rather than automatic time-based rotation): a new
+  `ReliabilityTelemetryRuntime::rotate_identity` generates and persists a fresh local salt, and a
+  new admin-authenticated `POST /api/v1/auth/telemetry/rotate-identity` endpoint (audited exactly
+  like `telemetry_settings_put`, reusing `build_settings_response` so the fresh
+  `telemetry_subject_id` comes back immediately) triggers it. This also clears the persisted
+  `last_sent_fingerprint` dedup marker, so the very next send after a rotation always goes out even
+  if the payload content is otherwise byte-identical — the collector has never seen a batch under
+  the new subject id yet. `server-admin`'s `TelemetryConfigurationCard` exposes this as a
+  confirmation-gated "Reset telemetry identity" button (reusing the existing `window.confirm`
+  destructive-action pattern from `CertificatesPage`/`S3ControlPlanePage`), with inline copy
+  warning that this breaks longitudinal fleet-side trend continuity for the node going forward.
 
 Deliberately **deferred** (documented at their respective sections, not blockers for the above):
 
@@ -58,8 +70,9 @@ Deliberately **deferred** (documented at their respective sections, not blockers
   and an opt-in `BundledCountryResolver` (RIR-delegated-stats-backed, via the `iptocc` crate, no
   API key/account required) all ship in `crates/stats-collector-server/src/country.rs` behind the
   `bundled-country-db` Cargo feature; wiring it up at deployment time is still a deployment concern.
-- `telemetry_subject_id` rotation (Section 8) and an anonymous ingestion token (Section 5.2) —
-  optional later stages.
+- An anonymous ingestion token (Section 5.2) — optional later stage; automatic time-based
+  `telemetry_subject_id` rotation was considered and deliberately not implemented (see Section 8) in
+  favor of the user-controlled reset above.
 - Production TLS termination / deployment wiring for the collector at `creax.de:44044` — a
   deployment concern, not hardcoded in the crate.
 - The legal review of the opt-out-by-default posture (Section 4.4/8) remains a prerequisite before
@@ -237,6 +250,11 @@ telemetry_enabled: std::env::var("IRONMESH_RELIABILITY_TELEMETRY_ENABLED")
   default but the UI setting as an override.
 - Admin endpoint to read/set, following the existing auth pattern (`authorize_admin_request`, as in
   `hardware_health_current`): e.g. `GET/PUT /api/v1/auth/telemetry/settings`.
+- A separate, explicit admin action to reset the pseudonymization identity itself (distinct from
+  the enabled/disabled toggle above): `POST /api/v1/auth/telemetry/rotate-identity`, surfaced as a
+  confirmation-gated "Reset telemetry identity" button next to the toggle in `server-admin`. See
+  Section 4.1/8 for what this does and why it is a deliberate user-controlled action rather than an
+  automatic one.
 
 ### 3.3 Transparency Before Sending
 
@@ -279,11 +297,19 @@ telemetry_subject_id = HMAC-SHA256(local_random_salt, "ironmesh-telemetry-v1" ||
 - This makes `telemetry_subject_id` stable enough over time for longitudinal analysis ("this node has
   shown rising `reallocated_sector_count` for 3 weeks"), but not traceable back to the cluster-internal
   `node_id` without knowing the local salt.
-- Rotation: analogous to the 90-day retention convention from
-  `docs/server-node-storage-stats-strategy.md`, an optional periodic rotation (e.g. every 180 days)
-  could be offered to further complicate long-term tracking — this does break existing time series
-  though; the exact rotation interval is an open question (Section 8) with a trade-off between
-  statistical continuity and privacy.
+- ~~Rotation~~ — resolved (Section 8): rather than an automatic fixed-interval rotation (e.g. every
+  180 days, analogous to the 90-day retention convention from
+  `docs/server-node-storage-stats-strategy.md`), rotation is **user-controlled only** — an explicit
+  "Reset telemetry identity" admin action (`POST /api/v1/auth/telemetry/rotate-identity`,
+  `ReliabilityTelemetryRuntime::rotate_identity`). This deliberately avoids picking a single
+  fixed interval that would silently break statistical continuity for every operator by default;
+  instead, an operator who has a specific reason to want a fresh identity (e.g. after completing a
+  GDPR erasure request against the old `telemetry_subject_id`, or just out of caution) can trigger
+  it themselves, with the admin UI clearly warning that this breaks longitudinal fleet-side time
+  series continuity for the node going forward and is irreversible (the old salt is discarded, not
+  archived). The dedup-by-fingerprint send-skip logic (Section 6) is reset alongside the salt, so
+  the very next send after a rotation is never skipped just because the payload content looks
+  unchanged — the collector has not yet seen anything under the new identity.
 - **No** `cluster_id`, `public_url`, node labels, or any other cluster affiliation is sent along.
 
 ### 4.2 Coarse Location Data
@@ -569,15 +595,22 @@ Resolved based on project-owner feedback on the initial draft:
   passthroughs, since aggregating a monotonic counter over a window adds no information beyond the
   latest reading. See `crates/server-node-sdk/src/reliability_telemetry.rs`
   (`TemperatureAccumulator`, `TelemetryStorageSmart`).
+- ~~Rotation of `telemetry_subject_id`~~ — resolved in favor of the **user-controlled "reset"
+  option**, not automatic fixed-interval rotation and not "never rotating": an explicit admin
+  action (`POST /api/v1/auth/telemetry/rotate-identity`, a confirmation-gated button in
+  `server-admin`'s `TelemetryConfigurationCard`) generates a fresh local salt on demand, so
+  statistical continuity is preserved by default for every operator who never touches the button,
+  while an operator with a concrete reason (e.g. following up on a GDPR erasure request against the
+  old id) can deliberately start a new identity. A fixed interval was rejected because it would
+  impose the continuity/privacy trade-off on every installation by default without an operator
+  actively deciding they want it. See Section 4.1 and
+  `crates/server-node-sdk/src/reliability_telemetry.rs` (`rotate_identity`).
 
 Still open:
 
 - **Legal review before rollout:** is "enabled by default + opt-out", combined with the bootstrap
   confirmation step from Section 4.4, legally sufficient in the relevant jurisdictions (especially
   EU/GDPR)? Should be clarified before implementation, not just before release.
-- **Rotation of `telemetry_subject_id`:** fixed interval (e.g. 180 days) vs. never rotating vs.
-  user-controlled ("reset" button in the admin UI)? The trade-off between statistical continuity and
-  privacy still needs a decision.
 - **Abuse protection without identity:** how is spoofing/spam at the non-authenticated ingestion
   endpoint prevented, without introducing a de-anonymization risk via an auth token? An anonymous
   issuance token (Section 5.2) vs. pure IP rate limiting is still open.
