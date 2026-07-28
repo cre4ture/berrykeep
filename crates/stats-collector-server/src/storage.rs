@@ -8,7 +8,7 @@
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// A single stored ingestion row, as inserted by [`IngestStorage::insert`].
 ///
@@ -64,6 +64,18 @@ impl IngestStorage {
                 );
                 CREATE INDEX IF NOT EXISTS idx_hardware_reliability_ingest_subject
                     ON hardware_reliability_ingest(telemetry_subject_id);
+                -- Registration handshake tokens (doc Section 5.2/8): one opaque bearer token per
+                -- `telemetry_subject_id`, issued idempotently by `POST /v1/register/*` and checked
+                -- (but never exposed) by the ingest endpoint. Deliberately its own table, never
+                -- joined into `hardware_reliability_ingest` or any admin/raw-record view - it is a
+                -- bearer secret, not telemetry content (see `get_or_create_ingestion_token` and
+                -- `token_for_subject` below, and `lib.rs`'s `admin_raw_records`/`RawRecordView`,
+                -- which only ever read from `hardware_reliability_ingest`).
+                CREATE TABLE IF NOT EXISTS ingestion_tokens (
+                    telemetry_subject_id TEXT PRIMARY KEY,
+                    token TEXT NOT NULL,
+                    created_at_unix INTEGER NOT NULL
+                );
                 ",
             )
             .context("failed to initialize hardware_reliability_ingest schema")?;
@@ -136,6 +148,12 @@ impl IngestStorage {
 
     /// Deletes every row for a given `telemetry_subject_id` (GDPR erasure, doc Section 4.5).
     /// Returns the number of rows removed.
+    ///
+    /// Also revokes any registered ingestion token for this subject id (see `ingestion_tokens`
+    /// below): once a subject's telemetry content is erased, there is no remaining purpose in
+    /// keeping its registration credential around, and an operator who erases a subject and later
+    /// re-registers under the same pseudonym (unlikely, but possible if they reused a salt) gets a
+    /// fresh token rather than silently resuming the old one.
     pub fn delete_subject(&self, telemetry_subject_id: &str) -> Result<usize> {
         let connection = self
             .connection
@@ -147,7 +165,66 @@ impl IngestStorage {
                 rusqlite::params![telemetry_subject_id],
             )
             .context("failed to delete records for subject")?;
+        connection
+            .execute(
+                "DELETE FROM ingestion_tokens WHERE telemetry_subject_id = ?1",
+                rusqlite::params![telemetry_subject_id],
+            )
+            .context("failed to revoke ingestion token for subject")?;
         Ok(removed)
+    }
+
+    /// Idempotently issues (or returns the already-registered) ingestion token for
+    /// `telemetry_subject_id` (doc Section 5.2/8 registration handshake). `candidate_token` is
+    /// only actually stored if no row exists yet for this subject id - the
+    /// `INSERT ... ON CONFLICT DO NOTHING` followed by a `SELECT` makes concurrent first-time
+    /// registrations for the same subject id race-safe: whichever insert wins, every caller reads
+    /// back that same winning token, so a re-run operator or a node restarting before its first
+    /// successful ingest never gets a silently invalidated token.
+    pub fn get_or_create_ingestion_token(
+        &self,
+        telemetry_subject_id: &str,
+        created_at_unix: i64,
+        candidate_token: &str,
+    ) -> Result<String> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("ingest storage mutex should not be poisoned");
+        connection
+            .execute(
+                "INSERT INTO ingestion_tokens (telemetry_subject_id, token, created_at_unix)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(telemetry_subject_id) DO NOTHING",
+                rusqlite::params![telemetry_subject_id, candidate_token, created_at_unix],
+            )
+            .context("failed to insert ingestion token")?;
+        connection
+            .query_row(
+                "SELECT token FROM ingestion_tokens WHERE telemetry_subject_id = ?1",
+                rusqlite::params![telemetry_subject_id],
+                |row| row.get(0),
+            )
+            .context("failed to read ingestion token after insert")
+    }
+
+    /// Looks up the registered ingestion token for `telemetry_subject_id`, if any. Used by the
+    /// ingest handler to validate an `X-Ironmesh-Ingestion-Token` header (doc Section 5.2/8).
+    /// Never exposed via any admin/raw-record view (see the `ingestion_tokens` table doc comment
+    /// above) - it is a bearer secret, not telemetry content.
+    pub fn token_for_subject(&self, telemetry_subject_id: &str) -> Result<Option<String>> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("ingest storage mutex should not be poisoned");
+        connection
+            .query_row(
+                "SELECT token FROM ingestion_tokens WHERE telemetry_subject_id = ?1",
+                rusqlite::params![telemetry_subject_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read ingestion token")
     }
 
     /// Deletes raw rows older than `cutoff_unix` (retention enforcement, doc Section 4.6). Returns
@@ -280,5 +357,67 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(storage.count().unwrap(), 1);
         assert!(storage.records_for_subject("old").unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_or_create_ingestion_token_is_idempotent() {
+        let storage = IngestStorage::open_in_memory().expect("storage should open");
+        let first = storage
+            .get_or_create_ingestion_token("subject-a", 1_000, "candidate-1")
+            .expect("first registration should succeed");
+        assert_eq!(first, "candidate-1");
+
+        // A second registration attempt for the same subject id must return the *same* token,
+        // even though it offers a different candidate - an operator re-running setup, or a node
+        // restarting before its first successful ingest, must not get a silently invalidated
+        // token.
+        let second = storage
+            .get_or_create_ingestion_token("subject-a", 2_000, "candidate-2")
+            .expect("second registration should succeed");
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn get_or_create_ingestion_token_is_independent_per_subject() {
+        let storage = IngestStorage::open_in_memory().expect("storage should open");
+        let a = storage
+            .get_or_create_ingestion_token("subject-a", 1_000, "token-a")
+            .unwrap();
+        let b = storage
+            .get_or_create_ingestion_token("subject-b", 1_000, "token-b")
+            .unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn token_for_subject_returns_none_when_unregistered() {
+        let storage = IngestStorage::open_in_memory().expect("storage should open");
+        assert_eq!(storage.token_for_subject("never-registered").unwrap(), None);
+    }
+
+    #[test]
+    fn token_for_subject_returns_the_registered_token() {
+        let storage = IngestStorage::open_in_memory().expect("storage should open");
+        storage
+            .get_or_create_ingestion_token("subject-a", 1_000, "token-a")
+            .unwrap();
+        assert_eq!(
+            storage.token_for_subject("subject-a").unwrap(),
+            Some("token-a".to_string())
+        );
+    }
+
+    #[test]
+    fn delete_subject_also_revokes_the_ingestion_token() {
+        let storage = IngestStorage::open_in_memory().expect("storage should open");
+        storage.insert(1, "subject-a", 1, None, "{}").unwrap();
+        storage
+            .get_or_create_ingestion_token("subject-a", 1_000, "token-a")
+            .unwrap();
+        assert!(storage.token_for_subject("subject-a").unwrap().is_some());
+
+        storage.delete_subject("subject-a").unwrap();
+
+        assert_eq!(storage.token_for_subject("subject-a").unwrap(), None);
     }
 }
