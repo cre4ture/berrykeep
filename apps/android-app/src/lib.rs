@@ -36,6 +36,74 @@ mod tests {
     }
 
     #[test]
+    fn connection_diagnostics_track_functional_success_separately_from_probe() {
+        let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
+            connection_name: Some("android-foreground".to_string()),
+            diagnostics: ClientConnectionDiagnostics {
+                endpoints: vec![client_sdk::ClientEndpointDiagnostics {
+                    locator: "https://example.test".to_string(),
+                    last_success_unix_ms: Some(3_000),
+                    recent_attempts: vec![
+                        client_sdk::ClientConnectionAttempt {
+                            started_unix_ms: 900,
+                            finished_unix_ms: Some(1_000),
+                            method: "GET".to_string(),
+                            url: "https://example.test/api/v1/store/index".to_string(),
+                            outcome: "failure".to_string(),
+                            ..client_sdk::ClientConnectionAttempt::default()
+                        },
+                        client_sdk::ClientConnectionAttempt {
+                            started_unix_ms: 1_900,
+                            finished_unix_ms: Some(2_000),
+                            method: "GET".to_string(),
+                            url: "https://example.test/api/v1/store/index".to_string(),
+                            outcome: "success".to_string(),
+                            ..client_sdk::ClientConnectionAttempt::default()
+                        },
+                        client_sdk::ClientConnectionAttempt {
+                            started_unix_ms: 2_900,
+                            finished_unix_ms: Some(3_000),
+                            method: "GET".to_string(),
+                            url: "https://example.test/api/v1/diagnostics/latency?response_bytes=0"
+                                .to_string(),
+                            outcome: "success".to_string(),
+                            ..client_sdk::ClientConnectionAttempt::default()
+                        },
+                    ],
+                    ..client_sdk::ClientEndpointDiagnostics::default()
+                }],
+                last_success_unix_ms: Some(3_000),
+            },
+        });
+
+        assert_eq!(update.last_successful_connection_unix_ms, Some(3_000));
+        assert!(
+            update
+                .last_successful_connection_url
+                .as_deref()
+                .is_some_and(|url| url.contains("/diagnostics/latency"))
+        );
+        assert_eq!(
+            update.last_successful_functional_request_unix_ms,
+            Some(2_000)
+        );
+        assert_eq!(
+            update.last_successful_functional_request_url.as_deref(),
+            Some("https://example.test/api/v1/store/index")
+        );
+
+        let json = serde_json::to_value(update).expect("diagnostics update should serialize");
+        assert_eq!(
+            json["lastSuccessfulFunctionalRequestUnixMs"],
+            serde_json::json!(2_000)
+        );
+        assert_eq!(
+            json["lastSuccessfulFunctionalRequestUrl"],
+            serde_json::json!("https://example.test/api/v1/store/index")
+        );
+    }
+
+    #[test]
     fn rebuild_service_summary_reports_stopped_when_no_profiles_are_active() {
         let mut status = AndroidFolderSyncServiceStatus::default();
 
@@ -290,6 +358,8 @@ struct AndroidAppConnectionDiagnosticsUpdate {
     source_label: Option<String>,
     last_successful_connection_unix_ms: Option<u64>,
     last_successful_connection_url: Option<String>,
+    last_successful_functional_request_unix_ms: Option<u64>,
+    last_successful_functional_request_url: Option<String>,
     failed_attempts: Vec<AndroidAppFailedConnectionAttempt>,
 }
 
@@ -447,6 +517,8 @@ fn summarize_android_connection_diagnostics(
         .filter(|value| !value.is_empty());
     let mut last_successful_connection_unix_ms = None;
     let mut last_successful_connection_url = None;
+    let mut last_successful_functional_request_unix_ms = None;
+    let mut last_successful_functional_request_url = None;
     let mut failed_attempts = Vec::new();
 
     for endpoint in event.diagnostics.endpoints {
@@ -461,6 +533,19 @@ fn summarize_android_connection_diagnostics(
                 .find(|attempt| attempt.outcome == "success")
                 .map(|attempt| attempt.url.clone())
                 .or_else(|| Some(endpoint.locator.clone()));
+        }
+
+        for attempt in &endpoint.recent_attempts {
+            if attempt.outcome != "success" || is_android_connectivity_probe_url(&attempt.url) {
+                continue;
+            }
+            let finished_unix_ms = attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms);
+            if last_successful_functional_request_unix_ms
+                .is_none_or(|current| finished_unix_ms >= current)
+            {
+                last_successful_functional_request_unix_ms = Some(finished_unix_ms);
+                last_successful_functional_request_url = Some(attempt.url.clone());
+            }
         }
 
         failed_attempts.extend(
@@ -493,8 +578,17 @@ fn summarize_android_connection_diagnostics(
         source_label,
         last_successful_connection_unix_ms,
         last_successful_connection_url,
+        last_successful_functional_request_unix_ms,
+        last_successful_functional_request_url,
         failed_attempts,
     }
+}
+
+fn is_android_connectivity_probe_url(url: &str) -> bool {
+    url.split_once('?')
+        .map_or(url, |(path, _)| path)
+        .trim_end_matches('/')
+        .ends_with("/api/v1/diagnostics/latency")
 }
 
 fn summarize_android_error(error: &str) -> String {
@@ -586,6 +680,10 @@ fn log_android_connection_diagnostics(update: &AndroidAppConnectionDiagnosticsUp
             finished_unix_ms = ?attempt.finished_unix_ms,
             last_successful_connection_unix_ms = ?update.last_successful_connection_unix_ms,
             last_successful_connection_url = ?update.last_successful_connection_url,
+            last_successful_functional_request_unix_ms =
+                ?update.last_successful_functional_request_unix_ms,
+            last_successful_functional_request_url =
+                ?update.last_successful_functional_request_url,
             failed_attempt_count = update.failed_attempts.len(),
             error = ?attempt.error,
             "app connection attempt"
@@ -599,6 +697,10 @@ fn log_android_connection_diagnostics(update: &AndroidAppConnectionDiagnosticsUp
         outcome = "success",
         last_successful_connection_unix_ms = ?update.last_successful_connection_unix_ms,
         last_successful_connection_url = ?update.last_successful_connection_url,
+        last_successful_functional_request_unix_ms =
+            ?update.last_successful_functional_request_unix_ms,
+        last_successful_functional_request_url =
+            ?update.last_successful_functional_request_url,
         failed_attempt_count = update.failed_attempts.len(),
         "app connection attempt"
     );

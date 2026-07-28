@@ -60,6 +60,16 @@ object RustPreferencesBridge {
         val context = appContext ?: error("RustPreferencesBridge is not initialized")
         val update = diagnosticsUpdateAdapter.fromJson(diagnosticsJson) ?: return
         val current = IronmeshPreferences.getAppConnectionStatus(context)
+        IronmeshPreferences.setAppConnectionStatus(
+            context,
+            mergeAppConnectionDiagnostics(current, update),
+        )
+    }
+
+    internal fun mergeAppConnectionDiagnostics(
+        current: AppConnectionStatus,
+        update: AppConnectionDiagnosticsUpdate,
+    ): AppConnectionStatus {
         val mergedFailures = (current.failedAttempts + update.failedAttempts)
             .distinctBy { attempt -> failedAttemptKey(attempt) }
             .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
@@ -78,6 +88,24 @@ object RustPreferencesBridge {
                 update.lastSuccessfulConnectionUrl?.takeIf { it.isNotBlank() }
                     ?: current.lastSuccessfulConnectionUrl
             else -> current.lastSuccessfulConnectionUrl
+        }
+        val effectiveLastFunctionalSuccessUnixMs = when {
+            current.lastSuccessfulFunctionalRequestUnixMs == null ->
+                update.lastSuccessfulFunctionalRequestUnixMs
+            update.lastSuccessfulFunctionalRequestUnixMs == null ->
+                current.lastSuccessfulFunctionalRequestUnixMs
+            update.lastSuccessfulFunctionalRequestUnixMs >=
+                current.lastSuccessfulFunctionalRequestUnixMs ->
+                update.lastSuccessfulFunctionalRequestUnixMs
+            else -> current.lastSuccessfulFunctionalRequestUnixMs
+        }
+        val effectiveLastFunctionalSuccessUrl = when {
+            effectiveLastFunctionalSuccessUnixMs == null -> null
+            effectiveLastFunctionalSuccessUnixMs ==
+                update.lastSuccessfulFunctionalRequestUnixMs ->
+                update.lastSuccessfulFunctionalRequestUrl?.takeIf { it.isNotBlank() }
+                    ?: current.lastSuccessfulFunctionalRequestUrl
+            else -> current.lastSuccessfulFunctionalRequestUrl
         }
 
         val latestFailure = mergedFailures.maxByOrNull { attempt ->
@@ -108,18 +136,17 @@ object RustPreferencesBridge {
             else -> current.message
         }
 
-        IronmeshPreferences.setAppConnectionStatus(
-            context,
-            current.copy(
-                state = nextState,
-                message = nextMessage,
-                updatedUnixMs = latestEventUnixMs ?: current.updatedUnixMs,
-                retryAttemptCount = if (shouldRefreshState) 0L else current.retryAttemptCount,
-                nextRetryUnixMs = if (shouldRefreshState) null else current.nextRetryUnixMs,
-                lastSuccessfulConnectionUnixMs = effectiveLastSuccessUnixMs,
-                lastSuccessfulConnectionUrl = effectiveLastSuccessUrl,
-                failedAttempts = mergedFailures,
-            ),
+        return current.copy(
+            state = nextState,
+            message = nextMessage,
+            updatedUnixMs = latestEventUnixMs ?: current.updatedUnixMs,
+            retryAttemptCount = if (shouldRefreshState) 0L else current.retryAttemptCount,
+            nextRetryUnixMs = if (shouldRefreshState) null else current.nextRetryUnixMs,
+            lastSuccessfulConnectionUnixMs = effectiveLastSuccessUnixMs,
+            lastSuccessfulConnectionUrl = effectiveLastSuccessUrl,
+            lastSuccessfulFunctionalRequestUnixMs = effectiveLastFunctionalSuccessUnixMs,
+            lastSuccessfulFunctionalRequestUrl = effectiveLastFunctionalSuccessUrl,
+            failedAttempts = mergedFailures,
         )
     }
 

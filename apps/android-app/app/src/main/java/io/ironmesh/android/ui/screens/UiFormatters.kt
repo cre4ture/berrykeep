@@ -15,6 +15,7 @@ import io.ironmesh.android.data.FolderSyncRuntimeMetrics
 import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.APP_CONNECTION_STATE_CONNECTED
 import io.ironmesh.android.data.APP_CONNECTION_STATE_CONNECTING
+import io.ironmesh.android.data.APP_CONNECTION_STATE_ERROR
 import io.ironmesh.android.data.APP_CONNECTION_STATE_RECONNECTING
 import io.ironmesh.android.data.APP_CONNECTION_STATE_RETRY_SCHEDULED
 import io.ironmesh.android.data.APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT
@@ -28,6 +29,8 @@ import kotlinx.coroutines.delay
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+
+private const val CONNECTIVITY_PROBE_PATH = "/api/v1/diagnostics/latency"
 
 fun displayStatusToken(value: String): String {
     if (value.isBlank()) {
@@ -55,11 +58,20 @@ fun appConnectionHeadline(
         APP_CONNECTION_STATE_RETRY_SCHEDULED -> "Retry scheduled"
         APP_CONNECTION_STATE_WAITING_FOR_NETWORK -> "Waiting for network"
         APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT -> "Enrollment needed"
+        APP_CONNECTION_STATE_ERROR -> "App requests failed"
         APP_CONNECTION_STATE_CONNECTED -> {
-            if (connectionStatus.isConnected(nowUnixMs)) {
-                "App connection is healthy"
-            } else {
-                "App connection status is stale"
+            when {
+                !connectionStatus.isConnected(nowUnixMs) ->
+                    "App connection status is stale"
+                connectionStatus.lastSuccessfulRequestWasConnectivityProbe() &&
+                    connectionStatus.hasUnresolvedFunctionalRequestFailure() ->
+                    "Server reachable; app requests failed"
+                isAppConnectionHealthy(connectionStatus, nowUnixMs) ->
+                    "App connection is healthy"
+                connectionStatus.lastSuccessfulRequestWasConnectivityProbe() ->
+                    "Server is reachable"
+                else ->
+                    "App requests need attention"
             }
         }
         else -> "App connection is idle"
@@ -69,14 +81,20 @@ fun appConnectionHeadline(
 @Composable
 fun rememberConnectionHealthNow(connectionStatus: AppConnectionStatus): Long {
     var nowUnixMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(connectionStatus.state, connectionStatus.lastSuccessfulConnectionUnixMs) {
+    LaunchedEffect(
+        connectionStatus.state,
+        connectionStatus.lastSuccessfulConnectionUnixMs,
+        connectionStatus.lastSuccessfulFunctionalRequestUnixMs,
+    ) {
         nowUnixMs = System.currentTimeMillis()
         if (!connectionStatus.isConnected(nowUnixMs)) {
             return@LaunchedEffect
         }
 
-        val expiresAtUnixMs = requireNotNull(connectionStatus.lastSuccessfulConnectionUnixMs) +
-            APP_CONNECTION_HEALTH_MAX_AGE_MS
+        val expiresAtUnixMs = listOfNotNull(
+            connectionStatus.lastSuccessfulConnectionUnixMs,
+            connectionStatus.effectiveLastFunctionalSuccessUnixMs(),
+        ).minOf { successUnixMs -> successUnixMs + APP_CONNECTION_HEALTH_MAX_AGE_MS }
         delay((expiresAtUnixMs - nowUnixMs + 1L).coerceAtLeast(0L))
         nowUnixMs = System.currentTimeMillis()
     }
@@ -88,7 +106,13 @@ fun appConnectionStatusBadge(
     nowUnixMs: Long = System.currentTimeMillis(),
 ): String {
     return when {
-        connectionStatus.isConnected(nowUnixMs) -> "Healthy"
+        connectionStatus.lastSuccessfulRequestWasConnectivityProbe() &&
+            connectionStatus.isConnected(nowUnixMs) &&
+            connectionStatus.hasUnresolvedFunctionalRequestFailure() -> "Degraded"
+        isAppConnectionHealthy(connectionStatus, nowUnixMs) -> "Healthy"
+        connectionStatus.lastSuccessfulRequestWasConnectivityProbe() &&
+            connectionStatus.isConnected(nowUnixMs) -> "Reachable"
+        connectionStatus.isConnected(nowUnixMs) -> "Attention"
         connectionStatus.state == APP_CONNECTION_STATE_CONNECTED -> "Stale"
         else -> displayStatusToken(connectionStatus.state)
     }
@@ -97,6 +121,26 @@ fun appConnectionStatusBadge(
 fun appConnectionSummary(
     connectionStatus: AppConnectionStatus,
 ): String {
+    if (connectionStatus.lastSuccessfulRequestWasConnectivityProbe()) {
+        val parts = mutableListOf<String>()
+        when {
+            connectionStatus.hasUnresolvedFunctionalRequestFailure() ->
+                parts += "Server responded to a connectivity probe, but a newer app request failed"
+            connectionStatus.lastSuccessfulFunctionalRequestUnixMs != null ->
+                parts += "Server is reachable and an app request has also succeeded"
+            else ->
+                parts +=
+                    "Server responded to a connectivity probe; library and sync requests are not verified"
+        }
+        connectionStatus.lastSuccessfulFunctionalRequestUnixMs?.let { lastSuccess ->
+            parts += "Last app request success ${formatTimestamp(lastSuccess)}"
+        }
+        connectionStatus.lastSuccessfulConnectionUnixMs?.let { lastSuccess ->
+            parts += "Last connectivity check ${formatTimestamp(lastSuccess)}"
+        }
+        return parts.joinToString(" | ")
+    }
+
     val parts = mutableListOf<String>()
     connectionStatus.message
         .trim()
@@ -115,6 +159,54 @@ fun appConnectionSummary(
         parts += "No app connection activity yet"
     }
     return parts.joinToString(" | ")
+}
+
+fun isAppConnectionHealthy(
+    connectionStatus: AppConnectionStatus,
+    nowUnixMs: Long = System.currentTimeMillis(),
+): Boolean {
+    if (!connectionStatus.isConnected(nowUnixMs)) {
+        return false
+    }
+    val lastFunctionalSuccessUnixMs =
+        connectionStatus.effectiveLastFunctionalSuccessUnixMs() ?: return false
+    return lastFunctionalSuccessUnixMs in
+        (nowUnixMs - APP_CONNECTION_HEALTH_MAX_AGE_MS)..nowUnixMs &&
+        !connectionStatus.hasUnresolvedFunctionalRequestFailure()
+}
+
+internal fun AppConnectionStatus.lastSuccessfulRequestWasConnectivityProbe(): Boolean {
+    return lastSuccessfulConnectionUrl
+        ?.let(::isConnectivityProbeRequestUrl)
+        ?: false
+}
+
+internal fun AppConnectionStatus.hasUnresolvedFunctionalRequestFailure(): Boolean {
+    val latestFunctionalFailureUnixMs = failedAttempts
+        .asSequence()
+        .filterNot { attempt -> attempt.isConnectivityProbeRequest() }
+        .map { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
+        .maxOrNull()
+        ?: return false
+    return latestFunctionalFailureUnixMs >
+        (effectiveLastFunctionalSuccessUnixMs() ?: Long.MIN_VALUE)
+}
+
+private fun AppConnectionStatus.effectiveLastFunctionalSuccessUnixMs(): Long? {
+    return lastSuccessfulFunctionalRequestUnixMs
+        ?: lastSuccessfulConnectionUnixMs
+            ?.takeUnless { lastSuccessfulRequestWasConnectivityProbe() }
+}
+
+private fun AppFailedConnectionAttempt.isConnectivityProbeRequest(): Boolean {
+    return isConnectivityProbeRequestUrl(url)
+}
+
+private fun isConnectivityProbeRequestUrl(url: String): Boolean {
+    return url
+        .substringBefore('?')
+        .trimEnd('/')
+        .endsWith(CONNECTIVITY_PROBE_PATH)
 }
 
 fun syncOverviewHeadline(
@@ -156,7 +248,7 @@ fun shouldShowRetryConnectionAction(
     if (!hasProfiles) {
         return false
     }
-    return !connectionStatus.isConnected(nowUnixMs) ||
+    return !isAppConnectionHealthy(connectionStatus, nowUnixMs) ||
         connectionStatus.isRetryPending()
 }
 
