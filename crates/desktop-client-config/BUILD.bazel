@@ -1,0 +1,28 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# This leaf crate has only third-party dependencies, all of which are derived
+# from Cargo.toml by Crate Universe.
+rust_library(
+    name = "desktop_client_config",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "desktop_client_config",
+    crate_root = "src/lib.rs",
+    edition = crate_edition(),
+    visibility = ["//apps:__subpackages__"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_test",
+    size = "small",
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate = ":desktop_client_config",
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
