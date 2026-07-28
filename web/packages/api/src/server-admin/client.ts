@@ -772,6 +772,15 @@ export async function getTelemetryPreview(
   });
 }
 
+export async function rotateTelemetryIdentity(
+  adminTokenOverride?: string
+): Promise<TelemetrySettingsResponse> {
+  return fetchAdminJson<TelemetrySettingsResponse>(apiV1("/auth/telemetry/rotate-identity"), {
+    method: "POST",
+    adminTokenOverride
+  });
+}
+
 export async function getServerHealth(): Promise<ServerHealthResponse> {
   return fetchJson<ServerHealthResponse>(apiV1("/health"), {
     credentials: "same-origin",

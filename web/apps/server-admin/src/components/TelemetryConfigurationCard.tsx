@@ -1,6 +1,7 @@
 import {
   getTelemetryPreview,
   getTelemetrySettings,
+  rotateTelemetryIdentity,
   updateTelemetrySettings,
   type TelemetrySettingsResponse
 } from "@ironmesh/api";
@@ -55,10 +56,22 @@ export function TelemetryConfigurationCard({ canInspect }: TelemetryConfiguratio
     }
   });
 
+  const rotateIdentityMutation = useMutation({
+    mutationFn: () => rotateTelemetryIdentity(normalizedAdminTokenOverride || undefined),
+    onSuccess: (response: TelemetrySettingsResponse) => {
+      queryClient.setQueryData(settingsQueryKey, response);
+      void queryClient.invalidateQueries({ queryKey: settingsQueryKey });
+    }
+  });
+
   const settings: TelemetrySettingsResponse | null = canInspect
     ? settingsQuery.data ?? null
     : null;
-  const loadError = firstErrorMessage([settingsQuery.error, toggleMutation.error]);
+  const loadError = firstErrorMessage([
+    settingsQuery.error,
+    toggleMutation.error,
+    rotateIdentityMutation.error
+  ]);
   const preview = previewRequested && canInspect ? previewQuery.data ?? null : null;
   const sentHistory = settings?.sent_history ?? [];
 
@@ -68,6 +81,21 @@ export function TelemetryConfigurationCard({ canInspect }: TelemetryConfiguratio
       return;
     }
     void previewQuery.refetch();
+  };
+
+  const rotateIdentity = () => {
+    const confirmed = window.confirm(
+      "Reset the telemetry identity now? This immediately replaces the local salt, so this node " +
+        "will report a brand new telemetry_subject_id from now on. This is irreversible: fleet-wide " +
+        "trend comparisons for this node (e.g. rising SMART counters over weeks) start over under the " +
+        "new ID, and the old ID shown above will no longer match anything this node sends — keep a " +
+        "copy of it first if you still need to reference it (e.g. for a pending GDPR erasure request " +
+        "against the old ID)."
+    );
+    if (!confirmed) {
+      return;
+    }
+    rotateIdentityMutation.mutate();
   };
 
   return (
@@ -138,15 +166,33 @@ export function TelemetryConfigurationCard({ canInspect }: TelemetryConfiguratio
             ) : null}
 
             <Stack gap={4}>
-              <Text size="sm">
-                Telemetry subject ID:{" "}
-                <Code>{settings.telemetry_subject_id ?? "not generated yet"}</Code>
-              </Text>
+              <Group justify="space-between" align="center">
+                <Text size="sm">
+                  Telemetry subject ID:{" "}
+                  <Code>{settings.telemetry_subject_id ?? "not generated yet"}</Code>
+                </Text>
+                <Button
+                  variant="light"
+                  color="red"
+                  size="xs"
+                  onClick={rotateIdentity}
+                  loading={rotateIdentityMutation.isPending}
+                >
+                  Reset telemetry identity
+                </Button>
+              </Group>
               <Text size="sm" c="dimmed" maw={860}>
                 This pseudonymous ID is derived locally with a secret salt and is the only identifier
                 sent to the collector — it cannot be traced back to this node without the local salt.
                 To request deletion of (or access to) the centrally stored data, quote exactly this ID
                 to the project maintainers; there is no automated flow yet.
+              </Text>
+              <Text size="sm" c="dimmed" maw={860}>
+                Resetting generates a brand new ID and discards the old salt on this node, so it
+                breaks longitudinal fleet-side trend comparisons for this node going forward (the
+                collector cannot tell the old and new IDs belong to the same node). Use this only
+                when you deliberately want a fresh identity — e.g. after finishing a GDPR erasure
+                request against the old ID — not as a routine action.
               </Text>
             </Stack>
 
