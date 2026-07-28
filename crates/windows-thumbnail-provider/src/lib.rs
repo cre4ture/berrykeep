@@ -665,7 +665,7 @@ struct ThumbnailClientBuild {
     client: client_sdk::IronMeshClient,
     /// Keeps the shared route controller and its executor alive while this
     /// cached Explorer client is in use.
-    managed_client: client_sdk::ManagedIronMeshClient,
+    managed_client: Option<client_sdk::ManagedIronMeshClient>,
     auth_mode: &'static str,
     candidate_paths: Vec<PathBuf>,
     selected_path: Option<PathBuf>,
@@ -673,8 +673,7 @@ struct ThumbnailClientBuild {
 
 impl ThumbnailClientBuild {
     fn uses_managed_routes(&self) -> bool {
-        let _ = &self.managed_client;
-        true
+        self.managed_client.is_some()
     }
 }
 
@@ -847,7 +846,7 @@ fn build_thumbnail_client(
                             .with_connection_name(connection_name.clone());
                         let build = ThumbnailClientBuild {
                             client,
-                            managed_client,
+                            managed_client: Some(managed_client),
                             auth_mode: "client-identity",
                             candidate_paths: identity_load.candidate_paths.clone(),
                             selected_path: identity_load.selected_path.clone(),
@@ -902,7 +901,7 @@ fn build_thumbnail_client(
                 })?;
             let build = ThumbnailClientBuild {
                 client,
-                managed_client,
+                managed_client: Some(managed_client),
                 auth_mode: "anonymous",
                 candidate_paths: identity_load.candidate_paths,
                 selected_path: identity_load.selected_path,
@@ -970,7 +969,7 @@ fn build_thumbnail_client(
                 })?;
             let build = ThumbnailClientBuild {
                 client,
-                managed_client,
+                managed_client: Some(managed_client),
                 auth_mode: "anonymous",
                 candidate_paths: discovery.candidate_paths,
                 selected_path: discovery.selected_path,
@@ -1488,6 +1487,7 @@ mod tests {
     fn test_client_build(label: &str) -> ThumbnailClientBuild {
         ThumbnailClientBuild {
             client: client_sdk::IronMeshClient::from_direct_base_url("http://127.0.0.1:9"),
+            managed_client: None,
             auth_mode: "anonymous",
             candidate_paths: vec![],
             selected_path: Some(PathBuf::from(label)),
