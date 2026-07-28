@@ -9,6 +9,7 @@ authors.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 serde.workspace = true
+time = { version = "0.3", features = ["formatting"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -4,6 +4,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::Once;
 
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::SubscriberExt;
@@ -52,6 +54,7 @@ pub struct LogBuffer {
 
 impl LogBuffer {
     pub const DEFAULT_DIAGNOSTIC_CAPACITY: usize = 2_000;
+    pub const MOBILE_DIAGNOSTIC_CAPACITY: usize = 20_000;
 
     pub fn new(max_entries: usize) -> Self {
         Self {
@@ -106,6 +109,26 @@ impl LogBuffer {
             .filter(|entry| entry.captured_at_unix >= earliest_unix)
             .cloned()
             .collect()
+    }
+
+    /// Renders every retained entry as plain text in capture order.
+    pub fn render_text(&self) -> String {
+        let entries = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut rendered = String::new();
+        for entry in entries.iter() {
+            let timestamp = OffsetDateTime::from_unix_timestamp(entry.captured_at_unix as i64)
+                .ok()
+                .and_then(|value| value.format(&Rfc3339).ok())
+                .unwrap_or_else(|| format!("unix:{}", entry.captured_at_unix));
+            rendered.push_str(&timestamp);
+            rendered.push(' ');
+            rendered.push_str(entry.line.trim_end());
+            rendered.push('\n');
+        }
+        rendered
     }
 }
 
@@ -203,6 +226,18 @@ mod tests {
         assert_eq!(
             entries.last().map(|entry| entry.line.as_str()),
             Some("2000")
+        );
+    }
+
+    #[test]
+    fn render_text_preserves_capture_order_and_normalizes_line_endings() {
+        let buffer = LogBuffer::new(4);
+        buffer.push_with_timestamp(100, "first\n".to_string());
+        buffer.push_with_timestamp(101, "second".to_string());
+
+        assert_eq!(
+            buffer.render_text(),
+            "1970-01-01T00:01:40Z first\n1970-01-01T00:01:41Z second\n"
         );
     }
 }

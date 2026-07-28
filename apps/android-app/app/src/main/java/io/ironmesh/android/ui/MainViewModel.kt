@@ -2,19 +2,22 @@ package io.ironmesh.android.ui
 
 import android.app.Application
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.DocumentsContract
-import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
+import io.ironmesh.android.BuildConfig
 import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.api.StoreIndexResponse
 import io.ironmesh.android.api.StoreIndexSortOrder
 import io.ironmesh.android.data.ConnectionRouteSnapshot
+import io.ironmesh.android.data.AndroidDiagnosticLog as Log
+import io.ironmesh.android.data.buildAndroidDiagnosticLogExport
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.EnrollmentAccessVerification
 import io.ironmesh.android.data.EmbeddedWebUiSession
@@ -363,7 +366,64 @@ class MainViewModel(
     }
 
     fun setStatus(message: String) {
+        Log.i("MainViewModel", "status: $message")
         uiState.value = uiState.value.copy(status = message)
+    }
+
+    fun exportDiagnosticLog(destination: Uri) {
+        Log.i("DiagnosticExport", "Preparing diagnostic log export")
+        val snapshot = uiState.value
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val rustLog = runCatching { repository.getDiagnosticLog() }
+                        .getOrElse { error ->
+                            "Rust diagnostic log unavailable: ${error.message}\n"
+                        }
+                    val logText = buildAndroidDiagnosticLogExport(
+                        generatedAtUnixMs = System.currentTimeMillis(),
+                        metadata = diagnosticMetadata(snapshot),
+                        applicationLog = Log.renderText(),
+                        rustLog = rustLog,
+                    )
+                    val resolver = getApplication<Application>().contentResolver
+                    val output = resolver.openOutputStream(destination, "wt")
+                        ?: error("The selected destination could not be opened")
+                    output.bufferedWriter(Charsets.UTF_8).use { writer ->
+                        writer.write(logText)
+                    }
+                }
+            }.onSuccess {
+                setStatus("Diagnostic log saved")
+            }.onFailure { error ->
+                Log.e("DiagnosticExport", "Failed to save diagnostic log", error)
+                setStatus("Failed to save diagnostic log: ${error.message}")
+            }
+        }
+    }
+
+    private fun diagnosticMetadata(state: MainUiState): List<Pair<String, String>> {
+        val deviceAuth = state.deviceAuthState
+        val activeRoute = state.connectionRoutes
+            ?.activeIndex
+            ?.let { activeIndex ->
+                state.connectionRoutes.endpoints.firstOrNull { endpoint -> endpoint.index == activeIndex }
+            }
+        return listOf(
+            "App version" to BuildConfig.LONG_VERSION,
+            "Platform" to "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
+            "Device" to "${Build.MANUFACTURER} ${Build.MODEL}",
+            "Cluster ID" to deviceAuth.clusterId.ifBlank { "unavailable" },
+            "Device ID" to deviceAuth.deviceId.ifBlank { "unavailable" },
+            "Device label" to deviceAuth.label.orEmpty().ifBlank { "unavailable" },
+            "Visible section" to state.selectedSection.name,
+            "UI status" to state.status,
+            "Connection state" to "${state.appConnectionStatus.state}: ${state.appConnectionStatus.message}",
+            "Active route" to (activeRoute?.let { "${it.pathKind}: ${it.locator}" } ?: "unavailable"),
+            "Connection diagnostics error" to state.connectionRoutesError.orEmpty().ifBlank { "none" },
+            "Title latency" to state.titleLatencyStatus.toString(),
+            "Sync profile count" to state.syncProfiles.size.toString(),
+        )
     }
 
     fun updateNewSyncLabel(value: String) {

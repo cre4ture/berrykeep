@@ -8,11 +8,11 @@ import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
-import android.util.Log
 import android.webkit.MimeTypeMap
 import io.ironmesh.android.R
 import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.data.DeviceAuthState
+import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository

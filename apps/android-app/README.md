@@ -11,6 +11,7 @@ This is the IronMesh Android app.
 - Configure multiple folder-sync profiles (remote prefix <-> local folder)
 - Automatic periodic background folder sync (WorkManager) + manual "Sync Now"
 - Optional Rust-backed title latency monitor with configurable period; compact `D` (direct) or `R` (relay) result in the app bar
+- App-bar diagnostic export that writes retained Android application events, current connection state, and Rust tracing output to a user-selected text file
 
 ## Open in Android Studio
 
