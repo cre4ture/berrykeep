@@ -16,6 +16,7 @@ include = [
     "ironmesh_ios_facade_free",
     "ironmesh_ios_string_free",
     "ironmesh_ios_bytes_free",
+    "ironmesh_ios_diagnostic_log",
     "ironmesh_ios_facade_list_json",
     "ironmesh_ios_facade_metadata_json",
     "ironmesh_ios_facade_store_index_with_options_json",

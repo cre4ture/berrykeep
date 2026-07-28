@@ -49,6 +49,18 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         ironmesh_ios_facade_free(handle)
     }
 
+    func diagnosticLog() throws -> String {
+        var logPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_diagnostic_log(&logPointer, &errorPointer)
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let logPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no diagnostic log.")
+        }
+        return consumeString(logPointer)
+    }
+
     func startWebUi(
         connectionInput: String,
         serverCAPem: String?,

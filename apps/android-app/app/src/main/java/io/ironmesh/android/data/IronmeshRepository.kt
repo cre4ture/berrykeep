@@ -425,6 +425,8 @@ class IronmeshRepository {
         )
     }
 
+    fun getDiagnosticLog(): String = RustClientBridge.getDiagnosticLog()
+
     fun getConnectionRouteSnapshot(
         connectionInput: String,
         serverCaPem: String? = null,

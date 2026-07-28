@@ -1,11 +1,11 @@
 package io.ironmesh.android.work
 
 import android.content.Context
-import android.util.Log
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import io.ironmesh.android.data.APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT
+import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncConfig
