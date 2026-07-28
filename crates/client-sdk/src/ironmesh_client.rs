@@ -1023,8 +1023,12 @@ fn direct_quic_route_identity(candidate: &ConnectionCandidate) -> String {
     let relay_url = hints
         .and_then(|hints| hints.relay_url.as_deref())
         .unwrap_or_default();
+    let relay_auth_identity = hints
+        .and_then(|hints| hints.relay_auth_token.as_deref())
+        .map(|token| blake3::hash(token.as_bytes()).to_hex().to_string())
+        .unwrap_or_default();
     format!(
-        "{}#{transport_id}#{alpn}#{relay_url}",
+        "{}#{transport_id}#{alpn}#{relay_url}#{relay_auth_identity}",
         candidate.endpoint.trim().trim_end_matches('/')
     )
 }
@@ -2456,6 +2460,15 @@ impl IronMeshClient {
         candidate: ConnectionCandidate,
         target_node_id: Option<NodeId>,
     ) -> Self {
+        Self::from_direct_quic_candidate_with_rendezvous(candidate, target_node_id, None, None)
+    }
+
+    pub(crate) fn from_direct_quic_candidate_with_rendezvous(
+        candidate: ConnectionCandidate,
+        target_node_id: Option<NodeId>,
+        rendezvous: Option<RendezvousControlClient>,
+        relay_ca_pem: Option<String>,
+    ) -> Self {
         let request_base_url = candidate.endpoint.trim().trim_end_matches('/').to_string();
         let route_identity = direct_quic_route_identity(&candidate);
         Self {
@@ -2464,7 +2477,12 @@ impl IronMeshClient {
                     request_base_url,
                     target_node_id,
                     route_identity,
-                    session_pool: TransportSessionPool::new_direct_quic(candidate, target_node_id),
+                    session_pool: TransportSessionPool::new_direct_quic(
+                        candidate,
+                        target_node_id,
+                        rendezvous,
+                        relay_ca_pem,
+                    ),
                 },
                 0,
             )]),

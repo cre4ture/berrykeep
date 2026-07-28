@@ -356,6 +356,7 @@ async fn start_global_rendezvous(
         bind_addr,
         public_url: base_url.to_string(),
         relay_public_urls: vec![base_url.to_string()],
+        iroh_relay: None,
         peer_rendezvous_urls: Vec::new(),
         mtls: Some(RendezvousMtlsConfig {
             client_ca: RendezvousClientCa::Global {

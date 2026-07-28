@@ -43,7 +43,7 @@ pub use cluster_registration::{
 };
 pub use direct_quic::{
     DEFAULT_DIRECT_QUIC_ALPN, DirectQuicAcceptedConnection, DirectQuicEndpoint,
-    DirectQuicEndpointConfig, DirectQuicEndpointSnapshot, DirectQuicSession,
+    DirectQuicEndpointConfig, DirectQuicEndpointSnapshot, DirectQuicRelayConfig, DirectQuicSession,
     direct_quic_endpoint_url, endpoint_addr_from_candidate, endpoint_id_from_candidate,
     load_or_create_secret_key, read_secret_key_from_path, write_secret_key_to_path,
 };
@@ -76,7 +76,8 @@ pub use relay_wake::{
     RelayWakeClient, RelayWakeControlMessage, RelayWakeEvent, RelayWakeRegistration,
 };
 pub use rendezvous::{
-    DiscoveryResponse, PresenceEntry, PresenceListResponse, PresenceRegistration,
+    DiscoveryResponse, IrohRelayAdvertisement, IrohRelayTicket, IrohRelayTicketRequest,
+    PresenceEntry, PresenceListResponse, PresenceRegistration,
     RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse, RendezvousClientConfig,
     RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
     RendezvousRuntimeState, TransportCapability, is_expected_idle_relay_tunnel_accept_timeout,

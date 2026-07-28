@@ -1817,6 +1817,7 @@ mod tests {
                 bind_addr,
                 public_url: format!("{}/", state.public_url),
                 relay_public_urls: vec![format!("{}/", state.public_url)],
+                iroh_relay: None,
                 peer_rendezvous_urls: Vec::new(),
                 mtls: None,
             })

@@ -37,6 +37,33 @@ use transport_sdk::{
 };
 
 #[test]
+fn direct_quic_route_identity_changes_on_relay_token_rotation_without_exposing_tokens() {
+    let mut candidate = ConnectionCandidate {
+        kind: CandidateKind::DirectQuic,
+        endpoint: "iroh://dynamic-node-key".to_string(),
+        rtt_ms: None,
+        transport_hints: Some(
+            transport_sdk::candidates::ConnectionCandidateTransportHints {
+                relay_url: Some("https://relay.example".to_string()),
+                relay_auth_token: Some("first-sensitive-token".to_string()),
+                ..Default::default()
+            },
+        ),
+    };
+    let first = direct_quic_route_identity(&candidate);
+    candidate
+        .transport_hints
+        .as_mut()
+        .expect("candidate should include hints")
+        .relay_auth_token = Some("second-sensitive-token".to_string());
+    let second = direct_quic_route_identity(&candidate);
+
+    assert_ne!(first, second);
+    assert!(!first.contains("first-sensitive-token"));
+    assert!(!second.contains("second-sensitive-token"));
+}
+
+#[test]
 fn object_url_builder_escapes_segments() {
     let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
     let url = client
@@ -1348,6 +1375,7 @@ async fn spawn_relay_test_server_on_listener_with_security(
             bind_addr: addr,
             public_url: format!("{}/", state.public_url),
             relay_public_urls: vec![format!("{}/", state.public_url)],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })
@@ -2136,6 +2164,7 @@ async fn spawn_relay_mixed_workload_test_server(
             bind_addr: addr,
             public_url: format!("{}/", state.public_url),
             relay_public_urls: vec![format!("{}/", state.public_url)],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })

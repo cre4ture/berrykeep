@@ -14,18 +14,37 @@ pub enum CandidateKind {
     Relay,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ConnectionCandidateTransportHints {
     #[serde(default)]
     pub transport_id: Option<String>,
     #[serde(default)]
     pub relay_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_auth_token: Option<String>,
     #[serde(default)]
     pub alpn: Option<String>,
     #[serde(default)]
     pub direct_socket_addrs: Vec<String>,
     #[serde(default)]
     pub observed_socket_addrs: Vec<String>,
+}
+
+impl std::fmt::Debug for ConnectionCandidateTransportHints {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectionCandidateTransportHints")
+            .field("transport_id", &self.transport_id)
+            .field("relay_url", &self.relay_url)
+            .field(
+                "relay_auth_token",
+                &self.relay_auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("alpn", &self.alpn)
+            .field("direct_socket_addrs", &self.direct_socket_addrs)
+            .field("observed_socket_addrs", &self.observed_socket_addrs)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +93,13 @@ impl ConnectionCandidateTransportHints {
             }
             Url::parse(relay_url.trim())
                 .with_context(|| format!("invalid candidate relay_url {relay_url}"))?;
+        }
+        if self
+            .relay_auth_token
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            anyhow::bail!("candidate relay_auth_token must not be blank when present");
         }
         validate_socket_addr_list("direct_socket_addrs", &self.direct_socket_addrs)?;
         validate_socket_addr_list("observed_socket_addrs", &self.observed_socket_addrs)?;
@@ -194,6 +220,7 @@ mod tests {
             transport_hints: Some(ConnectionCandidateTransportHints {
                 transport_id: Some(" ".to_string()),
                 relay_url: None,
+                relay_auth_token: None,
                 alpn: None,
                 direct_socket_addrs: Vec::new(),
                 observed_socket_addrs: Vec::new(),
@@ -214,6 +241,7 @@ mod tests {
             transport_hints: Some(ConnectionCandidateTransportHints {
                 transport_id: Some("peer-key-1".to_string()),
                 relay_url: Some("not-a-url".to_string()),
+                relay_auth_token: None,
                 alpn: Some("iroh/0".to_string()),
                 direct_socket_addrs: Vec::new(),
                 observed_socket_addrs: Vec::new(),
@@ -234,6 +262,7 @@ mod tests {
             transport_hints: Some(ConnectionCandidateTransportHints {
                 transport_id: Some("peer-key-1".to_string()),
                 relay_url: Some("https://relay.example".to_string()),
+                relay_auth_token: None,
                 alpn: Some("iroh/0".to_string()),
                 direct_socket_addrs: vec!["192.0.2.10:4242".to_string()],
                 observed_socket_addrs: vec!["203.0.113.10:55000".to_string()],
@@ -252,6 +281,7 @@ mod tests {
             transport_hints: Some(ConnectionCandidateTransportHints {
                 transport_id: Some("peer-key-1".to_string()),
                 relay_url: Some("https://relay.example".to_string()),
+                relay_auth_token: None,
                 alpn: Some("iroh/0".to_string()),
                 direct_socket_addrs: vec!["not-a-socket-addr".to_string()],
                 observed_socket_addrs: Vec::new(),
@@ -272,6 +302,7 @@ mod tests {
             transport_hints: Some(ConnectionCandidateTransportHints {
                 transport_id: Some("peer-key-1".to_string()),
                 relay_url: Some("https://relay.example".to_string()),
+                relay_auth_token: None,
                 alpn: Some("iroh/0".to_string()),
                 direct_socket_addrs: Vec::new(),
                 observed_socket_addrs: vec![" ".to_string()],
@@ -281,5 +312,22 @@ mod tests {
         .expect_err("blank observed socket addr should fail");
 
         assert!(error.to_string().contains("observed_socket_addrs"));
+    }
+
+    #[test]
+    fn candidate_debug_output_redacts_relay_auth_token() {
+        let candidate = ConnectionCandidate {
+            kind: CandidateKind::DirectQuic,
+            endpoint: "iroh://peer-key-1".to_string(),
+            rtt_ms: None,
+            transport_hints: Some(ConnectionCandidateTransportHints {
+                relay_auth_token: Some("sensitive-relay-token".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        let debug = format!("{candidate:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("sensitive-relay-token"));
     }
 }

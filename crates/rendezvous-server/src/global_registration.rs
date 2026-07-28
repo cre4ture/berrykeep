@@ -573,6 +573,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().expect("bind address should parse"),
             public_url: "https://rendezvous.example".to_string(),
             relay_public_urls: vec!["https://rendezvous.example".to_string()],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: Some(RendezvousMtlsConfig {
                 client_ca: RendezvousClientCa::Global {
@@ -679,6 +680,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().expect("bind address should parse"),
             public_url: "https://rendezvous.example".to_string(),
             relay_public_urls: vec!["https://rendezvous.example".to_string()],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: Some(RendezvousMtlsConfig {
                 client_ca: RendezvousClientCa::Global {

@@ -23,14 +23,17 @@ This plan is implemented by the following shared and platform changes:
 - CLI, Android, and iOS construct that managed client; Kotlin and Swift only
   forward lifecycle/network hints and persist a renewed identity through their
   existing secure stores.
-- Direct QUIC candidates validate their authenticated transport identity, while
-  server nodes accept `IRONMESH_DIRECT_QUIC_RELAY_URLS` and advertise the
-  configured iroh relay metadata through Rendezvous.
+- Direct QUIC candidates validate their authenticated transport identity.
+  Server nodes still accept `IRONMESH_DIRECT_QUIC_RELAY_URLS` for external
+  relays, and now also reconcile authenticated relay advertisements returned by
+  Rendezvous.
+- `ironmesh-rendezvous-service` can supervise an authenticated upstream iroh
+  relay listener in the same process and distribute its URL and admission token
+  through authenticated registration and discovery responses.
 
-An iroh-compatible relay must still be deployed and health-checked in each
-production environment before relying on relay-assisted NAT traversal. The
-operational procedure is in `docs/iroh-relay-companion-operations.md`; this
-repository cannot deploy environment-owned relay infrastructure itself.
+Relay-assisted NAT traversal must still be enabled, proxied through public TLS,
+and health-checked in each production environment. The integrated operational
+procedure is in `docs/iroh-relay-companion-operations.md`.
 
 ## 1. Decision summary
 

@@ -3,8 +3,9 @@ use super::{
     ServerNodeConfig, ServerRequestTiming, ServerState, StartupRepairStatus,
     apply_server_timing_to_buffered_response, await_repair_busy_threshold,
     build_rendezvous_presence_registration, build_store_index_entries, cluster, constant_time_eq,
-    jittered_backoff_secs, lock_store, new_store_rwlock, node_descriptor_from_presence_entry,
-    parse_direct_quic_relay_urls, plan_peer_transport, read_store,
+    direct_quic_relay_configs_from_tickets, jittered_backoff_secs, lock_store, new_store_rwlock,
+    node_descriptor_from_presence_entry, parse_direct_quic_relay_urls, plan_peer_transport,
+    read_store,
     replication::{build_replication_bundle_push_path, build_replication_export_path},
     resolve_peer_base_url, run_startup_replication_repair_once,
     should_trigger_autonomous_post_write_replication, token_matches,
@@ -40,6 +41,52 @@ fn direct_quic_relay_urls_are_trimmed_and_deduplicated() {
         ]
     );
     assert!(parse_direct_quic_relay_urls(None).is_empty());
+}
+
+#[test]
+fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
+    let tickets = HashMap::from([
+        (
+            "https://rendezvous-b.example".to_string(),
+            transport_sdk::IrohRelayTicket {
+                public_urls: vec![
+                    "https://relay-b.example/".to_string(),
+                    "https://shared-relay.example".to_string(),
+                ],
+                auth_token: "token-b".to_string(),
+                expires_at_unix: 10_000,
+            },
+        ),
+        (
+            "https://rendezvous-a.example".to_string(),
+            transport_sdk::IrohRelayTicket {
+                public_urls: vec![
+                    "https://relay-a.example".to_string(),
+                    "https://shared-relay.example/".to_string(),
+                ],
+                auth_token: "token-a".to_string(),
+                expires_at_unix: 10_000,
+            },
+        ),
+    ]);
+
+    assert_eq!(
+        direct_quic_relay_configs_from_tickets(&tickets),
+        vec![
+            transport_sdk::DirectQuicRelayConfig {
+                url: "https://relay-a.example".to_string(),
+                auth_token: Some("token-a".to_string()),
+            },
+            transport_sdk::DirectQuicRelayConfig {
+                url: "https://relay-b.example".to_string(),
+                auth_token: Some("token-b".to_string()),
+            },
+            transport_sdk::DirectQuicRelayConfig {
+                url: "https://shared-relay.example".to_string(),
+                auth_token: Some("token-b".to_string()),
+            },
+        ]
+    );
 }
 
 use super::storage::{
@@ -214,6 +261,7 @@ async fn pair_test_relay_tunnel(
             bind_addr: relay_bind_addr,
             public_url: format!("{relay_url}/"),
             relay_public_urls: vec![format!("{relay_url}/")],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })
@@ -1050,6 +1098,7 @@ async fn capture_mtls_presence_register(
     Json(transport_sdk::RegisterPresenceResponse {
         accepted: true,
         software_version: None,
+        iroh_relay: None,
         updated_at_unix,
         entry: transport_sdk::PresenceEntry {
             registration,
@@ -1153,6 +1202,7 @@ async fn https_presence_register(
     Json(transport_sdk::RegisterPresenceResponse {
         accepted: true,
         software_version: None,
+        iroh_relay: None,
         updated_at_unix,
         entry: transport_sdk::PresenceEntry {
             registration,
@@ -7723,6 +7773,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
             bind_addr: rendezvous_bind_addr,
             public_url: canonical_rendezvous_url.clone(),
             relay_public_urls: vec![canonical_rendezvous_url.clone()],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })
@@ -7904,6 +7955,7 @@ async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_mul
             bind_addr: bind_addr_a,
             public_url: canonical_rendezvous_url_a.clone(),
             relay_public_urls: vec![canonical_rendezvous_url_a.clone()],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })
@@ -7929,6 +7981,7 @@ async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_mul
             bind_addr: bind_addr_b,
             public_url: canonical_rendezvous_url_b.clone(),
             relay_public_urls: vec![canonical_rendezvous_url_b.clone()],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })
@@ -15340,6 +15393,7 @@ async fn build_test_state(
                 "http://127.0.0.1:39080".to_string(),
                 super::RendezvousEndpointRegistrationRuntime::default(),
             )]))),
+            rendezvous_iroh_relays: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_mode: super::RelayMode::Disabled,
             enrollment_issuer_url: None,
             node_enrollment_path: None,
@@ -18384,6 +18438,7 @@ async fn spawn_cleanup_relay_stub(
             bind_addr: relay_bind_addr,
             public_url: format!("{relay_base_url}/"),
             relay_public_urls: vec![format!("{relay_base_url}/")],
+            iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
         })
@@ -18927,6 +18982,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                     Json(transport_sdk::RegisterPresenceResponse {
                         accepted: true,
                         software_version: None,
+                        iroh_relay: None,
                         updated_at_unix,
                         entry: transport_sdk::PresenceEntry {
                             registration,
@@ -18983,6 +19039,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                     Json(transport_sdk::RegisterPresenceResponse {
                         accepted: true,
                         software_version: None,
+                        iroh_relay: None,
                         updated_at_unix,
                         entry: transport_sdk::PresenceEntry {
                             registration,

@@ -82,23 +82,24 @@ use transport_sdk::{
     ClientBootstrapClaimTrust, ClientEnrollmentRequest, ClusterRegistrationChallengeRequest,
     ClusterRegistrationChallengeResponse, ClusterRegistrationCompleteRequest,
     ClusterRegistrationProofAlgorithm, ClusterRegistrationRecord, ConnectionCandidate,
-    DirectQuicEndpoint, DirectQuicEndpointConfig, DirectQuicSession,
+    DirectQuicEndpoint, DirectQuicEndpointConfig, DirectQuicRelayConfig, DirectQuicSession,
     HEADER_SERVER_PROCESSING_DURATION_US, HEADER_SERVER_RECEIVED_UNIX_MS,
-    HEADER_SERVER_RESPONDED_UNIX_MS, MultiplexConfig, MultiplexMode, MultiplexedSession,
-    NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
-    NodeJoinRequest, PeerIdentity, PeerTransportClient, PeerTransportClientConfig,
-    PresenceRegistration, RelayHttpHeader, RelayMode, RelayTicketRequest, RelayTunnelAcceptRequest,
-    RelayTunnelClient, RelayTunnelSecurityMode, RelayTunnelSession, RelayTunnelSessionKind,
-    RelayTunnelSourceSecurityConfig, RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity,
-    RelayWakeClient, RelayWakeEvent, RelayWakeRegistration, RendezvousClientConfig,
-    RendezvousControlClient, SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability,
-    TransportHeader, TransportPathKind, TransportRequestHead, TransportResponseHead,
-    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
-    credential_fingerprint, endpoint_id_from_candidate, load_or_create_secret_key,
-    perform_transport_client_handshake, perform_transport_server_handshake,
-    read_buffered_transport_response, read_transport_request_head, read_transport_response_head,
-    verify_signed_request_headers, write_buffered_transport_request,
-    write_buffered_transport_response, write_transport_response_head,
+    HEADER_SERVER_RESPONDED_UNIX_MS, IrohRelayTicket, MultiplexConfig, MultiplexMode,
+    MultiplexedSession, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
+    NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
+    PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
+    RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSecurityMode,
+    RelayTunnelSession, RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig,
+    RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity, RelayWakeClient, RelayWakeEvent,
+    RelayWakeRegistration, RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders,
+    TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader, TransportPathKind,
+    TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
+    TransportSessionRole, TransportStreamKind, credential_fingerprint, endpoint_id_from_candidate,
+    load_or_create_secret_key, perform_transport_client_handshake,
+    perform_transport_server_handshake, read_buffered_transport_response,
+    read_transport_request_head, read_transport_response_head, verify_signed_request_headers,
+    write_buffered_transport_request, write_buffered_transport_response,
+    write_transport_response_head,
 };
 use uuid::Uuid;
 
@@ -123,6 +124,7 @@ const GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED_ENV: &str =
 /// endpoint. The existing IronMesh HTTP relay is intentionally not substituted
 /// here; it remains the independent fallback transport.
 const DIRECT_QUIC_RELAY_URLS_ENV: &str = "IRONMESH_DIRECT_QUIC_RELAY_URLS";
+const DIRECT_QUIC_RELAY_AUTH_TOKEN_ENV: &str = "IRONMESH_DIRECT_QUIC_RELAY_AUTH_TOKEN";
 const GLOBAL_RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 10;
 const GLOBAL_RENDEZVOUS_REGISTRATION_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 use x509_parser::extensions::ParsedExtension;
@@ -353,6 +355,7 @@ struct ServerNetworkRuntime {
     managed_rendezvous_public_url: Option<String>,
     rendezvous_registration_state:
         Arc<Mutex<HashMap<String, RendezvousEndpointRegistrationRuntime>>>,
+    rendezvous_iroh_relays: Arc<StdMutex<HashMap<String, IrohRelayTicket>>>,
     relay_mode: RelayMode,
     enrollment_issuer_url: Option<String>,
     node_enrollment_path: Option<PathBuf>,
@@ -4545,6 +4548,21 @@ async fn try_start_direct_quic_runtime(
 
     let mut endpoint_config = DirectQuicEndpointConfig::new(secret_key);
     endpoint_config.relay_urls = direct_quic_relay_urls_from_env();
+    endpoint_config.relay_auth_token = std::env::var(DIRECT_QUIC_RELAY_AUTH_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    endpoint_config.relay_ca_pem = match direct_quic_relay_ca_pem(config) {
+        Ok(ca_pem) => ca_pem,
+        Err(error) => {
+            warn!(
+                %error,
+                node_id = %config.node_id,
+                "failed loading direct QUIC relay CA; continuing without direct QUIC"
+            );
+            return None;
+        }
+    };
     let configured_relay_urls = endpoint_config.relay_urls.clone();
     match DirectQuicEndpoint::bind(endpoint_config).await {
         Ok(endpoint) => {
@@ -4571,6 +4589,31 @@ async fn try_start_direct_quic_runtime(
             None
         }
     }
+}
+
+fn direct_quic_relay_ca_pem(config: &ServerNodeConfig) -> Result<Option<String>> {
+    let configured_path = config
+        .rendezvous_ca_cert_path
+        .as_ref()
+        .or(config.public_ca_cert_path.as_ref())
+        .or(config.internal_tls.as_ref().map(|tls| &tls.ca_cert_path));
+    if let Some(path) = configured_path {
+        return std::fs::read_to_string(path)
+            .with_context(|| {
+                format!(
+                    "failed reading direct QUIC relay CA certificate {}",
+                    path.display()
+                )
+            })
+            .map(Some);
+    }
+    Ok(config.bootstrap_trust_roots.as_ref().and_then(|roots| {
+        roots
+            .rendezvous_ca_pem
+            .clone()
+            .or_else(|| roots.public_api_ca_pem.clone())
+            .or_else(|| roots.cluster_ca_pem.clone())
+    }))
 }
 
 fn direct_quic_relay_urls_from_env() -> Vec<String> {
@@ -7179,6 +7222,7 @@ async fn run_inner(
                 .as_ref()
                 .map(|managed| managed.public_url.clone()),
             rendezvous_registration_state,
+            rendezvous_iroh_relays: Arc::new(StdMutex::new(HashMap::new())),
             relay_mode: config.relay_mode,
             enrollment_issuer_url: config.enrollment_issuer_url.clone(),
             node_enrollment_path: config.node_enrollment_path.clone(),
@@ -8363,18 +8407,28 @@ fn spawn_rendezvous_presence_heartbeat(
                         client.register_presence(&registration),
                     )
                     .await;
-                    (url, result)
+                    (url, client, result)
                 });
             }
 
             let mut all_registered = true;
             while let Some(result) = registrations.join_next().await {
-                let Ok((url, result)) = result else {
+                let Ok((url, client, result)) = result else {
                     all_registered = false;
                     continue;
                 };
                 match result {
                     Ok(Ok(response)) => {
+                        if !refresh_endpoint_bound_iroh_relay(
+                            &state,
+                            &url,
+                            &client,
+                            response.iroh_relay.is_some(),
+                        )
+                        .await
+                        {
+                            all_registered = false;
+                        }
                         let recovered = record_rendezvous_registration_success(
                             &state,
                             &url,
@@ -8458,6 +8512,113 @@ fn spawn_rendezvous_presence_heartbeat(
             .await;
         }
     })
+}
+
+async fn refresh_endpoint_bound_iroh_relay(
+    state: &ServerState,
+    rendezvous_url: &str,
+    client: &RendezvousControlClient,
+    relay_advertised: bool,
+) -> bool {
+    let Some(direct_quic) = state.network.direct_quic.as_ref() else {
+        return true;
+    };
+    let relay_configs = if relay_advertised {
+        let ticket = tokio::time::timeout(
+            Duration::from_secs(RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS),
+            client.issue_iroh_relay_ticket(&direct_quic.endpoint.endpoint_id()),
+        )
+        .await;
+        match ticket {
+            Ok(Ok(ticket)) => {
+                update_rendezvous_iroh_relay_ticket(state, rendezvous_url, Some(ticket))
+            }
+            Ok(Err(error)) => {
+                warn!(
+                    %error,
+                    node_id = %state.node_id,
+                    %rendezvous_url,
+                    "failed obtaining endpoint-bound iroh relay ticket"
+                );
+                return false;
+            }
+            Err(_) => {
+                warn!(
+                    node_id = %state.node_id,
+                    %rendezvous_url,
+                    "timed out obtaining endpoint-bound iroh relay ticket"
+                );
+                return false;
+            }
+        }
+    } else {
+        update_rendezvous_iroh_relay_ticket(state, rendezvous_url, None)
+    };
+
+    match direct_quic
+        .endpoint
+        .reconcile_dynamic_relays(&relay_configs)
+        .await
+    {
+        Ok(configured) if configured > 0 => {
+            info!(
+                node_id = %state.node_id,
+                %rendezvous_url,
+                configured_relay_count = relay_configs.len(),
+                "reconciled direct QUIC endpoint from rendezvous-provided iroh relays"
+            );
+            true
+        }
+        Ok(_) => true,
+        Err(error) => {
+            warn!(
+                %error,
+                node_id = %state.node_id,
+                %rendezvous_url,
+                "rejected rendezvous-provided direct QUIC relay configuration"
+            );
+            false
+        }
+    }
+}
+
+fn update_rendezvous_iroh_relay_ticket(
+    state: &ServerState,
+    rendezvous_url: &str,
+    relay: Option<IrohRelayTicket>,
+) -> Vec<DirectQuicRelayConfig> {
+    let mut tickets = state
+        .network
+        .rendezvous_iroh_relays
+        .lock()
+        .expect("rendezvous iroh relay ticket mutex poisoned");
+    if let Some(relay) = relay {
+        tickets.insert(rendezvous_url.to_string(), relay);
+    } else {
+        tickets.remove(rendezvous_url);
+    }
+
+    direct_quic_relay_configs_from_tickets(&tickets)
+}
+
+fn direct_quic_relay_configs_from_tickets(
+    tickets: &HashMap<String, IrohRelayTicket>,
+) -> Vec<DirectQuicRelayConfig> {
+    let mut sources = tickets.iter().collect::<Vec<_>>();
+    sources.sort_by_key(|(source, _)| *source);
+    let mut relays = BTreeMap::<String, Option<String>>::new();
+    for (_, advertisement) in sources {
+        for public_url in &advertisement.public_urls {
+            relays.insert(
+                public_url.trim().trim_end_matches('/').to_string(),
+                Some(advertisement.auth_token.clone()),
+            );
+        }
+    }
+    relays
+        .into_iter()
+        .map(|(url, auth_token)| DirectQuicRelayConfig { url, auth_token })
+        .collect()
 }
 
 fn build_rendezvous_presence_registration(

@@ -71,6 +71,22 @@ jobs:
           BAZEL_REMOTE_CACHE_WRITABLE: ${{ steps.bazel-cache.outputs.writable }}
         run: |
           set -euo pipefail
-          bazel test //:unit \
+          bazel_log="$(mktemp)"
+          trap 'rm -f "${bazel_log}"' EXIT
+
+          if bazel test //:unit \
             "--remote_cache=${BAZEL_REMOTE_CACHE_URL}" \
-            "--remote_upload_local_results=${BAZEL_REMOTE_CACHE_WRITABLE}"
+            "--remote_upload_local_results=${BAZEL_REMOTE_CACHE_WRITABLE}" \
+            2>&1 | tee "${bazel_log}"; then
+            exit 0
+          fi
+
+          if ! grep -q "lost inputs with digests" "${bazel_log}"; then
+            exit 1
+          fi
+
+          echo "::warning::Bazel remote cache lost inputs; retrying once without remote cache reads"
+          bazel clean --expunge
+          bazel test //:unit \
+            --noremote_accept_cached \
+            --remote_upload_local_results=false
