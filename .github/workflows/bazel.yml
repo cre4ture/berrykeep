@@ -48,20 +48,27 @@ jobs:
   unit:
     name: Bazel unit
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.write_cache && 120 || 30 }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Bazel
         uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+          cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Start GitHub-backed Bazel cache
         id: bazel-cache
         uses: cre4ture/bazel-github-actions-cache-v2@389eae8501ff832fd7f51bbf0950ca7302750983 # v0.1.0
         with:
-          # Default-branch pushes publish; PRs are read-only. A maintainer can
-          # explicitly seed the selected branch from workflow_dispatch.
-          write: ${{ github.event_name == 'workflow_dispatch' && inputs.write_cache && 'true' || 'auto' }}
+          # Fine-grained publication is intentionally limited to an explicit
+          # maintainer seed because one GitHub cache entry per Bazel object can
+          # make large default-branch builds wait on thousands of uploads.
+          write: ${{ github.event_name == 'workflow_dispatch' && inputs.write_cache && 'true' || 'false' }}
           key-prefix: ironmesh-bazel-v1
 
       - name: Test native Bazel targets
