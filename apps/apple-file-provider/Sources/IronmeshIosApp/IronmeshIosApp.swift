@@ -38,6 +38,28 @@ struct IronmeshIosApp: App {
     }
 }
 
+private struct IronmeshDiagnosticLogDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.plainText] }
+
+    var text: String
+
+    init(text: String = "") {
+        self.text = text
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        guard let data = configuration.file.regularFileContents,
+              let text = String(data: data, encoding: .utf8) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        self.text = text
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data(text.utf8))
+    }
+}
+
 private enum IronmeshUiTestWebUiSession {
     static var embeddedSurface: IronmeshEmbeddedSurface? {
         IronmeshEmbeddedSurface(
@@ -803,13 +825,55 @@ private struct IronmeshConnectionPathBadge: View {
 
 struct IronmeshTitleLatencyToolbarItem: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
+    @State private var diagnosticLogDocument = IronmeshDiagnosticLogDocument()
+    @State private var showsDiagnosticLogExporter = false
+    @State private var diagnosticLogExportError: String?
 
     var body: some View {
-        if model.titleLatencyStatus.state != "disabled" {
-            Text(label)
-                .font(.caption2.monospacedDigit().weight(.semibold))
-                .foregroundStyle(color)
-                .accessibilityLabel(accessibilityLabel)
+        HStack(spacing: 8) {
+            if model.titleLatencyStatus.state != "disabled" {
+                Text(label)
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(color)
+                    .accessibilityLabel(accessibilityLabel)
+            }
+
+            Button {
+                diagnosticLogDocument = IronmeshDiagnosticLogDocument(
+                    text: model.diagnosticLogText()
+                )
+                showsDiagnosticLogExporter = true
+            } label: {
+                Image(systemName: "square.and.arrow.down")
+            }
+            .accessibilityLabel("Save diagnostic log")
+        }
+        .fileExporter(
+            isPresented: $showsDiagnosticLogExporter,
+            document: diagnosticLogDocument,
+            contentType: .plainText,
+            defaultFilename: diagnosticLogFilename()
+        ) { result in
+            if case .failure(let error) = result {
+                diagnosticLogExportError = error.localizedDescription
+            }
+        }
+        .alert(
+            "Diagnostic log export failed",
+            isPresented: Binding(
+                get: { diagnosticLogExportError != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        diagnosticLogExportError = nil
+                    }
+                }
+            )
+        ) {
+            Button("OK") {
+                diagnosticLogExportError = nil
+            }
+        } message: {
+            Text(diagnosticLogExportError ?? "The selected destination could not be written.")
         }
     }
 
@@ -877,6 +941,15 @@ struct IronmeshTitleLatencyToolbarItem: View {
             return "connection"
         }
     }
+}
+
+private func diagnosticLogFilename(now: Date = Date()) -> String {
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "yyyyMMdd-HHmmss"
+    return "berrykeep-diagnostic-\(formatter.string(from: now)).log"
 }
 
 private struct IronmeshSettingsView: View {
