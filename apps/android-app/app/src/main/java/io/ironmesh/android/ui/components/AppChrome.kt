@@ -45,6 +45,7 @@ fun IronmeshAppShell(
     snackbarHostState: SnackbarHostState,
     deviceLabel: String?,
     titleLatencyStatus: TitleLatencyProbeStatus,
+    onExportDiagnosticLog: () -> Unit,
     onNavigateBack: (() -> Unit)? = null,
     topBarActions: @Composable RowScope.() -> Unit = {},
     content: @Composable (Modifier) -> Unit,
@@ -87,6 +88,7 @@ fun IronmeshAppShell(
                             selectedSection = selectedSection,
                             deviceLabel = deviceLabel,
                             titleLatencyStatus = titleLatencyStatus,
+                            onExportDiagnosticLog = onExportDiagnosticLog,
                             onNavigateBack = onNavigateBack,
                             actions = topBarActions,
                         )
@@ -109,6 +111,7 @@ fun IronmeshAppShell(
                         selectedSection = selectedSection,
                         deviceLabel = deviceLabel,
                         titleLatencyStatus = titleLatencyStatus,
+                        onExportDiagnosticLog = onExportDiagnosticLog,
                         onNavigateBack = onNavigateBack,
                         actions = topBarActions,
                     )
@@ -145,6 +148,7 @@ private fun IronmeshTopBar(
     selectedSection: MainSection,
     deviceLabel: String?,
     titleLatencyStatus: TitleLatencyProbeStatus,
+    onExportDiagnosticLog: () -> Unit,
     onNavigateBack: (() -> Unit)?,
     actions: @Composable RowScope.() -> Unit,
 ) {
@@ -172,6 +176,9 @@ private fun IronmeshTopBar(
         },
         actions = {
             TitleLatencyIndicator(titleLatencyStatus)
+            TextButton(onClick = onExportDiagnosticLog) {
+                Text(stringResource(R.string.export_diagnostic_log))
+            }
             actions()
         },
     )
