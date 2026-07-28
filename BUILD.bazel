@@ -6,6 +6,7 @@ test_suite(
         "//crates/client-sdk:unit_test",
         "//crates/common:unit_test",
         "//crates/rendezvous-server:unit_test",
+        "//crates/sync-agent-core:unit_test",
         "//crates/sync-core:unit_test",
         "//crates/transport-sdk:unit_test",
     ],

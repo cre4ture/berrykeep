@@ -1,0 +1,34 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# First-party workspace dependencies are native targets because Crate Universe
+# deliberately omits them from all_crate_deps. The embedded UI files are
+# compile-time inputs of include_str! and therefore belong in compile_data.
+rust_library(
+    name = "sync_agent_core",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    compile_data = glob(["src/folder_agent_ui/**"]),
+    crate_name = "sync_agent_core",
+    crate_root = "src/lib.rs",
+    edition = crate_edition(),
+    visibility = ["//crates:__subpackages__"],
+    deps = all_crate_deps(normal = True) + [
+        "//crates/client-sdk:client_sdk",
+        "//crates/common",
+        "//crates/sync-core:sync_core",
+    ],
+)
+
+rust_test(
+    name = "unit_test",
+    size = "small",
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate = ":sync_agent_core",
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
