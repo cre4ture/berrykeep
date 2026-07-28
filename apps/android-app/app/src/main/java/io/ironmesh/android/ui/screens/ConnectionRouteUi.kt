@@ -42,7 +42,7 @@ internal fun RouteStateBadge(
 internal fun routeStateColors(state: ConnectionRouteState): RouteStateColors {
     val colors = MaterialTheme.colorScheme
     return when (state) {
-        ConnectionRouteState.ACTIVE -> RouteStateColors(
+        ConnectionRouteState.LAST_USED -> RouteStateColors(
             container = colors.primaryContainer,
             badge = colors.primary,
             onBadge = colors.onPrimary,
@@ -53,13 +53,13 @@ internal fun routeStateColors(state: ConnectionRouteState): RouteStateColors {
             onBadge = colors.onSecondaryContainer,
         )
         ConnectionRouteState.CHECKING,
-        ConnectionRouteState.STANDBY,
+        ConnectionRouteState.UNKNOWN,
         -> RouteStateColors(
             container = colors.surfaceVariant,
             badge = colors.surface,
             onBadge = colors.onSurface,
         )
-        ConnectionRouteState.PAUSED -> RouteStateColors(
+        ConnectionRouteState.COOL_DOWN -> RouteStateColors(
             container = colors.tertiaryContainer,
             badge = colors.tertiary,
             onBadge = colors.onTertiary,
@@ -75,14 +75,14 @@ internal fun routeStateColors(state: ConnectionRouteState): RouteStateColors {
 @Composable
 internal fun routeStatusDetail(route: ConnectionRouteItem): String {
     return when (route.state) {
-        ConnectionRouteState.ACTIVE -> routeQuality(route.endpoint)
+        ConnectionRouteState.LAST_USED -> routeQuality(route.endpoint)
         ConnectionRouteState.AVAILABLE -> stringResource(R.string.connection_paths_route_available)
         ConnectionRouteState.CHECKING -> stringResource(R.string.connection_paths_route_checking)
-        ConnectionRouteState.PAUSED -> route.endpoint.circuitOpenUntilUnixMs?.let { until ->
+        ConnectionRouteState.COOL_DOWN -> route.endpoint.circuitOpenUntilUnixMs?.let { until ->
             stringResource(R.string.connection_paths_route_retry_after, formatTimestamp(until))
-        } ?: stringResource(R.string.connection_paths_state_paused)
+        } ?: stringResource(R.string.connection_paths_state_cool_down)
         ConnectionRouteState.UNAVAILABLE -> stringResource(R.string.connection_paths_route_failed)
-        ConnectionRouteState.STANDBY -> stringResource(R.string.connection_paths_route_standby)
+        ConnectionRouteState.UNKNOWN -> stringResource(R.string.connection_paths_route_unknown)
     }
 }
 
@@ -94,19 +94,19 @@ internal fun formatConnectionLatency(value: Double): String {
 @Composable
 private fun routeQuality(endpoint: ConnectionRouteEndpointSnapshot): String {
     return endpoint.ewmaLatencyMs?.let { latency -> formatConnectionLatency(latency) }
-        ?: stringResource(R.string.connection_paths_route_working)
+        ?: stringResource(R.string.connection_paths_route_last_used)
 }
 
 @Composable
 private fun routeStatusLabel(state: ConnectionRouteState): String {
     return stringResource(
         when (state) {
-            ConnectionRouteState.ACTIVE -> R.string.connection_paths_state_active
+            ConnectionRouteState.LAST_USED -> R.string.connection_paths_state_last_used
             ConnectionRouteState.AVAILABLE -> R.string.connection_paths_state_available
             ConnectionRouteState.CHECKING -> R.string.connection_paths_state_checking
-            ConnectionRouteState.PAUSED -> R.string.connection_paths_state_paused
+            ConnectionRouteState.COOL_DOWN -> R.string.connection_paths_state_cool_down
             ConnectionRouteState.UNAVAILABLE -> R.string.connection_paths_state_unavailable
-            ConnectionRouteState.STANDBY -> R.string.connection_paths_state_standby
+            ConnectionRouteState.UNKNOWN -> R.string.connection_paths_state_unknown
         },
     )
 }

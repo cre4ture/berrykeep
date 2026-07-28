@@ -8,7 +8,7 @@ import org.junit.Test
 
 class ConnectionPathsPresentationTest {
     @Test
-    fun prioritizesActiveAndAvailableRoutesAheadOfPausedAndFailedRoutes() {
+    fun prioritizesLastUsedAndAvailableRoutesAheadOfCoolDownAndFailedRoutes() {
         val snapshot = ConnectionRouteSnapshot(
             generatedAtUnixMs = 1_000L,
             rankedIndices = listOf(0, 1, 2, 3),
@@ -23,9 +23,9 @@ class ConnectionPathsPresentationTest {
         val presentation = connectionPathsPresentation(snapshot, error = null)
 
         assertEquals(listOf(2, 1, 0, 3), presentation.routes.map { it.endpoint.index })
-        assertEquals(ConnectionRouteState.ACTIVE, presentation.routes[0].state)
+        assertEquals(ConnectionRouteState.LAST_USED, presentation.routes[0].state)
         assertEquals(ConnectionRouteState.AVAILABLE, presentation.routes[1].state)
-        assertEquals(ConnectionRouteState.PAUSED, presentation.routes[2].state)
+        assertEquals(ConnectionRouteState.COOL_DOWN, presentation.routes[2].state)
         assertEquals(ConnectionRouteState.UNAVAILABLE, presentation.routes[3].state)
     }
 

@@ -14,12 +14,12 @@ internal enum class ConnectionOverviewState {
 }
 
 internal enum class ConnectionRouteState {
-    ACTIVE,
+    LAST_USED,
     AVAILABLE,
     CHECKING,
-    PAUSED,
+    COOL_DOWN,
     UNAVAILABLE,
-    STANDBY,
+    UNKNOWN,
 }
 
 internal data class ConnectionOverview(
@@ -144,12 +144,12 @@ internal fun connectionRouteState(
     snapshotUnixMs: Long?,
 ): ConnectionRouteState {
     return when {
-        endpoint.active -> ConnectionRouteState.ACTIVE
-        isCoolingDown(endpoint, snapshotUnixMs) -> ConnectionRouteState.PAUSED
+        endpoint.active -> ConnectionRouteState.LAST_USED
+        isCoolingDown(endpoint, snapshotUnixMs) -> ConnectionRouteState.COOL_DOWN
         endpoint.backgroundProbeInFlight -> ConnectionRouteState.CHECKING
         endpoint.totalSuccesses > 0L && endpoint.consecutiveFailures == 0 -> ConnectionRouteState.AVAILABLE
         endpoint.totalFailures > 0L -> ConnectionRouteState.UNAVAILABLE
-        else -> ConnectionRouteState.STANDBY
+        else -> ConnectionRouteState.UNKNOWN
     }
 }
 
@@ -208,12 +208,12 @@ private fun rankedConnectionEndpoints(snapshot: ConnectionRouteSnapshot?): List<
 
 private fun routeStatePriority(state: ConnectionRouteState): Int {
     return when (state) {
-        ConnectionRouteState.ACTIVE -> 0
+        ConnectionRouteState.LAST_USED -> 0
         ConnectionRouteState.AVAILABLE -> 1
         ConnectionRouteState.CHECKING -> 2
-        ConnectionRouteState.PAUSED -> 3
+        ConnectionRouteState.COOL_DOWN -> 3
         ConnectionRouteState.UNAVAILABLE -> 4
-        ConnectionRouteState.STANDBY -> 5
+        ConnectionRouteState.UNKNOWN -> 5
     }
 }
 
