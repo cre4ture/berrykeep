@@ -1,0 +1,30 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# First-party workspace dependencies are native targets because Crate Universe
+# deliberately omits them from all_crate_deps.
+rust_library(
+    name = "desktop_status",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "desktop_status",
+    crate_root = "src/lib.rs",
+    edition = crate_edition(),
+    visibility = ["//crates:__subpackages__"],
+    deps = all_crate_deps(normal = True) + [
+        "//crates/client-sdk:client_sdk",
+    ],
+)
+
+rust_test(
+    name = "unit_test",
+    size = "small",
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate = ":desktop_status",
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)

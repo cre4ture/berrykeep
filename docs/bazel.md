@@ -12,6 +12,7 @@ The current native targets are:
 
 - `//crates/client-sdk:unit_test`
 - `//crates/common:unit_test`
+- `//crates/desktop-status:unit_test`
 - `//crates/rendezvous-server:unit_test`
 - `//crates/sync-agent-core:unit_test`
 - `//crates/sync-core:unit_test`
@@ -20,11 +21,12 @@ The current native targets are:
 `transport-sdk` consumes the native `//crates/common:common` target, while
 `rendezvous-server` consumes both native targets. `client-sdk` completes this
 dependency layer by consuming `common`, `sync-core`, and `transport-sdk` at
-runtime and `rendezvous-server` only in its unit tests. Changes therefore
-invalidate only the affected downstream Bazel actions without introducing
-duplicate generated crates. `sync-agent-core` builds on the native
-`client-sdk`, `common`, and `sync-core` graph, and tracks its embedded folder
-agent UI files as compile-time inputs. Run the current Bazel unit suite with:
+runtime and `rendezvous-server` only in its unit tests. `desktop-status`
+consumes the native `client-sdk` target, extending dependency-aware
+invalidation to desktop integration code without introducing duplicate
+generated crates. `sync-agent-core` builds on the native `client-sdk`,
+`common`, and `sync-core` graph, and tracks its embedded folder agent UI files
+as compile-time inputs. Run the current Bazel unit suite with:
 
 ```bash
 bazel test //:unit
