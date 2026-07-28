@@ -1819,7 +1819,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
         let snapshot = if refresh != 0 {
             runtime()?.block_on(sdk.refresh_connection_route_snapshot())
         } else {
-            sdk.connection_route_snapshot()
+            runtime()?.block_on(sdk.refresh_due_connection_route_snapshot())
         };
         serde_json::to_string(&snapshot).context("failed to serialize connection route snapshot")
     })();
