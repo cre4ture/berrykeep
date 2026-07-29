@@ -62,6 +62,9 @@ const CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT: usize = 1;
 const CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT: usize = 3;
 const CLIENT_ROUTE_RECENT_ATTEMPT_LIMIT: usize = 64;
 const CLIENT_BUFFERED_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+// A warm multiplexed session should fail over quickly. Cold Direct-QUIC setup has its own
+// ten-second budget in `session_pool`.
+const CLIENT_WARM_MULTIPLEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_LONG_RUNNING_REQUEST_GRACE: Duration = Duration::from_secs(10);
 const MOBILE_CONNECTION_LOG_TARGET: &str = "ironmesh_mobile_connection";
 const STORE_INDEX_WAIT_DEFAULT_TIMEOUT_MS: u64 = 25_000;
@@ -6315,6 +6318,13 @@ async fn execute_direct_multiplex_buffered_request(
             direct, method, url, headers, body,
         )
         .await;
+    };
+    let timeout = if timeout == CLIENT_BUFFERED_REQUEST_ATTEMPT_TIMEOUT
+        && direct.session_pool.has_cached_session().await
+    {
+        CLIENT_WARM_MULTIPLEX_REQUEST_TIMEOUT
+    } else {
+        timeout
     };
 
     match tokio::time::timeout(

@@ -6,9 +6,8 @@ use iroh::endpoint::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use std::time::Instant;
-use tokio::sync::Mutex;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, Semaphore};
 use transport_sdk::{
     ClientIdentityMaterial, ConnectionCandidate, DEFAULT_DIRECT_QUIC_ALPN, DirectQuicEndpoint,
     DirectQuicEndpointConfig, ExpectedNodeServerIdentity, MultiplexConfig, MultiplexMode,
@@ -27,6 +26,8 @@ const MOBILE_CONNECTION_LOG_TARGET: &str = "ironmesh_mobile_connection";
 pub(crate) struct TransportSessionPool {
     target: SessionPoolTarget,
     cached_session: Arc<Mutex<Option<CachedTransportSession>>>,
+    // Serializes cold setup without retaining the cache mutex during network I/O.
+    session_setup_permit: Arc<Semaphore>,
     stats: Arc<TransportSessionPoolStats>,
     route_index: Arc<AtomicU64>,
 }
@@ -94,6 +95,8 @@ struct TransportSessionPoolStats {
 const DIRECT_CONNECTION_MODE_UNKNOWN: u64 = 0;
 const DIRECT_CONNECTION_MODE_DIRECT: u64 = 1;
 const DIRECT_CONNECTION_MODE_RELAY: u64 = 2;
+pub(crate) const RELAY_TICKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl TransportSessionPool {
     pub(crate) fn new_direct(
@@ -108,6 +111,7 @@ impl TransportSessionPool {
                 expected_server_identity,
             },
             cached_session: Arc::new(Mutex::new(None)),
+            session_setup_permit: Arc::new(Semaphore::new(1)),
             stats: Arc::new(TransportSessionPoolStats::default()),
             route_index: Arc::new(AtomicU64::new(u64::MAX)),
         }
@@ -128,6 +132,7 @@ impl TransportSessionPool {
                 relay_ca_pem,
             },
             cached_session: Arc::new(Mutex::new(None)),
+            session_setup_permit: Arc::new(Semaphore::new(1)),
             stats: Arc::new(TransportSessionPoolStats::default()),
             route_index: Arc::new(AtomicU64::new(u64::MAX)),
         }
@@ -145,6 +150,7 @@ impl TransportSessionPool {
                 source_security,
             },
             cached_session: Arc::new(Mutex::new(None)),
+            session_setup_permit: Arc::new(Semaphore::new(1)),
             stats: Arc::new(TransportSessionPoolStats::default()),
             route_index: Arc::new(AtomicU64::new(u64::MAX)),
         }
@@ -201,13 +207,16 @@ impl TransportSessionPool {
         identity: &ClientIdentityMaterial,
         connection_name: Option<&str>,
     ) -> Result<Arc<MultiplexedSession>> {
-        let mut guard = self.cached_session.lock().await;
-        if let Some(existing) = guard.as_ref() {
-            self.stats.reuse_count.fetch_add(1, Ordering::Relaxed);
-            return Ok(Arc::clone(&existing.session));
+        if let Some(session) = self.cached_session().await {
+            return Ok(session);
+        }
+        let _setup_permit = self.acquire_session_setup_permit().await;
+        if let Some(session) = self.cached_session().await {
+            return Ok(session);
         }
 
         let connect_started = Instant::now();
+        let mut cold_quic_setup_started = None;
 
         let (multiplexed, handshake_context, target) = match &self.target {
             SessionPoolTarget::DirectHttps {
@@ -251,69 +260,82 @@ impl TransportSessionPool {
                     anyhow!("direct QUIC transport target is missing target node id")
                 })?;
                 let target_label = candidate.endpoint.clone();
-                let endpoint = ensure_direct_quic_endpoint(
-                    endpoint,
-                    candidate,
-                    rendezvous.as_ref(),
-                    relay_ca_pem.as_deref(),
-                    self.route_index(),
-                )
-                .await?;
-                tracing::info!(
-                    target: MOBILE_CONNECTION_LOG_TARGET,
-                    event = "iroh_connect_scheduled",
-                    candidate_index = ?self.route_index(),
-                    path_kind = "direct_quic",
-                    locator = %candidate.endpoint,
-                    target_node_id = %target_node_id,
-                    "iroh_connect_scheduled"
-                );
                 let iroh_connect_started = Instant::now();
-                tracing::info!(
-                    target: MOBILE_CONNECTION_LOG_TARGET,
-                    event = "iroh_connect_started",
-                    candidate_index = ?self.route_index(),
-                    path_kind = "direct_quic",
-                    locator = %candidate.endpoint,
-                    target_node_id = %target_node_id,
-                    "iroh_connect_started"
-                );
-                let direct_quic = match endpoint
-                    .connect_session(candidate, MultiplexConfig::default())
-                    .await
-                {
-                    Ok(session) => {
+                cold_quic_setup_started = Some(iroh_connect_started);
+                let direct_quic = tokio::time::timeout(
+                    remaining_cold_quic_setup_budget(iroh_connect_started)?,
+                    async {
+                        let endpoint = ensure_direct_quic_endpoint(
+                            endpoint,
+                            candidate,
+                            rendezvous.as_ref(),
+                            relay_ca_pem.as_deref(),
+                            self.route_index(),
+                        )
+                        .await?;
                         tracing::info!(
                             target: MOBILE_CONNECTION_LOG_TARGET,
-                            event = "iroh_connect_completed",
+                            event = "iroh_connect_scheduled",
                             candidate_index = ?self.route_index(),
                             path_kind = "direct_quic",
                             locator = %candidate.endpoint,
                             target_node_id = %target_node_id,
-                            duration_us = duration_as_u64_micros(iroh_connect_started.elapsed()),
-                            "iroh_connect_completed"
+                            "iroh_connect_scheduled"
                         );
-                        session
-                    }
-                    Err(error) => {
-                        tracing::warn!(
+                        tracing::info!(
                             target: MOBILE_CONNECTION_LOG_TARGET,
-                            event = "iroh_connect_failed",
+                            event = "iroh_connect_started",
                             candidate_index = ?self.route_index(),
                             path_kind = "direct_quic",
                             locator = %candidate.endpoint,
                             target_node_id = %target_node_id,
-                            duration_us = duration_as_u64_micros(iroh_connect_started.elapsed()),
-                            error = %error,
-                            "iroh_connect_failed"
+                            "iroh_connect_started"
                         );
-                        return Err(error).with_context(|| {
-                            format!(
-                                "failed opening direct QUIC transport session to {target_label}"
-                            )
-                        });
-                    }
-                };
+                        match endpoint
+                            .connect_session(candidate, MultiplexConfig::default())
+                            .await
+                        {
+                            Ok(session) => {
+                                tracing::info!(
+                                    target: MOBILE_CONNECTION_LOG_TARGET,
+                                    event = "iroh_connect_completed",
+                                    candidate_index = ?self.route_index(),
+                                    path_kind = "direct_quic",
+                                    locator = %candidate.endpoint,
+                                    target_node_id = %target_node_id,
+                                    duration_us = duration_as_u64_micros(iroh_connect_started.elapsed()),
+                                    "iroh_connect_completed"
+                                );
+                                Ok(session)
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: MOBILE_CONNECTION_LOG_TARGET,
+                                    event = "iroh_connect_failed",
+                                    candidate_index = ?self.route_index(),
+                                    path_kind = "direct_quic",
+                                    locator = %candidate.endpoint,
+                                    target_node_id = %target_node_id,
+                                    duration_us = duration_as_u64_micros(iroh_connect_started.elapsed()),
+                                    error = %error,
+                                    "iroh_connect_failed"
+                                );
+                                Err(error).with_context(|| {
+                                    format!(
+                                        "failed opening direct QUIC transport session to {target_label}"
+                                    )
+                                })
+                            }
+                        }
+                    },
+                )
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "cold direct QUIC session setup to {target_label} timed out after {:?}",
+                        COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT
+                    )
+                })??;
                 self.update_hole_punching_mode(&direct_quic.connection);
                 self.spawn_hole_punching_monitor(direct_quic.connection.clone());
                 (
@@ -327,7 +349,7 @@ impl TransportSessionPool {
             }
         };
 
-        perform_transport_client_handshake(
+        let handshake = perform_transport_client_handshake(
             &multiplexed,
             TransportSessionControlMessage::Hello {
                 protocol_version: TRANSPORT_PROTOCOL_VERSION,
@@ -337,20 +359,31 @@ impl TransportSessionPool {
                 connection_name: connection_name.map(ToString::to_string),
                 target,
             },
-        )
-        .await
-        .with_context(|| handshake_context)?;
+        );
+        let handshake_result = match cold_quic_setup_started {
+            Some(setup_started) => {
+                tokio::time::timeout(remaining_cold_quic_setup_budget(setup_started)?, handshake)
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "cold direct QUIC session setup timed out after {:?}",
+                            COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT
+                        )
+                    })?
+            }
+            None => handshake.await,
+        };
+        handshake_result.with_context(|| handshake_context)?;
 
         let session = Arc::new(multiplexed);
-        *guard = Some(CachedTransportSession {
-            session: Arc::clone(&session),
-            _relay_session: None,
-        });
-        self.stats.connect_count.fetch_add(1, Ordering::Relaxed);
-        self.stats.connect_duration_us.fetch_add(
-            duration_as_u64_micros(connect_started.elapsed()),
-            Ordering::Relaxed,
-        );
+        let (session, inserted) = self.cache_session(session, None).await;
+        if inserted {
+            self.stats.connect_count.fetch_add(1, Ordering::Relaxed);
+            self.stats.connect_duration_us.fetch_add(
+                duration_as_u64_micros(connect_started.elapsed()),
+                Ordering::Relaxed,
+            );
+        }
         Ok(session)
     }
 
@@ -412,10 +445,12 @@ impl TransportSessionPool {
             bail!("attempted to open a relay session from a direct transport session pool");
         };
 
-        let mut guard = self.cached_session.lock().await;
-        if let Some(existing) = guard.as_ref() {
-            self.stats.reuse_count.fetch_add(1, Ordering::Relaxed);
-            return Ok(Arc::clone(&existing.session));
+        if let Some(session) = self.cached_session().await {
+            return Ok(session);
+        }
+        let _setup_permit = self.acquire_session_setup_permit().await;
+        if let Some(session) = self.cached_session().await {
+            return Ok(session);
         }
 
         let connect_started = Instant::now();
@@ -430,19 +465,52 @@ impl TransportSessionPool {
             "relay_pairing_started"
         );
 
-        let ticket = match rendezvous
-            .issue_relay_ticket(&RelayTicketRequest {
+        let ticket_started = Instant::now();
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "iroh_relay_ticket_started",
+            candidate_index = ?self.route_index(),
+            path_kind = "relay_tunnel",
+            target_node_id = %target_node_id,
+            timeout_ms = RELAY_TICKET_REQUEST_TIMEOUT.as_millis(),
+            "iroh_relay_ticket_started"
+        );
+        let ticket = match tokio::time::timeout(
+            RELAY_TICKET_REQUEST_TIMEOUT,
+            rendezvous.issue_relay_ticket(&RelayTicketRequest {
                 cluster_id: rendezvous.config().cluster_id,
                 source: source.clone(),
                 target: PeerIdentity::Node(*target_node_id),
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
                 security_mode: transport_sdk::RelayTunnelSecurityMode::InnerMtls,
                 requested_expires_in_secs: Some(300),
-            })
-            .await
+            }),
+        )
+        .await
         {
-            Ok(ticket) => ticket,
-            Err(error) => {
+            Ok(Ok(ticket)) => {
+                tracing::info!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "iroh_relay_ticket_completed",
+                    candidate_index = ?self.route_index(),
+                    path_kind = "relay_tunnel",
+                    target_node_id = %target_node_id,
+                    duration_us = duration_as_u64_micros(ticket_started.elapsed()),
+                    "iroh_relay_ticket_completed"
+                );
+                ticket
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "iroh_relay_ticket_failed",
+                    candidate_index = ?self.route_index(),
+                    path_kind = "relay_tunnel",
+                    target_node_id = %target_node_id,
+                    duration_us = duration_as_u64_micros(ticket_started.elapsed()),
+                    error = %error,
+                    "iroh_relay_ticket_failed"
+                );
                 tracing::warn!(
                     target: MOBILE_CONNECTION_LOG_TARGET,
                     event = "relay_pairing_failed",
@@ -459,6 +527,26 @@ impl TransportSessionPool {
                         target_node_id
                     )
                 });
+            }
+            Err(_) => {
+                let error = anyhow!(
+                    "issuing multiplex relay ticket for client target node {} timed out after {:?}",
+                    target_node_id,
+                    RELAY_TICKET_REQUEST_TIMEOUT
+                );
+                tracing::warn!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "iroh_relay_ticket_failed",
+                    candidate_index = ?self.route_index(),
+                    path_kind = "relay_tunnel",
+                    target_node_id = %target_node_id,
+                    duration_us = duration_as_u64_micros(ticket_started.elapsed()),
+                    timeout_ms = RELAY_TICKET_REQUEST_TIMEOUT.as_millis(),
+                    reason = "timeout",
+                    error = %error,
+                    "iroh_relay_ticket_failed"
+                );
+                return Err(error);
             }
         };
         let relay_tunnel = match rendezvous.connect_relay_tunnel_source(&ticket).await {
@@ -530,19 +618,56 @@ impl TransportSessionPool {
         })?;
 
         let session = Arc::new(multiplexed);
+        let (session, inserted) = self.cache_session(session, Some(relay_session)).await;
+        if inserted {
+            self.stats.connect_count.fetch_add(1, Ordering::Relaxed);
+            self.stats.connect_duration_us.fetch_add(
+                duration_as_u64_micros(connect_started.elapsed()),
+                Ordering::Relaxed,
+            );
+            self.stats
+                .relay_pairing_duration_us
+                .fetch_add(relay_pairing_duration_us, Ordering::Relaxed);
+        }
+        Ok(session)
+    }
+
+    pub(crate) async fn has_cached_session(&self) -> bool {
+        self.cached_session.lock().await.is_some()
+    }
+
+    async fn cached_session(&self) -> Option<Arc<MultiplexedSession>> {
+        let guard = self.cached_session.lock().await;
+        let session = guard.as_ref().map(|cached| Arc::clone(&cached.session));
+        if session.is_some() {
+            self.stats.reuse_count.fetch_add(1, Ordering::Relaxed);
+        }
+        session
+    }
+
+    async fn acquire_session_setup_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.session_setup_permit)
+            .acquire_owned()
+            .await
+            .expect("transport session setup permit must not be closed")
+    }
+
+    async fn cache_session(
+        &self,
+        session: Arc<MultiplexedSession>,
+        relay_session: Option<RelayTunnelSession>,
+    ) -> (Arc<MultiplexedSession>, bool) {
+        let mut guard = self.cached_session.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            self.stats.reuse_count.fetch_add(1, Ordering::Relaxed);
+            return (Arc::clone(&existing.session), false);
+        }
+
         *guard = Some(CachedTransportSession {
             session: Arc::clone(&session),
-            _relay_session: Some(relay_session),
+            _relay_session: relay_session,
         });
-        self.stats.connect_count.fetch_add(1, Ordering::Relaxed);
-        self.stats.connect_duration_us.fetch_add(
-            duration_as_u64_micros(connect_started.elapsed()),
-            Ordering::Relaxed,
-        );
-        self.stats
-            .relay_pairing_duration_us
-            .fetch_add(relay_pairing_duration_us, Ordering::Relaxed);
-        Ok(session)
+        (session, true)
     }
 }
 
@@ -564,25 +689,87 @@ async fn ensure_direct_quic_endpoint(
     relay_ca_pem: Option<&str>,
     route_index: Option<usize>,
 ) -> Result<DirectQuicEndpoint> {
-    let mut guard = endpoint.lock().await;
-    if let Some(managed) = guard.as_ref() {
-        return Ok(managed.endpoint.clone());
+    {
+        let guard = endpoint.lock().await;
+        if let Some(managed) = guard.as_ref() {
+            return Ok(managed.endpoint.clone());
+        }
     }
 
     let secret_key = SecretKey::generate();
     let endpoint_id = secret_key.public().to_string();
     let relay_ticket = match rendezvous {
-        Some(rendezvous) => match rendezvous.issue_iroh_relay_ticket(&endpoint_id).await {
-            Ok(ticket) => Some(ticket),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    %endpoint_id,
-                    "failed obtaining endpoint-bound iroh relay ticket; direct addresses remain available"
-                );
-                None
+        Some(rendezvous) => {
+            let ticket_started = Instant::now();
+            tracing::info!(
+                target: MOBILE_CONNECTION_LOG_TARGET,
+                event = "iroh_relay_ticket_started",
+                candidate_index = ?route_index,
+                path_kind = "direct_quic",
+                locator = %candidate.endpoint,
+                endpoint_id = %endpoint_id,
+                timeout_ms = RELAY_TICKET_REQUEST_TIMEOUT.as_millis(),
+                "iroh_relay_ticket_started"
+            );
+            match tokio::time::timeout(
+                RELAY_TICKET_REQUEST_TIMEOUT,
+                rendezvous.issue_iroh_relay_ticket(&endpoint_id),
+            )
+            .await
+            {
+                Ok(Ok(ticket)) => {
+                    tracing::info!(
+                        target: MOBILE_CONNECTION_LOG_TARGET,
+                        event = "iroh_relay_ticket_completed",
+                        candidate_index = ?route_index,
+                        path_kind = "direct_quic",
+                        locator = %candidate.endpoint,
+                        endpoint_id = %endpoint_id,
+                        duration_us = duration_as_u64_micros(ticket_started.elapsed()),
+                        "iroh_relay_ticket_completed"
+                    );
+                    Some(ticket)
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        target: MOBILE_CONNECTION_LOG_TARGET,
+                        event = "iroh_relay_ticket_failed",
+                        candidate_index = ?route_index,
+                        path_kind = "direct_quic",
+                        locator = %candidate.endpoint,
+                        endpoint_id = %endpoint_id,
+                        duration_us = duration_as_u64_micros(ticket_started.elapsed()),
+                        error = %error,
+                        "iroh_relay_ticket_failed"
+                    );
+                    tracing::warn!(
+                        %error,
+                        %endpoint_id,
+                        "failed obtaining endpoint-bound iroh relay ticket; direct addresses remain available"
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: MOBILE_CONNECTION_LOG_TARGET,
+                        event = "iroh_relay_ticket_failed",
+                        candidate_index = ?route_index,
+                        path_kind = "direct_quic",
+                        locator = %candidate.endpoint,
+                        endpoint_id = %endpoint_id,
+                        duration_us = duration_as_u64_micros(ticket_started.elapsed()),
+                        timeout_ms = RELAY_TICKET_REQUEST_TIMEOUT.as_millis(),
+                        reason = "timeout",
+                        "iroh_relay_ticket_failed"
+                    );
+                    tracing::warn!(
+                        %endpoint_id,
+                        "iroh relay ticket request timed out; direct addresses remain available"
+                    );
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
 
@@ -607,13 +794,13 @@ async fn ensure_direct_quic_endpoint(
     }
     config.relay_ca_pem = relay_ca_pem.map(ToString::to_string);
 
-    let endpoint = DirectQuicEndpoint::bind(config).await.with_context(|| {
+    let bound_endpoint = DirectQuicEndpoint::bind(config).await.with_context(|| {
         format!(
             "failed binding local direct QUIC endpoint for remote candidate {}",
             candidate.endpoint
         )
     })?;
-    let endpoint_snapshot = endpoint.snapshot();
+    let endpoint_snapshot = bound_endpoint.snapshot();
     tracing::info!(
         target: MOBILE_CONNECTION_LOG_TARGET,
         event = "iroh_endpoint_created",
@@ -626,7 +813,7 @@ async fn ensure_direct_quic_endpoint(
         "iroh_endpoint_created"
     );
     if let Some(ticket) = relay_ticket.as_ref() {
-        endpoint
+        bound_endpoint
             .reconcile_dynamic_relays(&iroh_relay_configs_from_ticket(ticket))
             .await
             .context("failed applying endpoint-bound iroh relay ticket")?;
@@ -637,17 +824,33 @@ async fn ensure_direct_quic_endpoint(
         .unwrap_or_else(unix_ts);
     let relay_ticket_refresh = rendezvous.map(|rendezvous| {
         spawn_iroh_relay_ticket_refresh(
-            endpoint.clone(),
+            bound_endpoint.clone(),
             rendezvous.clone(),
             endpoint_id,
             initial_expires_at_unix,
         )
     });
-    *guard = Some(ManagedDirectQuicEndpoint {
-        endpoint: endpoint.clone(),
+    let managed_endpoint = ManagedDirectQuicEndpoint {
+        endpoint: bound_endpoint.clone(),
         relay_ticket_refresh,
-    });
-    Ok(endpoint)
+    };
+    let mut guard = endpoint.lock().await;
+    if let Some(existing) = guard.as_ref() {
+        return Ok(existing.endpoint.clone());
+    }
+    *guard = Some(managed_endpoint);
+    Ok(bound_endpoint)
+}
+
+fn remaining_cold_quic_setup_budget(setup_started: Instant) -> Result<Duration> {
+    COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT
+        .checked_sub(setup_started.elapsed())
+        .ok_or_else(|| {
+            anyhow!(
+                "cold direct QUIC session setup exceeded its {:?} time budget",
+                COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT
+            )
+        })
 }
 
 fn spawn_iroh_relay_ticket_refresh(
