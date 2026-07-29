@@ -243,6 +243,26 @@ just test-quic-network
 Patchbay network namespaces and therefore requires `nft`, `tc`, and
 unprivileged user namespaces; it does not require root at runtime.
 
+The serial test suite starts the real Rendezvous service, Server Node, and
+IronMesh Client CLI in separate Patchbay network namespaces. It covers:
+
+- IPv4 EIM/APDF (`Nat::Home`) on both peers, without an additional firewall,
+  and requires Iroh to migrate the pooled Direct QUIC connection from relay to
+  a direct hole-punched path;
+- the Patchbay `Hotel` profile (symmetric NAT and UDP blocked), with the Iroh
+  relay enabled, and requires a relay-assisted Direct QUIC path;
+- the same blocked-UDP profile with the Iroh relay disabled, and requires the
+  IronMesh relay tunnel to remain usable;
+- a fault endpoint that accepts but stalls Iroh relay-ticket requests. A
+  held-open Direct QUIC SDK probe verifies the three-second timeout while the
+  CLI remains usable through the IronMesh relay fallback.
+
+The CLI exercises the same client SDK and managed routing implementation used
+by app shells, so no phone simulator is needed for these transport assertions.
+The narrow SDK probe in the ticket-fault case exists only to keep the
+intentionally stalled Direct QUIC attempt alive long enough to observe its
+timeout deterministically.
+
 ### 2) Verify stable lanes are still healthy
 
 ```bash

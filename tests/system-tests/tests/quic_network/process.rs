@@ -55,10 +55,6 @@ impl ProcessGuard {
         Ok(())
     }
 
-    pub(super) fn stderr(&self) -> String {
-        fs::read_to_string(&self.stderr_path).unwrap_or_default()
-    }
-
     pub(super) fn stderr_tail(&self) -> String {
         log_tail(&self.stderr_path)
     }

@@ -1,4 +1,10 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{
@@ -21,12 +27,16 @@ pub const IROH_RELAY_TICKET_PATH: &str = "/control/iroh-relay/ticket";
 #[derive(Clone)]
 struct TicketTimeoutState {
     shutdown_tx: watch::Sender<bool>,
+    ticket_requests: Arc<AtomicU64>,
 }
 
 impl TicketTimeoutState {
     fn new() -> Self {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-        Self { shutdown_tx }
+        Self {
+            shutdown_tx,
+            ticket_requests: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -41,6 +51,7 @@ async fn ticket_timeout_handler(
     request: Request<Body>,
 ) -> Response {
     if request.method() == Method::POST && request.uri().path() == IROH_RELAY_TICKET_PATH {
+        state.ticket_requests.fetch_add(1, Ordering::Relaxed);
         let mut shutdown_rx = state.shutdown_tx.subscribe();
         if !*shutdown_rx.borrow() {
             let _ = shutdown_rx.wait_for(|shutdown| *shutdown).await;
@@ -62,6 +73,7 @@ async fn ticket_timeout_handler(
 /// a final safeguard, so the listener cannot outlive its owner.
 pub struct TicketTimeoutServer {
     local_addr: SocketAddr,
+    ticket_requests: Arc<AtomicU64>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<()>>>,
 }
@@ -76,6 +88,7 @@ impl TicketTimeoutServer {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let fault_state = TicketTimeoutState::new();
         let fault_shutdown_tx = fault_state.shutdown_tx.clone();
+        let ticket_requests = Arc::clone(&fault_state.ticket_requests);
         let task = device
             .spawn(move |_device| async move {
                 let listener = match TcpListener::bind(bind_addr).await {
@@ -143,6 +156,7 @@ impl TicketTimeoutServer {
 
         Ok(Self {
             local_addr,
+            ticket_requests,
             shutdown_tx: Some(shutdown_tx),
             task: Some(task),
         })
@@ -150,6 +164,10 @@ impl TicketTimeoutServer {
 
     pub fn url(&self) -> String {
         format!("http://{}", self.local_addr)
+    }
+
+    pub fn ticket_request_count(&self) -> u64 {
+        self.ticket_requests.load(Ordering::Relaxed)
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
@@ -201,6 +219,7 @@ mod tests {
     #[tokio::test]
     async fn ticket_post_stalls() {
         let state = TicketTimeoutState::new();
+        let observed_state = state.clone();
         let request = Request::builder()
             .method(Method::POST)
             .uri(IROH_RELAY_TICKET_PATH)
@@ -216,6 +235,7 @@ mod tests {
             .is_err(),
             "ticket request unexpectedly completed"
         );
+        assert_eq!(observed_state.ticket_requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

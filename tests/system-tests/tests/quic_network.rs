@@ -12,7 +12,6 @@ mod tls;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use patchbay::RouterPreset;
 use serde_json::Value;
 use tokio::time::timeout;
 
@@ -32,9 +31,18 @@ enum ExpectedRoute {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum NetworkProfile {
+    /// IPv4 EIM/APDF NAT without a second firewall layer, matching Iroh's
+    /// upstream `Nat::Home` hole-punch test topology.
+    HolePunchableHomeNat,
+    /// Symmetric IPv4 NAT with UDP blocked.
+    HotelBlockedUdp,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Scenario {
     name: &'static str,
-    router: RouterPreset,
+    network: NetworkProfile,
     iroh_relay_enabled: bool,
     stall_iroh_ticket: bool,
     expected: ExpectedRoute,
@@ -43,7 +51,7 @@ struct Scenario {
 impl Scenario {
     const HOME_DIRECT: Self = Self {
         name: "home-direct",
-        router: RouterPreset::Home,
+        network: NetworkProfile::HolePunchableHomeNat,
         iroh_relay_enabled: true,
         stall_iroh_ticket: false,
         expected: ExpectedRoute::DirectQuic("direct"),
@@ -51,7 +59,7 @@ impl Scenario {
 
     const HOTEL_IROH_RELAY: Self = Self {
         name: "hotel-iroh-relay",
-        router: RouterPreset::Hotel,
+        network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: true,
         stall_iroh_ticket: false,
         expected: ExpectedRoute::DirectQuic("relay"),
@@ -59,7 +67,7 @@ impl Scenario {
 
     const HOTEL_IRONMESH_RELAY: Self = Self {
         name: "hotel-ironmesh-relay",
-        router: RouterPreset::Hotel,
+        network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: false,
         stall_iroh_ticket: false,
         expected: ExpectedRoute::RelayTunnel,
@@ -67,7 +75,7 @@ impl Scenario {
 
     const TICKET_TIMEOUT_FALLBACK: Self = Self {
         name: "ticket-timeout-fallback",
-        router: RouterPreset::Hotel,
+        network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: true,
         stall_iroh_ticket: true,
         expected: ExpectedRoute::RelayTunnel,
@@ -133,28 +141,29 @@ async fn exercise_and_assert(runtime: &mut ScenarioRuntime, scenario: Scenario) 
     );
 
     if scenario.stall_iroh_ticket {
-        runtime
-            .wait_for_cli_logs(Duration::from_secs(10), |logs| {
-                has_direct_ticket_timeout(logs) && has_direct_only_fallback(logs)
-            })
+        let ticket_requests_before = runtime.ticket_request_count()?;
+        let probe = runtime
+            .probe_direct_quic_ticket_timeout()
             .await
-            .context("ticket timeout scenario missed the direct QUIC fallback diagnostics")?;
+            .context("failed exercising the stalled Direct QUIC ticket path")?;
+        ensure!(
+            !probe.succeeded,
+            "Direct QUIC unexpectedly succeeded despite blocked UDP and a stalled relay ticket"
+        );
+        ensure!(
+            probe.elapsed >= Duration::from_millis(2_800),
+            "Direct QUIC failed before the three-second relay-ticket timeout: {:?} ({})",
+            probe.elapsed,
+            probe.error.as_deref().unwrap_or("no error")
+        );
+        let ticket_requests_after = runtime.ticket_request_count()?;
+        ensure!(
+            ticket_requests_after > ticket_requests_before,
+            "the deterministic Direct QUIC probe never reached the stalled ticket endpoint \
+             (before={ticket_requests_before}, after={ticket_requests_after})"
+        );
     }
     Ok(())
-}
-
-fn has_direct_ticket_timeout(logs: &str) -> bool {
-    logs.lines().any(|line| {
-        line.contains("iroh_relay_ticket_failed")
-            && line.contains("path_kind=\"direct_quic\"")
-            && line.contains("error_class=\"timeout\"")
-    })
-}
-
-fn has_direct_only_fallback(logs: &str) -> bool {
-    logs.lines().any(|line| {
-        line.contains("iroh_direct_only_fallback") && line.contains("path_kind=\"direct_quic\"")
-    })
 }
 
 fn candidate_matches(snapshot: &Value, expected: ExpectedRoute) -> bool {

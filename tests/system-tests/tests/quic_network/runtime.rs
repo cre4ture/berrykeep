@@ -5,15 +5,19 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use client_sdk::ConnectionBootstrap;
-use patchbay::{Device, Lab, OutDir, RouterPreset};
+use client_sdk::{
+    ClientIdentityMaterial, ConnectionBootstrap,
+    build_client_with_optional_identity_from_planned_target,
+};
+use patchbay::{Device, Lab, Nat, OutDir, Router, RouterPreset};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
+use transport_sdk::TransportPathKind;
 use uuid::Uuid;
 
 use super::{
-    ExpectedRoute, Scenario, candidate_matches,
+    ExpectedRoute, NetworkProfile, Scenario, candidate_matches,
     fault_rendezvous::TicketTimeoutServer,
     process::{
         ADMIN_TOKEN, CLI_WEB_PORT, NODE_PUBLIC_PORT, PROCESS_READY_TIMEOUT, ProcessGuard,
@@ -24,9 +28,18 @@ use super::{
 
 const ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(50);
 const DEVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const DIRECT_QUIC_FAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(18);
+
+pub(super) struct DirectQuicFaultProbe {
+    pub(super) elapsed: Duration,
+    pub(super) succeeded: bool,
+    pub(super) error: Option<String>,
+}
 
 pub(super) struct ScenarioRuntime {
     client: Device,
+    bootstrap: ConnectionBootstrap,
+    identity: ClientIdentityMaterial,
     web_base_url: String,
     cli: ProcessGuard,
     node: ProcessGuard,
@@ -52,16 +65,8 @@ impl ScenarioRuntime {
             .preset(RouterPreset::PublicV4)
             .build()
             .await?;
-        let node_router = lab
-            .add_router("node-nat")
-            .preset(scenario.router)
-            .build()
-            .await?;
-        let client_router = lab
-            .add_router("client-nat")
-            .preset(scenario.router)
-            .build()
-            .await?;
+        let node_router = add_network_router(&lab, "node-nat", scenario.network).await?;
+        let client_router = add_network_router(&lab, "client-nat", scenario.network).await?;
         let rendezvous_device = lab
             .add_device("rendezvous")
             .uplink(public_router.id())
@@ -131,6 +136,8 @@ impl ScenarioRuntime {
         } else {
             None
         };
+        let bootstrap = ConnectionBootstrap::from_path(&bootstrap_path)?;
+        let identity = ClientIdentityMaterial::from_path(&identity_path)?;
 
         let mut cli = spawn_cli_web(&client_device, &artifacts, &bootstrap_path, &identity_path)?;
         let web_base_url = format!("http://127.0.0.1:{CLI_WEB_PORT}");
@@ -145,6 +152,8 @@ impl ScenarioRuntime {
 
         Ok(Self {
             client: client_device,
+            bootstrap,
+            identity,
             web_base_url,
             cli,
             node,
@@ -196,26 +205,58 @@ impl ScenarioRuntime {
         .await
     }
 
-    pub(super) async fn wait_for_cli_logs(
-        &mut self,
-        wait_for: Duration,
-        predicate: impl Fn(&str) -> bool,
-    ) -> Result<String> {
-        let deadline = Instant::now() + wait_for;
-        loop {
-            let logs = self.cli.stderr();
-            if predicate(&logs) {
-                return Ok(logs);
-            }
-            self.cli.ensure_running()?;
-            if Instant::now() >= deadline {
-                bail!(
-                    "CLI diagnostics did not appear within {wait_for:?}\n{}",
-                    self.cli.stderr_tail()
-                );
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
+    pub(super) fn ticket_request_count(&self) -> Result<u64> {
+        self.ticket_timeout
+            .as_ref()
+            .map(TicketTimeoutServer::ticket_request_count)
+            .context("scenario has no Iroh ticket fault server")
+    }
+
+    pub(super) async fn probe_direct_quic_ticket_timeout(
+        &self,
+    ) -> Result<DirectQuicFaultProbe> {
+        let bootstrap = self.bootstrap.clone();
+        let identity = self.identity.clone();
+        self.client
+            .spawn(move |_device| async move {
+                let targets = bootstrap
+                    .refresh_dynamic_targets(Some(&identity))
+                    .await
+                    .context("failed refreshing direct QUIC probe targets")?;
+                let target = targets
+                    .into_iter()
+                    .find(|target| target.path_kind == TransportPathKind::DirectQuic)
+                    .context("dynamic discovery returned no Direct QUIC target")?;
+                let client = build_client_with_optional_identity_from_planned_target(
+                    &target,
+                    Some(&identity),
+                )
+                .context("failed building Direct QUIC probe client")?;
+
+                let started = Instant::now();
+                let (succeeded, error) = match timeout(
+                    DIRECT_QUIC_FAULT_PROBE_TIMEOUT,
+                    client.store_index(None, 1, None),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => (true, None),
+                    Ok(Err(error)) => (false, Some(format!("{error:#}"))),
+                    Err(_) => (
+                        false,
+                        Some(format!(
+                            "Direct QUIC probe exceeded {DIRECT_QUIC_FAULT_PROBE_TIMEOUT:?}"
+                        )),
+                    ),
+                };
+                Ok(DirectQuicFaultProbe {
+                    elapsed: started.elapsed(),
+                    succeeded,
+                    error,
+                })
+            })?
+            .await
+            .context("Direct QUIC fault probe task panicked")?
     }
 
     pub(super) async fn stop(mut self) {
@@ -225,6 +266,25 @@ impl ScenarioRuntime {
         if let Some(ticket_timeout) = self.ticket_timeout.take() {
             let _ = ticket_timeout.shutdown().await;
         }
+    }
+}
+
+async fn add_network_router(
+    lab: &Lab,
+    name: &str,
+    profile: NetworkProfile,
+) -> Result<Router> {
+    match profile {
+        NetworkProfile::HolePunchableHomeNat => {
+            // Match Iroh's own IPv4 NAT traversal tests exactly: EIM/APDF NAT
+            // with no additional firewall. RouterBuilder defaults to IPv4-only.
+            Ok(lab.add_router(name).nat(Nat::Home).build().await?)
+        }
+        NetworkProfile::HotelBlockedUdp => Ok(lab
+            .add_router(name)
+            .preset(RouterPreset::Hotel)
+            .build()
+            .await?),
     }
 }
 
