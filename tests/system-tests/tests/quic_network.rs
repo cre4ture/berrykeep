@@ -121,17 +121,11 @@ async fn run_scenario(scenario: Scenario) -> Result<()> {
 }
 
 async fn exercise_and_assert(runtime: &mut ScenarioRuntime, scenario: Scenario) -> Result<()> {
-    let route_snapshot = runtime.wait_for_route(scenario.expected).await?;
-    assert_expected_route(&route_snapshot, scenario.expected).with_context(|| {
-        format!(
-            "unexpected routes for {}\n{route_snapshot:#}",
-            scenario.name
-        )
-    })?;
+    runtime.wait_for_route(scenario.expected).await?;
 
     let started = Instant::now();
     let store_list = runtime
-        .store_list()
+        .wait_for_store_list()
         .await
         .with_context(|| format!("store/list failed in {}", scenario.name))?;
     ensure!(
@@ -144,6 +138,13 @@ async fn exercise_and_assert(runtime: &mut ScenarioRuntime, scenario: Scenario) 
         scenario.name,
         started.elapsed()
     );
+    let route_snapshot = runtime.connection_routes().await?;
+    assert_expected_route(&route_snapshot, scenario.expected).with_context(|| {
+        format!(
+            "unexpected routes after exercising {}\n{route_snapshot:#}",
+            scenario.name
+        )
+    })?;
 
     if scenario.stall_iroh_ticket {
         let ticket_requests_after = runtime.ticket_request_count()?;
@@ -203,6 +204,10 @@ fn assert_expected_route(snapshot: &Value, expected: ExpectedRoute) -> Result<()
                     && endpoint["total_successes"].as_u64().unwrap_or_default() > 0
             })
             .context("successful Direct QUIC endpoint disappeared")?;
+        ensure!(
+            direct["active"] == true,
+            "Direct QUIC route was not active after the CLI request: {direct:#}"
+        );
         ensure!(
             direct["transport_session_pool"]["connect_count"]
                 .as_u64()

@@ -23,6 +23,7 @@ use super::{
 };
 
 const ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(50);
+const STORE_READY_TIMEOUT: Duration = Duration::from_secs(35);
 const DEVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 pub(super) struct ScenarioRuntime {
     client: Device,
@@ -182,6 +183,29 @@ impl ScenarioRuntime {
             None,
         )
         .await
+    }
+
+    pub(super) async fn wait_for_store_list(&self) -> Result<Value> {
+        let deadline = Instant::now() + STORE_READY_TIMEOUT;
+        let mut last_error = String::from("no request attempted");
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
+                    "store/list did not become usable within {STORE_READY_TIMEOUT:?}: {last_error}"
+                );
+            }
+            match timeout(remaining, self.store_list()).await {
+                Ok(Ok(store_list)) => return Ok(store_list),
+                Ok(Err(error)) => last_error = format!("{error:#}"),
+                Err(_) => {
+                    bail!(
+                        "store/list did not become usable within {STORE_READY_TIMEOUT:?}: {last_error}"
+                    );
+                }
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
     }
 
     pub(super) async fn connection_routes(&self) -> Result<Value> {
