@@ -15023,6 +15023,98 @@ fn store_index_page_cache_key(
     })
 }
 
+fn store_index_gallery_query(
+    query: &StoreIndexQuery,
+    prefix: &str,
+    depth: usize,
+) -> Option<storage::GalleryIndexQuery> {
+    if query.snapshot.is_some() || query.cursor.is_some() || query.page_size.is_some() {
+        return None;
+    }
+    let media_filter = match query.media_filter? {
+        StoreIndexMediaFilter::All => storage::GalleryIndexMediaFilter::All,
+        StoreIndexMediaFilter::Image => storage::GalleryIndexMediaFilter::Image,
+        StoreIndexMediaFilter::Video => storage::GalleryIndexMediaFilter::Video,
+    };
+    let captured_sort = match query.sort? {
+        StoreIndexSortOrder::CapturedAsc => storage::GalleryIndexCapturedSort::Asc,
+        StoreIndexSortOrder::CapturedDesc => storage::GalleryIndexCapturedSort::Desc,
+        _ => return None,
+    };
+    Some(storage::GalleryIndexQuery {
+        prefix: prefix.to_string(),
+        depth,
+        media_filter,
+        captured_sort,
+        offset: query.offset.unwrap_or(0),
+        limit: query.limit?.max(1),
+    })
+}
+
+fn store_index_response_from_gallery_index_page(
+    page: storage::GalleryIndexPage,
+    query: &StoreIndexQuery,
+    prefix: String,
+    depth: usize,
+    thumbnail_route: &str,
+) -> StoreIndexResponse {
+    let total_entry_count = page.total_entry_count;
+    let offset = query.offset.unwrap_or(0).min(total_entry_count);
+    let limit = query.limit.map(|value| value.max(1));
+    let entries = page
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let media = entry
+                .content_fingerprint
+                .as_ref()
+                .map(|content_fingerprint| {
+                    build_media_index_response(
+                        &entry.key,
+                        None,
+                        None,
+                        &MediaCacheLookup {
+                            content_fingerprint: content_fingerprint.clone(),
+                            metadata: entry.media_metadata,
+                        },
+                        thumbnail_route,
+                    )
+                });
+            StoreIndexEntry {
+                path: entry.key,
+                entry_type: "key".to_string(),
+                version: None,
+                content_hash: Some(entry.manifest_hash),
+                size_bytes: entry.size_bytes,
+                modified_at_unix: entry.modified_at_unix,
+                content_fingerprint: entry.content_fingerprint,
+                media,
+            }
+        })
+        .collect::<Vec<_>>();
+    StoreIndexResponse {
+        prefix,
+        depth,
+        entry_count: entries.len(),
+        total_entry_count,
+        offset,
+        limit,
+        has_more: limit
+            .map(|limit| offset.saturating_add(limit) < total_entry_count)
+            .unwrap_or(false),
+        next_cursor: None,
+        media_summary: StoreIndexMediaSummary {
+            ready_count: page.media_summary.ready_count,
+            pending_count: page.media_summary.pending_count,
+            incomplete_count: page.media_summary.incomplete_count,
+            image_count: page.media_summary.image_count,
+            video_count: page.media_summary.video_count,
+            geotagged_count: page.media_summary.geotagged_count,
+        },
+        entries,
+    }
+}
+
 fn with_store_index_response_headers(
     namespace_change_sequence: u64,
     request_id: Uuid,
@@ -15139,6 +15231,66 @@ async fn list_store_index_response_attempt(
         .storage
         .namespace_change_sequence
         .load(Ordering::SeqCst);
+
+    if let Some(gallery_query) = store_index_gallery_query(&query, &prefix, depth) {
+        let gallery_index_started_at = Instant::now();
+        let gallery_page = {
+            let store = read_store(state, "store_index.gallery_index").await;
+            store.query_gallery_index(&gallery_query).await
+        };
+        match gallery_page {
+            Ok(Some(page)) => {
+                if state
+                    .storage
+                    .namespace_change_sequence
+                    .load(Ordering::SeqCst)
+                    != namespace_change_sequence
+                {
+                    if allow_namespace_retry {
+                        return Box::pin(list_store_index_response_attempt(
+                            state,
+                            query,
+                            thumbnail_route,
+                            false,
+                        ))
+                        .await;
+                    }
+                    return StatusCode::CONFLICT.into_response();
+                }
+                let total_ms = request_started_at.elapsed().as_millis();
+                let gallery_index_ms = gallery_index_started_at.elapsed().as_millis();
+                let total_entry_count = page.total_entry_count;
+                let materialized_entry_count = page.entries.len();
+                let response = Json(store_index_response_from_gallery_index_page(
+                    page,
+                    &query,
+                    prefix,
+                    depth,
+                    thumbnail_route,
+                ))
+                .into_response();
+                return with_store_index_response_headers(
+                    namespace_change_sequence,
+                    request_id,
+                    response,
+                    format!(
+                        "gallery-index;desc=sqlite, gallery-index-query;dur={gallery_index_ms}, total;dur={total_ms}"
+                    ),
+                    total_entry_count,
+                    total_entry_count,
+                    materialized_entry_count,
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    prefix = %prefix,
+                    "gallery index fast path failed; falling back to the generic store index"
+                );
+            }
+        }
+    }
 
     if let Some(cache_key) = page_cache_key.as_ref() {
         let cached = match state.storage.store_index_page_cache.lock() {
@@ -16314,24 +16466,7 @@ fn prefilter_store_index_entry_plan_for_media(
 }
 
 fn media_type_for_path(path: &str) -> Option<&'static str> {
-    let extension = path
-        .rsplit('.')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(
-        extension.as_str(),
-        "bmp" | "gif" | "jpeg" | "jpg" | "png" | "webp"
-    ) {
-        return Some("image");
-    }
-    if matches!(
-        extension.as_str(),
-        "avi" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "ogv" | "ts" | "webm"
-    ) {
-        return Some("video");
-    }
-    None
+    storage::gallery_media_type_for_path(path)
 }
 
 #[cfg(test)]

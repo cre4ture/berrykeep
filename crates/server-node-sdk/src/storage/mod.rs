@@ -974,6 +974,68 @@ pub(super) struct CurrentObjectEntry {
     pub(super) object_id: String,
 }
 
+/// A persisted, current-state projection used to serve the paginated gallery without
+/// first materializing every object in the namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GalleryIndexMediaFilter {
+    All,
+    Image,
+    Video,
+}
+
+impl GalleryIndexMediaFilter {
+    pub(crate) fn media_type(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Image => Some("image"),
+            Self::Video => Some("video"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GalleryIndexCapturedSort {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GalleryIndexQuery {
+    pub(crate) prefix: String,
+    pub(crate) depth: usize,
+    pub(crate) media_filter: GalleryIndexMediaFilter,
+    pub(crate) captured_sort: GalleryIndexCapturedSort,
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GalleryIndexMediaSummary {
+    pub(crate) ready_count: usize,
+    pub(crate) pending_count: usize,
+    pub(crate) incomplete_count: usize,
+    pub(crate) image_count: usize,
+    pub(crate) video_count: usize,
+    pub(crate) geotagged_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GalleryIndexEntry {
+    pub(crate) key: String,
+    pub(crate) manifest_hash: String,
+    pub(crate) size_bytes: Option<u64>,
+    pub(crate) modified_at_unix: Option<u64>,
+    pub(crate) content_fingerprint: Option<String>,
+    pub(crate) media_metadata: Option<CachedMediaMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GalleryIndexPage {
+    pub(crate) total_entry_count: usize,
+    pub(crate) media_summary: GalleryIndexMediaSummary,
+    pub(crate) entries: Vec<GalleryIndexEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VersionConsistencyState {
@@ -1590,6 +1652,63 @@ pub(super) fn sqlite_like_prefix_pattern(prefix: &str) -> String {
     pattern
 }
 
+pub(crate) fn gallery_media_type_for_path(path: &str) -> Option<&'static str> {
+    let extension = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        extension.as_str(),
+        "bmp" | "gif" | "jpeg" | "jpg" | "png" | "webp"
+    ) {
+        return Some("image");
+    }
+    if matches!(
+        extension.as_str(),
+        "avi" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "ogv" | "ts" | "webm"
+    ) {
+        return Some("video");
+    }
+    None
+}
+
+pub(super) fn gallery_index_media_type_from_metadata(
+    metadata: Option<&CachedMediaMetadata>,
+) -> Option<&str> {
+    let metadata = metadata?;
+    if metadata
+        .mime_type
+        .as_deref()
+        .is_some_and(|mime_type| mime_type.starts_with("image/"))
+    {
+        return Some("image");
+    }
+    if metadata
+        .mime_type
+        .as_deref()
+        .is_some_and(|mime_type| mime_type.starts_with("video/"))
+    {
+        return Some("video");
+    }
+    match metadata.media_type.as_deref() {
+        Some("image") => Some("image"),
+        Some("video") => Some("video"),
+        _ => None,
+    }
+}
+
+pub(super) fn gallery_index_media_status(
+    metadata: Option<&CachedMediaMetadata>,
+) -> Option<&'static str> {
+    metadata.map(|metadata| match metadata.status {
+        MediaCacheStatus::Ready => "ready",
+        MediaCacheStatus::Incomplete => "incomplete",
+        MediaCacheStatus::Unsupported => "unsupported",
+        MediaCacheStatus::Failed => "failed",
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectVersionInspection {
     pub version_id: String,
@@ -2078,6 +2197,10 @@ trait MetadataStore: Send + Sync {
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
     async fn remove_current_object(&self, key: &str) -> Result<()>;
+    async fn query_gallery_index(
+        &self,
+        query: &GalleryIndexQuery,
+    ) -> Result<Option<GalleryIndexPage>>;
     async fn count_current_objects(&self) -> Result<usize>;
     async fn list_current_object_keys(&self) -> Result<Vec<String>>;
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>>;
@@ -3313,6 +3436,13 @@ impl PersistentStore {
             self.storage_pool.clone(),
             self.metadata_store.clone(),
         ))
+    }
+
+    pub(crate) async fn query_gallery_index(
+        &self,
+        query: &GalleryIndexQuery,
+    ) -> Result<Option<GalleryIndexPage>> {
+        self.metadata_store.query_gallery_index(query).await
     }
 
     pub(crate) fn storage_stats_collector(&self) -> StorageStatsCollector {
@@ -6194,7 +6324,10 @@ impl PersistentStore {
     }
 
     #[cfg(test)]
-    async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
+    pub(crate) async fn persist_media_cache_record(
+        &self,
+        metadata: &CachedMediaMetadata,
+    ) -> Result<()> {
         persist_media_cache_record_with_payload(
             &self.media_thumbnails_dir,
             self.metadata_store.as_ref(),

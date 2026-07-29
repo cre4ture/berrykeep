@@ -12,14 +12,14 @@ use crate::cluster::NodeDescriptor;
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, ManifestSummary, ManualRepairActionRunRecord,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
-    MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord,
-    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
-    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
-    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
-    compress_snapshot_json, decompress_snapshot_json, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs,
+    DataScrubRunRecord, FileVersionIndex, GalleryIndexPage, GalleryIndexQuery, ManifestSummary,
+    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
+    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
+    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
+    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
+    StorageStatsSample, StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -145,6 +145,15 @@ impl MetadataStore for TursoMetadataStore {
             .execute("DELETE FROM current_objects WHERE key = ?1", (key,))
             .await?;
         Ok(())
+    }
+
+    async fn query_gallery_index(
+        &self,
+        _query: &GalleryIndexQuery,
+    ) -> Result<Option<GalleryIndexPage>> {
+        // Keep the existing implementation as the safe fallback until the same
+        // projection is available for the optional Turso metadata backend.
+        Ok(None)
     }
 
     async fn count_current_objects(&self) -> Result<usize> {
