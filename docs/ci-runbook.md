@@ -17,6 +17,11 @@ Configure these protected-environment values before tagging:
 The normal `Win Server MSI` CI job remains intentionally unsigned and uploads
 only a short-lived validation artifact. Never publish that artifact.
 
+The validation job does not run on ordinary pushes or manual CI runs. Add the
+`ci:windows-server-node-msi` label to a pull request to request it, or push a
+stable `vX.Y.Z` release tag to run it automatically alongside the signed
+release workflow.
+
 ## Android release builds on pull requests
 
 Pull requests run the Android debug checks by default. To request the signed

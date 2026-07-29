@@ -907,10 +907,31 @@ jobs:
       - name: Run Windows workspace clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+  windows-server-node-msi-gate:
+    name: Win Server MSI gate
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.gate.outputs.should_build }}
+    steps:
+      - name: Determine whether the MSI validation build was requested
+        id: gate
+        env:
+          WINDOWS_SERVER_MSI_REQUESTED: ${{ contains(github.event.pull_request.labels.*.name, 'ci:windows-server-node-msi') }}
+        run: |
+          # The unsigned MSI validation build is expensive. Run it only on a
+          # pull request that explicitly requests it or for a stable release
+          # tag, whose corresponding Release workflow builds the signed MSI.
+          SHOULD_BUILD=false
+          if [ "${WINDOWS_SERVER_MSI_REQUESTED}" = "true" ] || { [ "${GITHUB_REF_TYPE}" = "tag" ] && [[ "${GITHUB_REF_NAME}" =~ ^v[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]]; }; then
+            SHOULD_BUILD=true
+          fi
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+
   windows-server-node-msi:
     name: Win Server MSI
     runs-on: windows-latest
-    needs: workspace-check
+    needs: [workspace-check, windows-server-node-msi-gate]
+    if: ${{ needs.windows-server-node-msi-gate.outputs.should_build == 'true' }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
