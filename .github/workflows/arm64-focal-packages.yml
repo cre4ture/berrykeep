@@ -39,8 +39,9 @@ jobs:
       - name: Prepare vendored crates and web assets
         run: ./scripts/prepare-ppa-source.sh
 
-      - name: Cache sccache (ARM64 Focal build)
-        uses: actions/cache@v4
+      - name: Restore sccache (ARM64 Focal build)
+        id: restore-sccache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/sccache-arm64
           key: sccache-arm64-focal-${{ hashFiles('Cargo.lock') }}
@@ -100,9 +101,16 @@ jobs:
                   -o -name "ironmesh_*_arm64.buildinfo" \) \
                 -exec cp -v {} artifacts/ \;
             '
-          # actions/cache runs its post-job save as the runner user, but the
-          # container wrote the cache as root; hand ownership back so it saves.
+          # The explicit save step runs as the runner user, but the container
+          # wrote the cache as root; hand ownership back before that step.
           sudo chown -R "$(id -u):$(id -g)" "$sccache_dir" || true
+
+      - name: Save sccache (ARM64 Focal build)
+        if: ${{ github.event_name != 'pull_request' && steps.restore-sccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/sccache-arm64
+          key: ${{ steps.restore-sccache.outputs.cache-primary-key }}
 
       - name: Upload Focal ARM64 Debian packages
         uses: actions/upload-artifact@v4

@@ -57,6 +57,9 @@ Pull request jobs restore the shared Rust caches but do not write them:
   already cached on `main` remain available;
 - every `Swatinem/rust-cache` path, including the shared Android composite
   action, uses `save-if: ${{ github.event_name != 'pull_request' }}`.
+- the Focal ARM64 package build restores its mounted on-disk sccache with
+  `actions/cache/restore`, then runs `actions/cache/save` only for trusted
+  non-pull-request events.
 
 GitHub scopes pull request cache writes to the pull request merge ref. Those
 entries are not reusable by `main` or unrelated pull requests, so allowing
