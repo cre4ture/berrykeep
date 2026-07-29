@@ -234,19 +234,14 @@ type GalleryGridCollection = {
 
 type GalleryWorldMarkerPoint = ClusterableScreenPoint<GalleryEntry>;
 
-type GallerySurfaceProps = {
-  intro?: string;
-  previewHint: string;
-  initialViewMode?: GalleryViewMode;
-  basemaps?: GalleryBasemapConfig[] | null;
-  /** Cluster-configured initial choice. A config update overrides an old local choice. */
-  preferredBasemapId?: string | null;
-  /** True while the caller is resolving the cluster-configured map variants. */
-  basemapConfigurationLoading?: boolean;
-  /** A refresh failure is shown without discarding a previously loaded map. */
-  basemapConfigurationError?: string | null;
-  retryBasemapConfiguration?: () => void;
-  allowedMediaKinds?: GalleryMediaKind[];
+/**
+ * Application-specific gallery transport and media behavior.
+ *
+ * Keeping this boundary free of authentication and cache implementation details
+ * lets the client and admin applications share the complete gallery surface
+ * while retaining their own API clients and query caches.
+ */
+export type GalleryDataSource = {
   loadSnapshots: () => Promise<GallerySnapshot[]>;
   loadEntries: (
     prefix: string,
@@ -267,6 +262,22 @@ type GallerySurfaceProps = {
   ) => Promise<GalleryEntry["media"] | null>;
 };
 
+type GallerySurfaceProps = {
+  intro?: string;
+  previewHint: string;
+  initialViewMode?: GalleryViewMode;
+  basemaps?: GalleryBasemapConfig[] | null;
+  /** Cluster-configured initial choice. A config update overrides an old local choice. */
+  preferredBasemapId?: string | null;
+  /** True while the caller is resolving the cluster-configured map variants. */
+  basemapConfigurationLoading?: boolean;
+  /** A refresh failure is shown without discarding a previously loaded map. */
+  basemapConfigurationError?: string | null;
+  retryBasemapConfiguration?: () => void;
+  allowedMediaKinds?: GalleryMediaKind[];
+  dataSource: GalleryDataSource;
+};
+
 export function GallerySurface({
   intro,
   previewHint,
@@ -277,13 +288,16 @@ export function GallerySurface({
   basemapConfigurationError,
   retryBasemapConfiguration,
   allowedMediaKinds,
-  loadSnapshots,
-  loadEntries,
-  getMediaRequests,
-  loadVersions,
-  restoreVersion,
-  retryMediaEntry
+  dataSource
 }: GallerySurfaceProps) {
+  const {
+    loadSnapshots,
+    loadEntries,
+    getMediaRequests,
+    loadVersions,
+    restoreVersion,
+    retryMediaEntry
+  } = dataSource;
   const [prefix, setPrefix] = useState("");
   const [depth, setDepth] = useState(4);
   const [thumbnailsPerRow, setThumbnailsPerRow] = useState(loadStoredThumbnailsPerRow);
