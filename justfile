@@ -52,10 +52,13 @@ test-all:
     just test-system-nightly
 
 test-system-nightly:
-    cargo +nightly -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml
+    cargo +nightly -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml --lib
 
 test-system-nightly-one name:
-    cargo +nightly -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml --lib -- {{name}} --exact --nocapture
+    cargo +nightly -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml --lib -- {{ name }} --exact --nocapture
+
+test-quic-network:
+    cargo +nightly -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml --test quic_network -- --test-threads=1 --nocapture
 
 ci-stable:
     cargo fmt --all -- --check
@@ -68,6 +71,7 @@ ci-required:
     just coverage
     just ci-web-smoke
     just test-system-nightly
+    if [[ "$$(uname -s)" == "Linux" ]]; then just test-quic-network; fi
 
 ci-ios:
     cargo test --locked -p ios-app
