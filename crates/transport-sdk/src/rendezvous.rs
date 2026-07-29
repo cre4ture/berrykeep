@@ -72,6 +72,8 @@ pub struct IrohRelayTicket {
     pub public_urls: Vec<String>,
     pub auth_token: String,
     pub expires_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_port: Option<u16>,
 }
 
 impl std::fmt::Debug for IrohRelayTicket {
@@ -81,6 +83,7 @@ impl std::fmt::Debug for IrohRelayTicket {
             .field("public_urls", &self.public_urls)
             .field("auth_token", &"[REDACTED]")
             .field("expires_at_unix", &self.expires_at_unix)
+            .field("quic_port", &self.quic_port)
             .finish()
     }
 }
@@ -96,6 +99,9 @@ impl IrohRelayTicket {
         }
         if self.expires_at_unix == 0 {
             bail!("iroh relay ticket expires_at_unix must be greater than zero");
+        }
+        if self.quic_port == Some(0) {
+            bail!("iroh relay ticket quic_port must be greater than zero when present");
         }
         Ok(())
     }
@@ -1136,6 +1142,7 @@ mod tests {
             public_urls: vec!["https://rendezvous.example".to_string()],
             auth_token: "sensitive-endpoint-ticket".to_string(),
             expires_at_unix: 10_000,
+            quic_port: Some(7842),
         };
         ticket.validate().expect("valid relay ticket should pass");
         let debug = format!("{ticket:?}");

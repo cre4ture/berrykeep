@@ -23,6 +23,7 @@ pub(super) fn write_node_tls(
     cluster_id: Uuid,
     node_id: Uuid,
     node_ip: Ipv4Addr,
+    rendezvous_ip: Ipv4Addr,
 ) -> Result<NodeTlsPaths> {
     fs::create_dir_all(root)
         .with_context(|| format!("failed creating TLS directory {}", root.display()))?;
@@ -44,6 +45,9 @@ pub(super) fn write_node_tls(
     node_params
         .subject_alt_names
         .push(SanType::IpAddress(IpAddr::V4(node_ip)));
+    node_params
+        .subject_alt_names
+        .push(SanType::IpAddress(IpAddr::V4(rendezvous_ip)));
     node_params
         .subject_alt_names
         .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));

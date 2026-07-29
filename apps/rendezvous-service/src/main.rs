@@ -37,6 +37,8 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
     if let Some(iroh_relay) = config.iroh_relay.as_ref() {
         info!(
             public_urls = ?iroh_relay.public_urls,
+            quic_bind_addr = ?iroh_relay.quic.as_ref().map(|quic| quic.bind_addr),
+            quic_public_port = ?iroh_relay.quic.as_ref().map(|quic| quic.public_port),
             client_rx_bytes_per_second = iroh_relay.client_rx_bytes_per_second,
             ticket_ttl_secs = iroh_relay.ticket_ttl.as_secs(),
             "embedded authenticated iroh relay enabled on rendezvous listener"
@@ -98,6 +100,7 @@ mod tests {
                 ticket_ttl: Duration::from_secs(300),
                 client_rx_bytes_per_second: 16 * 1024 * 1024,
                 client_rx_max_burst_bytes: 32 * 1024 * 1024,
+                quic: None,
             }),
             peer_rendezvous_urls: Vec::new(),
             mtls: Some(config::RendezvousMtlsConfig {
@@ -308,6 +311,7 @@ mod tests {
             .map(|url| DirectQuicRelayConfig {
                 url: url.clone(),
                 auth_token: Some(ticket.auth_token.clone()),
+                quic_port: ticket.quic_port,
             })
             .collect::<Vec<_>>();
         endpoint
@@ -331,6 +335,7 @@ mod tests {
                 ticket_ttl: Duration::from_secs(300),
                 client_rx_bytes_per_second: 16 * 1024 * 1024,
                 client_rx_max_burst_bytes: 32 * 1024 * 1024,
+                quic: None,
             }),
             peer_rendezvous_urls: Vec::new(),
             mtls: None,

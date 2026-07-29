@@ -254,14 +254,14 @@ IronMesh Client CLI in separate Patchbay network namespaces. It covers:
 - the same blocked-UDP profile with the Iroh relay disabled, and requires the
   IronMesh relay tunnel to remain usable;
 - a fault endpoint that accepts but stalls Iroh relay-ticket requests. A
-  held-open Direct QUIC SDK probe verifies the three-second timeout while the
-  CLI remains usable through the IronMesh relay fallback.
+  CLI request before and after the three-second ticket budget verifies that the
+  stalled background refresh never blocks the IronMesh relay fallback.
 
 The CLI exercises the same client SDK and managed routing implementation used
 by app shells, so no phone simulator is needed for these transport assertions.
-The narrow SDK probe in the ticket-fault case exists only to keep the
-intentionally stalled Direct QUIC attempt alive long enough to observe its
-timeout deterministically.
+The Home-NAT case also runs the Rendezvous relay's UDP QUIC Address Discovery
+(QAD) endpoint. Without QAD, peers behind separate NATs cannot learn their
+public UDP mappings and Iroh correctly remains on its packet-forwarding relay.
 
 ### 2) Verify stable lanes are still healthy
 

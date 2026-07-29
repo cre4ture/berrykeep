@@ -48,11 +48,11 @@ use crate::iroh_relay::IrohRelayRuntime;
 
 pub use crate::auth::GlobalClusterClientCertVerifier;
 pub use crate::cluster_registry::{ClusterCaRecord, ClusterCaRegistry, cluster_ca_fingerprint};
-pub use crate::iroh_relay::IrohRelayServerConfig;
+pub use crate::iroh_relay::{IrohRelayQuicServerConfig, IrohRelayServerConfig};
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RendezvousServerTlsIdentity {
     Files {
         cert_path: PathBuf,
@@ -278,6 +278,11 @@ pub async fn serve(state: RendezvousAppState) -> Result<()> {
     let app = build_router(state.clone());
     spawn_mesh_probe_task(state.mesh_peers.clone());
     let relay_service = state.iroh_relay.as_ref().map(IrohRelayRuntime::service);
+    let quic_server = if let Some(relay) = state.iroh_relay.as_ref() {
+        relay.spawn_quic_server().await?
+    } else {
+        None
+    };
 
     let tls_config = if let Some(mtls) = state.config.mtls.as_ref() {
         let tls_config = if let Some(global) = mtls.global_mtls_config() {
@@ -309,6 +314,12 @@ pub async fn serve(state: RendezvousAppState) -> Result<()> {
     };
     if let Some(relay_service) = relay_service {
         relay_service.shutdown().await;
+    }
+    if let Some(quic_server) = quic_server {
+        quic_server
+            .shutdown()
+            .await
+            .context("embedded iroh QAD server shutdown failed")?;
     }
     result?;
     Ok(())

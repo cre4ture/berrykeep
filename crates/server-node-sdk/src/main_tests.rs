@@ -55,6 +55,7 @@ fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
                 ],
                 auth_token: "token-b".to_string(),
                 expires_at_unix: 10_000,
+                quic_port: Some(7843),
             },
         ),
         (
@@ -66,6 +67,7 @@ fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
                 ],
                 auth_token: "token-a".to_string(),
                 expires_at_unix: 10_000,
+                quic_port: Some(7842),
             },
         ),
     ]);
@@ -76,14 +78,17 @@ fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
             transport_sdk::DirectQuicRelayConfig {
                 url: "https://relay-a.example".to_string(),
                 auth_token: Some("token-a".to_string()),
+                quic_port: Some(7842),
             },
             transport_sdk::DirectQuicRelayConfig {
                 url: "https://relay-b.example".to_string(),
                 auth_token: Some("token-b".to_string()),
+                quic_port: Some(7843),
             },
             transport_sdk::DirectQuicRelayConfig {
                 url: "https://shared-relay.example".to_string(),
                 auth_token: Some("token-b".to_string()),
+                quic_port: Some(7843),
             },
         ]
     );

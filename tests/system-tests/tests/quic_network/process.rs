@@ -21,6 +21,7 @@ pub(super) const RENDEZVOUS_PORT: u16 = 19_090;
 pub(super) const NODE_PUBLIC_PORT: u16 = 18_080;
 pub(super) const NODE_INTERNAL_PORT: u16 = 28_080;
 pub(super) const CLI_WEB_PORT: u16 = 18_081;
+pub(super) const IROH_QAD_PORT: u16 = 7_842;
 pub(super) const PROCESS_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(super) struct ProcessGuard {
@@ -80,6 +81,7 @@ pub(super) fn spawn_rendezvous(
     artifacts: &Path,
     public_url: &str,
     iroh_relay_enabled: bool,
+    tls: &NodeTlsPaths,
 ) -> Result<ProcessGuard> {
     let stdout_path = artifacts.join("rendezvous.stdout.log");
     let stderr_path = artifacts.join("rendezvous.stderr.log");
@@ -96,6 +98,13 @@ pub(super) fn spawn_rendezvous(
             "IRONMESH_IROH_RELAY_ENABLED",
             if iroh_relay_enabled { "true" } else { "false" },
         )
+        .env(
+            "IRONMESH_IROH_RELAY_QUIC_BIND",
+            format!("0.0.0.0:{IROH_QAD_PORT}"),
+        )
+        .env("IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT", IROH_QAD_PORT.to_string())
+        .env("IRONMESH_IROH_RELAY_QUIC_TLS_CERT", &tls.node_cert)
+        .env("IRONMESH_IROH_RELAY_QUIC_TLS_KEY", &tls.node_key)
         .env("RUST_LOG", "info")
         .stdout(Stdio::from(fs::File::create(&stdout_path)?))
         .stderr(Stdio::from(fs::File::create(&stderr_path)?));

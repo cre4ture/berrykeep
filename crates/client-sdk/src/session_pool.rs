@@ -1149,6 +1149,7 @@ fn iroh_relay_configs_from_ticket(
         .map(|url| transport_sdk::DirectQuicRelayConfig {
             url: url.clone(),
             auth_token: Some(ticket.auth_token.clone()),
+            quic_port: ticket.quic_port,
         })
         .collect()
 }

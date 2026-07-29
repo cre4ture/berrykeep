@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use runtime::ScenarioRuntime;
 
@@ -141,27 +141,21 @@ async fn exercise_and_assert(runtime: &mut ScenarioRuntime, scenario: Scenario) 
     );
 
     if scenario.stall_iroh_ticket {
-        let ticket_requests_before = runtime.ticket_request_count()?;
-        let probe = runtime
-            .probe_direct_quic_ticket_timeout()
-            .await
-            .context("failed exercising the stalled Direct QUIC ticket path")?;
-        ensure!(
-            !probe.succeeded,
-            "Direct QUIC unexpectedly succeeded despite blocked UDP and a stalled relay ticket"
-        );
-        ensure!(
-            probe.elapsed >= Duration::from_millis(2_800),
-            "Direct QUIC failed before the three-second relay-ticket timeout: {:?} ({})",
-            probe.elapsed,
-            probe.error.as_deref().unwrap_or("no error")
-        );
         let ticket_requests_after = runtime.ticket_request_count()?;
         ensure!(
-            ticket_requests_after > ticket_requests_before,
-            "the deterministic Direct QUIC probe never reached the stalled ticket endpoint \
-             (before={ticket_requests_before}, after={ticket_requests_after})"
+            ticket_requests_after > 0,
+            "the CLI never reached the intentionally stalled Iroh ticket endpoint"
         );
+        // Keep the fault active beyond the client-side ticket budget. The CLI
+        // must continue serving storage through the IronMesh relay while that
+        // background refresh is stalled.
+        sleep(Duration::from_millis(3_500)).await;
+        runtime
+            .store_list()
+            .await
+            .context("CLI fallback stopped working after the Iroh ticket timeout budget")?;
+        let routes_after_timeout = runtime.connection_routes().await?;
+        assert_expected_route(&routes_after_timeout, ExpectedRoute::RelayTunnel)?;
     }
     Ok(())
 }

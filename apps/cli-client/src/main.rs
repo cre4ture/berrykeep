@@ -20,6 +20,7 @@ use serde::Serialize;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use tracing_subscriber::filter::Directive;
@@ -77,7 +78,39 @@ struct S3GatewayState {
 
 struct CliClientHolder {
     client: IronMeshClient,
-    _managed_client: Option<ManagedIronMeshClient>,
+    _managed_client: Option<ManagedCliClient>,
+}
+
+struct ManagedCliClient {
+    _client: ManagedIronMeshClient,
+    _runtime: ManagedCliRuntime,
+}
+
+struct ManagedCliRuntime {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ManagedCliRuntime {
+    fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ManagedCliRuntime {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl CliClientHolder {
@@ -88,15 +121,77 @@ impl CliClientHolder {
         }
     }
 
-    fn managed(managed_client: ManagedIronMeshClient) -> Self {
+    fn managed(managed_client: ManagedIronMeshClient, runtime: ManagedCliRuntime) -> Self {
         Self {
             client: managed_client.client(),
-            _managed_client: Some(managed_client),
+            _managed_client: Some(ManagedCliClient {
+                _client: managed_client,
+                _runtime: runtime,
+            }),
         }
     }
 
     fn client(&self) -> &IronMeshClient {
         &self.client
+    }
+}
+
+fn build_managed_cli_client(
+    bootstrap: ConnectionBootstrap,
+    identity: ClientIdentityMaterial,
+) -> Result<(ManagedIronMeshClient, ManagedCliRuntime)> {
+    const MANAGED_CLI_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let thread = std::thread::Builder::new()
+        .name("ironmesh-cli-managed-runtime".to_string())
+        .stack_size(MANAGED_CLI_STACK_SIZE)
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build managed CLI client runtime")
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = result_tx.send(Err(error));
+                    return;
+                }
+            };
+            match runtime.block_on(
+                bootstrap
+                    .build_managed_client_with_identity(identity, ManagedClientOptions::default()),
+            ) {
+                Ok(managed_client) => {
+                    if result_tx.send(Ok(managed_client)).is_ok() {
+                        runtime.block_on(async {
+                            let _ = shutdown_rx.await;
+                        });
+                    }
+                }
+                Err(error) => {
+                    let _ = result_tx.send(Err(error));
+                }
+            }
+        })
+        .context("failed spawning managed CLI client runtime thread")?;
+    let runtime = ManagedCliRuntime {
+        shutdown: Some(shutdown_tx),
+        thread: Some(thread),
+    };
+    match result_rx.recv() {
+        Ok(Ok(managed_client)) => Ok((managed_client, runtime)),
+        Ok(Err(error)) => {
+            runtime.shutdown();
+            Err(error)
+        }
+        Err(error) => {
+            runtime.shutdown();
+            Err(anyhow::anyhow!(
+                "managed CLI client runtime exited before initialization: {error}"
+            ))
+        }
     }
 }
 
@@ -642,12 +737,7 @@ async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> 
         let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
         let client_holder = match client_identity.as_ref() {
             Some(identity) => {
-                let managed = bootstrap
-                    .build_managed_client_with_identity(
-                        identity.clone(),
-                        ManagedClientOptions::default(),
-                    )
-                    .await?;
+                let (managed, runtime) = build_managed_cli_client(bootstrap, identity.clone())?;
                 if let Some(renewed_identity) = managed.take_identity_update() {
                     match persist_renewed_client_identity(
                         client_identity_path.as_deref(),
@@ -664,7 +754,7 @@ async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> 
                         ),
                     }
                 }
-                CliClientHolder::managed(managed)
+                CliClientHolder::managed(managed, runtime)
             }
             None => CliClientHolder::unmanaged(bootstrap.build_client()?),
         };

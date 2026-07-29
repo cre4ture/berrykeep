@@ -8607,18 +8607,25 @@ fn direct_quic_relay_configs_from_tickets(
 ) -> Vec<DirectQuicRelayConfig> {
     let mut sources = tickets.iter().collect::<Vec<_>>();
     sources.sort_by_key(|(source, _)| *source);
-    let mut relays = BTreeMap::<String, Option<String>>::new();
+    let mut relays = BTreeMap::<String, (Option<String>, Option<u16>)>::new();
     for (_, advertisement) in sources {
         for public_url in &advertisement.public_urls {
             relays.insert(
                 public_url.trim().trim_end_matches('/').to_string(),
-                Some(advertisement.auth_token.clone()),
+                (
+                    Some(advertisement.auth_token.clone()),
+                    advertisement.quic_port,
+                ),
             );
         }
     }
     relays
         .into_iter()
-        .map(|(url, auth_token)| DirectQuicRelayConfig { url, auth_token })
+        .map(|(url, (auth_token, quic_port))| DirectQuicRelayConfig {
+            url,
+            auth_token,
+            quic_port,
+        })
         .collect()
 }
 

@@ -5,15 +5,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use client_sdk::{
-    ClientIdentityMaterial, ConnectionBootstrap,
-    build_client_with_optional_identity_from_planned_target,
-};
+use client_sdk::ConnectionBootstrap;
 use patchbay::{Device, Lab, Nat, OutDir, Router, RouterPreset};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
-use transport_sdk::TransportPathKind;
 use uuid::Uuid;
 
 use super::{
@@ -28,18 +24,8 @@ use super::{
 
 const ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(50);
 const DEVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
-const DIRECT_QUIC_FAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(18);
-
-pub(super) struct DirectQuicFaultProbe {
-    pub(super) elapsed: Duration,
-    pub(super) succeeded: bool,
-    pub(super) error: Option<String>,
-}
-
 pub(super) struct ScenarioRuntime {
     client: Device,
-    bootstrap: ConnectionBootstrap,
-    identity: ClientIdentityMaterial,
     web_base_url: String,
     cli: ProcessGuard,
     node: ProcessGuard,
@@ -89,12 +75,22 @@ impl ScenarioRuntime {
         let node_ip = node_device
             .ip()
             .context("node device has no IPv4 address")?;
+        let cluster_id = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        let tls = write_node_tls(
+            &artifacts.join("node-tls"),
+            cluster_id,
+            node_id,
+            node_ip,
+            rendezvous_ip,
+        )?;
         let rendezvous_url = format!("http://{rendezvous_ip}:{RENDEZVOUS_PORT}");
         let mut rendezvous = spawn_rendezvous(
             &rendezvous_device,
             &artifacts,
             &rendezvous_url,
             scenario.iroh_relay_enabled,
+            &tls,
         )?;
         wait_for_status(
             &rendezvous_device,
@@ -104,9 +100,6 @@ impl ScenarioRuntime {
         .await?;
         rendezvous.ensure_running()?;
 
-        let cluster_id = Uuid::new_v4();
-        let node_id = Uuid::new_v4();
-        let tls = write_node_tls(&artifacts.join("node-tls"), cluster_id, node_id, node_ip)?;
         let mut node = spawn_node(
             &node_device,
             &artifacts,
@@ -136,9 +129,6 @@ impl ScenarioRuntime {
         } else {
             None
         };
-        let bootstrap = ConnectionBootstrap::from_path(&bootstrap_path)?;
-        let identity = ClientIdentityMaterial::from_path(&identity_path)?;
-
         let mut cli = spawn_cli_web(&client_device, &artifacts, &bootstrap_path, &identity_path)?;
         let web_base_url = format!("http://127.0.0.1:{CLI_WEB_PORT}");
         wait_for_status(
@@ -152,8 +142,6 @@ impl ScenarioRuntime {
 
         Ok(Self {
             client: client_device,
-            bootstrap,
-            identity,
             web_base_url,
             cli,
             node,
@@ -210,53 +198,6 @@ impl ScenarioRuntime {
             .as_ref()
             .map(TicketTimeoutServer::ticket_request_count)
             .context("scenario has no Iroh ticket fault server")
-    }
-
-    pub(super) async fn probe_direct_quic_ticket_timeout(
-        &self,
-    ) -> Result<DirectQuicFaultProbe> {
-        let bootstrap = self.bootstrap.clone();
-        let identity = self.identity.clone();
-        self.client
-            .spawn(move |_device| async move {
-                let targets = bootstrap
-                    .refresh_dynamic_targets(Some(&identity))
-                    .await
-                    .context("failed refreshing direct QUIC probe targets")?;
-                let target = targets
-                    .into_iter()
-                    .find(|target| target.path_kind == TransportPathKind::DirectQuic)
-                    .context("dynamic discovery returned no Direct QUIC target")?;
-                let client = build_client_with_optional_identity_from_planned_target(
-                    &target,
-                    Some(&identity),
-                )
-                .context("failed building Direct QUIC probe client")?;
-
-                let started = Instant::now();
-                let (succeeded, error) = match timeout(
-                    DIRECT_QUIC_FAULT_PROBE_TIMEOUT,
-                    client.store_index(None, 1, None),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => (true, None),
-                    Ok(Err(error)) => (false, Some(format!("{error:#}"))),
-                    Err(_) => (
-                        false,
-                        Some(format!(
-                            "Direct QUIC probe exceeded {DIRECT_QUIC_FAULT_PROBE_TIMEOUT:?}"
-                        )),
-                    ),
-                };
-                Ok(DirectQuicFaultProbe {
-                    elapsed: started.elapsed(),
-                    succeeded,
-                    error,
-                })
-            })?
-            .await
-            .context("Direct QUIC fault probe task panicked")?
     }
 
     pub(super) async fn stop(mut self) {

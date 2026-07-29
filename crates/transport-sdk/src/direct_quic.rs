@@ -12,7 +12,7 @@ use base64::Engine;
 use iroh::endpoint::{RecvStream, SendStream, presets};
 use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey, TransportAddr};
-use iroh_relay::{RelayConfig, RelayMap};
+use iroh_relay::{RelayConfig, RelayMap, RelayQuicConfig};
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -58,6 +58,7 @@ impl std::fmt::Debug for DirectQuicEndpointConfig {
 pub struct DirectQuicRelayConfig {
     pub url: String,
     pub auth_token: Option<String>,
+    pub quic_port: Option<u16>,
 }
 
 impl std::fmt::Debug for DirectQuicRelayConfig {
@@ -69,6 +70,7 @@ impl std::fmt::Debug for DirectQuicRelayConfig {
                 "auth_token",
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("quic_port", &self.quic_port)
             .finish()
     }
 }
@@ -82,14 +84,22 @@ pub struct DirectQuicEndpointSnapshot {
     pub alpn: String,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ConfiguredRelay {
+    auth_token: Option<String>,
+    quic_port: Option<u16>,
+}
+
+type ConfiguredRelays = BTreeMap<String, ConfiguredRelay>;
+
 #[derive(Clone)]
 pub struct DirectQuicEndpoint {
     endpoint: Endpoint,
     alpn: String,
     relay_enabled: bool,
-    static_relays: Arc<BTreeMap<String, Option<String>>>,
-    dynamic_relays: Arc<Mutex<BTreeMap<String, Option<String>>>>,
-    configured_relays: Arc<Mutex<BTreeMap<String, Option<String>>>>,
+    static_relays: Arc<ConfiguredRelays>,
+    dynamic_relays: Arc<Mutex<ConfiguredRelays>>,
+    configured_relays: Arc<Mutex<ConfiguredRelays>>,
 }
 
 pub struct DirectQuicAcceptedConnection {
@@ -160,6 +170,7 @@ impl DirectQuicEndpoint {
             .map(|url| DirectQuicRelayConfig {
                 url: url.trim().to_string(),
                 auth_token: config.relay_auth_token.clone(),
+                quic_port: None,
             })
             .collect::<Vec<_>>();
         // Keep the relay transport present when tickets may be installed later.
@@ -189,7 +200,10 @@ impl DirectQuicEndpoint {
             .map(|relay| {
                 (
                     normalize_relay_url(&relay.url).to_string(),
-                    relay.auth_token,
+                    ConfiguredRelay {
+                        auth_token: relay.auth_token,
+                        quic_port: relay.quic_port,
+                    },
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -219,7 +233,10 @@ impl DirectQuicEndpoint {
                 validate_relay_config(relay)?;
                 Ok((
                     normalize_relay_url(&relay.url).to_string(),
-                    relay.auth_token.clone(),
+                    ConfiguredRelay {
+                        auth_token: relay.auth_token.clone(),
+                        quic_port: relay.quic_port,
+                    },
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
@@ -236,7 +253,7 @@ impl DirectQuicEndpoint {
             desired_effective.extend(
                 self.static_relays
                     .iter()
-                    .map(|(url, token)| (url.clone(), token.clone())),
+                    .map(|(url, config)| (url.clone(), config.clone())),
             );
 
             let removed = configured
@@ -246,10 +263,11 @@ impl DirectQuicEndpoint {
                 .collect::<Vec<_>>();
             let upserted = desired_effective
                 .iter()
-                .filter(|(url, token)| configured.get(*url) != Some(*token))
-                .map(|(url, token)| DirectQuicRelayConfig {
+                .filter(|(url, config)| configured.get(*url) != Some(*config))
+                .map(|(url, config)| DirectQuicRelayConfig {
                     url: url.clone(),
-                    auth_token: token.clone(),
+                    auth_token: config.auth_token.clone(),
+                    quic_port: config.quic_port,
                 })
                 .collect::<Vec<_>>();
             *dynamic = desired_dynamic;
@@ -307,8 +325,7 @@ impl DirectQuicEndpoint {
             .and_then(|relay_url| {
                 self.static_relays
                     .get(normalize_relay_url(relay_url))
-                    .cloned()
-                    .flatten()
+                    .and_then(|config| config.auth_token.clone())
             });
         if let Some(hints) = candidate.transport_hints.as_mut() {
             hints.relay_auth_token = relay_auth_token;
@@ -423,7 +440,8 @@ fn iroh_relay_config(relay: &DirectQuicRelayConfig) -> Result<(RelayUrl, RelayCo
         .trim()
         .parse::<RelayUrl>()
         .with_context(|| format!("invalid direct QUIC relay URL {}", relay.url))?;
-    let mut config = RelayConfig::new(url.clone(), None);
+    let quic = relay.quic_port.map(RelayQuicConfig::new);
+    let mut config = RelayConfig::new(url.clone(), quic);
     if let Some(auth_token) = relay.auth_token.as_deref() {
         config = config.with_auth_token(auth_token);
     }
@@ -442,6 +460,9 @@ fn validate_relay_config(relay: &DirectQuicRelayConfig) -> Result<()> {
         .is_some_and(|value| value.trim().is_empty())
     {
         bail!("direct QUIC relay auth token must not be blank when present");
+    }
+    if relay.quic_port == Some(0) {
+        bail!("direct QUIC relay QUIC port must be greater than zero when present");
     }
     Ok(())
 }
@@ -791,6 +812,7 @@ mod tests {
         let relay = DirectQuicRelayConfig {
             url: "http://127.0.0.1:9/".to_string(),
             auth_token: Some("first-token".to_string()),
+            quic_port: Some(7842),
         };
 
         assert_eq!(
@@ -851,6 +873,7 @@ mod tests {
         let relay = DirectQuicRelayConfig {
             url: "https://relay.example".to_string(),
             auth_token: Some("sensitive-relay-token".to_string()),
+            quic_port: Some(7842),
         };
 
         let debug = format!("{endpoint:?} {relay:?}");
