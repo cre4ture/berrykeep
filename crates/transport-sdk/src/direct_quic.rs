@@ -27,6 +27,10 @@ pub const DEFAULT_DIRECT_QUIC_ALPN: &str = "ironmesh/transport/1";
 #[derive(Clone)]
 pub struct DirectQuicEndpointConfig {
     pub secret_key: SecretKey,
+    /// Whether this endpoint may use relay transport.  A direct-only fallback
+    /// must leave this disabled so an authenticated IronMesh relay cannot be
+    /// attempted without the endpoint-bound ticket that authorizes it.
+    pub relay_enabled: bool,
     pub relay_urls: Vec<String>,
     pub relay_auth_token: Option<String>,
     pub relay_ca_pem: Option<String>,
@@ -38,6 +42,7 @@ impl std::fmt::Debug for DirectQuicEndpointConfig {
         formatter
             .debug_struct("DirectQuicEndpointConfig")
             .field("secret_key", &"[REDACTED]")
+            .field("relay_enabled", &self.relay_enabled)
             .field("relay_urls", &self.relay_urls)
             .field(
                 "relay_auth_token",
@@ -81,6 +86,7 @@ pub struct DirectQuicEndpointSnapshot {
 pub struct DirectQuicEndpoint {
     endpoint: Endpoint,
     alpn: String,
+    relay_enabled: bool,
     static_relays: Arc<BTreeMap<String, Option<String>>>,
     dynamic_relays: Arc<Mutex<BTreeMap<String, Option<String>>>>,
     configured_relays: Arc<Mutex<BTreeMap<String, Option<String>>>>,
@@ -106,6 +112,7 @@ impl DirectQuicEndpointConfig {
     pub fn new(secret_key: SecretKey) -> Self {
         Self {
             secret_key,
+            relay_enabled: true,
             relay_urls: Vec::new(),
             relay_auth_token: None,
             relay_ca_pem: None,
@@ -130,6 +137,9 @@ impl DirectQuicEndpointConfig {
         {
             bail!("direct QUIC relay auth token must not be blank when present");
         }
+        if !self.relay_enabled && (!self.relay_urls.is_empty() || self.relay_auth_token.is_some()) {
+            bail!("direct QUIC relay configuration requires relay transport to be enabled");
+        }
         if self.relay_urls.is_empty() && self.relay_auth_token.is_some() {
             bail!("direct QUIC relay auth token requires at least one relay URL");
         }
@@ -152,11 +162,15 @@ impl DirectQuicEndpoint {
                 auth_token: config.relay_auth_token.clone(),
             })
             .collect::<Vec<_>>();
-        // Keep the relay transport present even when no static relay is known.
-        // Iroh supports adding relays to an empty custom map at runtime, whereas
-        // RelayMode::Disabled permanently omits the relay transport and later
-        // insert_relay calls cannot bring the endpoint online.
-        let relay_mode = RelayMode::Custom(relay_map(&configured_relays)?);
+        // Keep the relay transport present when tickets may be installed later.
+        // Direct-only fallback endpoints deliberately use RelayMode::Disabled:
+        // a candidate relay address alone must never bypass endpoint-ticket
+        // authentication on an IronMesh relay.
+        let relay_mode = if config.relay_enabled {
+            RelayMode::Custom(relay_map(&configured_relays)?)
+        } else {
+            RelayMode::Disabled
+        };
 
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)
             .secret_key(config.secret_key)
@@ -182,6 +196,7 @@ impl DirectQuicEndpoint {
         Ok(Self {
             endpoint,
             alpn: config.alpn,
+            relay_enabled: config.relay_enabled,
             static_relays: Arc::new(static_relays.clone()),
             dynamic_relays: Arc::new(Mutex::new(BTreeMap::new())),
             configured_relays: Arc::new(Mutex::new(static_relays)),
@@ -195,6 +210,9 @@ impl DirectQuicEndpoint {
         &self,
         relays: &[DirectQuicRelayConfig],
     ) -> Result<usize> {
+        if !self.relay_enabled {
+            bail!("cannot install relays on a direct-only QUIC endpoint");
+        }
         let desired_dynamic = relays
             .iter()
             .map(|relay| {
@@ -303,7 +321,7 @@ impl DirectQuicEndpoint {
         candidate: &ConnectionCandidate,
         config: MultiplexConfig,
     ) -> Result<DirectQuicSession> {
-        let endpoint_addr = endpoint_addr_from_candidate(candidate)?;
+        let endpoint_addr = endpoint_addr_from_candidate_with_relay(candidate, self.relay_enabled)?;
         let remote_endpoint_id = endpoint_addr.id.to_string();
         let alpn = candidate
             .transport_hints
@@ -549,6 +567,13 @@ pub fn endpoint_id_from_candidate(candidate: &ConnectionCandidate) -> Result<Str
 }
 
 pub fn endpoint_addr_from_candidate(candidate: &ConnectionCandidate) -> Result<EndpointAddr> {
+    endpoint_addr_from_candidate_with_relay(candidate, true)
+}
+
+fn endpoint_addr_from_candidate_with_relay(
+    candidate: &ConnectionCandidate,
+    include_relay: bool,
+) -> Result<EndpointAddr> {
     let endpoint_id = endpoint_id_from_candidate(candidate)?;
     let endpoint_id = endpoint_id
         .parse()
@@ -556,7 +581,7 @@ pub fn endpoint_addr_from_candidate(candidate: &ConnectionCandidate) -> Result<E
 
     let mut addrs = Vec::new();
     if let Some(hints) = candidate.transport_hints.as_ref() {
-        if let Some(relay_url) = hints.relay_url.as_deref() {
+        if include_relay && let Some(relay_url) = hints.relay_url.as_deref() {
             addrs.push(TransportAddr::Relay(
                 relay_url
                     .parse::<RelayUrl>()
@@ -610,6 +635,37 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
     Ok(secret_key)
 }
 
+/// Returns peer addresses that can actually be dialed.  Candidates are shared
+/// across machines, so wildcard bind addresses describe the *publisher's*
+/// socket rather than a remote route.
+pub fn usable_peer_socket_addrs_from_candidate(
+    candidate: &ConnectionCandidate,
+) -> Result<Vec<SocketAddr>> {
+    let Some(hints) = candidate.transport_hints.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut values =
+        Vec::with_capacity(hints.direct_socket_addrs.len() + hints.observed_socket_addrs.len());
+    values.extend(hints.direct_socket_addrs.iter());
+    values.extend(hints.observed_socket_addrs.iter());
+
+    let mut addrs = Vec::new();
+    for value in values {
+        let addr = value
+            .trim()
+            .parse::<SocketAddr>()
+            .with_context(|| format!("invalid direct QUIC socket address {value}"))?;
+        if !addr.ip().is_unspecified() && addr.port() != 0 && !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+    Ok(addrs)
+}
+
+pub fn has_usable_peer_addresses(candidate: &ConnectionCandidate) -> Result<bool> {
+    Ok(!usable_peer_socket_addrs_from_candidate(candidate)?.is_empty())
+}
+
 fn socket_addrs_to_transport_addrs(values: &[String]) -> Result<Vec<TransportAddr>> {
     let mut addrs = Vec::new();
     for value in values {
@@ -617,7 +673,10 @@ fn socket_addrs_to_transport_addrs(values: &[String]) -> Result<Vec<TransportAdd
             .trim()
             .parse::<SocketAddr>()
             .with_context(|| format!("invalid direct QUIC socket address {value}"))?;
-        if !addrs.contains(&TransportAddr::Ip(addr)) {
+        if !addr.ip().is_unspecified()
+            && addr.port() != 0
+            && !addrs.contains(&TransportAddr::Ip(addr))
+        {
             addrs.push(TransportAddr::Ip(addr));
         }
     }
@@ -668,6 +727,45 @@ mod tests {
                 .as_ref()
                 .and_then(|hints| hints.transport_id.as_deref()),
             Some("peer-key-1")
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_addresses_are_not_usable_peer_addresses() {
+        let candidate = ConnectionCandidate {
+            kind: CandidateKind::DirectQuic,
+            endpoint: "iroh://peer-key-1".to_string(),
+            rtt_ms: None,
+            transport_hints: Some(ConnectionCandidateTransportHints {
+                transport_id: Some("peer-key-1".to_string()),
+                relay_url: None,
+                relay_auth_token: None,
+                alpn: None,
+                direct_socket_addrs: vec!["0.0.0.0:28080".to_string(), "[::]:28080".to_string()],
+                observed_socket_addrs: vec!["192.168.178.92:28080".to_string()],
+            }),
+        };
+
+        assert_eq!(
+            usable_peer_socket_addrs_from_candidate(&candidate)
+                .expect("candidate socket addresses should parse"),
+            vec!["192.168.178.92:28080".parse().unwrap()]
+        );
+        assert!(has_usable_peer_addresses(&candidate).expect("candidate should be usable"));
+
+        let only_bind_addresses = ConnectionCandidate {
+            transport_hints: Some(ConnectionCandidateTransportHints {
+                observed_socket_addrs: Vec::new(),
+                direct_socket_addrs: vec!["0.0.0.0:28080".to_string(), "[::]:28080".to_string()],
+                ..candidate
+                    .transport_hints
+                    .clone()
+                    .expect("hints should exist")
+            }),
+            ..candidate
+        };
+        assert!(
+            !has_usable_peer_addresses(&only_bind_addresses).expect("bind addresses should parse")
         );
     }
 

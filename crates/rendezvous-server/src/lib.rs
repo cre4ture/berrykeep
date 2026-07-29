@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use common::{ClusterId, DeviceId, NodeId};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 use transport_sdk::peer::PeerIdentity;
 use transport_sdk::rendezvous::{
     DiscoveryResponse, IrohRelayAdvertisement, IrohRelayTicket, IrohRelayTicketRequest,
@@ -422,32 +422,75 @@ async fn issue_iroh_relay_ticket(
     authenticated_peer: MaybeAuthenticatedPeer,
     Json(request): Json<IrohRelayTicketRequest>,
 ) -> std::result::Result<Json<IrohRelayTicket>, (StatusCode, String)> {
-    request
-        .validate()
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
-        .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
-    ensure_authenticated_peer_cluster(
-        state.config.mtls.is_some(),
-        &authenticated_peer,
-        request.cluster_id,
-        "iroh relay ticket request",
-    )
-    .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
-    let runtime = state.iroh_relay.as_ref().ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            "embedded iroh relay is disabled".to_string(),
-        )
-    })?;
-    let peer = authenticated_peer
+    let started = Instant::now();
+    let endpoint_id = request.endpoint_id.clone();
+    let cluster_id = request.cluster_id;
+    let requesting_peer = authenticated_peer
         .0
         .as_ref()
-        .map(|authenticated| authenticated.identity.clone());
-    let ticket = runtime
-        .issue_ticket(request.cluster_id, peer, &request.endpoint_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    Ok(Json(ticket))
+        .map(|authenticated| authenticated.identity.to_string());
+    info!(
+        event = "iroh_relay_ticket_started",
+        endpoint_id = %endpoint_id,
+        cluster_id = %cluster_id,
+        requesting_peer = ?requesting_peer,
+        "iroh_relay_ticket_started"
+    );
+
+    let result = async {
+        request
+            .validate()
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
+            .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+        ensure_authenticated_peer_cluster(
+            state.config.mtls.is_some(),
+            &authenticated_peer,
+            request.cluster_id,
+            "iroh relay ticket request",
+        )
+        .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+        let runtime = state.iroh_relay.as_ref().ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "embedded iroh relay is disabled".to_string(),
+            )
+        })?;
+        let peer = authenticated_peer
+            .0
+            .as_ref()
+            .map(|authenticated| authenticated.identity.clone());
+        let ticket = runtime
+            .issue_ticket(request.cluster_id, peer, &request.endpoint_id)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        Ok::<_, (StatusCode, String)>(Json(ticket))
+    }
+    .await;
+
+    match &result {
+        Ok(Json(ticket)) => info!(
+            event = "iroh_relay_ticket_completed",
+            endpoint_id = %endpoint_id,
+            cluster_id = %cluster_id,
+            requesting_peer = ?requesting_peer,
+            status = StatusCode::OK.as_u16(),
+            duration_us = started.elapsed().as_micros() as u64,
+            relay_urls = ?ticket.public_urls,
+            relay_scope = "endpoint_bound",
+            "iroh_relay_ticket_completed"
+        ),
+        Err((status, error)) => warn!(
+            event = "iroh_relay_ticket_failed",
+            endpoint_id = %endpoint_id,
+            cluster_id = %cluster_id,
+            requesting_peer = ?requesting_peer,
+            status = status.as_u16(),
+            duration_us = started.elapsed().as_micros() as u64,
+            error = %error,
+            "iroh_relay_ticket_failed"
+        ),
+    }
+    result
 }
 
 async fn list_presence(

@@ -287,6 +287,22 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 const ANDROID_CONNECTION_LOG_TARGET: &str = "ironmesh_android_connection";
 
+/// Android calls this while loading the native library, before any JNI bridge
+/// can create an Iroh endpoint or resolve a relay host.  Iroh uses this
+/// application context to read Android's configured DNS servers.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(vm: JavaVM, context: *mut std::ffi::c_void) -> jint {
+    // The Android runtime keeps both pointers valid for the process lifetime.
+    unsafe {
+        transport_sdk::install_android_jni_context(
+            vm.get_java_vm_pointer() as *mut std::ffi::c_void,
+            context,
+        );
+    }
+    jni::JNIVersion::V6.into()
+}
+
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     if let Some(rt) = RUNTIME.get() {

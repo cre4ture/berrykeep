@@ -45,8 +45,19 @@ pub use direct_quic::{
     DEFAULT_DIRECT_QUIC_ALPN, DirectQuicAcceptedConnection, DirectQuicEndpoint,
     DirectQuicEndpointConfig, DirectQuicEndpointSnapshot, DirectQuicRelayConfig, DirectQuicSession,
     direct_quic_endpoint_url, endpoint_addr_from_candidate, endpoint_id_from_candidate,
-    load_or_create_secret_key, read_secret_key_from_path, write_secret_key_to_path,
+    has_usable_peer_addresses, load_or_create_secret_key, read_secret_key_from_path,
+    usable_peer_socket_addrs_from_candidate, write_secret_key_to_path,
 };
+
+/// Publishes the Android JVM and application context to Iroh before its DNS
+/// resolver or endpoint implementation is used.
+#[cfg(target_os = "android")]
+pub unsafe fn install_android_jni_context(
+    java_vm: *mut std::ffi::c_void,
+    context_jobject: *mut std::ffi::c_void,
+) {
+    unsafe { iroh::dns::install_android_jni_context(java_vm, context_jobject) }
+}
 pub use http_connector::{HttpRouteKind, TransportHttpClientConfig, TransportHttpRequestTarget};
 pub use identity::{
     ClientEnrollmentRequest, ClientIdentityMaterial, IssuedClientIdentity, next_device_id,

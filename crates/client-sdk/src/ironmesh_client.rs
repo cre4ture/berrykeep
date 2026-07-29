@@ -2109,7 +2109,7 @@ async fn probe_endpoint_background_quality(
     for probe_index in 0..total_probe_count {
         let headers = request_auth_headers_for_auth(auth, &method, &url, connection_name)?;
         let started_at = std::time::Instant::now();
-        let response = tokio::time::timeout(
+        let response = match tokio::time::timeout(
             CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
             execute_buffered_request_for_transport(
                 &endpoint.transport,
@@ -2122,13 +2122,21 @@ async fn probe_endpoint_background_quality(
             ),
         )
         .await
-        .map_err(|_| {
-            anyhow!(
-                "background health probe timed out after {} ms for {}",
-                CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
-                endpoint.descriptor.locator
-            )
-        })??;
+        {
+            Ok(response) => response?,
+            Err(_) => {
+                if let ClientTransport::DirectQuic { session_pool, .. } = &endpoint.transport {
+                    session_pool
+                        .log_direct_quic_probe_cancellation(probe_index)
+                        .await;
+                }
+                bail!(
+                    "background health probe timed out after {} ms for {}",
+                    CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
+                    endpoint.descriptor.locator
+                );
+            }
+        };
         if !response.status.is_success() {
             bail!(
                 "background health probe returned {} from {}",

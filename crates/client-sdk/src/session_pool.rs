@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, watch};
 use transport_sdk::{
     ClientIdentityMaterial, ConnectionCandidate, DEFAULT_DIRECT_QUIC_ALPN, DirectQuicEndpoint,
     DirectQuicEndpointConfig, ExpectedNodeServerIdentity, MultiplexConfig, MultiplexMode,
@@ -15,8 +15,8 @@ use transport_sdk::{
     RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig, RendezvousControlClient,
     TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
     WebSocketByteStream, build_signed_request_headers,
-    connect_websocket_with_expected_server_identity, perform_transport_client_handshake,
-    websocket_url,
+    connect_websocket_with_expected_server_identity, has_usable_peer_addresses,
+    perform_transport_client_handshake, websocket_url,
 };
 
 const IROH_RELAY_TICKET_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -28,6 +28,10 @@ pub(crate) struct TransportSessionPool {
     cached_session: Arc<Mutex<Option<CachedTransportSession>>>,
     // Serializes cold setup without retaining the cache mutex during network I/O.
     session_setup_permit: Arc<Semaphore>,
+    // A cold QUIC setup is owned by the pool rather than a request or health
+    // probe.  A short-lived consumer may stop waiting without cancelling the
+    // ticket request, endpoint creation, or QUIC handshake for other users.
+    direct_quic_setup: Arc<SharedSessionSetupCoordinator>,
     stats: Arc<TransportSessionPoolStats>,
     route_index: Arc<AtomicU64>,
 }
@@ -61,6 +65,55 @@ struct CachedTransportSession {
 struct ManagedDirectQuicEndpoint {
     endpoint: DirectQuicEndpoint,
     relay_ticket_refresh: Option<tokio::task::AbortHandle>,
+}
+
+type SharedSessionSetupResult = std::result::Result<Arc<MultiplexedSession>, Arc<str>>;
+
+#[derive(Clone)]
+struct SharedSessionSetup {
+    attempt_id: u64,
+    receiver: watch::Receiver<Option<SharedSessionSetupResult>>,
+}
+
+#[derive(Default)]
+struct SharedSessionSetupCoordinator {
+    active: Mutex<Option<SharedSessionSetup>>,
+    next_attempt_id: AtomicU64,
+    setup_active: std::sync::atomic::AtomicBool,
+}
+
+struct DirectQuicSetupWaitGuard {
+    candidate_index: Option<usize>,
+    locator: String,
+    target_node_id: Option<NodeId>,
+    coordinator: Arc<SharedSessionSetupCoordinator>,
+    completed: bool,
+}
+
+impl DirectQuicSetupWaitGuard {
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for DirectQuicSetupWaitGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "iroh_connect_cancelled",
+            candidate_index = ?self.candidate_index,
+            path_kind = "direct_quic",
+            locator = %self.locator,
+            endpoint_id = "pending",
+            target_node_id = ?self.target_node_id,
+            cancelled_by = "session_consumer",
+            shared_session_setup_continues = self.coordinator.setup_active.load(Ordering::Relaxed),
+            "iroh_connect_cancelled"
+        );
+    }
 }
 
 impl Drop for ManagedDirectQuicEndpoint {
@@ -112,6 +165,7 @@ impl TransportSessionPool {
             },
             cached_session: Arc::new(Mutex::new(None)),
             session_setup_permit: Arc::new(Semaphore::new(1)),
+            direct_quic_setup: Arc::new(SharedSessionSetupCoordinator::default()),
             stats: Arc::new(TransportSessionPoolStats::default()),
             route_index: Arc::new(AtomicU64::new(u64::MAX)),
         }
@@ -133,6 +187,7 @@ impl TransportSessionPool {
             },
             cached_session: Arc::new(Mutex::new(None)),
             session_setup_permit: Arc::new(Semaphore::new(1)),
+            direct_quic_setup: Arc::new(SharedSessionSetupCoordinator::default()),
             stats: Arc::new(TransportSessionPoolStats::default()),
             route_index: Arc::new(AtomicU64::new(u64::MAX)),
         }
@@ -151,6 +206,7 @@ impl TransportSessionPool {
             },
             cached_session: Arc::new(Mutex::new(None)),
             session_setup_permit: Arc::new(Semaphore::new(1)),
+            direct_quic_setup: Arc::new(SharedSessionSetupCoordinator::default()),
             stats: Arc::new(TransportSessionPoolStats::default()),
             route_index: Arc::new(AtomicU64::new(u64::MAX)),
         }
@@ -207,11 +263,49 @@ impl TransportSessionPool {
         identity: &ClientIdentityMaterial,
         connection_name: Option<&str>,
     ) -> Result<Arc<MultiplexedSession>> {
+        if let Some(mut cancellation_guard) = self.direct_quic_setup_wait_guard() {
+            if let Some(session) = self.cached_session().await {
+                cancellation_guard.complete();
+                return Ok(session);
+            }
+
+            let setup_pool = self.clone();
+            let setup_identity = identity.clone();
+            let setup_connection_name = connection_name.map(ToString::to_string);
+            let result = self
+                .wait_for_shared_direct_quic_setup(move || async move {
+                    setup_pool
+                        .establish_direct_session(&setup_identity, setup_connection_name.as_deref())
+                        .await
+                })
+                .await;
+            cancellation_guard.complete();
+            return result;
+        }
+
+        self.establish_direct_session(identity, connection_name)
+            .await
+    }
+
+    async fn establish_direct_session(
+        &self,
+        identity: &ClientIdentityMaterial,
+        connection_name: Option<&str>,
+    ) -> Result<Arc<MultiplexedSession>> {
         if let Some(session) = self.cached_session().await {
             return Ok(session);
         }
-        let _setup_permit = self.acquire_session_setup_permit().await;
-        if let Some(session) = self.cached_session().await {
+        // Direct HTTPS retains the existing serialization.  Direct QUIC is
+        // serialized by its detached, shared setup task above, which must not
+        // be owned by an individual request or health probe.
+        let _setup_permit = if !matches!(&self.target, SessionPoolTarget::DirectQuic { .. }) {
+            Some(self.acquire_session_setup_permit().await)
+        } else {
+            None
+        };
+        if _setup_permit.is_some()
+            && let Some(session) = self.cached_session().await
+        {
             return Ok(session);
         }
 
@@ -268,6 +362,7 @@ impl TransportSessionPool {
                         let endpoint = ensure_direct_quic_endpoint(
                             endpoint,
                             candidate,
+                            target_node_id,
                             rendezvous.as_ref(),
                             relay_ca_pem.as_deref(),
                             self.route_index(),
@@ -279,6 +374,7 @@ impl TransportSessionPool {
                             candidate_index = ?self.route_index(),
                             path_kind = "direct_quic",
                             locator = %candidate.endpoint,
+                            endpoint_id = %endpoint.endpoint_id(),
                             target_node_id = %target_node_id,
                             "iroh_connect_scheduled"
                         );
@@ -288,6 +384,7 @@ impl TransportSessionPool {
                             candidate_index = ?self.route_index(),
                             path_kind = "direct_quic",
                             locator = %candidate.endpoint,
+                            endpoint_id = %endpoint.endpoint_id(),
                             target_node_id = %target_node_id,
                             "iroh_connect_started"
                         );
@@ -302,6 +399,7 @@ impl TransportSessionPool {
                                     candidate_index = ?self.route_index(),
                                     path_kind = "direct_quic",
                                     locator = %candidate.endpoint,
+                                    endpoint_id = %endpoint.endpoint_id(),
                                     target_node_id = %target_node_id,
                                     duration_us = duration_as_u64_micros(iroh_connect_started.elapsed()),
                                     "iroh_connect_completed"
@@ -315,6 +413,7 @@ impl TransportSessionPool {
                                     candidate_index = ?self.route_index(),
                                     path_kind = "direct_quic",
                                     locator = %candidate.endpoint,
+                                    endpoint_id = %endpoint.endpoint_id(),
                                     target_node_id = %target_node_id,
                                     duration_us = duration_as_u64_micros(iroh_connect_started.elapsed()),
                                     error = %error,
@@ -636,6 +735,114 @@ impl TransportSessionPool {
         self.cached_session.lock().await.is_some()
     }
 
+    fn direct_quic_setup_wait_guard(&self) -> Option<DirectQuicSetupWaitGuard> {
+        let SessionPoolTarget::DirectQuic {
+            candidate,
+            target_node_id,
+            ..
+        } = &self.target
+        else {
+            return None;
+        };
+        Some(DirectQuicSetupWaitGuard {
+            candidate_index: self.route_index(),
+            locator: candidate.endpoint.clone(),
+            target_node_id: *target_node_id,
+            coordinator: Arc::clone(&self.direct_quic_setup),
+            completed: false,
+        })
+    }
+
+    async fn wait_for_shared_direct_quic_setup<F, Fut>(
+        &self,
+        setup: F,
+    ) -> Result<Arc<MultiplexedSession>>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Arc<MultiplexedSession>>> + Send + 'static,
+    {
+        let mut receiver = {
+            let mut active = self.direct_quic_setup.active.lock().await;
+            if let Some(existing) = active.as_ref() {
+                existing.receiver.clone()
+            } else {
+                let attempt_id = self
+                    .direct_quic_setup
+                    .next_attempt_id
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                let (sender, receiver) = watch::channel(None);
+                *active = Some(SharedSessionSetup {
+                    attempt_id,
+                    receiver: receiver.clone(),
+                });
+                self.direct_quic_setup
+                    .setup_active
+                    .store(true, Ordering::Relaxed);
+
+                let coordinator = Arc::clone(&self.direct_quic_setup);
+                tokio::spawn(async move {
+                    let result = setup()
+                        .await
+                        .map_err(|error| Arc::<str>::from(error.to_string()));
+                    let _ = sender.send(Some(result));
+                    let mut active = coordinator.active.lock().await;
+                    if active
+                        .as_ref()
+                        .is_some_and(|current| current.attempt_id == attempt_id)
+                    {
+                        *active = None;
+                        coordinator.setup_active.store(false, Ordering::Relaxed);
+                    }
+                });
+                receiver
+            }
+        };
+
+        loop {
+            if let Some(result) = receiver.borrow().as_ref() {
+                return result
+                    .clone()
+                    .map_err(|error| anyhow!(error.as_ref().to_string()));
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| anyhow!("shared direct QUIC session setup task ended unexpectedly"))?;
+        }
+    }
+
+    pub(crate) async fn log_direct_quic_probe_cancellation(&self, probe_index: usize) {
+        let SessionPoolTarget::DirectQuic {
+            candidate,
+            target_node_id,
+            endpoint,
+            ..
+        } = &self.target
+        else {
+            return;
+        };
+        let endpoint_id = endpoint
+            .lock()
+            .await
+            .as_ref()
+            .map(|managed| managed.endpoint.endpoint_id())
+            .unwrap_or_else(|| "pending".to_string());
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "iroh_connect_cancelled",
+            candidate_index = ?self.route_index(),
+            path_kind = "direct_quic",
+            locator = %candidate.endpoint,
+            endpoint_id = %endpoint_id,
+            target_node_id = ?target_node_id,
+            cancelled_by = "background_health_probe",
+            probe_index,
+            shared_session_setup_continues = self.direct_quic_setup.setup_active.load(Ordering::Relaxed),
+            "iroh_connect_cancelled"
+        );
+    }
+
     async fn cached_session(&self) -> Option<Arc<MultiplexedSession>> {
         let guard = self.cached_session.lock().await;
         let session = guard.as_ref().map(|cached| Arc::clone(&cached.session));
@@ -685,6 +892,7 @@ fn relay_session_role_for_source(source: &PeerIdentity) -> TransportSessionRole 
 async fn ensure_direct_quic_endpoint(
     endpoint: &Arc<Mutex<Option<ManagedDirectQuicEndpoint>>>,
     candidate: &ConnectionCandidate,
+    target_node_id: NodeId,
     rendezvous: Option<&RendezvousControlClient>,
     relay_ca_pem: Option<&str>,
     route_index: Option<usize>,
@@ -696,6 +904,7 @@ async fn ensure_direct_quic_endpoint(
         }
     }
 
+    let has_usable_peer_addresses = has_usable_peer_addresses(candidate)?;
     let secret_key = SecretKey::generate();
     let endpoint_id = secret_key.public().to_string();
     let relay_ticket = match rendezvous {
@@ -708,6 +917,9 @@ async fn ensure_direct_quic_endpoint(
                 path_kind = "direct_quic",
                 locator = %candidate.endpoint,
                 endpoint_id = %endpoint_id,
+                target_node_id = %target_node_id,
+                relay_scope = "endpoint_bound",
+                rendezvous_urls = ?rendezvous.config().rendezvous_urls,
                 timeout_ms = RELAY_TICKET_REQUEST_TIMEOUT.as_millis(),
                 "iroh_relay_ticket_started"
             );
@@ -725,6 +937,9 @@ async fn ensure_direct_quic_endpoint(
                         path_kind = "direct_quic",
                         locator = %candidate.endpoint,
                         endpoint_id = %endpoint_id,
+                        target_node_id = %target_node_id,
+                        relay_scope = "endpoint_bound",
+                        relay_urls = ?ticket.public_urls,
                         duration_us = duration_as_u64_micros(ticket_started.elapsed()),
                         "iroh_relay_ticket_completed"
                     );
@@ -738,14 +953,12 @@ async fn ensure_direct_quic_endpoint(
                         path_kind = "direct_quic",
                         locator = %candidate.endpoint,
                         endpoint_id = %endpoint_id,
+                        target_node_id = %target_node_id,
+                        relay_scope = "endpoint_bound",
+                        error_class = "request",
                         duration_us = duration_as_u64_micros(ticket_started.elapsed()),
                         error = %error,
                         "iroh_relay_ticket_failed"
-                    );
-                    tracing::warn!(
-                        %error,
-                        %endpoint_id,
-                        "failed obtaining endpoint-bound iroh relay ticket; direct addresses remain available"
                     );
                     None
                 }
@@ -757,14 +970,13 @@ async fn ensure_direct_quic_endpoint(
                         path_kind = "direct_quic",
                         locator = %candidate.endpoint,
                         endpoint_id = %endpoint_id,
+                        target_node_id = %target_node_id,
+                        relay_scope = "endpoint_bound",
+                        error_class = "timeout",
                         duration_us = duration_as_u64_micros(ticket_started.elapsed()),
                         timeout_ms = RELAY_TICKET_REQUEST_TIMEOUT.as_millis(),
                         reason = "timeout",
                         "iroh_relay_ticket_failed"
-                    );
-                    tracing::warn!(
-                        %endpoint_id,
-                        "iroh relay ticket request timed out; direct addresses remain available"
                     );
                     None
                 }
@@ -773,13 +985,55 @@ async fn ensure_direct_quic_endpoint(
         None => None,
     };
 
+    let static_relay_authorized = rendezvous.is_none()
+        && candidate
+            .transport_hints
+            .as_ref()
+            .and_then(|hints| hints.relay_url.as_deref())
+            .is_some()
+        && candidate
+            .transport_hints
+            .as_ref()
+            .and_then(|hints| hints.relay_auth_token.as_deref())
+            .is_some_and(|token| !token.trim().is_empty());
+    let relay_enabled = relay_ticket.is_some() || static_relay_authorized;
+    if !relay_enabled && !has_usable_peer_addresses {
+        tracing::warn!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "iroh_connect_failed",
+            candidate_index = ?route_index,
+            path_kind = "direct_quic",
+            locator = %candidate.endpoint,
+            endpoint_id = %endpoint_id,
+            target_node_id = %target_node_id,
+            reason = "no_relay_ticket_or_usable_peer_addresses",
+            "iroh_connect_failed"
+        );
+        bail!("direct QUIC unavailable: no relay ticket and no usable peer addresses");
+    }
+    if !relay_enabled {
+        tracing::warn!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "iroh_direct_only_fallback",
+            candidate_index = ?route_index,
+            path_kind = "direct_quic",
+            locator = %candidate.endpoint,
+            endpoint_id = %endpoint_id,
+            target_node_id = %target_node_id,
+            relay_scope = "disabled",
+            usable_peer_addresses = has_usable_peer_addresses,
+            "continuing with direct-only QUIC because no relay ticket is available"
+        );
+    }
+
     let mut config = DirectQuicEndpointConfig::new(secret_key);
+    config.relay_enabled = relay_enabled;
     config.alpn = candidate
         .transport_hints
         .as_ref()
         .and_then(|hints| hints.alpn.clone())
         .unwrap_or_else(|| DEFAULT_DIRECT_QUIC_ALPN.to_string());
-    if rendezvous.is_none() {
+    if static_relay_authorized {
         if let Some(relay_url) = candidate
             .transport_hints
             .as_ref()
@@ -801,6 +1055,9 @@ async fn ensure_direct_quic_endpoint(
         )
     })?;
     let endpoint_snapshot = bound_endpoint.snapshot();
+    if endpoint_snapshot.endpoint_id != endpoint_id {
+        bail!("direct QUIC endpoint id changed while installing an endpoint-bound relay ticket");
+    }
     tracing::info!(
         target: MOBILE_CONNECTION_LOG_TARGET,
         event = "iroh_endpoint_created",
@@ -808,6 +1065,8 @@ async fn ensure_direct_quic_endpoint(
         path_kind = "direct_quic",
         locator = %candidate.endpoint,
         endpoint_id = %endpoint_snapshot.endpoint_id,
+        target_node_id = %target_node_id,
+        relay_enabled = relay_enabled,
         relay_url = ?endpoint_snapshot.relay_url,
         direct_socket_addrs = ?endpoint_snapshot.direct_socket_addrs,
         "iroh_endpoint_created"
@@ -822,14 +1081,16 @@ async fn ensure_direct_quic_endpoint(
         .as_ref()
         .map(|ticket| ticket.expires_at_unix)
         .unwrap_or_else(unix_ts);
-    let relay_ticket_refresh = rendezvous.map(|rendezvous| {
-        spawn_iroh_relay_ticket_refresh(
-            bound_endpoint.clone(),
-            rendezvous.clone(),
-            endpoint_id,
-            initial_expires_at_unix,
-        )
-    });
+    let relay_ticket_refresh = rendezvous
+        .filter(|_| relay_ticket.is_some())
+        .map(|rendezvous| {
+            spawn_iroh_relay_ticket_refresh(
+                bound_endpoint.clone(),
+                rendezvous.clone(),
+                endpoint_id,
+                initial_expires_at_unix,
+            )
+        });
     let managed_endpoint = ManagedDirectQuicEndpoint {
         endpoint: bound_endpoint.clone(),
         relay_ticket_refresh,
@@ -970,6 +1231,166 @@ fn unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport_sdk::candidates::ConnectionCandidateTransportHints;
+
+    #[tokio::test]
+    async fn direct_quic_without_ticket_or_peer_addresses_fails_before_connecting() {
+        let remote_endpoint_id = SecretKey::generate().public().to_string();
+        let candidate = ConnectionCandidate {
+            kind: transport_sdk::CandidateKind::DirectQuic,
+            endpoint: format!("iroh://{remote_endpoint_id}"),
+            rtt_ms: None,
+            transport_hints: Some(ConnectionCandidateTransportHints {
+                transport_id: Some(remote_endpoint_id),
+                relay_url: Some("https://relay.example".to_string()),
+                relay_auth_token: None,
+                alpn: None,
+                direct_socket_addrs: vec!["0.0.0.0:28080".to_string(), "[::]:28080".to_string()],
+                observed_socket_addrs: Vec::new(),
+            }),
+        };
+        let endpoint = Arc::new(Mutex::new(None));
+
+        let error = match ensure_direct_quic_endpoint(
+            &endpoint,
+            &candidate,
+            NodeId::new_v4(),
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a direct-only fallback requires a usable remote address"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("direct QUIC unavailable: no relay ticket and no usable peer addresses")
+        );
+        assert!(endpoint.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ticket_timeout_without_peer_addresses_does_not_start_direct_quic() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ticket listener should bind");
+        let ticket_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("ticket listener address should be available")
+        );
+        let request_started = Arc::new(AtomicU64::new(0));
+        let request_started_for_server = Arc::clone(&request_started);
+        let ticket_server = tokio::spawn(async move {
+            let (_stream, _) = listener
+                .accept()
+                .await
+                .expect("ticket listener should accept a connection");
+            request_started_for_server.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+
+        let cluster_id = uuid::Uuid::now_v7();
+        let rendezvous = RendezvousControlClient::new(
+            transport_sdk::RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![ticket_url],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+        let remote_endpoint_id = SecretKey::generate().public().to_string();
+        let candidate = ConnectionCandidate {
+            kind: transport_sdk::CandidateKind::DirectQuic,
+            endpoint: format!("iroh://{remote_endpoint_id}"),
+            rtt_ms: None,
+            transport_hints: Some(ConnectionCandidateTransportHints {
+                transport_id: Some(remote_endpoint_id),
+                relay_url: None,
+                relay_auth_token: None,
+                alpn: None,
+                direct_socket_addrs: vec!["0.0.0.0:28080".to_string(), "[::]:28080".to_string()],
+                observed_socket_addrs: Vec::new(),
+            }),
+        };
+        let endpoint = Arc::new(Mutex::new(None));
+
+        let error = match ensure_direct_quic_endpoint(
+            &endpoint,
+            &candidate,
+            NodeId::new_v4(),
+            Some(&rendezvous),
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("ticket timeout without peers must not create an endpoint"),
+            Err(error) => error,
+        };
+
+        ticket_server.abort();
+        let _ = ticket_server.await;
+
+        assert!(
+            error
+                .to_string()
+                .contains("direct QUIC unavailable: no relay ticket and no usable peer addresses")
+        );
+        assert_eq!(request_started.load(Ordering::SeqCst), 1);
+        assert!(endpoint.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_cancel_shared_direct_quic_setup() {
+        let pool = TransportSessionPool::new_direct_quic(
+            ConnectionCandidate {
+                kind: transport_sdk::CandidateKind::DirectQuic,
+                endpoint: format!("iroh://{}", SecretKey::generate().public()),
+                rtt_ms: None,
+                transport_hints: None,
+            },
+            Some(NodeId::new_v4()),
+            None,
+            None,
+        );
+        let starts = Arc::new(AtomicU64::new(0));
+        let first_starts = Arc::clone(&starts);
+        let first = tokio::time::timeout(
+            Duration::from_millis(10),
+            pool.wait_for_shared_direct_quic_setup(move || async move {
+                first_starts.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                Err(anyhow!("synthetic shared setup failure"))
+            }),
+        )
+        .await;
+        assert!(first.is_err(), "the first consumer should stop waiting");
+
+        let result = match pool
+            .wait_for_shared_direct_quic_setup(|| async {
+                panic!("a second consumer must join, not start another setup")
+            })
+            .await
+        {
+            Ok(_) => panic!("the shared setup result should be delivered to later consumers"),
+            Err(error) => error,
+        };
+        assert!(
+            result
+                .to_string()
+                .contains("synthetic shared setup failure")
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn direct_quic_pool_snapshot_starts_empty() {
         let pool = TransportSessionPool::new_direct_quic(
