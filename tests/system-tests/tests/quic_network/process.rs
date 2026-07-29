@@ -102,7 +102,10 @@ pub(super) fn spawn_rendezvous(
             "IRONMESH_IROH_RELAY_QUIC_BIND",
             format!("0.0.0.0:{IROH_QAD_PORT}"),
         )
-        .env("IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT", IROH_QAD_PORT.to_string())
+        .env(
+            "IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT",
+            IROH_QAD_PORT.to_string(),
+        )
         .env("IRONMESH_IROH_RELAY_QUIC_TLS_CERT", &tls.node_cert)
         .env("IRONMESH_IROH_RELAY_QUIC_TLS_KEY", &tls.node_key)
         .env("RUST_LOG", "info")

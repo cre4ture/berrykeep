@@ -44,6 +44,7 @@ struct Scenario {
     name: &'static str,
     network: NetworkProfile,
     iroh_relay_enabled: bool,
+    ironmesh_relay_enabled: bool,
     stall_iroh_ticket: bool,
     expected: ExpectedRoute,
 }
@@ -53,6 +54,7 @@ impl Scenario {
         name: "home-direct",
         network: NetworkProfile::HolePunchableHomeNat,
         iroh_relay_enabled: true,
+        ironmesh_relay_enabled: false,
         stall_iroh_ticket: false,
         expected: ExpectedRoute::DirectQuic("direct"),
     };
@@ -61,6 +63,7 @@ impl Scenario {
         name: "hotel-iroh-relay",
         network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: true,
+        ironmesh_relay_enabled: false,
         stall_iroh_ticket: false,
         expected: ExpectedRoute::DirectQuic("relay"),
     };
@@ -69,6 +72,7 @@ impl Scenario {
         name: "hotel-ironmesh-relay",
         network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: false,
+        ironmesh_relay_enabled: true,
         stall_iroh_ticket: false,
         expected: ExpectedRoute::RelayTunnel,
     };
@@ -77,6 +81,7 @@ impl Scenario {
         name: "ticket-timeout-fallback",
         network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: true,
+        ironmesh_relay_enabled: true,
         stall_iroh_ticket: true,
         expected: ExpectedRoute::RelayTunnel,
     };

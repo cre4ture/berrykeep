@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use client_sdk::ConnectionBootstrap;
+use client_sdk::{ConnectionBootstrap, RelayMode};
 use patchbay::{Device, Lab, Nat, OutDir, Router, RouterPreset};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
@@ -118,6 +118,7 @@ impl ScenarioRuntime {
         fs::create_dir_all(&client_dir)?;
         let bootstrap_path = client_dir.join("connection.bootstrap.json");
         issue_bootstrap(&node_device, &node_url, &bootstrap_path).await?;
+        configure_ironmesh_relay(&bootstrap_path, scenario.ironmesh_relay_enabled)?;
         let identity_path = client_dir.join("connection.bootstrap.client-identity.json");
         enroll_cli(&node_device, &bootstrap_path, &identity_path).await?;
 
@@ -210,11 +211,7 @@ impl ScenarioRuntime {
     }
 }
 
-async fn add_network_router(
-    lab: &Lab,
-    name: &str,
-    profile: NetworkProfile,
-) -> Result<Router> {
+async fn add_network_router(lab: &Lab, name: &str, profile: NetworkProfile) -> Result<Router> {
     match profile {
         NetworkProfile::HolePunchableHomeNat => {
             // Match Iroh's own IPv4 NAT traversal tests exactly: EIM/APDF NAT
@@ -251,6 +248,16 @@ async fn issue_bootstrap(device: &Device, node_url: &str, output: &Path) -> Resu
         })?
         .await
         .context("bootstrap issue task panicked")?
+}
+
+fn configure_ironmesh_relay(path: &Path, enabled: bool) -> Result<()> {
+    let mut bootstrap = ConnectionBootstrap::from_path(path)?;
+    bootstrap.relay_mode = if enabled {
+        RelayMode::Fallback
+    } else {
+        RelayMode::Disabled
+    };
+    bootstrap.write_to_path(path)
 }
 
 fn prepend_rendezvous_url(path: &Path, first_url: &str) -> Result<()> {
