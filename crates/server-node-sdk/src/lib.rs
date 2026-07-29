@@ -1,3 +1,4 @@
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -12972,7 +12973,127 @@ struct StoreIndexPageCacheValue {
     visible_file_count: usize,
     total_entry_count: usize,
     media_summary: StoreIndexMediaSummary,
-    entries: Vec<StoreIndexEntry>,
+    prepared_entries: StdMutex<StoreIndexPreparedEntries>,
+}
+
+impl StoreIndexPageCacheValue {
+    fn new(
+        prefix: String,
+        depth: usize,
+        matching_key_count: usize,
+        visible_file_count: usize,
+        media_summary: StoreIndexMediaSummary,
+        entries: Vec<StoreIndexEntry>,
+        sort: Option<StoreIndexSortOrder>,
+    ) -> Self {
+        let total_entry_count = entries.len();
+        Self {
+            prefix,
+            depth,
+            matching_key_count,
+            visible_file_count,
+            total_entry_count,
+            media_summary,
+            prepared_entries: StdMutex::new(StoreIndexPreparedEntries::new(entries, sort)),
+        }
+    }
+
+    fn page(&self, offset: usize, end: usize) -> (Vec<StoreIndexEntry>, usize) {
+        let mut prepared = match self.prepared_entries.lock() {
+            Ok(prepared) => prepared,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let entries = prepared.page(offset, end);
+        (entries, prepared.materialized_entry_count())
+    }
+}
+
+#[derive(Debug)]
+enum StoreIndexPreparedEntries {
+    PathOrdered(Vec<StoreIndexEntry>),
+    IncrementallySorted {
+        materialized: Vec<StoreIndexEntry>,
+        remaining: BinaryHeap<StoreIndexOrderedEntry>,
+    },
+}
+
+impl StoreIndexPreparedEntries {
+    fn new(entries: Vec<StoreIndexEntry>, sort: Option<StoreIndexSortOrder>) -> Self {
+        match sort {
+            None | Some(StoreIndexSortOrder::PathAsc) => Self::PathOrdered(entries),
+            Some(sort) => Self::IncrementallySorted {
+                materialized: Vec::new(),
+                remaining: entries
+                    .into_iter()
+                    .map(|entry| StoreIndexOrderedEntry { sort, entry })
+                    .collect(),
+            },
+        }
+    }
+
+    fn page(&mut self, offset: usize, end: usize) -> Vec<StoreIndexEntry> {
+        match self {
+            Self::PathOrdered(entries) => entries[offset..end].to_vec(),
+            Self::IncrementallySorted {
+                materialized,
+                remaining,
+            } => {
+                while materialized.len() < end {
+                    let Some(entry) = remaining.pop() else {
+                        break;
+                    };
+                    materialized.push(entry.entry);
+                }
+                if remaining.capacity() > remaining.len().saturating_mul(2) {
+                    remaining.shrink_to_fit();
+                }
+                materialized[offset..end].to_vec()
+            }
+        }
+    }
+
+    fn materialized_entry_count(&self) -> usize {
+        match self {
+            Self::PathOrdered(entries) => entries.len(),
+            Self::IncrementallySorted { materialized, .. } => materialized.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn remaining_entry_capacity(&self) -> usize {
+        match self {
+            Self::PathOrdered(_) => 0,
+            Self::IncrementallySorted { remaining, .. } => remaining.capacity(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StoreIndexOrderedEntry {
+    sort: StoreIndexSortOrder,
+    entry: StoreIndexEntry,
+}
+
+impl PartialEq for StoreIndexOrderedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.sort == other.sort
+            && compare_store_index_entries(&self.entry, &other.entry, self.sort).is_eq()
+    }
+}
+
+impl Eq for StoreIndexOrderedEntry {}
+
+impl PartialOrd for StoreIndexOrderedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for StoreIndexOrderedEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        debug_assert_eq!(self.sort, other.sort);
+        compare_store_index_entries(&self.entry, &other.entry, self.sort).reverse()
+    }
 }
 
 #[derive(Debug)]
@@ -13009,7 +13130,7 @@ impl StoreIndexPageCache {
         &mut self,
         key: StoreIndexPageCacheKey,
         namespace_change_sequence: u64,
-        value: StoreIndexPageCacheValue,
+        value: Arc<StoreIndexPageCacheValue>,
     ) {
         if value.total_entry_count > STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT {
             return;
@@ -13020,7 +13141,7 @@ impl StoreIndexPageCache {
             key,
             namespace_change_sequence,
             created_at: Instant::now(),
-            value: Arc::new(value),
+            value,
         });
         self.entries.truncate(STORE_INDEX_PAGE_CACHE_MAX_SCOPES);
     }
@@ -14903,18 +15024,15 @@ fn store_index_page_cache_key(
 }
 
 fn with_store_index_response_headers(
-    state: &ServerState,
+    namespace_change_sequence: u64,
     request_id: Uuid,
     mut response: Response,
     server_timing: String,
     matching_key_count: usize,
     visible_file_count: usize,
+    materialized_entry_count: usize,
 ) -> Response {
-    let change_sequence = state
-        .storage
-        .namespace_change_sequence
-        .load(Ordering::SeqCst);
-    if let Ok(header_value) = HeaderValue::from_str(&change_sequence.to_string()) {
+    if let Ok(header_value) = HeaderValue::from_str(&namespace_change_sequence.to_string()) {
         response
             .headers_mut()
             .insert("x-ironmesh-change-sequence", header_value);
@@ -14937,23 +15055,37 @@ fn with_store_index_response_headers(
             .headers_mut()
             .insert("x-ironmesh-store-index-visible-files", header_value);
     }
+    if let Ok(header_value) = HeaderValue::from_str(&materialized_entry_count.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ironmesh-store-index-materialized-entries", header_value);
+    }
     response
 }
 
 fn cached_store_index_page_response(
     state: &ServerState,
+    namespace_change_sequence: u64,
     query: &StoreIndexQuery,
     request_id: Uuid,
     request_started_at: Instant,
     cached: Arc<StoreIndexPageCacheValue>,
-) -> Response {
+) -> Option<Response> {
     let offset = query.offset.unwrap_or(0).min(cached.total_entry_count);
     let limit = query.limit.map(|value| value.max(1));
     let end = limit
         .map(|value| offset.saturating_add(value).min(cached.total_entry_count))
         .unwrap_or(cached.total_entry_count);
     let has_more = end < cached.total_entry_count;
-    let entries = cached.entries[offset..end].to_vec();
+    let (entries, materialized_entry_count) = cached.page(offset, end);
+    if state
+        .storage
+        .namespace_change_sequence
+        .load(Ordering::SeqCst)
+        != namespace_change_sequence
+    {
+        return None;
+    }
     let total_ms = request_started_at.elapsed().as_millis();
     let response = (
         StatusCode::OK,
@@ -14971,20 +15103,30 @@ fn cached_store_index_page_response(
         }),
     )
         .into_response();
-    with_store_index_response_headers(
-        state,
+    Some(with_store_index_response_headers(
+        namespace_change_sequence,
         request_id,
         response,
         format!("store-index-page-cache;desc=hit, total;dur={total_ms}"),
         cached.matching_key_count,
         cached.visible_file_count,
-    )
+        materialized_entry_count,
+    ))
 }
 
 async fn list_store_index_response(
     state: &ServerState,
     query: StoreIndexQuery,
     thumbnail_route: &str,
+) -> Response {
+    list_store_index_response_attempt(state, query, thumbnail_route, true).await
+}
+
+async fn list_store_index_response_attempt(
+    state: &ServerState,
+    query: StoreIndexQuery,
+    thumbnail_route: &str,
+    allow_namespace_retry: bool,
 ) -> Response {
     let request_id = Uuid::new_v4();
     let request_started_at = Instant::now();
@@ -15006,13 +15148,26 @@ async fn list_store_index_response(
                 .get(cache_key, namespace_change_sequence),
         };
         if let Some(cached) = cached {
-            return cached_store_index_page_response(
+            if let Some(response) = cached_store_index_page_response(
                 state,
+                namespace_change_sequence,
                 &query,
                 request_id,
                 request_started_at,
                 cached,
-            );
+            ) {
+                return response;
+            }
+            if allow_namespace_retry {
+                return Box::pin(list_store_index_response_attempt(
+                    state,
+                    query,
+                    thumbnail_route,
+                    false,
+                ))
+                .await;
+            }
+            return StatusCode::CONFLICT.into_response();
         }
     }
 
@@ -15089,7 +15244,8 @@ async fn list_store_index_response(
     }
 
     let entry_plan_started_at = Instant::now();
-    let entry_plan = plan_store_index_entries(&keys, &prefix, depth);
+    let mut entry_plan = plan_store_index_entries(&keys, &prefix, depth);
+    prefilter_store_index_entry_plan_for_media(&mut entry_plan, query.media_filter);
     let visible_object_hashes =
         filter_store_index_values_for_paths(&key_hashes, &entry_plan.file_entries);
     let visible_object_ids =
@@ -15251,7 +15407,9 @@ async fn list_store_index_response(
     let filter_ms = filter_started_at.elapsed().as_millis();
 
     let sort_started_at = Instant::now();
-    if let Some(sort) = query.sort {
+    if page_cache_key.is_none()
+        && let Some(sort) = query.sort
+    {
         sort_store_index_entries(&mut entries, sort);
     }
     let sort_ms = sort_started_at.elapsed().as_millis();
@@ -15259,33 +15417,53 @@ async fn list_store_index_response(
     let pagination_started_at = Instant::now();
     let total_entry_count = entries.len();
     let media_summary = summarize_store_index_entries(&entries);
+    if state
+        .storage
+        .namespace_change_sequence
+        .load(Ordering::SeqCst)
+        != namespace_change_sequence
+    {
+        if allow_namespace_retry {
+            return Box::pin(list_store_index_response_attempt(
+                state,
+                query,
+                thumbnail_route,
+                false,
+            ))
+            .await;
+        }
+        return StatusCode::CONFLICT.into_response();
+    }
     let offset = query.offset.unwrap_or(0).min(total_entry_count);
     let limit = query.limit.map(|value| value.max(1));
     let has_more = limit
         .map(|value| offset.saturating_add(value) < total_entry_count)
         .unwrap_or(false);
-    if let Some(cache_key) =
-        page_cache_key.filter(|_| total_entry_count <= STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT)
-    {
+    let materialized_entry_count;
+    if let Some(cache_key) = page_cache_key {
         let end = limit
             .map(|value| offset.saturating_add(value).min(total_entry_count))
             .unwrap_or(total_entry_count);
-        let cached = StoreIndexPageCacheValue {
-            prefix: prefix.clone(),
+        let cached = Arc::new(StoreIndexPageCacheValue::new(
+            prefix.clone(),
             depth,
-            matching_key_count: keys.len(),
-            visible_file_count: entry_plan.file_entries.len(),
-            total_entry_count,
-            media_summary: media_summary.clone(),
+            keys.len(),
+            entry_plan.file_entries.len(),
+            media_summary.clone(),
             entries,
-        };
-        entries = cached.entries[offset..end].to_vec();
-        match state.storage.store_index_page_cache.lock() {
-            Ok(mut cache) => cache.insert(cache_key, namespace_change_sequence, cached),
-            Err(poisoned) => {
-                poisoned
-                    .into_inner()
-                    .insert(cache_key, namespace_change_sequence, cached)
+            query.sort,
+        ));
+        (entries, materialized_entry_count) = cached.page(offset, end);
+        if total_entry_count <= STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT {
+            match state.storage.store_index_page_cache.lock() {
+                Ok(mut cache) => {
+                    cache.insert(cache_key, namespace_change_sequence, Arc::clone(&cached))
+                }
+                Err(poisoned) => poisoned.into_inner().insert(
+                    cache_key,
+                    namespace_change_sequence,
+                    Arc::clone(&cached),
+                ),
             }
         }
     } else {
@@ -15293,6 +15471,7 @@ async fn list_store_index_response(
             Some(value) => entries.into_iter().skip(offset).take(value).collect(),
             None => entries.into_iter().skip(offset).collect(),
         };
+        materialized_entry_count = total_entry_count;
     }
     let pagination_ms = pagination_started_at.elapsed().as_millis();
     let returned_entry_count = entries.len();
@@ -15364,7 +15543,7 @@ async fn list_store_index_response(
     )
         .into_response();
     with_store_index_response_headers(
-        state,
+        namespace_change_sequence,
         request_id,
         response,
         format!(
@@ -15372,6 +15551,7 @@ async fn list_store_index_response(
         ),
         keys.len(),
         entry_plan.file_entries.len(),
+        materialized_entry_count,
     )
 }
 
@@ -15838,8 +16018,12 @@ fn compare_store_index_optional_u64(
     }
 }
 
-fn sort_store_index_entries(entries: &mut [StoreIndexEntry], sort: StoreIndexSortOrder) {
-    entries.sort_by(|left, right| match sort {
+fn compare_store_index_entries(
+    left: &StoreIndexEntry,
+    right: &StoreIndexEntry,
+    sort: StoreIndexSortOrder,
+) -> std::cmp::Ordering {
+    match sort {
         StoreIndexSortOrder::PathAsc => left.path.cmp(&right.path),
         StoreIndexSortOrder::PathDesc => right.path.cmp(&left.path),
         StoreIndexSortOrder::CapturedAsc => store_index_entry_captured_at(left)
@@ -15890,7 +16074,11 @@ fn sort_store_index_entries(entries: &mut [StoreIndexEntry], sort: StoreIndexSor
             compare_store_index_optional_u64(left.modified_at_unix, right.modified_at_unix, true)
                 .then_with(|| left.path.cmp(&right.path))
         }
-    });
+    }
+}
+
+fn sort_store_index_entries(entries: &mut [StoreIndexEntry], sort: StoreIndexSortOrder) {
+    entries.sort_by(|left, right| compare_store_index_entries(left, right, sort));
 }
 
 fn summarize_store_index_entries(entries: &[StoreIndexEntry]) -> StoreIndexMediaSummary {
@@ -16111,6 +16299,18 @@ fn media_gps_response(value: &MediaGpsCoordinates) -> MediaGpsResponse {
 
 fn looks_like_media_path(path: &str) -> bool {
     media_type_for_path(path).is_some()
+}
+
+fn prefilter_store_index_entry_plan_for_media(
+    plan: &mut StoreIndexEntryPlan,
+    media_filter: Option<StoreIndexMediaFilter>,
+) {
+    if media_filter.is_none() {
+        return;
+    }
+
+    plan.prefix_entries.clear();
+    plan.file_entries.retain(|path| looks_like_media_path(path));
 }
 
 fn media_type_for_path(path: &str) -> Option<&'static str> {

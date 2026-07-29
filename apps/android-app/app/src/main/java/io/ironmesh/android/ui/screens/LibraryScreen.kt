@@ -72,13 +72,17 @@ import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import io.ironmesh.android.DocumentBitmapLoader
+import io.ironmesh.android.R
 import io.ironmesh.android.ui.GalleryCollectionState
 import io.ironmesh.android.ui.GalleryImageItem
+import io.ironmesh.android.ui.GalleryLoadError
+import io.ironmesh.android.ui.GalleryLoadErrorKind
 import io.ironmesh.android.ui.GalleryPageState
 import io.ironmesh.android.ui.GalleryPageStatus
 import io.ironmesh.android.ui.GallerySortOption
@@ -90,6 +94,25 @@ import kotlinx.coroutines.withContext
 import kotlin.math.abs
 
 private const val GALLERY_PAGE_KEY_PREFIX = "gallery-page:"
+
+internal enum class GalleryContentPresentation {
+    LOADING,
+    LOAD_ERROR,
+    EMPTY,
+    EMPTY_CURRENT_DIRECTORY,
+    CONTENT,
+}
+
+internal fun galleryContentPresentation(state: MainUiState): GalleryContentPresentation {
+    val totalItemCount = state.galleryCollection?.totalItemCount ?: 0
+    return when {
+        state.galleryLoading -> GalleryContentPresentation.LOADING
+        state.galleryError != null -> GalleryContentPresentation.LOAD_ERROR
+        totalItemCount == 0 && state.galleryDirectories.isEmpty() -> GalleryContentPresentation.EMPTY
+        totalItemCount == 0 -> GalleryContentPresentation.EMPTY_CURRENT_DIRECTORY
+        else -> GalleryContentPresentation.CONTENT
+    }
+}
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -293,13 +316,21 @@ fun LibraryScreen(
                 }
             }
 
-            when {
-                state.galleryLoading -> {
+            when (galleryContentPresentation(state)) {
+                GalleryContentPresentation.LOADING -> {
                     item(key = "gallery-loading") {
                         CircularProgressIndicator()
                     }
                 }
-                totalGalleryItems == 0 && state.galleryDirectories.isEmpty() -> {
+                GalleryContentPresentation.LOAD_ERROR -> {
+                    item(key = "gallery-error") {
+                        LibraryLoadErrorCard(
+                            error = requireNotNull(state.galleryError),
+                            onRetry = vm::refreshGallery,
+                        )
+                    }
+                }
+                GalleryContentPresentation.EMPTY -> {
                     item(key = "gallery-empty") {
                         Text(
                             if (state.galleryMode == GalleryViewMode.FLATTENED_ALL_IMAGES) {
@@ -310,12 +341,12 @@ fun LibraryScreen(
                         )
                     }
                 }
-                totalGalleryItems == 0 -> {
+                GalleryContentPresentation.EMPTY_CURRENT_DIRECTORY -> {
                     item(key = "gallery-empty-directory") {
                         Text("No images in the current directory.")
                     }
                 }
-                else -> {
+                GalleryContentPresentation.CONTENT -> {
                     items(
                         count = pageCount,
                         key = { pageIndex -> "$GALLERY_PAGE_KEY_PREFIX$pageIndex" },
@@ -353,6 +384,49 @@ fun LibraryScreen(
             onFocusIndex = vm::pinGalleryItem,
             onDismiss = { fullscreenIndex = null },
         )
+    }
+}
+
+@Composable
+private fun LibraryLoadErrorCard(
+    error: GalleryLoadError,
+    onRetry: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.errorContainer,
+        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        shape = RoundedCornerShape(22.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.library_load_error_title),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Text(
+                text = stringResource(
+                    when (error.kind) {
+                        GalleryLoadErrorKind.TIMEOUT -> R.string.library_load_error_timeout
+                        GalleryLoadErrorKind.REQUEST_FAILED -> R.string.library_load_error_request_failed
+                    },
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            error.technicalDetail
+                ?.takeIf { it.isNotBlank() }
+                ?.let { detail ->
+                    Text(
+                        text = stringResource(R.string.library_load_error_details, detail),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            Button(onClick = onRetry) {
+                Text(stringResource(R.string.library_load_error_retry))
+            }
+        }
     }
 }
 

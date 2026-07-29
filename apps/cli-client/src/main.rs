@@ -268,7 +268,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            let suite = run_latency_test(
+            let suite = Box::pin(run_latency_test(
                 &cli,
                 *path,
                 node_id,
@@ -280,7 +280,7 @@ async fn main() -> Result<()> {
                     server_delay_ms: *server_delay_ms,
                     pause_between_samples_ms: *pause_ms,
                 },
-            )
+            ))
             .await?;
             if *json {
                 println!("{}", serde_json::to_string_pretty(&suite)?);

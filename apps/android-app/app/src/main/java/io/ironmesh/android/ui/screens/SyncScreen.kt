@@ -38,7 +38,6 @@ import io.ironmesh.android.R
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
-import io.ironmesh.android.data.isConnected
 import io.ironmesh.android.ui.FolderSyncActivityFilter
 import io.ironmesh.android.ui.FolderSyncHistoryState
 import io.ironmesh.android.ui.MainUiState
@@ -67,7 +66,7 @@ fun SyncScreen(
     val editingProfile = state.syncProfiles.firstOrNull { it.id == editingProfileId }
     val heroTone = when {
         state.folderSyncStatus.errorProfileCount > 0L -> HeroTone.Error
-        !connectionStatus.isConnected(connectionHealthNow) -> HeroTone.Warning
+        !isAppConnectionHealthy(connectionStatus, connectionHealthNow) -> HeroTone.Warning
         else -> HeroTone.Good
     }
 
@@ -114,7 +113,7 @@ fun SyncScreen(
                 }
             }
             Text(
-                text = connectionStatus.message,
+                text = appConnectionSummary(connectionStatus),
                 style = MaterialTheme.typography.bodyMedium,
             )
             connectionStatus.lastSuccessfulConnectionUrl

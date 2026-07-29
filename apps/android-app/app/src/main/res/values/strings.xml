@@ -69,6 +69,11 @@
     <string name="wifi_help_text">Leave the Wi-Fi list empty to allow any Wi-Fi. Exact names require Android Wi-Fi and location access.</string>
     <string name="profile_details">Profile details</string>
     <string name="library_refresh">Refresh</string>
+    <string name="library_load_error_title">Library couldn’t be loaded</string>
+    <string name="library_load_error_timeout">The gallery index did not respond in time. Check the connection and try again.</string>
+    <string name="library_load_error_request_failed">The gallery index request failed. Check the connection and try again.</string>
+    <string name="library_load_error_details">Details: %1$s</string>
+    <string name="library_load_error_retry">Try again</string>
     <string name="settings_device">Device</string>
     <string name="settings_permissions">Permissions</string>
     <string name="settings_appearance">Appearance</string>

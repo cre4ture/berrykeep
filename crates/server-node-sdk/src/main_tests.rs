@@ -13702,8 +13702,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         super::list_store_index(
             axum::extract::State(state.clone()),
             axum::extract::Query(super::StoreIndexQuery {
-                prefix: Some("gallery".to_string()),
-                depth: Some(2),
+                prefix: None,
+                depth: Some(64),
                 snapshot: None,
                 view: Some(super::StoreIndexView::Tree),
                 cursor: None,
@@ -13711,19 +13711,34 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 offset: Some(0),
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-                media_filter: None,
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
             }),
         )
         .await,
     );
     assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        first_response
+            .headers()
+            .get("x-ironmesh-store-index-materialized-entries")
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "the cold page should materialize only its requested sorted prefix"
+    );
+    let first_body = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_payload: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(first_payload["entries"][0]["path"], "gallery/a.png");
+    assert_eq!(first_payload["total_entry_count"], 2);
+    assert_eq!(first_payload["has_more"], true);
 
     let second_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
             axum::extract::State(state.clone()),
             axum::extract::Query(super::StoreIndexQuery {
-                prefix: Some("gallery".to_string()),
-                depth: Some(2),
+                prefix: None,
+                depth: Some(64),
                 snapshot: None,
                 view: Some(super::StoreIndexView::Tree),
                 cursor: None,
@@ -13731,7 +13746,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 offset: Some(1),
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-                media_filter: None,
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
             }),
         )
         .await,
@@ -13745,11 +13760,118 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
             .is_some_and(|value| value.contains("store-index-page-cache;desc=hit")),
         "the second index page should reuse the prepared result"
     );
+    assert_eq!(
+        second_response
+            .headers()
+            .get("x-ironmesh-store-index-materialized-entries")
+            .and_then(|value| value.to_str().ok()),
+        Some("2"),
+        "the cached second page should extend the sorted prefix by one entry"
+    );
     let second_body = to_bytes(second_response.into_body(), usize::MAX)
         .await
         .unwrap();
     let second_payload: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
     assert_eq!(second_payload["entries"][0]["path"], "gallery/b.png");
+    assert_eq!(second_payload["total_entry_count"], 2);
+    assert_eq!(second_payload["has_more"], false);
+
+    let cached_query = super::StoreIndexQuery {
+        prefix: None,
+        depth: Some(64),
+        snapshot: None,
+        view: Some(super::StoreIndexView::Tree),
+        cursor: None,
+        page_size: None,
+        offset: Some(0),
+        limit: Some(1),
+        sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+        media_filter: Some(super::StoreIndexMediaFilter::Image),
+    };
+    let cached_sequence = state
+        .storage
+        .namespace_change_sequence
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let cached_key = super::store_index_page_cache_key(
+        &cached_query,
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .expect("paginated tree query should have a cache key");
+    let stale_cached = state
+        .storage
+        .store_index_page_cache
+        .lock()
+        .unwrap()
+        .get(&cached_key, cached_sequence)
+        .expect("prepared page should be cached");
+    super::publish_namespace_change(&state);
+    assert!(
+        super::cached_store_index_page_response(
+            &state,
+            cached_sequence,
+            &cached_query,
+            uuid::Uuid::new_v4(),
+            std::time::Instant::now(),
+            stale_cached,
+        )
+        .is_none(),
+        "a mutation between cache lookup and response must reject the stale page"
+    );
+
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/0.png",
+                bytes::Bytes::from_static(b"new"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+    super::publish_namespace_change(&state);
+
+    let invalidated_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: None,
+                depth: Some(64),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(1),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(invalidated_response.status(), axum::http::StatusCode::OK);
+    assert!(
+        invalidated_response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.contains("store-index-page-cache;desc=hit")),
+        "a namespace mutation must invalidate the prepared result"
+    );
+    assert_eq!(
+        invalidated_response
+            .headers()
+            .get("x-ironmesh-store-index-materialized-entries")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let invalidated_body = to_bytes(invalidated_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let invalidated_payload: serde_json::Value = serde_json::from_slice(&invalidated_body).unwrap();
+    assert_eq!(invalidated_payload["entries"][0]["path"], "gallery/0.png");
+    assert_eq!(invalidated_payload["total_entry_count"], 3);
+    assert_eq!(invalidated_payload["has_more"], true);
 
     cleanup_test_state(&state).await;
 }
@@ -13886,6 +14008,146 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
     assert_eq!(summary.geotagged_count, 1);
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].path, "gallery/clip.mp4");
+}
+
+#[test]
+fn store_index_media_filter_prefilters_metadata_lookup_plan() {
+    let keys = vec![
+        "gallery/a.jpg".to_string(),
+        "gallery/b.mp4".to_string(),
+        "gallery/notes.txt".to_string(),
+        "gallery/raw.bin".to_string(),
+        "gallery/nested/too/deep/image.png".to_string(),
+    ];
+    let mut plan = super::plan_store_index_entries(&keys, "gallery", 2);
+
+    assert_eq!(plan.file_entries.len(), 4);
+    assert_eq!(plan.prefix_entries, vec!["gallery/nested/too/"]);
+
+    super::prefilter_store_index_entry_plan_for_media(
+        &mut plan,
+        Some(super::StoreIndexMediaFilter::Image),
+    );
+
+    assert_eq!(
+        plan.file_entries,
+        vec!["gallery/a.jpg", "gallery/b.mp4"],
+        "all extension-recognized media candidates must remain because cached metadata can override their concrete kind"
+    );
+    assert!(
+        plan.prefix_entries.is_empty(),
+        "prefixes never survive a media filter and should not trigger metadata work"
+    );
+}
+
+#[test]
+fn store_index_prepared_sort_materializes_only_requested_prefix() {
+    let entries = (0..100)
+        .map(|index| super::StoreIndexEntry {
+            path: format!("gallery/{index:03}.jpg"),
+            entry_type: "key".to_string(),
+            version: None,
+            content_hash: None,
+            size_bytes: None,
+            modified_at_unix: None,
+            content_fingerprint: None,
+            media: Some(super::MediaIndexResponse {
+                status: "ready".to_string(),
+                content_fingerprint: format!("fingerprint-{index}"),
+                media_type: Some("image".to_string()),
+                mime_type: Some("image/jpeg".to_string()),
+                width: None,
+                height: None,
+                orientation: None,
+                taken_at_unix: Some(index),
+                gps: None,
+                thumbnail: None,
+                error: None,
+            }),
+        })
+        .collect::<Vec<_>>();
+    let mut prepared = super::StoreIndexPreparedEntries::new(
+        entries.clone(),
+        Some(super::StoreIndexSortOrder::CapturedDesc),
+    );
+
+    assert_eq!(prepared.materialized_entry_count(), 0);
+    let first_page = prepared.page(0, 5);
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "gallery/099.jpg",
+            "gallery/098.jpg",
+            "gallery/097.jpg",
+            "gallery/096.jpg",
+            "gallery/095.jpg",
+        ]
+    );
+    assert_eq!(
+        prepared.materialized_entry_count(),
+        5,
+        "the cold page must not fully sort the remaining 95 entries"
+    );
+
+    let second_page = prepared.page(5, 10);
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "gallery/094.jpg",
+            "gallery/093.jpg",
+            "gallery/092.jpg",
+            "gallery/091.jpg",
+            "gallery/090.jpg",
+        ]
+    );
+    assert_eq!(
+        prepared.materialized_entry_count(),
+        10,
+        "a cache hit should extend, not rebuild, the sorted prefix"
+    );
+
+    let deep_page = prepared.page(90, 95);
+    assert_eq!(deep_page.len(), 5);
+    assert!(
+        prepared.remaining_entry_capacity() <= 10,
+        "deep pagination should release excess heap capacity"
+    );
+
+    for sort in [
+        super::StoreIndexSortOrder::PathAsc,
+        super::StoreIndexSortOrder::PathDesc,
+        super::StoreIndexSortOrder::CapturedAsc,
+        super::StoreIndexSortOrder::CapturedDesc,
+        super::StoreIndexSortOrder::TypeAsc,
+        super::StoreIndexSortOrder::TypeDesc,
+        super::StoreIndexSortOrder::SizeAsc,
+        super::StoreIndexSortOrder::SizeDesc,
+        super::StoreIndexSortOrder::ModifiedAsc,
+        super::StoreIndexSortOrder::ModifiedDesc,
+    ] {
+        let mut fully_sorted = entries.clone();
+        super::sort_store_index_entries(&mut fully_sorted, sort);
+        let mut incrementally_sorted =
+            super::StoreIndexPreparedEntries::new(entries.clone(), Some(sort));
+        let incremental_page = incrementally_sorted.page(0, entries.len());
+        assert_eq!(
+            incremental_page
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            fully_sorted
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            "incremental ordering must match full ordering for {sort:?}"
+        );
+    }
 }
 
 async fn metadata_import_makes_store_index_visible_without_marking_local_replica_impl(
