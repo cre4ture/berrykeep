@@ -46,6 +46,7 @@ runs:
       with:
         cache-targets: false
         shared-key: ${{ inputs.rust-cache-shared-key }}
+        save-if: ${{ github.event_name != 'pull_request' }}
 
     - name: Setup Java
       uses: actions/setup-java@v4

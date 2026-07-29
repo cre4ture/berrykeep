@@ -24,6 +24,9 @@ env:
   # dev-profile check/test/clippy jobs got almost no cross-run reuse from it.
   # Disabling incremental lets sccache actually cache rustc invocations.
   CARGO_INCREMENTAL: "0"
+  # Pull requests can restore caches from main, but their merge-ref caches are
+  # not reusable by main or by unrelated pull requests.
+  SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
 
 jobs:
   workflow-lint:

@@ -48,6 +48,22 @@ Optional (recommended separately):
 
 Why: CI lanes are intentionally split between stable and nightly. Requiring exactly these checks prevents accidental bypass (missing nightly lane) or false blocking (obsolete check names).
 
+## Pull request cache policy
+
+Pull request jobs restore the shared Rust caches but do not write them:
+
+- sccache keeps `SCCACHE_GHA_ENABLED=true` and sets
+  `SCCACHE_GHA_RW_MODE=READ_ONLY` for pull requests, so compiler artifacts
+  already cached on `main` remain available;
+- every `Swatinem/rust-cache` path, including the shared Android composite
+  action, uses `save-if: ${{ github.event_name != 'pull_request' }}`.
+
+GitHub scopes pull request cache writes to the pull request merge ref. Those
+entries are not reusable by `main` or unrelated pull requests, so allowing
+them to accumulate only increases cache churn and eviction pressure. Trusted
+non-pull-request runs keep write access: pushes to `main`, scheduled runs,
+manual dispatches, and release workflows continue to seed reusable caches.
+
 ## Local required-check reproduction
 
 From the repo root, the closest local equivalent to the required branch-protection set is:
