@@ -185,11 +185,19 @@ merge-ref scope. Trusted `push`, `schedule`, and `workflow_dispatch` runs still
 refresh those archives. This prevents short-lived pull-request archives from
 evicting reusable default-branch cache entries.
 
-The `Cache cleanup` workflow runs when a pull request closes and deletes up to
-the 100 largest remaining entries under its `refs/pull/<number>/merge` scope.
-This also reclaims entries written by cache clients that do not support a
-restore-only mode. The cleanup job never checks out or executes pull-request
-code and has only `actions: write` plus `contents: read` permission.
+The `Cache cleanup` workflow runs when a pull request closes and repeatedly
+deletes batches of the largest entries under its exact
+`refs/pull/<number>/merge` scope. The cleanup is intentionally capped at 800
+entries: the built-in `GITHUB_TOKEN` has a 1,000-request-per-hour REST API
+limit, and each cache needs an individual delete request. Deletes are spaced
+one second apart to stay below GitHub's secondary mutation limits. The final
+log reports any entries left after the bounded cleanup.
+
+This reclaims entries written by legacy or misconfigured cache clients while
+leaving API capacity for other workflows. Pull-request cache writers should
+still use restore-only mode so that the bounded cleanup normally removes every
+remaining entry. The cleanup job never checks out or executes pull-request code
+and has only `actions: write` plus `contents: read` permission.
 
 ## Nightly lane fails, stable lanes pass
 
