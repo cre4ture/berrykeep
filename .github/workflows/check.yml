@@ -950,3 +950,22 @@ jobs:
           name: berrykeep-server-node-msi-x64
           path: windows/server-node-installer/out/**/*.msi
           if-no-files-found: error
+
+  required-ci:
+    name: Required CI
+    if: ${{ always() }}
+    needs:
+      - workspace-check
+      - rustfmt
+      - clippy
+      - unit-tests
+      - ios-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required CI results
+        env:
+          REQUIRED_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq --exit-status '
+            all(.[]; .result == "success" or .result == "skipped")
+          ' <<<"${REQUIRED_RESULTS}"
