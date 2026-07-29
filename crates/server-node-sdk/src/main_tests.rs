@@ -13711,7 +13711,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 offset: Some(0),
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-                media_filter: Some(super::StoreIndexMediaFilter::Image),
+                media_filter: None,
             }),
         )
         .await,
@@ -13746,7 +13746,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 offset: Some(1),
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-                media_filter: Some(super::StoreIndexMediaFilter::Image),
+                media_filter: None,
             }),
         )
         .await,
@@ -13786,7 +13786,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         offset: Some(0),
         limit: Some(1),
         sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-        media_filter: Some(super::StoreIndexMediaFilter::Image),
+        media_filter: None,
     };
     let cached_sequence = state
         .storage
@@ -13844,7 +13844,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 offset: Some(0),
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-                media_filter: Some(super::StoreIndexMediaFilter::Image),
+                media_filter: None,
             }),
         )
         .await,
@@ -13881,6 +13881,388 @@ run_on_main_metadata_backends!(
     list_store_index_reuses_paginated_page_cache,
     list_store_index_reuses_paginated_page_cache_turso
 );
+
+#[tokio::test]
+async fn list_store_index_uses_sqlite_gallery_projection_for_captured_pagination() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let second_png = {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    };
+    let (older, newer) = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let older = locked
+            .put_object_versioned(
+                "gallery/older.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let newer = locked
+            .put_object_versioned(
+                "gallery/newer.png",
+                bytes::Bytes::from(second_png),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut older_metadata = locked
+            .ensure_media_metadata(&older.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        older_metadata.taken_at_unix = Some(100);
+        locked
+            .persist_media_cache_record(&older_metadata)
+            .await
+            .unwrap();
+        let mut newer_metadata = locked
+            .ensure_media_metadata(&newer.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        newer_metadata.taken_at_unix = Some(200);
+        locked
+            .persist_media_cache_record(&newer_metadata)
+            .await
+            .unwrap();
+        (older, newer)
+    };
+
+    let first_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(64),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(1),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(first_response.status(), StatusCode::OK);
+    assert!(
+        first_response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("gallery-index;desc=sqlite")),
+        "the SQLite projection should bypass the full store-index scan"
+    );
+    assert_eq!(
+        first_response
+            .headers()
+            .get("x-ironmesh-store-index-materialized-entries")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let first_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first_payload["entries"][0]["path"], "gallery/newer.png");
+    assert_eq!(first_payload["entries"][0]["media"]["taken_at_unix"], 200);
+    assert!(
+        first_payload["entries"][0]["modified_at_unix"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+    assert_eq!(first_payload["total_entry_count"], 2);
+    assert_eq!(first_payload["media_summary"]["ready_count"], 2);
+
+    let second_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(64),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(1),
+                limit: Some(1),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(second_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(second_payload["entries"][0]["path"], "gallery/older.png");
+    assert_eq!(second_payload["entries"][0]["media"]["taken_at_unix"], 100);
+
+    assert_ne!(older.manifest_hash, newer.manifest_hash);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn list_store_index_gallery_projection_matches_generic_pending_media_on_cache_miss() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/pending.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let generic_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(64),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(1),
+                sort: Some(super::StoreIndexSortOrder::PathAsc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+            }),
+        )
+        .await,
+    );
+    let generic_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(generic_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(generic_payload["entries"][0]["media"]["status"], "pending");
+
+    let gallery_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(64),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(1),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+            }),
+        )
+        .await,
+    );
+    assert!(
+        gallery_response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("gallery-index;desc=sqlite"))
+    );
+    let gallery_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(gallery_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        gallery_payload["entries"][0]["media"], generic_payload["entries"][0]["media"],
+        "a missing media-cache record must retain the generic pending-media response"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_zero_timestamps_and_depth()
+ {
+    fn colored_png_bytes(red: u8) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([red, 34, 56, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (older, zero, latest_snapshot_id) = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let older = locked
+            .put_object_versioned(
+                "gallery/older.png",
+                bytes::Bytes::from(colored_png_bytes(12)),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let zero = locked
+            .put_object_versioned(
+                "gallery/zero.png",
+                bytes::Bytes::from(colored_png_bytes(34)),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        locked
+            .put_object_versioned(
+                "gallery/missing.png",
+                bytes::Bytes::from(colored_png_bytes(56)),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let deep = locked
+            .put_object_versioned(
+                "gallery/deep/hidden.png",
+                bytes::Bytes::from(colored_png_bytes(78)),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut older_metadata = locked
+            .ensure_media_metadata(&older.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        older_metadata.taken_at_unix = Some(100);
+        locked
+            .persist_media_cache_record(&older_metadata)
+            .await
+            .unwrap();
+        let mut zero_metadata = locked
+            .ensure_media_metadata(&zero.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        zero_metadata.taken_at_unix = Some(0);
+        locked
+            .persist_media_cache_record(&zero_metadata)
+            .await
+            .unwrap();
+        (older, zero, deep.snapshot_id)
+    };
+
+    let generic_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(1),
+                snapshot: Some(latest_snapshot_id),
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(10),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(generic_response.status(), StatusCode::OK);
+    let generic_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(generic_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let gallery_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(1),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(10),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(gallery_response.status(), StatusCode::OK);
+    let gallery_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(gallery_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let signature = |payload: &serde_json::Value| {
+        payload["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["path"].clone(),
+                    entry["media"]["status"].clone(),
+                    entry["media"]["taken_at_unix"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(signature(&gallery_payload), signature(&generic_payload));
+    assert_eq!(
+        signature(&gallery_payload),
+        vec![
+            (
+                serde_json::json!("gallery/older.png"),
+                serde_json::json!("ready"),
+                serde_json::json!(100),
+            ),
+            (
+                serde_json::json!("gallery/missing.png"),
+                serde_json::json!("pending"),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!("gallery/zero.png"),
+                serde_json::json!("ready"),
+                serde_json::json!(0),
+            ),
+        ]
+    );
+    assert_eq!(gallery_payload["total_entry_count"], 3);
+    assert_eq!(
+        gallery_payload["media_summary"],
+        generic_payload["media_summary"]
+    );
+    assert_ne!(older.manifest_hash, zero.manifest_hash);
+
+    cleanup_test_state(&state).await;
+}
 
 #[test]
 fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
