@@ -1,3 +1,13 @@
+ironmesh (1.0.41-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Extend managed QUIC route diagnostics and connection lifecycle logs across
+    desktop and mobile clients.
+  * Improve client route scoring, retry behavior, and gallery indexing errors.
+  * Strengthen Bazel targets, cache handling, and required CI aggregation.
+  * Roll the workspace release to 1.0.41.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 29 Jul 2026 14:57:58 +0200
+
 ironmesh (1.0.40-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Embed an authenticated Iroh relay on the Rendezvous endpoint and port.
