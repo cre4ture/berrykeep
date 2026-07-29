@@ -9,13 +9,11 @@ import {
 import {
   GallerySurface,
   galleryBasemapsFromConfiguration,
-  type GalleryEntry,
-  type GalleryLoadEntriesOptions,
-  type GalleryMediaRequests
+  type GalleryDataSource
 } from "@ironmesh/ui";
 import { Stack, Tabs } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
-import { useCallback } from "react";
+import { useMemo } from "react";
 import { MapDatasetImportCard } from "../components/MapDatasetImportCard";
 import { MapVariantConfigurationCard } from "../components/MapVariantConfigurationCard";
 import { useAdminAccess } from "../lib/admin-access";
@@ -23,16 +21,13 @@ import { useAdminAccess } from "../lib/admin-access";
 const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
 
 export function GalleryPage() {
-  const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
-  const normalizedAdminTokenOverride = adminTokenOverride.trim();
-  const hasExplicitAdminAccess =
-    Boolean(normalizedAdminTokenOverride) || Boolean(sessionStatus?.authenticated);
+  const { sessionStatus, sessionLoading } = useAdminAccess();
   const loginRequired = sessionStatus?.login_required ?? true;
   const canInspectMapConfiguration =
-    !sessionLoading && (!loginRequired || hasExplicitAdminAccess);
+    !sessionLoading && (!loginRequired || Boolean(sessionStatus?.authenticated));
   const mapConfigurationQuery = useQuery({
-    queryKey: ["gallery-page", "map-configuration", normalizedAdminTokenOverride],
-    queryFn: () => getAdminGalleryMapConfiguration(normalizedAdminTokenOverride || undefined),
+    queryKey: ["gallery-page", "map-configuration"],
+    queryFn: () => getAdminGalleryMapConfiguration(),
     enabled: canInspectMapConfiguration,
     staleTime: 5_000
   });
@@ -42,65 +37,42 @@ export function GalleryPage() {
     mapConfiguration?.configuration.variants ?? []
   );
 
-  const loadSnapshots = useCallback(
-    () => listAdminSnapshots(normalizedAdminTokenOverride || undefined),
-    [normalizedAdminTokenOverride]
-  );
-  const loadEntries = useCallback(
-    (
-      prefix: string,
-      depth: number,
-      snapshotId: string | null,
-      options?: GalleryLoadEntriesOptions
-    ) =>
-      listAdminStoreEntries(
-        prefix,
-        depth,
-        snapshotId,
-        normalizedAdminTokenOverride || undefined,
-        options
-      ),
-    [normalizedAdminTokenOverride]
-  );
-  const loadVersions = useCallback(
-    (key: string) => getAdminVersionGraph(key, normalizedAdminTokenOverride || undefined),
-    [normalizedAdminTokenOverride]
-  );
-  const getMediaRequests = useCallback(
-    (
-      entry: GalleryEntry,
-      snapshotId: string | null,
-      versionId?: string | null
-    ): GalleryMediaRequests => {
-      const thumbnailUrl = entry.media?.thumbnail?.url ?? null;
-      const original = {
-        url: adminBinaryObjectUrl(entry.path, snapshotId, versionId)
-      };
+  const galleryDataSource = useMemo<GalleryDataSource>(
+    () => ({
+      loadSnapshots: () => listAdminSnapshots(),
+      loadEntries: (prefix, depth, snapshotId, options) =>
+        listAdminStoreEntries(prefix, depth, snapshotId, undefined, options),
+      loadVersions: (key) => getAdminVersionGraph(key),
+      getMediaRequests: (entry, snapshotId, versionId) => {
+        const thumbnailUrl = entry.media?.thumbnail?.url ?? null;
+        const original = {
+          url: adminBinaryObjectUrl(entry.path, snapshotId, versionId)
+        };
 
-      return {
-        thumbnail: thumbnailUrl
-          ? {
-              url: thumbnailUrl
-            }
-          : null,
-        fullscreen:
-          thumbnailUrl && entry.media?.media_type !== "video"
+        return {
+          thumbnail: thumbnailUrl
             ? {
-                url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
+                url: thumbnailUrl
               }
             : null,
-        original
-      };
-    },
+          fullscreen:
+            thumbnailUrl && entry.media?.media_type !== "video"
+              ? {
+                  url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
+                }
+              : null,
+          original
+        };
+      },
+      restoreVersion: (key, versionId, targetPath) =>
+        restoreAdminStoreVersion(key, versionId, targetPath),
+      retryMediaEntry: (entry, snapshotId) =>
+        retryAdminMediaCacheEntry(entry.path, undefined, {
+          snapshot: snapshotId,
+          version: typeof entry.version === "string" ? entry.version : null
+        })
+    }),
     []
-  );
-  const retryMediaEntry = useCallback(
-    (entry: GalleryEntry, snapshotId: string | null) =>
-      retryAdminMediaCacheEntry(entry.path, normalizedAdminTokenOverride || undefined, {
-        snapshot: snapshotId,
-        version: typeof entry.version === "string" ? entry.version : null
-      }),
-    [normalizedAdminTokenOverride]
   );
   return (
     <Tabs defaultValue="gallery">
@@ -119,14 +91,7 @@ export function GalleryPage() {
           basemapConfigurationLoading={mapConfigurationQuery.isLoading}
           basemapConfigurationError={mapConfigurationError}
           retryBasemapConfiguration={() => void mapConfigurationQuery.refetch()}
-          loadSnapshots={loadSnapshots}
-          loadEntries={loadEntries}
-          getMediaRequests={getMediaRequests}
-          loadVersions={loadVersions}
-          restoreVersion={(key, versionId, targetPath) =>
-            restoreAdminStoreVersion(key, versionId, targetPath)
-          }
-          retryMediaEntry={retryMediaEntry}
+          dataSource={galleryDataSource}
         />
       </Tabs.Panel>
 

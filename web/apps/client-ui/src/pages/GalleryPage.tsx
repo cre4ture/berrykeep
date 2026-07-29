@@ -11,9 +11,7 @@ import {
   GallerySurface,
   galleryBasemapsFromConfiguration,
   PageHeader,
-  type GalleryEntry,
-  type GalleryLoadEntriesOptions,
-  type GalleryMediaRequests,
+  type GalleryDataSource,
   type GallerySurfaceViewMode
 } from "@ironmesh/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -89,44 +87,39 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
     () => galleryBasemapsFromConfiguration(mapConfiguration?.configuration.variants ?? []),
     [mapConfiguration]
   );
-  const loadSnapshots = useCallback(() => listSnapshots(), []);
-  const loadEntries = useCallback(
-    (
-      prefix: string,
-      depth: number,
-      snapshotId: string | null,
-      options?: GalleryLoadEntriesOptions
-    ) => listStoreEntries(prefix, depth, snapshotId, options),
-    []
-  );
-  const getMediaRequests = useCallback(
-    (entry: GalleryEntry, snapshotId: string | null, versionId?: string | null): GalleryMediaRequests => {
-      const thumbnailUrl = entry.media?.thumbnail?.url ?? null;
-      return {
-        thumbnail: thumbnailUrl
-          ? {
-              url: thumbnailUrl
-            }
-          : null,
-        fullscreen:
-          thumbnailUrl && entry.media?.media_type !== "video"
+  const galleryDataSource = useMemo<GalleryDataSource>(
+    () => ({
+      loadSnapshots: () => listSnapshots(),
+      loadEntries: (prefix, depth, snapshotId, options) =>
+        listStoreEntries(prefix, depth, snapshotId, options),
+      getMediaRequests: (entry, snapshotId, versionId) => {
+        const thumbnailUrl = entry.media?.thumbnail?.url ?? null;
+        return {
+          thumbnail: thumbnailUrl
             ? {
-                url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
+                url: thumbnailUrl
               }
             : null,
-        original: {
-          url: binaryMediaUrl(entry.path, snapshotId, versionId)
-        }
-      };
-    },
-    []
-  );
-  const retryMediaEntry = useCallback(
-    (entry: GalleryEntry, snapshotId: string | null) =>
-      retryStoreMediaCacheEntry(entry.path, {
-        snapshot: snapshotId,
-        version: typeof entry.version === "string" ? entry.version : null
-      }),
+          fullscreen:
+            thumbnailUrl && entry.media?.media_type !== "video"
+              ? {
+                  url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
+                }
+              : null,
+          original: {
+            url: binaryMediaUrl(entry.path, snapshotId, versionId)
+          }
+        };
+      },
+      loadVersions: getVersionGraph,
+      restoreVersion: (key, versionId, targetPath) =>
+        restoreStoreVersion(key, versionId, targetPath),
+      retryMediaEntry: (entry, snapshotId) =>
+        retryStoreMediaCacheEntry(entry.path, {
+          snapshot: snapshotId,
+          version: typeof entry.version === "string" ? entry.version : null
+        })
+    }),
     []
   );
 
@@ -145,14 +138,7 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
         basemapConfigurationLoading={mapConfigurationLoading}
         basemapConfigurationError={mapConfigurationError}
         retryBasemapConfiguration={() => void refreshMapConfiguration()}
-        loadSnapshots={loadSnapshots}
-        loadEntries={loadEntries}
-        getMediaRequests={getMediaRequests}
-        loadVersions={getVersionGraph}
-        restoreVersion={(key, versionId, targetPath) =>
-          restoreStoreVersion(key, versionId, targetPath)
-        }
-        retryMediaEntry={retryMediaEntry}
+        dataSource={galleryDataSource}
       />
     </>
   );
