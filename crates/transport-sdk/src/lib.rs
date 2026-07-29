@@ -52,6 +52,7 @@ pub use direct_quic::{
 /// Publishes the Android JVM and application context to Iroh before its DNS
 /// resolver or endpoint implementation is used.
 #[cfg(target_os = "android")]
+#[allow(unsafe_code)]
 pub unsafe fn install_android_jni_context(
     java_vm: *mut std::ffi::c_void,
     context_jobject: *mut std::ffi::c_void,

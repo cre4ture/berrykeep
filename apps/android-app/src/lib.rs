@@ -291,6 +291,7 @@ const ANDROID_CONNECTION_LOG_TARGET: &str = "ironmesh_android_connection";
 /// can create an Iroh endpoint or resolve a relay host.  Iroh uses this
 /// application context to read Android's configured DNS servers.
 #[cfg(target_os = "android")]
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "system" fn JNI_OnLoad(vm: JavaVM, context: *mut std::ffi::c_void) -> jint {
     // The Android runtime keeps both pointers valid for the process lifetime.
