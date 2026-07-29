@@ -12,6 +12,7 @@ The current native targets are:
 
 - `//crates/client-sdk:unit_test`
 - `//crates/common:unit_test`
+- `//crates/desktop-client-config:unit_test`
 - `//crates/desktop-status:unit_test`
 - `//crates/rendezvous-server:unit_test`
 - `//crates/sync-core:unit_test`
@@ -22,8 +23,11 @@ The current native targets are:
 dependency layer by consuming `common`, `sync-core`, and `transport-sdk` at
 runtime and `rendezvous-server` only in its unit tests. `desktop-status`
 consumes the native `client-sdk` target, extending dependency-aware
-invalidation to desktop integration code without introducing duplicate
-generated crates. Run the current Bazel unit suite with:
+invalidation to desktop integration code. `desktop-client-config` is an
+independent leaf whose dependencies are all supplied by Crate Universe; its
+native library prepares the later `background-launcher` and `config-app`
+application targets. These targets avoid duplicate generated crates. Run the
+current Bazel unit suite with:
 
 ```bash
 bazel test //:unit
