@@ -4,10 +4,45 @@
 
 # BerryKeep
 
-Private, self-hosted storage for files and media, built around clustered server
-nodes and native access paths.
+Your data. Your hardware. Your storage cluster.
 
-BerryKeep is building toward a private, self-hosted storage system that makes clustered files, folders, and media feel as approachable as a consumer cloud drive, while keeping deployment, trust, and data ownership in your hands. The project combines secure multi-node storage, offline-friendly sync and conflict handling, and native filesystem access paths so the same data can surface cleanly in web, mobile, and OS file-manager workflows.
+BerryKeep is private, self-hosted storage for files and media. It turns the
+hardware you already own into a resilient storage cluster, so files, folders,
+and media stay under your control without sacrificing the convenience people
+expect from a cloud drive. Secure multi-node storage, offline-friendly sync and
+conflict handling, and native access paths bring the same data cleanly to the
+web, mobile, and operating-system file managers.
+
+## Built for the hardware you already own
+
+You do not need a rack, a NAS appliance, or enterprise disks to run BerryKeep
+at home. Put a server node on an unused desktop or laptop, a small always-on
+Linux computer such as a Raspberry Pi-class device. On those computers, an
+inexpensive external USB drive is enough for each node; give it a stable mount
+location and a stable place on your network. That is a practical BerryKeep
+cluster. The repository also includes an Android Server Node app for compatible
+spare Android phones.
+
+The important part is the cluster, not any individual device. A straightforward
+home setup uses three devices in different places in the house, each with its
+own USB drive. With enough online nodes and capacity, BerryKeep's default
+replication factor of three stores independent replicas across the cluster. It
+places data, replicates it after writes, and repairs degraded replicas from a
+healthy peer automatically. A failed drive or an unreliable node should not
+turn into data loss because the remaining nodes still hold the other copies.
+
+BerryKeep also watches the machines that hold your data. Node health reporting
+automatically detects and surfaces storage-integrity problems, repair failures,
+disk-health signals (when SMART is available), thermal throttling, ECC memory
+errors on capable systems, and network-error indicators in the administrator
+UI. You can spot unstable hardware early, replace it deliberately, and let the
+cluster restore its intended redundancy instead of discovering a problem only
+after a disk has failed.
+
+This is intentionally modest hardware used well: reclaim devices that would
+otherwise sit unused, start with a single external drive per node, then add
+capacity or nodes when your library grows. The current supported installation
+paths are documented below.
 
 ## Renaming from IronMesh
 
@@ -48,10 +83,11 @@ do not mean the project is production-ready yet.
 
 Current direction highlights:
 
-- Cluster-aware storage with deterministic placement, asynchronous replication and repair, and a no-loss version model for offline or concurrent edits.
+- Cluster-aware storage with deterministic placement, automatic replication and repair, and a no-loss version model for offline or concurrent edits.
 - Native access paths across the web UI, CLI, Android, Linux FUSE, and Windows CFAPI placeholder integration, with on-demand hydration where the platform supports it.
 - Secure onboarding and connectivity through guided zero-touch cluster setup, certificate-backed identities, and rendezvous/relay paths for harder network topologies.
 - Media-aware browsing with cached thumbnails and metadata designed to support gallery-style experiences without downloading original files first.
+- Hardware-health reporting that makes storage, runtime, and host reliability signals visible before a weak node becomes a bigger problem.
 
 BerryKeep draws inspiration from [PicApport](https://www.picapport.de/de/index.php) on the self-hosted media/gallery side and [Syncthing](https://syncthing.net/) on the private, direct-first synchronization side.
 
