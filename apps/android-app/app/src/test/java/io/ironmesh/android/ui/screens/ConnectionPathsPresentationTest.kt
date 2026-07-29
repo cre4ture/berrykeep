@@ -52,6 +52,18 @@ class ConnectionPathsPresentationTest {
 
         assertEquals(ConnectionOverviewState.RELAY, presentation.overview.state)
         assertEquals("Relay via relay.example:7443 to node-a", routeDisplayLabel(relay))
+        assertEquals("Relay · relay.example:7443", compactRouteDisplayLabel(relay))
+    }
+
+    @Test
+    fun compactsLongTargetIdentifiersForDenseRouteRows() {
+        val direct = endpoint(
+            index = 2,
+            pathKind = "direct_https",
+            targetNodeId = "7314c3bb-2e1d-4508-a4d1-d274d985f059",
+        )
+
+        assertEquals("HTTPS · 7314c3bb…f059", compactRouteDisplayLabel(direct))
     }
 
     @Test

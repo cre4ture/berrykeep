@@ -5,6 +5,8 @@ test_suite(
     tests = [
         "//crates/client-sdk:unit_test",
         "//crates/common:unit_test",
+        "//crates/desktop-client-config:unit_test",
+        "//crates/desktop-status:unit_test",
         "//crates/rendezvous-server:unit_test",
         "//crates/sync-core:unit_test",
         "//crates/transport-sdk:unit_test",

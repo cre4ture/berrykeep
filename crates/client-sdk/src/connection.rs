@@ -445,6 +445,23 @@ pub fn build_client_with_optional_identity_from_planned_target(
     }
 }
 
+/// Builds all supported client transport routes for the supplied identity.
+///
+/// Unenrolled clients deliberately retain direct HTTPS-only behavior: relay and
+/// Direct QUIC routes require a client identity for their authenticated inner
+/// transport handshake. Keeping that policy here lets managed route refresh
+/// callers share one route-construction path without duplicating platform
+/// checks.
+pub fn build_client_with_optional_identity_from_planned_targets(
+    targets: &[PlannedConnectionBootstrapTarget],
+    identity: Option<&ClientIdentityMaterial>,
+) -> Result<IronMeshClient> {
+    match identity {
+        Some(identity) => build_http_client_with_identity_from_planned_targets(targets, identity),
+        None => build_http_client_from_planned_targets(targets),
+    }
+}
+
 pub fn build_http_client(
     server_ca_cert: Option<&Path>,
     base_url_str: &str,

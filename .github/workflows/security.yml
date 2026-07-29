@@ -29,6 +29,8 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -50,6 +52,8 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2

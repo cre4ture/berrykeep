@@ -1,0 +1,154 @@
+name: Cache cleanup
+
+on:
+  pull_request:
+    types:
+      - closed
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  closed-pull-request:
+    name: Closed PR cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Delete bounded pull-request cache batches
+        env:
+          CACHE_REF: refs/pull/${{ github.event.pull_request.number }}/merge
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          readonly batch_size=100
+          readonly max_batches=8
+          readonly request_timeout_seconds=60
+          readonly mutation_interval_seconds=1
+          readonly rate_limit_reserve=100
+
+          if [[ ! "${CACHE_REF}" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]; then
+            echo "::error::Refusing to clean unexpected cache ref: ${CACHE_REF}"
+            exit 1
+          fi
+
+          list_cache_batch() {
+            timeout "${request_timeout_seconds}s" \
+              gh api \
+                --method GET \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "repos/${GH_REPO}/actions/caches" \
+                -f ref="${CACHE_REF}" \
+                -F per_page="${batch_size}" \
+                -f sort=size_in_bytes \
+                -f direction=desc
+          }
+
+          validate_cache_batch() {
+            local cache_batch="$1"
+
+            if ! jq -e \
+              --arg expected_ref "${CACHE_REF}" \
+              '
+                (.total_count | type == "number") and
+                (.actions_caches | type == "array") and
+                all(
+                  .actions_caches[];
+                  (.id | type == "number") and .ref == $expected_ref
+                )
+              ' \
+              <<<"${cache_batch}" >/dev/null; then
+              echo "::error::GitHub returned an invalid cache batch or a cache outside ${CACHE_REF}"
+              return 1
+            fi
+          }
+
+          delete_cache() {
+            local cache_id="$1"
+            local output
+            local status
+
+            if output="$(
+              timeout "${request_timeout_seconds}s" \
+                gh api \
+                  --include \
+                  --method DELETE \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "repos/${GH_REPO}/actions/caches/${cache_id}" 2>&1
+            )"; then
+              status="$(awk 'NR == 1 { print $2 }' <<<"${output}")"
+              if [[ "${status}" != "204" ]]; then
+                echo "::error::Deleting cache ${cache_id} returned HTTP ${status:-unknown}"
+                return 1
+              fi
+              return 0
+            fi
+
+            status="$(awk 'NR == 1 { print $2 }' <<<"${output}")"
+            if [[ "${status}" == "404" ]]; then
+              echo "::warning::Cache ${cache_id} disappeared before deletion"
+              return 2
+            fi
+
+            echo "::error::Could not delete cache ${cache_id} (HTTP ${status:-unknown})"
+            printf '%s\n' "${output}"
+            return 1
+          }
+
+          planned_requests=$((max_batches * (batch_size + 1) + 1))
+          required_requests=$((planned_requests + rate_limit_reserve))
+          rate_limit="$(
+            timeout "${request_timeout_seconds}s" \
+              gh api rate_limit --jq '.resources.core | "\(.remaining) \(.reset)"'
+          )"
+          read -r remaining_requests reset_at <<<"${rate_limit}"
+          if [[ ! "${remaining_requests}" =~ ^[0-9]+$ || ! "${reset_at}" =~ ^[0-9]+$ ]]; then
+            echo "::error::GitHub returned invalid core rate-limit data: ${rate_limit}"
+            exit 1
+          fi
+          if (( remaining_requests < required_requests )); then
+            reset_time="$(date --utc --date="@${reset_at}" --iso-8601=seconds)"
+            echo "::error::Cache cleanup needs up to ${planned_requests} requests plus a ${rate_limit_reserve}-request reserve, but only ${remaining_requests} remain until ${reset_time}"
+            exit 1
+          fi
+
+          deleted=0
+          disappeared=0
+          for ((batch = 1; batch <= max_batches; batch++)); do
+            cache_batch="$(list_cache_batch)"
+            validate_cache_batch "${cache_batch}"
+
+            mapfile -t cache_ids < <(
+              jq -r '.actions_caches[].id' <<<"${cache_batch}"
+            )
+            if (( ${#cache_ids[@]} == 0 )); then
+              echo "No caches remain for ${CACHE_REF}"
+              break
+            fi
+
+            echo "Deleting batch ${batch}/${max_batches} (${#cache_ids[@]} caches) for ${CACHE_REF}"
+            for cache_id in "${cache_ids[@]}"; do
+              if delete_cache "${cache_id}"; then
+                ((deleted += 1))
+              else
+                delete_result=$?
+                if (( delete_result == 2 )); then
+                  ((disappeared += 1))
+                else
+                  exit "${delete_result}"
+                fi
+              fi
+              sleep "${mutation_interval_seconds}"
+            done
+          done
+
+          final_batch="$(list_cache_batch)"
+          validate_cache_batch "${final_batch}"
+
+          remaining_caches="$(jq -r '.total_count' <<<"${final_batch}")"
+          echo "::notice::Cache cleanup for ${CACHE_REF}: deleted=${deleted}, already_gone=${disappeared}, remaining=${remaining_caches}"
+          if (( remaining_caches > 0 )); then
+            echo "::warning::The bounded cleanup left ${remaining_caches} caches for ${CACHE_REF}; no other ref was touched"
+          fi

@@ -4,7 +4,8 @@ use crate::local_state::local_appdata_connection_bootstrap_path;
 use anyhow::{Context, Result, anyhow};
 use client_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial,
-    ConnectionBootstrap, IronMeshClient, RelayMode, normalize_server_base_url,
+    ConnectionBootstrap, ManagedClientOptions, ManagedIronMeshClient, RelayMode,
+    normalize_server_base_url,
 };
 use reqwest::Url;
 use std::fs;
@@ -158,14 +159,14 @@ fn discover_connection_bootstrap_path(
 }
 
 impl ResolvedConnectionConfig {
-    pub fn build_client(
+    pub fn build_managed_client(
         &self,
         client_identity: Option<&ClientIdentityMaterial>,
-    ) -> Result<IronMeshClient> {
-        match client_identity {
-            Some(identity) => self.bootstrap.build_client_with_identity(identity),
-            None => self.bootstrap.build_client(),
-        }
+    ) -> Result<ManagedIronMeshClient> {
+        self.bootstrap.build_managed_client_blocking(
+            client_identity.cloned(),
+            ManagedClientOptions::default(),
+        )
     }
 }
 

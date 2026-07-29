@@ -166,6 +166,48 @@ internal fun routeDisplayLabel(endpoint: ConnectionRouteEndpointSnapshot): Strin
     return endpoint.targetNodeId?.let { "$prefix to $it" } ?: prefix
 }
 
+internal fun compactRouteDisplayLabel(endpoint: ConnectionRouteEndpointSnapshot): String {
+    val prefix = when (endpoint.pathKind) {
+        RELAY_TUNNEL_PATH_KIND -> "Relay"
+        "direct_quic" -> when (endpoint.holePunchingMode) {
+            HOLE_PUNCHING_MODE_DIRECT -> "QUIC NAT"
+            HOLE_PUNCHING_MODE_RELAY -> "QUIC relay"
+            else -> "QUIC"
+        }
+        else -> "HTTPS"
+    }
+    val destination = when (endpoint.pathKind) {
+        RELAY_TUNNEL_PATH_KIND -> summarizeRelayLocator(endpoint.locator)
+            ?: endpoint.targetNodeId?.let(::compactRouteIdentifier)
+            ?: compactRouteLocator(endpoint.locator)
+        else -> endpoint.targetNodeId?.let(::compactRouteIdentifier)
+            ?: compactRouteLocator(endpoint.locator)
+    }
+    return destination
+        ?.takeIf { it.isNotBlank() }
+        ?.let { "$prefix · $it" }
+        ?: prefix
+}
+
+private fun compactRouteIdentifier(value: String): String {
+    val trimmed = value.trim()
+    return if (trimmed.length <= 16) {
+        trimmed
+    } else {
+        "${trimmed.take(8)}…${trimmed.takeLast(4)}"
+    }
+}
+
+private fun compactRouteLocator(locator: String): String? {
+    return locator
+        .trim()
+        .takeIf { it.isNotBlank() }
+        ?.substringAfterLast('@')
+        ?.substringAfter("://")
+        ?.substringBefore('/')
+        ?.let(::compactRouteIdentifier)
+}
+
 internal fun routeScoreBreakdown(endpoint: ConnectionRouteEndpointSnapshot): RouteScoreBreakdown {
     val latencyIsEstimated = endpoint.ewmaLatencyMs == null
     return RouteScoreBreakdown(

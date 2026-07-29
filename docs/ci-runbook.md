@@ -31,22 +31,54 @@ workflow, so the release legs remain unavailable there by design.
 
 ## Required checks (branch protection alignment)
 
-For branch `main`, require these status checks:
+For branch `main`, require these stable aggregate status checks:
 
-- `workspace-check`
-- `rustfmt`
-- `clippy`
-- `unit-tests`
-- `ios-build`
-- `coverage`
-- `system-tests`
+- `Required CI`
+- `Required coverage`
+- `Required system tests`
+
+The aggregate jobs are the branch-protection contract. `Required CI` covers
+`workspace-check`, `rustfmt`, `clippy`, `unit-tests`, and `ios-build`;
+`Required coverage` covers the coverage lane; and `Required system tests`
+covers every operating-system entry in the system-test matrix. The aggregate
+jobs always report a terminal result and accept an intentionally skipped
+dependency. This keeps branch protection stable when a future impact gate
+skips a lane that cannot be affected by the pull request.
+
+Do not require the implementation job names directly. Matrix expansion and
+future job-level impact conditions may change those names or skip those jobs,
+while the three aggregate names above remain stable. `Bazel unit` remains
+advisory until the native Bazel suite has parity with the required Cargo unit
+test lane and its workflow reports a result for every pull request.
 
 Optional (recommended separately):
 
 - `cargo-audit`
 - `cargo-deny`
 
-Why: CI lanes are intentionally split between stable and nightly. Requiring exactly these checks prevents accidental bypass (missing nightly lane) or false blocking (obsolete check names).
+Why: CI lanes are intentionally split between stable and nightly. Requiring
+exactly these aggregate checks prevents accidental bypass (missing nightly
+lane) or false blocking (obsolete, matrix-expanded, or intentionally skipped
+implementation checks).
+
+## Pull request cache policy
+
+Pull request jobs restore the shared Rust caches but do not write them:
+
+- sccache keeps `SCCACHE_GHA_ENABLED=true` and sets
+  `SCCACHE_GHA_RW_MODE=READ_ONLY` for pull requests, so compiler artifacts
+  already cached on `main` remain available;
+- every `Swatinem/rust-cache` path, including the shared Android composite
+  action, uses `save-if: ${{ github.event_name != 'pull_request' }}`.
+- the Focal ARM64 package build restores its mounted on-disk sccache with
+  `actions/cache/restore`, then runs `actions/cache/save` only for trusted
+  non-pull-request events.
+
+GitHub scopes pull request cache writes to the pull request merge ref. Those
+entries are not reusable by `main` or unrelated pull requests, so allowing
+them to accumulate only increases cache churn and eviction pressure. Trusted
+non-pull-request runs keep write access: pushes to `main`, scheduled runs,
+manual dispatches, and release workflows continue to seed reusable caches.
 
 ## Local required-check reproduction
 
@@ -144,6 +176,28 @@ Useful per-lane shortcuts:
 - `just coverage`
 - `just ci-web-smoke`
 - `just test-system-nightly`
+
+## GitHub Actions cache scope
+
+Pull-request workflows restore `Swatinem/rust-cache` entries from the default
+branch but do not publish new archive entries into the pull request's isolated
+merge-ref scope. Trusted `push`, `schedule`, and `workflow_dispatch` runs still
+refresh those archives. This prevents short-lived pull-request archives from
+evicting reusable default-branch cache entries.
+
+The `Cache cleanup` workflow runs when a pull request closes and repeatedly
+deletes batches of the largest entries under its exact
+`refs/pull/<number>/merge` scope. The cleanup is intentionally capped at 800
+entries: the built-in `GITHUB_TOKEN` has a 1,000-request-per-hour REST API
+limit, and each cache needs an individual delete request. Deletes are spaced
+one second apart to stay below GitHub's secondary mutation limits. The final
+log reports any entries left after the bounded cleanup.
+
+This reclaims entries written by legacy or misconfigured cache clients while
+leaving API capacity for other workflows. Pull-request cache writers should
+still use restore-only mode so that the bounded cleanup normally removes every
+remaining entry. The cleanup job never checks out or executes pull-request code
+and has only `actions: write` plus `contents: read` permission.
 
 ## Nightly lane fails, stable lanes pass
 

@@ -24,6 +24,9 @@ env:
   # dev-profile check/test/clippy jobs got almost no cross-run reuse from it.
   # Disabling incremental lets sccache actually cache rustc invocations.
   CARGO_INCREMENTAL: "0"
+  # Pull requests can restore caches from main, but their merge-ref caches are
+  # not reusable by main or by unrelated pull requests.
+  SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
 
 jobs:
   workflow-lint:
@@ -78,6 +81,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Run workspace check
         run: cargo check --locked --workspace
@@ -96,6 +100,8 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -140,6 +146,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -182,6 +189,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Run unit tests
         run: cargo test --locked --workspace
@@ -241,6 +249,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install Playwright browser
         working-directory: web
@@ -454,6 +463,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Show Xcode version
         run: |
@@ -756,6 +766,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build Linux release binary bundle
         run: |
@@ -882,6 +893,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Check Windows CFAPI adapter crate
         run: cargo check --locked -p adapter-windows-cfapi --all-targets
@@ -927,6 +939,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build Windows Server Node MSI
         run: powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Build-Msi.ps1
@@ -940,3 +953,22 @@ jobs:
           name: berrykeep-server-node-msi-x64
           path: windows/server-node-installer/out/**/*.msi
           if-no-files-found: error
+
+  required-ci:
+    name: Required CI
+    if: ${{ always() }}
+    needs:
+      - workspace-check
+      - rustfmt
+      - clippy
+      - unit-tests
+      - ios-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required CI results
+        env:
+          REQUIRED_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq --exit-status '
+            all(.[]; .result == "success" or .result == "skipped")
+          ' <<<"${REQUIRED_RESULTS}"

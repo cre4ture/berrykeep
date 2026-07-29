@@ -90,6 +90,7 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
         XCTAssertTrue(quic.isDirectQuicHolePunched)
         XCTAssertFalse(quic.usesRelayPath)
         XCTAssertEqual(quic.connectionDisplayName, "Direct via NAT (QUIC)")
+        XCTAssertEqual(quic.compactConnectionDisplayName, "QUIC NAT · 018f7630…0001")
         XCTAssertEqual(
             quic.connectionExplanation,
             "Rendezvous established this connection; data travels directly between this device and the cluster."
@@ -98,6 +99,34 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
         let relay = try XCTUnwrap(snapshot.endpoints.first(where: { $0.pathKind == .relayTunnel }))
         XCTAssertTrue(relay.isCoolingDown(atUnixMs: snapshot.generatedAtUnixMs))
         XCTAssertEqual(relay.lastError, "relay unavailable")
+        XCTAssertEqual(relay.compactConnectionDisplayName, "Relay · relay.example")
+    }
+
+    func testCompactsRelayLocatorAfterIdentityAndScheme() {
+        let endpoint = AppleConnectionRouteEndpoint(
+            index: 0,
+            pathKind: .relayTunnel,
+            holePunchingMode: nil,
+            locator: "node-a@https://creax.de:44043/path",
+            bootstrapRank: 0,
+            targetNodeId: "7314c3bb-2e1d-4508-a4d1-d274d985f059",
+            active: true,
+            score: 1,
+            ewmaLatencyMs: nil,
+            ewmaThroughputBytesPerSec: nil,
+            consecutiveFailures: 0,
+            totalFailures: 0,
+            totalSuccesses: 1,
+            lastMeasurementUnixMs: nil,
+            lastSuccessUnixMs: nil,
+            lastFailureUnixMs: nil,
+            circuitOpenUntilUnixMs: nil,
+            backgroundProbeInFlight: false,
+            lastBackgroundProbeUnixMs: nil,
+            lastError: nil
+        )
+
+        XCTAssertEqual(endpoint.compactConnectionDisplayName, "Relay · creax.de:44043")
     }
 
     func testUnknownPathKindRemainsDecodable() throws {

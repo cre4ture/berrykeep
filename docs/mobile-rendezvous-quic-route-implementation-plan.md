@@ -1,4 +1,4 @@
-# Dynamic Rendezvous-Discovered QUIC Routes for Mobile Clients
+# Dynamic Rendezvous-Discovered QUIC Routes for Clients
 
 Status: implemented in PR #221
 
@@ -20,9 +20,11 @@ This plan is implemented by the following shared and platform changes:
 - `client-sdk` now owns asynchronous discovery, managed route refresh,
   stable-key reconciliation, route retirement, identity renewal, and
   all-route-failure refresh triggers.
-- CLI, Android, and iOS construct that managed client; Kotlin and Swift only
-  forward lifecycle/network hints and persist a renewed identity through their
-  existing secure stores.
+- CLI, Android, iOS, Windows CFAPI/thumbnail integrations, and Linux
+  FUSE/folder-sync integrations construct that managed client. Kotlin and Swift
+  only forward lifecycle/network hints and persist a renewed identity through
+  their existing secure stores; synchronous desktop consumers use the shared
+  blocking constructor and retain the managed handle for their lifetime.
 - Direct QUIC candidates validate their authenticated transport identity.
   Server nodes still accept `IRONMESH_DIRECT_QUIC_RELAY_URLS` for external
   relays, and now also reconcile authenticated relay advertisements returned by
@@ -365,7 +367,7 @@ platform-specific workaround.
 | `apps/cli-client` | Replace its bespoke one-shot refresh/build sequence with the common managed client. | Remain the only user of dynamic discovery. |
 | Android JNI/Rust wrapper | Construct the managed shared client, persist identity updates, and forward connectivity hints. | Parse candidate payloads or choose QUIC versus relay. |
 | iOS Rust/Swift wrapper | Construct the managed shared client, persist identity updates, and forward foreground/operation hints. | Depend on perpetual background execution. |
-| Sync/desktop consumers | Adopt the same managed constructor when touched, so the behavior remains uniform. | Duplicate the CLI sequence. |
+| Sync/desktop consumers | Use the same managed constructor and route controller as CLI and mobile clients. | Duplicate the CLI sequence. |
 
 ## 8. Implementation sequence
 

@@ -22,6 +22,8 @@ data class AppConnectionStatus(
     val nextRetryUnixMs: Long? = null,
     val lastSuccessfulConnectionUnixMs: Long? = null,
     val lastSuccessfulConnectionUrl: String? = null,
+    val lastSuccessfulFunctionalRequestUnixMs: Long? = null,
+    val lastSuccessfulFunctionalRequestUrl: String? = null,
     val failedAttempts: List<AppFailedConnectionAttempt> = emptyList(),
 )
 
@@ -41,6 +43,8 @@ data class AppConnectionDiagnosticsUpdate(
     val sourceLabel: String? = null,
     val lastSuccessfulConnectionUnixMs: Long? = null,
     val lastSuccessfulConnectionUrl: String? = null,
+    val lastSuccessfulFunctionalRequestUnixMs: Long? = null,
+    val lastSuccessfulFunctionalRequestUrl: String? = null,
     val failedAttempts: List<AppFailedConnectionAttempt> = emptyList(),
 )
 

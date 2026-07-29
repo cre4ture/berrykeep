@@ -17,6 +17,9 @@ env:
   # sccache (RUSTC_WRAPPER) cannot cache incremental compilation; disabling it
   # lets sccache actually cache rustc invocations across CI runs.
   CARGO_INCREMENTAL: "0"
+  # Pull requests can restore caches from main, but their merge-ref caches are
+  # not reusable by main or by unrelated pull requests.
+  SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
 
 jobs:
   coverage:
@@ -58,6 +61,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -75,3 +79,17 @@ jobs:
             --summary-only \
             --ignore-filename-regex 'crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)' \
             --fail-under-lines 68
+
+  required-coverage:
+    name: Required coverage
+    if: ${{ always() }}
+    needs: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required coverage result
+        env:
+          REQUIRED_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq --exit-status '
+            all(.[]; .result == "success" or .result == "skipped")
+          ' <<<"${REQUIRED_RESULTS}"

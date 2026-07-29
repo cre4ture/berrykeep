@@ -3,21 +3,24 @@ package io.ironmesh.android.ui.screens
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.R
 
@@ -30,56 +33,102 @@ internal fun ConnectionRouteCard(
 ) {
     val endpoint = route.endpoint
     val stateColors = routeStateColors(route.state)
+    val toggleLabel = stringResource(
+        if (expanded) R.string.connection_paths_hide_details else R.string.connection_paths_details,
+    )
 
-    Card(
+    Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .animateContentSize()
-            .clickable(onClick = onToggleDetails),
-        colors = CardDefaults.cardColors(containerColor = stateColors.container),
+            .animateContentSize(),
+        color = if (route.state == ConnectionRouteState.LAST_USED) {
+            stateColors.container
+        } else {
+            MaterialTheme.colorScheme.surface
+        },
     ) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.fillMaxWidth(),
         ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.Top,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 40.dp)
+                    .clickable(onClickLabel = toggleLabel, onClick = onToggleDetails)
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
+                RouteRankIndicator(route, stateColors)
                 Column(
                     modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    Text(routeDisplayLabel(endpoint), style = MaterialTheme.typography.titleSmall)
                     Text(
-                        text = routeStatusDetail(route),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        text = compactRouteDisplayLabel(endpoint),
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = routeSelectionSummary(route),
-                        style = MaterialTheme.typography.labelMedium,
+                        text = routeCompactSummary(route),
+                        style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
-                RouteStateBadge(route.state, stateColors)
-            }
-
-            TextButton(onClick = onToggleDetails) {
                 Text(
-                    stringResource(
-                        if (expanded) R.string.connection_paths_hide_details else R.string.connection_paths_details,
-                    ),
+                    text = if (expanded) "⌃" else "›",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
 
             if (expanded) {
                 HorizontalDivider()
-                ConnectionRouteDetails(route, onCopyEndpoint)
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    ConnectionRouteDetails(route, onCopyEndpoint)
+                }
             }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         }
     }
+}
+
+@Composable
+private fun RouteRankIndicator(
+    route: ConnectionRouteItem,
+    stateColors: RouteStateColors,
+) {
+    Surface(
+        modifier = Modifier.size(24.dp),
+        color = stateColors.badge,
+        contentColor = stateColors.onBadge,
+        shape = MaterialTheme.shapes.small,
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = route.selectionRank.toString(),
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun routeCompactSummary(route: ConnectionRouteItem): String {
+    val parts = mutableListOf(routeStatusLabel(route.state))
+    route.endpoint.ewmaLatencyMs?.let { latency ->
+        parts += formatConnectionLatency(latency)
+    }
+    parts += stringResource(
+        R.string.connection_paths_route_score_compact,
+        route.scoreBreakdown.total,
+    )
+    return parts.joinToString(" · ")
 }
 
 @Composable
@@ -214,16 +263,6 @@ private fun ConnectionScoreBreakdown(score: RouteScoreBreakdown) {
         } else {
             stringResource(R.string.connection_paths_score_not_applied)
         },
-    )
-}
-
-@Composable
-private fun routeSelectionSummary(route: ConnectionRouteItem): String {
-    return stringResource(
-        R.string.connection_paths_route_selection_summary,
-        route.selectionRank,
-        route.selectionCandidateCount,
-        route.scoreBreakdown.total,
     )
 }
 

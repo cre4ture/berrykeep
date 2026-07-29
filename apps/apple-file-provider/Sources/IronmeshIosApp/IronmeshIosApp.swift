@@ -612,9 +612,8 @@ struct IronmeshConnectionPathsView: View {
             }
 
             if let snapshot = model.connectionRouteSnapshot {
-                overview(snapshot)
-
-                Section("Ranked paths") {
+                Section {
+                    IronmeshConnectionOverviewRow(snapshot: snapshot)
                     ForEach(Array(snapshot.rankedEndpoints.enumerated()), id: \.element.id) { rank, endpoint in
                         IronmeshConnectionPathRow(
                             endpoint: endpoint,
@@ -669,30 +668,95 @@ struct IronmeshConnectionPathsView: View {
             }
         }
     }
+}
 
-    @ViewBuilder
-    private func overview(_ snapshot: AppleConnectionRouteSnapshot) -> some View {
-        Section("Overview") {
-            IronmeshKeyValueRow(
-                label: "Selected path",
-                value: snapshot.activeEndpoint?.connectionDisplayName ?? "None"
-            )
-            if let explanation = snapshot.activeEndpoint?.connectionExplanation {
-                Text(explanation)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+private struct IronmeshConnectionOverviewRow: View {
+    let snapshot: AppleConnectionRouteSnapshot
+
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    expanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(title)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                        Text(summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    Text("\(snapshot.endpoints.count) routes")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Image(systemName: expanded ? "chevron.up" : "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(minHeight: 38)
+                .contentShape(Rectangle())
             }
-            IronmeshKeyValueRow(label: "Candidates", value: "\(snapshot.endpoints.count)")
-            IronmeshKeyValueRow(label: "Direct", value: "\(snapshot.directEndpointCount)")
-            IronmeshKeyValueRow(label: "Relay", value: "\(snapshot.relayEndpointCount)")
-            IronmeshKeyValueRow(
-                label: "Evaluated",
-                value: unixMillisecondsTimestamp(snapshot.generatedAtUnixMs)
-            )
-            Text("Routes are evaluated only when this view opens or you explicitly refresh it.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+            .buttonStyle(.plain)
+            .accessibilityHint(expanded ? "Hides connection overview details" : "Shows connection overview details")
+
+            if expanded {
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    IronmeshKeyValueRow(
+                        label: "Selected path",
+                        value: snapshot.activeEndpoint?.connectionDisplayName ?? "None"
+                    )
+                    if let explanation = snapshot.activeEndpoint?.connectionExplanation {
+                        Text(explanation)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    IronmeshKeyValueRow(label: "Direct", value: "\(snapshot.directEndpointCount)")
+                    IronmeshKeyValueRow(label: "Relay", value: "\(snapshot.relayEndpointCount)")
+                    IronmeshKeyValueRow(
+                        label: "Evaluated",
+                        value: unixMillisecondsTimestamp(snapshot.generatedAtUnixMs)
+                    )
+                    Text("Routes are evaluated only when this view opens or you explicitly refresh it.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 8)
+            }
         }
+        .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
+        .listRowBackground(Color.accentColor.opacity(0.09))
+    }
+
+    private var title: String {
+        guard let endpoint = snapshot.activeEndpoint else {
+            return "No active route"
+        }
+        if endpoint.usesRelayPath {
+            return "Connected through relay"
+        }
+        if endpoint.isDirectQuicHolePunched {
+            return "Connected directly via NAT"
+        }
+        return "Connected directly"
+    }
+
+    private var summary: String {
+        guard let endpoint = snapshot.activeEndpoint else {
+            return "No route is currently selected"
+        }
+        var values = [endpoint.compactConnectionDisplayName]
+        if let latency = endpoint.ewmaLatencyMs {
+            values.append(String(format: "%.1f ms", latency))
+        }
+        return values.joined(separator: " · ")
     }
 }
 
@@ -701,125 +765,137 @@ private struct IronmeshConnectionPathRow: View {
     let rank: Int
     let snapshotTimestamp: UInt64
 
+    @State private var expanded = false
+
     private var coolingDown: Bool {
         endpoint.isCoolingDown(atUnixMs: currentUnixMilliseconds)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
-                Label(endpoint.connectionDisplayName, systemImage: pathIcon)
-                    .font(.headline)
-                Spacer()
-                Text("#\(rank)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    expanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Text("\(rank)")
+                        .font(.caption.monospacedDigit().weight(.bold))
+                        .foregroundStyle(routeState.color)
+                        .frame(width: 26, height: 26)
+                        .background(routeState.color.opacity(0.16), in: RoundedRectangle(cornerRadius: 7))
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(endpoint.compactConnectionDisplayName)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                        Text(compactSummary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                    Image(systemName: expanded ? "chevron.up" : "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(minHeight: 40)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Rank \(rank), \(endpoint.compactConnectionDisplayName), \(compactSummary)")
+            .accessibilityHint(expanded ? "Hides route details" : "Shows route details")
 
-            Text(endpoint.locator)
-                .font(.footnote.monospaced())
-                .textSelection(.enabled)
-
-            if let explanation = endpoint.connectionExplanation {
-                Text(explanation)
+            if expanded {
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    if let explanation = endpoint.connectionExplanation {
+                        Text(explanation)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    IronmeshKeyValueRow(label: "Endpoint", value: endpoint.locator)
+                    Group {
+                        IronmeshKeyValueRow(label: "EWMA latency", value: milliseconds(endpoint.ewmaLatencyMs))
+                        IronmeshKeyValueRow(
+                            label: "EWMA throughput",
+                            value: bytesPerSecond(endpoint.ewmaThroughputBytesPerSec)
+                        )
+                        IronmeshKeyValueRow(label: "Score", value: String(format: "%.2f", endpoint.score))
+                        IronmeshKeyValueRow(label: "Successes", value: "\(endpoint.totalSuccesses)")
+                        IronmeshKeyValueRow(
+                            label: "Failures",
+                            value: "\(endpoint.consecutiveFailures) consecutive, \(endpoint.totalFailures) total"
+                        )
+                        IronmeshKeyValueRow(label: "Bootstrap rank", value: "\(endpoint.bootstrapRank)")
+                        if let holePunchingMode = endpoint.holePunchingMode {
+                            IronmeshKeyValueRow(label: "QUIC path", value: holePunchingMode.capitalized)
+                        }
+                        if let targetNodeId = endpoint.targetNodeId {
+                            IronmeshKeyValueRow(label: "Target node", value: targetNodeId)
+                        }
+                        IronmeshKeyValueRow(
+                            label: "Last measurement",
+                            value: unixMillisecondsTimestamp(endpoint.lastMeasurementUnixMs)
+                        )
+                        IronmeshKeyValueRow(
+                            label: "Last success",
+                            value: unixMillisecondsTimestamp(endpoint.lastSuccessUnixMs)
+                        )
+                        IronmeshKeyValueRow(
+                            label: "Last failure",
+                            value: unixMillisecondsTimestamp(endpoint.lastFailureUnixMs)
+                        )
+                        IronmeshKeyValueRow(
+                            label: "Last probe",
+                            value: unixMillisecondsTimestamp(endpoint.lastBackgroundProbeUnixMs)
+                        )
+                        if let circuitOpenUntilUnixMs = endpoint.circuitOpenUntilUnixMs {
+                            IronmeshKeyValueRow(
+                                label: "Cooldown until",
+                                value: unixMillisecondsTimestamp(circuitOpenUntilUnixMs)
+                            )
+                        }
+                        if let lastError = endpoint.lastError {
+                            IronmeshKeyValueRow(label: "Last error", value: lastError)
+                        }
+                    }
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 8)
             }
-
-            HStack(spacing: 8) {
-                if endpoint.active {
-                    IronmeshConnectionPathBadge(title: "Active", color: .green)
-                }
-                if endpoint.backgroundProbeInFlight {
-                    IronmeshConnectionPathBadge(title: "Probing", color: .blue)
-                }
-                if coolingDown {
-                    IronmeshConnectionPathBadge(title: "Cooldown", color: .orange)
-                }
-                if !endpoint.active && !endpoint.backgroundProbeInFlight && !coolingDown {
-                    IronmeshConnectionPathBadge(title: "Standby", color: .gray)
-                }
-            }
-
-            Group {
-                IronmeshKeyValueRow(label: "EWMA latency", value: milliseconds(endpoint.ewmaLatencyMs))
-                IronmeshKeyValueRow(label: "EWMA throughput", value: bytesPerSecond(endpoint.ewmaThroughputBytesPerSec))
-                IronmeshKeyValueRow(label: "Score", value: String(format: "%.2f", endpoint.score))
-                IronmeshKeyValueRow(label: "Successes", value: "\(endpoint.totalSuccesses)")
-                IronmeshKeyValueRow(
-                    label: "Failures",
-                    value: "\(endpoint.consecutiveFailures) consecutive, \(endpoint.totalFailures) total"
-                )
-                IronmeshKeyValueRow(label: "Bootstrap rank", value: "\(endpoint.bootstrapRank)")
-                if let holePunchingMode = endpoint.holePunchingMode {
-                    IronmeshKeyValueRow(label: "QUIC path", value: holePunchingMode.capitalized)
-                }
-                if let targetNodeId = endpoint.targetNodeId {
-                    IronmeshKeyValueRow(label: "Target node", value: targetNodeId)
-                }
-                IronmeshKeyValueRow(
-                    label: "Last measurement",
-                    value: unixMillisecondsTimestamp(endpoint.lastMeasurementUnixMs)
-                )
-                IronmeshKeyValueRow(
-                    label: "Last success",
-                    value: unixMillisecondsTimestamp(endpoint.lastSuccessUnixMs)
-                )
-                IronmeshKeyValueRow(
-                    label: "Last failure",
-                    value: unixMillisecondsTimestamp(endpoint.lastFailureUnixMs)
-                )
-                IronmeshKeyValueRow(
-                    label: "Last probe",
-                    value: unixMillisecondsTimestamp(endpoint.lastBackgroundProbeUnixMs)
-                )
-                if let circuitOpenUntilUnixMs = endpoint.circuitOpenUntilUnixMs {
-                    IronmeshKeyValueRow(
-                        label: "Cooldown until",
-                        value: unixMillisecondsTimestamp(circuitOpenUntilUnixMs)
-                    )
-                }
-                if let lastError = endpoint.lastError {
-                    IronmeshKeyValueRow(label: "Last error", value: lastError)
-                }
-            }
-            .font(.footnote)
         }
-        .padding(.vertical, 6)
-        .accessibilityElement(children: .contain)
-        .accessibilityHint("Ranked at \(rank), snapshot \(unixMillisecondsTimestamp(snapshotTimestamp))")
+        .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+        .listRowBackground(endpoint.active ? Color.accentColor.opacity(0.15) : Color.clear)
+        .accessibilityHint("Snapshot \(unixMillisecondsTimestamp(snapshotTimestamp))")
     }
 
-    private var pathIcon: String {
-        if endpoint.usesRelayPath {
-            return "arrow.triangle.branch"
+    private var compactSummary: String {
+        var values = [routeState.title]
+        if let latency = endpoint.ewmaLatencyMs {
+            values.append(String(format: "%.1f ms", latency))
         }
-        switch endpoint.pathKind {
-        case .directHTTPS:
-            return "lock.shield"
-        case .directQUIC:
-            return endpoint.isDirectQuicHolePunched
-                ? "point.3.connected.trianglepath.dotted"
-                : "bolt.horizontal"
-        case .relayTunnel:
-            return "arrow.triangle.branch"
-        case .unknown:
-            return "questionmark.circle"
-        }
+        values.append(String(format: "%.0f pts", endpoint.score))
+        return values.joined(separator: " · ")
     }
-}
 
-private struct IronmeshConnectionPathBadge: View {
-    let title: String
-    let color: Color
-
-    var body: some View {
-        Text(title)
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(color)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(color.opacity(0.12), in: Capsule())
+    private var routeState: (title: String, color: Color) {
+        if endpoint.active {
+            return ("Active", .green)
+        }
+        if endpoint.backgroundProbeInFlight {
+            return ("Probing", .blue)
+        }
+        if coolingDown {
+            return ("Cooldown", .orange)
+        }
+        if endpoint.totalSuccesses > 0 && endpoint.consecutiveFailures == 0 {
+            return ("Available", .teal)
+        }
+        if endpoint.totalFailures > 0 {
+            return ("Unavailable", .red)
+        }
+        return ("Standby", .gray)
     }
 }
 
