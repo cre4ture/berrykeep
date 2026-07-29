@@ -2,6 +2,7 @@ import {
   updateAdminGalleryMapConfiguration,
   type AdminGalleryMapConfiguration
 } from "@ironmesh/api";
+import { galleryQueryKeys } from "@ironmesh/ui";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -62,7 +63,7 @@ export function MapVariantConfigurationCard({
       updateAdminGalleryMapConfiguration(next, normalizedAdminTokenOverride || undefined),
     onSuccess: (response) => {
       queryClient.setQueryData(
-        ["gallery-page", "map-configuration", normalizedAdminTokenOverride],
+        galleryQueryKeys.mapConfiguration(),
         response
       );
     }

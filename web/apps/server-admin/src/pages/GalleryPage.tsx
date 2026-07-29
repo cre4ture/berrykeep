@@ -9,6 +9,8 @@ import {
 import {
   GallerySurface,
   galleryBasemapsFromConfiguration,
+  galleryMapConfigurationQueryPolicy,
+  galleryQueryKeys,
   type GalleryDataSource
 } from "@ironmesh/ui";
 import { Stack, Tabs } from "@mantine/core";
@@ -26,10 +28,10 @@ export function GalleryPage() {
   const canInspectMapConfiguration =
     !sessionLoading && (!loginRequired || Boolean(sessionStatus?.authenticated));
   const mapConfigurationQuery = useQuery({
-    queryKey: ["gallery-page", "map-configuration"],
+    queryKey: galleryQueryKeys.mapConfiguration(),
     queryFn: () => getAdminGalleryMapConfiguration(),
-    enabled: canInspectMapConfiguration,
-    staleTime: 5_000
+    ...galleryMapConfigurationQueryPolicy,
+    enabled: canInspectMapConfiguration
   });
   const mapConfiguration = mapConfigurationQuery.data ?? null;
   const mapConfigurationError = errorMessage(mapConfigurationQuery.error);
