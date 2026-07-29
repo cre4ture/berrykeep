@@ -303,9 +303,9 @@ private fun overviewSubtitle(overview: ConnectionOverview): String {
     val activeRoute = overview.activeRoute
     if (activeRoute != null && overview.state !in setOf(ConnectionOverviewState.ERROR, ConnectionOverviewState.UNAVAILABLE)) {
         val quality = activeRoute.ewmaLatencyMs?.let { latency -> formatConnectionLatency(latency) }
-            ?: stringResource(R.string.connection_paths_route_working)
+            ?: stringResource(R.string.connection_paths_route_last_used)
         return stringResource(
-            R.string.connection_paths_active_route,
+            R.string.connection_paths_last_used_route,
             routeDisplayLabel(activeRoute),
             quality,
         )

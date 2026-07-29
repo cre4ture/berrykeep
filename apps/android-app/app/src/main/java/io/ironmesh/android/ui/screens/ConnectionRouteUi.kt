@@ -16,7 +16,7 @@ internal data class RouteStateColors(
 internal fun routeStateColors(state: ConnectionRouteState): RouteStateColors {
     val colors = MaterialTheme.colorScheme
     return when (state) {
-        ConnectionRouteState.ACTIVE -> RouteStateColors(
+        ConnectionRouteState.LAST_USED -> RouteStateColors(
             container = colors.primaryContainer,
             badge = colors.primary,
             onBadge = colors.onPrimary,
@@ -27,13 +27,13 @@ internal fun routeStateColors(state: ConnectionRouteState): RouteStateColors {
             onBadge = colors.onSecondaryContainer,
         )
         ConnectionRouteState.CHECKING,
-        ConnectionRouteState.STANDBY,
+        ConnectionRouteState.UNKNOWN,
         -> RouteStateColors(
             container = colors.surfaceVariant,
             badge = colors.surface,
             onBadge = colors.onSurface,
         )
-        ConnectionRouteState.PAUSED -> RouteStateColors(
+        ConnectionRouteState.COOL_DOWN -> RouteStateColors(
             container = colors.tertiaryContainer,
             badge = colors.tertiary,
             onBadge = colors.onTertiary,
@@ -55,12 +55,12 @@ internal fun formatConnectionLatency(value: Double): String {
 internal fun routeStatusLabel(state: ConnectionRouteState): String {
     return stringResource(
         when (state) {
-            ConnectionRouteState.ACTIVE -> R.string.connection_paths_state_active
+            ConnectionRouteState.LAST_USED -> R.string.connection_paths_state_last_used
             ConnectionRouteState.AVAILABLE -> R.string.connection_paths_state_available
             ConnectionRouteState.CHECKING -> R.string.connection_paths_state_checking
-            ConnectionRouteState.PAUSED -> R.string.connection_paths_state_paused
+            ConnectionRouteState.COOL_DOWN -> R.string.connection_paths_state_cool_down
             ConnectionRouteState.UNAVAILABLE -> R.string.connection_paths_state_unavailable
-            ConnectionRouteState.STANDBY -> R.string.connection_paths_state_standby
+            ConnectionRouteState.UNKNOWN -> R.string.connection_paths_state_unknown
         },
     )
 }

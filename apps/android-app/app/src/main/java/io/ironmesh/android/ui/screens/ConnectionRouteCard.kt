@@ -41,7 +41,7 @@ internal fun ConnectionRouteCard(
         modifier = Modifier
             .fillMaxWidth()
             .animateContentSize(),
-        color = if (route.state == ConnectionRouteState.ACTIVE) {
+        color = if (route.state == ConnectionRouteState.LAST_USED) {
             stateColors.container
         } else {
             MaterialTheme.colorScheme.surface
@@ -199,7 +199,7 @@ private fun ConnectionRouteDetails(
         )
     }
     endpoint.circuitOpenUntilUnixMs
-        ?.takeIf { route.state == ConnectionRouteState.PAUSED }
+        ?.takeIf { route.state == ConnectionRouteState.COOL_DOWN }
         ?.let { until ->
             ConnectionDetail(
                 label = stringResource(R.string.connection_paths_retry_after),
@@ -257,7 +257,7 @@ private fun ConnectionScoreBreakdown(score: RouteScoreBreakdown) {
         },
     )
     ConnectionDetail(
-        label = stringResource(R.string.connection_paths_score_active_route_credit),
+        label = stringResource(R.string.connection_paths_score_last_used_route_credit),
         value = if (score.activeRouteCreditPoints > 0.0) {
             scorePointsCredited(score.activeRouteCreditPoints)
         } else {
@@ -293,15 +293,15 @@ private fun scorePointsCredited(points: Double): String {
 @Composable
 private fun routeSelectionReason(route: ConnectionRouteItem): String {
     return when {
-        route.state == ConnectionRouteState.PAUSED -> {
+        route.state == ConnectionRouteState.COOL_DOWN -> {
             stringResource(R.string.connection_paths_selection_reason_cooling_down)
         }
         route.endpoint.active && route.selectionRank == 1 -> {
-            stringResource(R.string.connection_paths_selection_reason_active_best)
+            stringResource(R.string.connection_paths_selection_reason_last_used_best)
         }
         route.endpoint.active -> {
             stringResource(
-                R.string.connection_paths_selection_reason_active_ranked,
+                R.string.connection_paths_selection_reason_last_used_ranked,
                 route.selectionRank,
             )
         }

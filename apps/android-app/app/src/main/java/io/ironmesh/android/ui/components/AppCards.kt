@@ -93,7 +93,15 @@ fun StatusHeroCard(
                 color = colors.second.copy(alpha = 0.92f),
             )
             if (actions != null) {
-                actions()
+                MaterialTheme(
+                    colorScheme = MaterialTheme.colorScheme.copy(
+                        primary = colors.second,
+                        onPrimary = colors.first,
+                        outline = colors.second,
+                    ),
+                ) {
+                    actions()
+                }
             }
         }
     }
