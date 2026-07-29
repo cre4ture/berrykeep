@@ -17,6 +17,9 @@ env:
   # sccache (RUSTC_WRAPPER) cannot cache incremental compilation; disabling it
   # lets sccache actually cache rustc invocations across CI runs.
   CARGO_INCREMENTAL: "0"
+  # Pull requests can restore caches from main, but their merge-ref caches are
+  # not reusable by main or by unrelated pull requests.
+  SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
 
 jobs:
   system-tests:
@@ -79,3 +82,17 @@ jobs:
 
       - name: Run system tests
         run: cargo -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml
+
+  required-system-tests:
+    name: Required system tests
+    if: ${{ always() }}
+    needs: system-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required system-test results
+        env:
+          REQUIRED_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq --exit-status '
+            all(.[]; .result == "success" or .result == "skipped")
+          ' <<<"${REQUIRED_RESULTS}"

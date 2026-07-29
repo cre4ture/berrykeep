@@ -19,7 +19,7 @@ use rcgen::{
 use std::pin::Pin;
 use std::sync::{
     Arc, Barrier,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
 use tokio::sync::Mutex;
@@ -956,7 +956,7 @@ struct RelayTestState {
     paired_session_count: Arc<AtomicUsize>,
     target_handshake_failure_count: Arc<AtomicUsize>,
     object_write_failures_remaining: Arc<AtomicUsize>,
-    response_delay_ms: u64,
+    response_delay_ms: Arc<AtomicU64>,
     response_status: u16,
     response_headers: Vec<RelayHttpHeader>,
     response_body: Vec<u8>,
@@ -1144,8 +1144,9 @@ async fn serve_test_multiplex_session(
             return;
         }
 
-        if state.response_delay_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(state.response_delay_ms)).await;
+        let response_delay_ms = state.response_delay_ms.load(Ordering::SeqCst);
+        if response_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(response_delay_ms)).await;
         }
 
         write_buffered_transport_response(
@@ -1377,7 +1378,7 @@ async fn spawn_relay_test_server_on_listener_with_security(
         object_write_failures_remaining: Arc::new(AtomicUsize::new(
             object_write_failures_remaining,
         )),
-        response_delay_ms,
+        response_delay_ms: Arc::new(AtomicU64::new(response_delay_ms)),
         response_status,
         response_headers,
         response_body,
@@ -1437,7 +1438,7 @@ async fn spawn_direct_transport_test_server(
         paired_session_count: Arc::new(AtomicUsize::new(0)),
         target_handshake_failure_count: Arc::new(AtomicUsize::new(0)),
         object_write_failures_remaining: Arc::new(AtomicUsize::new(0)),
-        response_delay_ms: 0,
+        response_delay_ms: Arc::new(AtomicU64::new(0)),
         response_status,
         response_headers,
         response_body,
@@ -2496,6 +2497,17 @@ async fn relay_transport_executes_generic_json_get_request() {
         .expect("generic JSON GET over relay should succeed");
 
     assert_eq!(response["status"], "ok");
+    let attempt = client
+        .connection_diagnostics()
+        .endpoints
+        .into_iter()
+        .flat_map(|endpoint| endpoint.recent_attempts)
+        .find(|attempt| attempt.url.contains("/api/v1/cluster/status"))
+        .expect("relay request diagnostics should retain the completed request");
+    assert_eq!(
+        attempt.timeout_ms,
+        Some(duration_to_u64_ms(CLIENT_BUFFERED_REQUEST_ATTEMPT_TIMEOUT).unwrap())
+    );
 
     let captured = relay_state
         .captured_request
@@ -2511,6 +2523,85 @@ async fn relay_transport_executes_generic_json_get_request() {
             .any(|header| header.name == transport_sdk::HEADER_DEVICE_ID
                 && header.value == identity.device_id.to_string())
     );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_buffered_request_enforces_total_deadline() {
+    let (relay_state, server) = spawn_relay_test_server(
+        200,
+        vec![
+            RelayHttpHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            },
+            RelayHttpHeader {
+                name: "content-length".to_string(),
+                value: br#"{"status":"ok"}"#.len().to_string(),
+            },
+        ],
+        br#"{"status":"ok"}"#.to_vec(),
+    )
+    .await;
+
+    let identity = relay_test_identity(&relay_state.security, "relay-timeout-test-device");
+    let client = relay_test_client(&relay_state, identity);
+    client
+        .get_json_path("/cluster/status")
+        .await
+        .expect("initial relay request should warm the multiplexed session");
+    relay_state.response_delay_ms.store(2_000, Ordering::SeqCst);
+
+    let endpoint = client
+        .transport_router
+        .endpoint(0)
+        .expect("relay endpoint should exist");
+    let ClientTransport::Relay(relay) = &endpoint.transport else {
+        panic!("test client should use relay transport");
+    };
+    let source = relay_source_identity_for_auth(&client.auth)
+        .expect("relay source identity should be available");
+    let url = client
+        .relative_url("/cluster/status")
+        .expect("relay request URL should build");
+    let timeout = Duration::from_millis(250);
+    let started_at = std::time::Instant::now();
+    let error = execute_relay_multiplex_buffered_request(
+        RelayMultiplexSessionContext {
+            relay,
+            source,
+            connection_name: client.connection_name.as_deref(),
+        },
+        &Method::GET,
+        &url,
+        &[],
+        &[],
+        Some(timeout),
+    )
+    .await
+    .expect_err("stalled relay request should hit its total deadline");
+
+    assert!(started_at.elapsed() >= Duration::from_millis(200));
+    assert!(started_at.elapsed() < Duration::from_secs(2));
+    assert!(
+        error.chain().any(|cause| cause
+            .downcast_ref::<RelayMultiplexRequestTimeout>()
+            .is_some()),
+        "timeout should retain its typed cause: {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("timed out after 250ms"),
+        "timeout should include its applied deadline: {error:#}"
+    );
+    let captured = relay_state
+        .captured_request
+        .lock()
+        .await
+        .clone()
+        .expect("stalled relay request should reach the target");
+    assert_eq!(captured.path_and_query, "/api/v1/cluster/status");
 
     server.abort();
     let _ = server.await;
@@ -2803,6 +2894,84 @@ async fn relay_transport_streams_upload_session_chunks_over_object_write() {
         "/api/v1/store/uploads/upload-123/chunk/2"
     );
     assert_eq!(captured.body, b"chunk-body".to_vec());
+    let attempt = client
+        .connection_diagnostics()
+        .endpoints
+        .into_iter()
+        .flat_map(|endpoint| endpoint.recent_attempts)
+        .find(|attempt| {
+            attempt
+                .url
+                .contains("/api/v1/store/uploads/upload-123/chunk/2")
+        })
+        .expect("relay upload diagnostics should retain the completed request");
+    assert_eq!(
+        attempt.timeout_ms,
+        Some(duration_to_u64_ms(CLIENT_BUFFERED_REQUEST_ATTEMPT_TIMEOUT).unwrap()),
+        "diagnostics should report the relay response-head deadline"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn relay_streamed_upload_chunk_enforces_response_head_deadline() {
+    let response_body = serde_json::to_vec(&UploadSessionChunkResponse {
+        stored: true,
+        received_index: 3,
+    })
+    .expect("upload chunk response should serialize");
+    let (relay_state, server) = spawn_relay_test_server(200, Vec::new(), response_body).await;
+    let identity = relay_test_identity(&relay_state.security, "relay-upload-timeout-device");
+    let client = relay_test_client(&relay_state, identity);
+    client
+        .get_json_path("/cluster/status")
+        .await
+        .expect("initial relay request should warm the multiplexed session");
+    relay_state.response_delay_ms.store(2_000, Ordering::SeqCst);
+
+    let endpoint = client
+        .transport_router
+        .endpoint(0)
+        .expect("relay endpoint should exist");
+    let ClientTransport::Relay(relay) = &endpoint.transport else {
+        panic!("test client should use relay transport");
+    };
+    let source = relay_source_identity_for_auth(&client.auth)
+        .expect("relay source identity should be available");
+    let url = client
+        .relative_url("/store/uploads/upload-timeout/chunk/3")
+        .expect("relay upload URL should build");
+    let timeout = Duration::from_millis(250);
+    let started_at = std::time::Instant::now();
+    let error = execute_relay_multiplex_streaming_object_write_request(
+        RelayMultiplexSessionContext {
+            relay,
+            source,
+            connection_name: client.connection_name.as_deref(),
+        },
+        &Method::PUT,
+        &url,
+        &[],
+        b"chunk-body",
+        Some(timeout),
+    )
+    .await
+    .expect_err("stalled relay response head should time out");
+
+    assert!(started_at.elapsed() >= Duration::from_millis(200));
+    assert!(started_at.elapsed() < Duration::from_secs(2));
+    assert!(
+        error.chain().any(|cause| cause
+            .downcast_ref::<RelayMultiplexRequestTimeout>()
+            .is_some()),
+        "timeout should retain its relay-specific typed cause: {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("relay multiplex"),
+        "timeout should identify the relay transport: {error:#}"
+    );
 
     server.abort();
     let _ = server.await;
@@ -3323,7 +3492,88 @@ async fn combined_direct_transports_fail_over_to_second_endpoint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
+async fn single_direct_buffered_request_enforces_total_deadline() {
+    let (direct_state, direct_server) =
+        spawn_direct_transport_server_that_hangs_after_first_success().await;
+
+    let test_result = async {
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("single-direct-timeout-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let client = IronMeshClient::from_direct_base_url(direct_state.public_url.clone())
+            .with_client_identity(identity);
+        client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("initial direct request should warm the multiplexed session");
+
+        let endpoint = client
+            .transport_router
+            .endpoint(0)
+            .expect("direct endpoint should exist");
+        let ClientTransport::DirectHttp {
+            server_base_url,
+            session_pool,
+            ..
+        } = &endpoint.transport
+        else {
+            panic!("test client should use direct HTTP multiplex transport");
+        };
+        let ClientRequestAuth::SignedIdentity(identity) = &client.auth else {
+            panic!("test client should have signed identity");
+        };
+        let direct = DirectMultiplexSessionContext {
+            transport_locator: server_base_url,
+            session_pool,
+            identity,
+            connection_name: client.connection_name.as_deref(),
+        };
+        let url = client
+            .relative_url("/cluster/status")
+            .expect("direct request URL should build");
+        let timeout = Duration::from_millis(250);
+        let started_at = std::time::Instant::now();
+        let error = execute_direct_multiplex_buffered_request(
+            direct,
+            &Method::GET,
+            &url,
+            &[],
+            &[],
+            Some(timeout),
+        )
+        .await
+        .expect_err("stalled direct request should hit its total deadline");
+
+        assert!(started_at.elapsed() >= Duration::from_millis(200));
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<DirectMultiplexRequestTimeout>()
+                .is_some()),
+            "timeout should retain its typed cause: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("timed out after 250ms"),
+            "timeout should include its applied deadline: {error:#}"
+        );
+        assert_eq!(direct_state.stalled_request_count.load(Ordering::SeqCst), 1);
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    direct_server.abort();
+    let _ = direct_server.await;
+
+    test_result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_route_stall_falls_back_to_relay_after_ten_second_deadline() {
     let (direct_state, direct_server) =
         spawn_direct_transport_server_that_hangs_after_first_success().await;
     let relay_body = br#"{"status":"ok","route":"relay"}"#.to_vec();
@@ -3345,8 +3595,7 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
     .await;
 
     let test_result = async {
-        let identity =
-            relay_test_identity(&relay_state.security, "direct-stall-failover-device");
+        let identity = relay_test_identity(&relay_state.security, "direct-stall-failover-device");
         let target_node_id = relay_state.security.target_node_id;
 
         let direct = IronMeshClient::from_direct_base_url(direct_state.public_url.clone())
@@ -3364,8 +3613,9 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
         assert_eq!(first["route"], "direct");
         assert!(!client.uses_relay_transport());
 
+        let started_at = std::time::Instant::now();
         let fallback = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(12),
             client.get_json_path("/cluster/status"),
         )
         .await;
@@ -3378,11 +3628,13 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
             }
             Err(_) => {
                 return Err(anyhow::anyhow!(
-                    "request did not fall back to relay within 3 seconds after the direct session stalled"
+                    "request did not fall back to relay after the 10-second direct deadline"
                 ));
             }
         };
 
+        assert!(started_at.elapsed() >= Duration::from_secs(10));
+        assert!(started_at.elapsed() < Duration::from_secs(12));
         assert_eq!(fallback["route"], "relay");
         assert!(client.uses_relay_transport());
         assert_eq!(client.relay_target_node_id(), Some(target_node_id));
@@ -3402,6 +3654,23 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
         assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
         assert!(relay_state.issued_ticket_count.load(Ordering::SeqCst) >= 1);
         assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 1);
+        let diagnostics = client.connection_diagnostics();
+        let direct_timeout = diagnostics
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.path_kind == "direct")
+            .and_then(|endpoint| endpoint.recent_attempts.last())
+            .and_then(|attempt| attempt.timeout_ms);
+        let relay_timeout = diagnostics
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.path_kind == "relay")
+            .and_then(|endpoint| endpoint.recent_attempts.last())
+            .and_then(|attempt| attempt.timeout_ms);
+        let expected_timeout_ms =
+            duration_to_u64_ms(CLIENT_BUFFERED_REQUEST_ATTEMPT_TIMEOUT).unwrap();
+        assert_eq!(direct_timeout, Some(expected_timeout_ms));
+        assert_eq!(relay_timeout, Some(expected_timeout_ms));
 
         Ok::<(), anyhow::Error>(())
     }
@@ -3416,7 +3685,7 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_only_store_index_wait_can_run_longer_than_failover_timeout() {
+async fn direct_store_index_wait_keeps_its_explicit_long_poll_semantics() {
     let (direct_state, direct_server) =
         spawn_direct_transport_server_that_delays_store_index_wait().await;
 
@@ -3468,6 +3737,45 @@ async fn direct_only_store_index_wait_can_run_longer_than_failover_timeout() {
 }
 
 #[test]
+fn buffered_request_timeout_applies_to_normal_and_bounds_long_running_paths() {
+    let normal = Url::parse("https://node.example/api/v1/store/index?depth=64")
+        .expect("normal request URL should parse");
+    let store_wait =
+        Url::parse("https://node.example/api/v1/store/index/changes/wait?since=41&timeout_ms=2500")
+            .expect("store wait URL should parse");
+    let default_store_wait =
+        Url::parse("https://node.example/api/v1/store/index/changes/wait?since=41")
+            .expect("store wait URL without timeout should parse");
+    let delayed_latency =
+        Url::parse("https://node.example/api/v1/diagnostics/latency?server_delay_ms=12000")
+            .expect("delayed latency URL should parse");
+    let immediate_latency =
+        Url::parse("https://node.example/api/v1/diagnostics/latency?server_delay_ms=0")
+            .expect("immediate latency URL should parse");
+
+    assert_eq!(
+        buffered_request_timeout(&normal),
+        Some(Duration::from_secs(10))
+    );
+    assert_eq!(
+        buffered_request_timeout(&store_wait),
+        Some(Duration::from_millis(12_500))
+    );
+    assert_eq!(
+        buffered_request_timeout(&default_store_wait),
+        Some(Duration::from_secs(35))
+    );
+    assert_eq!(
+        buffered_request_timeout(&delayed_latency),
+        Some(Duration::from_secs(22))
+    );
+    assert_eq!(
+        buffered_request_timeout(&immediate_latency),
+        Some(Duration::from_secs(10))
+    );
+}
+
+#[test]
 fn ensure_operation_id_header_reuses_existing_value_for_mutating_methods() {
     let mut headers = Vec::<RelayHttpHeader>::new();
 
@@ -3509,11 +3817,11 @@ async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fa
         assert_eq!(first["route"], "direct");
 
         tokio::time::timeout(
-            Duration::from_secs(4),
+            Duration::from_secs(12),
             client.post_relative_path("/cluster/status"),
         )
         .await
-        .expect("mutating request should fall back within 4 seconds")
+        .expect("mutating request should fall back after the 10-second direct deadline")
         .expect("mutating request should fall back to relay");
 
         let relay_request = tokio::time::timeout(Duration::from_secs(2), async {

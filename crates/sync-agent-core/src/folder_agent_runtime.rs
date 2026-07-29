@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use client_sdk::{
     ClientConnectionDiagnostics, ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
-    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,
+    ManagedClientOptions, ManagedIronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller,
+    RemoteSnapshotScope, RemoteSnapshotUpdate,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -795,7 +796,11 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         BTreeMap::new()
     };
 
-    let client = configured_client(options)?;
+    let configured_client = configured_client(options)?;
+    if configured_client.managed_client.is_some() {
+        tracing::info!("using shared Rendezvous-managed client routes for folder sync");
+    }
+    let client = configured_client.client.clone();
     let status_callback = attach_connection_diagnostics(status_callback, client.clone());
     let snapshot_scope = RemoteSnapshotScope::new(
         scope.remote_prefix().map(ToString::to_string),
@@ -1618,37 +1623,45 @@ fn local_path_diverged_since_baseline<B: FolderAgentLocalBackend>(
     Ok(local_state.get(path) != current.as_ref())
 }
 
-fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClient> {
+struct ConfiguredFolderAgentClient {
+    client: IronMeshClient,
+    managed_client: Option<ManagedIronMeshClient>,
+}
+
+fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<ConfiguredFolderAgentClient> {
     let server_ca_pem = normalized_optional_string(options.server_ca_pem.as_deref());
     let client_bootstrap_json =
         normalized_optional_string(options.client_bootstrap_json.as_deref());
     let client_identity_json = normalized_optional_string(options.client_identity_json.as_deref());
-    let mut client_identity = client_identity_json
+    let client_identity = client_identity_json
         .as_deref()
         .map(ClientIdentityMaterial::from_json_str)
         .transpose()
         .context("failed to parse client identity JSON")?;
 
-    if let Some(raw_bootstrap) = client_bootstrap_json.as_deref()
-        && let Some(identity) = client_identity.as_mut()
-    {
+    if let Some(raw_bootstrap) = client_bootstrap_json.as_deref() {
         let mut bootstrap = ConnectionBootstrap::from_json_str(raw_bootstrap)
             .context("failed to parse connection bootstrap JSON")?;
         if let Some(server_ca_pem) = server_ca_pem.as_ref() {
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
         }
 
-        let original_identity = identity.clone();
-        let client = bootstrap.build_client_with_identity_renewing(identity)?;
-        if identity != &original_identity
+        let managed_client = bootstrap
+            .build_managed_client_blocking(client_identity, ManagedClientOptions::default())?;
+        if let Some(identity) = managed_client.latest_identity_update()
             && let Some(persist_client_identity) = options.persist_client_identity
         {
-            persist_client_identity(identity)
+            persist_client_identity(&identity)
                 .context("failed to persist renewed folder sync client identity")?;
         }
-        return Ok(match options.connection_name.as_deref() {
+        let client = managed_client.client();
+        let client = match options.connection_name.as_deref() {
             Some(connection_name) => client.with_connection_name(connection_name),
             None => client,
+        };
+        return Ok(ConfiguredFolderAgentClient {
+            client,
+            managed_client: Some(managed_client),
         });
     }
 
@@ -1658,9 +1671,13 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClie
         options.server_ca_pem.as_deref(),
         options.client_identity_json.as_deref(),
     )?;
-    Ok(match options.connection_name.as_deref() {
+    let client = match options.connection_name.as_deref() {
         Some(connection_name) => client.with_connection_name(connection_name),
         None => client,
+    };
+    Ok(ConfiguredFolderAgentClient {
+        client,
+        managed_client: None,
     })
 }
 

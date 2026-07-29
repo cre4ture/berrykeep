@@ -14,8 +14,9 @@ pub use folder_agent_ui::*;
 
 use anyhow::{Context, Result, anyhow};
 use client_sdk::{
-    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem, normalize_server_base_url,
+    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, ManagedClientOptions,
+    build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    normalize_server_base_url,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -70,7 +71,7 @@ pub fn build_configured_client(
     let server_ca_pem = normalized_optional_string(server_ca_pem);
     let client_bootstrap_json = normalized_optional_string(client_bootstrap_json);
     let client_identity_json = normalized_optional_string(client_identity_json);
-    let mut client_identity = client_identity_json
+    let client_identity = client_identity_json
         .as_deref()
         .map(ClientIdentityMaterial::from_json_str)
         .transpose()
@@ -81,10 +82,9 @@ pub fn build_configured_client(
         if let Some(server_ca_pem) = server_ca_pem.as_ref() {
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
         }
-        return match client_identity.as_mut() {
-            Some(identity) => bootstrap.build_client_with_identity_renewing(identity),
-            None => bootstrap.build_client(),
-        };
+        let managed_client = bootstrap
+            .build_managed_client_blocking(client_identity, ManagedClientOptions::default())?;
+        return Ok(managed_client.client());
     }
 
     let server_base_url = server_base_url

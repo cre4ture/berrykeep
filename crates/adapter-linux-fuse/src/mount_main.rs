@@ -18,9 +18,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
 use client_sdk::{
-    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, RemoteSnapshotFetcher,
-    RemoteSnapshotPoller, RemoteSnapshotScope, RequestedRange, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem, normalize_server_base_url,
+    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, ManagedClientOptions,
+    ManagedIronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
+    RequestedRange, build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    normalize_server_base_url,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -92,6 +93,7 @@ struct Args {
 
 struct ResolvedUpstreamTarget {
     client: IronMeshClient,
+    managed_client: Option<ManagedIronMeshClient>,
     connection_target: String,
 }
 
@@ -229,6 +231,13 @@ fn run_mount_inner(
     has_client_identity: bool,
     gnome_status: Option<&GnomeStatusRuntime>,
 ) -> Result<()> {
+    if upstream_target
+        .as_ref()
+        .and_then(|target| target.managed_client.as_ref())
+        .is_some()
+    {
+        tracing::info!("using shared Rendezvous-managed client routes for Linux FUSE");
+    }
     let adapter = LinuxFuseAdapter::new(args.fs_name.clone());
     let download_stage_root = download_stage_root(args)?;
     let mut config = FuseMountConfig::new(args.mountpoint.clone(), args.fs_name.clone());
@@ -512,10 +521,15 @@ fn resolve_upstream_target(
         if let Some(server_ca_override) = server_ca_override.as_ref() {
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_override.clone());
         }
-        let client = bootstrap.build_client_with_optional_identity(client_identity)?;
+        let managed_client = bootstrap.build_managed_client_blocking(
+            client_identity.cloned(),
+            ManagedClientOptions::default(),
+        )?;
+        let client = managed_client.client();
         let connection_target = bootstrap.connection_target_label()?;
         return Ok(Some(ResolvedUpstreamTarget {
             client,
+            managed_client: Some(managed_client),
             connection_target,
         }));
     }
@@ -531,6 +545,7 @@ fn resolve_upstream_target(
     )?;
     Ok(Some(ResolvedUpstreamTarget {
         client,
+        managed_client: None,
         connection_target: base_url.to_string(),
     }))
 }

@@ -136,6 +136,10 @@ class FolderSyncForegroundService : Service() {
             nextRetryUnixMs = nextRetryAt,
             lastSuccessfulConnectionUnixMs = previous.lastSuccessfulConnectionUnixMs,
             lastSuccessfulConnectionUrl = previous.lastSuccessfulConnectionUrl,
+            lastSuccessfulFunctionalRequestUnixMs =
+                previous.lastSuccessfulFunctionalRequestUnixMs,
+            lastSuccessfulFunctionalRequestUrl =
+                previous.lastSuccessfulFunctionalRequestUrl,
             failedAttempts = previous.failedAttempts,
         )
         IronmeshPreferences.setAppConnectionStatus(applicationContext, snapshot)

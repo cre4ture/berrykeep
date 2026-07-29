@@ -18,7 +18,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.R
-import io.ironmesh.android.data.isConnected
 import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainUiState
 import io.ironmesh.android.ui.components.EmptyStateCard
@@ -43,7 +42,7 @@ fun HomeScreen(
     val hasProfiles = state.syncProfiles.isNotEmpty()
     val heroTone = when {
         status.errorProfileCount > 0L -> HeroTone.Error
-        !connectionStatus.isConnected(connectionHealthNow) -> HeroTone.Warning
+        !isAppConnectionHealthy(connectionStatus, connectionHealthNow) -> HeroTone.Warning
         else -> HeroTone.Good
     }
     val heroTitle = appConnectionHeadline(connectionStatus, connectionHealthNow)

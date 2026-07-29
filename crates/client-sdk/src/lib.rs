@@ -19,7 +19,8 @@ pub use client_node::ClientNode;
 pub use connection::{
     build_blocking_http_client, build_blocking_reqwest_client_from_pem,
     build_blocking_reqwest_client_from_pem_for_url,
-    build_client_with_optional_identity_from_planned_target, build_http_client,
+    build_client_with_optional_identity_from_planned_target,
+    build_client_with_optional_identity_from_planned_targets, build_http_client,
     build_http_client_from_pem, build_http_client_from_planned_targets,
     build_http_client_with_identity, build_http_client_with_identity_from_pem,
     build_http_client_with_identity_from_planned_target,

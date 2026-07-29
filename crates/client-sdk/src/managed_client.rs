@@ -1,13 +1,13 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::{runtime::Runtime, sync::Mutex as AsyncMutex};
 
 use crate::{
     ClientConnectionRouteSnapshot, ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
-    PlannedConnectionBootstrapTarget, build_http_client_with_identity_from_planned_targets,
+    PlannedConnectionBootstrapTarget, build_client_with_optional_identity_from_planned_targets,
 };
 
 const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
@@ -76,7 +76,7 @@ pub struct ManagedIronMeshClient {
 struct ManagedRouteController {
     client: IronMeshClient,
     bootstrap: ConnectionBootstrap,
-    identity: Mutex<ClientIdentityMaterial>,
+    identity: Mutex<Option<ClientIdentityMaterial>>,
     options: ManagedClientOptions,
     refresh_lock: AsyncMutex<()>,
     routes: Mutex<ManagedRouteState>,
@@ -84,6 +84,10 @@ struct ManagedRouteController {
     last_success: Mutex<Option<Instant>>,
     last_outcome: Mutex<RouteRefreshOutcome>,
     pending_identity_update: Mutex<Option<ClientIdentityMaterial>>,
+    /// Present for blocking consumers such as desktop daemons. It keeps the
+    /// executor used for initial discovery and later refreshes alive for the
+    /// lifetime of the managed client.
+    runtime_guard: Mutex<Option<Arc<Runtime>>>,
 }
 
 #[derive(Default)]
@@ -97,17 +101,27 @@ struct ManagedDynamicRoute {
 }
 
 impl ConnectionBootstrap {
-    /// Builds a stable client handle from static bootstrap routes, then performs a
-    /// bounded, fail-open Rendezvous refresh. A failed or slow discovery response
-    /// never invalidates the static direct HTTPS or relay routes.
-    pub async fn build_managed_client_with_identity(
+    /// Builds a stable client handle from static bootstrap routes, then performs
+    /// a bounded, fail-open Rendezvous refresh. Enrolled clients can adopt
+    /// discovered Direct QUIC routes; anonymous clients continue to use only
+    /// direct HTTPS routes.
+    pub async fn build_managed_client(
         &self,
-        identity: ClientIdentityMaterial,
+        identity: Option<ClientIdentityMaterial>,
         options: ManagedClientOptions,
     ) -> Result<ManagedIronMeshClient> {
         self.validate()?;
-        identity.validate()?;
-        let client = self.build_client_with_identity(&identity)?;
+        if let Some(identity) = identity.as_ref() {
+            identity.validate()?;
+            if identity.cluster_id != self.cluster_id {
+                anyhow::bail!(
+                    "client identity cluster_id {} does not match bootstrap cluster_id {}",
+                    identity.cluster_id,
+                    self.cluster_id
+                );
+            }
+        }
+        let client = self.build_client_with_optional_identity(identity.as_ref())?;
         let controller = Arc::new(ManagedRouteController {
             client: client.clone(),
             bootstrap: self.clone(),
@@ -119,6 +133,7 @@ impl ConnectionBootstrap {
             last_success: Mutex::new(None),
             last_outcome: Mutex::new(RouteRefreshOutcome::default()),
             pending_identity_update: Mutex::new(None),
+            runtime_guard: Mutex::new(None),
         });
         let managed = ManagedIronMeshClient {
             client,
@@ -131,16 +146,9 @@ impl ConnectionBootstrap {
                 let Some(controller) = weak_controller.upgrade() else {
                     return;
                 };
-                let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                    return;
-                };
-                handle.spawn(async move {
-                    let managed = ManagedIronMeshClient {
-                        client: controller.client.clone(),
-                        controller,
-                    };
-                    let _ = managed.notify_transport_failure().await;
-                });
+                if controller.options.refresh_on_transport_failure {
+                    controller.schedule_refresh(RouteRefreshReason::TransportFailure);
+                }
             })));
 
         let initial_refresh = managed.clone();
@@ -154,14 +162,35 @@ impl ConnectionBootstrap {
         {
             // The caller already has a usable static client. Continue discovery
             // opportunistically instead of extending foreground startup.
-            let background_refresh = managed.clone();
-            tokio::spawn(async move {
-                let _ = background_refresh
-                    .refresh_routes(RouteRefreshReason::Startup)
-                    .await;
-            });
+            managed.schedule_refresh(RouteRefreshReason::Startup);
         }
 
+        Ok(managed)
+    }
+
+    /// Builds a stable client handle from static bootstrap routes, then performs a
+    /// bounded, fail-open Rendezvous refresh. A failed or slow discovery response
+    /// never invalidates the static direct HTTPS or relay routes.
+    pub async fn build_managed_client_with_identity(
+        &self,
+        identity: ClientIdentityMaterial,
+        options: ManagedClientOptions,
+    ) -> Result<ManagedIronMeshClient> {
+        self.build_managed_client(Some(identity), options).await
+    }
+
+    /// Synchronous counterpart for desktop daemons and shell integrations that
+    /// do not otherwise own a Tokio runtime. The returned managed client keeps
+    /// its runtime alive, so transport-failure and network-change refreshes use
+    /// the same shared route controller as mobile clients.
+    pub fn build_managed_client_blocking(
+        &self,
+        identity: Option<ClientIdentityMaterial>,
+        options: ManagedClientOptions,
+    ) -> Result<ManagedIronMeshClient> {
+        let runtime = blocking_managed_client_runtime();
+        let managed = runtime.block_on(self.build_managed_client(identity, options))?;
+        managed.attach_runtime(runtime);
         Ok(managed)
     }
 }
@@ -179,14 +208,7 @@ impl ManagedIronMeshClient {
     /// platform passes only the hint; candidate parsing and route selection stay in
     /// the shared Rust controller.
     pub fn notify_network_changed(&self) {
-        let managed = self.clone();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
-                let _ = managed
-                    .refresh_routes(RouteRefreshReason::NetworkChanged)
-                    .await;
-            });
-        }
+        self.schedule_refresh(RouteRefreshReason::NetworkChanged);
     }
 
     pub async fn notify_network_changed_async(&self) -> RouteRefreshOutcome {
@@ -249,62 +271,66 @@ impl ManagedIronMeshClient {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let bootstrap = self.controller.bootstrap.clone();
-        let original_identity = identity.clone();
-        let renewed = tokio::task::spawn_blocking(move || {
-            let mut identity = identity;
-            bootstrap
-                .renew_rendezvous_identity_if_needed(&mut identity)
-                .map(|updated| (identity, updated))
-        })
-        .await;
+        let identity_updated = if let Some(current_identity) = identity.clone() {
+            let bootstrap = self.controller.bootstrap.clone();
+            let original_identity = current_identity.clone();
+            let renewed = tokio::task::spawn_blocking(move || {
+                let mut identity = current_identity;
+                bootstrap
+                    .renew_rendezvous_identity_if_needed(&mut identity)
+                    .map(|updated| (identity, updated))
+            })
+            .await;
 
-        let identity_updated = match renewed {
-            Ok(Ok((renewed_identity, updated))) => {
-                identity = renewed_identity;
-                let identity_updated = updated && identity != original_identity;
-                if identity_updated {
-                    *self
-                        .controller
-                        .identity
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = identity.clone();
-                    *self
-                        .controller
-                        .pending_identity_update
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.clone());
+            match renewed {
+                Ok(Ok((renewed_identity, updated))) => {
+                    let identity_updated = updated && renewed_identity != original_identity;
+                    identity = Some(renewed_identity);
+                    if identity_updated {
+                        *self
+                            .controller
+                            .identity
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = identity.clone();
+                        *self
+                            .controller
+                            .pending_identity_update
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = identity.clone();
+                    }
+                    identity_updated
                 }
-                identity_updated
+                Ok(Err(error)) => {
+                    // Renewal is advisory for route discovery. Preserve static routes and
+                    // report the structured failure rather than discarding a valid client.
+                    return self.record_outcome(RouteRefreshOutcome {
+                        discovery_used: false,
+                        discovery_error: Some(RouteDiscoveryError {
+                            message: format!("failed renewing Rendezvous identity: {error:#}"),
+                        }),
+                        identity_updated: false,
+                        ..RouteRefreshOutcome::default()
+                    });
+                }
+                Err(error) => {
+                    return self.record_outcome(RouteRefreshOutcome {
+                        discovery_used: false,
+                        discovery_error: Some(RouteDiscoveryError {
+                            message: format!("Rendezvous identity renewal task failed: {error}"),
+                        }),
+                        identity_updated: false,
+                        ..RouteRefreshOutcome::default()
+                    });
+                }
             }
-            Ok(Err(error)) => {
-                // Renewal is advisory for route discovery. Preserve static routes and
-                // report the structured failure rather than discarding a valid client.
-                return self.record_outcome(RouteRefreshOutcome {
-                    discovery_used: false,
-                    discovery_error: Some(RouteDiscoveryError {
-                        message: format!("failed renewing Rendezvous identity: {error:#}"),
-                    }),
-                    identity_updated: false,
-                    ..RouteRefreshOutcome::default()
-                });
-            }
-            Err(error) => {
-                return self.record_outcome(RouteRefreshOutcome {
-                    discovery_used: false,
-                    discovery_error: Some(RouteDiscoveryError {
-                        message: format!("Rendezvous identity renewal task failed: {error}"),
-                    }),
-                    identity_updated: false,
-                    ..RouteRefreshOutcome::default()
-                });
-            }
+        } else {
+            false
         };
 
         let refreshed_targets = match self
             .controller
             .bootstrap
-            .refresh_dynamic_targets(Some(&identity))
+            .refresh_dynamic_targets(identity.as_ref())
             .await
         {
             Ok(targets) => targets,
@@ -323,9 +349,9 @@ impl ManagedIronMeshClient {
         let desired_targets = self.reconcile_target_set(refreshed_targets);
         let identity_for_build = identity.clone();
         let refreshed_client = match tokio::task::spawn_blocking(move || {
-            build_http_client_with_identity_from_planned_targets(
+            build_client_with_optional_identity_from_planned_targets(
                 &desired_targets,
-                &identity_for_build,
+                identity_for_build.as_ref(),
             )
         })
         .await
@@ -456,6 +482,42 @@ impl ManagedIronMeshClient {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = outcome.clone();
         outcome
     }
+
+    fn attach_runtime(&self, runtime: Arc<Runtime>) {
+        *self
+            .controller
+            .runtime_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
+    }
+
+    fn schedule_refresh(&self, reason: RouteRefreshReason) {
+        self.controller.clone().schedule_refresh(reason);
+    }
+}
+
+impl ManagedRouteController {
+    fn schedule_refresh(self: Arc<Self>, reason: RouteRefreshReason) {
+        let task_controller = self.clone();
+        let task = async move {
+            let managed = ManagedIronMeshClient {
+                client: task_controller.client.clone(),
+                controller: task_controller,
+            };
+            let _ = managed.refresh_routes(reason).await;
+        };
+
+        let runtime = self
+            .runtime_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(runtime) = runtime {
+            runtime.spawn(task);
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(task);
+        }
+    }
 }
 
 fn planned_target_key(target: &PlannedConnectionBootstrapTarget) -> String {
@@ -468,4 +530,65 @@ fn planned_target_key(target: &PlannedConnectionBootstrapTarget) -> String {
             target.path_kind, target.target_node_id, target.server_base_url
         )
     })
+}
+
+fn blocking_managed_client_runtime() -> Arc<Runtime> {
+    static RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("failed to build shared managed client runtime"),
+            )
+        })
+        .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use transport_sdk::{BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, RelayMode};
+    use uuid::Uuid;
+
+    #[test]
+    fn blocking_managed_client_keeps_anonymous_bootstrap_on_shared_routes() {
+        let bootstrap = ConnectionBootstrap {
+            version: 1,
+            cluster_id: Uuid::now_v7(),
+            rendezvous_urls: Vec::new(),
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: "http://127.0.0.1:9".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: None,
+            }],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+        };
+        let options = ManagedClientOptions {
+            initial_discovery_timeout: Duration::ZERO,
+            ..ManagedClientOptions::default()
+        };
+
+        let managed = bootstrap
+            .build_managed_client_blocking(None, options)
+            .expect("anonymous bootstrap should retain its direct HTTPS fallback");
+
+        assert_eq!(managed.route_snapshot().endpoints.len(), 1);
+        assert!(
+            managed.route_snapshot().endpoints[0]
+                .locator
+                .starts_with("http://127.0.0.1:9")
+        );
+    }
 }

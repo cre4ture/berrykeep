@@ -138,6 +138,16 @@ data class GalleryPageState(
     val error: String? = null,
 )
 
+enum class GalleryLoadErrorKind {
+    TIMEOUT,
+    REQUEST_FAILED,
+}
+
+data class GalleryLoadError(
+    val kind: GalleryLoadErrorKind,
+    val technicalDetail: String? = null,
+)
+
 data class MainUiState(
     val deviceAuthState: DeviceAuthState = DeviceAuthState(),
     val bootstrapInput: String = "",
@@ -181,6 +191,7 @@ data class MainUiState(
     val gallerySort: GallerySortOption = GallerySortOption.CREATION_TIME,
     val themeAccentColorHex: String = DEFAULT_IRONMESH_ACCENT_COLOR_HEX,
     val galleryLoading: Boolean = false,
+    val galleryError: GalleryLoadError? = null,
     val loading: Boolean = false,
 )
 
@@ -568,12 +579,7 @@ class MainViewModel(
         val request = currentGalleryRequest(pageSize = uiState.value.galleryCollection?.pageSize ?: GALLERY_PAGE_SIZE)
         val requestVersion = nextGalleryRequestVersion()
         pinnedGalleryItemIndex = null
-        uiState.value = uiState.value.copy(
-            galleryLoading = true,
-            galleryCollection = null,
-            galleryPages = emptyMap(),
-            status = "Loading gallery...",
-        )
+        uiState.value = uiState.value.withGalleryRefreshStarted()
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
@@ -602,6 +608,7 @@ class MainViewModel(
                         galleryCurrentDirectoryDocumentId = snapshot.currentDirectoryDocumentId,
                         galleryCurrentDirectoryPath = snapshot.currentDirectoryPath,
                         galleryLoading = false,
+                        galleryError = null,
                         status = when (snapshot.mode) {
                             GalleryViewMode.FLATTENED_ALL_IMAGES ->
                                 "Gallery loaded: ${snapshot.collection.totalItemCount} images"
@@ -615,10 +622,7 @@ class MainViewModel(
                     if (!isCurrentGalleryRequest(requestVersion)) {
                         return@onFailure
                     }
-                    uiState.value = uiState.value.copy(
-                        galleryLoading = false,
-                        status = "Error: ${error.message}",
-                    )
+                    uiState.value = uiState.value.withGalleryRefreshFailure(error)
                 }
         }
     }
@@ -1942,6 +1946,57 @@ class MainViewModel(
         val normalized = path.trim().trim('/')
         return if (normalized.isBlank()) GALLERY_ROOT_PATH else "$normalized/"
     }
+}
+
+internal fun MainUiState.withGalleryRefreshStarted(): MainUiState {
+    return copy(
+        galleryLoading = true,
+        galleryError = null,
+        galleryCollection = null,
+        galleryPages = emptyMap(),
+        status = "Loading gallery...",
+    )
+}
+
+internal fun MainUiState.withGalleryRefreshFailure(error: Throwable): MainUiState {
+    val galleryError = galleryLoadErrorFrom(error)
+    return copy(
+        galleryLoading = false,
+        galleryError = galleryError,
+        status = galleryLoadFailureStatus(galleryError),
+    )
+}
+
+internal fun galleryLoadErrorFrom(error: Throwable): GalleryLoadError {
+    val causes = generateSequence(error) { current -> current.cause }
+        .take(8)
+        .toList()
+    val technicalDetail = causes
+        .mapNotNull { cause -> cause.message?.trim()?.takeIf(String::isNotEmpty) }
+        .lastOrNull()
+        ?: causes.lastOrNull()?.javaClass?.simpleName?.takeIf(String::isNotEmpty)
+    val timedOut = causes.any { cause ->
+        cause.javaClass.simpleName.contains("timeout", ignoreCase = true) ||
+            cause.message?.let { message ->
+                message.contains("timeout", ignoreCase = true) ||
+                    message.contains("timed out", ignoreCase = true)
+            } == true
+    }
+    return GalleryLoadError(
+        kind = if (timedOut) GalleryLoadErrorKind.TIMEOUT else GalleryLoadErrorKind.REQUEST_FAILED,
+        technicalDetail = technicalDetail,
+    )
+}
+
+private fun galleryLoadFailureStatus(error: GalleryLoadError): String {
+    val summary = when (error.kind) {
+        GalleryLoadErrorKind.TIMEOUT -> "Gallery index request timed out"
+        GalleryLoadErrorKind.REQUEST_FAILED -> "Gallery index request failed"
+    }
+    return error.technicalDetail
+        ?.takeIf { it.isNotBlank() }
+        ?.let { detail -> "$summary: $detail" }
+        ?: summary
 }
 
 private fun MainSection.isConnectionDiagnosticsSection(): Boolean {

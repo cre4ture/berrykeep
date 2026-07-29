@@ -1,11 +1,36 @@
 package io.ironmesh.android.data
 
+import com.squareup.moshi.Moshi
+import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AppConnectionStatusTest {
+    @Test
+    fun legacyPersistedStatusDefaultsFunctionalSuccessFields() {
+        val adapter = Moshi.Builder()
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(AppConnectionStatus::class.java)
+
+        val status = adapter.fromJson(
+            """
+            {
+              "state": "connected",
+              "lastSuccessfulConnectionUnixMs": 1234,
+              "lastSuccessfulConnectionUrl": "https://example.test/api/v1/diagnostics/latency"
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(1234L, status?.lastSuccessfulConnectionUnixMs)
+        assertNull(status?.lastSuccessfulFunctionalRequestUnixMs)
+        assertNull(status?.lastSuccessfulFunctionalRequestUrl)
+    }
+
     @Test
     fun nextRetryDelayStartsAtTwoSeconds() {
         assertEquals(2_000L, nextAppConnectionRetryDelayMs(1))
