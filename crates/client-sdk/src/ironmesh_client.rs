@@ -221,6 +221,7 @@ struct ClientEndpointRouter {
     endpoints: Arc<RwLock<Vec<ClientEndpoint>>>,
     active_route_key: Arc<RwLock<Option<String>>>,
     transport_failure_refresh_observer: Arc<TransportFailureRefreshObserverSlot>,
+    relay_connection_refresh_observer: Arc<RelayConnectionRefreshObserverSlot>,
 }
 
 #[derive(Clone, Copy)]
@@ -516,6 +517,8 @@ type ConnectionDiagnosticsObserver =
 type ConnectionDiagnosticsObserverSlot = RwLock<Option<ConnectionDiagnosticsObserver>>;
 type TransportFailureRefreshObserver = Arc<dyn Fn() + Send + Sync + 'static>;
 type TransportFailureRefreshObserverSlot = RwLock<Option<TransportFailureRefreshObserver>>;
+type RelayConnectionRefreshObserver = Arc<dyn Fn(NodeId) + Send + Sync + 'static>;
+type RelayConnectionRefreshObserverSlot = RwLock<Option<RelayConnectionRefreshObserver>>;
 
 fn connection_diagnostics_observer() -> &'static ConnectionDiagnosticsObserverSlot {
     static OBSERVER: OnceLock<ConnectionDiagnosticsObserverSlot> = OnceLock::new();
@@ -560,6 +563,7 @@ impl ClientEndpointRouter {
             endpoints: Arc::new(RwLock::new(endpoints)),
             active_route_key: Arc::new(RwLock::new(initial_active)),
             transport_failure_refresh_observer: Arc::new(RwLock::new(None)),
+            relay_connection_refresh_observer: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -751,6 +755,9 @@ impl ClientEndpointRouter {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
+        let first_relay_connection = !latency_samples_ms.is_empty()
+            && state.total_successes == 0
+            && endpoint.transport.relay_target_node_id().is_some();
         for (sample_index, latency_ms) in latency_samples_ms.iter().copied().enumerate() {
             record_endpoint_success_sample(
                 &mut state,
@@ -761,6 +768,10 @@ impl ClientEndpointRouter {
         }
         if latency_samples_ms.is_empty() {
             state.background_probe_in_flight = false;
+        }
+        drop(state);
+        if first_relay_connection {
+            self.notify_first_relay_connection(index, &endpoint);
         }
     }
 
@@ -842,6 +853,8 @@ impl ClientEndpointRouter {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
+        let first_relay_connection =
+            state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
         let finished_unix_ms = unix_ts_ms();
         let total_duration_us = duration_ms_as_u64_micros(measurement.total_duration_ms);
         let server_processing_duration_us = parse_header_u64(
@@ -914,6 +927,9 @@ impl ClientEndpointRouter {
         );
         drop(state);
         self.set_active_index(index);
+        if first_relay_connection {
+            self.notify_first_relay_connection(index, &endpoint);
+        }
     }
 
     fn record_request_failure(
@@ -972,6 +988,38 @@ impl ClientEndpointRouter {
             .transport_failure_refresh_observer
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
+    }
+
+    fn set_relay_connection_refresh_observer(
+        &self,
+        observer: Option<RelayConnectionRefreshObserver>,
+    ) {
+        *self
+            .relay_connection_refresh_observer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
+    }
+
+    fn notify_first_relay_connection(&self, index: usize, endpoint: &ClientEndpoint) {
+        let Some(target_node_id) = endpoint.transport.relay_target_node_id() else {
+            return;
+        };
+        let observer = self
+            .relay_connection_refresh_observer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(observer) = observer else {
+            return;
+        };
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "relay_connection_established",
+            candidate_index = index,
+            target_node_id = %target_node_id,
+            "first successful relay connection established"
+        );
+        observer(target_node_id);
     }
 
     fn has_selectable_route(&self) -> bool {
@@ -2779,6 +2827,14 @@ impl IronMeshClient {
     ) {
         self.transport_router
             .set_transport_failure_refresh_observer(observer);
+    }
+
+    pub(crate) fn set_relay_connection_refresh_observer(
+        &self,
+        observer: Option<Arc<dyn Fn(NodeId) + Send + Sync + 'static>>,
+    ) {
+        self.transport_router
+            .set_relay_connection_refresh_observer(observer);
     }
 
     pub fn with_client_identity(mut self, identity: ClientIdentityMaterial) -> Self {

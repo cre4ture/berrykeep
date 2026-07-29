@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::{runtime::Runtime, sync::Mutex as AsyncMutex};
@@ -11,14 +12,16 @@ use crate::{
 };
 
 const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
+const MIN_PERIODIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Policy for shared, Rendezvous-managed client routes.
 #[derive(Debug, Clone)]
 pub struct ManagedClientOptions {
     /// Maximum foreground wait for the first advisory discovery pass.
     pub initial_discovery_timeout: Duration,
-    /// A stale lifecycle hint is ignored until this interval has elapsed after a
-    /// successful discovery pass.
+    /// Low-priority fallback cadence for discovery. Foreground, network-change,
+    /// and relay-connected events refresh immediately; this interval only keeps
+    /// dynamic routes fresh when none of those events arrive.
     pub discovery_ttl: Duration,
     /// Time an absent dynamic candidate remains selectable after a successful
     /// discovery response omits it. Static bootstrap targets are never retired.
@@ -32,7 +35,7 @@ impl Default for ManagedClientOptions {
     fn default() -> Self {
         Self {
             initial_discovery_timeout: Duration::from_secs(2),
-            discovery_ttl: Duration::from_secs(5 * 60),
+            discovery_ttl: Duration::from_secs(2 * 60),
             route_retirement_grace: Duration::from_secs(10 * 60),
             refresh_on_transport_failure: true,
         }
@@ -46,8 +49,30 @@ pub enum RouteRefreshReason {
     Stale,
     NetworkChanged,
     TransportFailure,
+    RelayConnected,
     Foregrounded,
     ExplicitDiagnosticRequest,
+}
+
+impl RouteRefreshReason {
+    const fn is_event_driven(self) -> bool {
+        matches!(
+            self,
+            Self::NetworkChanged | Self::RelayConnected | Self::Foregrounded
+        )
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Stale => "stale",
+            Self::NetworkChanged => "network_changed",
+            Self::TransportFailure => "transport_failure",
+            Self::RelayConnected => "relay_connected",
+            Self::Foregrounded => "foregrounded",
+            Self::ExplicitDiagnosticRequest => "explicit_diagnostic_request",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,10 +105,11 @@ struct ManagedRouteController {
     options: ManagedClientOptions,
     refresh_lock: AsyncMutex<()>,
     routes: Mutex<ManagedRouteState>,
-    last_attempt: Mutex<Option<Instant>>,
+    last_attempt: Mutex<Option<ManagedRouteRefreshAttempt>>,
     last_success: Mutex<Option<Instant>>,
     last_outcome: Mutex<RouteRefreshOutcome>,
     pending_identity_update: Mutex<Option<ClientIdentityMaterial>>,
+    periodic_refresh_started: AtomicBool,
     /// Present for blocking consumers such as desktop daemons. It keeps the
     /// executor used for initial discovery and later refreshes alive for the
     /// lifetime of the managed client.
@@ -98,6 +124,12 @@ struct ManagedRouteState {
 struct ManagedDynamicRoute {
     target: PlannedConnectionBootstrapTarget,
     last_seen: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct ManagedRouteRefreshAttempt {
+    started_at: Instant,
+    reason: RouteRefreshReason,
 }
 
 impl ConnectionBootstrap {
@@ -133,6 +165,7 @@ impl ConnectionBootstrap {
             last_success: Mutex::new(None),
             last_outcome: Mutex::new(RouteRefreshOutcome::default()),
             pending_identity_update: Mutex::new(None),
+            periodic_refresh_started: AtomicBool::new(false),
             runtime_guard: Mutex::new(None),
         });
         let managed = ManagedIronMeshClient {
@@ -150,6 +183,21 @@ impl ConnectionBootstrap {
                     controller.schedule_refresh(RouteRefreshReason::TransportFailure);
                 }
             })));
+        let weak_controller = Arc::downgrade(&controller);
+        managed
+            .client
+            .set_relay_connection_refresh_observer(Some(Arc::new(move |target_node_id| {
+                let Some(controller) = weak_controller.upgrade() else {
+                    return;
+                };
+                tracing::info!(
+                    event = "dynamic_route_refresh_triggered",
+                    refresh_reason = RouteRefreshReason::RelayConnected.as_str(),
+                    target_node_id = %target_node_id,
+                    "scheduling dynamic route refresh after first successful relay connection"
+                );
+                controller.schedule_refresh(RouteRefreshReason::RelayConnected);
+            })));
 
         let initial_refresh = managed.clone();
         if tokio::time::timeout(options.initial_discovery_timeout, async move {
@@ -164,6 +212,7 @@ impl ConnectionBootstrap {
             // opportunistically instead of extending foreground startup.
             managed.schedule_refresh(RouteRefreshReason::Startup);
         }
+        managed.start_periodic_refresh();
 
         Ok(managed)
     }
@@ -256,14 +305,22 @@ impl ManagedIronMeshClient {
         }
 
         let _refresh_guard = self.controller.refresh_lock.lock().await;
-        if self.recently_attempted() {
+        if self.recently_attempted(reason) {
             return self.last_outcome();
         }
         *self
             .controller
             .last_attempt
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ManagedRouteRefreshAttempt {
+            started_at: Instant::now(),
+            reason,
+        });
+        tracing::info!(
+            event = "dynamic_route_refresh_started",
+            refresh_reason = reason.as_str(),
+            "refreshing dynamic client routes"
+        );
 
         let mut identity = self
             .controller
@@ -458,12 +515,14 @@ impl ManagedIronMeshClient {
             })
     }
 
-    fn recently_attempted(&self) -> bool {
-        self.controller
+    fn recently_attempted(&self, reason: RouteRefreshReason) -> bool {
+        let last_attempt = self
+            .controller
             .last_attempt
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some_and(|last_attempt| last_attempt.elapsed() < REFRESH_COALESCE_WINDOW)
+            .to_owned();
+        refresh_attempt_is_coalesced(last_attempt, reason)
     }
 
     fn last_outcome(&self) -> RouteRefreshOutcome {
@@ -494,6 +553,13 @@ impl ManagedIronMeshClient {
     fn schedule_refresh(&self, reason: RouteRefreshReason) {
         self.controller.clone().schedule_refresh(reason);
     }
+
+    fn start_periodic_refresh(&self) {
+        if self.controller.bootstrap.rendezvous_urls.is_empty() {
+            return;
+        }
+        self.controller.clone().start_periodic_refresh();
+    }
 }
 
 impl ManagedRouteController {
@@ -507,6 +573,47 @@ impl ManagedRouteController {
             let _ = managed.refresh_routes(reason).await;
         };
 
+        let _ = self.spawn_refresh_task(task);
+    }
+
+    fn start_periodic_refresh(self: Arc<Self>) {
+        if self
+            .periodic_refresh_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let interval = self
+            .options
+            .discovery_ttl
+            .max(MIN_PERIODIC_REFRESH_INTERVAL);
+        let weak_controller = Arc::downgrade(&self);
+        let task = async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(controller) = weak_controller.upgrade() else {
+                    return;
+                };
+                let managed = ManagedIronMeshClient {
+                    client: controller.client.clone(),
+                    controller,
+                };
+                let _ = managed.refresh_routes(RouteRefreshReason::Stale).await;
+            }
+        };
+
+        if !self.spawn_refresh_task(task) {
+            self.periodic_refresh_started
+                .store(false, Ordering::Release);
+        }
+    }
+
+    fn spawn_refresh_task<F>(&self, task: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let runtime = self
             .runtime_guard
             .lock()
@@ -514,10 +621,28 @@ impl ManagedRouteController {
             .clone();
         if let Some(runtime) = runtime {
             runtime.spawn(task);
+            true
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(task);
+            true
+        } else {
+            false
         }
     }
+}
+
+fn refresh_attempt_is_coalesced(
+    last_attempt: Option<ManagedRouteRefreshAttempt>,
+    reason: RouteRefreshReason,
+) -> bool {
+    let Some(last_attempt) = last_attempt else {
+        return false;
+    };
+    if last_attempt.started_at.elapsed() >= REFRESH_COALESCE_WINDOW {
+        return false;
+    }
+
+    !(reason.is_event_driven() && last_attempt.reason != reason)
 }
 
 fn planned_target_key(target: &PlannedConnectionBootstrapTarget) -> String {
@@ -552,6 +677,39 @@ mod tests {
     use super::*;
     use transport_sdk::{BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, RelayMode};
     use uuid::Uuid;
+
+    #[test]
+    fn default_discovery_fallback_runs_every_two_minutes() {
+        assert_eq!(
+            ManagedClientOptions::default().discovery_ttl,
+            Duration::from_secs(2 * 60)
+        );
+    }
+
+    #[test]
+    fn event_driven_refresh_bypasses_a_different_recent_refresh_reason() {
+        let just_started = ManagedRouteRefreshAttempt {
+            started_at: Instant::now(),
+            reason: RouteRefreshReason::Startup,
+        };
+
+        assert!(refresh_attempt_is_coalesced(
+            Some(just_started),
+            RouteRefreshReason::Startup,
+        ));
+        assert!(!refresh_attempt_is_coalesced(
+            Some(just_started),
+            RouteRefreshReason::RelayConnected,
+        ));
+        assert!(!refresh_attempt_is_coalesced(
+            Some(just_started),
+            RouteRefreshReason::Foregrounded,
+        ));
+        assert!(!refresh_attempt_is_coalesced(
+            Some(just_started),
+            RouteRefreshReason::NetworkChanged,
+        ));
+    }
 
     #[test]
     fn blocking_managed_client_keeps_anonymous_bootstrap_on_shared_routes() {

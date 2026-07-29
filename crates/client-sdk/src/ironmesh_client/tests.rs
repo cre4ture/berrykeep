@@ -2528,6 +2528,50 @@ async fn relay_transport_executes_generic_json_get_request() {
     let _ = server.await;
 }
 
+#[tokio::test]
+async fn first_successful_relay_request_notifies_dynamic_route_refresh_once() {
+    let (relay_state, server) = spawn_relay_test_server(
+        200,
+        vec![
+            RelayHttpHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            },
+            RelayHttpHeader {
+                name: "content-length".to_string(),
+                value: br#"{"status":"ok"}"#.len().to_string(),
+            },
+        ],
+        br#"{"status":"ok"}"#.to_vec(),
+    )
+    .await;
+    let client = relay_test_client(
+        &relay_state,
+        relay_test_identity(&relay_state.security, "relay-refresh-observer-device"),
+    );
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let observed_refreshes = Arc::clone(&refreshes);
+    let expected_target_node_id = relay_state.security.target_node_id;
+    client.set_relay_connection_refresh_observer(Some(Arc::new(move |target_node_id| {
+        assert_eq!(target_node_id, expected_target_node_id);
+        observed_refreshes.fetch_add(1, Ordering::SeqCst);
+    })));
+
+    client
+        .get_json_path("/cluster/status")
+        .await
+        .expect("first relay request should succeed");
+    client
+        .get_json_path("/cluster/status")
+        .await
+        .expect("reused relay request should succeed");
+
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+
+    server.abort();
+    let _ = server.await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_buffered_request_enforces_total_deadline() {
     let (relay_state, server) = spawn_relay_test_server(

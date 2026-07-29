@@ -2039,6 +2039,43 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_not
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_notifyForegrounded(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+) {
+    let result = (|| -> Result<()> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let configured =
+            cached_configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?;
+        let Some(managed_client) = configured.managed_client else {
+            return Ok(());
+        };
+        runtime()?.spawn(async move {
+            let _ = managed_client.notify_foregrounded().await;
+            if let Some(identity) = managed_client.take_identity_update()
+                && let Err(error) = persist_android_client_identity(&identity)
+            {
+                tracing::warn!(error = %error, "failed to persist rendezvous identity after Android foreground hint");
+            }
+        });
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        throw_java_error(&mut env, format!("rust notifyForegrounded failed: {err:#}"));
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_resetConnectionTimingMeasurement(
     mut env: JNIEnv,
     _class: JClass,
