@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use tokio::{runtime::Runtime, sync::Mutex as AsyncMutex};
 
 use crate::{
-    ClientConnectionRouteSnapshot, ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
-    PlannedConnectionBootstrapTarget, build_client_with_optional_identity_from_planned_targets,
+    ClientConnectionRouteEndpointSnapshot, ClientConnectionRouteSnapshot, ClientIdentityMaterial,
+    ConnectionBootstrap, IronMeshClient, PlannedConnectionBootstrapTarget,
+    build_client_with_optional_identity_from_planned_targets,
 };
 
 const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
@@ -132,6 +133,30 @@ struct ManagedRouteRefreshAttempt {
     reason: RouteRefreshReason,
 }
 
+#[derive(Clone, Copy)]
+enum RouteSource {
+    Bootstrap,
+    Cache,
+    Rendezvous,
+}
+
+impl RouteSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Cache => "cache",
+            Self::Rendezvous => "rendezvous",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RouteRefreshTelemetry {
+    reason: RouteRefreshReason,
+    started_at: Instant,
+    candidate_count_before: usize,
+}
+
 impl ConnectionBootstrap {
     /// Builds a stable client handle from static bootstrap routes, then performs
     /// a bounded, fail-open Rendezvous refresh. Enrolled clients can adopt
@@ -172,6 +197,9 @@ impl ConnectionBootstrap {
             client,
             controller: controller.clone(),
         };
+        for endpoint in &managed.route_snapshot().endpoints {
+            log_route_added(RouteSource::Bootstrap, endpoint);
+        }
         let weak_controller = Arc::downgrade(&controller);
         managed
             .client
@@ -316,9 +344,15 @@ impl ManagedIronMeshClient {
             started_at: Instant::now(),
             reason,
         });
+        let telemetry = RouteRefreshTelemetry {
+            reason,
+            started_at: Instant::now(),
+            candidate_count_before: self.client.connection_route_snapshot().endpoints.len(),
+        };
         tracing::info!(
-            event = "dynamic_route_refresh_started",
+            event = "route_refresh_started",
             refresh_reason = reason.as_str(),
+            candidate_count_before = telemetry.candidate_count_before,
             "refreshing dynamic client routes"
         );
 
@@ -360,24 +394,32 @@ impl ManagedIronMeshClient {
                 Ok(Err(error)) => {
                     // Renewal is advisory for route discovery. Preserve static routes and
                     // report the structured failure rather than discarding a valid client.
-                    return self.record_outcome(RouteRefreshOutcome {
-                        discovery_used: false,
-                        discovery_error: Some(RouteDiscoveryError {
-                            message: format!("failed renewing Rendezvous identity: {error:#}"),
-                        }),
-                        identity_updated: false,
-                        ..RouteRefreshOutcome::default()
-                    });
+                    return self.finish_route_refresh(
+                        telemetry,
+                        RouteRefreshOutcome {
+                            discovery_used: false,
+                            discovery_error: Some(RouteDiscoveryError {
+                                message: format!("failed renewing Rendezvous identity: {error:#}"),
+                            }),
+                            identity_updated: false,
+                            ..RouteRefreshOutcome::default()
+                        },
+                    );
                 }
                 Err(error) => {
-                    return self.record_outcome(RouteRefreshOutcome {
-                        discovery_used: false,
-                        discovery_error: Some(RouteDiscoveryError {
-                            message: format!("Rendezvous identity renewal task failed: {error}"),
-                        }),
-                        identity_updated: false,
-                        ..RouteRefreshOutcome::default()
-                    });
+                    return self.finish_route_refresh(
+                        telemetry,
+                        RouteRefreshOutcome {
+                            discovery_used: false,
+                            discovery_error: Some(RouteDiscoveryError {
+                                message: format!(
+                                    "Rendezvous identity renewal task failed: {error}"
+                                ),
+                            }),
+                            identity_updated: false,
+                            ..RouteRefreshOutcome::default()
+                        },
+                    );
                 }
             }
         } else {
@@ -392,14 +434,17 @@ impl ManagedIronMeshClient {
         {
             Ok(targets) => targets,
             Err(error) => {
-                return self.record_outcome(RouteRefreshOutcome {
-                    discovery_used: false,
-                    discovery_error: Some(RouteDiscoveryError {
-                        message: format!("Rendezvous discovery failed: {error:#}"),
-                    }),
-                    identity_updated,
-                    ..RouteRefreshOutcome::default()
-                });
+                return self.finish_route_refresh(
+                    telemetry,
+                    RouteRefreshOutcome {
+                        discovery_used: false,
+                        discovery_error: Some(RouteDiscoveryError {
+                            message: format!("Rendezvous discovery failed: {error:#}"),
+                        }),
+                        identity_updated,
+                        ..RouteRefreshOutcome::default()
+                    },
+                );
             }
         };
 
@@ -415,43 +460,55 @@ impl ManagedIronMeshClient {
         {
             Ok(Ok(client)) => client,
             Ok(Err(error)) => {
-                return self.record_outcome(RouteRefreshOutcome {
-                    discovery_used: true,
-                    discovery_error: Some(RouteDiscoveryError {
-                        message: format!("failed building refreshed client routes: {error:#}"),
-                    }),
-                    identity_updated,
-                    ..RouteRefreshOutcome::default()
-                });
+                return self.finish_route_refresh(
+                    telemetry,
+                    RouteRefreshOutcome {
+                        discovery_used: true,
+                        discovery_error: Some(RouteDiscoveryError {
+                            message: format!("failed building refreshed client routes: {error:#}"),
+                        }),
+                        identity_updated,
+                        ..RouteRefreshOutcome::default()
+                    },
+                );
             }
             Err(error) => {
-                return self.record_outcome(RouteRefreshOutcome {
-                    discovery_used: true,
-                    discovery_error: Some(RouteDiscoveryError {
-                        message: format!("route construction task failed: {error}"),
-                    }),
-                    identity_updated,
-                    ..RouteRefreshOutcome::default()
-                });
+                return self.finish_route_refresh(
+                    telemetry,
+                    RouteRefreshOutcome {
+                        discovery_used: true,
+                        discovery_error: Some(RouteDiscoveryError {
+                            message: format!("route construction task failed: {error}"),
+                        }),
+                        identity_updated,
+                        ..RouteRefreshOutcome::default()
+                    },
+                );
             }
         };
 
+        let routes_before = self.client.connection_route_snapshot();
         let (routes_added, routes_removed, routes_retained) = self
             .client
             .reconcile_transport_membership(&refreshed_client, !identity_updated);
+        let routes_after = self.client.connection_route_snapshot();
+        log_dynamic_route_membership_changes(&routes_before, &routes_after);
         *self
             .controller
             .last_success
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
-        self.record_outcome(RouteRefreshOutcome {
-            discovery_used: true,
-            discovery_error: None,
-            routes_added,
-            routes_removed,
-            routes_retained,
-            identity_updated,
-        })
+        self.finish_route_refresh(
+            telemetry,
+            RouteRefreshOutcome {
+                discovery_used: true,
+                discovery_error: None,
+                routes_added,
+                routes_removed,
+                routes_retained,
+                identity_updated,
+            },
+        )
     }
 
     fn reconcile_target_set(
@@ -540,6 +597,29 @@ impl ManagedIronMeshClient {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = outcome.clone();
         outcome
+    }
+
+    fn finish_route_refresh(
+        &self,
+        telemetry: RouteRefreshTelemetry,
+        outcome: RouteRefreshOutcome,
+    ) -> RouteRefreshOutcome {
+        let candidate_count_after = self.client.connection_route_snapshot().endpoints.len();
+        tracing::info!(
+            event = "route_refresh_completed",
+            refresh_reason = telemetry.reason.as_str(),
+            candidate_count_before = telemetry.candidate_count_before,
+            candidate_count_after,
+            duration_ms = telemetry.started_at.elapsed().as_millis() as u64,
+            discovery_used = outcome.discovery_used,
+            routes_added = outcome.routes_added,
+            routes_removed = outcome.routes_removed,
+            routes_retained = outcome.routes_retained,
+            identity_updated = outcome.identity_updated,
+            discovery_error = ?outcome.discovery_error.as_ref().map(|error| error.message.as_str()),
+            "finished refreshing dynamic client routes"
+        );
+        self.record_outcome(outcome)
     }
 
     fn attach_runtime(&self, runtime: Arc<Runtime>) {
@@ -655,6 +735,68 @@ fn planned_target_key(target: &PlannedConnectionBootstrapTarget) -> String {
             target.path_kind, target.target_node_id, target.server_base_url
         )
     })
+}
+
+fn log_dynamic_route_membership_changes(
+    routes_before: &ClientConnectionRouteSnapshot,
+    routes_after: &ClientConnectionRouteSnapshot,
+) {
+    let previous = routes_before
+        .endpoints
+        .iter()
+        .map(|endpoint| (route_snapshot_key(endpoint), endpoint))
+        .collect::<BTreeMap<_, _>>();
+    let current = routes_after
+        .endpoints
+        .iter()
+        .map(|endpoint| (route_snapshot_key(endpoint), endpoint))
+        .collect::<BTreeMap<_, _>>();
+
+    for (route_key, endpoint) in &current {
+        if !previous.contains_key(route_key) {
+            log_route_added(RouteSource::Rendezvous, endpoint);
+        }
+    }
+    for (route_key, endpoint) in &previous {
+        if !current.contains_key(route_key) {
+            log_route_removed(RouteSource::Cache, endpoint);
+        }
+    }
+}
+
+fn route_snapshot_key(endpoint: &ClientConnectionRouteEndpointSnapshot) -> String {
+    format!(
+        "{:?}#{}#{}#{}",
+        endpoint.path_kind,
+        endpoint.locator,
+        endpoint
+            .target_node_id
+            .map(|node_id| node_id.to_string())
+            .unwrap_or_default(),
+        endpoint.hole_punching_mode.as_deref().unwrap_or_default(),
+    )
+}
+
+fn log_route_added(source: RouteSource, endpoint: &ClientConnectionRouteEndpointSnapshot) {
+    tracing::info!(
+        event = "route_added",
+        route_source = source.as_str(),
+        path_kind = ?endpoint.path_kind,
+        target_node_id = ?endpoint.target_node_id,
+        route_locator = %endpoint.locator,
+        "route candidate added to the client router"
+    );
+}
+
+fn log_route_removed(source: RouteSource, endpoint: &ClientConnectionRouteEndpointSnapshot) {
+    tracing::info!(
+        event = "route_removed",
+        route_source = source.as_str(),
+        path_kind = ?endpoint.path_kind,
+        target_node_id = ?endpoint.target_node_id,
+        route_locator = %endpoint.locator,
+        "route candidate removed from the client router"
+    );
 }
 
 fn blocking_managed_client_runtime() -> Arc<Runtime> {
