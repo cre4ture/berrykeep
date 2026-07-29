@@ -21,12 +21,14 @@ use transport_sdk::{
 };
 
 const IROH_RELAY_TICKET_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const MOBILE_CONNECTION_LOG_TARGET: &str = "ironmesh_mobile_connection";
 
 #[derive(Clone)]
 pub(crate) struct TransportSessionPool {
     target: SessionPoolTarget,
     cached_session: Arc<Mutex<Option<CachedTransportSession>>>,
     stats: Arc<TransportSessionPoolStats>,
+    route_index: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -107,6 +109,7 @@ impl TransportSessionPool {
             },
             cached_session: Arc::new(Mutex::new(None)),
             stats: Arc::new(TransportSessionPoolStats::default()),
+            route_index: Arc::new(AtomicU64::new(u64::MAX)),
         }
     }
 
@@ -126,6 +129,7 @@ impl TransportSessionPool {
             },
             cached_session: Arc::new(Mutex::new(None)),
             stats: Arc::new(TransportSessionPoolStats::default()),
+            route_index: Arc::new(AtomicU64::new(u64::MAX)),
         }
     }
 
@@ -142,6 +146,7 @@ impl TransportSessionPool {
             },
             cached_session: Arc::new(Mutex::new(None)),
             stats: Arc::new(TransportSessionPoolStats::default()),
+            route_index: Arc::new(AtomicU64::new(u64::MAX)),
         }
     }
 
@@ -153,6 +158,18 @@ impl TransportSessionPool {
             connect_duration_us: self.stats.connect_duration_us.load(Ordering::Relaxed),
             relay_pairing_duration_us: self.stats.relay_pairing_duration_us.load(Ordering::Relaxed),
         }
+    }
+
+    pub(crate) fn set_route_index(&self, route_index: usize) {
+        self.route_index.store(
+            route_index.try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn route_index(&self) -> Option<usize> {
+        let route_index = self.route_index.load(Ordering::Relaxed);
+        (route_index != u64::MAX).then_some(route_index as usize)
     }
 
     pub(crate) fn hole_punching_mode(&self) -> Option<&'static str> {
@@ -239,14 +256,64 @@ impl TransportSessionPool {
                     candidate,
                     rendezvous.as_ref(),
                     relay_ca_pem.as_deref(),
+                    self.route_index(),
                 )
                 .await?;
-                let direct_quic = endpoint
+                tracing::info!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "iroh_connect_scheduled",
+                    candidate_index = ?self.route_index(),
+                    path_kind = "direct_quic",
+                    locator = %candidate.endpoint,
+                    target_node_id = %target_node_id,
+                    "iroh_connect_scheduled"
+                );
+                let iroh_connect_started = Instant::now();
+                tracing::info!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "iroh_connect_started",
+                    candidate_index = ?self.route_index(),
+                    path_kind = "direct_quic",
+                    locator = %candidate.endpoint,
+                    target_node_id = %target_node_id,
+                    "iroh_connect_started"
+                );
+                let direct_quic = match endpoint
                     .connect_session(candidate, MultiplexConfig::default())
                     .await
-                    .with_context(|| {
-                        format!("failed opening direct QUIC transport session to {target_label}")
-                    })?;
+                {
+                    Ok(session) => {
+                        tracing::info!(
+                            target: MOBILE_CONNECTION_LOG_TARGET,
+                            event = "iroh_connect_completed",
+                            candidate_index = ?self.route_index(),
+                            path_kind = "direct_quic",
+                            locator = %candidate.endpoint,
+                            target_node_id = %target_node_id,
+                            duration_us = duration_as_u64_micros(iroh_connect_started.elapsed()),
+                            "iroh_connect_completed"
+                        );
+                        session
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: MOBILE_CONNECTION_LOG_TARGET,
+                            event = "iroh_connect_failed",
+                            candidate_index = ?self.route_index(),
+                            path_kind = "direct_quic",
+                            locator = %candidate.endpoint,
+                            target_node_id = %target_node_id,
+                            duration_us = duration_as_u64_micros(iroh_connect_started.elapsed()),
+                            error = %error,
+                            "iroh_connect_failed"
+                        );
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed opening direct QUIC transport session to {target_label}"
+                            )
+                        });
+                    }
+                };
                 self.update_hole_punching_mode(&direct_quic.connection);
                 self.spawn_hole_punching_monitor(direct_quic.connection.clone());
                 (
@@ -353,7 +420,17 @@ impl TransportSessionPool {
 
         let connect_started = Instant::now();
 
-        let ticket = rendezvous
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "relay_pairing_started",
+            candidate_index = ?self.route_index(),
+            path_kind = "relay_tunnel",
+            locator = %rendezvous.config().rendezvous_urls.first().map(String::as_str).unwrap_or("rendezvous"),
+            target_node_id = %target_node_id,
+            "relay_pairing_started"
+        );
+
+        let ticket = match rendezvous
             .issue_relay_ticket(&RelayTicketRequest {
                 cluster_id: rendezvous.config().cluster_id,
                 source: source.clone(),
@@ -363,25 +440,63 @@ impl TransportSessionPool {
                 requested_expires_in_secs: Some(300),
             })
             .await
-            .with_context(|| {
-                format!(
-                    "failed issuing multiplex relay ticket for client target node {}",
-                    target_node_id
-                )
-            })?;
-        let relay_tunnel = rendezvous
-            .connect_relay_tunnel_source(&ticket)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed opening relay tunnel source for client target node {}",
-                    target_node_id
-                )
-            })?;
+        {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                tracing::warn!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "relay_pairing_failed",
+                    candidate_index = ?self.route_index(),
+                    path_kind = "relay_tunnel",
+                    locator = %rendezvous.config().rendezvous_urls.first().map(String::as_str).unwrap_or("rendezvous"),
+                    target_node_id = %target_node_id,
+                    error = %error,
+                    "relay_pairing_failed"
+                );
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed issuing multiplex relay ticket for client target node {}",
+                        target_node_id
+                    )
+                });
+            }
+        };
+        let relay_tunnel = match rendezvous.connect_relay_tunnel_source(&ticket).await {
+            Ok(tunnel) => tunnel,
+            Err(error) => {
+                tracing::warn!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "relay_pairing_failed",
+                    candidate_index = ?self.route_index(),
+                    path_kind = "relay_tunnel",
+                    locator = %rendezvous.config().rendezvous_urls.first().map(String::as_str).unwrap_or("rendezvous"),
+                    target_node_id = %target_node_id,
+                    error = %error,
+                    "relay_pairing_failed"
+                );
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed opening relay tunnel source for client target node {}",
+                        target_node_id
+                    )
+                });
+            }
+        };
         let relay_pairing_duration_us = relay_tunnel
             .pairing_timing()
             .map(|timing| timing.relay_pairing_duration_us)
             .unwrap_or_default();
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "relay_pairing_completed",
+            candidate_index = ?self.route_index(),
+            path_kind = "relay_tunnel",
+            locator = %rendezvous.config().rendezvous_urls.first().map(String::as_str).unwrap_or("rendezvous"),
+            target_node_id = %target_node_id,
+            pairing_duration_us = relay_pairing_duration_us,
+            total_duration_us = duration_as_u64_micros(connect_started.elapsed()),
+            "relay_pairing_completed"
+        );
         let (relay_session, multiplexed) = relay_tunnel
             .into_secure_multiplexed_source_session(
                 source_security.clone(),
@@ -447,6 +562,7 @@ async fn ensure_direct_quic_endpoint(
     candidate: &ConnectionCandidate,
     rendezvous: Option<&RendezvousControlClient>,
     relay_ca_pem: Option<&str>,
+    route_index: Option<usize>,
 ) -> Result<DirectQuicEndpoint> {
     let mut guard = endpoint.lock().await;
     if let Some(managed) = guard.as_ref() {
@@ -497,6 +613,18 @@ async fn ensure_direct_quic_endpoint(
             candidate.endpoint
         )
     })?;
+    let endpoint_snapshot = endpoint.snapshot();
+    tracing::info!(
+        target: MOBILE_CONNECTION_LOG_TARGET,
+        event = "iroh_endpoint_created",
+        candidate_index = ?route_index,
+        path_kind = "direct_quic",
+        locator = %candidate.endpoint,
+        endpoint_id = %endpoint_snapshot.endpoint_id,
+        relay_url = ?endpoint_snapshot.relay_url,
+        direct_socket_addrs = ?endpoint_snapshot.direct_socket_addrs,
+        "iroh_endpoint_created"
+    );
     if let Some(ticket) = relay_ticket.as_ref() {
         endpoint
             .reconcile_dynamic_relays(&iroh_relay_configs_from_ticket(ticket))
@@ -654,6 +782,9 @@ mod tests {
         );
 
         assert_eq!(pool.snapshot(), TransportSessionPoolSnapshot::default());
+        assert_eq!(pool.route_index(), None);
+        pool.set_route_index(4);
+        assert_eq!(pool.route_index(), Some(4));
     }
 
     #[test]

@@ -3776,6 +3776,22 @@ fn buffered_request_timeout_applies_to_normal_and_bounds_long_running_paths() {
 }
 
 #[test]
+fn timeout_route_log_reason_explains_why_active_zero_is_not_switched() {
+    assert!(is_timeout_error_message("operation TIMED OUT"));
+    assert!(is_timeout_error_message("transport timeout"));
+    assert!(!is_timeout_error_message("connection reset by peer"));
+
+    assert_eq!(
+        route_not_switched_reason(Some(0), &[2, 1]),
+        "active_index=0_changes_only_after_a_successful_request;higher_ranked_candidates_remain_failover_candidates_until_then"
+    );
+    assert_eq!(
+        route_not_switched_reason(Some(0), &[]),
+        "active_index=0_remains_the_highest_ranked_route"
+    );
+}
+
+#[test]
 fn ensure_operation_id_header_reuses_existing_value_for_mutating_methods() {
     let mut headers = Vec::<RelayHttpHeader>::new();
 
