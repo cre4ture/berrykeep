@@ -158,7 +158,7 @@ impl ScenarioRuntime {
         let deadline = Instant::now() + ROUTE_READY_TIMEOUT;
         let mut last_snapshot: Value;
         loop {
-            last_snapshot = match self.refresh_routes().await {
+            last_snapshot = match self.connection_routes().await {
                 Ok(snapshot) => {
                     if candidate_matches(&snapshot, expected) {
                         return Ok(snapshot);
@@ -186,22 +186,36 @@ impl ScenarioRuntime {
         .await
     }
 
-    pub(super) async fn refresh_routes(&self) -> Result<Value> {
+    pub(super) async fn connection_routes(&self) -> Result<Value> {
         device_json_request(
             &self.client,
-            reqwest::Method::POST,
-            format!("{}/api/connection-routes/refresh", self.web_base_url),
-            Some(json!({})),
+            reqwest::Method::GET,
+            format!("{}/api/connection-routes", self.web_base_url),
+            None,
         )
         .await
     }
 
-    pub(super) fn cli_stderr(&self) -> String {
-        self.cli.stderr()
-    }
-
-    pub(super) fn cli_stderr_tail(&self) -> String {
-        self.cli.stderr_tail()
+    pub(super) async fn wait_for_cli_logs(
+        &mut self,
+        wait_for: Duration,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Result<String> {
+        let deadline = Instant::now() + wait_for;
+        loop {
+            let logs = self.cli.stderr();
+            if predicate(&logs) {
+                return Ok(logs);
+            }
+            self.cli.ensure_running()?;
+            if Instant::now() >= deadline {
+                bail!(
+                    "CLI diagnostics did not appear within {wait_for:?}\n{}",
+                    self.cli.stderr_tail()
+                );
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
     }
 
     pub(super) async fn stop(mut self) {

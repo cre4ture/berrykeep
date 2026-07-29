@@ -101,14 +101,20 @@ async fn run_with_timeout(scenario: Scenario) -> Result<()> {
 }
 
 async fn run_scenario(scenario: Scenario) -> Result<()> {
-    let runtime = ScenarioRuntime::setup(scenario).await?;
-    let result = exercise_and_assert(&runtime, scenario).await;
+    let mut runtime = ScenarioRuntime::setup(scenario).await?;
+    let result = exercise_and_assert(&mut runtime, scenario).await;
     runtime.stop().await;
     result
 }
 
-async fn exercise_and_assert(runtime: &ScenarioRuntime, scenario: Scenario) -> Result<()> {
-    runtime.wait_for_route(scenario.expected).await?;
+async fn exercise_and_assert(runtime: &mut ScenarioRuntime, scenario: Scenario) -> Result<()> {
+    let route_snapshot = runtime.wait_for_route(scenario.expected).await?;
+    assert_expected_route(&route_snapshot, scenario.expected).with_context(|| {
+        format!(
+            "unexpected routes for {}\n{route_snapshot:#}",
+            scenario.name
+        )
+    })?;
 
     let started = Instant::now();
     let store_list = runtime
@@ -126,19 +132,29 @@ async fn exercise_and_assert(runtime: &ScenarioRuntime, scenario: Scenario) -> R
         started.elapsed()
     );
 
-    let snapshot = runtime.refresh_routes().await?;
-    assert_expected_route(&snapshot, scenario.expected)
-        .with_context(|| format!("unexpected routes for {}\n{snapshot:#}", scenario.name))?;
-
     if scenario.stall_iroh_ticket {
-        let logs = runtime.cli_stderr();
-        ensure!(
-            logs.contains("iroh_relay_ticket_failed") && logs.contains("iroh_direct_only_fallback"),
-            "ticket timeout scenario did not emit the expected timeout/direct-only diagnostics\n{}",
-            runtime.cli_stderr_tail()
-        );
+        runtime
+            .wait_for_cli_logs(Duration::from_secs(10), |logs| {
+                has_direct_ticket_timeout(logs) && has_direct_only_fallback(logs)
+            })
+            .await
+            .context("ticket timeout scenario missed the direct QUIC fallback diagnostics")?;
     }
     Ok(())
+}
+
+fn has_direct_ticket_timeout(logs: &str) -> bool {
+    logs.lines().any(|line| {
+        line.contains("iroh_relay_ticket_failed")
+            && line.contains("path_kind=\"direct_quic\"")
+            && line.contains("error_class=\"timeout\"")
+    })
+}
+
+fn has_direct_only_fallback(logs: &str) -> bool {
+    logs.lines().any(|line| {
+        line.contains("iroh_direct_only_fallback") && line.contains("path_kind=\"direct_quic\"")
+    })
 }
 
 fn candidate_matches(snapshot: &Value, expected: ExpectedRoute) -> bool {
@@ -185,6 +201,13 @@ fn assert_expected_route(snapshot: &Value, expected: ExpectedRoute) -> Result<()
                 .unwrap_or_default()
                 >= 1,
             "Direct QUIC route did not establish a pooled session: {direct:#}"
+        );
+        ensure!(
+            direct["transport_session_pool"]["reuse_count"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1,
+            "Direct QUIC route did not reuse its pooled session: {direct:#}"
         );
     }
     Ok(())

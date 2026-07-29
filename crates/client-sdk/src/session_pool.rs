@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use common::NodeId;
 use futures_util::StreamExt;
 use iroh::SecretKey;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, PathList};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -435,7 +435,10 @@ impl TransportSessionPool {
                         COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT
                     )
                 })??;
-                self.update_hole_punching_mode(&direct_quic.connection);
+                self.stats.direct_connection_mode.store(
+                    direct_connection_mode_from_paths(&direct_quic.connection.paths()),
+                    Ordering::Relaxed,
+                );
                 self.spawn_hole_punching_monitor(direct_quic.connection.clone());
                 (
                     direct_quic.session,
@@ -486,46 +489,14 @@ impl TransportSessionPool {
         Ok(session)
     }
 
-    fn update_hole_punching_mode(&self, connection: &Connection) {
-        let mode = connection
-            .paths()
-            .iter()
-            .find(|path| path.is_selected())
-            .map(|path| {
-                if path.is_ip() {
-                    DIRECT_CONNECTION_MODE_DIRECT
-                } else if path.is_relay() {
-                    DIRECT_CONNECTION_MODE_RELAY
-                } else {
-                    DIRECT_CONNECTION_MODE_UNKNOWN
-                }
-            })
-            .unwrap_or(DIRECT_CONNECTION_MODE_UNKNOWN);
-        self.stats
-            .direct_connection_mode
-            .store(mode, Ordering::Relaxed);
-    }
-
     fn spawn_hole_punching_monitor(&self, connection: Connection) {
         let stats = Arc::clone(&self.stats);
         tokio::spawn(async move {
-            let mut events = connection.path_events();
-            while events.next().await.is_some() {
-                let mode = connection
-                    .paths()
-                    .iter()
-                    .find(|path| path.is_selected())
-                    .map(|path| {
-                        if path.is_ip() {
-                            DIRECT_CONNECTION_MODE_DIRECT
-                        } else if path.is_relay() {
-                            DIRECT_CONNECTION_MODE_RELAY
-                        } else {
-                            DIRECT_CONNECTION_MODE_UNKNOWN
-                        }
-                    })
-                    .unwrap_or(DIRECT_CONNECTION_MODE_UNKNOWN);
-                stats.direct_connection_mode.store(mode, Ordering::Relaxed);
+            let mut paths = connection.paths_stream();
+            while let Some(paths) = paths.next().await {
+                stats
+                    .direct_connection_mode
+                    .store(direct_connection_mode_from_paths(&paths), Ordering::Relaxed);
             }
         });
     }
@@ -887,6 +858,22 @@ fn relay_session_role_for_source(source: &PeerIdentity) -> TransportSessionRole 
         PeerIdentity::Node(_) => TransportSessionRole::Node,
         PeerIdentity::Device(_) => TransportSessionRole::Client,
     }
+}
+
+fn direct_connection_mode_from_paths(paths: &PathList<'_>) -> u64 {
+    paths
+        .iter()
+        .find(|path| path.is_selected())
+        .map(|path| {
+            if path.is_ip() {
+                DIRECT_CONNECTION_MODE_DIRECT
+            } else if path.is_relay() {
+                DIRECT_CONNECTION_MODE_RELAY
+            } else {
+                DIRECT_CONNECTION_MODE_UNKNOWN
+            }
+        })
+        .unwrap_or(DIRECT_CONNECTION_MODE_UNKNOWN)
 }
 
 async fn ensure_direct_quic_endpoint(
