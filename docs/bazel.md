@@ -15,6 +15,7 @@ The current native targets are:
 - `//crates/desktop-client-config:unit_test`
 - `//crates/desktop-status:unit_test`
 - `//crates/rendezvous-server:unit_test`
+- `//crates/sync-agent-core:unit_test`
 - `//crates/sync-core:unit_test`
 - `//crates/transport-sdk:unit_test`
 
@@ -26,8 +27,10 @@ consumes the native `client-sdk` target, extending dependency-aware
 invalidation to desktop integration code. `desktop-client-config` is an
 independent leaf whose dependencies are all supplied by Crate Universe; its
 native library prepares the later `background-launcher` and `config-app`
-application targets. These targets avoid duplicate generated crates. Run the
-current Bazel unit suite with:
+application targets. `sync-agent-core` builds on the native `client-sdk`,
+`common`, and `sync-core` graph, and tracks its embedded folder agent UI files
+as compile-time inputs. These targets avoid duplicate generated crates. Run
+the current Bazel unit suite with:
 
 ```bash
 bazel test //:unit
