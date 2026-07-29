@@ -24,6 +24,10 @@ internal release APKs, add the `ci:android-release` label to the pull request.
 The label triggers a workflow run immediately and remains effective for later
 pushes to the pull request while it is present.
 
+The Android Server Node release APK is intentionally excluded from ordinary
+`main` pushes and manual CI runs. It is built only for a pull request bearing
+that label or for an explicit stable `vX.Y.Z` release tag.
+
 This requires the repository secrets `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64`
 and the corresponding release-signing credentials. For pull requests from
 forks, GitHub does not expose these secrets to the standard `pull_request`
