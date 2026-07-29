@@ -63,6 +63,7 @@ const CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT: usize = 3;
 const CLIENT_ROUTE_RECENT_ATTEMPT_LIMIT: usize = 64;
 const CLIENT_BUFFERED_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_LONG_RUNNING_REQUEST_GRACE: Duration = Duration::from_secs(10);
+const MOBILE_CONNECTION_LOG_TARGET: &str = "ironmesh_mobile_connection";
 const STORE_INDEX_WAIT_DEFAULT_TIMEOUT_MS: u64 = 25_000;
 const STORE_INDEX_WAIT_MIN_TIMEOUT_MS: u64 = 250;
 const STORE_INDEX_WAIT_MAX_TIMEOUT_MS: u64 = 60_000;
@@ -444,6 +445,15 @@ impl ClientTransport {
         }
     }
 
+    fn set_route_index(&self, route_index: usize) {
+        match self {
+            Self::DirectHttp { session_pool, .. } | Self::DirectQuic { session_pool, .. } => {
+                session_pool.set_route_index(route_index);
+            }
+            Self::Relay(relay) => relay.session_pool.set_route_index(route_index),
+        }
+    }
+
     fn hole_punching_mode(&self) -> Option<String> {
         match self {
             Self::DirectQuic { session_pool, .. } => {
@@ -590,13 +600,72 @@ impl ClientEndpointRouter {
     }
 
     fn set_active_index(&self, index: usize) {
-        let route_key = self
-            .endpoint(index)
+        let previous_active_index = self.active_index();
+        let endpoint = self.endpoint(index);
+        let route_key = endpoint
+            .as_ref()
             .map(|endpoint| endpoint.descriptor.route_key.clone());
         *self
             .active_route_key
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = route_key;
+
+        if let Some(endpoint) = endpoint {
+            tracing::info!(
+                target: MOBILE_CONNECTION_LOG_TARGET,
+                event = "selected_route_index",
+                selected_route_index = index,
+                candidate_index = index,
+                path_kind = transport_path_kind_label(endpoint.transport.transport_path_kind()),
+                locator = %endpoint.descriptor.locator,
+                previous_active_index = ?previous_active_index,
+                selection_phase = "active_after_success",
+                "selected_route_index"
+            );
+        }
+    }
+
+    fn log_route_candidate_scheduled(&self, index: usize, endpoint: &ClientEndpoint) {
+        endpoint.transport.set_route_index(index);
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "selected_route_index",
+            selected_route_index = index,
+            candidate_index = index,
+            path_kind = transport_path_kind_label(endpoint.transport.transport_path_kind()),
+            locator = %endpoint.descriptor.locator,
+            active_index = ?self.active_index(),
+            ranked_indices = ?self.rank_indices(),
+            selection_phase = "scheduled",
+            "selected_route_index"
+        );
+    }
+
+    fn log_timeout_route_not_switched(&self, timed_out_index: usize, timeout_error: &str) {
+        let active_index = self.active_index();
+        let ranked_indices = self.rank_indices();
+        let higher_ranked_indices = active_index
+            .and_then(|active_index| {
+                ranked_indices
+                    .iter()
+                    .position(|index| *index == active_index)
+                    .map(|active_rank| ranked_indices[..active_rank].to_vec())
+            })
+            .unwrap_or_default();
+        let route_not_switched_reason =
+            route_not_switched_reason(active_index, &higher_ranked_indices);
+
+        tracing::warn!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "route_not_switched_reason",
+            timed_out_index,
+            active_index = ?active_index,
+            ranked_indices = ?ranked_indices,
+            higher_ranked_indices = ?higher_ranked_indices,
+            route_not_switched_reason,
+            timeout_error = %timeout_error,
+            "route_not_switched_reason"
+        );
     }
 
     fn best_ranked_index(&self) -> Option<usize> {
@@ -698,6 +767,10 @@ impl ClientEndpointRouter {
         };
         let mut state = lock_endpoint_state(&endpoint.state);
         record_endpoint_failure_sample(&mut state, error, true);
+        drop(state);
+        if is_timeout_error_message(error) {
+            self.log_timeout_route_not_switched(index, error);
+        }
     }
 
     fn snapshot(&self) -> ClientConnectionRouteSnapshot {
@@ -882,6 +955,9 @@ impl ClientEndpointRouter {
             },
         );
         drop(state);
+        if is_timeout_error_message(error) {
+            self.log_timeout_route_not_switched(index, error);
+        }
         self.notify_transport_failure_when_exhausted(had_selectable_route);
     }
 
@@ -1103,6 +1179,27 @@ fn transport_path_kind_label(path_kind: TransportPathKind) -> &'static str {
         TransportPathKind::DirectHttps => "direct_https",
         TransportPathKind::DirectQuic => "direct_quic",
         TransportPathKind::RelayTunnel => "relay_tunnel",
+    }
+}
+
+fn is_timeout_error_message(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("timed out") || error.contains("timeout")
+}
+
+fn route_not_switched_reason(
+    active_index: Option<usize>,
+    higher_ranked_indices: &[usize],
+) -> &'static str {
+    match active_index {
+        None => "there_is_no_active_route_to_switch",
+        Some(0) if higher_ranked_indices.is_empty() => {
+            "active_index=0_remains_the_highest_ranked_route"
+        }
+        Some(0) => {
+            "active_index=0_changes_only_after_a_successful_request;higher_ranked_candidates_remain_failover_candidates_until_then"
+        }
+        Some(_) => "active_route_is_not_index_0",
     }
 }
 
@@ -2702,24 +2799,21 @@ impl IronMeshClient {
     }
 
     pub async fn refresh_connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
-        let tasks = self
-            .transport_router
-            .endpoints_snapshot()
-            .into_iter()
-            .enumerate()
-            .map(|(index, endpoint)| {
-                let auth = self.auth.clone();
-                let connection_name = self.connection_name.clone();
-                async move {
-                    let result = probe_endpoint_background_quality(
-                        &endpoint,
-                        &auth,
-                        connection_name.as_deref(),
-                    )
-                    .await;
-                    (index, result)
-                }
-            });
+        let endpoints = self.transport_router.endpoints_snapshot();
+        for (index, endpoint) in endpoints.iter().enumerate() {
+            self.transport_router
+                .log_route_candidate_scheduled(index, endpoint);
+        }
+        let tasks = endpoints.into_iter().enumerate().map(|(index, endpoint)| {
+            let auth = self.auth.clone();
+            let connection_name = self.connection_name.clone();
+            async move {
+                let result =
+                    probe_endpoint_background_quality(&endpoint, &auth, connection_name.as_deref())
+                        .await;
+                (index, result)
+            }
+        });
 
         for (index, result) in join_all(tasks).await {
             match result {
@@ -2740,23 +2834,21 @@ impl IronMeshClient {
     /// Unlike [`Self::refresh_connection_route_snapshot`], this is cheap to call from a
     /// periodic status poll because recently measured routes are skipped.
     pub async fn refresh_due_connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
-        let tasks = self
-            .transport_router
-            .claim_background_probe_candidates()
-            .into_iter()
-            .map(|(index, endpoint)| {
-                let auth = self.auth.clone();
-                let connection_name = self.connection_name.clone();
-                async move {
-                    let result = probe_endpoint_background_quality(
-                        &endpoint,
-                        &auth,
-                        connection_name.as_deref(),
-                    )
-                    .await;
-                    (index, result)
-                }
-            });
+        let endpoints = self.transport_router.claim_background_probe_candidates();
+        for (index, endpoint) in &endpoints {
+            self.transport_router
+                .log_route_candidate_scheduled(*index, endpoint);
+        }
+        let tasks = endpoints.into_iter().map(|(index, endpoint)| {
+            let auth = self.auth.clone();
+            let connection_name = self.connection_name.clone();
+            async move {
+                let result =
+                    probe_endpoint_background_quality(&endpoint, &auth, connection_name.as_deref())
+                        .await;
+                (index, result)
+            }
+        });
 
         for (index, result) in join_all(tasks).await {
             match result {
@@ -2844,6 +2936,8 @@ impl IronMeshClient {
         }
 
         for (index, endpoint) in self.transport_router.claim_background_probe_candidates() {
+            self.transport_router
+                .log_route_candidate_scheduled(index, &endpoint);
             let transport_router = self.transport_router.clone();
             let auth = self.auth.clone();
             let connection_name = self.connection_name.clone();
@@ -2944,6 +3038,8 @@ impl IronMeshClient {
             let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
+            self.transport_router
+                .log_route_candidate_scheduled(index, &endpoint);
             let endpoint_context = self.endpoint_context_for_route(index);
             let endpoint_url = endpoint
                 .rewrite_url(&url)
@@ -3075,6 +3171,8 @@ impl IronMeshClient {
             let Some(endpoint) = self.transport_router.endpoint(route_index) else {
                 continue;
             };
+            self.transport_router
+                .log_route_candidate_scheduled(route_index, &endpoint);
             let endpoint_url = endpoint
                 .rewrite_url(&url)
                 .with_context(|| format!("failed to rewrite streamed PUT {}", url));
@@ -3775,6 +3873,8 @@ impl IronMeshClient {
             let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
+            self.transport_router
+                .log_route_candidate_scheduled(index, &endpoint);
             let endpoint_url = endpoint
                 .rewrite_url(&url)
                 .with_context(|| format!("failed to rewrite streamed {} {}", method, url));
@@ -3883,6 +3983,8 @@ impl IronMeshClient {
             let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
+            self.transport_router
+                .log_route_candidate_scheduled(index, &endpoint);
             let endpoint_url = endpoint
                 .rewrite_url(&url)
                 .with_context(|| format!("failed to rewrite streamed {} {}", method, url));
@@ -4315,6 +4417,8 @@ impl IronMeshClient {
             let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
+            self.transport_router
+                .log_route_candidate_scheduled(index, &endpoint);
             let endpoint_url = endpoint
                 .rewrite_url(&url)
                 .with_context(|| format!("failed to rewrite streamed GET {}", url));

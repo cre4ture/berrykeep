@@ -300,7 +300,15 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
         .build()
         .context("failed to initialize android rust runtime")?;
 
-    let _ = RUNTIME.set(rt);
+    if RUNTIME.set(rt).is_ok() {
+        tracing::info!(
+            target: ANDROID_CONNECTION_LOG_TARGET,
+            event = "foreground_runtime_started",
+            platform = "android",
+            runtime_kind = "rust_tokio",
+            "foreground_runtime_started"
+        );
+    }
     RUNTIME
         .get()
         .ok_or_else(|| anyhow::anyhow!("runtime initialization race"))

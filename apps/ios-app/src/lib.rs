@@ -463,6 +463,14 @@ impl IosStorageApp {
     }
 
     pub fn notify_foregrounded(&self) {
+        tracing::info!(
+            event = "foreground_runtime_started",
+            platform = "ios",
+            runtime_kind = "rust_tokio",
+            lifecycle = "foregrounded",
+            connection_name = ?self.connection_name,
+            "foreground_runtime_started"
+        );
         if let Some(managed_client) = self.managed_client.as_ref() {
             let _ = self.runtime.block_on(managed_client.notify_foregrounded());
         }
@@ -1383,10 +1391,18 @@ pub extern "C" fn ironmesh_ios_facade_stop_web_ui(out_error: *mut *mut c_char) -
 }
 
 fn build_runtime() -> Result<Runtime> {
-    Builder::new_current_thread()
+    let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("failed to create iOS facade runtime")
+        .context("failed to create iOS facade runtime")?;
+    tracing::info!(
+        event = "foreground_runtime_started",
+        platform = "ios",
+        runtime_kind = "rust_tokio",
+        lifecycle = "created",
+        "foreground_runtime_started"
+    );
+    Ok(runtime)
 }
 
 #[allow(unsafe_code)]
