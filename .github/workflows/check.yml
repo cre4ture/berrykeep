@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
     types:
       - opened
@@ -284,17 +286,21 @@ jobs:
           # Debug legs run the cheap JVM unit tests (+ server-node package
           # validation build). They always run, including on pull requests.
           DEBUG_TARGETS='{"label":"app dbg","module":"android-app","directory":"apps/android-app","variant":"debug","artifact":""},{"label":"node dbg","module":"android-server-node-app","directory":"apps/android-server-node-app","variant":"debug","artifact":""}'
-          # Release legs build the signed "performance testing" APKs. They are
-          # expensive, so build them on push to main / workflow_dispatch, or
-          # on pull requests explicitly marked with ci:android-release. The
-          # signing keystore secret must be available in all cases.
-          RELEASE_TARGETS='{"label":"app rel","module":"android-app","directory":"apps/android-app","variant":"release","artifact":"android-release-performance"},{"label":"node rel","module":"android-server-node-app","directory":"apps/android-server-node-app","variant":"release","artifact":"android-server-node-release-performance"}'
+          # The app release build remains available on main pushes and manual
+          # runs, as well as on pull requests marked with ci:android-release.
+          # The server-node release build is more expensive and runs only when
+          # that label is present or for a stable vX.Y.Z release tag.
+          APP_RELEASE_TARGET='{"label":"app rel","module":"android-app","directory":"apps/android-app","variant":"release","artifact":"android-release-performance"}'
+          NODE_RELEASE_TARGET='{"label":"node rel","module":"android-server-node-app","directory":"apps/android-server-node-app","variant":"release","artifact":"android-server-node-release-performance"}'
+
+          TARGETS="${DEBUG_TARGETS}"
           if { [ "${GITHUB_EVENT_NAME}" != "pull_request" ] || [ "${ANDROID_RELEASE_REQUESTED}" = "true" ]; } && [ -n "${IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64}" ]; then
-            TARGETS="[${DEBUG_TARGETS},${RELEASE_TARGETS}]"
-          else
-            TARGETS="[${DEBUG_TARGETS}]"
+            TARGETS="${TARGETS},${APP_RELEASE_TARGET}"
           fi
-          echo "matrix={\"target\":${TARGETS}}" >> "$GITHUB_OUTPUT"
+          if { [ "${ANDROID_RELEASE_REQUESTED}" = "true" ] || { [ "${GITHUB_REF_TYPE}" = "tag" ] && [[ "${GITHUB_REF_NAME}" =~ ^v[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]]; }; } && [ -n "${IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64}" ]; then
+            TARGETS="${TARGETS},${NODE_RELEASE_TARGET}"
+          fi
+          echo "matrix={\"target\":[${TARGETS}]}" >> "$GITHUB_OUTPUT"
 
   android-build:
     name: Android (${{ matrix.target.label }})
