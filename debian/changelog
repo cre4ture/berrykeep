@@ -1,3 +1,12 @@
+ironmesh (1.0.42-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Strengthen managed QUIC route handling, relay fallback, and diagnostics.
+  * Add a fast SQLite gallery-index path and share gallery data adapters.
+  * Expand QUIC integration coverage and provision the Linux FUSE CI runtime.
+  * Roll the workspace release to 1.0.42.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 30 Jul 2026 10:44:42 +0200
+
 ironmesh (1.0.41-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Extend managed QUIC route diagnostics and connection lifecycle logs across
