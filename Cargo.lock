@@ -162,6 +162,7 @@ dependencies = [
  "client-sdk",
  "common",
  "futures-util",
+ "hickory-resolver",
  "jni 0.21.1",
  "reqwest 0.12.28",
  "serde",

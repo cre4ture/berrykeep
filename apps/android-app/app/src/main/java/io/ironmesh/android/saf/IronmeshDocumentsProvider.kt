@@ -16,7 +16,7 @@ import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
-import io.ironmesh.android.data.RustPreferencesBridge
+import io.ironmesh.android.data.RustBridgeInitializer
 import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.io.FileInputStream
@@ -34,7 +34,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     private val thumbnailExecutor = Executors.newFixedThreadPool(MAX_CONCURRENT_THUMBNAIL_STREAMS)
 
     override fun onCreate(): Boolean {
-        context?.applicationContext?.let { RustPreferencesBridge.initialize(it) }
+        context?.let(RustBridgeInitializer::initialize)
         return true
     }
 
