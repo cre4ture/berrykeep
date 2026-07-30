@@ -451,6 +451,44 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   expect(requestedPaths).not.toContain("/auth/bootstrap-claims/issue");
 });
 
+test("server-admin mobile drawer is available only when its navigation is available", async ({ page }) => {
+  await installServerAdminMocks(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+
+  const mobileMenuToggle = page.getByRole("button", { name: "Toggle navigation menu" });
+  const primaryNavigation = page.getByLabel("Primary navigation");
+
+  await expect(page.getByRole("heading", { name: "Admin login required" })).toBeVisible();
+  await expect(mobileMenuToggle).toHaveCount(0);
+  await expect(primaryNavigation).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await expect(mobileMenuToggle).toBeVisible();
+  await expect
+    .poll(async () => primaryNavigation.evaluate((node) => node.getBoundingClientRect().right))
+    .toBeLessThanOrEqual(0);
+
+  await mobileMenuToggle.click();
+
+  await expect
+    .poll(async () => primaryNavigation.evaluate((node) => node.getBoundingClientRect().right))
+    .toBeGreaterThan(0);
+  await expect(primaryNavigation.getByText("Dashboard", { exact: true })).toBeVisible();
+  await expect(primaryNavigation.getByText("Repair", { exact: true })).toBeVisible();
+
+  await primaryNavigation.getByText("Repair", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Repair" })).toBeVisible();
+  await expect
+    .poll(async () => primaryNavigation.evaluate((node) => node.getBoundingClientRect().right))
+    .toBeLessThanOrEqual(0);
+});
+
 test("server-admin creates a hybrid map from configured raster and vector artifacts", async ({ page }) => {
   let savedConfiguration: GalleryMapConfiguration | null = null;
 
