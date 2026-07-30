@@ -39,6 +39,7 @@ const LONG_VERSION: &str = git_version::git_version!(
     fallback = concat!(env!("CARGO_PKG_VERSION"), "\nBuild revision: unknown"),
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
+const CLI_RUNTIME_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LatencyTestPathSelection {
@@ -140,13 +141,11 @@ fn build_managed_cli_client(
     bootstrap: ConnectionBootstrap,
     identity: ClientIdentityMaterial,
 ) -> Result<(ManagedIronMeshClient, ManagedCliRuntime)> {
-    const MANAGED_CLI_STACK_SIZE: usize = 8 * 1024 * 1024;
-
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let thread = std::thread::Builder::new()
         .name("ironmesh-cli-managed-runtime".to_string())
-        .stack_size(MANAGED_CLI_STACK_SIZE)
+        .stack_size(CLI_RUNTIME_STACK_SIZE)
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -284,8 +283,26 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let thread = std::thread::Builder::new()
+        .name("ironmesh-cli-runtime".to_string())
+        .stack_size(CLI_RUNTIME_STACK_SIZE)
+        .spawn(|| -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("ironmesh-cli-worker")
+                .thread_stack_size(CLI_RUNTIME_STACK_SIZE)
+                .build()
+                .context("failed to build CLI runtime")?;
+            runtime.block_on(run())
+        })
+        .context("failed spawning CLI runtime thread")?;
+    thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("CLI runtime thread panicked"))?
+}
+
+async fn run() -> Result<()> {
     init_cli_tracing();
     let cli = Cli::parse();
     info!(
