@@ -448,6 +448,34 @@ fn paired_session_count() -> Result<usize> {
         .unwrap_or(0))
 }
 
+#[cfg(target_os = "android")]
+fn android_system_dns_server_count() -> Result<usize> {
+    let (config, _) = hickory_resolver::system_conf::read_system_conf()
+        .context("failed to read Android system DNS through the installed Iroh JNI context")?;
+    Ok(config.name_servers().len())
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI during instrumentation tests.
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_getAndroidSystemDnsServerCount(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    match android_system_dns_server_count() {
+        Ok(count) => count.try_into().unwrap_or(jint::MAX),
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust getAndroidSystemDnsServerCount failed: {err:#}"),
+            );
+            0
+        }
+    }
+}
+
 /// # Safety
 /// This function is intended to be called from Java via JNI during instrumentation tests.
 #[allow(unsafe_code)]

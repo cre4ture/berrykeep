@@ -29,8 +29,6 @@ import com.journeyapps.barcodescanner.ScanOptions
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.EmbeddedWebUiSession
-import io.ironmesh.android.data.RustPreferencesBridge
-import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainViewModel
 import io.ironmesh.android.ui.components.IronmeshAppShell
@@ -50,8 +48,6 @@ import java.time.format.DateTimeFormatter
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        RustSafBridge.initialize(applicationContext)
-        RustPreferencesBridge.initialize(applicationContext)
         enableEdgeToEdge()
 
         setContent {

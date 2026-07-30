@@ -12,7 +12,6 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.APP_CONNECTION_STATE_CONNECTED
 import io.ironmesh.android.data.APP_CONNECTION_STATE_CONNECTING
@@ -25,7 +24,6 @@ import io.ironmesh.android.data.FolderSyncStorageDiagnosticsHelper
 import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
-import io.ironmesh.android.data.RustPreferencesBridge
 import io.ironmesh.android.data.nextAppConnectionRetryDelayMs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -73,8 +71,6 @@ class FolderSyncForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        RustSafBridge.initialize(applicationContext)
-        RustPreferencesBridge.initialize(applicationContext)
         ensureNotificationChannel()
         startForeground(
             NOTIFICATION_ID,
