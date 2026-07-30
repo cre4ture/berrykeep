@@ -3667,6 +3667,7 @@ async fn single_direct_buffered_request_enforces_total_deadline() {
             session_pool,
             identity,
             connection_name: client.connection_name.as_deref(),
+            direct_quic_setup_waiter: DirectQuicSetupWaiter::SessionConsumer,
         };
         let url = client
             .relative_url("/cluster/status")

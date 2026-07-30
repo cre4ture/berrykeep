@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore, watch};
 use transport_sdk::{
     ClientIdentityMaterial, ConnectionCandidate, DEFAULT_DIRECT_QUIC_ALPN, DirectQuicEndpoint,
-    DirectQuicEndpointConfig, ExpectedNodeServerIdentity, MultiplexConfig, MultiplexMode,
-    MultiplexedSession, PeerIdentity, RelayTicketRequest, RelayTunnelSession,
+    DirectQuicEndpointConfig, DirectQuicSession, ExpectedNodeServerIdentity, MultiplexConfig,
+    MultiplexMode, MultiplexedSession, PeerIdentity, RelayTicketRequest, RelayTunnelSession,
     RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig, RendezvousControlClient,
     TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
     WebSocketByteStream, build_signed_request_headers,
@@ -82,13 +82,65 @@ struct SharedSessionSetupCoordinator {
     setup_active: std::sync::atomic::AtomicBool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum DirectQuicSetupWaiter {
+    SessionConsumer,
+    BackgroundHealthProbe { probe_index: usize },
+}
+
+impl DirectQuicSetupWaiter {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SessionConsumer => "session_consumer",
+            Self::BackgroundHealthProbe { .. } => "background_health_probe",
+        }
+    }
+
+    const fn probe_index(self) -> Option<usize> {
+        match self {
+            Self::SessionConsumer => None,
+            Self::BackgroundHealthProbe { probe_index } => Some(probe_index),
+        }
+    }
+}
+
 struct DirectQuicSetupWaitGuard {
+    setup_attempt_id: u64,
     candidate_index: Option<usize>,
     locator: String,
     target_node_id: Option<NodeId>,
     coordinator: Arc<SharedSessionSetupCoordinator>,
+    waiter: DirectQuicSetupWaiter,
     completed: bool,
 }
+
+#[derive(Debug)]
+struct ColdDirectQuicSessionSetupTimeout {
+    target_label: String,
+    stage: &'static str,
+}
+
+struct DirectQuicConnectContext<'a> {
+    candidate: &'a ConnectionCandidate,
+    target_node_id: NodeId,
+    endpoint: &'a Arc<Mutex<Option<ManagedDirectQuicEndpoint>>>,
+    rendezvous: Option<&'a RendezvousControlClient>,
+    relay_ca_pem: Option<&'a str>,
+    setup_attempt_id: u64,
+    setup_started: Instant,
+}
+
+impl std::fmt::Display for ColdDirectQuicSessionSetupTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cold direct QUIC session setup to {} timed out after {:?} during {}",
+            self.target_label, COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT, self.stage
+        )
+    }
+}
+
+impl std::error::Error for ColdDirectQuicSessionSetupTimeout {}
 
 impl DirectQuicSetupWaitGuard {
     fn complete(&mut self) {
@@ -103,15 +155,16 @@ impl Drop for DirectQuicSetupWaitGuard {
         }
         tracing::info!(
             target: MOBILE_CONNECTION_LOG_TARGET,
-            event = "iroh_connect_cancelled",
+            event = "iroh_session_setup_wait_cancelled",
+            setup_attempt_id = self.setup_attempt_id,
             candidate_index = ?self.candidate_index,
             path_kind = "direct_quic",
             locator = %self.locator,
-            endpoint_id = "pending",
             target_node_id = ?self.target_node_id,
-            cancelled_by = "session_consumer",
+            cancelled_by = self.waiter.label(),
+            probe_index = ?self.waiter.probe_index(),
             shared_session_setup_continues = self.coordinator.setup_active.load(Ordering::Relaxed),
-            "iroh_connect_cancelled"
+            "iroh_session_setup_wait_cancelled"
         );
     }
 }
@@ -262,28 +315,41 @@ impl TransportSessionPool {
         &self,
         identity: &ClientIdentityMaterial,
         connection_name: Option<&str>,
+        setup_waiter: DirectQuicSetupWaiter,
     ) -> Result<Arc<MultiplexedSession>> {
-        if let Some(mut cancellation_guard) = self.direct_quic_setup_wait_guard() {
+        if matches!(&self.target, SessionPoolTarget::DirectQuic { .. }) {
             if let Some(session) = self.cached_session().await {
-                cancellation_guard.complete();
                 return Ok(session);
             }
 
             let setup_pool = self.clone();
             let setup_identity = identity.clone();
             let setup_connection_name = connection_name.map(ToString::to_string);
-            let result = self
-                .wait_for_shared_direct_quic_setup(move || async move {
-                    setup_pool
-                        .establish_direct_session(&setup_identity, setup_connection_name.as_deref())
-                        .await
-                })
+            return self
+                .wait_for_shared_direct_quic_setup(
+                    setup_waiter,
+                    move |setup_attempt_id| async move {
+                        let setup_started = Instant::now();
+                        setup_pool.log_direct_quic_session_setup_started(setup_attempt_id);
+                        let result = setup_pool
+                            .establish_direct_session(
+                                &setup_identity,
+                                setup_connection_name.as_deref(),
+                                Some(setup_attempt_id),
+                            )
+                            .await;
+                        setup_pool.log_direct_quic_session_setup_finished(
+                            setup_attempt_id,
+                            setup_started.elapsed(),
+                            &result,
+                        );
+                        result
+                    },
+                )
                 .await;
-            cancellation_guard.complete();
-            return result;
         }
 
-        self.establish_direct_session(identity, connection_name)
+        self.establish_direct_session(identity, connection_name, None)
             .await
     }
 
@@ -291,6 +357,7 @@ impl TransportSessionPool {
         &self,
         identity: &ClientIdentityMaterial,
         connection_name: Option<&str>,
+        direct_quic_setup_attempt_id: Option<u64>,
     ) -> Result<Arc<MultiplexedSession>> {
         if let Some(session) = self.cached_session().await {
             return Ok(session);
@@ -353,88 +420,23 @@ impl TransportSessionPool {
                 let target_node_id = target_node_id.ok_or_else(|| {
                     anyhow!("direct QUIC transport target is missing target node id")
                 })?;
+                let setup_attempt_id = direct_quic_setup_attempt_id.ok_or_else(|| {
+                    anyhow!("direct QUIC session setup is missing its attempt id")
+                })?;
                 let target_label = candidate.endpoint.clone();
-                let iroh_connect_started = Instant::now();
-                cold_quic_setup_started = Some(iroh_connect_started);
-                let direct_quic = tokio::time::timeout(
-                    remaining_cold_quic_setup_budget(iroh_connect_started)?,
-                    async {
-                        let endpoint = ensure_direct_quic_endpoint(
-                            endpoint,
-                            candidate,
-                            target_node_id,
-                            rendezvous.as_ref(),
-                            relay_ca_pem.as_deref(),
-                            self.route_index(),
-                        )
-                        .await?;
-                        tracing::info!(
-                            target: MOBILE_CONNECTION_LOG_TARGET,
-                            event = "iroh_connect_scheduled",
-                            candidate_index = ?self.route_index(),
-                            path_kind = "direct_quic",
-                            locator = %candidate.endpoint,
-                            endpoint_id = %endpoint.endpoint_id(),
-                            target_node_id = %target_node_id,
-                            "iroh_connect_scheduled"
-                        );
-                        tracing::info!(
-                            target: MOBILE_CONNECTION_LOG_TARGET,
-                            event = "iroh_connect_started",
-                            candidate_index = ?self.route_index(),
-                            path_kind = "direct_quic",
-                            locator = %candidate.endpoint,
-                            endpoint_id = %endpoint.endpoint_id(),
-                            target_node_id = %target_node_id,
-                            "iroh_connect_started"
-                        );
-                        match endpoint
-                            .connect_session(candidate, MultiplexConfig::default())
-                            .await
-                        {
-                            Ok(session) => {
-                                tracing::info!(
-                                    target: MOBILE_CONNECTION_LOG_TARGET,
-                                    event = "iroh_connect_completed",
-                                    candidate_index = ?self.route_index(),
-                                    path_kind = "direct_quic",
-                                    locator = %candidate.endpoint,
-                                    endpoint_id = %endpoint.endpoint_id(),
-                                    target_node_id = %target_node_id,
-                                    duration_us = duration_as_u64_micros(iroh_connect_started.elapsed()),
-                                    "iroh_connect_completed"
-                                );
-                                Ok(session)
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    target: MOBILE_CONNECTION_LOG_TARGET,
-                                    event = "iroh_connect_failed",
-                                    candidate_index = ?self.route_index(),
-                                    path_kind = "direct_quic",
-                                    locator = %candidate.endpoint,
-                                    endpoint_id = %endpoint.endpoint_id(),
-                                    target_node_id = %target_node_id,
-                                    duration_us = duration_as_u64_micros(iroh_connect_started.elapsed()),
-                                    error = %error,
-                                    "iroh_connect_failed"
-                                );
-                                Err(error).with_context(|| {
-                                    format!(
-                                        "failed opening direct QUIC transport session to {target_label}"
-                                    )
-                                })
-                            }
-                        }
-                    },
-                )
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "cold direct QUIC session setup to {target_label} timed out after {:?}",
-                        COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT
-                    )
-                })??;
+                let setup_started = Instant::now();
+                cold_quic_setup_started = Some(setup_started);
+                let direct_quic = self
+                    .connect_direct_quic_session(DirectQuicConnectContext {
+                        candidate,
+                        target_node_id,
+                        endpoint,
+                        rendezvous: rendezvous.as_ref(),
+                        relay_ca_pem: relay_ca_pem.as_deref(),
+                        setup_attempt_id,
+                        setup_started,
+                    })
+                    .await?;
                 self.stats.direct_connection_mode.store(
                     direct_connection_mode_from_paths(&direct_quic.connection.paths()),
                     Ordering::Relaxed,
@@ -464,13 +466,22 @@ impl TransportSessionPool {
         );
         let handshake_result = match cold_quic_setup_started {
             Some(setup_started) => {
-                tokio::time::timeout(remaining_cold_quic_setup_budget(setup_started)?, handshake)
+                let target_label = match &self.target {
+                    SessionPoolTarget::DirectQuic { candidate, .. } => candidate.endpoint.clone(),
+                    _ => "direct_quic".to_string(),
+                };
+                let remaining_budget =
+                    remaining_cold_quic_setup_budget(setup_started).map_err(|_| {
+                        ColdDirectQuicSessionSetupTimeout {
+                            target_label: target_label.clone(),
+                            stage: "transport_handshake",
+                        }
+                    })?;
+                tokio::time::timeout(remaining_budget, handshake)
                     .await
-                    .map_err(|_| {
-                        anyhow!(
-                            "cold direct QUIC session setup timed out after {:?}",
-                            COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT
-                        )
+                    .map_err(|_| ColdDirectQuicSessionSetupTimeout {
+                        target_label,
+                        stage: "transport_handshake",
                     })?
             }
             None => handshake.await,
@@ -487,6 +498,142 @@ impl TransportSessionPool {
             );
         }
         Ok(session)
+    }
+
+    async fn connect_direct_quic_session(
+        &self,
+        context: DirectQuicConnectContext<'_>,
+    ) -> Result<DirectQuicSession> {
+        let DirectQuicConnectContext {
+            candidate,
+            target_node_id,
+            endpoint,
+            rendezvous,
+            relay_ca_pem,
+            setup_attempt_id,
+            setup_started,
+        } = context;
+        let target_label = candidate.endpoint.clone();
+        let mut iroh_connect_started = None;
+        let mut iroh_connect_endpoint_id = None;
+        let direct_quic_result =
+            tokio::time::timeout(remaining_cold_quic_setup_budget(setup_started)?, async {
+                let endpoint = ensure_direct_quic_endpoint(
+                    endpoint,
+                    candidate,
+                    target_node_id,
+                    rendezvous,
+                    relay_ca_pem,
+                    self.route_index(),
+                    setup_attempt_id,
+                )
+                .await?;
+                let endpoint_id = endpoint.endpoint_id();
+                let remaining_setup_budget = remaining_cold_quic_setup_budget(setup_started)?;
+                let connect_started = Instant::now();
+                iroh_connect_started = Some(connect_started);
+                iroh_connect_endpoint_id = Some(endpoint_id.clone());
+                tracing::info!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "iroh_connect_scheduled",
+                    setup_attempt_id,
+                    candidate_index = ?self.route_index(),
+                    path_kind = "direct_quic",
+                    locator = %candidate.endpoint,
+                    endpoint_id = %endpoint_id,
+                    target_node_id = %target_node_id,
+                    setup_elapsed_us = duration_as_u64_micros(setup_started.elapsed()),
+                    remaining_setup_budget_ms = remaining_setup_budget.as_millis(),
+                    "iroh_connect_scheduled"
+                );
+                tracing::info!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "iroh_connect_started",
+                    setup_attempt_id,
+                    candidate_index = ?self.route_index(),
+                    path_kind = "direct_quic",
+                    locator = %candidate.endpoint,
+                    endpoint_id = %endpoint_id,
+                    target_node_id = %target_node_id,
+                    setup_elapsed_us = duration_as_u64_micros(setup_started.elapsed()),
+                    remaining_setup_budget_ms = remaining_setup_budget.as_millis(),
+                    "iroh_connect_started"
+                );
+                match endpoint
+                    .connect_session(candidate, MultiplexConfig::default())
+                    .await
+                {
+                    Ok(session) => {
+                        tracing::info!(
+                            target: MOBILE_CONNECTION_LOG_TARGET,
+                            event = "iroh_connect_completed",
+                            setup_attempt_id,
+                            candidate_index = ?self.route_index(),
+                            path_kind = "direct_quic",
+                            locator = %candidate.endpoint,
+                            endpoint_id = %endpoint_id,
+                            target_node_id = %target_node_id,
+                            duration_us = duration_as_u64_micros(connect_started.elapsed()),
+                            "iroh_connect_completed"
+                        );
+                        Ok(session)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: MOBILE_CONNECTION_LOG_TARGET,
+                            event = "iroh_connect_failed",
+                            setup_attempt_id,
+                            candidate_index = ?self.route_index(),
+                            path_kind = "direct_quic",
+                            locator = %candidate.endpoint,
+                            endpoint_id = %endpoint_id,
+                            target_node_id = %target_node_id,
+                            duration_us = duration_as_u64_micros(connect_started.elapsed()),
+                            reason = "connect_error",
+                            error = %error,
+                            "iroh_connect_failed"
+                        );
+                        Err(error).with_context(|| {
+                            format!(
+                                "failed opening direct QUIC transport session to {target_label}"
+                            )
+                        })
+                    }
+                }
+            })
+            .await;
+
+        match direct_quic_result {
+            Ok(result) => result,
+            Err(_) => {
+                let failed_stage = if let (Some(connect_started), Some(endpoint_id)) =
+                    (iroh_connect_started, iroh_connect_endpoint_id.as_deref())
+                {
+                    tracing::warn!(
+                        target: MOBILE_CONNECTION_LOG_TARGET,
+                        event = "iroh_connect_failed",
+                        setup_attempt_id,
+                        candidate_index = ?self.route_index(),
+                        path_kind = "direct_quic",
+                        locator = %candidate.endpoint,
+                        endpoint_id,
+                        target_node_id = %target_node_id,
+                        duration_us = duration_as_u64_micros(connect_started.elapsed()),
+                        reason = "cold_session_setup_timeout",
+                        timeout_ms = COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT.as_millis(),
+                        "iroh_connect_failed"
+                    );
+                    "iroh_connect"
+                } else {
+                    "endpoint_setup"
+                };
+                Err(ColdDirectQuicSessionSetupTimeout {
+                    target_label,
+                    stage: failed_stage,
+                }
+                .into())
+            }
+        }
     }
 
     fn spawn_hole_punching_monitor(&self, connection: Connection) {
@@ -706,7 +853,81 @@ impl TransportSessionPool {
         self.cached_session.lock().await.is_some()
     }
 
-    fn direct_quic_setup_wait_guard(&self) -> Option<DirectQuicSetupWaitGuard> {
+    fn log_direct_quic_session_setup_started(&self, setup_attempt_id: u64) {
+        let SessionPoolTarget::DirectQuic {
+            candidate,
+            target_node_id,
+            ..
+        } = &self.target
+        else {
+            return;
+        };
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "iroh_session_setup_started",
+            setup_attempt_id,
+            candidate_index = ?self.route_index(),
+            path_kind = "direct_quic",
+            locator = %candidate.endpoint,
+            target_node_id = ?target_node_id,
+            timeout_ms = COLD_DIRECT_QUIC_SESSION_SETUP_TIMEOUT.as_millis(),
+            "iroh_session_setup_started"
+        );
+    }
+
+    fn log_direct_quic_session_setup_finished(
+        &self,
+        setup_attempt_id: u64,
+        duration: Duration,
+        result: &Result<Arc<MultiplexedSession>>,
+    ) {
+        let SessionPoolTarget::DirectQuic {
+            candidate,
+            target_node_id,
+            ..
+        } = &self.target
+        else {
+            return;
+        };
+        match result {
+            Ok(_) => tracing::info!(
+                target: MOBILE_CONNECTION_LOG_TARGET,
+                event = "iroh_session_setup_completed",
+                setup_attempt_id,
+                candidate_index = ?self.route_index(),
+                path_kind = "direct_quic",
+                locator = %candidate.endpoint,
+                target_node_id = ?target_node_id,
+                duration_us = duration_as_u64_micros(duration),
+                "iroh_session_setup_completed"
+            ),
+            Err(error) => {
+                let timeout = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<ColdDirectQuicSessionSetupTimeout>());
+                tracing::warn!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "iroh_session_setup_failed",
+                    setup_attempt_id,
+                    candidate_index = ?self.route_index(),
+                    path_kind = "direct_quic",
+                    locator = %candidate.endpoint,
+                    target_node_id = ?target_node_id,
+                    duration_us = duration_as_u64_micros(duration),
+                    reason = if timeout.is_some() { "timeout" } else { "error" },
+                    failed_stage = ?timeout.map(|timeout| timeout.stage),
+                    error = %error,
+                    "iroh_session_setup_failed"
+                );
+            }
+        }
+    }
+
+    fn direct_quic_setup_wait_guard(
+        &self,
+        setup_attempt_id: u64,
+        waiter: DirectQuicSetupWaiter,
+    ) -> Option<DirectQuicSetupWaitGuard> {
         let SessionPoolTarget::DirectQuic {
             candidate,
             target_node_id,
@@ -716,26 +937,29 @@ impl TransportSessionPool {
             return None;
         };
         Some(DirectQuicSetupWaitGuard {
+            setup_attempt_id,
             candidate_index: self.route_index(),
             locator: candidate.endpoint.clone(),
             target_node_id: *target_node_id,
             coordinator: Arc::clone(&self.direct_quic_setup),
+            waiter,
             completed: false,
         })
     }
 
     async fn wait_for_shared_direct_quic_setup<F, Fut>(
         &self,
+        waiter: DirectQuicSetupWaiter,
         setup: F,
     ) -> Result<Arc<MultiplexedSession>>
     where
-        F: FnOnce() -> Fut + Send + 'static,
+        F: FnOnce(u64) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<Arc<MultiplexedSession>>> + Send + 'static,
     {
-        let mut receiver = {
+        let (setup_attempt_id, mut receiver) = {
             let mut active = self.direct_quic_setup.active.lock().await;
             if let Some(existing) = active.as_ref() {
-                existing.receiver.clone()
+                (existing.attempt_id, existing.receiver.clone())
             } else {
                 let attempt_id = self
                     .direct_quic_setup
@@ -753,7 +977,7 @@ impl TransportSessionPool {
 
                 let coordinator = Arc::clone(&self.direct_quic_setup);
                 tokio::spawn(async move {
-                    let result = setup()
+                    let result = setup(attempt_id)
                         .await
                         .map_err(|error| Arc::<str>::from(error.to_string()));
                     let _ = sender.send(Some(result));
@@ -766,52 +990,27 @@ impl TransportSessionPool {
                         coordinator.setup_active.store(false, Ordering::Relaxed);
                     }
                 });
-                receiver
+                (attempt_id, receiver)
             }
         };
 
-        loop {
+        let mut cancellation_guard = self.direct_quic_setup_wait_guard(setup_attempt_id, waiter);
+        let result = loop {
             if let Some(result) = receiver.borrow().as_ref() {
-                return result
+                break result
                     .clone()
                     .map_err(|error| anyhow!(error.as_ref().to_string()));
             }
-            receiver
-                .changed()
-                .await
-                .map_err(|_| anyhow!("shared direct QUIC session setup task ended unexpectedly"))?;
-        }
-    }
-
-    pub(crate) async fn log_direct_quic_probe_cancellation(&self, probe_index: usize) {
-        let SessionPoolTarget::DirectQuic {
-            candidate,
-            target_node_id,
-            endpoint,
-            ..
-        } = &self.target
-        else {
-            return;
+            if receiver.changed().await.is_err() {
+                break Err(anyhow!(
+                    "shared direct QUIC session setup task ended unexpectedly"
+                ));
+            }
         };
-        let endpoint_id = endpoint
-            .lock()
-            .await
-            .as_ref()
-            .map(|managed| managed.endpoint.endpoint_id())
-            .unwrap_or_else(|| "pending".to_string());
-        tracing::info!(
-            target: MOBILE_CONNECTION_LOG_TARGET,
-            event = "iroh_connect_cancelled",
-            candidate_index = ?self.route_index(),
-            path_kind = "direct_quic",
-            locator = %candidate.endpoint,
-            endpoint_id = %endpoint_id,
-            target_node_id = ?target_node_id,
-            cancelled_by = "background_health_probe",
-            probe_index,
-            shared_session_setup_continues = self.direct_quic_setup.setup_active.load(Ordering::Relaxed),
-            "iroh_connect_cancelled"
-        );
+        if let Some(guard) = cancellation_guard.as_mut() {
+            guard.complete();
+        }
+        result
     }
 
     async fn cached_session(&self) -> Option<Arc<MultiplexedSession>> {
@@ -883,6 +1082,7 @@ async fn ensure_direct_quic_endpoint(
     rendezvous: Option<&RendezvousControlClient>,
     relay_ca_pem: Option<&str>,
     route_index: Option<usize>,
+    setup_attempt_id: u64,
 ) -> Result<DirectQuicEndpoint> {
     {
         let guard = endpoint.lock().await;
@@ -900,6 +1100,7 @@ async fn ensure_direct_quic_endpoint(
             tracing::info!(
                 target: MOBILE_CONNECTION_LOG_TARGET,
                 event = "iroh_relay_ticket_started",
+                setup_attempt_id,
                 candidate_index = ?route_index,
                 path_kind = "direct_quic",
                 locator = %candidate.endpoint,
@@ -920,6 +1121,7 @@ async fn ensure_direct_quic_endpoint(
                     tracing::info!(
                         target: MOBILE_CONNECTION_LOG_TARGET,
                         event = "iroh_relay_ticket_completed",
+                        setup_attempt_id,
                         candidate_index = ?route_index,
                         path_kind = "direct_quic",
                         locator = %candidate.endpoint,
@@ -936,6 +1138,7 @@ async fn ensure_direct_quic_endpoint(
                     tracing::warn!(
                         target: MOBILE_CONNECTION_LOG_TARGET,
                         event = "iroh_relay_ticket_failed",
+                        setup_attempt_id,
                         candidate_index = ?route_index,
                         path_kind = "direct_quic",
                         locator = %candidate.endpoint,
@@ -953,6 +1156,7 @@ async fn ensure_direct_quic_endpoint(
                     tracing::warn!(
                         target: MOBILE_CONNECTION_LOG_TARGET,
                         event = "iroh_relay_ticket_failed",
+                        setup_attempt_id,
                         candidate_index = ?route_index,
                         path_kind = "direct_quic",
                         locator = %candidate.endpoint,
@@ -987,14 +1191,15 @@ async fn ensure_direct_quic_endpoint(
     if !relay_enabled && !has_usable_peer_addresses {
         tracing::warn!(
             target: MOBILE_CONNECTION_LOG_TARGET,
-            event = "iroh_connect_failed",
+            event = "iroh_endpoint_setup_failed",
+            setup_attempt_id,
             candidate_index = ?route_index,
             path_kind = "direct_quic",
             locator = %candidate.endpoint,
             endpoint_id = %endpoint_id,
             target_node_id = %target_node_id,
             reason = "no_relay_ticket_or_usable_peer_addresses",
-            "iroh_connect_failed"
+            "iroh_endpoint_setup_failed"
         );
         bail!("direct QUIC unavailable: no relay ticket and no usable peer addresses");
     }
@@ -1002,6 +1207,7 @@ async fn ensure_direct_quic_endpoint(
         tracing::warn!(
             target: MOBILE_CONNECTION_LOG_TARGET,
             event = "iroh_direct_only_fallback",
+            setup_attempt_id,
             candidate_index = ?route_index,
             path_kind = "direct_quic",
             locator = %candidate.endpoint,
@@ -1048,6 +1254,7 @@ async fn ensure_direct_quic_endpoint(
     tracing::info!(
         target: MOBILE_CONNECTION_LOG_TARGET,
         event = "iroh_endpoint_created",
+        setup_attempt_id,
         candidate_index = ?route_index,
         path_kind = "direct_quic",
         locator = %candidate.endpoint,
@@ -1246,6 +1453,7 @@ mod tests {
             None,
             None,
             None,
+            1,
         )
         .await
         {
@@ -1317,6 +1525,7 @@ mod tests {
             Some(&rendezvous),
             None,
             None,
+            1,
         )
         .await
         {
@@ -1353,17 +1562,21 @@ mod tests {
         let first_starts = Arc::clone(&starts);
         let first = tokio::time::timeout(
             Duration::from_millis(10),
-            pool.wait_for_shared_direct_quic_setup(move || async move {
-                first_starts.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(60)).await;
-                Err(anyhow!("synthetic shared setup failure"))
-            }),
+            pool.wait_for_shared_direct_quic_setup(
+                DirectQuicSetupWaiter::BackgroundHealthProbe { probe_index: 0 },
+                move |setup_attempt_id| async move {
+                    assert_eq!(setup_attempt_id, 1);
+                    first_starts.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    Err(anyhow!("synthetic shared setup failure"))
+                },
+            ),
         )
         .await;
         assert!(first.is_err(), "the first consumer should stop waiting");
 
         let result = match pool
-            .wait_for_shared_direct_quic_setup(|| async {
+            .wait_for_shared_direct_quic_setup(DirectQuicSetupWaiter::SessionConsumer, |_| async {
                 panic!("a second consumer must join, not start another setup")
             })
             .await
@@ -1377,6 +1590,46 @@ mod tests {
                 .contains("synthetic shared setup failure")
         );
         assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_quic_setup_attempt_ids_increment_after_terminal_results() {
+        let pool = TransportSessionPool::new_direct_quic(
+            ConnectionCandidate {
+                kind: transport_sdk::CandidateKind::DirectQuic,
+                endpoint: format!("iroh://{}", SecretKey::generate().public()),
+                rtt_ms: None,
+                transport_hints: None,
+            },
+            Some(NodeId::new_v4()),
+            None,
+            None,
+        );
+
+        for expected_attempt_id in 1..=2 {
+            let error = match pool
+                .wait_for_shared_direct_quic_setup(
+                    DirectQuicSetupWaiter::SessionConsumer,
+                    move |setup_attempt_id| async move {
+                        assert_eq!(setup_attempt_id, expected_attempt_id);
+                        Err(anyhow!("synthetic terminal result"))
+                    },
+                )
+                .await
+            {
+                Ok(_) => panic!("synthetic setup should fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("synthetic terminal result"));
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pool.direct_quic_setup.setup_active.load(Ordering::Relaxed) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal setup should clear the active attempt");
+        }
     }
 
     #[test]
