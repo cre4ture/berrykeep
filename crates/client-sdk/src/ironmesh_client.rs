@@ -42,7 +42,9 @@ use transport_sdk::{
 };
 use uuid::Uuid;
 
-use crate::session_pool::{TransportSessionPool, TransportSessionPoolSnapshot};
+use crate::session_pool::{
+    DirectQuicSetupWaiter, TransportSessionPool, TransportSessionPoolSnapshot,
+};
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
@@ -1686,6 +1688,7 @@ fn apply_headers_to_request(
 struct TransportRequestOptions<'a> {
     connection_name: Option<&'a str>,
     request_timeout: Option<Duration>,
+    direct_quic_setup_waiter: DirectQuicSetupWaiter,
 }
 
 impl<'a> TransportRequestOptions<'a> {
@@ -1693,13 +1696,21 @@ impl<'a> TransportRequestOptions<'a> {
         Self {
             connection_name,
             request_timeout,
+            direct_quic_setup_waiter: DirectQuicSetupWaiter::SessionConsumer,
         }
+    }
+
+    const fn for_background_health_probe(mut self, probe_index: usize) -> Self {
+        self.direct_quic_setup_waiter =
+            DirectQuicSetupWaiter::BackgroundHealthProbe { probe_index };
+        self
     }
 
     const fn without_request_timeout(self) -> Self {
         Self {
             connection_name: self.connection_name,
             request_timeout: None,
+            direct_quic_setup_waiter: self.direct_quic_setup_waiter,
         }
     }
 }
@@ -1726,6 +1737,7 @@ async fn execute_buffered_request_for_transport(
                     session_pool,
                     identity,
                     connection_name: options.connection_name,
+                    direct_quic_setup_waiter: options.direct_quic_setup_waiter,
                 };
                 return execute_direct_multiplex_buffered_request(
                     direct,
@@ -1776,6 +1788,7 @@ async fn execute_buffered_request_for_transport(
                 session_pool,
                 identity,
                 connection_name: options.connection_name,
+                direct_quic_setup_waiter: options.direct_quic_setup_waiter,
             };
             execute_direct_multiplex_buffered_request(
                 direct,
@@ -1831,6 +1844,7 @@ async fn execute_streaming_read_request_for_transport(
                         session_pool,
                         identity,
                         connection_name,
+                        direct_quic_setup_waiter: DirectQuicSetupWaiter::SessionConsumer,
                     },
                     response_head_timeout,
                     method,
@@ -1864,6 +1878,7 @@ async fn execute_streaming_read_request_for_transport(
                     session_pool,
                     identity,
                     connection_name,
+                    direct_quic_setup_waiter: DirectQuicSetupWaiter::SessionConsumer,
                 },
                 response_head_timeout,
                 method,
@@ -1952,6 +1967,7 @@ async fn execute_streaming_object_write_request_for_transport(
                     session_pool,
                     identity,
                     connection_name: options.connection_name,
+                    direct_quic_setup_waiter: options.direct_quic_setup_waiter,
                 };
                 return execute_direct_multiplex_streaming_object_write_request(
                     direct,
@@ -1989,6 +2005,7 @@ async fn execute_streaming_object_write_request_for_transport(
                 session_pool,
                 identity,
                 connection_name: options.connection_name,
+                direct_quic_setup_waiter: options.direct_quic_setup_waiter,
             };
             execute_direct_multiplex_streaming_object_write_request(
                 direct,
@@ -2043,6 +2060,7 @@ async fn execute_streaming_write_request_for_transport(
                     session_pool,
                     identity,
                     connection_name: options.connection_name,
+                    direct_quic_setup_waiter: options.direct_quic_setup_waiter,
                 };
                 return execute_direct_multiplex_streaming_write_request(
                     direct,
@@ -2099,6 +2117,7 @@ async fn execute_streaming_write_request_for_transport(
                 session_pool,
                 identity,
                 connection_name: options.connection_name,
+                direct_quic_setup_waiter: options.direct_quic_setup_waiter,
             };
             execute_direct_multiplex_streaming_write_request(
                 direct,
@@ -2162,7 +2181,8 @@ async fn probe_endpoint_background_quality(
             execute_buffered_request_for_transport(
                 &endpoint.transport,
                 auth,
-                TransportRequestOptions::new(connection_name, None),
+                TransportRequestOptions::new(connection_name, None)
+                    .for_background_health_probe(probe_index),
                 &method,
                 &url,
                 &headers,
@@ -2173,11 +2193,16 @@ async fn probe_endpoint_background_quality(
         {
             Ok(response) => response?,
             Err(_) => {
-                if let ClientTransport::DirectQuic { session_pool, .. } = &endpoint.transport {
-                    session_pool
-                        .log_direct_quic_probe_cancellation(probe_index)
-                        .await;
-                }
+                tracing::info!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "background_health_probe_timed_out",
+                    path_kind =
+                        transport_path_kind_label(endpoint.transport.transport_path_kind()),
+                    locator = %endpoint.descriptor.locator,
+                    probe_index,
+                    timeout_ms = CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
+                    "background_health_probe_timed_out"
+                );
                 bail!(
                     "background health probe timed out after {} ms for {}",
                     CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
@@ -6000,6 +6025,7 @@ struct DirectMultiplexSessionContext<'a> {
     session_pool: &'a TransportSessionPool,
     identity: &'a ClientIdentityMaterial,
     connection_name: Option<&'a str>,
+    direct_quic_setup_waiter: DirectQuicSetupWaiter,
 }
 
 struct RelayMultiplexSessionContext<'a> {
@@ -6127,7 +6153,11 @@ async fn execute_direct_multiplex_streaming_read_request(
     for attempt in 0..2 {
         let session = direct
             .session_pool
-            .ensure_direct_session(direct.identity, direct.connection_name)
+            .ensure_direct_session(
+                direct.identity,
+                direct.connection_name,
+                direct.direct_quic_setup_waiter,
+            )
             .await
             .context("failed ensuring direct multiplex session")?;
         let result = execute_multiplex_streaming_read_request(
@@ -6224,7 +6254,11 @@ async fn execute_direct_multiplex_streaming_object_write_request(
     for attempt in 0..2 {
         let session = direct
             .session_pool
-            .ensure_direct_session(direct.identity, direct.connection_name)
+            .ensure_direct_session(
+                direct.identity,
+                direct.connection_name,
+                direct.direct_quic_setup_waiter,
+            )
             .await
             .context("failed ensuring direct multiplex session")?;
         let result = execute_multiplex_streaming_object_write_request(
@@ -6323,7 +6357,11 @@ async fn execute_direct_multiplex_streaming_write_request(
 ) -> Result<BufferedTransportResponse> {
     let session = direct
         .session_pool
-        .ensure_direct_session(direct.identity, direct.connection_name)
+        .ensure_direct_session(
+            direct.identity,
+            direct.connection_name,
+            direct.direct_quic_setup_waiter,
+        )
         .await
         .context("failed ensuring direct multiplex session")?;
     execute_multiplex_streaming_write_request(
@@ -6425,7 +6463,11 @@ async fn execute_direct_multiplex_buffered_request_without_timeout(
     for attempt in 0..2 {
         let session = direct
             .session_pool
-            .ensure_direct_session(direct.identity, direct.connection_name)
+            .ensure_direct_session(
+                direct.identity,
+                direct.connection_name,
+                direct.direct_quic_setup_waiter,
+            )
             .await
             .context("failed ensuring direct multiplex session")?;
         let request = BufferedTransportRequest::new(
