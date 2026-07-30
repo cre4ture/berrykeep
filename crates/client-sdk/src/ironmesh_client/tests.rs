@@ -140,6 +140,48 @@ fn route_reconciliation_preserves_static_state_and_retires_dynamic_routes() {
     assert_eq!(static_client.connection_route_snapshot().endpoints.len(), 1);
 }
 
+#[tokio::test]
+async fn newly_discovered_direct_quic_is_ranked_first_and_probed() {
+    let static_client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let dynamic_quic = IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+        ConnectionCandidate {
+            kind: CandidateKind::DirectQuic,
+            endpoint: "iroh://dynamic-node-key".to_string(),
+            rtt_ms: None,
+            transport_hints: None,
+        },
+        Some(NodeId::new_v4()),
+    );
+    let refreshed = IronMeshClient::combine(vec![
+        dynamic_quic,
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/"),
+    ])
+    .expect("refreshed routes should combine");
+
+    static_client.reconcile_transport_membership(&refreshed, true);
+    let before_probe = static_client.connection_route_snapshot();
+    let direct_quic = before_probe
+        .endpoints
+        .iter()
+        .find(|route| route.path_kind == TransportPathKind::DirectQuic)
+        .expect("dynamic Direct QUIC route should exist");
+    assert_eq!(
+        before_probe.ranked_indices.first(),
+        Some(&direct_quic.index),
+        "new Direct QUIC should receive the first exploration attempt"
+    );
+    assert!(!direct_quic.active);
+
+    static_client.spawn_due_connection_route_refresh();
+    let after_probe_scheduled = static_client.connection_route_snapshot();
+    let direct_quic = after_probe_scheduled
+        .endpoints
+        .iter()
+        .find(|route| route.path_kind == TransportPathKind::DirectQuic)
+        .expect("dynamic Direct QUIC route should remain");
+    assert!(direct_quic.last_background_probe_unix_ms.is_some());
+}
+
 #[test]
 fn exhausted_route_set_notifies_managed_refresh_once() {
     let client = IronMeshClient::combine(vec![
@@ -264,11 +306,20 @@ fn route_score_strongly_prefers_direct_over_relay_and_stabilizes_active_route() 
         locator: "relay://node@example".to_string(),
         bootstrap_rank: 0,
     };
+    let direct_quic = ClientEndpointDescriptor {
+        route_key: "direct-quic-route".to_string(),
+        path_kind: ClientEndpointPathKind::Direct,
+        transport_path_kind: TransportPathKind::DirectQuic,
+        locator: "iroh://direct-quic".to_string(),
+        bootstrap_rank: 0,
+    };
 
     assert_eq!(endpoint_score(0, None, &direct, &state), 100.0);
     assert_eq!(endpoint_score(0, None, &relay, &state), 600.0);
+    assert_eq!(endpoint_score(0, None, &direct_quic, &state), 0.0);
     assert_eq!(endpoint_score(0, Some(0), &direct, &state), 50.0);
     assert_eq!(endpoint_score(0, Some(0), &relay, &state), 550.0);
+    assert_eq!(endpoint_score(0, Some(0), &direct_quic, &state), -50.0);
 }
 
 #[test]

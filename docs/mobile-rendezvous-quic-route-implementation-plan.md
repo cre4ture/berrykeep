@@ -306,7 +306,43 @@ No platform needs to maintain a permanent background timer. In particular, iOS
 must work when the process was suspended and the next operation is its only
 opportunity to refresh.
 
-### 5.5 Identity renewal and FFI persistence
+### 5.5 Discovery concurrency and telemetry
+
+Discovery uses bounded races instead of serially paying the network timeout of
+every Rendezvous endpoint:
+
+- mesh discovery races the configured bootstrap endpoints;
+- per-node discovery runs concurrently for independent target nodes;
+- endpoint attempts share one global concurrency limit;
+- each request has an explicit timeout and the complete refresh has a separate
+  global deadline;
+- a Direct QUIC result cancels slower attempts for the same node immediately;
+  other usable results allow a short success grace to collect a better route;
+- authenticated, connected Rendezvous peers are tried before unverified seed
+  fallbacks, ordered by active state, recent success, and failure count.
+
+A successful response still has to satisfy all validation and trust rules in
+section 5.2. Parallelism changes latency, not trust.
+
+The tracing contract exposes enough detail to attribute a slow refresh without
+logging URL credentials or query parameters:
+
+| Event | Important fields |
+| --- | --- |
+| `dynamic_discovery_started` | run ID, endpoint and node counts, concurrency and timeout budgets |
+| `rendezvous_discovery_attempt_started` | run ID, mesh/node phase, target node, sanitized endpoint |
+| `rendezvous_discovery_attempt_completed` | duration, success, timeout, candidate/peer counts, error |
+| `rendezvous_discovery_race_completed` | winning endpoint, duration, cancelled attempt count |
+| `dynamic_discovery_completed` | total duration, timeout/error, discovered nodes and routes |
+| `dynamic_route_probe_scheduled` | refresh reason and number of newly added routes |
+
+New authenticated direct candidates are placed before static direct fallbacks.
+Direct QUIC receives an initial exploration bonus, then latency, failures,
+circuit state, active-route hysteresis, and explicit relay policy remain
+authoritative. A background quality probe prewarms a new route without delaying
+or duplicating the foreground operation.
+
+### 5.6 Identity renewal and FFI persistence
 
 Identity renewal is common logic. The route controller should check and renew
 the Rendezvous client identity before each discovery session when necessary.

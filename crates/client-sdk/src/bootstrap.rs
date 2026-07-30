@@ -1,12 +1,15 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use common::{ClusterId, NodeId};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use transport_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, CandidateKind,
     ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
@@ -15,6 +18,7 @@ use transport_sdk::{
     RelayMode, RendezvousControlClient, RendezvousEndpointConnectionState,
     RendezvousEndpointStatus, TransportPathKind,
 };
+use uuid::Uuid;
 
 use crate::connection::{
     build_blocking_reqwest_client_from_pem_for_url,
@@ -26,6 +30,11 @@ use crate::device_auth::{
     renew_rendezvous_identity,
 };
 use crate::ironmesh_client::{CLIENT_API_V1_PREFIX, IronMeshClient, normalize_server_base_url};
+
+const DISCOVERY_MAX_CONCURRENCY: usize = 8;
+const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCOVERY_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+const DISCOVERY_SUCCESS_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionBootstrap {
@@ -754,8 +763,71 @@ impl ConnectionBootstrap {
             return self.planned_targets();
         }
 
-        let discovery = self.fetch_dynamic_discovery(identity).await?;
-        self.build_refreshed_targets(&discovery)
+        let discovery_run_id = Uuid::now_v7();
+        let started_at = Instant::now();
+        tracing::info!(
+            event = "dynamic_discovery_started",
+            discovery_run_id = %discovery_run_id,
+            rendezvous_endpoint_count = self.rendezvous_urls.len(),
+            target_node_count = self.discovery_target_node_ids()?.len(),
+            max_concurrency = DISCOVERY_MAX_CONCURRENCY,
+            request_timeout_ms = DISCOVERY_REQUEST_TIMEOUT.as_millis() as u64,
+            refresh_timeout_ms = DISCOVERY_REFRESH_TIMEOUT.as_millis() as u64,
+            "starting bounded parallel Rendezvous discovery"
+        );
+
+        let discovery = match tokio::time::timeout(
+            DISCOVERY_REFRESH_TIMEOUT,
+            self.fetch_dynamic_discovery(identity, discovery_run_id),
+        )
+        .await
+        {
+            Ok(Ok(discovery)) => discovery,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    event = "dynamic_discovery_completed",
+                    discovery_run_id = %discovery_run_id,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    success = false,
+                    timed_out = false,
+                    error = %format!("{error:#}"),
+                    "Rendezvous discovery failed"
+                );
+                return Err(error);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    event = "dynamic_discovery_completed",
+                    discovery_run_id = %discovery_run_id,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    success = false,
+                    timed_out = true,
+                    "Rendezvous discovery exceeded its global deadline"
+                );
+                bail!(
+                    "Rendezvous discovery exceeded its {} ms global deadline",
+                    DISCOVERY_REFRESH_TIMEOUT.as_millis()
+                );
+            }
+        };
+        let targets = self.build_refreshed_targets(&discovery)?;
+        tracing::info!(
+            event = "dynamic_discovery_completed",
+            discovery_run_id = %discovery_run_id,
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            success = true,
+            timed_out = false,
+            rendezvous_endpoint_count = discovery.rendezvous_urls.len(),
+            discovered_node_count = discovery.direct_candidates_by_node.len(),
+            direct_candidate_count = discovery
+                .direct_candidates_by_node
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            planned_target_count = targets.len(),
+            "Rendezvous discovery completed"
+        );
+        Ok(targets)
     }
 
     pub fn connection_target_label(&self) -> Result<String> {
@@ -951,13 +1023,6 @@ impl ConnectionBootstrap {
         })
     }
 
-    fn build_rendezvous_discovery_client(
-        &self,
-        identity: Option<&ClientIdentityMaterial>,
-    ) -> Result<RendezvousControlClient> {
-        self.build_rendezvous_discovery_client_for_urls(&self.rendezvous_urls, identity)
-    }
-
     fn build_rendezvous_discovery_client_for_urls(
         &self,
         rendezvous_urls: &[String],
@@ -988,9 +1053,19 @@ impl ConnectionBootstrap {
     async fn fetch_dynamic_discovery(
         &self,
         identity: Option<&ClientIdentityMaterial>,
+        discovery_run_id: Uuid,
     ) -> Result<DynamicDiscoveryState> {
-        let rendezvous_client = self.build_rendezvous_discovery_client(identity)?;
-        let mesh_discovery: DiscoveryResponse = rendezvous_client.fetch_discovery(None).await?;
+        let concurrency = Arc::new(Semaphore::new(DISCOVERY_MAX_CONCURRENCY));
+        let mesh_discovery = self
+            .fetch_first_discovery_response(
+                identity,
+                &self.rendezvous_urls,
+                None,
+                "mesh",
+                discovery_run_id,
+                Arc::clone(&concurrency),
+            )
+            .await?;
         let mut discovery = DynamicDiscoveryState {
             rendezvous_urls: merge_connected_rendezvous_urls(
                 &self.rendezvous_urls,
@@ -999,16 +1074,41 @@ impl ConnectionBootstrap {
             direct_candidates_by_node: BTreeMap::new(),
             relay_capable_nodes: BTreeSet::new(),
         };
+        let base_rendezvous_urls = discovery.rendezvous_urls.clone();
+        let base_rendezvous_url_set = base_rendezvous_urls
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut additional_rendezvous_urls = BTreeSet::new();
 
+        let mut node_discoveries = FuturesUnordered::new();
         for node_id in self.discovery_target_node_ids()? {
-            let node_discovery = self
-                .fetch_node_discovery_across_rendezvous_urls(
-                    identity,
-                    &discovery.rendezvous_urls,
+            let rendezvous_urls = discovery.rendezvous_urls.clone();
+            let concurrency = Arc::clone(&concurrency);
+            node_discoveries.push(async move {
+                (
                     node_id,
+                    self.fetch_node_discovery_across_rendezvous_urls(
+                        identity,
+                        &rendezvous_urls,
+                        node_id,
+                        discovery_run_id,
+                        concurrency,
+                    )
+                    .await,
                 )
-                .await?;
-            discovery.rendezvous_urls = node_discovery.rendezvous_urls;
+            });
+        }
+
+        while let Some((node_id, result)) = node_discoveries.next().await {
+            let node_discovery = result?;
+            additional_rendezvous_urls.extend(
+                node_discovery
+                    .rendezvous_urls
+                    .iter()
+                    .filter(|url| !base_rendezvous_url_set.contains(*url))
+                    .cloned(),
+            );
             if !node_discovery.candidates.is_empty() {
                 discovery
                     .direct_candidates_by_node
@@ -1018,8 +1118,59 @@ impl ConnectionBootstrap {
                 discovery.relay_capable_nodes.insert(node_id);
             }
         }
+        discovery.rendezvous_urls = merge_parallel_rendezvous_url_results(
+            &base_rendezvous_urls,
+            &self.rendezvous_urls,
+            additional_rendezvous_urls,
+        )?;
 
         Ok(discovery)
+    }
+
+    async fn fetch_first_discovery_response(
+        &self,
+        identity: Option<&ClientIdentityMaterial>,
+        rendezvous_urls: &[String],
+        node_id: Option<NodeId>,
+        phase: &'static str,
+        discovery_run_id: Uuid,
+        concurrency: Arc<Semaphore>,
+    ) -> Result<DiscoveryResponse> {
+        let mut attempts = FuturesUnordered::new();
+        for rendezvous_url in rendezvous_urls {
+            attempts.push(self.fetch_discovery_attempt(
+                identity,
+                rendezvous_url.clone(),
+                node_id,
+                phase,
+                discovery_run_id,
+                Arc::clone(&concurrency),
+            ));
+        }
+
+        let race_started_at = Instant::now();
+        let mut last_error = None;
+        while let Some(result) = attempts.next().await {
+            match result {
+                Ok((winning_url, response)) => {
+                    tracing::info!(
+                        event = "rendezvous_discovery_race_completed",
+                        discovery_run_id = %discovery_run_id,
+                        discovery_phase = phase,
+                        target_node_id = %discovery_node_label(node_id),
+                        winning_endpoint = %rendezvous_endpoint_log_label(&winning_url),
+                        duration_ms = race_started_at.elapsed().as_millis() as u64,
+                        cancelled_attempt_count = attempts.len(),
+                        "Rendezvous discovery race produced a successful response"
+                    );
+                    return Ok(response);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow!("Rendezvous discovery has no configured endpoints")))
     }
 
     async fn fetch_node_discovery_across_rendezvous_urls(
@@ -1027,30 +1178,65 @@ impl ConnectionBootstrap {
         identity: Option<&ClientIdentityMaterial>,
         seed_rendezvous_urls: &[String],
         node_id: NodeId,
+        discovery_run_id: Uuid,
+        concurrency: Arc<Semaphore>,
     ) -> Result<NodeDynamicDiscoveryState> {
         let mut rendezvous_urls = seed_rendezvous_urls.to_vec();
-        let mut next_index = 0usize;
+        let mut queried_urls = BTreeSet::new();
+        let mut attempts = FuturesUnordered::new();
+        for rendezvous_url in &rendezvous_urls {
+            if queried_urls.insert(rendezvous_url.clone()) {
+                attempts.push(self.fetch_discovery_attempt(
+                    identity,
+                    rendezvous_url.clone(),
+                    Some(node_id),
+                    "node",
+                    discovery_run_id,
+                    Arc::clone(&concurrency),
+                ));
+            }
+        }
+
+        let race_started_at = Instant::now();
         let mut saw_success = false;
         let mut last_error = None;
         let mut candidates = Vec::new();
         let mut relay_capable = false;
         let mut seen_candidates = BTreeSet::new();
+        let mut first_usable_endpoint = None;
+        let mut success_grace_deadline = None;
 
-        while next_index < rendezvous_urls.len() {
-            let current_url = rendezvous_urls[next_index].clone();
-            next_index += 1;
-
-            let rendezvous_client = self.build_rendezvous_discovery_client_for_urls(
-                std::slice::from_ref(&current_url),
-                identity,
-            )?;
-            match rendezvous_client.fetch_discovery(Some(node_id)).await {
-                Ok(response) => {
+        loop {
+            let next_result = if let Some(deadline) = success_grace_deadline {
+                tokio::select! {
+                    result = attempts.next() => result,
+                    () = tokio::time::sleep_until(deadline) => None,
+                }
+            } else {
+                attempts.next().await
+            };
+            let Some(result) = next_result else {
+                break;
+            };
+            match result {
+                Ok((winning_url, response)) => {
                     saw_success = true;
                     rendezvous_urls = merge_connected_rendezvous_urls(
                         &rendezvous_urls,
                         &response.rendezvous_peers,
                     )?;
+                    for rendezvous_url in &rendezvous_urls {
+                        if queried_urls.insert(rendezvous_url.clone()) {
+                            attempts.push(self.fetch_discovery_attempt(
+                                identity,
+                                rendezvous_url.clone(),
+                                Some(node_id),
+                                "node",
+                                discovery_run_id,
+                                Arc::clone(&concurrency),
+                            ));
+                        }
+                    }
                     if let Some(node_candidates) = response.node_candidates {
                         for candidate in node_candidates {
                             let seen_key = discovery_candidate_seen_key(&candidate)?;
@@ -1060,6 +1246,35 @@ impl ConnectionBootstrap {
                         }
                     }
                     relay_capable |= response.node_relay_capable;
+
+                    let direct_quic_discovered = candidates
+                        .iter()
+                        .any(|candidate| candidate.kind == CandidateKind::DirectQuic);
+                    if direct_quic_discovered {
+                        tracing::info!(
+                            event = "rendezvous_discovery_race_completed",
+                            discovery_run_id = %discovery_run_id,
+                            discovery_phase = "node",
+                            target_node_id = %node_id,
+                            winning_endpoint = %rendezvous_endpoint_log_label(&winning_url),
+                            duration_ms = race_started_at.elapsed().as_millis() as u64,
+                            candidate_count = candidates.len(),
+                            relay_capable,
+                            cancelled_attempt_count = attempts.len(),
+                            "Rendezvous discovery race produced a usable route"
+                        );
+                        return Ok(NodeDynamicDiscoveryState {
+                            rendezvous_urls,
+                            candidates: transport_sdk::rank_candidates(&candidates),
+                            relay_capable,
+                        });
+                    }
+                    if (!candidates.is_empty() || relay_capable) && success_grace_deadline.is_none()
+                    {
+                        first_usable_endpoint = Some(winning_url);
+                        success_grace_deadline =
+                            Some(tokio::time::Instant::now() + DISCOVERY_SUCCESS_GRACE);
+                    }
                 }
                 Err(error) => last_error = Some(error),
             }
@@ -1071,11 +1286,141 @@ impl ConnectionBootstrap {
             }));
         }
 
+        if let Some(winning_url) = first_usable_endpoint {
+            tracing::info!(
+                event = "rendezvous_discovery_race_completed",
+                discovery_run_id = %discovery_run_id,
+                discovery_phase = "node",
+                target_node_id = %node_id,
+                winning_endpoint = %rendezvous_endpoint_log_label(&winning_url),
+                duration_ms = race_started_at.elapsed().as_millis() as u64,
+                candidate_count = candidates.len(),
+                relay_capable,
+                cancelled_attempt_count = attempts.len(),
+                success_grace_ms = DISCOVERY_SUCCESS_GRACE.as_millis() as u64,
+                "Rendezvous discovery race completed after the success grace"
+            );
+        }
+
         Ok(NodeDynamicDiscoveryState {
             rendezvous_urls,
             candidates: transport_sdk::rank_candidates(&candidates),
             relay_capable,
         })
+    }
+
+    async fn fetch_discovery_attempt(
+        &self,
+        identity: Option<&ClientIdentityMaterial>,
+        rendezvous_url: String,
+        node_id: Option<NodeId>,
+        phase: &'static str,
+        discovery_run_id: Uuid,
+        concurrency: Arc<Semaphore>,
+    ) -> Result<(String, DiscoveryResponse)> {
+        let _permit = concurrency
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("Rendezvous discovery concurrency limiter closed"))?;
+        let started_at = Instant::now();
+        let endpoint_label = rendezvous_endpoint_log_label(&rendezvous_url);
+        tracing::info!(
+            event = "rendezvous_discovery_attempt_started",
+            discovery_run_id = %discovery_run_id,
+            discovery_phase = phase,
+            target_node_id = %discovery_node_label(node_id),
+            rendezvous_endpoint = %endpoint_label,
+            "querying Rendezvous discovery endpoint"
+        );
+
+        let rendezvous_client = match self.build_rendezvous_discovery_client_for_urls(
+            std::slice::from_ref(&rendezvous_url),
+            identity,
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(
+                    event = "rendezvous_discovery_attempt_completed",
+                    discovery_run_id = %discovery_run_id,
+                    discovery_phase = phase,
+                    target_node_id = %discovery_node_label(node_id),
+                    rendezvous_endpoint = %endpoint_label,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    success = false,
+                    timed_out = false,
+                    error = %format!("{error:#}"),
+                    "failed to construct Rendezvous discovery request"
+                );
+                return Err(error);
+            }
+        };
+
+        match tokio::time::timeout(
+            DISCOVERY_REQUEST_TIMEOUT,
+            rendezvous_client.fetch_discovery(node_id),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                tracing::info!(
+                    event = "rendezvous_discovery_attempt_completed",
+                    discovery_run_id = %discovery_run_id,
+                    discovery_phase = phase,
+                    target_node_id = %discovery_node_label(node_id),
+                    rendezvous_endpoint = %endpoint_label,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    success = true,
+                    timed_out = false,
+                    candidate_count = response
+                        .node_candidates
+                        .as_ref()
+                        .map(Vec::len)
+                        .unwrap_or_default(),
+                    connected_peer_count = response
+                        .rendezvous_peers
+                        .iter()
+                        .filter(|peer| {
+                            peer.status == RendezvousEndpointConnectionState::Connected
+                        })
+                        .count(),
+                    relay_capable = response.node_relay_capable,
+                    "Rendezvous discovery request completed"
+                );
+                Ok((rendezvous_url, response))
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    event = "rendezvous_discovery_attempt_completed",
+                    discovery_run_id = %discovery_run_id,
+                    discovery_phase = phase,
+                    target_node_id = %discovery_node_label(node_id),
+                    rendezvous_endpoint = %endpoint_label,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    success = false,
+                    timed_out = false,
+                    error = %format!("{error:#}"),
+                    "Rendezvous discovery request failed"
+                );
+                Err(error)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    event = "rendezvous_discovery_attempt_completed",
+                    discovery_run_id = %discovery_run_id,
+                    discovery_phase = phase,
+                    target_node_id = %discovery_node_label(node_id),
+                    rendezvous_endpoint = %endpoint_label,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    success = false,
+                    timed_out = true,
+                    "Rendezvous discovery request timed out"
+                );
+                bail!(
+                    "Rendezvous discovery request to {endpoint_label} timed out after {} ms",
+                    DISCOVERY_REQUEST_TIMEOUT.as_millis()
+                );
+            }
+        }
     }
 
     fn discovery_target_node_ids(&self) -> Result<Vec<NodeId>> {
@@ -1097,15 +1442,12 @@ impl ConnectionBootstrap {
         discovery: &DynamicDiscoveryState,
     ) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
         let static_direct_targets = self.direct_https_targets()?;
-        let mut direct_targets = static_direct_targets.clone();
+        let mut direct_targets = Vec::new();
         let mut seen_direct_targets = BTreeSet::new();
 
-        for target in &direct_targets {
-            if let Some(seen_key) = planned_direct_target_seen_key(target)? {
-                seen_direct_targets.insert(seen_key);
-            }
-        }
-
+        // Authenticated, freshly discovered direct routes are the best initial
+        // exploration candidates. Runtime health, latency, circuit breaking, and
+        // the active-route bonus still decide the durable route after first use.
         for (node_id, candidates) in &discovery.direct_candidates_by_node {
             for candidate in candidates {
                 let Some(path_kind) = planned_path_kind_for_candidate(candidate) else {
@@ -1132,6 +1474,14 @@ impl ConnectionBootstrap {
                     device_label: self.device_label.clone(),
                     device_id: self.device_id.clone(),
                 });
+            }
+        }
+
+        for target in &static_direct_targets {
+            if let Some(seen_key) = planned_direct_target_seen_key(target)?
+                && seen_direct_targets.insert(seen_key)
+            {
+                direct_targets.push(target.clone());
             }
         }
 
@@ -1186,6 +1536,25 @@ fn merge_connected_rendezvous_urls(
     let mut merged = Vec::new();
     let mut seen = BTreeSet::new();
 
+    let mut connected_peers = peers
+        .iter()
+        .filter(|peer| peer.status == RendezvousEndpointConnectionState::Connected)
+        .collect::<Vec<_>>();
+    connected_peers.sort_by(|left, right| {
+        right
+            .active
+            .cmp(&left.active)
+            .then_with(|| right.last_success_unix.cmp(&left.last_success_unix))
+            .then_with(|| left.consecutive_failures.cmp(&right.consecutive_failures))
+            .then_with(|| left.url.cmp(&right.url))
+    });
+    for peer in connected_peers {
+        let normalized = normalize_rendezvous_base_url(&peer.url)?;
+        if seen.insert(normalized.clone()) {
+            merged.push(normalized);
+        }
+    }
+
     for url in seed_urls {
         let normalized = normalize_rendezvous_base_url(url)?;
         if seen.insert(normalized.clone()) {
@@ -1193,17 +1562,58 @@ fn merge_connected_rendezvous_urls(
         }
     }
 
-    for peer in peers {
-        if peer.status != RendezvousEndpointConnectionState::Connected {
-            continue;
-        }
-        let normalized = normalize_rendezvous_base_url(&peer.url)?;
-        if seen.insert(normalized.clone()) {
-            merged.push(normalized);
+    Ok(merged)
+}
+
+fn merge_parallel_rendezvous_url_results(
+    base_urls: &[String],
+    seed_urls: &[String],
+    additional_urls: BTreeSet<String>,
+) -> Result<Vec<String>> {
+    let normalized_seed_urls = seed_urls
+        .iter()
+        .map(|url| normalize_rendezvous_base_url(url))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut merged = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for url in base_urls
+        .iter()
+        .filter(|url| !normalized_seed_urls.contains(*url))
+        .chain(
+            additional_urls
+                .iter()
+                .filter(|url| !normalized_seed_urls.contains(*url)),
+        )
+        .chain(
+            base_urls
+                .iter()
+                .filter(|url| normalized_seed_urls.contains(*url)),
+        )
+    {
+        if seen.insert(url.clone()) {
+            merged.push(url.clone());
         }
     }
 
     Ok(merged)
+}
+
+fn discovery_node_label(node_id: Option<NodeId>) -> String {
+    node_id
+        .map(|node_id| node_id.to_string())
+        .unwrap_or_else(|| "mesh".to_string())
+}
+
+fn rendezvous_endpoint_log_label(raw_url: &str) -> String {
+    let Ok(mut parsed) = Url::parse(raw_url.trim()) else {
+        return "[invalid-rendezvous-url]".to_string();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
 }
 
 fn normalize_rendezvous_base_url(url: &str) -> Result<String> {
@@ -2341,34 +2751,27 @@ mod tests {
             seed_calls
                 .lock()
                 .expect("query record lock should not be poisoned")
-                .clone(),
-            vec![None, Some(expected_node_id.clone())]
+                .first(),
+            Some(&None)
         );
-        assert_eq!(
+        assert!(
             peer_calls
                 .lock()
                 .expect("query record lock should not be poisoned")
-                .clone(),
-            vec![Some(expected_node_id.clone())]
+                .contains(&Some(expected_node_id.clone()))
         );
-        assert_eq!(targets[0].path_kind, TransportPathKind::DirectHttps);
-        assert_eq!(
-            targets[0].server_base_url.as_deref(),
-            Some("https://public.example/")
-        );
-        assert_eq!(targets[0].target_node_id, Some(target_node_id));
 
-        assert_eq!(targets[1].path_kind, TransportPathKind::DirectQuic);
-        assert!(targets[1].server_base_url.is_none());
+        assert_eq!(targets[0].path_kind, TransportPathKind::DirectQuic);
+        assert!(targets[0].server_base_url.is_none());
         assert_eq!(
-            targets[1]
+            targets[0]
                 .direct_candidate
                 .as_ref()
                 .map(|candidate| candidate.endpoint.as_str()),
             Some("iroh://peer-key-1")
         );
         assert_eq!(
-            targets[1]
+            targets[0]
                 .direct_candidate
                 .as_ref()
                 .and_then(|candidate| candidate.transport_hints.as_ref())
@@ -2376,16 +2779,23 @@ mod tests {
             Some("peer-key-1")
         );
         assert_eq!(
-            targets[1]
+            targets[0]
                 .direct_candidate
                 .as_ref()
                 .and_then(|candidate| candidate.transport_hints.as_ref())
                 .and_then(|hints| hints.relay_url.as_deref()),
             Some("https://relay-quic.example")
         );
-        assert_eq!(targets[1].target_node_id, Some(target_node_id));
+        assert_eq!(targets[0].target_node_id, Some(target_node_id));
 
         assert_eq!(targets.len(), 5);
+
+        assert_eq!(targets[1].path_kind, TransportPathKind::DirectHttps);
+        assert_eq!(
+            targets[1].server_base_url.as_deref(),
+            Some("https://public.example/")
+        );
+        assert_eq!(targets[1].target_node_id, Some(target_node_id));
 
         assert_eq!(targets[2].path_kind, TransportPathKind::DirectHttps);
         assert_eq!(
@@ -2398,20 +2808,263 @@ mod tests {
         assert_eq!(targets[3].target_node_id, Some(target_node_id));
         assert_eq!(
             targets[3].rendezvous_urls,
-            vec![format!("http://{seed_addr}/")]
+            vec![format!("http://{peer_addr}/")]
         );
 
         assert_eq!(targets[4].path_kind, TransportPathKind::RelayTunnel);
         assert_eq!(targets[4].target_node_id, Some(target_node_id));
         assert_eq!(
             targets[4].rendezvous_urls,
-            vec![format!("http://{peer_addr}/")]
+            vec![format!("http://{seed_addr}/")]
         );
 
         seed_server.abort();
         let _ = seed_server.await;
         peer_server.abort();
         let _ = peer_server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_dynamic_targets_discovers_target_nodes_concurrently() {
+        let cluster_id = ClusterId::now_v7();
+        let first_node_id = NodeId::new_v4();
+        let second_node_id = NodeId::new_v4();
+        let node_requests_started = Arc::new(AtomicUsize::new(0));
+        let all_node_requests_started = Arc::new(tokio::sync::Notify::new());
+
+        let route_request_count = Arc::clone(&node_requests_started);
+        let route_notify = Arc::clone(&all_node_requests_started);
+        let router = Router::new().route(
+            "/control/discovery",
+            get(move |Query(query): Query<TestDiscoveryQuery>| {
+                let route_request_count = Arc::clone(&route_request_count);
+                let route_notify = Arc::clone(&route_notify);
+                async move {
+                    if let Some(node_id) = query.node_id {
+                        let started = route_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        if started >= 2 {
+                            route_notify.notify_waiters();
+                        }
+                        while route_request_count.load(Ordering::SeqCst) < 2 {
+                            route_notify.notified().await;
+                        }
+                        Json(DiscoveryResponse {
+                            rendezvous_peers: vec![RendezvousEndpointStatus {
+                                url: format!("https://peer-{node_id}.example"),
+                                status: RendezvousEndpointConnectionState::Connected,
+                                last_attempt_unix: Some(10),
+                                last_success_unix: Some(10),
+                                consecutive_failures: 0,
+                                last_error: None,
+                                active: false,
+                            }],
+                            node_candidates: Some(vec![ConnectionCandidate {
+                                kind: CandidateKind::DirectHttps,
+                                endpoint: format!("https://dynamic-{node_id}.example"),
+                                rtt_ms: Some(5),
+                                transport_hints: None,
+                            }]),
+                            node_relay_capable: false,
+                        })
+                    } else {
+                        Json(DiscoveryResponse {
+                            rendezvous_peers: Vec::new(),
+                            node_candidates: None,
+                            node_relay_capable: false,
+                        })
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("discovery listener should bind");
+        let addr = listener.local_addr().expect("discovery listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("discovery test server should run");
+        });
+
+        let mut bootstrap =
+            refreshable_bootstrap(cluster_id, format!("http://{addr}"), first_node_id);
+        bootstrap.relay_mode = RelayMode::Disabled;
+        bootstrap.direct_endpoints.push(BootstrapEndpoint {
+            url: "https://second-static.example".to_string(),
+            usage: Some(BootstrapEndpointUse::PublicApi),
+            node_id: Some(second_node_id),
+        });
+
+        let targets = tokio::time::timeout(
+            Duration::from_secs(1),
+            bootstrap.refresh_dynamic_targets(None),
+        )
+        .await
+        .expect("parallel node discovery should not deadlock")
+        .expect("parallel node discovery should succeed");
+
+        assert_eq!(node_requests_started.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|target| {
+                    target
+                        .server_base_url
+                        .as_deref()
+                        .is_some_and(|url| url.contains("dynamic-"))
+                })
+                .count(),
+            2
+        );
+        let first_dynamic_target = targets
+            .iter()
+            .find(|target| {
+                target
+                    .server_base_url
+                    .as_deref()
+                    .is_some_and(|url| url.contains("dynamic-"))
+            })
+            .expect("a dynamic target should be present");
+        assert!(
+            first_dynamic_target
+                .rendezvous_urls
+                .iter()
+                .any(|url| url.contains(&first_node_id.to_string()))
+        );
+        assert!(
+            first_dynamic_target
+                .rendezvous_urls
+                .iter()
+                .any(|url| url.contains(&second_node_id.to_string()))
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_dynamic_targets_does_not_wait_for_a_stalled_seed() {
+        let stalled_router = Router::new().route(
+            "/control/discovery",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Json(DiscoveryResponse {
+                    rendezvous_peers: Vec::new(),
+                    node_candidates: None,
+                    node_relay_capable: false,
+                })
+            }),
+        );
+        let stalled_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stalled listener should bind");
+        let stalled_addr = stalled_listener
+            .local_addr()
+            .expect("stalled listener addr");
+        let stalled_server = tokio::spawn(async move {
+            axum::serve(stalled_listener, stalled_router)
+                .await
+                .expect("stalled discovery test server should run");
+        });
+
+        let healthy_router = Router::new().route(
+            "/control/discovery",
+            get(|Query(query): Query<TestDiscoveryQuery>| async move {
+                Json(DiscoveryResponse {
+                    rendezvous_peers: Vec::new(),
+                    node_candidates: query.node_id.map(|_| {
+                        vec![ConnectionCandidate {
+                            kind: CandidateKind::DirectQuic,
+                            endpoint: "iroh://healthy-peer-key".to_string(),
+                            rtt_ms: Some(5),
+                            transport_hints: None,
+                        }]
+                    }),
+                    node_relay_capable: false,
+                })
+            }),
+        );
+        let healthy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("healthy listener should bind");
+        let healthy_addr = healthy_listener
+            .local_addr()
+            .expect("healthy listener addr");
+        let healthy_server = tokio::spawn(async move {
+            axum::serve(healthy_listener, healthy_router)
+                .await
+                .expect("healthy discovery test server should run");
+        });
+
+        let cluster_id = ClusterId::now_v7();
+        let target_node_id = NodeId::new_v4();
+        let mut bootstrap =
+            refreshable_bootstrap(cluster_id, format!("http://{stalled_addr}"), target_node_id);
+        bootstrap.relay_mode = RelayMode::Disabled;
+        bootstrap
+            .rendezvous_urls
+            .push(format!("http://{healthy_addr}"));
+
+        let targets = tokio::time::timeout(
+            Duration::from_secs(1),
+            bootstrap.refresh_dynamic_targets(None),
+        )
+        .await
+        .expect("healthy endpoint should win without waiting for the stalled seed")
+        .expect("parallel discovery should succeed");
+
+        assert_eq!(targets[0].path_kind, TransportPathKind::DirectQuic);
+
+        stalled_server.abort();
+        let _ = stalled_server.await;
+        healthy_server.abort();
+        let _ = healthy_server.await;
+    }
+
+    #[test]
+    fn connected_rendezvous_peers_are_prioritized_by_health_before_seeds() {
+        let peers = vec![
+            RendezvousEndpointStatus {
+                url: "https://connected.example".to_string(),
+                status: RendezvousEndpointConnectionState::Connected,
+                last_attempt_unix: Some(20),
+                last_success_unix: Some(20),
+                consecutive_failures: 0,
+                last_error: None,
+                active: false,
+            },
+            RendezvousEndpointStatus {
+                url: "https://active.example".to_string(),
+                status: RendezvousEndpointConnectionState::Connected,
+                last_attempt_unix: Some(10),
+                last_success_unix: Some(10),
+                consecutive_failures: 0,
+                last_error: None,
+                active: true,
+            },
+        ];
+
+        let merged = merge_connected_rendezvous_urls(&["https://seed.example".to_string()], &peers)
+            .expect("Rendezvous URLs should merge");
+
+        assert_eq!(
+            merged,
+            vec![
+                "https://active.example/".to_string(),
+                "https://connected.example/".to_string(),
+                "https://seed.example/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rendezvous_log_label_redacts_credentials_and_query_parameters() {
+        assert_eq!(
+            rendezvous_endpoint_log_label(
+                "https://user:secret@rendezvous.example/control?token=sensitive#fragment"
+            ),
+            "https://rendezvous.example/control"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
