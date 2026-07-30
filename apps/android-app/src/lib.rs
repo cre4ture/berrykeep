@@ -1,3 +1,5 @@
+#[cfg(target_os = "android")]
+mod android_context;
 mod android_saf_backend;
 #[cfg(debug_assertions)]
 mod android_test_bridge;
@@ -287,21 +289,22 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 const ANDROID_CONNECTION_LOG_TARGET: &str = "ironmesh_android_connection";
 
-/// Android calls this while loading the native library, before any JNI bridge
-/// can create an Iroh endpoint or resolve a relay host.  Iroh uses this
-/// application context to read Android's configured DNS servers.
+/// # Safety
+/// This function is intended to be called from Java via JNI during application startup.
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "system" fn JNI_OnLoad(vm: JavaVM, context: *mut std::ffi::c_void) -> jint {
-    // The Android runtime keeps both pointers valid for the process lifetime.
-    unsafe {
-        transport_sdk::install_android_jni_context(
-            vm.get_java_vm_pointer() as *mut std::ffi::c_void,
-            context,
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_initializeAndroidContext(
+    mut env: JNIEnv,
+    _class: JClass,
+    application_context: JObject,
+) {
+    if let Err(err) = android_context::initialize(&mut env, application_context) {
+        throw_java_error(
+            &mut env,
+            format!("rust initializeAndroidContext failed: {err:#}"),
         );
     }
-    jni::JNIVersion::V6.into()
 }
 
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {

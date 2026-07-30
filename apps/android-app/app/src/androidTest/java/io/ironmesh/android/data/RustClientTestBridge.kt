@@ -6,6 +6,9 @@ object RustClientTestBridge {
     }
 
     @JvmStatic
+    external fun getAndroidSystemDnsServerCount(): Int
+
+    @JvmStatic
     external fun startRendezvousRenewalScenario(): String
 
     @JvmStatic
