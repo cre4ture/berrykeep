@@ -40,6 +40,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Linux FUSE runtime
+        if: ${{ matrix.label == 'linux' }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fuse3
+          command -v fusermount3
+          test -c /dev/fuse
+          test -r /dev/fuse
+          test -w /dev/fuse
+          ls -l /dev/fuse "$(command -v fusermount3)"
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
