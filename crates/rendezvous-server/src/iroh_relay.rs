@@ -36,6 +36,7 @@ use tracing::warn;
 use transport_sdk::{IrohRelayTicket, PeerIdentity};
 
 use crate::auth::{AuthenticatedPeer, WithAuthenticatedPeer, authenticated_peer_from_tls_stream};
+use crate::{RendezvousServerTlsIdentity, auth::build_server_rustls_config};
 
 const TICKET_FORMAT: &str = "imrt1";
 const TICKET_VERSION: u8 = 1;
@@ -50,6 +51,25 @@ pub struct IrohRelayServerConfig {
     pub ticket_ttl: Duration,
     pub client_rx_bytes_per_second: u32,
     pub client_rx_max_burst_bytes: u32,
+    pub quic: Option<IrohRelayQuicServerConfig>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct IrohRelayQuicServerConfig {
+    pub bind_addr: SocketAddr,
+    pub public_port: u16,
+    pub server_identity: RendezvousServerTlsIdentity,
+}
+
+impl std::fmt::Debug for IrohRelayQuicServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IrohRelayQuicServerConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("public_port", &self.public_port)
+            .field("server_identity", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl IrohRelayServerConfig {
@@ -85,6 +105,14 @@ impl IrohRelayServerConfig {
         }
         if self.client_rx_max_burst_bytes == 0 {
             bail!("embedded iroh relay receive burst must be greater than zero");
+        }
+        if let Some(quic) = self.quic.as_ref() {
+            if quic.bind_addr.port() == 0 {
+                bail!("embedded iroh relay QUIC bind port must be greater than zero");
+            }
+            if quic.public_port == 0 {
+                bail!("embedded iroh relay QUIC public port must be greater than zero");
+            }
         }
         Ok(())
     }
@@ -138,6 +166,7 @@ impl TicketAuthority {
     fn issue(
         &self,
         public_urls: Vec<String>,
+        quic_port: Option<u16>,
         cluster_id: ClusterId,
         peer: Option<PeerIdentity>,
         endpoint_id: &str,
@@ -167,6 +196,7 @@ impl TicketAuthority {
                 URL_SAFE_NO_PAD.encode(signature)
             ),
             expires_at_unix,
+            quic_port,
         })
     }
 
@@ -362,6 +392,22 @@ impl IrohRelayRuntime {
         self.service.clone()
     }
 
+    pub(crate) async fn spawn_quic_server(&self) -> Result<Option<::iroh_relay::server::Server>> {
+        let Some(quic) = self.config.quic.as_ref() else {
+            return Ok(None);
+        };
+        let server_config = build_server_rustls_config(&quic.server_identity)
+            .context("failed building embedded iroh QAD TLS configuration")?;
+        let mut quic_config = ::iroh_relay::server::QuicConfig::new(quic.bind_addr);
+        quic_config.server_config = Some(server_config);
+        let mut config = ::iroh_relay::server::ServerConfig::default();
+        config.quic = Some(quic_config);
+        let server = ::iroh_relay::server::Server::spawn(config)
+            .await
+            .context("failed starting embedded iroh QAD server")?;
+        Ok(Some(server))
+    }
+
     pub(crate) fn issue_ticket(
         &self,
         cluster_id: ClusterId,
@@ -370,6 +416,7 @@ impl IrohRelayRuntime {
     ) -> Result<IrohRelayTicket> {
         self.authority.issue(
             self.config.public_urls.clone(),
+            self.config.quic.as_ref().map(|quic| quic.public_port),
             cluster_id,
             peer,
             endpoint_id,
@@ -549,6 +596,7 @@ mod tests {
             ticket_ttl: Duration::from_secs(3600),
             client_rx_bytes_per_second: 1024,
             client_rx_max_burst_bytes: 2048,
+            quic: None,
         };
         config.validate().expect("valid config should pass");
 
@@ -567,12 +615,14 @@ mod tests {
         let ticket = authority
             .issue(
                 vec!["https://relay.example".to_string()],
+                Some(7443),
                 ClusterId::now_v7(),
                 None,
                 &endpoint,
                 7_200,
             )
             .expect("ticket should issue");
+        assert_eq!(ticket.quic_port, Some(7443));
 
         let claims = authority
             .verify(&ticket.auth_token, &endpoint, 7_201)
@@ -603,6 +653,7 @@ mod tests {
         let first = authority
             .issue(
                 vec!["https://relay.example".to_string()],
+                None,
                 cluster_id,
                 None,
                 &endpoint,
@@ -612,6 +663,7 @@ mod tests {
         let second = authority
             .issue(
                 vec!["https://relay.example".to_string()],
+                None,
                 cluster_id,
                 None,
                 &endpoint,
@@ -629,6 +681,7 @@ mod tests {
         let ticket = authority
             .issue(
                 vec!["https://relay.example".to_string()],
+                None,
                 ClusterId::now_v7(),
                 None,
                 &allowed_endpoint.to_string(),

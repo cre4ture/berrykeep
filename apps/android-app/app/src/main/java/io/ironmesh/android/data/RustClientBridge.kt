@@ -138,6 +138,13 @@ object RustClientBridge {
     )
 
     @JvmStatic
+    external fun notifyForegrounded(
+        connectionInput: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    )
+
+    @JvmStatic
     external fun resetConnectionTimingMeasurement(
         connectionInput: String,
         serverCaPem: String?,

@@ -10,15 +10,17 @@ use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
     IronMeshClient, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,
-    ManagedClientOptions, build_client_with_optional_identity_from_planned_target,
-    build_http_client_from_pem, build_http_client_with_identity_from_pem,
-    compare_direct_and_relay_latency, enroll_connection_input_blocking, normalize_server_base_url,
+    ManagedClientOptions, ManagedIronMeshClient,
+    build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
+    enroll_connection_input_blocking, normalize_server_base_url,
 };
 use futures_util::TryStreamExt;
 use serde::Serialize;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use tracing_subscriber::filter::Directive;
@@ -37,6 +39,7 @@ const LONG_VERSION: &str = git_version::git_version!(
     fallback = concat!(env!("CARGO_PKG_VERSION"), "\nBuild revision: unknown"),
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
+const CLI_RUNTIME_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LatencyTestPathSelection {
@@ -73,6 +76,124 @@ struct LatencyTestSuiteResult {
 struct S3GatewayState {
     client: IronMeshClient,
 }
+
+struct CliClientHolder {
+    client: IronMeshClient,
+    _managed_client: Option<ManagedCliClient>,
+}
+
+struct ManagedCliClient {
+    _client: ManagedIronMeshClient,
+    _runtime: ManagedCliRuntime,
+}
+
+struct ManagedCliRuntime {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ManagedCliRuntime {
+    fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ManagedCliRuntime {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl CliClientHolder {
+    fn unmanaged(client: IronMeshClient) -> Self {
+        Self {
+            client,
+            _managed_client: None,
+        }
+    }
+
+    fn managed(managed_client: ManagedIronMeshClient, runtime: ManagedCliRuntime) -> Self {
+        Self {
+            client: managed_client.client(),
+            _managed_client: Some(ManagedCliClient {
+                _client: managed_client,
+                _runtime: runtime,
+            }),
+        }
+    }
+
+    fn client(&self) -> &IronMeshClient {
+        &self.client
+    }
+}
+
+fn build_managed_cli_client(
+    bootstrap: ConnectionBootstrap,
+    identity: ClientIdentityMaterial,
+) -> Result<(ManagedIronMeshClient, ManagedCliRuntime)> {
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let thread = std::thread::Builder::new()
+        .name("ironmesh-cli-managed-runtime".to_string())
+        .stack_size(CLI_RUNTIME_STACK_SIZE)
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build managed CLI client runtime")
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = result_tx.send(Err(error));
+                    return;
+                }
+            };
+            match runtime.block_on(
+                bootstrap
+                    .build_managed_client_with_identity(identity, ManagedClientOptions::default()),
+            ) {
+                Ok(managed_client) => {
+                    if result_tx.send(Ok(managed_client)).is_ok() {
+                        runtime.block_on(async {
+                            let _ = shutdown_rx.await;
+                        });
+                    }
+                }
+                Err(error) => {
+                    let _ = result_tx.send(Err(error));
+                }
+            }
+        })
+        .context("failed spawning managed CLI client runtime thread")?;
+    let runtime = ManagedCliRuntime {
+        shutdown: Some(shutdown_tx),
+        thread: Some(thread),
+    };
+    match result_rx.recv() {
+        Ok(Ok(managed_client)) => Ok((managed_client, runtime)),
+        Ok(Err(error)) => {
+            runtime.shutdown();
+            Err(error)
+        }
+        Err(error) => {
+            runtime.shutdown();
+            Err(anyhow::anyhow!(
+                "managed CLI client runtime exited before initialization: {error}"
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
 #[command(about = "CLI client for BerryKeep distributed storage")]
@@ -162,8 +283,26 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let thread = std::thread::Builder::new()
+        .name("ironmesh-cli-runtime".to_string())
+        .stack_size(CLI_RUNTIME_STACK_SIZE)
+        .spawn(|| -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("ironmesh-cli-worker")
+                .thread_stack_size(CLI_RUNTIME_STACK_SIZE)
+                .build()
+                .context("failed to build CLI runtime")?;
+            runtime.block_on(run())
+        })
+        .context("failed spawning CLI runtime thread")?;
+    thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("CLI runtime thread panicked"))?
+}
+
+async fn run() -> Result<()> {
     init_cli_tracing();
     let cli = Cli::parse();
     info!(
@@ -191,47 +330,51 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::CacheList => {
-            let client = build_client_node_from_cli(&cli).await?;
+            let client_holder = build_authenticated_sdk_from_cli(&cli).await?;
+            let client = ClientNode::with_client(client_holder.client().clone());
             for entry in client.cache_entries().await {
                 println!("{} ({} bytes)", entry.key, entry.size_bytes);
             }
             Ok(())
         }
         Commands::Put { key, value } => {
-            let client = build_client_node_from_cli(&cli).await?;
+            let client_holder = build_authenticated_sdk_from_cli(&cli).await?;
+            let client = ClientNode::with_client(client_holder.client().clone());
             let object = client.put(key.clone(), Bytes::from(value.clone())).await?;
             println!("stored '{}' ({} bytes)", object.key, object.size_bytes);
             Ok(())
         }
         Commands::Get { key } => {
-            let client = build_client_node_from_cli(&cli).await?;
+            let client_holder = build_authenticated_sdk_from_cli(&cli).await?;
+            let client = ClientNode::with_client(client_holder.client().clone());
             let payload = client.get_cached_or_fetch(key).await?;
             println!("{}", String::from_utf8_lossy(&payload));
             Ok(())
         }
         Commands::List { prefix, depth } => {
-            let sdk = build_authenticated_sdk_from_cli(&cli).await?;
-            let value = sdk
+            let client_holder = build_authenticated_sdk_from_cli(&cli).await?;
+            let value = client_holder
+                .client()
                 .store_index(prefix.as_deref(), (*depth).max(1), None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         Commands::Health => {
-            let client = build_authenticated_sdk_from_cli(&cli).await?;
-            print_json_endpoint(&client, "/api/v1/health").await
+            let client_holder = build_authenticated_sdk_from_cli(&cli).await?;
+            print_json_endpoint(client_holder.client(), "/api/v1/health").await
         }
         Commands::ClusterStatus => {
-            let client = build_authenticated_sdk_from_cli(&cli).await?;
-            print_json_endpoint(&client, "/api/v1/cluster/status").await
+            let client_holder = build_authenticated_sdk_from_cli(&cli).await?;
+            print_json_endpoint(client_holder.client(), "/api/v1/cluster/status").await
         }
         Commands::Nodes => {
-            let client = build_authenticated_sdk_from_cli(&cli).await?;
-            print_json_endpoint(&client, "/api/v1/cluster/nodes").await
+            let client_holder = build_authenticated_sdk_from_cli(&cli).await?;
+            print_json_endpoint(client_holder.client(), "/api/v1/cluster/nodes").await
         }
         Commands::ReplicationPlan => {
-            let client = build_authenticated_sdk_from_cli(&cli).await?;
-            print_json_endpoint(&client, "/api/v1/cluster/replication/plan").await
+            let client_holder = build_authenticated_sdk_from_cli(&cli).await?;
+            print_json_endpoint(client_holder.client(), "/api/v1/cluster/replication/plan").await
         }
         Commands::LatencyTest {
             path,
@@ -291,7 +434,8 @@ async fn main() -> Result<()> {
         }
         Commands::ServeS3 { bind } => {
             let bind_addr: SocketAddr = bind.parse()?;
-            let client = build_authenticated_sdk_from_cli(&cli).await?;
+            let client_holder = build_authenticated_sdk_from_cli(&cli).await?;
+            let client = client_holder.client().clone();
             log_client_transport_ready("serve_s3", &client);
             info!(
                 bind_addr = %bind_addr,
@@ -315,8 +459,13 @@ async fn main() -> Result<()> {
                 connection_source = connection_source(&cli),
                 "starting cli web interface"
             );
-            let web_ui_config = if cli.server_base_url.is_some() || cli.bootstrap_file.is_some() {
-                let client = build_authenticated_sdk_from_cli(&cli).await?;
+            let client_holder = if cli.server_base_url.is_some() || cli.bootstrap_file.is_some() {
+                Some(build_authenticated_sdk_from_cli(&cli).await?)
+            } else {
+                None
+            };
+            let web_ui_config = if let Some(client_holder) = client_holder.as_ref() {
+                let client = client_holder.client().clone();
                 log_client_transport_ready("serve_web", &client);
                 let mut web_ui_config = WebUiConfig::from_client(client);
                 if let Some(bootstrap_path) = cli.bootstrap_file.as_deref() {
@@ -583,7 +732,7 @@ async fn enroll_from_bootstrap(
     Ok(())
 }
 
-fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient> {
+async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> {
     let client_identity_path = configured_client_identity_path(cli);
     let client_identity = read_client_identity_from_cli(cli)?;
     let server_ca_override = read_server_ca_override_from_cli(cli)?;
@@ -603,16 +752,9 @@ fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient
             "building authenticated client from bootstrap"
         );
         let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
-        let client = match client_identity.as_ref() {
+        let client_holder = match client_identity.as_ref() {
             Some(identity) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("failed to build managed CLI client runtime")?;
-                let managed = runtime.block_on(bootstrap.build_managed_client_with_identity(
-                    identity.clone(),
-                    ManagedClientOptions::default(),
-                ))?;
+                let (managed, runtime) = build_managed_cli_client(bootstrap, identity.clone())?;
                 if let Some(renewed_identity) = managed.take_identity_update() {
                     match persist_renewed_client_identity(
                         client_identity_path.as_deref(),
@@ -629,12 +771,12 @@ fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient
                         ),
                     }
                 }
-                managed.client()
+                CliClientHolder::managed(managed, runtime)
             }
-            None => bootstrap.build_client()?,
+            None => CliClientHolder::unmanaged(bootstrap.build_client()?),
         };
-        log_client_transport_ready("build_authenticated_sdk_from_cli_blocking", &client);
-        return Ok(client);
+        log_client_transport_ready("build_authenticated_sdk_from_cli", client_holder.client());
+        return Ok(client_holder);
     }
 
     let server_base_url = cli
@@ -658,21 +800,8 @@ fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient
         ),
         None => build_http_client_from_pem(server_ca_override.as_deref(), base_url.as_str()),
     }?;
-    log_client_transport_ready("build_authenticated_sdk_from_cli_blocking", &client);
-    Ok(client)
-}
-
-async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<IronMeshClient> {
-    let cli = cli.clone();
-    tokio::task::spawn_blocking(move || build_authenticated_sdk_from_cli_blocking(&cli))
-        .await
-        .context("client construction task panicked")?
-}
-
-async fn build_client_node_from_cli(cli: &Cli) -> Result<ClientNode> {
-    Ok(ClientNode::with_client(
-        build_authenticated_sdk_from_cli(cli).await?,
-    ))
+    log_client_transport_ready("build_authenticated_sdk_from_cli", &client);
+    Ok(CliClientHolder::unmanaged(client))
 }
 
 async fn print_json_endpoint(client: &IronMeshClient, path: &str) -> Result<()> {
@@ -707,8 +836,9 @@ async fn run_latency_test(
         );
     }
 
-    let current_client = build_authenticated_sdk_from_cli(cli).await?;
-    log_client_transport_ready("latency_test_current_client", &current_client);
+    let current_client_holder = build_authenticated_sdk_from_cli(cli).await?;
+    let current_client = current_client_holder.client();
+    log_client_transport_ready("latency_test_current_client", current_client);
     let bootstrap = load_bootstrap_from_cli(cli)?;
     let identity = read_client_identity_from_cli(cli)?;
     let diagnostic_targets = bootstrap
@@ -720,12 +850,12 @@ async fn run_latency_test(
 
     let mut targets = match path_selection {
         LatencyTestPathSelection::Current => {
-            vec![probe_current_latency_target(&current_client, &config).await]
+            vec![probe_current_latency_target(current_client, &config).await]
         }
         LatencyTestPathSelection::Direct => {
             vec![
                 probe_direct_latency_target(
-                    &current_client,
+                    current_client,
                     &diagnostic_targets,
                     identity.as_ref(),
                     &config,
@@ -736,7 +866,7 @@ async fn run_latency_test(
         }
         LatencyTestPathSelection::Relay => {
             probe_relay_latency_targets(
-                &current_client,
+                current_client,
                 &diagnostic_targets,
                 identity.as_ref(),
                 &config,
@@ -747,13 +877,13 @@ async fn run_latency_test(
             .await
         }
         LatencyTestPathSelection::All => {
-            let mut targets = vec![probe_current_latency_target(&current_client, &config).await];
+            let mut targets = vec![probe_current_latency_target(current_client, &config).await];
             if (current_client.uses_relay_transport() || node_id.is_some())
                 && diagnostic_targets.direct.is_some()
             {
                 targets.push(
                     probe_direct_latency_target(
-                        &current_client,
+                        current_client,
                         &diagnostic_targets,
                         identity.as_ref(),
                         &config,
@@ -764,7 +894,7 @@ async fn run_latency_test(
             }
             targets.extend(
                 probe_relay_latency_targets(
-                    &current_client,
+                    current_client,
                     &diagnostic_targets,
                     identity.as_ref(),
                     &config,

@@ -40,6 +40,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Linux FUSE runtime
+        if: ${{ matrix.label == 'linux' }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fuse3
+          command -v fusermount3
+          test -c /dev/fuse
+          test -r /dev/fuse
+          test -w /dev/fuse
+          ls -l /dev/fuse "$(command -v fusermount3)"
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -81,12 +93,91 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Run system tests
-        run: cargo -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml
+        run: cargo -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml --lib
+
+  quic-network-tests:
+    name: Sys (linux QUIC network)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      IRONMESH_QUIC_TEST_ARTIFACT_DIR: ${{ github.workspace }}/test-artifacts/quic-network
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install network-namespace tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes iproute2 nftables
+
+      - name: Enable unprivileged user namespaces
+        run: |
+          if sysctl -n kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          command -v nft
+          command -v tc
+          unshare --user --map-root-user true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install web workspace dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Run QUIC network tests
+        shell: bash
+        run: |
+          mkdir -p "${IRONMESH_QUIC_TEST_ARTIFACT_DIR}"
+          cargo -Z bindeps test --locked \
+            --manifest-path tests/system-tests/Cargo.toml \
+            --test quic_network \
+            -- --test-threads=1 --nocapture \
+            2>&1 | tee "${IRONMESH_QUIC_TEST_ARTIFACT_DIR}/test-output.log"
+
+      - name: Upload QUIC network test diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: quic-network-test-diagnostics
+          path: ${{ env.IRONMESH_QUIC_TEST_ARTIFACT_DIR }}
+          if-no-files-found: warn
+          retention-days: 7
 
   required-system-tests:
     name: Required system tests
     if: ${{ always() }}
-    needs: system-tests
+    needs:
+      - system-tests
+      - quic-network-tests
     runs-on: ubuntu-latest
     steps:
       - name: Verify required system-test results

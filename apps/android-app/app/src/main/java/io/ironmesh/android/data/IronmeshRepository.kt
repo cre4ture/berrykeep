@@ -460,6 +460,23 @@ class IronmeshRepository {
         )
     }
 
+    /**
+     * A foreground transition is a high-value route-discovery hint. The shared
+     * Rust controller coalesces it with any concurrent refresh and keeps the
+     * existing static routes when discovery is unavailable.
+     */
+    fun notifyForegrounded(
+        connectionInput: String,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ) {
+        RustClientBridge.notifyForegrounded(
+            normalizedConnectionInput(connectionInput),
+            serverCaPem,
+            normalizedClientIdentityJson(clientIdentityJson),
+        )
+    }
+
     fun resetConnectionTimingMeasurement(
         connectionInput: String,
         serverCaPem: String? = null,

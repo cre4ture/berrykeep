@@ -230,7 +230,10 @@ class MainViewModel(
     private var processLifecycleObserverRegistered = false
     private val processLifecycleObserver = LifecycleEventObserver { _, event ->
         when (event) {
-            Lifecycle.Event.ON_START -> webUiSessionBackgroundGrace.cancelScheduledStop()
+            Lifecycle.Event.ON_START -> {
+                webUiSessionBackgroundGrace.cancelScheduledStop()
+                notifyManagedClientForegrounded()
+            }
             Lifecycle.Event.ON_STOP -> {
                 if (uiState.value.webUiSession != null) {
                     webUiSessionBackgroundGrace.scheduleStop()
@@ -306,6 +309,29 @@ class MainViewModel(
             action()
         } else {
             mainHandler.post(action)
+        }
+    }
+
+    private fun notifyManagedClientForegrounded() {
+        val deviceAuth = uiState.value.deviceAuthState
+        val connectionInput = deviceAuth.connectionBootstrapJson()
+        val clientIdentityJson = deviceAuth.toClientIdentityJson()
+        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+            return
+        }
+
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    repository.notifyForegrounded(
+                        connectionInput = connectionInput,
+                        serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                        clientIdentityJson = clientIdentityJson,
+                    )
+                }.onFailure { error ->
+                    Log.w("MainViewModel", "Foreground route refresh hint failed", error)
+                }
+            }
         }
     }
 

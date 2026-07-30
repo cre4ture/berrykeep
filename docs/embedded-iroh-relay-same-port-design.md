@@ -91,8 +91,9 @@ gain IronMesh ticket semantics automatically.
 ## Configuration
 
 The default production setup needs no relay-specific variables. It derives the
-relay origin from `IRONMESH_RENDEZVOUS_PUBLIC_URL` and uses the existing bind
-address and TLS identity.
+relay origin from `IRONMESH_RENDEZVOUS_PUBLIC_URL`, uses the existing TCP bind
+address for Rendezvous and `/relay`, and reuses the TLS identity for Iroh QUIC
+Address Discovery on UDP `7842`.
 
 Advanced controls are:
 
@@ -103,9 +104,17 @@ Advanced controls are:
 - `IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND` — per-connection receive
   rate.
 - `IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES` — per-connection burst size.
+- `IRONMESH_IROH_RELAY_QUIC_BIND` — QAD UDP bind address; defaults to
+  `0.0.0.0:7842` when a Rendezvous TLS identity is present.
+- `IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT` — advertised QAD UDP port; defaults
+  to the bind port.
+- `IRONMESH_IROH_RELAY_QUIC_TLS_CERT` and
+  `IRONMESH_IROH_RELAY_QUIC_TLS_KEY` — optional dedicated QAD identity for
+  deployments that cannot reuse Rendezvous TLS.
 
-There is intentionally no embedded-relay bind address, public URL, static
-authentication token, or TLS certificate setting.
+There is intentionally no separate relay public URL or static authentication
+token. The QAD endpoint only reports the caller's observed UDP address; relay
+admission remains protected by endpoint-bound tickets on `/relay`.
 
 ## Security Properties and Limits
 
