@@ -1677,10 +1677,11 @@ mod tests {
                 .filter(|target| target.path_kind == transport_sdk::TransportPathKind::RelayTunnel)
                 .collect::<Vec<_>>();
             assert_eq!(relay_targets.len(), 2, "expected one relay target per rendezvous URL");
-            let relay_rendezvous_urls = relay_targets
+            let mut relay_rendezvous_urls = relay_targets
                 .iter()
                 .map(|target| target.rendezvous_urls.clone())
                 .collect::<Vec<_>>();
+            relay_rendezvous_urls.sort();
             assert_eq!(
                 relay_rendezvous_urls,
                 vec![

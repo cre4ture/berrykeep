@@ -46,11 +46,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes fuse3
-          command -v fusermount3
+          fusermount3_path="$(dpkg-query --listfiles fuse3 | awk '/\/fusermount3$/ { print; exit }')"
+          test -n "$fusermount3_path"
+          export PATH="$(dirname "$fusermount3_path"):$PATH"
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          test "$(readlink -f "$(command -v fusermount3)")" = "$(readlink -f "$fusermount3_path")"
           test -c /dev/fuse
           test -r /dev/fuse
           test -w /dev/fuse
-          ls -l /dev/fuse "$(command -v fusermount3)"
+          ls -l /dev/fuse "$fusermount3_path"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

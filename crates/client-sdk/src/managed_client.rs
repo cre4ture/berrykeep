@@ -493,6 +493,15 @@ impl ManagedIronMeshClient {
             .reconcile_transport_membership(&refreshed_client, !identity_updated);
         let routes_after = self.client.connection_route_snapshot();
         log_dynamic_route_membership_changes(&routes_before, &routes_after);
+        if routes_added > 0 {
+            tracing::info!(
+                event = "dynamic_route_probe_scheduled",
+                refresh_reason = telemetry.reason.as_str(),
+                routes_added,
+                "probing newly discovered routes without blocking the active fallback"
+            );
+            self.client.spawn_due_connection_route_refresh();
+        }
         *self
             .controller
             .last_success
