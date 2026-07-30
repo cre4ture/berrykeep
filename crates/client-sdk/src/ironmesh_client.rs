@@ -2199,7 +2199,7 @@ async fn probe_endpoint_background_quality(
     Ok(latency_samples_ms)
 }
 
-fn blocking_runtime() -> Result<&'static tokio::runtime::Runtime> {
+pub(crate) fn blocking_runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 
     match RUNTIME.get_or_init(|| {
