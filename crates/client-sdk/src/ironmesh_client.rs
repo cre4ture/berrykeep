@@ -53,6 +53,7 @@ const STAGED_DOWNLOAD_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
 const TRANSPORT_STREAM_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
 const CLIENT_ROUTE_UNKNOWN_LATENCY_MS: f64 = 75.0;
 const CLIENT_ROUTE_RELAY_PENALTY_MS: f64 = 500.0;
+const CLIENT_ROUTE_DIRECT_QUIC_BONUS_MS: f64 = 100.0;
 const CLIENT_ROUTE_FAILURE_PENALTY_MS: f64 = 250.0;
 const CLIENT_ROUTE_ACTIVE_BONUS_MS: f64 = 50.0;
 const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
@@ -1204,6 +1205,9 @@ fn endpoint_score(
         .unwrap_or(CLIENT_ROUTE_UNKNOWN_LATENCY_MS);
     if descriptor.path_kind == ClientEndpointPathKind::Relay {
         score += CLIENT_ROUTE_RELAY_PENALTY_MS;
+    }
+    if descriptor.transport_path_kind == TransportPathKind::DirectQuic {
+        score -= CLIENT_ROUTE_DIRECT_QUIC_BONUS_MS;
     }
     score += state.consecutive_failures as f64 * CLIENT_ROUTE_FAILURE_PENALTY_MS;
     if let Some(throughput_bytes_per_sec) = state.ewma_throughput_bytes_per_sec {
@@ -2954,6 +2958,10 @@ impl IronMeshClient {
         }
 
         self.connection_route_snapshot()
+    }
+
+    pub(crate) fn spawn_due_connection_route_refresh(&self) {
+        self.maybe_spawn_background_quality_refresh();
     }
 
     pub fn connection_diagnostics(&self) -> ClientConnectionDiagnostics {
