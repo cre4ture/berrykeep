@@ -287,6 +287,23 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 const ANDROID_CONNECTION_LOG_TARGET: &str = "ironmesh_android_connection";
 
+/// Android calls this while loading the native library, before any JNI bridge
+/// can create an Iroh endpoint or resolve a relay host.  Iroh uses this
+/// application context to read Android's configured DNS servers.
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(vm: JavaVM, context: *mut std::ffi::c_void) -> jint {
+    // The Android runtime keeps both pointers valid for the process lifetime.
+    unsafe {
+        transport_sdk::install_android_jni_context(
+            vm.get_java_vm_pointer() as *mut std::ffi::c_void,
+            context,
+        );
+    }
+    jni::JNIVersion::V6.into()
+}
+
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     if let Some(rt) = RUNTIME.get() {
@@ -2015,6 +2032,43 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_not
             &mut env,
             format!("rust notifyNetworkChanged failed: {err:#}"),
         );
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_notifyForegrounded(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+) {
+    let result = (|| -> Result<()> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let configured =
+            cached_configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?;
+        let Some(managed_client) = configured.managed_client else {
+            return Ok(());
+        };
+        runtime()?.spawn(async move {
+            let _ = managed_client.notify_foregrounded().await;
+            if let Some(identity) = managed_client.take_identity_update()
+                && let Err(error) = persist_android_client_identity(&identity)
+            {
+                tracing::warn!(error = %error, "failed to persist rendezvous identity after Android foreground hint");
+            }
+        });
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        throw_java_error(&mut env, format!("rust notifyForegrounded failed: {err:#}"));
     }
 }
 

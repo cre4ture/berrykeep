@@ -357,6 +357,17 @@ pub(crate) fn build_global_mtls_rustls_config(
     ))
 }
 
+pub(crate) fn build_server_rustls_config(
+    server_identity: &RendezvousServerTlsIdentity,
+) -> Result<rustls::ServerConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (cert_chain, key) = load_server_tls_identity(server_identity)?;
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .context("failed creating server-only rustls config")
+}
+
 fn load_server_tls_identity(
     server_identity: &RendezvousServerTlsIdentity,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {

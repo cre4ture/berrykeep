@@ -5,8 +5,9 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use common::{ClusterId, NodeId};
 pub use rendezvous_server::{
-    ClusterCaRegistry, GlobalClusterRegistrationConfig, IrohRelayServerConfig, RendezvousClientCa,
-    RendezvousMtlsConfig, RendezvousServerConfig, RendezvousServerTlsIdentity,
+    ClusterCaRegistry, GlobalClusterRegistrationConfig, IrohRelayQuicServerConfig,
+    IrohRelayServerConfig, RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerConfig,
+    RendezvousServerTlsIdentity,
 };
 
 use crate::failover::{
@@ -176,8 +177,6 @@ impl RendezvousServiceConfig {
         let allow_insecure_http = lookup_env("IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP")
             .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
-        let iroh_relay =
-            build_embedded_iroh_relay_config(&lookup_env, &public_url, allow_insecure_http)?;
         let global_registration_enabled =
             lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED")
                 .map(|value| {
@@ -222,6 +221,12 @@ impl RendezvousServiceConfig {
                 failover_package.as_ref(),
             )?
         };
+        let iroh_relay = build_embedded_iroh_relay_config(
+            &lookup_env,
+            &public_url,
+            allow_insecure_http,
+            mtls.as_ref().map(|mtls| mtls.server_identity.clone()),
+        )?;
 
         let config = Self {
             bind_addr,
@@ -291,6 +296,7 @@ fn build_embedded_iroh_relay_config<F>(
     lookup_env: &F,
     public_url: &str,
     allow_insecure_http: bool,
+    default_server_identity: Option<RendezvousServerTlsIdentity>,
 ) -> Result<Option<IrohRelayServerConfig>>
 where
     F: Fn(&str) -> Option<String>,
@@ -299,6 +305,10 @@ where
     const TICKET_TTL_ENV: &str = "IRONMESH_IROH_RELAY_TICKET_TTL_SECS";
     const RATE_ENV: &str = "IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND";
     const BURST_ENV: &str = "IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES";
+    const QUIC_BIND_ENV: &str = "IRONMESH_IROH_RELAY_QUIC_BIND";
+    const QUIC_PUBLIC_PORT_ENV: &str = "IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT";
+    const QUIC_CERT_ENV: &str = "IRONMESH_IROH_RELAY_QUIC_TLS_CERT";
+    const QUIC_KEY_ENV: &str = "IRONMESH_IROH_RELAY_QUIC_TLS_KEY";
 
     let enabled = lookup_env(ENABLED_ENV)
         .map(|value| parse_bool_env(ENABLED_ENV, &value))
@@ -320,12 +330,59 @@ where
         parse_positive_env_u32(RATE_ENV, configured_rate, 16 * 1024 * 1024)?;
     let client_rx_max_burst_bytes =
         parse_positive_env_u32(BURST_ENV, configured_burst, 32 * 1024 * 1024)?;
+    let quic_cert_path = lookup_env(QUIC_CERT_ENV);
+    let quic_key_path = lookup_env(QUIC_KEY_ENV);
+    let explicit_server_identity = match (quic_cert_path, quic_key_path) {
+        (Some(cert_path), Some(key_path)) => Some(RendezvousServerTlsIdentity::Files {
+            cert_path: PathBuf::from(cert_path),
+            key_path: PathBuf::from(key_path),
+        }),
+        (None, None) => None,
+        _ => bail!("{QUIC_CERT_ENV} and {QUIC_KEY_ENV} must be set together"),
+    };
+    let server_identity = explicit_server_identity.or(default_server_identity);
+    let configured_quic_bind = lookup_env(QUIC_BIND_ENV);
+    let configured_public_port = lookup_env(QUIC_PUBLIC_PORT_ENV);
+    if server_identity.is_none()
+        && (configured_quic_bind.is_some() || configured_public_port.is_some())
+    {
+        bail!(
+            "embedded iroh relay QUIC address discovery requires {QUIC_CERT_ENV} plus \
+             {QUIC_KEY_ENV}, or the rendezvous TLS identity"
+        );
+    }
+    let quic = server_identity
+        .map(|server_identity| -> Result<IrohRelayQuicServerConfig> {
+            let bind_addr = configured_quic_bind
+                .unwrap_or_else(|| "0.0.0.0:7842".to_string())
+                .parse::<SocketAddr>()
+                .with_context(|| format!("invalid {QUIC_BIND_ENV}"))?;
+            if bind_addr.port() == 0 {
+                bail!("{QUIC_BIND_ENV} port must be greater than zero");
+            }
+            let public_port = match configured_public_port {
+                Some(value) => value
+                    .parse::<u16>()
+                    .with_context(|| format!("invalid {QUIC_PUBLIC_PORT_ENV}"))?,
+                None => bind_addr.port(),
+            };
+            if public_port == 0 {
+                bail!("{QUIC_PUBLIC_PORT_ENV} must be greater than zero");
+            }
+            Ok(IrohRelayQuicServerConfig {
+                bind_addr,
+                public_port,
+                server_identity,
+            })
+        })
+        .transpose()?;
 
     Ok(Some(IrohRelayServerConfig {
         public_urls: vec![public_url.trim_end_matches('/').to_string()],
         ticket_ttl: std::time::Duration::from_secs(u64::from(ticket_ttl_secs)),
         client_rx_bytes_per_second,
         client_rx_max_burst_bytes,
+        quic,
     }))
 }
 
@@ -643,6 +700,15 @@ mod tests {
         assert_eq!(relay.ticket_ttl, std::time::Duration::from_secs(7200));
         assert_eq!(relay.client_rx_bytes_per_second, 16 * 1024 * 1024);
         assert_eq!(relay.client_rx_max_burst_bytes, 32 * 1024 * 1024);
+        let quic = relay
+            .quic
+            .as_ref()
+            .expect("rendezvous TLS identity should enable QUIC address discovery");
+        assert_eq!(
+            quic.bind_addr,
+            "0.0.0.0:7842".parse().expect("default QAD address")
+        );
+        assert_eq!(quic.public_port, 7842);
 
         let configured = config
             .server_config()
@@ -667,6 +733,49 @@ mod tests {
         let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
             .expect("explicitly disabled relay config should load");
         assert!(config.iroh_relay.is_none());
+    }
+
+    #[test]
+    fn from_lookup_supports_dedicated_iroh_quic_identity_for_insecure_test_relay() {
+        let cli = RendezvousServiceCliConfig::default();
+        let env = HashMap::from([
+            (
+                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IRONMESH_IROH_RELAY_QUIC_BIND".to_string(),
+                "0.0.0.0:17842".to_string(),
+            ),
+            (
+                "IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT".to_string(),
+                "27842".to_string(),
+            ),
+            (
+                "IRONMESH_IROH_RELAY_QUIC_TLS_CERT".to_string(),
+                "/tmp/qad.pem".to_string(),
+            ),
+            (
+                "IRONMESH_IROH_RELAY_QUIC_TLS_KEY".to_string(),
+                "/tmp/qad.key".to_string(),
+            ),
+        ]);
+
+        let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
+            .expect("dedicated QAD identity should load");
+        let quic = config
+            .iroh_relay
+            .and_then(|relay| relay.quic)
+            .expect("QAD should be configured");
+        assert_eq!(
+            quic.bind_addr,
+            "0.0.0.0:17842".parse().expect("configured QAD address")
+        );
+        assert_eq!(quic.public_port, 27842);
+        assert!(matches!(
+            quic.server_identity,
+            RendezvousServerTlsIdentity::Files { .. }
+        ));
     }
 
     #[test]
