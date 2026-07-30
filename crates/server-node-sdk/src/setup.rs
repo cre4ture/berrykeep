@@ -11,7 +11,8 @@ use sha2::Sha256;
 use std::net::Ipv4Addr;
 use tokio::sync::mpsc::{self, OwnedPermit};
 
-const SETUP_STATE_VERSION: u32 = 1;
+const LEGACY_SETUP_STATE_VERSION: u32 = 1;
+const SETUP_STATE_VERSION: u32 = 2;
 const MANAGED_SIGNER_BACKUP_VERSION: u32 = 1;
 const MANAGED_RENDEZVOUS_FAILOVER_VERSION: u32 = 1;
 const MANAGED_SIGNER_BACKUP_SALT_LEN: usize = 16;
@@ -19,6 +20,12 @@ const MANAGED_SIGNER_BACKUP_NONCE_LEN: usize = 12;
 const MANAGED_SIGNER_BACKUP_KEY_LEN: usize = 32;
 const MANAGED_SIGNER_BACKUP_PBKDF2_ROUNDS: u32 = 600_000;
 const SETUP_RUNTIME_TRANSITION_DELAY_MS: u64 = 100;
+const MANAGED_INTERNAL_CA_CERT_PATH: &str = "managed/runtime/internal/cluster-ca.pem";
+const MANAGED_INTERNAL_CERT_PATH: &str = "managed/runtime/internal/node.pem";
+const MANAGED_INTERNAL_KEY_PATH: &str = "managed/runtime/internal/node.key";
+const MANAGED_PUBLIC_CERT_PATH: &str = "managed/runtime/public/public.pem";
+const MANAGED_PUBLIC_KEY_PATH: &str = "managed/runtime/public/public.key";
+const MANAGED_PUBLIC_CA_CERT_PATH: &str = "managed/runtime/public/public-ca.pem";
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -45,14 +52,49 @@ enum SetupLifecycleState {
     Online,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ManagedRecoveryReasonCode {
+    EnrollmentPackageMissing,
+    EnrollmentPackageInvalid,
+    EnrollmentIdentityMismatch,
+    CertificateMaterialMissing,
+    CertificateExpired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManagedRecoveryReason {
+    code: ManagedRecoveryReasonCode,
+    detected_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+impl ManagedRecoveryReason {
+    fn new(code: ManagedRecoveryReasonCode, detail: impl Into<Option<String>>) -> Self {
+        Self {
+            code,
+            detected_at_unix: unix_ts(),
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ManagedSetupState {
     version: u32,
     state: SetupLifecycleState,
     updated_at_unix: u64,
     cluster_id: Option<ClusterId>,
     node_id: Option<NodeId>,
+    /// Read-only compatibility input for setup-state v1. Version 2 derives the enrollment path
+    /// from the setup data directory and never serializes this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_node_enrollment_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_data_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_reason: Option<ManagedRecoveryReason>,
     pub(crate) admin_password_hash: Option<String>,
     managed_rendezvous_bind_addr: Option<String>,
     managed_rendezvous_public_url: Option<String>,
@@ -68,6 +110,8 @@ impl Default for ManagedSetupState {
             cluster_id: None,
             node_id: None,
             runtime_node_enrollment_path: None,
+            runtime_data_dir: None,
+            recovery_reason: None,
             admin_password_hash: None,
             managed_rendezvous_bind_addr: None,
             managed_rendezvous_public_url: None,
@@ -186,6 +230,7 @@ struct SetupStatusResponse {
     bootstrap_tls_fingerprint: Option<String>,
     cluster_id: Option<ClusterId>,
     node_id: Option<NodeId>,
+    recovery_reason: Option<ManagedRecoveryReason>,
     pending_join_request: Option<NodeJoinRequest>,
 }
 
@@ -275,7 +320,10 @@ pub(crate) fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<
         return Ok(StartupMode::Setup(config));
     };
 
-    if managed_state.state != SetupLifecycleState::Online {
+    if !matches!(
+        managed_state.state,
+        SetupLifecycleState::Online | SetupLifecycleState::Recovery
+    ) {
         tracing::info!(
             startup_mode = "bootstrap_setup",
             startup_reason = "managed_setup_state_not_online",
@@ -288,82 +336,231 @@ pub(crate) fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<
         return Ok(StartupMode::Setup(config));
     }
 
-    let Some(enrollment_path) = managed_state.runtime_node_enrollment_path.as_deref() else {
-        tracing::warn!(
-            startup_mode = "bootstrap_setup",
-            startup_reason = "runtime_node_enrollment_path_missing",
-            state_path = %config.state_path.display(),
-            cluster_id = ?managed_state.cluster_id,
-            node_id = ?managed_state.node_id,
-            "server node managed state is online but has no runtime enrollment path"
-        );
-        return Ok(StartupMode::Setup(config));
-    };
-
-    let resolved_path = match resolve_materialized_path(&config.data_dir, enrollment_path) {
+    let source_enrollment_path = match find_managed_enrollment_path(&config, &managed_state) {
         Ok(path) => path,
         Err(err) => {
             tracing::warn!(
                 startup_mode = "bootstrap_setup",
-                startup_reason = "runtime_node_enrollment_path_invalid",
+                startup_reason = "runtime_node_enrollment_path_missing_or_invalid",
                 state_path = %config.state_path.display(),
-                enrollment_path = %enrollment_path,
                 error = %err,
                 cluster_id = ?managed_state.cluster_id,
                 node_id = ?managed_state.node_id,
-                "server node managed state references an invalid runtime enrollment path"
+                "server node managed state has no usable runtime enrollment package"
             );
+            transition_managed_setup_state_to_recovery(
+                &config.state_path,
+                &mut managed_state,
+                ManagedRecoveryReason::new(
+                    ManagedRecoveryReasonCode::EnrollmentPackageMissing,
+                    Some(err.to_string()),
+                ),
+            )?;
             return Ok(StartupMode::Setup(config));
         }
     };
-    if !resolved_path.exists() {
+    if !source_enrollment_path.exists() {
         tracing::warn!(
             startup_mode = "bootstrap_setup",
             startup_reason = "runtime_node_enrollment_file_missing",
             state_path = %config.state_path.display(),
-            enrollment_path = %enrollment_path,
-            resolved_enrollment_path = %resolved_path.display(),
+            resolved_enrollment_path = %source_enrollment_path.display(),
             cluster_id = ?managed_state.cluster_id,
             node_id = ?managed_state.node_id,
-            "server node managed state is online but runtime enrollment file is missing"
+            "server node managed state has no runtime enrollment file"
         );
+        transition_managed_setup_state_to_recovery(
+            &config.state_path,
+            &mut managed_state,
+            ManagedRecoveryReason::new(
+                ManagedRecoveryReasonCode::EnrollmentPackageMissing,
+                Some(format!(
+                    "runtime enrollment file {} does not exist",
+                    source_enrollment_path.display()
+                )),
+            ),
+        )?;
         return Ok(StartupMode::Setup(config));
     }
 
-    let mut runtime = ServerNodeConfig::from_enrollment_path(&resolved_path).map_err(|err| {
-        tracing::error!(
-            startup_reason = "runtime_node_enrollment_load_failed",
-            state_path = %config.state_path.display(),
-            enrollment_path = %enrollment_path,
-            resolved_enrollment_path = %resolved_path.display(),
-            error = %err,
-            "server node failed to load managed runtime enrollment"
+    let original_package = match NodeEnrollmentPackage::from_path(&source_enrollment_path) {
+        Ok(package) => package,
+        Err(err) => {
+            tracing::error!(
+                startup_mode = "bootstrap_setup",
+                startup_reason = "runtime_node_enrollment_load_failed",
+                state_path = %config.state_path.display(),
+                resolved_enrollment_path = %source_enrollment_path.display(),
+                error = %err,
+                "server node failed to load managed runtime enrollment"
+            );
+            transition_managed_setup_state_to_recovery(
+                &config.state_path,
+                &mut managed_state,
+                ManagedRecoveryReason::new(
+                    ManagedRecoveryReasonCode::EnrollmentPackageInvalid,
+                    Some(err.to_string()),
+                ),
+            )?;
+            return Ok(StartupMode::Setup(config));
+        }
+    };
+    let runtime_data_dir = match managed_runtime_data_dir(&managed_state, &original_package) {
+        Ok(path) => path,
+        Err(err) => {
+            transition_managed_setup_state_to_recovery(
+                &config.state_path,
+                &mut managed_state,
+                ManagedRecoveryReason::new(
+                    ManagedRecoveryReasonCode::EnrollmentPackageInvalid,
+                    Some(err.to_string()),
+                ),
+            )?;
+            return Ok(StartupMode::Setup(config));
+        }
+    };
+    let managed_package =
+        match canonical_managed_node_enrollment(original_package.clone(), &runtime_data_dir) {
+            Ok(package) => package,
+            Err(err) => {
+                transition_managed_setup_state_to_recovery(
+                    &config.state_path,
+                    &mut managed_state,
+                    ManagedRecoveryReason::new(
+                        ManagedRecoveryReasonCode::EnrollmentPackageInvalid,
+                        Some(err.to_string()),
+                    ),
+                )?;
+                return Ok(StartupMode::Setup(config));
+            }
+        };
+    let canonical_enrollment_path = runtime_node_enrollment_path(&config.data_dir);
+    let mut runtime = match ServerNodeConfig::from_enrollment(managed_package.clone()) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::error!(
+                startup_mode = "bootstrap_setup",
+                startup_reason = "runtime_node_enrollment_materialization_failed",
+                state_path = %config.state_path.display(),
+                resolved_enrollment_path = %source_enrollment_path.display(),
+                runtime_data_dir = %runtime_data_dir.display(),
+                error = %err,
+                "server node failed to materialize managed runtime enrollment"
+            );
+            transition_managed_setup_state_to_recovery(
+                &config.state_path,
+                &mut managed_state,
+                ManagedRecoveryReason::new(
+                    ManagedRecoveryReasonCode::EnrollmentPackageInvalid,
+                    Some(err.to_string()),
+                ),
+            )?;
+            return Ok(StartupMode::Setup(config));
+        }
+    };
+    runtime.node_enrollment_path = Some(canonical_enrollment_path.clone());
+    runtime.node_enrollment_auto_renew_enabled =
+        parse_enrollment_auto_renew_enabled(default_node_enrollment_auto_renew_enabled(&runtime));
+    runtime.node_enrollment_auto_renew_check_secs = node_enrollment_auto_renew_check_secs();
+
+    if managed_state
+        .cluster_id
+        .is_some_and(|cluster_id| cluster_id != runtime.cluster_id)
+        || managed_state
+            .node_id
+            .is_some_and(|node_id| node_id != runtime.node_id)
+    {
+        let identity_mismatch_detail = format!(
+            "runtime enrollment identity {}/{} does not match managed state {}/{}",
+            runtime.cluster_id,
+            runtime.node_id,
+            managed_state
+                .cluster_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
+            managed_state
+                .node_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unset".to_string())
         );
-        err
-    })?;
+        transition_managed_setup_state_to_recovery(
+            &config.state_path,
+            &mut managed_state,
+            ManagedRecoveryReason::new(
+                ManagedRecoveryReasonCode::EnrollmentIdentityMismatch,
+                Some(identity_mismatch_detail),
+            ),
+        )?;
+        return Ok(StartupMode::Setup(config));
+    }
+
     apply_managed_signer_paths(&config.data_dir, &mut runtime);
     apply_managed_rendezvous_config(&config.data_dir, &managed_state, &mut runtime);
-    if runtime_enrollment_requires_rejoin(&runtime) {
+
+    if original_package != managed_package || source_enrollment_path != canonical_enrollment_path {
+        managed_package
+            .write_to_path(&canonical_enrollment_path)
+            .context("failed persisting canonical managed runtime enrollment")?;
+    }
+
+    let recovered = managed_state.state == SetupLifecycleState::Recovery;
+    let runtime_data_dir_string = runtime_data_dir.display().to_string();
+    let model_migrated = managed_state.version != SETUP_STATE_VERSION
+        || managed_state.cluster_id != Some(runtime.cluster_id)
+        || managed_state.node_id != Some(runtime.node_id)
+        || managed_state.runtime_node_enrollment_path.is_some()
+        || managed_state.runtime_data_dir.as_deref() != Some(runtime_data_dir_string.as_str());
+    managed_state.version = SETUP_STATE_VERSION;
+    managed_state.cluster_id = Some(runtime.cluster_id);
+    managed_state.node_id = Some(runtime.node_id);
+    managed_state.runtime_node_enrollment_path = None;
+    managed_state.runtime_data_dir = Some(runtime_data_dir_string);
+    if model_migrated {
+        managed_state.updated_at_unix = unix_ts();
+        write_managed_setup_state(&config.state_path, &managed_state)?;
+    }
+
+    if let Some(reason_code) = runtime_enrollment_recovery_reason(&runtime) {
         tracing::warn!(
             startup_mode = "bootstrap_setup",
             startup_reason = "runtime_node_enrollment_requires_rejoin",
             state_path = %config.state_path.display(),
-            enrollment_path = %enrollment_path,
-            resolved_enrollment_path = %resolved_path.display(),
+            resolved_enrollment_path = %source_enrollment_path.display(),
             cluster_id = %runtime.cluster_id,
             node_id = %runtime.node_id,
             "server node startup selected setup recovery mode"
         );
-        transition_managed_setup_state_to_recovery(&config.state_path, &mut managed_state)?;
+        transition_managed_setup_state_to_recovery(
+            &config.state_path,
+            &mut managed_state,
+            ManagedRecoveryReason::new(reason_code, None),
+        )?;
         return Ok(StartupMode::Setup(config));
     }
+
+    let lifecycle_changed = managed_state.state != SetupLifecycleState::Online
+        || managed_state.recovery_reason.is_some();
+    managed_state.state = SetupLifecycleState::Online;
+    managed_state.recovery_reason = None;
+    if lifecycle_changed {
+        managed_state.updated_at_unix = unix_ts();
+        write_managed_setup_state(&config.state_path, &managed_state)?;
+    }
+
     runtime.admin_password_hash = managed_state.admin_password_hash.clone();
     tracing::info!(
         startup_mode = "runtime",
-        startup_reason = "managed_setup_state_online",
+        startup_reason = if recovered {
+            "managed_setup_recovered"
+        } else if model_migrated {
+            "managed_setup_state_migrated"
+        } else {
+            "managed_setup_state_online"
+        },
         state_path = %config.state_path.display(),
-        enrollment_path = %enrollment_path,
-        resolved_enrollment_path = %resolved_path.display(),
+        enrollment_path = %runtime_node_enrollment_relative_path().display(),
+        resolved_enrollment_path = %canonical_enrollment_path.display(),
+        runtime_data_dir = %runtime_data_dir.display(),
         cluster_id = %runtime.cluster_id,
         node_id = %runtime.node_id,
         "server node startup selected normal runtime mode"
@@ -475,6 +672,7 @@ async fn get_setup_status(State(state): State<SetupServerState>) -> impl IntoRes
             bootstrap_tls_fingerprint: fingerprint,
             cluster_id: managed.cluster_id,
             node_id: managed.node_id,
+            recovery_reason: managed.recovery_reason,
             pending_join_request: managed.pending_join_request,
         }),
     )
@@ -558,19 +756,12 @@ async fn start_new_cluster(
         bind_addr: bind_addr.to_string(),
         public_url: Some(public_url.clone()),
         labels: labels.clone(),
-        public_tls: Some(BootstrapServerTlsFiles {
-            cert_path: "managed/runtime/public/public.pem".to_string(),
-            key_path: "managed/runtime/public/public.key".to_string(),
-        }),
-        public_ca_cert_path: Some("managed/runtime/public/public-ca.pem".to_string()),
+        public_tls: Some(managed_public_tls_files()),
+        public_ca_cert_path: Some(MANAGED_PUBLIC_CA_CERT_PATH.to_string()),
         public_peer_api_enabled: false,
         internal_bind_addr: Some(internal_bind_addr.to_string()),
         internal_url: Some(internal_url.clone()),
-        internal_tls: Some(BootstrapTlsFiles {
-            ca_cert_path: "managed/runtime/internal/cluster-ca.pem".to_string(),
-            cert_path: "managed/runtime/internal/node.pem".to_string(),
-            key_path: "managed/runtime/internal/node.key".to_string(),
-        }),
+        internal_tls: Some(managed_internal_tls_files()),
         rendezvous_urls: vec![managed_rendezvous_public_url.clone()],
         rendezvous_mtls_required: true,
         direct_endpoints: vec![
@@ -666,11 +857,9 @@ async fn start_new_cluster(
     managed.updated_at_unix = unix_ts();
     managed.cluster_id = Some(cluster_id);
     managed.node_id = Some(node_id);
-    managed.runtime_node_enrollment_path = Some(
-        runtime_node_enrollment_relative_path()
-            .display()
-            .to_string(),
-    );
+    managed.runtime_node_enrollment_path = None;
+    managed.runtime_data_dir = Some(state.config.data_dir.display().to_string());
+    managed.recovery_reason = None;
     managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     managed.managed_rendezvous_bind_addr = Some(managed_rendezvous_bind_addr.to_string());
     managed.managed_rendezvous_public_url = Some(managed_rendezvous_public_url.clone());
@@ -749,18 +938,17 @@ async fn generate_join_request(
     let node_id = managed.node_id.unwrap_or_else(NodeId::new_v4);
     let internal_bind_addr = default_internal_bind_addr(state.config.bind_addr);
     let join_request = NodeJoinRequest {
-        version: SETUP_STATE_VERSION,
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
         node_id,
         mode: NodeBootstrapMode::Cluster,
-        data_dir: state.config.data_dir.display().to_string(),
+        // Transport v1 still requires this compatibility field. Managed import replaces it with
+        // the receiving node's local runtime data root, so no issuer-side host path is exported.
+        data_dir: ".".to_string(),
         bind_addr: state.config.bind_addr.to_string(),
         public_url: Some(origin_to_string(&public_origin)),
         labels: default_setup_labels(),
-        public_tls: Some(BootstrapServerTlsFiles {
-            cert_path: "managed/runtime/public/public.pem".to_string(),
-            key_path: "managed/runtime/public/public.key".to_string(),
-        }),
-        public_ca_cert_path: Some("managed/runtime/public/public-ca.pem".to_string()),
+        public_tls: Some(managed_public_tls_files()),
+        public_ca_cert_path: Some(MANAGED_PUBLIC_CA_CERT_PATH.to_string()),
         public_peer_api_enabled: false,
         internal_bind_addr: Some(internal_bind_addr.to_string()),
         internal_url: Some(
@@ -775,15 +963,13 @@ async fn generate_join_request(
                 }
             },
         ),
-        internal_tls: Some(BootstrapTlsFiles {
-            ca_cert_path: "managed/runtime/internal/cluster-ca.pem".to_string(),
-            cert_path: "managed/runtime/internal/node.pem".to_string(),
-            key_path: "managed/runtime/internal/node.key".to_string(),
-        }),
+        internal_tls: Some(managed_internal_tls_files()),
     };
     managed.state = SetupLifecycleState::PendingJoin;
     managed.updated_at_unix = unix_ts();
     managed.node_id = Some(node_id);
+    managed.runtime_data_dir = Some(state.config.data_dir.display().to_string());
+    managed.recovery_reason = None;
     managed.pending_join_request = Some(join_request.clone());
     if let Err(err) = write_managed_setup_state(&state.config.state_path, &managed) {
         return (
@@ -804,7 +990,7 @@ async fn import_node_enrollment_package(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
     }
 
-    let mut package = match NodeEnrollmentPackage::from_json_str(&request.package_json) {
+    let package = match NodeEnrollmentPackage::from_json_str(&request.package_json) {
         Ok(package) => package,
         Err(err) => {
             return (
@@ -814,7 +1000,16 @@ async fn import_node_enrollment_package(
                 .into_response();
         }
     };
-    package.bootstrap.data_dir = state.config.data_dir.display().to_string();
+    let package = match canonical_managed_node_enrollment(package, &state.config.data_dir) {
+        Ok(package) => package,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
 
     let mut managed = state.managed_state.lock().await;
     if managed.state == SetupLifecycleState::Recovery {
@@ -873,11 +1068,9 @@ async fn import_node_enrollment_package(
     managed.updated_at_unix = unix_ts();
     managed.cluster_id = Some(package.bootstrap.cluster_id);
     managed.node_id = Some(package.bootstrap.node_id);
-    managed.runtime_node_enrollment_path = Some(
-        runtime_node_enrollment_relative_path()
-            .display()
-            .to_string(),
-    );
+    managed.runtime_node_enrollment_path = None;
+    managed.runtime_data_dir = Some(state.config.data_dir.display().to_string());
+    managed.recovery_reason = None;
     managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     managed.managed_rendezvous_bind_addr = None;
     managed.managed_rendezvous_public_url = None;
@@ -964,7 +1157,9 @@ fn explicit_runtime_env_vars_present() -> Vec<&'static str> {
     .collect()
 }
 
-fn runtime_enrollment_requires_rejoin(config: &ServerNodeConfig) -> bool {
+fn runtime_enrollment_recovery_reason(
+    config: &ServerNodeConfig,
+) -> Option<ManagedRecoveryReasonCode> {
     let status = collect_node_certificate_status(
         config
             .public_tls
@@ -994,9 +1189,18 @@ fn runtime_enrollment_requires_rejoin(config: &ServerNodeConfig) -> bool {
         },
     );
 
-    let requires_rejoin = node_certificate_requires_rejoin(&status.public_tls)
-        || node_certificate_requires_rejoin(&status.internal_tls);
-    if requires_rejoin {
+    let recovery_reason = if node_certificate_is_expired(&status.public_tls)
+        || node_certificate_is_expired(&status.internal_tls)
+    {
+        Some(ManagedRecoveryReasonCode::CertificateExpired)
+    } else if node_certificate_is_missing(&status.public_tls)
+        || node_certificate_is_missing(&status.internal_tls)
+    {
+        Some(ManagedRecoveryReasonCode::CertificateMaterialMissing)
+    } else {
+        None
+    };
+    if recovery_reason.is_some() {
         log_certificate_lifecycle_status(&status);
         tracing::warn!(
             node_id = %config.node_id,
@@ -1004,25 +1208,33 @@ fn runtime_enrollment_requires_rejoin(config: &ServerNodeConfig) -> bool {
             "managed runtime enrollment is unusable; starting setup recovery mode"
         );
     }
-    requires_rejoin
+    recovery_reason
 }
 
-fn node_certificate_requires_rejoin(status: &NodeCertificateStatusView) -> bool {
-    matches!(
-        status.state,
-        NodeCertificateLifecycleState::Expired | NodeCertificateLifecycleState::Missing
-    )
+fn node_certificate_is_expired(status: &NodeCertificateStatusView) -> bool {
+    status.state == NodeCertificateLifecycleState::Expired
+}
+
+fn node_certificate_is_missing(status: &NodeCertificateStatusView) -> bool {
+    status.state == NodeCertificateLifecycleState::Missing
 }
 
 fn transition_managed_setup_state_to_recovery(
     state_path: &std::path::Path,
     managed_state: &mut ManagedSetupState,
+    reason: ManagedRecoveryReason,
 ) -> Result<()> {
-    if managed_state.state == SetupLifecycleState::Recovery {
+    if managed_state.state == SetupLifecycleState::Recovery
+        && managed_state
+            .recovery_reason
+            .as_ref()
+            .is_some_and(|existing| existing.code == reason.code)
+    {
         tracing::info!(
             state_path = %state_path.display(),
             cluster_id = ?managed_state.cluster_id,
             node_id = ?managed_state.node_id,
+            recovery_reason = ?reason.code,
             "managed setup state is already in recovery"
         );
         return Ok(());
@@ -1032,11 +1244,13 @@ fn transition_managed_setup_state_to_recovery(
     managed_state.state = SetupLifecycleState::Recovery;
     managed_state.updated_at_unix = unix_ts();
     managed_state.pending_join_request = None;
+    managed_state.recovery_reason = Some(reason);
     tracing::warn!(
         state_path = %state_path.display(),
         previous_state = ?previous_state,
         cluster_id = ?managed_state.cluster_id,
         node_id = ?managed_state.node_id,
+        recovery_reason = ?managed_state.recovery_reason,
         "managed setup state transitioned to recovery"
     );
     write_managed_setup_state(state_path, managed_state)
@@ -1060,8 +1274,7 @@ pub(crate) fn managed_startup_bootstrap_config(
     data_dir: PathBuf,
     bind_addr: SocketAddr,
 ) -> Result<SetupBootstrapConfig> {
-    ensure_non_traversing_path(&data_dir, "managed setup data directory")?;
-    let data_dir = normalize_non_traversing_path(&data_dir);
+    let data_dir = absolute_local_path(&data_dir, "managed setup data directory")?;
     Ok(SetupBootstrapConfig {
         state_path: managed_setup_state_path(&data_dir),
         bootstrap_cert_path: bootstrap_setup_cert_path(&data_dir),
@@ -1095,14 +1308,119 @@ fn runtime_node_enrollment_path(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join(runtime_node_enrollment_relative_path())
 }
 
-/// Path of the runtime enrollment file relative to `data_dir`. This is the
-/// form that must be persisted into `ManagedSetupState::runtime_node_enrollment_path`,
-/// since `resolve_materialized_path` re-joins it with `data_dir` on load; storing
-/// the already-`data_dir`-joined path there would double the prefix.
+/// Fixed runtime enrollment path relative to the managed setup data directory.
+///
+/// Setup-state v2 derives this path and does not persist it. The relative form remains available
+/// only to locate and migrate setup-state v1 artifacts without joining `data_dir` twice.
 fn runtime_node_enrollment_relative_path() -> PathBuf {
     PathBuf::from("managed")
         .join("runtime")
         .join("node-enrollment.json")
+}
+
+fn managed_internal_tls_files() -> BootstrapTlsFiles {
+    BootstrapTlsFiles {
+        ca_cert_path: MANAGED_INTERNAL_CA_CERT_PATH.to_string(),
+        cert_path: MANAGED_INTERNAL_CERT_PATH.to_string(),
+        key_path: MANAGED_INTERNAL_KEY_PATH.to_string(),
+    }
+}
+
+fn managed_public_tls_files() -> BootstrapServerTlsFiles {
+    BootstrapServerTlsFiles {
+        cert_path: MANAGED_PUBLIC_CERT_PATH.to_string(),
+        key_path: MANAGED_PUBLIC_KEY_PATH.to_string(),
+    }
+}
+
+fn absolute_local_path(path: &std::path::Path, label: &str) -> Result<PathBuf> {
+    ensure_non_traversing_path(path, label)?;
+    let normalized = normalize_non_traversing_path(path);
+    if normalized.is_absolute() {
+        return Ok(normalized);
+    }
+    let current_dir = std::env::current_dir().context("failed resolving current directory")?;
+    Ok(normalize_non_traversing_path(&current_dir.join(normalized)))
+}
+
+/// Converts the portable enrollment envelope into the local managed runtime model.
+///
+/// Managed installations intentionally do not treat host paths from an imported enrollment
+/// package as configuration. The package supplies identity and credential material; the local
+/// runtime data root and this fixed role-based layout determine where that material lives.
+fn canonical_managed_node_enrollment(
+    mut package: NodeEnrollmentPackage,
+    runtime_data_dir: &std::path::Path,
+) -> Result<NodeEnrollmentPackage> {
+    package.validate()?;
+    let runtime_data_dir = absolute_local_path(runtime_data_dir, "managed runtime data directory")?;
+    package.bootstrap.data_dir = runtime_data_dir.display().to_string();
+
+    if package.bootstrap.public_tls.is_some() {
+        package.bootstrap.public_tls = Some(managed_public_tls_files());
+    }
+    if package.bootstrap.public_ca_cert_path.is_some()
+        || package.public_tls_material.is_some()
+        || package.bootstrap.trust_roots.public_api_ca_pem.is_some()
+    {
+        package.bootstrap.public_ca_cert_path = Some(MANAGED_PUBLIC_CA_CERT_PATH.to_string());
+    }
+    if package.bootstrap.internal_tls.is_some() {
+        package.bootstrap.internal_tls = Some(managed_internal_tls_files());
+    }
+
+    package.validate()?;
+    Ok(package)
+}
+
+fn managed_runtime_data_dir(
+    state: &ManagedSetupState,
+    package: &NodeEnrollmentPackage,
+) -> Result<PathBuf> {
+    let raw = state
+        .runtime_data_dir
+        .as_deref()
+        .unwrap_or(package.bootstrap.data_dir.as_str());
+    absolute_local_path(std::path::Path::new(raw), "managed runtime data directory")
+}
+
+fn resolve_legacy_managed_enrollment_path(
+    setup_data_dir: &std::path::Path,
+    raw_path: &str,
+) -> Result<PathBuf> {
+    match resolve_materialized_path(setup_data_dir, raw_path) {
+        Ok(path) => Ok(path),
+        Err(original_error) => {
+            let candidate = std::path::Path::new(raw_path);
+            if !candidate.is_absolute() || !candidate.exists() {
+                return Err(original_error);
+            }
+
+            let canonical_setup_data_dir = std::fs::canonicalize(setup_data_dir)
+                .with_context(|| format!("failed resolving {}", setup_data_dir.display()))?;
+            let canonical_candidate = std::fs::canonicalize(candidate)
+                .with_context(|| format!("failed resolving {}", candidate.display()))?;
+            if !canonical_candidate.starts_with(&canonical_setup_data_dir) {
+                return Err(original_error);
+            }
+            Ok(canonical_candidate)
+        }
+    }
+}
+
+fn find_managed_enrollment_path(
+    config: &SetupBootstrapConfig,
+    state: &ManagedSetupState,
+) -> Result<PathBuf> {
+    let canonical_path = runtime_node_enrollment_path(&config.data_dir);
+    if canonical_path.exists() {
+        return Ok(canonical_path);
+    }
+    let raw_path = state
+        .runtime_node_enrollment_path
+        .as_deref()
+        .context("managed runtime enrollment path is missing")?;
+    resolve_legacy_managed_enrollment_path(&config.data_dir, raw_path)
 }
 
 pub(crate) fn managed_signer_dir(data_dir: &std::path::Path) -> PathBuf {
@@ -1168,7 +1486,10 @@ pub(crate) fn read_managed_setup_state(
         .with_context(|| format!("failed reading {}", path.display()))?;
     let state = serde_json::from_str::<ManagedSetupState>(&raw)
         .with_context(|| format!("failed parsing {}", path.display()))?;
-    if state.version != SETUP_STATE_VERSION {
+    if !matches!(
+        state.version,
+        LEGACY_SETUP_STATE_VERSION | SETUP_STATE_VERSION
+    ) {
         bail!("unsupported managed setup state version {}", state.version);
     }
     Ok(Some(state))
@@ -1182,8 +1503,11 @@ pub(crate) fn write_managed_setup_state(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating {}", parent.display()))?;
     }
-    let payload =
-        serde_json::to_string_pretty(state).context("failed serializing managed setup state")?;
+    let mut persisted_state = state.clone();
+    persisted_state.version = SETUP_STATE_VERSION;
+    persisted_state.runtime_node_enrollment_path = None;
+    let payload = serde_json::to_string_pretty(&persisted_state)
+        .context("failed serializing managed setup state")?;
     std::fs::write(path, payload).with_context(|| format!("failed writing {}", path.display()))
 }
 
@@ -2064,11 +2388,13 @@ mod tests {
             cluster_id: Some(Uuid::now_v7()),
             node_id: Some(NodeId::new_v4()),
             runtime_node_enrollment_path: Some("managed/runtime/node-enrollment.json".to_string()),
+            runtime_data_dir: Some(dir.display().to_string()),
+            recovery_reason: None,
             admin_password_hash: Some(hash_token("super-secret-password")),
             managed_rendezvous_bind_addr: Some("0.0.0.0:9443".to_string()),
             managed_rendezvous_public_url: Some("https://node-a.local:9443".to_string()),
             pending_join_request: Some(NodeJoinRequest {
-                version: SETUP_STATE_VERSION,
+                version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
                 node_id: NodeId::new_v4(),
                 mode: NodeBootstrapMode::Cluster,
                 data_dir: dir.display().to_string(),
@@ -2092,7 +2418,13 @@ mod tests {
         };
         write_managed_setup_state(&path, &state).unwrap();
         let restored = read_managed_setup_state(&path).unwrap().unwrap();
+        assert_eq!(restored.version, SETUP_STATE_VERSION);
         assert_eq!(restored.state, SetupLifecycleState::PendingJoin);
+        assert!(restored.runtime_node_enrollment_path.is_none());
+        assert_eq!(
+            restored.runtime_data_dir.as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
         assert_eq!(
             restored.admin_password_hash.as_deref(),
             Some(hash_token("super-secret-password").as_str())
@@ -2111,13 +2443,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_node_enrollment_relative_path_resolves_without_doubling_data_dir_prefix() {
-        // Regression test: the runtime enrollment path stored in managed setup
-        // state must be relative to `data_dir`, not already joined with it.
-        // `resolve_materialized_path` joins whatever is stored with `data_dir`
-        // again, so storing the already-joined path doubles the prefix
-        // whenever `data_dir` is a relative path (e.g. "./data/server-node"),
-        // causing a valid enrollment file to look "missing" on every restart.
+    fn derived_runtime_node_enrollment_path_resolves_without_doubling_data_dir_prefix() {
+        // Regression test for the v1 failure mode. Version 2 no longer persists this derivable
+        // path, but its fixed relative form must still resolve exactly once against `data_dir`.
         let relative_data_dir = std::path::PathBuf::from("./data/server-node");
         let stored = runtime_node_enrollment_relative_path()
             .display()
@@ -2134,6 +2462,127 @@ mod tests {
             "enrollment path doubled the data_dir prefix: {}",
             resolved.display()
         );
+    }
+
+    #[test]
+    fn relative_enrollment_data_dir_materializes_tls_paths_exactly_once() {
+        let relative_data_dir = PathBuf::from("target")
+            .join(format!("ironmesh-relative-enrollment-{}", Uuid::now_v7()));
+        let absolute_data_dir = std::env::current_dir().unwrap().join(&relative_data_dir);
+        let _ = std::fs::remove_dir_all(&absolute_data_dir);
+        let bind_addr = "127.0.0.1:28443".parse::<SocketAddr>().unwrap();
+        let package = test_node_enrollment_package(&relative_data_dir, bind_addr);
+
+        let config = ServerNodeConfig::from_enrollment(package).unwrap();
+        let internal_tls = config.internal_tls.as_ref().unwrap();
+        let expected_cert_path = relative_data_dir.join(MANAGED_INTERNAL_CERT_PATH);
+
+        assert_eq!(internal_tls.cert_path, expected_cert_path);
+        assert!(internal_tls.cert_path.exists());
+        assert!(
+            !internal_tls
+                .cert_path
+                .display()
+                .to_string()
+                .contains("managed/runtime/data"),
+            "managed TLS path was unexpectedly prefixed more than once: {}",
+            internal_tls.cert_path.display()
+        );
+
+        let _ = std::fs::remove_dir_all(absolute_data_dir);
+    }
+
+    #[test]
+    fn legacy_recovery_state_self_heals_and_migrates_without_config_changes() {
+        let setup_dir = temp_dir("legacy-recovery-migration");
+        let config =
+            managed_startup_bootstrap_config(setup_dir.clone(), "127.0.0.1:28444".parse().unwrap())
+                .unwrap();
+        let relative_runtime_data_dir = PathBuf::from("target").join(format!(
+            "ironmesh-legacy-managed-runtime-{}",
+            Uuid::now_v7()
+        ));
+        let absolute_runtime_data_dir = std::env::current_dir()
+            .unwrap()
+            .join(&relative_runtime_data_dir);
+        let _ = std::fs::remove_dir_all(&absolute_runtime_data_dir);
+
+        let package = test_node_enrollment_package(&relative_runtime_data_dir, config.bind_addr);
+        let cluster_id = package.bootstrap.cluster_id;
+        let node_id = package.bootstrap.node_id;
+        let enrollment_path = runtime_node_enrollment_path(&config.data_dir);
+        package.write_to_path(&enrollment_path).unwrap();
+        assert!(
+            !absolute_runtime_data_dir
+                .join(MANAGED_INTERNAL_CERT_PATH)
+                .exists()
+        );
+
+        let legacy_state = ManagedSetupState {
+            version: LEGACY_SETUP_STATE_VERSION,
+            state: SetupLifecycleState::Recovery,
+            cluster_id: Some(cluster_id),
+            node_id: Some(node_id),
+            runtime_node_enrollment_path: Some(enrollment_path.display().to_string()),
+            ..ManagedSetupState::default()
+        };
+        let legacy_payload = serde_json::to_string_pretty(&legacy_state).unwrap();
+        assert!(!legacy_payload.contains("runtime_data_dir"));
+        assert!(!legacy_payload.contains("recovery_reason"));
+        std::fs::write(&config.state_path, legacy_payload).unwrap();
+
+        let startup_mode = load_managed_startup_mode(config.clone()).unwrap();
+        let StartupMode::Runtime(runtime) = startup_mode else {
+            panic!("valid embedded enrollment material should self-heal recovery");
+        };
+        assert_eq!(runtime.data_dir, absolute_runtime_data_dir);
+        assert_eq!(
+            runtime.internal_tls.as_ref().unwrap().cert_path,
+            absolute_runtime_data_dir.join(MANAGED_INTERNAL_CERT_PATH)
+        );
+        assert!(
+            absolute_runtime_data_dir
+                .join(MANAGED_INTERNAL_CERT_PATH)
+                .exists()
+        );
+
+        let migrated = read_managed_setup_state(&config.state_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.version, SETUP_STATE_VERSION);
+        assert_eq!(migrated.state, SetupLifecycleState::Online);
+        assert!(migrated.runtime_node_enrollment_path.is_none());
+        assert_eq!(
+            migrated.runtime_data_dir.as_deref(),
+            Some(absolute_runtime_data_dir.to_string_lossy().as_ref())
+        );
+        assert!(migrated.recovery_reason.is_none());
+
+        let migrated_package = NodeEnrollmentPackage::from_path(&enrollment_path).unwrap();
+        assert_eq!(
+            migrated_package.bootstrap.data_dir,
+            absolute_runtime_data_dir.display().to_string()
+        );
+        assert_eq!(
+            migrated_package
+                .bootstrap
+                .internal_tls
+                .as_ref()
+                .unwrap()
+                .cert_path,
+            MANAGED_INTERNAL_CERT_PATH
+        );
+
+        let state_after_migration = std::fs::read_to_string(&config.state_path).unwrap();
+        let restarted = load_managed_startup_mode(config.clone()).unwrap();
+        assert!(matches!(restarted, StartupMode::Runtime(_)));
+        assert_eq!(
+            std::fs::read_to_string(&config.state_path).unwrap(),
+            state_after_migration,
+            "an idempotent restart must not rewrite managed setup state"
+        );
+
+        let _ = std::fs::remove_dir_all(absolute_runtime_data_dir);
     }
 
     #[test]
@@ -2490,7 +2939,10 @@ mod tests {
         artifacts.package.write_to_path(&package_path).unwrap();
 
         let config = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
-        assert!(runtime_enrollment_requires_rejoin(&config));
+        assert_eq!(
+            runtime_enrollment_recovery_reason(&config),
+            Some(ManagedRecoveryReasonCode::CertificateExpired)
+        );
     }
 
     #[test]
@@ -2594,6 +3046,14 @@ mod tests {
         assert_eq!(restored.cluster_id, Some(cluster_id));
         assert_eq!(restored.node_id, Some(node_id));
         assert!(restored.pending_join_request.is_none());
+        assert_eq!(
+            restored.recovery_reason.as_ref().map(|reason| reason.code),
+            Some(ManagedRecoveryReasonCode::CertificateExpired)
+        );
+        assert_eq!(
+            restored.runtime_data_dir.as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
     }
 
     #[test]
