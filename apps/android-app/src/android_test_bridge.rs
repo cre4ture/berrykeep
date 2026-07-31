@@ -100,6 +100,7 @@ fn android_test_connection_bootstrap(public_url: &str) -> Result<ConnectionBoots
         version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
         cluster_id: android_test_cluster_id()?,
         rendezvous_urls: Vec::new(),
+        rendezvous_contact_list: None,
         rendezvous_mtls_required: false,
         direct_endpoints: vec![BootstrapEndpoint {
             url: public_url.to_string(),
