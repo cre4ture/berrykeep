@@ -17,6 +17,7 @@ import { useMemo } from "react";
 import { MapDatasetImportCard } from "../components/MapDatasetImportCard";
 import { MapVariantConfigurationCard } from "../components/MapVariantConfigurationCard";
 import { useAdminAccess } from "../lib/admin-access";
+import { galleryMapConfigurationQueryKey } from "../lib/gallery-query-keys";
 
 const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
 
@@ -26,7 +27,7 @@ export function GalleryPage() {
   const canInspectMapConfiguration =
     !sessionLoading && (!loginRequired || Boolean(sessionStatus?.authenticated));
   const mapConfigurationQuery = useQuery({
-    queryKey: ["gallery-page", "map-configuration"],
+    queryKey: galleryMapConfigurationQueryKey,
     queryFn: () => getAdminGalleryMapConfiguration(),
     enabled: canInspectMapConfiguration,
     staleTime: 5_000
