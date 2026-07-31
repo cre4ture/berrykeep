@@ -87,20 +87,23 @@ The core of this strategy is implemented across the node and a new central colle
 - **Production TLS and deployment helper** (Section 5.2): `stats-collector-server` supports direct
   TLS from environment-provided PEM files and reloads renewed certificates periodically.
   `scripts/deploy-stats-collector-service.sh` provides checksum-verified MUSL deployment with
-  remote-only admin-token initialization and rollback, while
-  `scripts/deploy-home-stats-collector-service.sh` fixes the intended `creature@creax.de`,
-  `/home/creature/ironmesh/telemetry`, and `https://creax.de:44044` layout. The first deployment was
-  verified end to end on 2026-07-31 (registration, token-authenticated ingestion, admin access,
-  erasure, k-anonymous summary, and cleanup of the synthetic test subject).
+  remote-only admin-token initialization and rollback. The primary
+  `scripts/deploy-strato-stats-collector-service.sh` wrapper fixes the intended
+  `root@217.160.159.105`, `/root/ironmesh/telemetry`, and
+  `https://217.160.159.105:9444` layout. It expects the automatically renewed, short-lived
+  Let's Encrypt IP certificate at `/etc/letsencrypt/live/217.160.159.105`; Certbot 5.4 or newer can
+  request it with the `shortlived` profile and `--ip-address 217.160.159.105`. The former
+  `scripts/deploy-home-stats-collector-service.sh` Uberspace wrapper remains available as a
+  transition fallback. The first STRATO deployment was verified end to end on 2026-07-31 with a
+  publicly trusted IP certificate, a successful automated-renewal dry run, registration,
+  token-authenticated ingestion from an external network, server-derived `country_code: "CH"`, and
+  cleanup of the synthetic test subject.
 
 Deliberately **deferred** (documented at their respective sections, not blockers for the above):
 
-- Effective country derivation on the current Uberspace direct-port deployment (Section 4.2): the
-  production binary includes and activates `BundledCountryResolver`, but Uberspace presents direct
-  high-port connections to the process through a non-global CGNAT source address. The resolver
-  therefore correctly returns no country for current traffic. Preserving a trustworthy original
-  source address (for example through a separately trusted HTTPS reverse-proxy listener) remains a
-  follow-up; raw IP addresses continue not to be stored or logged.
+- Continued validation of country derivation as IP allocation databases evolve. The STRATO
+  deployment preserves the public TCP source address, so the bundled offline resolver can derive a
+  country without storing or logging the raw IP address.
 - Production process supervision, database backup, and external monitoring/alerting. The first
   deployment deliberately follows the existing standalone rendezvous PID/nohup layout and has
   health/version/rollback checks, but it does not yet install a boot-persistent supervisor entry.
@@ -465,8 +468,8 @@ telemetry would unnecessarily complicate their security boundaries.
 
 ### 5.2 Ingestion Endpoint
 
-- **Hosting assumption (per project owner):** the central service is assumed to be hosted at
-  `creax.de`, port `44044`.
+- **Hosting assumption (per project owner):** the central service is hosted directly at
+  `217.160.159.105`, port `9444`.
 - Protocol: HTTPS (TLS 1.3), consistent with all other IronMesh HTTP services.
 - Auth: deliberately **no** per-node mTLS as in the cluster-internal case — the collector should
   specifically *not* know which cluster/operator a given record belongs to. Instead:
@@ -494,8 +497,8 @@ telemetry would unnecessarily complicate their security boundaries.
     table, and `crates/server-node-sdk/src/reliability_telemetry.rs`'s lazy, best-effort
     registration call (never blocks the main send path, and is cleared on `rotate_identity` since
     the token is scoped to the subject id that no longer applies after rotation).
-- Endpoint shape: `POST https://creax.de:44044/v1/ingest/hardware-reliability` with the versioned
-  payload sketched in Section 7.
+- Endpoint shape: `POST https://217.160.159.105:9444/v1/ingest/hardware-reliability` with the
+  versioned payload sketched in Section 7.
 
 ### 5.3 Storage / Access Control
 

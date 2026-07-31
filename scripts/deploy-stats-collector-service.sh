@@ -344,7 +344,11 @@ test -r "$TLS_KEY_PATH"
 command -v curl >/dev/null
 command -v openssl >/dev/null
 command -v sha256sum >/dev/null
-openssl x509 -in "$TLS_CERT_PATH" -noout -checkhost "$TLS_SERVER_NAME" >/dev/null
+if [[ "$TLS_SERVER_NAME" =~ ^[0-9]+(\.[0-9]+){3}$ || "$TLS_SERVER_NAME" == *:* ]]; then
+  openssl x509 -in "$TLS_CERT_PATH" -noout -checkip "$TLS_SERVER_NAME" >/dev/null
+else
+  openssl x509 -in "$TLS_CERT_PATH" -noout -checkhost "$TLS_SERVER_NAME" >/dev/null
+fi
 cert_pub="$(openssl x509 -in "$TLS_CERT_PATH" -pubkey -noout |
   openssl pkey -pubin -outform pem 2>/dev/null |
   sha256sum | cut -d' ' -f1)"
