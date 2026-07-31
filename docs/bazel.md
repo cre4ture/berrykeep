@@ -87,7 +87,11 @@ The workflow also uses
 at an immutable commit SHA. The action starts an HTTP cache on the runner's
 loopback interface and stores each validated Bazel AC/CAS object in GitHub
 Actions cache v2. It therefore needs no external server, repository secret, or
-manual repository setting.
+manual repository setting. The pinned v0.2 action validates the complete
+REAPI action-result closure before serving or publishing an action-cache
+entry. If GitHub has independently evicted a referenced CAS object, the
+dangling action result becomes an ordinary cache miss instead of reaching
+Bazel as a lost input; the workflow therefore needs no correctness retry.
 
 Fine-grained remote-cache publication is deliberately opt-in:
 
@@ -126,7 +130,8 @@ Evaluate the two layers with separate workflow runs rather than treating a
 successful seed as proof of a useful cache:
 
 1. Run a normal read-only build and record Bazel elapsed time, action count,
-   adapter hit/miss statistics, and the `setup-bazel` restore/save duration.
+   adapter hit/miss and action-result validation statistics, and the
+   `setup-bazel` restore/save duration.
 2. When a controlled fine-grained comparison is needed, dispatch one
    `write_cache` seed and record its published-object count, throttling,
    duration, and repository cache usage before and after the run.

@@ -8,7 +8,11 @@ import {
   type NaturalEarthImportJobView,
   type NaturalEarthImportProfile
 } from "@ironmesh/api";
-import { ironmeshPrimaryColor } from "@ironmesh/ui";
+import {
+  galleryMapConfigurationQueryPolicy,
+  galleryQueryKeys,
+  ironmeshPrimaryColor
+} from "@ironmesh/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -25,7 +29,6 @@ import {
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 import { formatBytes, formatRelativeUnixTs, formatUnixTs } from "../lib/format";
-import { galleryMapConfigurationQueryKey } from "../lib/gallery-query-keys";
 import {
   MapDatasetImportWizard,
   type MapDatasetImportWizardTarget,
@@ -56,10 +59,10 @@ export function MapDatasetImportCard() {
   const [wizardStep, setWizardStep] = useState(0);
 
   const mapConfigurationQuery = useQuery({
-    queryKey: galleryMapConfigurationQueryKey,
+    queryKey: galleryQueryKeys.mapConfiguration(),
     queryFn: () => getAdminGalleryMapConfiguration(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectMapImport,
-    staleTime: 5_000
+    ...galleryMapConfigurationQueryPolicy,
+    enabled: canInspectMapImport
   });
   const importTargets = useMemo(
     () => mapImportTargets(mapConfigurationQuery.data?.configuration.variants ?? []),

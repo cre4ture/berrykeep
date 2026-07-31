@@ -2,6 +2,7 @@ import {
   updateAdminGalleryMapConfiguration,
   type AdminGalleryMapConfiguration
 } from "@ironmesh/api";
+import { galleryQueryKeys } from "@ironmesh/ui";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -19,7 +20,6 @@ import {
 } from "@mantine/core";
 import { useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
-import { galleryMapConfigurationQueryKey } from "../lib/gallery-query-keys";
 
 type MapVariant = AdminGalleryMapConfiguration["variants"][number];
 type HybridAssetSource = {
@@ -62,7 +62,10 @@ export function MapVariantConfigurationCard({
     mutationFn: (next: AdminGalleryMapConfiguration) =>
       updateAdminGalleryMapConfiguration(next, normalizedAdminTokenOverride || undefined),
     onSuccess: (response) => {
-      queryClient.setQueryData(galleryMapConfigurationQueryKey, response);
+      queryClient.setQueryData(
+        galleryQueryKeys.mapConfiguration(),
+        response
+      );
     }
   });
   const saveError = firstErrorMessage([error, saveMutation.error]);

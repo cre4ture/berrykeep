@@ -1,29 +1,13 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useState } from "react";
+import { IronmeshQueryProvider } from "@ironmesh/ui";
 import { ServerAdminShell } from "./app-shell/ServerAdminShell";
 import { AdminAccessProvider } from "./lib/admin-access";
 
 export function App() {
-  const [queryClient] = useState(
-    () =>
-      new QueryClient({
-        defaultOptions: {
-          queries: {
-            retry: false,
-            refetchOnWindowFocus: false
-          },
-          mutations: {
-            retry: false
-          }
-        }
-      })
-  );
-
   return (
-    <QueryClientProvider client={queryClient}>
+    <IronmeshQueryProvider>
       <AdminAccessProvider>
         <ServerAdminShell />
       </AdminAccessProvider>
-    </QueryClientProvider>
+    </IronmeshQueryProvider>
   );
 }
