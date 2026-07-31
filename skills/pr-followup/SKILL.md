@@ -10,7 +10,7 @@ Read [references/ironmesh-pr-facts.md](references/ironmesh-pr-facts.md) before t
 ## Workflow
 
 1. Resolve the PR number, head branch, and target branch from the current branch or the caller's explicit PR.
-2. Periodically check. Start or re-arm a 20-minute sleep timer after any relevant PR activity. Do not do any investigation during that sleeping time to save token costs.
+2. Check regularly, but at most once per 20-minute interval. Start or re-arm a 20-minute sleep timer after any relevant PR activity, then do one poll when it expires. Do not do any investigation during that waiting time to save token costs.
 3. After sleeping, treat remote GitHub state for the latest pushed head commit as the source of truth. On each poll, inspect and address.
 6. If review feedback is concrete and actionable, apply the fix directly. If the feedback is ambiguous, conflicting, or changes product direction, ask the user.
 7. After every push, assume a fresh cycle starts. Reset the sleep timer from that push time like starting from step 2 again.
