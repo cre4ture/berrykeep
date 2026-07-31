@@ -490,6 +490,35 @@ test("client-ui gallery visibly replaces restored data after background revalida
   expect(mocks.galleryStoreListRequestCount()).toBe(initialRequestCount + 2);
 });
 
+test("client-ui gallery background updates preserve current controls", async ({ page }) => {
+  const mocks = await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  mocks.setGalleryStoreListDelayForMediaFilter("all", 2_000);
+  const delayedAllResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === apiV1("/store/list") && url.searchParams.get("media_filter") === "all";
+  });
+  await page.reload();
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  const mediaFilter = page.getByRole("textbox", { name: "Media" });
+  await mediaFilter.click();
+  await page.getByRole("option", { name: "Movies only", exact: true }).click();
+  await expect(mediaFilter).toHaveValue("Movies only");
+  const mediaGrid = page.locator('[data-gallery-grid="true"]');
+  await expect(mediaGrid.getByText("gallery/clip.mp4", { exact: true })).toBeVisible();
+  await expect(mediaGrid.getByText("gallery/cat.png", { exact: true })).toHaveCount(0);
+
+  await delayedAllResponse;
+  await expect(mediaFilter).toHaveValue("Movies only");
+  await expect(mediaGrid.getByText("gallery/clip.mp4", { exact: true })).toBeVisible();
+  await expect(mediaGrid.getByText("gallery/cat.png", { exact: true })).toHaveCount(0);
+});
+
 test("client-ui gallery cache is isolated when the authenticated cache scope changes", async ({
   page
 }) => {
@@ -978,6 +1007,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   let galleryOffline = false;
   let galleryStoreListRequestCount = 0;
   let galleryStoreListDelayMs = 0;
+  const galleryStoreListDelayByMediaFilter = new Map<string, number>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
   const connectionRoutesPayload = {
@@ -1448,8 +1478,11 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         });
         return;
       }
-      if (galleryStoreListDelayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, galleryStoreListDelayMs));
+      const storeListDelay =
+        galleryStoreListDelayByMediaFilter.get(searchParams.get("media_filter") ?? "") ??
+        galleryStoreListDelayMs;
+      if (storeListDelay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, storeListDelay));
       }
       return json(route, buildMockStoreListResponse(storeEntries, searchParams));
     }
@@ -1644,6 +1677,9 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     },
     setGalleryStoreListDelay: (delayMs: number) => {
       galleryStoreListDelayMs = delayMs;
+    },
+    setGalleryStoreListDelayForMediaFilter: (mediaFilter: string, delayMs: number) => {
+      galleryStoreListDelayByMediaFilter.set(mediaFilter, delayMs);
     },
     setCacheScope: (scope: string | null) => {
       cacheScope = scope;

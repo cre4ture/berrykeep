@@ -1,7 +1,7 @@
 import { getClientCacheContext } from "@ironmesh/api";
 import type {
   GalleryDataSource,
-  GalleryDataUpdateKind,
+  GalleryDataUpdate,
   GalleryLoadEntriesOptions,
   GalleryPayload,
   GallerySnapshot
@@ -26,8 +26,8 @@ type ResourceDescriptor =
       view: "raw" | "tree";
       offset: number | null;
       limit: number | null;
-      sort: string | null;
-      mediaFilter: string | null;
+      sort: GalleryLoadEntriesOptions["sort"] | null;
+      mediaFilter: GalleryLoadEntriesOptions["mediaFilter"] | null;
     };
 
 type ResourceConfig<T> = {
@@ -47,26 +47,30 @@ export function createPersistentGalleryDataSource(
   liveDataSource: GalleryDataSource,
   cache = new GalleryPersistentCache()
 ): GalleryDataSource {
-  const listeners = new Set<(kind: GalleryDataUpdateKind) => void>();
+  const listeners = new Set<(update: GalleryDataUpdate) => void>();
   const revalidationGeneration = new Map<GalleryCacheRecordKind, number>([
     ["snapshots", 0],
     ["entries", 0]
   ]);
   const revalidatedKeys = new Map<string, number>();
   const networkRequests = new Map<string, Promise<unknown>>();
-  const pendingUpdates = new Set<GalleryDataUpdateKind>();
+  const pendingUpdates = new Map<string, GalleryDataUpdate>();
   let updateScheduled = false;
   const cacheContextPromise = resolveCacheContext();
 
-  function emitUpdate(kind: GalleryDataUpdateKind) {
-    pendingUpdates.add(kind);
+  function emitUpdate(descriptor: ResourceDescriptor, payload: unknown) {
+    const update = galleryDataUpdate(descriptor, payload);
+    if (!update) {
+      return;
+    }
+    pendingUpdates.set(JSON.stringify(descriptor), update);
     if (updateScheduled) {
       return;
     }
     updateScheduled = true;
     queueMicrotask(() => {
       updateScheduled = false;
-      const updates = [...pendingUpdates];
+      const updates = [...pendingUpdates.values()];
       pendingUpdates.clear();
       for (const update of updates) {
         for (const listener of listeners) {
@@ -117,7 +121,7 @@ export function createPersistentGalleryDataSource(
     }
     revalidatedKeys.set(cacheKey, generation);
     void fetchAndPersist(config, context, cacheKey, queryKey)
-      .then(() => emitUpdate(config.descriptor.kind))
+      .then((payload) => emitUpdate(config.descriptor, payload))
       .catch(() => {
         // SWR keeps the last validated payload visible while offline. A user
         // refresh increments the generation and permits an explicit retry.
@@ -174,6 +178,32 @@ export function createPersistentGalleryDataSource(
       listeners.add(listener);
       return () => listeners.delete(listener);
     }
+  };
+}
+
+function galleryDataUpdate(
+  descriptor: ResourceDescriptor,
+  payload: unknown
+): GalleryDataUpdate | null {
+  if (descriptor.kind === "snapshots") {
+    return { kind: "snapshots" };
+  }
+  if (!isGalleryPayload(payload)) {
+    return null;
+  }
+  return {
+    kind: "entries",
+    prefix: descriptor.prefix,
+    depth: descriptor.depth,
+    snapshotId: descriptor.snapshotId,
+    options: {
+      view: descriptor.view,
+      ...(descriptor.offset === null ? {} : { offset: descriptor.offset }),
+      ...(descriptor.limit === null ? {} : { limit: descriptor.limit }),
+      ...(descriptor.sort === null ? {} : { sort: descriptor.sort }),
+      ...(descriptor.mediaFilter === null ? {} : { mediaFilter: descriptor.mediaFilter })
+    },
+    payload
   };
 }
 

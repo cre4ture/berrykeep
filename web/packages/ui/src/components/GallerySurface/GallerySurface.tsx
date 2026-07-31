@@ -195,6 +195,17 @@ export type GalleryLoadEntriesOptions = {
 
 export type GalleryDataUpdateKind = "snapshots" | "entries";
 
+export type GalleryDataUpdate =
+  | { kind: "snapshots" }
+  | {
+      kind: "entries";
+      prefix: string;
+      depth: number;
+      snapshotId: string | null;
+      options: GalleryLoadEntriesOptions;
+      payload: GalleryPayload;
+    };
+
 type GalleryLoadedScope = {
   prefix: string;
   depth: number;
@@ -265,7 +276,7 @@ export type GalleryDataSource = {
   /** Marks the next reads of this resource kind for a network revalidation. */
   requestRevalidation?: (kind: GalleryDataUpdateKind) => void;
   /** Announces that a background revalidation replaced cached data. */
-  subscribeToUpdates?: (listener: (kind: GalleryDataUpdateKind) => void) => () => void;
+  subscribeToUpdates?: (listener: (update: GalleryDataUpdate) => void) => () => void;
 };
 
 type GallerySurfaceProps = {
@@ -343,19 +354,18 @@ export function GallerySurface({
   const gridPagesRef = useRef<Record<number, GalleryGridPageState>>({});
   const gridPageCacheRef = useRef<GalleryGridPageCache>(new Map());
   const galleryRequestVersionRef = useRef(0);
+  const activeGalleryRequestRef = useRef({
+    viewMode,
+    sortOrder,
+    requestedServerMediaFilter: "image" as GalleryMediaFilter
+  });
 
   useEffect(() => {
     if (!subscribeToUpdates) {
       return;
     }
-    return subscribeToUpdates((kind) => {
-      if (kind === "snapshots") {
-        void refreshSnapshots(false);
-      } else {
-        void reloadAppliedEntries();
-      }
-    });
-  }, [subscribeToUpdates]);
+    return subscribeToUpdates(handleGalleryDataUpdate);
+  }, [mediaFilter, sortOrder, subscribeToUpdates, viewMode]);
 
   useEffect(() => {
     void refreshSnapshots(false);
@@ -419,6 +429,11 @@ export function GallerySurface({
     enabledMediaKinds,
     mediaFilter
   );
+  activeGalleryRequestRef.current = {
+    viewMode,
+    sortOrder,
+    requestedServerMediaFilter
+  };
   const availableBasemaps = basemaps ?? [];
   const basemapIdSignature = availableBasemaps.map((candidate) => candidate.id).join("\u0000");
   const activeBasemap =
@@ -635,8 +650,8 @@ export function GallerySurface({
     try {
       const payload = await loadSnapshots();
       setSnapshots(payload);
-      if (!snapshotId && payload.length > 0) {
-        setSnapshotId(payload[0]?.id ?? null);
+      if (payload.length > 0) {
+        setSnapshotId((current) => current ?? payload[0]?.id ?? null);
       }
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed to load snapshots");
@@ -668,6 +683,84 @@ export function GallerySurface({
     }
 
     await loadGalleryScope(scope, false);
+  }
+
+  function handleGalleryDataUpdate(update: GalleryDataUpdate) {
+    if (update.kind === "snapshots") {
+      void refreshSnapshots(false);
+      return;
+    }
+
+    const scope = loadedScopeRef.current;
+    const collection = gridCollectionRef.current;
+    const activeRequest = activeGalleryRequestRef.current;
+    if (
+      !scope ||
+      update.prefix !== scope.prefix ||
+      update.snapshotId !== scope.snapshotId ||
+      update.options.view !== "tree"
+    ) {
+      return;
+    }
+
+    const isNavigationUpdate =
+      update.depth === 1 &&
+      update.options.offset === undefined &&
+      update.options.limit === undefined &&
+      update.options.sort === undefined &&
+      update.options.mediaFilter === undefined;
+    if (isNavigationUpdate) {
+      setNavigationPayload(update.payload);
+      return;
+    }
+
+    const matchesCurrentMediaRequest =
+      update.depth === scope.depth &&
+      update.options.sort === activeRequest.sortOrder &&
+      update.options.mediaFilter === activeRequest.requestedServerMediaFilter;
+    if (!matchesCurrentMediaRequest) {
+      // A slow response for old controls must never replace the user's current
+      // view or reset its scroll position.
+      return;
+    }
+
+    if (activeRequest.viewMode === "map") {
+      if (update.options.offset === undefined && update.options.limit === undefined) {
+        setMapPayload(update.payload);
+      }
+      return;
+    }
+
+    const offset = update.options.offset;
+    const pageSize = update.options.limit;
+    const isCurrentGridPage =
+      collection !== null &&
+      typeof offset === "number" &&
+      offset >= 0 &&
+      typeof pageSize === "number" &&
+      pageSize === collection.pageSize &&
+      offset % pageSize === 0;
+    if (!isCurrentGridPage) {
+      return;
+    }
+
+    const pageIndex = offset / pageSize;
+    const nextPage: GalleryGridPageState = {
+      status: "ready",
+      entries: update.payload.entries,
+      error: null
+    };
+    const totalEntryCount = galleryPayloadTotalEntryCount(update.payload);
+    const nextCollection: GalleryGridCollection = {
+      ...collection,
+      prefix: update.payload.prefix,
+      totalEntryCount,
+      mediaSummary: galleryPayloadMediaSummary(update.payload),
+      pageCount: totalEntryCount > 0 ? Math.ceil(totalEntryCount / collection.pageSize) : 0
+    };
+    setGridCollection(nextCollection);
+    cacheGridPage(pageIndex, nextPage, collection.pageSize);
+    setGridPageState(pageIndex, nextPage);
   }
 
   async function loadVersionGraph(nextKey?: string) {
