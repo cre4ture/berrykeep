@@ -2447,6 +2447,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
                     limit: None,
                     has_more: false,
                     next_cursor: None,
+                    sync_token: None,
                     media_summary: StoreIndexMediaSummary::default(),
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
@@ -2473,6 +2474,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
             limit: None,
             has_more: false,
             next_cursor: None,
+            sync_token: None,
             media_summary: StoreIndexMediaSummary::default(),
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
@@ -3545,6 +3547,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
                     limit: None,
                     has_more: false,
                     next_cursor: None,
+                    sync_token: None,
                     media_summary: StoreIndexMediaSummary::default(),
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
@@ -3571,6 +3574,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
             limit: None,
             has_more: false,
             next_cursor: None,
+            sync_token: None,
             media_summary: StoreIndexMediaSummary::default(),
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),

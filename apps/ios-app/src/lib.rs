@@ -785,6 +785,7 @@ fn store_index_with_options_json(
         limit,
         sort: parse_store_index_sort_order(sort)?,
         media_filter: parse_store_index_media_filter(media_filter)?,
+        viewport: None,
         synthesize_missing_folder_markers: matches!(view, Some("tree"))
             && offset.is_none()
             && limit.is_none()
@@ -2014,6 +2015,7 @@ mod tests {
             limit: None,
             has_more: false,
             next_cursor: None,
+            sync_token: None,
             media_summary: Default::default(),
             entries,
         };

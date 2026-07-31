@@ -2457,6 +2457,8 @@ pub struct StoreIndexResponse {
     #[serde(default)]
     pub next_cursor: Option<String>,
     #[serde(default)]
+    pub sync_token: Option<String>,
+    #[serde(default)]
     pub media_summary: StoreIndexMediaSummary,
     #[serde(default)]
     pub entries: Vec<StoreIndexEntry>,
@@ -2591,6 +2593,7 @@ pub struct StoreIndexRequestOptions {
     pub limit: Option<usize>,
     pub sort: Option<StoreIndexSortOrder>,
     pub media_filter: Option<StoreIndexMediaFilter>,
+    pub viewport: Option<StoreIndexViewport>,
     pub synthesize_missing_folder_markers: bool,
 }
 
@@ -2604,9 +2607,28 @@ impl Default for StoreIndexRequestOptions {
             limit: None,
             sort: None,
             media_filter: None,
+            viewport: None,
             synthesize_missing_folder_markers: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StoreIndexViewport {
+    pub south: f64,
+    pub west: f64,
+    pub north: f64,
+    pub east: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreIndexDeltaResponse {
+    pub next_token: String,
+    pub has_more: bool,
+    #[serde(default)]
+    pub upserts: Vec<StoreIndexEntry>,
+    #[serde(default)]
+    pub removals: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3804,6 +3826,13 @@ impl IronMeshClient {
             url.query_pairs_mut()
                 .append_pair("media_filter", media_filter.as_query_value());
         }
+        if let Some(viewport) = options.viewport {
+            url.query_pairs_mut()
+                .append_pair("south", &viewport.south.to_string())
+                .append_pair("west", &viewport.west.to_string())
+                .append_pair("north", &viewport.north.to_string())
+                .append_pair("east", &viewport.east.to_string());
+        }
 
         let response = self
             .execute_buffered_request(Method::GET, url, Vec::new(), None)
@@ -3904,6 +3933,35 @@ impl IronMeshClient {
     ) -> Result<StoreIndexChangeWaitResponse> {
         let runtime = blocking_runtime()?;
         runtime.block_on(self.wait_for_store_index_change(since, timeout_ms))
+    }
+
+    pub async fn store_index_delta(
+        &self,
+        token: &str,
+        limit: Option<usize>,
+    ) -> Result<StoreIndexDeltaResponse> {
+        let mut url = self.store_index_url()?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("server URL cannot be a base"))?
+            .push("delta");
+        url.query_pairs_mut().append_pair("token", token);
+        if let Some(limit) = limit {
+            url.query_pairs_mut()
+                .append_pair("limit", &limit.max(1).to_string());
+        }
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+            .await
+            .context("failed to request /store/index/delta")?;
+        if !response.status.is_success() {
+            bail!(
+                "/store/index/delta returned non-success status: {} body={}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            );
+        }
+        serde_json::from_slice(&response.body)
+            .context("failed to parse /store/index/delta response")
     }
 
     pub async fn request_relative_path(

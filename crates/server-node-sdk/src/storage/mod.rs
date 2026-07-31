@@ -1007,6 +1007,15 @@ pub(crate) struct GalleryIndexQuery {
     pub(crate) captured_sort: GalleryIndexCapturedSort,
     pub(crate) offset: usize,
     pub(crate) limit: usize,
+    pub(crate) viewport: Option<GalleryViewportBounds>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GalleryViewportBounds {
+    pub(crate) south: f64,
+    pub(crate) west: f64,
+    pub(crate) north: f64,
+    pub(crate) east: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1031,9 +1040,57 @@ pub(crate) struct GalleryIndexEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct GalleryIndexPage {
+    pub(crate) history_id: String,
+    pub(crate) revision: u64,
     pub(crate) total_entry_count: usize,
     pub(crate) media_summary: GalleryIndexMediaSummary,
     pub(crate) entries: Vec<GalleryIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GalleryDeltaScope {
+    pub(crate) prefix: String,
+    pub(crate) depth: usize,
+    pub(crate) media_filter: GalleryIndexMediaFilter,
+    pub(crate) captured_sort: GalleryIndexCapturedSort,
+    pub(crate) viewport: Option<GalleryViewportBounds>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GalleryDeltaKind {
+    Upsert,
+    Removal,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GalleryDeltaChange {
+    pub(crate) key: String,
+    pub(crate) kind: GalleryDeltaKind,
+    pub(crate) entry: Option<GalleryIndexEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GalleryDeltaPage {
+    pub(crate) history_id: String,
+    pub(crate) next_revision: u64,
+    pub(crate) has_more: bool,
+    pub(crate) changes: Vec<GalleryDeltaChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GalleryDeltaCursorError {
+    Expired {
+        history_id: String,
+        current_revision: u64,
+    },
+    Ahead {
+        history_id: String,
+        current_revision: u64,
+    },
+    HistoryMismatch {
+        history_id: String,
+        current_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2201,6 +2258,13 @@ trait MetadataStore: Send + Sync {
         &self,
         query: &GalleryIndexQuery,
     ) -> Result<Option<GalleryIndexPage>>;
+    async fn query_gallery_delta(
+        &self,
+        history_id: &str,
+        since_revision: u64,
+        limit: usize,
+        scope: &GalleryDeltaScope,
+    ) -> Result<Option<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>>>;
     async fn count_current_objects(&self) -> Result<usize>;
     async fn list_current_object_keys(&self) -> Result<Vec<String>>;
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>>;
@@ -3443,6 +3507,18 @@ impl PersistentStore {
         query: &GalleryIndexQuery,
     ) -> Result<Option<GalleryIndexPage>> {
         self.metadata_store.query_gallery_index(query).await
+    }
+
+    pub(crate) async fn query_gallery_delta(
+        &self,
+        history_id: &str,
+        since_revision: u64,
+        limit: usize,
+        scope: &GalleryDeltaScope,
+    ) -> Result<Option<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>>> {
+        self.metadata_store
+            .query_gallery_delta(history_id, since_revision, limit, scope)
+            .await
     }
 
     pub(crate) fn storage_stats_collector(&self) -> StorageStatsCollector {

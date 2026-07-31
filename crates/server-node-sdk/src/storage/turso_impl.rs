@@ -12,7 +12,8 @@ use crate::cluster::NodeDescriptor;
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GalleryIndexPage, GalleryIndexQuery, ManifestSummary,
+    DataScrubRunRecord, FileVersionIndex, GalleryDeltaCursorError, GalleryDeltaPage,
+    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, ManifestSummary,
     ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
     RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
@@ -153,6 +154,18 @@ impl MetadataStore for TursoMetadataStore {
     ) -> Result<Option<GalleryIndexPage>> {
         // Keep the existing implementation as the safe fallback until the same
         // projection is available for the optional Turso metadata backend.
+        Ok(None)
+    }
+
+    async fn query_gallery_delta(
+        &self,
+        _history_id: &str,
+        _since_revision: u64,
+        _limit: usize,
+        _scope: &GalleryDeltaScope,
+    ) -> Result<Option<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>>> {
+        // The optional Turso backend still uses the generic gallery listing path,
+        // so it cannot offer a durable projection cursor yet.
         Ok(None)
     }
 

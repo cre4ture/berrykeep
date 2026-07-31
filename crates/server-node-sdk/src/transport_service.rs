@@ -14,22 +14,22 @@ use tower::ServiceExt;
 use crate::{
     BufferedTransportRequest, BufferedTransportResponse, InternalCaller,
     PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE, PUBLIC_API_V1_PREFIX, ServerState,
-    StoreIndexChangeWaitQuery, StoreIndexQuery, TransportHeader, build_internal_peer_api,
-    cluster_status, commit_version, complete_upload_session_route, confirm_version,
-    copy_object_path, delete_object, delete_object_by_query, delete_upload_session,
-    enroll_client_device, execute_replication_cleanup, get_media_thumbnail,
-    get_media_thumbnail_response, get_object, get_object_response, get_upload_session, head_object,
-    health, latency_diagnostic, list_nodes, list_snapshots, list_store_index,
-    list_store_index_response, list_tombstone_archives, list_versions, list_versions_response,
-    placement_for_key, process_stats_current, process_stats_history, put_object,
-    reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
+    StoreIndexChangeWaitQuery, StoreIndexDeltaQuery, StoreIndexQuery, TransportHeader,
+    build_internal_peer_api, cluster_status, commit_version, complete_upload_session_route,
+    confirm_version, copy_object_path, delete_object, delete_object_by_query,
+    delete_upload_session, enroll_client_device, execute_replication_cleanup, get_media_thumbnail,
+    get_media_thumbnail_response, get_object, get_object_response, get_store_index_delta,
+    get_upload_session, head_object, health, latency_diagnostic, list_nodes, list_snapshots,
+    list_store_index, list_store_index_response, list_tombstone_archives, list_versions,
+    list_versions_response, placement_for_key, process_stats_current, process_stats_history,
+    put_object, reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
     rendezvous_contact_config, renew_device_rendezvous_identity, replication, replication_plan,
     request_has_admin_auth, require_client_auth, require_client_or_admin_auth,
     require_internal_caller, restore_snapshot_path, restore_version_path, run_cleanup,
     run_tombstone_archive_purge, run_tombstone_archive_restore, run_tombstone_compaction,
     s3_frontend, start_upload_session, storage_stats_current, storage_stats_history,
-    transport_headers_from_response, trigger_replication_audit, upload_session_chunk,
-    validate_client_auth_request, wait_for_store_index_change,
+    store_index_delta_response, transport_headers_from_response, trigger_replication_audit,
+    upload_session_chunk, validate_client_auth_request, wait_for_store_index_change,
 };
 
 #[derive(Clone)]
@@ -206,6 +206,28 @@ async fn try_execute_direct_transport_request(
                 anyhow::anyhow!("failed parsing store index query {raw_path}: {err}")
             })?;
             Some(list_store_index_response(state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await)
+        }
+        ("GET", "/store/index/delta") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
+            let query =
+                parse_query::<StoreIndexDeltaQuery>(&normalized_raw_path).map_err(|err| {
+                    anyhow::anyhow!("failed parsing store index delta query {raw_path}: {err}")
+                })?;
+            Some(
+                store_index_delta_response(state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await,
+            )
         }
         ("GET", "/store/index/changes/wait") => {
             if let Some(response) = authorize_direct_transport_fast_path(
@@ -509,6 +531,7 @@ fn build_public_transport_router(state: ServerState) -> Router {
         )
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/index/delta", get(get_store_index_delta))
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
@@ -682,6 +705,7 @@ fn build_internal_transport_router(state: ServerState) -> Router {
         .route("/cluster/replication/plan", get(replication_plan))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/index/delta", get(get_store_index_delta))
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),

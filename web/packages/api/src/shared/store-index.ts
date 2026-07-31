@@ -54,8 +54,31 @@ export type StoreIndexResponse = {
   offset: number;
   limit?: number | null;
   has_more: boolean;
+  next_cursor?: string | null;
+  sync_token?: string | null;
   media_summary: StoreIndexMediaSummary;
   entries: StoreIndexEntry[];
+};
+
+export type StoreIndexDeltaResponse = {
+  next_token: string;
+  has_more: boolean;
+  upserts: StoreIndexEntry[];
+  removals: string[];
+};
+
+export type StoreIndexDeltaResetError = {
+  code: "store_index_delta_reset_required" | "store_index_delta_invalid_token";
+  reset: true;
+  message: string;
+  current_token?: string | null;
+};
+
+export type StoreIndexViewport = {
+  south: number;
+  west: number;
+  north: number;
+  east: number;
 };
 
 export type StoreListView = "raw" | "tree";
@@ -80,4 +103,5 @@ export type StoreListRequestOptions = {
   limit?: number;
   sort?: StoreListSortOrder;
   mediaFilter?: StoreListMediaFilter;
+  viewport?: StoreIndexViewport;
 };

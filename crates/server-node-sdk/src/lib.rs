@@ -133,6 +133,7 @@ use x509_parser::prelude::FromDer;
 
 mod cluster;
 mod embedded_rendezvous;
+mod gallery_sync;
 mod hardware_health;
 mod host_storage;
 mod listing;
@@ -148,6 +149,13 @@ mod storage;
 mod transport_service;
 mod ui;
 mod web_maps;
+
+#[cfg(test)]
+use gallery_sync::GallerySyncScope;
+use gallery_sync::{
+    GallerySyncTokenPayload, decode_gallery_sync_token, encode_gallery_sync_token,
+    gallery_delta_scope_from_sync, gallery_sync_scope_from_query,
+};
 
 const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -7402,6 +7410,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/index/delta", get(get_store_index_delta))
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
@@ -7487,6 +7496,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/scrub/run", post(trigger_data_scrub_public))
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
+        .route("/auth/store/index/delta", get(get_store_index_delta_admin))
         .route("/auth/data-changes", get(list_data_change_events))
         .route(
             "/auth/maps/config",
@@ -7814,6 +7824,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/cluster/replication/plan", get(replication_plan))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/index/delta", get(get_store_index_delta))
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
@@ -12821,6 +12832,16 @@ struct StoreIndexQuery {
     limit: Option<usize>,
     sort: Option<StoreIndexSortOrder>,
     media_filter: Option<StoreIndexMediaFilter>,
+    south: Option<f64>,
+    west: Option<f64>,
+    north: Option<f64>,
+    east: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct StoreIndexDeltaQuery {
+    token: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -12959,8 +12980,26 @@ struct StoreIndexResponse {
     has_more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_token: Option<String>,
     media_summary: StoreIndexMediaSummary,
     entries: Vec<StoreIndexEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreIndexDeltaResponse {
+    next_token: String,
+    has_more: bool,
+    upserts: Vec<StoreIndexEntry>,
+    removals: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreIndexDeltaResetResponse {
+    code: &'static str,
+    reset: bool,
+    message: &'static str,
+    current_token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15039,6 +15078,10 @@ async fn list_store_index_admin(
             "limit": query.limit,
             "sort": query.sort,
             "media_filter": query.media_filter,
+            "south": query.south,
+            "west": query.west,
+            "north": query.north,
+            "east": query.east,
         }),
     )
     .await
@@ -15049,11 +15092,173 @@ async fn list_store_index_admin(
     list_store_index_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
 }
 
+async fn get_store_index_delta(
+    State(state): State<ServerState>,
+    Query(query): Query<StoreIndexDeltaQuery>,
+) -> impl IntoResponse {
+    store_index_delta_response(&state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn get_store_index_delta_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<StoreIndexDeltaQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "auth/store/index/delta/get",
+        true,
+        true,
+        json!({ "limit": query.limit }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    store_index_delta_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn store_index_delta_response(
+    state: &ServerState,
+    query: StoreIndexDeltaQuery,
+    thumbnail_route: &str,
+) -> Response {
+    let Some(token) = query.token.as_deref() else {
+        return store_index_delta_reset_response(
+            StatusCode::BAD_REQUEST,
+            "store_index_delta_invalid_token",
+            "a sync token from a current store-index response is required",
+            None,
+        );
+    };
+    let Some(token_payload) = decode_gallery_sync_token(token) else {
+        return store_index_delta_reset_response(
+            StatusCode::BAD_REQUEST,
+            "store_index_delta_invalid_token",
+            "the supplied sync token is malformed or uses an unsupported version",
+            None,
+        );
+    };
+    let limit = query.limit.unwrap_or(500).clamp(1, 2_000);
+    let scope = gallery_delta_scope_from_sync(&token_payload.scope);
+    let delta = {
+        let store = read_store(state, "store_index.delta").await;
+        store
+            .query_gallery_delta(
+                &token_payload.history_id,
+                token_payload.revision,
+                limit,
+                &scope,
+            )
+            .await
+    };
+    let page = match delta {
+        Ok(Some(Ok(page))) => page,
+        Ok(Some(Err(storage::GalleryDeltaCursorError::Expired {
+            history_id,
+            current_revision,
+        }))) => {
+            return store_index_delta_reset_response(
+                StatusCode::CONFLICT,
+                "store_index_delta_reset_required",
+                "the sync token has expired; reload the current gallery index",
+                Some(encode_gallery_sync_token(&GallerySyncTokenPayload {
+                    history_id,
+                    revision: current_revision,
+                    scope: token_payload.scope,
+                })),
+            );
+        }
+        Ok(Some(Err(
+            storage::GalleryDeltaCursorError::Ahead {
+                history_id,
+                current_revision,
+            }
+            | storage::GalleryDeltaCursorError::HistoryMismatch {
+                history_id,
+                current_revision,
+            },
+        ))) => {
+            return store_index_delta_reset_response(
+                StatusCode::CONFLICT,
+                "store_index_delta_reset_required",
+                "the sync token does not belong to this gallery history; reload the current gallery index",
+                Some(encode_gallery_sync_token(&GallerySyncTokenPayload {
+                    history_id,
+                    revision: current_revision,
+                    scope: token_payload.scope,
+                })),
+            );
+        }
+        Ok(None) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "error": "durable gallery deltas require the SQLite metadata backend"
+                })),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query durable gallery deltas");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut latest_by_key = BTreeMap::new();
+    for change in page.changes {
+        latest_by_key.insert(change.key.clone(), change);
+    }
+    let mut upserts = Vec::new();
+    let mut removals = Vec::new();
+    for change in latest_by_key.into_values() {
+        match (change.kind, change.entry) {
+            (storage::GalleryDeltaKind::Upsert, Some(entry)) => {
+                upserts.push(store_index_entry_from_gallery_entry(entry, thumbnail_route));
+            }
+            _ => removals.push(change.key),
+        }
+    }
+    Json(StoreIndexDeltaResponse {
+        next_token: encode_gallery_sync_token(&GallerySyncTokenPayload {
+            history_id: page.history_id,
+            revision: page.next_revision,
+            scope: token_payload.scope,
+        }),
+        has_more: page.has_more,
+        upserts,
+        removals,
+    })
+    .into_response()
+}
+
+fn store_index_delta_reset_response(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+    current_token: Option<String>,
+) -> Response {
+    (
+        status,
+        Json(StoreIndexDeltaResetResponse {
+            code,
+            reset: true,
+            message,
+            current_token,
+        }),
+    )
+        .into_response()
+}
+
 fn store_index_page_cache_key(
     query: &StoreIndexQuery,
     thumbnail_route: &str,
 ) -> Option<StoreIndexPageCacheKey> {
-    if !matches!(query.view, Some(StoreIndexView::Tree)) || query.limit.is_none() {
+    if !matches!(query.view, Some(StoreIndexView::Tree))
+        || query.limit.is_none()
+        || store_index_has_viewport(query)
+    {
         return None;
     }
 
@@ -15066,6 +15271,38 @@ fn store_index_page_cache_key(
         media_filter: query.media_filter,
         thumbnail_route: thumbnail_route.to_string(),
     })
+}
+
+fn store_index_has_viewport(query: &StoreIndexQuery) -> bool {
+    query.south.is_some() || query.west.is_some() || query.north.is_some() || query.east.is_some()
+}
+
+fn store_index_viewport_bounds(
+    query: &StoreIndexQuery,
+) -> std::result::Result<Option<storage::GalleryViewportBounds>, &'static str> {
+    if !store_index_has_viewport(query) {
+        return Ok(None);
+    }
+    let (Some(south), Some(west), Some(north), Some(east)) =
+        (query.south, query.west, query.north, query.east)
+    else {
+        return Err("south, west, north, and east must be provided together");
+    };
+    if !south.is_finite() || !north.is_finite() || !west.is_finite() || !east.is_finite() {
+        return Err("viewport bounds must be finite numbers");
+    }
+    if !(-90.0..=90.0).contains(&south) || !(-90.0..=90.0).contains(&north) || south > north {
+        return Err("viewport latitude bounds must satisfy -90 <= south <= north <= 90");
+    }
+    if !(-180.0..=180.0).contains(&west) || !(-180.0..=180.0).contains(&east) {
+        return Err("viewport longitude bounds must be between -180 and 180");
+    }
+    Ok(Some(storage::GalleryViewportBounds {
+        south,
+        west,
+        north,
+        east,
+    }))
 }
 
 fn store_index_gallery_query(
@@ -15093,49 +15330,30 @@ fn store_index_gallery_query(
         captured_sort,
         offset: query.offset.unwrap_or(0),
         limit: query.limit?.max(1),
+        viewport: store_index_viewport_bounds(query).ok()?,
     })
 }
 
 fn store_index_response_from_gallery_index_page(
     page: storage::GalleryIndexPage,
+    gallery_query: &storage::GalleryIndexQuery,
     query: &StoreIndexQuery,
     prefix: String,
     depth: usize,
     thumbnail_route: &str,
 ) -> StoreIndexResponse {
+    let sync_token = encode_gallery_sync_token(&GallerySyncTokenPayload {
+        history_id: page.history_id,
+        revision: page.revision,
+        scope: gallery_sync_scope_from_query(gallery_query),
+    });
     let total_entry_count = page.total_entry_count;
     let offset = query.offset.unwrap_or(0).min(total_entry_count);
     let limit = query.limit.map(|value| value.max(1));
     let entries = page
         .entries
         .into_iter()
-        .map(|entry| {
-            let media = entry
-                .content_fingerprint
-                .as_ref()
-                .map(|content_fingerprint| {
-                    build_media_index_response(
-                        &entry.key,
-                        None,
-                        None,
-                        &MediaCacheLookup {
-                            content_fingerprint: content_fingerprint.clone(),
-                            metadata: entry.media_metadata,
-                        },
-                        thumbnail_route,
-                    )
-                });
-            StoreIndexEntry {
-                path: entry.key,
-                entry_type: "key".to_string(),
-                version: None,
-                content_hash: Some(entry.manifest_hash),
-                size_bytes: entry.size_bytes,
-                modified_at_unix: entry.modified_at_unix,
-                content_fingerprint: entry.content_fingerprint,
-                media,
-            }
-        })
+        .map(|entry| store_index_entry_from_gallery_entry(entry, thumbnail_route))
         .collect::<Vec<_>>();
     StoreIndexResponse {
         prefix,
@@ -15148,6 +15366,7 @@ fn store_index_response_from_gallery_index_page(
             .map(|limit| offset.saturating_add(limit) < total_entry_count)
             .unwrap_or(false),
         next_cursor: None,
+        sync_token: Some(sync_token),
         media_summary: StoreIndexMediaSummary {
             ready_count: page.media_summary.ready_count,
             pending_count: page.media_summary.pending_count,
@@ -15157,6 +15376,37 @@ fn store_index_response_from_gallery_index_page(
             geotagged_count: page.media_summary.geotagged_count,
         },
         entries,
+    }
+}
+
+fn store_index_entry_from_gallery_entry(
+    entry: storage::GalleryIndexEntry,
+    thumbnail_route: &str,
+) -> StoreIndexEntry {
+    let media = entry
+        .content_fingerprint
+        .as_ref()
+        .map(|content_fingerprint| {
+            build_media_index_response(
+                &entry.key,
+                None,
+                None,
+                &MediaCacheLookup {
+                    content_fingerprint: content_fingerprint.clone(),
+                    metadata: entry.media_metadata,
+                },
+                thumbnail_route,
+            )
+        });
+    StoreIndexEntry {
+        path: entry.key,
+        entry_type: "key".to_string(),
+        version: None,
+        content_hash: Some(entry.manifest_hash),
+        size_bytes: entry.size_bytes,
+        modified_at_unix: entry.modified_at_unix,
+        content_fingerprint: entry.content_fingerprint,
+        media,
     }
 }
 
@@ -15235,6 +15485,7 @@ fn cached_store_index_page_response(
             limit,
             has_more,
             next_cursor: None,
+            sync_token: None,
             media_summary: cached.media_summary.clone(),
             entries,
         }),
@@ -15265,6 +15516,12 @@ async fn list_store_index_response_attempt(
     thumbnail_route: &str,
     allow_namespace_retry: bool,
 ) -> Response {
+    let viewport = match store_index_viewport_bounds(&query) {
+        Ok(viewport) => viewport,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
     let request_id = Uuid::new_v4();
     let request_started_at = Instant::now();
     let prefix = query.prefix.clone().unwrap_or_default();
@@ -15277,7 +15534,17 @@ async fn list_store_index_response_attempt(
         .namespace_change_sequence
         .load(Ordering::SeqCst);
 
-    if let Some(gallery_query) = store_index_gallery_query(&query, &prefix, depth) {
+    let gallery_query = store_index_gallery_query(&query, &prefix, depth);
+    if viewport.is_some() && gallery_query.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "viewport bounds require a current, paginated gallery query sorted by captured time"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(gallery_query) = gallery_query {
         let gallery_index_started_at = Instant::now();
         let gallery_page = {
             let store = read_store(state, "store_index.gallery_index").await;
@@ -15308,6 +15575,7 @@ async fn list_store_index_response_attempt(
                 let materialized_entry_count = page.entries.len();
                 let response = Json(store_index_response_from_gallery_index_page(
                     page,
+                    &gallery_query,
                     &query,
                     prefix,
                     depth,
@@ -15325,6 +15593,15 @@ async fn list_store_index_response_attempt(
                     total_entry_count,
                     materialized_entry_count,
                 );
+            }
+            Ok(None) if viewport.is_some() => {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(json!({
+                        "error": "viewport gallery queries require the SQLite metadata backend"
+                    })),
+                )
+                    .into_response();
             }
             Ok(None) => {}
             Err(err) => {
@@ -15734,6 +16011,7 @@ async fn list_store_index_response_attempt(
             limit,
             has_more,
             next_cursor: None,
+            sync_token: None,
             media_summary,
             entries,
         }),
@@ -16052,6 +16330,7 @@ async fn list_store_index_response_cursor_mode(
             limit: Some(page_size),
             has_more: page.has_more,
             next_cursor: page.next_cursor,
+            sync_token: None,
             media_summary,
             entries,
         }),
