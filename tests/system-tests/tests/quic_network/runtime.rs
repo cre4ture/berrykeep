@@ -123,7 +123,7 @@ impl ScenarioRuntime {
         let identity_path = client_dir.join("connection.bootstrap.client-identity.json");
         enroll_cli(&node_device, &bootstrap_path, &identity_path).await?;
 
-        let ticket_timeout = if scenario.stall_iroh_ticket {
+        let ticket_timeout = if scenario.stall_first_iroh_ticket {
             let server =
                 TicketTimeoutServer::spawn(&rendezvous_device, "0.0.0.0:0".parse()?).await?;
             prepend_rendezvous_url(&bootstrap_path, &server.url())?;

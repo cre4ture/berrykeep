@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 use runtime::ScenarioRuntime;
 
@@ -45,7 +45,7 @@ struct Scenario {
     network: NetworkProfile,
     iroh_relay_enabled: bool,
     ironmesh_relay_enabled: bool,
-    stall_iroh_ticket: bool,
+    stall_first_iroh_ticket: bool,
     expected: ExpectedRoute,
 }
 
@@ -55,7 +55,7 @@ impl Scenario {
         network: NetworkProfile::HolePunchableHomeNat,
         iroh_relay_enabled: true,
         ironmesh_relay_enabled: false,
-        stall_iroh_ticket: false,
+        stall_first_iroh_ticket: false,
         expected: ExpectedRoute::DirectQuic("direct"),
     };
 
@@ -64,7 +64,7 @@ impl Scenario {
         network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: true,
         ironmesh_relay_enabled: false,
-        stall_iroh_ticket: false,
+        stall_first_iroh_ticket: false,
         expected: ExpectedRoute::DirectQuic("relay"),
     };
 
@@ -73,17 +73,17 @@ impl Scenario {
         network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: false,
         ironmesh_relay_enabled: true,
-        stall_iroh_ticket: false,
+        stall_first_iroh_ticket: false,
         expected: ExpectedRoute::RelayTunnel,
     };
 
-    const TICKET_TIMEOUT_FALLBACK: Self = Self {
-        name: "ticket-timeout-fallback",
+    const TICKET_RACE_HEALTHY_SECOND: Self = Self {
+        name: "ticket-race-healthy-second",
         network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: true,
-        ironmesh_relay_enabled: true,
-        stall_iroh_ticket: true,
-        expected: ExpectedRoute::RelayTunnel,
+        ironmesh_relay_enabled: false,
+        stall_first_iroh_ticket: true,
+        expected: ExpectedRoute::DirectQuic("relay"),
     };
 }
 
@@ -103,8 +103,8 @@ async fn udp_blocked_without_iroh_relay_falls_back_to_ironmesh_relay() -> Result
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn iroh_ticket_timeout_falls_back_to_ironmesh_relay() -> Result<()> {
-    run_with_timeout(Scenario::TICKET_TIMEOUT_FALLBACK).await
+async fn stalled_first_iroh_ticket_endpoint_uses_healthy_second_endpoint() -> Result<()> {
+    run_with_timeout(Scenario::TICKET_RACE_HEALTHY_SECOND).await
 }
 
 async fn run_with_timeout(scenario: Scenario) -> Result<()> {
@@ -146,22 +146,12 @@ async fn exercise_and_assert(runtime: &mut ScenarioRuntime, scenario: Scenario) 
         )
     })?;
 
-    if scenario.stall_iroh_ticket {
+    if scenario.stall_first_iroh_ticket {
         let ticket_requests_after = runtime.ticket_request_count()?;
         ensure!(
             ticket_requests_after > 0,
             "the CLI never reached the intentionally stalled Iroh ticket endpoint"
         );
-        // Keep the fault active beyond the client-side ticket budget. The CLI
-        // must continue serving storage through the IronMesh relay while that
-        // background refresh is stalled.
-        sleep(Duration::from_millis(3_500)).await;
-        runtime
-            .store_list()
-            .await
-            .context("CLI fallback stopped working after the Iroh ticket timeout budget")?;
-        let routes_after_timeout = runtime.connection_routes().await?;
-        assert_expected_route(&routes_after_timeout, ExpectedRoute::RelayTunnel)?;
     }
     Ok(())
 }
