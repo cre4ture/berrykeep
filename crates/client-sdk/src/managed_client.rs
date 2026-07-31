@@ -331,7 +331,11 @@ impl ConnectionBootstrap {
         identity: ClientIdentityMaterial,
         options: ManagedClientOptions,
     ) -> Result<ManagedIronMeshClient> {
-        self.build_managed_client(Some(identity), options).await
+        // Keep the public async wrapper shallow for FFI and CLI callers. The
+        // managed refresh path includes multiplexed direct and relay request
+        // futures; boxing it here avoids requiring every consumer crate to
+        // raise its compiler recursion limit.
+        Box::pin(self.build_managed_client(Some(identity), options)).await
     }
 
     /// Synchronous counterpart for desktop daemons and shell integrations that
