@@ -9,11 +9,12 @@ const RELIABILITY_TELEMETRY_STATE_FILE: &str = "telemetry/reliability-telemetry-
 const TELEMETRY_SCHEMA_VERSION: u32 = 1;
 const TELEMETRY_HMAC_DOMAIN: &[u8] = b"ironmesh-telemetry-v1";
 
-/// Central collector ingest URL. Per doc Section 5.2 the production collector is assumed to live
-/// at `creax.de:44044`; the endpoint path matches `stats-collector-server`'s ingest route.
+/// Central collector ingest URL. Per doc Section 5.2 the production collector is hosted directly
+/// on the STRATO public IPv4 address at port 9444; the endpoint path matches
+/// `stats-collector-server`'s ingest route.
 /// Overridable via `IRONMESH_RELIABILITY_TELEMETRY_COLLECTOR_URL` (chiefly so tests can point the
 /// sender at a local listener).
-const DEFAULT_COLLECTOR_URL: &str = "https://creax.de:44044/v1/ingest/hardware-reliability";
+const DEFAULT_COLLECTOR_URL: &str = "https://217.160.159.105:9444/v1/ingest/hardware-reliability";
 /// Path suffix of the ingest URL, stripped off to derive the registration endpoint's base URL
 /// (see `registration_url`). Kept in sync with `stats-collector-server`'s route.
 const INGEST_URL_PATH_SUFFIX: &str = "/v1/ingest/hardware-reliability";
@@ -1756,9 +1757,9 @@ mod tests {
 
     #[test]
     fn registration_url_replaces_the_ingest_suffix_with_register_plus_subject_id() {
-        let ingest_url = "https://creax.de:44044/v1/ingest/hardware-reliability";
+        let ingest_url = DEFAULT_COLLECTOR_URL;
         let url = registration_url(ingest_url, "abc123");
-        assert_eq!(url, "https://creax.de:44044/v1/register/abc123");
+        assert_eq!(url, "https://217.160.159.105:9444/v1/register/abc123");
     }
 
     #[test]
