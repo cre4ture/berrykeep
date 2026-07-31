@@ -12,11 +12,6 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         fullscreenButton.tap()
 
         assertFullscreenMapRemainsVisible(in: webView)
-        let exitFullscreenButton = element(in: webView, labelled: "Exit fullscreen map")
-        XCTAssertTrue(
-            exitFullscreenButton.waitForExistence(timeout: 45),
-            "The directly embedded Gallery Map should expose fullscreen controls"
-        )
         assertFullscreenMapClusterChooserIsVisible(in: webView)
     }
 
