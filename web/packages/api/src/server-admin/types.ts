@@ -1139,6 +1139,17 @@ export type RendezvousConfigView = {
   persisted: boolean;
 };
 
+export type RendezvousContactConfiguration = {
+  schema_version: number;
+  rendezvous_urls: string[];
+};
+
+export type RendezvousContactConfigurationResponse = {
+  configuration: RendezvousContactConfiguration;
+  stored: boolean;
+  version_id?: string | null;
+};
+
 export type DirectEndpointsConfigView = {
   effective_public_urls: string[];
   editable_public_urls: string[];
