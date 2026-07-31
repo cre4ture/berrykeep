@@ -154,10 +154,19 @@ Managed setup-mode nodes now recover expired runtime node certificates by fallin
 
 The current recovery slice makes these concrete choices:
 
-- startup inspects the stored runtime node enrollment package and treats expired or otherwise unreadable configured node certificates as a recovery condition,
+- managed setup state v2 stores the node-local runtime data root, but derives the enrollment
+  artifact path and TLS role paths from a fixed managed layout,
+- host paths carried by the transport-v1 enrollment envelope are compatibility input only; managed
+  startup rebinds the identity and embedded credential material to the node-local runtime root,
+- setup-state v1 installations migrate automatically on startup, including installations whose
+  legacy enrollment used a relative runtime data directory,
+- startup materializes missing TLS files again from valid embedded enrollment material and clears a
+  stale recovery state automatically; missing materialized files are not by themselves a rejoin,
+- startup persists a structured recovery reason when the enrollment artifact is missing or invalid,
+  its identity does not match, or its certificate material is actually missing or expired,
 - setup recovery preserves the existing `cluster_id` and stable `node_id`,
 - `start-cluster` is rejected while a node is in recovery so the operator cannot accidentally replace an existing cluster identity,
-- the recovery workflow is: generate a fresh join request, issue a fresh node enrollment package from an existing control-plane node, and import that package to return to runtime.
+- for a true recovery condition, the workflow is: generate a fresh join request, issue a fresh node enrollment package from an existing control-plane node, and import that package to return to runtime.
 
 ### Remaining gap
 

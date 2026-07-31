@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use common::{ClusterId, NodeId};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::{Certificate, Client, Url};
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
@@ -72,6 +73,8 @@ pub struct IrohRelayTicket {
     pub public_urls: Vec<String>,
     pub auth_token: String,
     pub expires_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_port: Option<u16>,
 }
 
 impl std::fmt::Debug for IrohRelayTicket {
@@ -81,6 +84,7 @@ impl std::fmt::Debug for IrohRelayTicket {
             .field("public_urls", &self.public_urls)
             .field("auth_token", &"[REDACTED]")
             .field("expires_at_unix", &self.expires_at_unix)
+            .field("quic_port", &self.quic_port)
             .finish()
     }
 }
@@ -96,6 +100,9 @@ impl IrohRelayTicket {
         }
         if self.expires_at_unix == 0 {
             bail!("iroh relay ticket expires_at_unix must be greater than zero");
+        }
+        if self.quic_port == Some(0) {
+            bail!("iroh relay ticket quic_port must be greater than zero when present");
         }
         Ok(())
     }
@@ -448,9 +455,12 @@ impl RendezvousControlClient {
         };
         request.validate()?;
         let ticket: IrohRelayTicket = self
-            .post_json("/control/iroh-relay/ticket", &request)
+            .post_json_first_valid(
+                "/control/iroh-relay/ticket",
+                &request,
+                IrohRelayTicket::validate,
+            )
             .await?;
-        ticket.validate()?;
         Ok(ticket)
     }
 
@@ -732,6 +742,73 @@ impl RendezvousControlClient {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
+    }
+
+    async fn post_json_first_valid<Body, T, Validate>(
+        &self,
+        path: &str,
+        body: &Body,
+        validate: Validate,
+    ) -> Result<T>
+    where
+        Body: Serialize + ?Sized,
+        T: DeserializeOwned,
+        Validate: Fn(&T) -> Result<()>,
+    {
+        let mut attempts = FuturesUnordered::new();
+        let mut errors = std::iter::repeat_with(|| None)
+            .take(self.config.rendezvous_urls.len())
+            .collect::<Vec<Option<anyhow::Error>>>();
+
+        for (index, base_url) in self.config.rendezvous_urls.iter().enumerate() {
+            let url = control_url(base_url, path)?;
+            let request = self.http.post(url.clone()).json(body);
+            let base_url = base_url.clone();
+            let client_identity_pem = self.client_identity_pem.as_deref();
+            attempts.push(async move {
+                let result = match request.send().await {
+                    Ok(response) if response.status().is_success() => {
+                        response.json::<T>().await.map_err(|error| {
+                            format!("failed decoding rendezvous response from {url}: {error}")
+                        })
+                    }
+                    Ok(response) => Err(rendezvous_response_error(&url, response).await),
+                    Err(error) => Err(decorate_rendezvous_transport_error(
+                        format!("failed contacting rendezvous endpoint {url}: {error}"),
+                        client_identity_pem,
+                        unix_timestamp(),
+                    )),
+                };
+                (index, base_url, url, result)
+            });
+        }
+
+        while let Some((index, base_url, url, result)) = attempts.next().await {
+            match result {
+                Ok(payload) => match validate(&payload) {
+                    Ok(()) => {
+                        self.record_endpoint_result(&base_url, Ok(()), true);
+                        return Ok(payload);
+                    }
+                    Err(error) => {
+                        let message = format!("invalid rendezvous response from {url}: {error}");
+                        self.record_endpoint_result(&base_url, Err(message.clone()), true);
+                        errors[index] = Some(anyhow!(message));
+                    }
+                },
+                Err(message) => {
+                    self.record_endpoint_result(&base_url, Err(message.clone()), true);
+                    errors[index] = Some(anyhow!(message));
+                }
+            }
+        }
+
+        Err(errors
+            .into_iter()
+            .rev()
+            .flatten()
+            .next()
+            .unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
     }
 
     fn record_endpoint_result(
@@ -1136,6 +1213,7 @@ mod tests {
             public_urls: vec!["https://rendezvous.example".to_string()],
             auth_token: "sensitive-endpoint-ticket".to_string(),
             expires_at_unix: 10_000,
+            quic_port: Some(7842),
         };
         ticket.validate().expect("valid relay ticket should pass");
         let debug = format!("{ticket:?}");
@@ -1152,6 +1230,99 @@ mod tests {
         .validate()
         .expect_err("invalid endpoint ID should fail");
         assert!(error.to_string().contains("endpoint_id"));
+    }
+
+    #[tokio::test]
+    async fn issue_iroh_relay_ticket_races_rendezvous_endpoints() {
+        let cluster_id = ClusterId::now_v7();
+        let endpoint_id = iroh::SecretKey::generate().public().to_string();
+        let requests_started = Arc::new(tokio::sync::Barrier::new(2));
+
+        let stalled_barrier = Arc::clone(&requests_started);
+        let stalled_router = Router::new().route(
+            "/control/iroh-relay/ticket",
+            post(move || {
+                let stalled_barrier = Arc::clone(&stalled_barrier);
+                async move {
+                    stalled_barrier.wait().await;
+                    std::future::pending::<StatusCode>().await
+                }
+            }),
+        );
+        let stalled_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stalled listener should bind");
+        let stalled_addr = stalled_listener
+            .local_addr()
+            .expect("stalled listener address");
+        let stalled_server = tokio::spawn(async move {
+            axum::serve(stalled_listener, stalled_router)
+                .await
+                .expect("stalled rendezvous server should run");
+        });
+
+        let healthy_barrier = Arc::clone(&requests_started);
+        let expected_endpoint_id = endpoint_id.clone();
+        let healthy_router = Router::new().route(
+            "/control/iroh-relay/ticket",
+            post(move |Json(request): Json<IrohRelayTicketRequest>| {
+                let healthy_barrier = Arc::clone(&healthy_barrier);
+                let expected_endpoint_id = expected_endpoint_id.clone();
+                async move {
+                    assert_eq!(request.cluster_id, cluster_id);
+                    assert_eq!(request.endpoint_id, expected_endpoint_id);
+                    healthy_barrier.wait().await;
+                    Json(IrohRelayTicket {
+                        public_urls: vec!["https://relay.example".to_string()],
+                        auth_token: "healthy-endpoint-ticket".to_string(),
+                        expires_at_unix: unix_timestamp() + 60,
+                        quic_port: Some(7842),
+                    })
+                }
+            }),
+        );
+        let healthy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("healthy listener should bind");
+        let healthy_addr = healthy_listener
+            .local_addr()
+            .expect("healthy listener address");
+        let healthy_server = tokio::spawn(async move {
+            axum::serve(healthy_listener, healthy_router)
+                .await
+                .expect("healthy rendezvous server should run");
+        });
+
+        let healthy_url = format!("http://{healthy_addr}");
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![format!("http://{stalled_addr}"), healthy_url.clone()],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        let ticket = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.issue_iroh_relay_ticket(&endpoint_id),
+        )
+        .await
+        .expect("healthy second endpoint should beat the stalled first endpoint")
+        .expect("healthy endpoint should issue a valid ticket");
+
+        assert_eq!(ticket.auth_token, "healthy-endpoint-ticket");
+        assert_eq!(
+            client.runtime_state().active_url.as_deref(),
+            Some(healthy_url.as_str())
+        );
+
+        stalled_server.abort();
+        let _ = stalled_server.await;
+        healthy_server.abort();
+        let _ = healthy_server.await;
     }
 
     #[tokio::test]

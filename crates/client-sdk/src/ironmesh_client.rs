@@ -42,7 +42,9 @@ use transport_sdk::{
 };
 use uuid::Uuid;
 
-use crate::session_pool::{TransportSessionPool, TransportSessionPoolSnapshot};
+use crate::session_pool::{
+    DirectQuicSetupWaiter, TransportSessionPool, TransportSessionPoolSnapshot,
+};
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
@@ -51,6 +53,7 @@ const STAGED_DOWNLOAD_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
 const TRANSPORT_STREAM_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
 const CLIENT_ROUTE_UNKNOWN_LATENCY_MS: f64 = 75.0;
 const CLIENT_ROUTE_RELAY_PENALTY_MS: f64 = 500.0;
+const CLIENT_ROUTE_DIRECT_QUIC_BONUS_MS: f64 = 100.0;
 const CLIENT_ROUTE_FAILURE_PENALTY_MS: f64 = 250.0;
 const CLIENT_ROUTE_ACTIVE_BONUS_MS: f64 = 50.0;
 const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
@@ -62,6 +65,9 @@ const CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT: usize = 1;
 const CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT: usize = 3;
 const CLIENT_ROUTE_RECENT_ATTEMPT_LIMIT: usize = 64;
 const CLIENT_BUFFERED_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+// A warm multiplexed session should fail over quickly. Cold Direct-QUIC setup has its own
+// ten-second budget in `session_pool`.
+const CLIENT_WARM_MULTIPLEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_LONG_RUNNING_REQUEST_GRACE: Duration = Duration::from_secs(10);
 const MOBILE_CONNECTION_LOG_TARGET: &str = "ironmesh_mobile_connection";
 const STORE_INDEX_WAIT_DEFAULT_TIMEOUT_MS: u64 = 25_000;
@@ -218,6 +224,7 @@ struct ClientEndpointRouter {
     endpoints: Arc<RwLock<Vec<ClientEndpoint>>>,
     active_route_key: Arc<RwLock<Option<String>>>,
     transport_failure_refresh_observer: Arc<TransportFailureRefreshObserverSlot>,
+    relay_connection_refresh_observer: Arc<RelayConnectionRefreshObserverSlot>,
 }
 
 #[derive(Clone, Copy)]
@@ -513,6 +520,8 @@ type ConnectionDiagnosticsObserver =
 type ConnectionDiagnosticsObserverSlot = RwLock<Option<ConnectionDiagnosticsObserver>>;
 type TransportFailureRefreshObserver = Arc<dyn Fn() + Send + Sync + 'static>;
 type TransportFailureRefreshObserverSlot = RwLock<Option<TransportFailureRefreshObserver>>;
+type RelayConnectionRefreshObserver = Arc<dyn Fn(NodeId) + Send + Sync + 'static>;
+type RelayConnectionRefreshObserverSlot = RwLock<Option<RelayConnectionRefreshObserver>>;
 
 fn connection_diagnostics_observer() -> &'static ConnectionDiagnosticsObserverSlot {
     static OBSERVER: OnceLock<ConnectionDiagnosticsObserverSlot> = OnceLock::new();
@@ -557,6 +566,7 @@ impl ClientEndpointRouter {
             endpoints: Arc::new(RwLock::new(endpoints)),
             active_route_key: Arc::new(RwLock::new(initial_active)),
             transport_failure_refresh_observer: Arc::new(RwLock::new(None)),
+            relay_connection_refresh_observer: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -748,6 +758,9 @@ impl ClientEndpointRouter {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
+        let first_relay_connection = !latency_samples_ms.is_empty()
+            && state.total_successes == 0
+            && endpoint.transport.relay_target_node_id().is_some();
         for (sample_index, latency_ms) in latency_samples_ms.iter().copied().enumerate() {
             record_endpoint_success_sample(
                 &mut state,
@@ -758,6 +771,10 @@ impl ClientEndpointRouter {
         }
         if latency_samples_ms.is_empty() {
             state.background_probe_in_flight = false;
+        }
+        drop(state);
+        if first_relay_connection {
+            self.notify_first_relay_connection(index, &endpoint);
         }
     }
 
@@ -839,6 +856,8 @@ impl ClientEndpointRouter {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
+        let first_relay_connection =
+            state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
         let finished_unix_ms = unix_ts_ms();
         let total_duration_us = duration_ms_as_u64_micros(measurement.total_duration_ms);
         let server_processing_duration_us = parse_header_u64(
@@ -911,6 +930,9 @@ impl ClientEndpointRouter {
         );
         drop(state);
         self.set_active_index(index);
+        if first_relay_connection {
+            self.notify_first_relay_connection(index, &endpoint);
+        }
     }
 
     fn record_request_failure(
@@ -969,6 +991,38 @@ impl ClientEndpointRouter {
             .transport_failure_refresh_observer
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
+    }
+
+    fn set_relay_connection_refresh_observer(
+        &self,
+        observer: Option<RelayConnectionRefreshObserver>,
+    ) {
+        *self
+            .relay_connection_refresh_observer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
+    }
+
+    fn notify_first_relay_connection(&self, index: usize, endpoint: &ClientEndpoint) {
+        let Some(target_node_id) = endpoint.transport.relay_target_node_id() else {
+            return;
+        };
+        let observer = self
+            .relay_connection_refresh_observer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(observer) = observer else {
+            return;
+        };
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "relay_connection_established",
+            candidate_index = index,
+            target_node_id = %target_node_id,
+            "first successful relay connection established"
+        );
+        observer(target_node_id);
     }
 
     fn has_selectable_route(&self) -> bool {
@@ -1151,6 +1205,9 @@ fn endpoint_score(
         .unwrap_or(CLIENT_ROUTE_UNKNOWN_LATENCY_MS);
     if descriptor.path_kind == ClientEndpointPathKind::Relay {
         score += CLIENT_ROUTE_RELAY_PENALTY_MS;
+    }
+    if descriptor.transport_path_kind == TransportPathKind::DirectQuic {
+        score -= CLIENT_ROUTE_DIRECT_QUIC_BONUS_MS;
     }
     score += state.consecutive_failures as f64 * CLIENT_ROUTE_FAILURE_PENALTY_MS;
     if let Some(throughput_bytes_per_sec) = state.ewma_throughput_bytes_per_sec {
@@ -1635,6 +1692,7 @@ fn apply_headers_to_request(
 struct TransportRequestOptions<'a> {
     connection_name: Option<&'a str>,
     request_timeout: Option<Duration>,
+    direct_quic_setup_waiter: DirectQuicSetupWaiter,
 }
 
 impl<'a> TransportRequestOptions<'a> {
@@ -1642,13 +1700,21 @@ impl<'a> TransportRequestOptions<'a> {
         Self {
             connection_name,
             request_timeout,
+            direct_quic_setup_waiter: DirectQuicSetupWaiter::SessionConsumer,
         }
+    }
+
+    const fn for_background_health_probe(mut self, probe_index: usize) -> Self {
+        self.direct_quic_setup_waiter =
+            DirectQuicSetupWaiter::BackgroundHealthProbe { probe_index };
+        self
     }
 
     const fn without_request_timeout(self) -> Self {
         Self {
             connection_name: self.connection_name,
             request_timeout: None,
+            direct_quic_setup_waiter: self.direct_quic_setup_waiter,
         }
     }
 }
@@ -1675,6 +1741,7 @@ async fn execute_buffered_request_for_transport(
                     session_pool,
                     identity,
                     connection_name: options.connection_name,
+                    direct_quic_setup_waiter: options.direct_quic_setup_waiter,
                 };
                 return execute_direct_multiplex_buffered_request(
                     direct,
@@ -1725,6 +1792,7 @@ async fn execute_buffered_request_for_transport(
                 session_pool,
                 identity,
                 connection_name: options.connection_name,
+                direct_quic_setup_waiter: options.direct_quic_setup_waiter,
             };
             execute_direct_multiplex_buffered_request(
                 direct,
@@ -1780,6 +1848,7 @@ async fn execute_streaming_read_request_for_transport(
                         session_pool,
                         identity,
                         connection_name,
+                        direct_quic_setup_waiter: DirectQuicSetupWaiter::SessionConsumer,
                     },
                     response_head_timeout,
                     method,
@@ -1813,6 +1882,7 @@ async fn execute_streaming_read_request_for_transport(
                     session_pool,
                     identity,
                     connection_name,
+                    direct_quic_setup_waiter: DirectQuicSetupWaiter::SessionConsumer,
                 },
                 response_head_timeout,
                 method,
@@ -1901,6 +1971,7 @@ async fn execute_streaming_object_write_request_for_transport(
                     session_pool,
                     identity,
                     connection_name: options.connection_name,
+                    direct_quic_setup_waiter: options.direct_quic_setup_waiter,
                 };
                 return execute_direct_multiplex_streaming_object_write_request(
                     direct,
@@ -1938,6 +2009,7 @@ async fn execute_streaming_object_write_request_for_transport(
                 session_pool,
                 identity,
                 connection_name: options.connection_name,
+                direct_quic_setup_waiter: options.direct_quic_setup_waiter,
             };
             execute_direct_multiplex_streaming_object_write_request(
                 direct,
@@ -1992,6 +2064,7 @@ async fn execute_streaming_write_request_for_transport(
                     session_pool,
                     identity,
                     connection_name: options.connection_name,
+                    direct_quic_setup_waiter: options.direct_quic_setup_waiter,
                 };
                 return execute_direct_multiplex_streaming_write_request(
                     direct,
@@ -2048,6 +2121,7 @@ async fn execute_streaming_write_request_for_transport(
                 session_pool,
                 identity,
                 connection_name: options.connection_name,
+                direct_quic_setup_waiter: options.direct_quic_setup_waiter,
             };
             execute_direct_multiplex_streaming_write_request(
                 direct,
@@ -2106,12 +2180,13 @@ async fn probe_endpoint_background_quality(
     for probe_index in 0..total_probe_count {
         let headers = request_auth_headers_for_auth(auth, &method, &url, connection_name)?;
         let started_at = std::time::Instant::now();
-        let response = tokio::time::timeout(
+        let response = match tokio::time::timeout(
             CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
             execute_buffered_request_for_transport(
                 &endpoint.transport,
                 auth,
-                TransportRequestOptions::new(connection_name, None),
+                TransportRequestOptions::new(connection_name, None)
+                    .for_background_health_probe(probe_index),
                 &method,
                 &url,
                 &headers,
@@ -2119,13 +2194,26 @@ async fn probe_endpoint_background_quality(
             ),
         )
         .await
-        .map_err(|_| {
-            anyhow!(
-                "background health probe timed out after {} ms for {}",
-                CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
-                endpoint.descriptor.locator
-            )
-        })??;
+        {
+            Ok(response) => response?,
+            Err(_) => {
+                tracing::info!(
+                    target: MOBILE_CONNECTION_LOG_TARGET,
+                    event = "background_health_probe_timed_out",
+                    path_kind =
+                        transport_path_kind_label(endpoint.transport.transport_path_kind()),
+                    locator = %endpoint.descriptor.locator,
+                    probe_index,
+                    timeout_ms = CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
+                    "background_health_probe_timed_out"
+                );
+                bail!(
+                    "background health probe timed out after {} ms for {}",
+                    CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
+                    endpoint.descriptor.locator
+                );
+            }
+        };
         if !response.status.is_success() {
             bail!(
                 "background health probe returned {} from {}",
@@ -2140,7 +2228,7 @@ async fn probe_endpoint_background_quality(
     Ok(latency_samples_ms)
 }
 
-fn blocking_runtime() -> Result<&'static tokio::runtime::Runtime> {
+pub(crate) fn blocking_runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 
     match RUNTIME.get_or_init(|| {
@@ -2770,6 +2858,14 @@ impl IronMeshClient {
             .set_transport_failure_refresh_observer(observer);
     }
 
+    pub(crate) fn set_relay_connection_refresh_observer(
+        &self,
+        observer: Option<Arc<dyn Fn(NodeId) + Send + Sync + 'static>>,
+    ) {
+        self.transport_router
+            .set_relay_connection_refresh_observer(observer);
+    }
+
     pub fn with_client_identity(mut self, identity: ClientIdentityMaterial) -> Self {
         self.auth = ClientRequestAuth::SignedIdentity(identity);
         self
@@ -2862,6 +2958,10 @@ impl IronMeshClient {
         }
 
         self.connection_route_snapshot()
+    }
+
+    pub(crate) fn spawn_due_connection_route_refresh(&self) {
+        self.maybe_spawn_background_quality_refresh();
     }
 
     pub fn connection_diagnostics(&self) -> ClientConnectionDiagnostics {
@@ -5933,6 +6033,7 @@ struct DirectMultiplexSessionContext<'a> {
     session_pool: &'a TransportSessionPool,
     identity: &'a ClientIdentityMaterial,
     connection_name: Option<&'a str>,
+    direct_quic_setup_waiter: DirectQuicSetupWaiter,
 }
 
 struct RelayMultiplexSessionContext<'a> {
@@ -6060,7 +6161,11 @@ async fn execute_direct_multiplex_streaming_read_request(
     for attempt in 0..2 {
         let session = direct
             .session_pool
-            .ensure_direct_session(direct.identity, direct.connection_name)
+            .ensure_direct_session(
+                direct.identity,
+                direct.connection_name,
+                direct.direct_quic_setup_waiter,
+            )
             .await
             .context("failed ensuring direct multiplex session")?;
         let result = execute_multiplex_streaming_read_request(
@@ -6157,7 +6262,11 @@ async fn execute_direct_multiplex_streaming_object_write_request(
     for attempt in 0..2 {
         let session = direct
             .session_pool
-            .ensure_direct_session(direct.identity, direct.connection_name)
+            .ensure_direct_session(
+                direct.identity,
+                direct.connection_name,
+                direct.direct_quic_setup_waiter,
+            )
             .await
             .context("failed ensuring direct multiplex session")?;
         let result = execute_multiplex_streaming_object_write_request(
@@ -6256,7 +6365,11 @@ async fn execute_direct_multiplex_streaming_write_request(
 ) -> Result<BufferedTransportResponse> {
     let session = direct
         .session_pool
-        .ensure_direct_session(direct.identity, direct.connection_name)
+        .ensure_direct_session(
+            direct.identity,
+            direct.connection_name,
+            direct.direct_quic_setup_waiter,
+        )
         .await
         .context("failed ensuring direct multiplex session")?;
     execute_multiplex_streaming_write_request(
@@ -6316,6 +6429,13 @@ async fn execute_direct_multiplex_buffered_request(
         )
         .await;
     };
+    let timeout = if timeout == CLIENT_BUFFERED_REQUEST_ATTEMPT_TIMEOUT
+        && direct.session_pool.has_cached_session().await
+    {
+        CLIENT_WARM_MULTIPLEX_REQUEST_TIMEOUT
+    } else {
+        timeout
+    };
 
     match tokio::time::timeout(
         timeout,
@@ -6351,7 +6471,11 @@ async fn execute_direct_multiplex_buffered_request_without_timeout(
     for attempt in 0..2 {
         let session = direct
             .session_pool
-            .ensure_direct_session(direct.identity, direct.connection_name)
+            .ensure_direct_session(
+                direct.identity,
+                direct.connection_name,
+                direct.direct_quic_setup_waiter,
+            )
             .await
             .context("failed ensuring direct multiplex session")?;
         let request = BufferedTransportRequest::new(

@@ -1,5 +1,6 @@
 package io.ironmesh.android.data
 
+import android.content.Context
 import java.io.InputStream
 import java.io.OutputStream
 
@@ -7,6 +8,13 @@ object RustClientBridge {
     init {
         System.loadLibrary("android_app")
     }
+
+    fun initialize(context: Context) {
+        initializeAndroidContext(context.applicationContext)
+    }
+
+    @JvmStatic
+    private external fun initializeAndroidContext(applicationContext: Context)
 
     @JvmStatic
     external fun enrollWithBootstrap(
@@ -132,6 +140,13 @@ object RustClientBridge {
 
     @JvmStatic
     external fun notifyNetworkChanged(
+        connectionInput: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    )
+
+    @JvmStatic
+    external fun notifyForegrounded(
         connectionInput: String,
         serverCaPem: String?,
         clientIdentityJson: String?,

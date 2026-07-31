@@ -1,24 +1,31 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::{runtime::Runtime, sync::Mutex as AsyncMutex};
+use tokio::{
+    runtime::Runtime,
+    sync::{Mutex as AsyncMutex, mpsc},
+};
 
 use crate::{
-    ClientConnectionRouteSnapshot, ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
-    PlannedConnectionBootstrapTarget, build_client_with_optional_identity_from_planned_targets,
+    ClientConnectionRouteEndpointSnapshot, ClientConnectionRouteSnapshot, ClientIdentityMaterial,
+    ConnectionBootstrap, IronMeshClient, PlannedConnectionBootstrapTarget,
+    build_client_with_optional_identity_from_planned_targets,
 };
 
 const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
+const MIN_PERIODIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Policy for shared, Rendezvous-managed client routes.
 #[derive(Debug, Clone)]
 pub struct ManagedClientOptions {
     /// Maximum foreground wait for the first advisory discovery pass.
     pub initial_discovery_timeout: Duration,
-    /// A stale lifecycle hint is ignored until this interval has elapsed after a
-    /// successful discovery pass.
+    /// Low-priority fallback cadence for discovery. Foreground, network-change,
+    /// and relay-connected events refresh immediately; this interval only keeps
+    /// dynamic routes fresh when none of those events arrive.
     pub discovery_ttl: Duration,
     /// Time an absent dynamic candidate remains selectable after a successful
     /// discovery response omits it. Static bootstrap targets are never retired.
@@ -32,7 +39,7 @@ impl Default for ManagedClientOptions {
     fn default() -> Self {
         Self {
             initial_discovery_timeout: Duration::from_secs(2),
-            discovery_ttl: Duration::from_secs(5 * 60),
+            discovery_ttl: Duration::from_secs(2 * 60),
             route_retirement_grace: Duration::from_secs(10 * 60),
             refresh_on_transport_failure: true,
         }
@@ -46,8 +53,30 @@ pub enum RouteRefreshReason {
     Stale,
     NetworkChanged,
     TransportFailure,
+    RelayConnected,
     Foregrounded,
     ExplicitDiagnosticRequest,
+}
+
+impl RouteRefreshReason {
+    const fn is_event_driven(self) -> bool {
+        matches!(
+            self,
+            Self::NetworkChanged | Self::RelayConnected | Self::Foregrounded
+        )
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Stale => "stale",
+            Self::NetworkChanged => "network_changed",
+            Self::TransportFailure => "transport_failure",
+            Self::RelayConnected => "relay_connected",
+            Self::Foregrounded => "foregrounded",
+            Self::ExplicitDiagnosticRequest => "explicit_diagnostic_request",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,10 +109,11 @@ struct ManagedRouteController {
     options: ManagedClientOptions,
     refresh_lock: AsyncMutex<()>,
     routes: Mutex<ManagedRouteState>,
-    last_attempt: Mutex<Option<Instant>>,
+    last_attempt: Mutex<Option<ManagedRouteRefreshAttempt>>,
     last_success: Mutex<Option<Instant>>,
     last_outcome: Mutex<RouteRefreshOutcome>,
     pending_identity_update: Mutex<Option<ClientIdentityMaterial>>,
+    periodic_refresh_started: AtomicBool,
     /// Present for blocking consumers such as desktop daemons. It keeps the
     /// executor used for initial discovery and later refreshes alive for the
     /// lifetime of the managed client.
@@ -98,6 +128,51 @@ struct ManagedRouteState {
 struct ManagedDynamicRoute {
     target: PlannedConnectionBootstrapTarget,
     last_seen: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct ManagedRouteRefreshAttempt {
+    started_at: Instant,
+    reason: RouteRefreshReason,
+}
+
+#[derive(Clone, Copy)]
+enum RouteSource {
+    Bootstrap,
+    Cache,
+    Rendezvous,
+}
+
+impl RouteSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Cache => "cache",
+            Self::Rendezvous => "rendezvous",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RouteRefreshTelemetry {
+    reason: RouteRefreshReason,
+    started_at: Instant,
+    candidate_count_before: usize,
+}
+
+#[derive(Default)]
+struct RouteMembershipChanges {
+    added: usize,
+    removed: usize,
+    retained: usize,
+}
+
+impl RouteMembershipChanges {
+    fn record(&mut self, (added, removed, retained): (usize, usize, usize)) {
+        self.added = self.added.saturating_add(added);
+        self.removed = self.removed.saturating_add(removed);
+        self.retained = retained;
+    }
 }
 
 impl ConnectionBootstrap {
@@ -133,12 +208,16 @@ impl ConnectionBootstrap {
             last_success: Mutex::new(None),
             last_outcome: Mutex::new(RouteRefreshOutcome::default()),
             pending_identity_update: Mutex::new(None),
+            periodic_refresh_started: AtomicBool::new(false),
             runtime_guard: Mutex::new(None),
         });
         let managed = ManagedIronMeshClient {
             client,
             controller: controller.clone(),
         };
+        for endpoint in &managed.route_snapshot().endpoints {
+            log_route_added(RouteSource::Bootstrap, endpoint);
+        }
         let weak_controller = Arc::downgrade(&controller);
         managed
             .client
@@ -149,6 +228,21 @@ impl ConnectionBootstrap {
                 if controller.options.refresh_on_transport_failure {
                     controller.schedule_refresh(RouteRefreshReason::TransportFailure);
                 }
+            })));
+        let weak_controller = Arc::downgrade(&controller);
+        managed
+            .client
+            .set_relay_connection_refresh_observer(Some(Arc::new(move |target_node_id| {
+                let Some(controller) = weak_controller.upgrade() else {
+                    return;
+                };
+                tracing::info!(
+                    event = "dynamic_route_refresh_triggered",
+                    refresh_reason = RouteRefreshReason::RelayConnected.as_str(),
+                    target_node_id = %target_node_id,
+                    "scheduling dynamic route refresh after first successful relay connection"
+                );
+                controller.schedule_refresh(RouteRefreshReason::RelayConnected);
             })));
 
         let initial_refresh = managed.clone();
@@ -164,6 +258,7 @@ impl ConnectionBootstrap {
             // opportunistically instead of extending foreground startup.
             managed.schedule_refresh(RouteRefreshReason::Startup);
         }
+        managed.start_periodic_refresh();
 
         Ok(managed)
     }
@@ -256,14 +351,28 @@ impl ManagedIronMeshClient {
         }
 
         let _refresh_guard = self.controller.refresh_lock.lock().await;
-        if self.recently_attempted() {
+        if self.recently_attempted(reason) {
             return self.last_outcome();
         }
         *self
             .controller
             .last_attempt
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ManagedRouteRefreshAttempt {
+            started_at: Instant::now(),
+            reason,
+        });
+        let telemetry = RouteRefreshTelemetry {
+            reason,
+            started_at: Instant::now(),
+            candidate_count_before: self.client.connection_route_snapshot().endpoints.len(),
+        };
+        tracing::info!(
+            event = "route_refresh_started",
+            refresh_reason = reason.as_str(),
+            candidate_count_before = telemetry.candidate_count_before,
+            "refreshing dynamic client routes"
+        );
 
         let mut identity = self
             .controller
@@ -303,98 +412,230 @@ impl ManagedIronMeshClient {
                 Ok(Err(error)) => {
                     // Renewal is advisory for route discovery. Preserve static routes and
                     // report the structured failure rather than discarding a valid client.
-                    return self.record_outcome(RouteRefreshOutcome {
-                        discovery_used: false,
-                        discovery_error: Some(RouteDiscoveryError {
-                            message: format!("failed renewing Rendezvous identity: {error:#}"),
-                        }),
-                        identity_updated: false,
-                        ..RouteRefreshOutcome::default()
-                    });
+                    return self.finish_route_refresh(
+                        telemetry,
+                        RouteRefreshOutcome {
+                            discovery_used: false,
+                            discovery_error: Some(RouteDiscoveryError {
+                                message: format!("failed renewing Rendezvous identity: {error:#}"),
+                            }),
+                            identity_updated: false,
+                            ..RouteRefreshOutcome::default()
+                        },
+                    );
                 }
                 Err(error) => {
-                    return self.record_outcome(RouteRefreshOutcome {
-                        discovery_used: false,
-                        discovery_error: Some(RouteDiscoveryError {
-                            message: format!("Rendezvous identity renewal task failed: {error}"),
-                        }),
-                        identity_updated: false,
-                        ..RouteRefreshOutcome::default()
-                    });
+                    return self.finish_route_refresh(
+                        telemetry,
+                        RouteRefreshOutcome {
+                            discovery_used: false,
+                            discovery_error: Some(RouteDiscoveryError {
+                                message: format!(
+                                    "Rendezvous identity renewal task failed: {error}"
+                                ),
+                            }),
+                            identity_updated: false,
+                            ..RouteRefreshOutcome::default()
+                        },
+                    );
                 }
             }
         } else {
             false
         };
 
-        let refreshed_targets = match self
-            .controller
-            .bootstrap
-            .refresh_dynamic_targets(identity.as_ref())
-            .await
-        {
+        let (updates_sender, mut updates_receiver) = mpsc::unbounded_channel();
+        let bootstrap = self.controller.bootstrap.clone();
+        let discovery_identity = identity.clone();
+        let discovery = bootstrap.refresh_dynamic_targets_with_updates(
+            discovery_identity.as_ref(),
+            move |targets| {
+                updates_sender
+                    .send(targets)
+                    .map_err(|_| anyhow!("dynamic route update receiver closed"))
+            },
+        );
+        tokio::pin!(discovery);
+
+        let mut changes = RouteMembershipChanges::default();
+        let mut preserve_existing = !identity_updated;
+        let refreshed_targets = loop {
+            tokio::select! {
+                Some(targets) = updates_receiver.recv() => {
+                    let membership = match self
+                        .adopt_discovered_targets(
+                            targets,
+                            identity.clone(),
+                            preserve_existing,
+                            telemetry.reason,
+                            "partial",
+                        )
+                        .await
+                    {
+                        Ok(membership) => membership,
+                        Err(error) => {
+                            return self.finish_route_refresh(
+                                telemetry,
+                                RouteRefreshOutcome {
+                                    discovery_used: true,
+                                    discovery_error: Some(RouteDiscoveryError {
+                                        message: format!("failed building discovered client routes: {error:#}"),
+                                    }),
+                                    routes_added: changes.added,
+                                    routes_removed: changes.removed,
+                                    routes_retained: changes.retained,
+                                    identity_updated,
+                                },
+                            );
+                        }
+                    };
+                    changes.record(membership);
+                    // An identity renewal must replace the existing transports once. Later
+                    // partial updates retain the newly created sessions instead of rebuilding
+                    // them while another node is still being discovered.
+                    preserve_existing = true;
+                }
+                result = &mut discovery => break result,
+            }
+        };
+
+        let refreshed_targets = match refreshed_targets {
             Ok(targets) => targets,
             Err(error) => {
-                return self.record_outcome(RouteRefreshOutcome {
-                    discovery_used: false,
-                    discovery_error: Some(RouteDiscoveryError {
-                        message: format!("Rendezvous discovery failed: {error:#}"),
-                    }),
-                    identity_updated,
-                    ..RouteRefreshOutcome::default()
-                });
+                return self.finish_route_refresh(
+                    telemetry,
+                    RouteRefreshOutcome {
+                        discovery_used: changes.added > 0,
+                        discovery_error: Some(RouteDiscoveryError {
+                            message: format!("Rendezvous discovery failed: {error:#}"),
+                        }),
+                        routes_added: changes.added,
+                        routes_removed: changes.removed,
+                        routes_retained: changes.retained,
+                        identity_updated,
+                    },
+                );
             }
         };
 
-        let desired_targets = self.reconcile_target_set(refreshed_targets);
-        let identity_for_build = identity.clone();
-        let refreshed_client = match tokio::task::spawn_blocking(move || {
-            build_client_with_optional_identity_from_planned_targets(
-                &desired_targets,
-                identity_for_build.as_ref(),
+        // If discovery completed at the same instant as a queued update, process
+        // the queue before the complete result. This keeps a session created from
+        // the first usable candidate alive through final reconciliation.
+        while let Ok(targets) = updates_receiver.try_recv() {
+            let membership = match self
+                .adopt_discovered_targets(
+                    targets,
+                    identity.clone(),
+                    preserve_existing,
+                    telemetry.reason,
+                    "partial",
+                )
+                .await
+            {
+                Ok(membership) => membership,
+                Err(error) => {
+                    return self.finish_route_refresh(
+                        telemetry,
+                        RouteRefreshOutcome {
+                            discovery_used: true,
+                            discovery_error: Some(RouteDiscoveryError {
+                                message: format!(
+                                    "failed building discovered client routes: {error:#}"
+                                ),
+                            }),
+                            routes_added: changes.added,
+                            routes_removed: changes.removed,
+                            routes_retained: changes.retained,
+                            identity_updated,
+                        },
+                    );
+                }
+            };
+            changes.record(membership);
+            preserve_existing = true;
+        }
+
+        let membership = match self
+            .adopt_discovered_targets(
+                refreshed_targets,
+                identity,
+                preserve_existing,
+                telemetry.reason,
+                "complete",
             )
-        })
-        .await
+            .await
         {
-            Ok(Ok(client)) => client,
-            Ok(Err(error)) => {
-                return self.record_outcome(RouteRefreshOutcome {
-                    discovery_used: true,
-                    discovery_error: Some(RouteDiscoveryError {
-                        message: format!("failed building refreshed client routes: {error:#}"),
-                    }),
-                    identity_updated,
-                    ..RouteRefreshOutcome::default()
-                });
-            }
+            Ok(membership) => membership,
             Err(error) => {
-                return self.record_outcome(RouteRefreshOutcome {
-                    discovery_used: true,
-                    discovery_error: Some(RouteDiscoveryError {
-                        message: format!("route construction task failed: {error}"),
-                    }),
-                    identity_updated,
-                    ..RouteRefreshOutcome::default()
-                });
+                return self.finish_route_refresh(
+                    telemetry,
+                    RouteRefreshOutcome {
+                        discovery_used: true,
+                        discovery_error: Some(RouteDiscoveryError {
+                            message: format!("failed building refreshed client routes: {error:#}"),
+                        }),
+                        routes_added: changes.added,
+                        routes_removed: changes.removed,
+                        routes_retained: changes.retained,
+                        identity_updated,
+                    },
+                );
             }
         };
-
-        let (routes_added, routes_removed, routes_retained) = self
-            .client
-            .reconcile_transport_membership(&refreshed_client, !identity_updated);
+        changes.record(membership);
         *self
             .controller
             .last_success
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
-        self.record_outcome(RouteRefreshOutcome {
-            discovery_used: true,
-            discovery_error: None,
-            routes_added,
-            routes_removed,
-            routes_retained,
-            identity_updated,
+        self.finish_route_refresh(
+            telemetry,
+            RouteRefreshOutcome {
+                discovery_used: true,
+                discovery_error: None,
+                routes_added: changes.added,
+                routes_removed: changes.removed,
+                routes_retained: changes.retained,
+                identity_updated,
+            },
+        )
+    }
+
+    async fn adopt_discovered_targets(
+        &self,
+        refreshed_targets: Vec<PlannedConnectionBootstrapTarget>,
+        identity: Option<ClientIdentityMaterial>,
+        preserve_existing: bool,
+        refresh_reason: RouteRefreshReason,
+        discovery_update: &'static str,
+    ) -> Result<(usize, usize, usize)> {
+        let desired_targets = self.reconcile_target_set(refreshed_targets);
+        let refreshed_client = tokio::task::spawn_blocking(move || {
+            build_client_with_optional_identity_from_planned_targets(
+                &desired_targets,
+                identity.as_ref(),
+            )
         })
+        .await
+        .map_err(|error| anyhow!("route construction task failed: {error}"))??;
+
+        let routes_before = self.client.connection_route_snapshot();
+        let membership = self
+            .client
+            .reconcile_transport_membership(&refreshed_client, preserve_existing);
+        let routes_after = self.client.connection_route_snapshot();
+        log_dynamic_route_membership_changes(&routes_before, &routes_after);
+        if membership.0 > 0 {
+            tracing::info!(
+                event = "dynamic_route_probe_scheduled",
+                refresh_reason = refresh_reason.as_str(),
+                discovery_update,
+                routes_added = membership.0,
+                "probing newly discovered routes without blocking the active fallback"
+            );
+            self.client.spawn_due_connection_route_refresh();
+        }
+        Ok(membership)
     }
 
     fn reconcile_target_set(
@@ -458,12 +699,14 @@ impl ManagedIronMeshClient {
             })
     }
 
-    fn recently_attempted(&self) -> bool {
-        self.controller
+    fn recently_attempted(&self, reason: RouteRefreshReason) -> bool {
+        let last_attempt = self
+            .controller
             .last_attempt
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some_and(|last_attempt| last_attempt.elapsed() < REFRESH_COALESCE_WINDOW)
+            .to_owned();
+        refresh_attempt_is_coalesced(last_attempt, reason)
     }
 
     fn last_outcome(&self) -> RouteRefreshOutcome {
@@ -483,6 +726,29 @@ impl ManagedIronMeshClient {
         outcome
     }
 
+    fn finish_route_refresh(
+        &self,
+        telemetry: RouteRefreshTelemetry,
+        outcome: RouteRefreshOutcome,
+    ) -> RouteRefreshOutcome {
+        let candidate_count_after = self.client.connection_route_snapshot().endpoints.len();
+        tracing::info!(
+            event = "route_refresh_completed",
+            refresh_reason = telemetry.reason.as_str(),
+            candidate_count_before = telemetry.candidate_count_before,
+            candidate_count_after,
+            duration_ms = telemetry.started_at.elapsed().as_millis() as u64,
+            discovery_used = outcome.discovery_used,
+            routes_added = outcome.routes_added,
+            routes_removed = outcome.routes_removed,
+            routes_retained = outcome.routes_retained,
+            identity_updated = outcome.identity_updated,
+            discovery_error = ?outcome.discovery_error.as_ref().map(|error| error.message.as_str()),
+            "finished refreshing dynamic client routes"
+        );
+        self.record_outcome(outcome)
+    }
+
     fn attach_runtime(&self, runtime: Arc<Runtime>) {
         *self
             .controller
@@ -493,6 +759,13 @@ impl ManagedIronMeshClient {
 
     fn schedule_refresh(&self, reason: RouteRefreshReason) {
         self.controller.clone().schedule_refresh(reason);
+    }
+
+    fn start_periodic_refresh(&self) {
+        if self.controller.bootstrap.rendezvous_urls.is_empty() {
+            return;
+        }
+        self.controller.clone().start_periodic_refresh();
     }
 }
 
@@ -507,6 +780,47 @@ impl ManagedRouteController {
             let _ = managed.refresh_routes(reason).await;
         };
 
+        let _ = self.spawn_refresh_task(task);
+    }
+
+    fn start_periodic_refresh(self: Arc<Self>) {
+        if self
+            .periodic_refresh_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let interval = self
+            .options
+            .discovery_ttl
+            .max(MIN_PERIODIC_REFRESH_INTERVAL);
+        let weak_controller = Arc::downgrade(&self);
+        let task = async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(controller) = weak_controller.upgrade() else {
+                    return;
+                };
+                let managed = ManagedIronMeshClient {
+                    client: controller.client.clone(),
+                    controller,
+                };
+                let _ = managed.refresh_routes(RouteRefreshReason::Stale).await;
+            }
+        };
+
+        if !self.spawn_refresh_task(task) {
+            self.periodic_refresh_started
+                .store(false, Ordering::Release);
+        }
+    }
+
+    fn spawn_refresh_task<F>(&self, task: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let runtime = self
             .runtime_guard
             .lock()
@@ -514,10 +828,28 @@ impl ManagedRouteController {
             .clone();
         if let Some(runtime) = runtime {
             runtime.spawn(task);
+            true
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(task);
+            true
+        } else {
+            false
         }
     }
+}
+
+fn refresh_attempt_is_coalesced(
+    last_attempt: Option<ManagedRouteRefreshAttempt>,
+    reason: RouteRefreshReason,
+) -> bool {
+    let Some(last_attempt) = last_attempt else {
+        return false;
+    };
+    if last_attempt.started_at.elapsed() >= REFRESH_COALESCE_WINDOW {
+        return false;
+    }
+
+    !(reason.is_event_driven() && last_attempt.reason != reason)
 }
 
 fn planned_target_key(target: &PlannedConnectionBootstrapTarget) -> String {
@@ -530,6 +862,68 @@ fn planned_target_key(target: &PlannedConnectionBootstrapTarget) -> String {
             target.path_kind, target.target_node_id, target.server_base_url
         )
     })
+}
+
+fn log_dynamic_route_membership_changes(
+    routes_before: &ClientConnectionRouteSnapshot,
+    routes_after: &ClientConnectionRouteSnapshot,
+) {
+    let previous = routes_before
+        .endpoints
+        .iter()
+        .map(|endpoint| (route_snapshot_key(endpoint), endpoint))
+        .collect::<BTreeMap<_, _>>();
+    let current = routes_after
+        .endpoints
+        .iter()
+        .map(|endpoint| (route_snapshot_key(endpoint), endpoint))
+        .collect::<BTreeMap<_, _>>();
+
+    for (route_key, endpoint) in &current {
+        if !previous.contains_key(route_key) {
+            log_route_added(RouteSource::Rendezvous, endpoint);
+        }
+    }
+    for (route_key, endpoint) in &previous {
+        if !current.contains_key(route_key) {
+            log_route_removed(RouteSource::Cache, endpoint);
+        }
+    }
+}
+
+fn route_snapshot_key(endpoint: &ClientConnectionRouteEndpointSnapshot) -> String {
+    format!(
+        "{:?}#{}#{}#{}",
+        endpoint.path_kind,
+        endpoint.locator,
+        endpoint
+            .target_node_id
+            .map(|node_id| node_id.to_string())
+            .unwrap_or_default(),
+        endpoint.hole_punching_mode.as_deref().unwrap_or_default(),
+    )
+}
+
+fn log_route_added(source: RouteSource, endpoint: &ClientConnectionRouteEndpointSnapshot) {
+    tracing::info!(
+        event = "route_added",
+        route_source = source.as_str(),
+        path_kind = ?endpoint.path_kind,
+        target_node_id = ?endpoint.target_node_id,
+        route_locator = %endpoint.locator,
+        "route candidate added to the client router"
+    );
+}
+
+fn log_route_removed(source: RouteSource, endpoint: &ClientConnectionRouteEndpointSnapshot) {
+    tracing::info!(
+        event = "route_removed",
+        route_source = source.as_str(),
+        path_kind = ?endpoint.path_kind,
+        target_node_id = ?endpoint.target_node_id,
+        route_locator = %endpoint.locator,
+        "route candidate removed from the client router"
+    );
 }
 
 fn blocking_managed_client_runtime() -> Arc<Runtime> {
@@ -550,8 +944,56 @@ fn blocking_managed_client_runtime() -> Arc<Runtime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use transport_sdk::{BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, RelayMode};
+    use axum::{Json, Router, extract::Query, routing::get};
+    use common::NodeId;
+    use serde::Deserialize;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use transport_sdk::{
+        BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, CandidateKind,
+        ConnectionCandidate, DiscoveryResponse, RelayMode, TransportPathKind,
+    };
     use uuid::Uuid;
+
+    #[derive(Debug, Deserialize)]
+    struct TestDiscoveryQuery {
+        node_id: Option<String>,
+    }
+
+    #[test]
+    fn default_discovery_fallback_runs_every_two_minutes() {
+        assert_eq!(
+            ManagedClientOptions::default().discovery_ttl,
+            Duration::from_secs(2 * 60)
+        );
+    }
+
+    #[test]
+    fn event_driven_refresh_bypasses_a_different_recent_refresh_reason() {
+        let just_started = ManagedRouteRefreshAttempt {
+            started_at: Instant::now(),
+            reason: RouteRefreshReason::Startup,
+        };
+
+        assert!(refresh_attempt_is_coalesced(
+            Some(just_started),
+            RouteRefreshReason::Startup,
+        ));
+        assert!(!refresh_attempt_is_coalesced(
+            Some(just_started),
+            RouteRefreshReason::RelayConnected,
+        ));
+        assert!(!refresh_attempt_is_coalesced(
+            Some(just_started),
+            RouteRefreshReason::Foregrounded,
+        ));
+        assert!(!refresh_attempt_is_coalesced(
+            Some(just_started),
+            RouteRefreshReason::NetworkChanged,
+        ));
+    }
 
     #[test]
     fn blocking_managed_client_keeps_anonymous_bootstrap_on_shared_routes() {
@@ -590,5 +1032,165 @@ mod tests {
                 .locator
                 .starts_with("http://127.0.0.1:9")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_client_adopts_a_usable_candidate_before_other_nodes_finish_discovery() {
+        let cluster_id = Uuid::now_v7();
+        let fast_node_id = NodeId::new_v4();
+        let stalled_node_id = NodeId::new_v4();
+        let candidate_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("candidate listener should bind");
+        let candidate_addr = candidate_listener
+            .local_addr()
+            .expect("candidate listener should expose its address");
+        let candidate_probe_count = Arc::new(AtomicUsize::new(0));
+        let candidate_route_probe_count = Arc::clone(&candidate_probe_count);
+        let candidate_health_probe_count = Arc::clone(&candidate_probe_count);
+        let candidate_server = tokio::spawn(async move {
+            axum::serve(
+                candidate_listener,
+                Router::new()
+                    .route(
+                        "/api/v1/diagnostics/latency",
+                        get(move || {
+                            let candidate_route_probe_count =
+                                Arc::clone(&candidate_route_probe_count);
+                            async move {
+                                candidate_route_probe_count.fetch_add(1, Ordering::SeqCst);
+                                "ok"
+                            }
+                        }),
+                    )
+                    .route(
+                        "/api/v1/health",
+                        get(move || {
+                            let candidate_health_probe_count =
+                                Arc::clone(&candidate_health_probe_count);
+                            async move {
+                                candidate_health_probe_count.fetch_add(1, Ordering::SeqCst);
+                                "ok"
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .expect("candidate test server should run");
+        });
+        let candidate_url = format!("http://{candidate_addr}");
+        let fast_node_label = fast_node_id.to_string();
+        let discovery_candidate_url = candidate_url.clone();
+        let discovery_router = Router::new()
+            .route(
+                "/control/discovery",
+                get(move |Query(query): Query<TestDiscoveryQuery>| {
+                    let fast_node_label = fast_node_label.clone();
+                    let candidate_url = discovery_candidate_url.clone();
+                    async move {
+                        if query.node_id.as_deref() == Some(fast_node_label.as_str()) {
+                            return Json(DiscoveryResponse {
+                                rendezvous_peers: Vec::new(),
+                                node_candidates: Some(vec![ConnectionCandidate {
+                                    kind: CandidateKind::DirectHttps,
+                                    endpoint: candidate_url,
+                                    rtt_ms: Some(5),
+                                    transport_hints: None,
+                                }]),
+                                node_relay_capable: false,
+                            });
+                        }
+                        if query.node_id.is_some() {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                        Json(DiscoveryResponse {
+                            rendezvous_peers: Vec::new(),
+                            node_candidates: None,
+                            node_relay_capable: false,
+                        })
+                    }
+                }),
+            )
+            .route("/api/v1/diagnostics/latency", get(|| async { "ok" }))
+            .route("/api/v1/health", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("discovery listener should bind");
+        let rendezvous_addr = listener
+            .local_addr()
+            .expect("discovery listener should expose its address");
+        let discovery_server = tokio::spawn(async move {
+            axum::serve(listener, discovery_router)
+                .await
+                .expect("discovery test server should run");
+        });
+
+        let route_url = format!("http://{rendezvous_addr}");
+        let bootstrap = ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: vec![route_url.clone()],
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![
+                BootstrapEndpoint {
+                    url: route_url.clone(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: Some(fast_node_id),
+                },
+                BootstrapEndpoint {
+                    url: route_url,
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: Some(stalled_node_id),
+                },
+            ],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+        };
+        let managed = bootstrap
+            .build_managed_client(
+                None,
+                ManagedClientOptions {
+                    initial_discovery_timeout: Duration::ZERO,
+                    discovery_ttl: Duration::from_secs(60),
+                    ..ManagedClientOptions::default()
+                },
+            )
+            .await
+            .expect("managed client should start from its static routes");
+        let refresh_client = managed.clone();
+        let refresh_task =
+            tokio::spawn(async move { refresh_client.notify_network_changed_async().await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let has_fast_candidate_route =
+                    managed.route_snapshot().endpoints.iter().any(|endpoint| {
+                        endpoint.path_kind == TransportPathKind::DirectHttps
+                            && endpoint.target_node_id == Some(fast_node_id)
+                            && endpoint.locator == candidate_url
+                            && candidate_probe_count.load(Ordering::SeqCst) > 0
+                    });
+                if has_fast_candidate_route {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the usable candidate should be adopted before the stalled node completes");
+
+        refresh_task.abort();
+        let _ = refresh_task.await;
+        discovery_server.abort();
+        let _ = discovery_server.await;
+        candidate_server.abort();
+        let _ = candidate_server.await;
     }
 }

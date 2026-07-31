@@ -8,7 +8,7 @@ import {
   type StackProps
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { type ComponentType, type ReactNode } from "react";
+import { type ComponentType, type ReactNode, useEffect } from "react";
 import { IronmeshBrand } from "../IronmeshBrand/IronmeshBrand";
 
 type NavigationShellIcon = ComponentType<{ size?: number | string }>;
@@ -43,8 +43,15 @@ export function NavigationShell<ItemId extends string = string>({
   navbarAriaLabel = "Primary navigation",
   showNavigation = true
 }: NavigationShellProps<ItemId>) {
-  const [mobileOpened, mobileControls] = useDisclosure(false);
-  const [desktopOpened, desktopControls] = useDisclosure(true);
+  const [mobileOpened, { close: closeMobileNavigation, toggle: toggleMobileNavigation }] = useDisclosure(false);
+  const [desktopOpened, { toggle: toggleDesktopNavigation }] = useDisclosure(true);
+  const hasNavigation = showNavigation && navigationItems.length > 0;
+
+  useEffect(() => {
+    if (!hasNavigation) {
+      closeMobileNavigation();
+    }
+  }, [closeMobileNavigation, hasNavigation]);
 
   return (
     <>
@@ -55,8 +62,8 @@ export function NavigationShell<ItemId extends string = string>({
           width: 280,
           breakpoint: "sm",
           collapsed: {
-            mobile: !showNavigation || !mobileOpened,
-            desktop: !showNavigation || !desktopOpened
+            mobile: !hasNavigation || !mobileOpened,
+            desktop: !hasNavigation || !desktopOpened
           }
         }}
         padding={{ base: "xs", sm: "md", lg: "lg" }}
@@ -64,20 +71,24 @@ export function NavigationShell<ItemId extends string = string>({
         <AppShell.Header className="shell-header">
           <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
             <Group gap="sm">
-              <Burger
-                opened={mobileOpened}
-                onClick={mobileControls.toggle}
-                hiddenFrom="sm"
-                size="sm"
-                aria-label="Toggle navigation menu"
-              />
-              <Burger
-                opened={desktopOpened}
-                onClick={desktopControls.toggle}
-                visibleFrom="sm"
-                size="sm"
-                aria-label="Toggle navigation sidebar"
-              />
+              {hasNavigation ? (
+                <>
+                  <Burger
+                    opened={mobileOpened}
+                    onClick={toggleMobileNavigation}
+                    hiddenFrom="sm"
+                    size="sm"
+                    aria-label="Toggle navigation menu"
+                  />
+                  <Burger
+                    opened={desktopOpened}
+                    onClick={toggleDesktopNavigation}
+                    visibleFrom="sm"
+                    size="sm"
+                    aria-label="Toggle navigation sidebar"
+                  />
+                </>
+              ) : null}
               <IronmeshBrand surfaceLabel={surfaceLabel} />
             </Group>
 
@@ -85,7 +96,7 @@ export function NavigationShell<ItemId extends string = string>({
           </Group>
         </AppShell.Header>
 
-        {showNavigation ? (
+        {hasNavigation ? (
           <AppShell.Navbar
             aria-label={navbarAriaLabel}
             className="shell-navbar"
@@ -112,7 +123,7 @@ export function NavigationShell<ItemId extends string = string>({
                       leftSection={<Icon size={16} />}
                       onClick={() => {
                         onNavigate(item.id);
-                        mobileControls.close();
+                        closeMobileNavigation();
                       }}
                     />
                   );
@@ -129,7 +140,7 @@ export function NavigationShell<ItemId extends string = string>({
         </AppShell.Main>
       </AppShell>
 
-      {mobileOpened ? <div className="shell-backdrop" onClick={mobileControls.close} /> : null}
+      {hasNavigation && mobileOpened ? <div className="shell-backdrop" onClick={closeMobileNavigation} /> : null}
     </>
   );
 }

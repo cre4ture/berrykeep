@@ -1,0 +1,36 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# Crate Universe supplies the platform-selected third-party dependencies.
+# First-party workspace dependencies stay native so Bazel can invalidate only
+# the affected portion of the IronMesh graph.
+rust_library(
+    name = "adapter_linux_fuse",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "adapter_linux_fuse",
+    crate_root = "src/lib.rs",
+    edition = crate_edition(),
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//crates:__subpackages__"],
+    deps = all_crate_deps(normal = True) + [
+        "//crates/client-sdk:client_sdk",
+        "//crates/common",
+        "//crates/desktop-status:desktop_status",
+        "//crates/sync-core:sync_core",
+    ],
+)
+
+rust_test(
+    name = "unit_test",
+    size = "small",
+    aliases = aliases(
+        normal_dev = True,
+        proc_macro_dev = True,
+    ),
+    crate = ":adapter_linux_fuse",
+    edition = crate_edition(),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = all_crate_deps(normal_dev = True),
+)

@@ -5577,13 +5577,13 @@ fn materialize_node_enrollment_package(
     package: NodeEnrollmentPackage,
 ) -> Result<TransportNodeBootstrap> {
     package.validate()?;
-    let mut bootstrap = package.bootstrap;
+    let bootstrap = package.bootstrap;
     let data_dir = PathBuf::from(&bootstrap.data_dir);
     let public_tls_material = package.public_tls_material;
     let internal_tls_material = package.internal_tls_material;
 
     if let (Some(internal_tls), Some(material)) = (
-        bootstrap.internal_tls.as_mut(),
+        bootstrap.internal_tls.as_ref(),
         internal_tls_material.as_ref(),
     ) {
         let ca_path = resolve_materialized_path(&data_dir, &internal_tls.ca_cert_path)?;
@@ -5603,14 +5603,10 @@ fn materialize_node_enrollment_package(
                 .with_context(|| format!("failed writing {}", path.display()))?;
         }
         write_tls_material_metadata_sidecar(&cert_path, &material.metadata)?;
-
-        internal_tls.ca_cert_path = ca_path.to_string_lossy().into_owned();
-        internal_tls.cert_path = cert_path.to_string_lossy().into_owned();
-        internal_tls.key_path = key_path.to_string_lossy().into_owned();
     }
 
     if let (Some(public_tls), Some(material)) =
-        (bootstrap.public_tls.as_mut(), public_tls_material.as_ref())
+        (bootstrap.public_tls.as_ref(), public_tls_material.as_ref())
     {
         let cert_path = resolve_materialized_path(&data_dir, &public_tls.cert_path)?;
         let key_path = resolve_materialized_path(&data_dir, &public_tls.key_path)?;
@@ -5627,16 +5623,13 @@ fn materialize_node_enrollment_package(
                 .with_context(|| format!("failed writing {}", path.display()))?;
         }
         write_tls_material_metadata_sidecar(&cert_path, &material.metadata)?;
-
-        public_tls.cert_path = cert_path.to_string_lossy().into_owned();
-        public_tls.key_path = key_path.to_string_lossy().into_owned();
     }
 
     if let Some(public_ca_pem) = public_tls_material
         .as_ref()
         .map(|material| material.ca_cert_pem.as_str())
         .or(bootstrap.trust_roots.public_api_ca_pem.as_deref())
-        && let Some(public_ca_cert_path) = bootstrap.public_ca_cert_path.as_mut()
+        && let Some(public_ca_cert_path) = bootstrap.public_ca_cert_path.as_ref()
     {
         let public_ca_path = resolve_materialized_path(&data_dir, public_ca_cert_path)?;
         if let Some(parent) = public_ca_path.parent() {
@@ -5645,7 +5638,6 @@ fn materialize_node_enrollment_package(
         }
         std::fs::write(&public_ca_path, public_ca_pem)
             .with_context(|| format!("failed writing {}", public_ca_path.display()))?;
-        *public_ca_cert_path = public_ca_path.to_string_lossy().into_owned();
     }
 
     Ok(bootstrap)
@@ -8607,18 +8599,25 @@ fn direct_quic_relay_configs_from_tickets(
 ) -> Vec<DirectQuicRelayConfig> {
     let mut sources = tickets.iter().collect::<Vec<_>>();
     sources.sort_by_key(|(source, _)| *source);
-    let mut relays = BTreeMap::<String, Option<String>>::new();
+    let mut relays = BTreeMap::<String, (Option<String>, Option<u16>)>::new();
     for (_, advertisement) in sources {
         for public_url in &advertisement.public_urls {
             relays.insert(
                 public_url.trim().trim_end_matches('/').to_string(),
-                Some(advertisement.auth_token.clone()),
+                (
+                    Some(advertisement.auth_token.clone()),
+                    advertisement.quic_port,
+                ),
             );
         }
     }
     relays
         .into_iter()
-        .map(|(url, auth_token)| DirectQuicRelayConfig { url, auth_token })
+        .map(|(url, (auth_token, quic_port))| DirectQuicRelayConfig {
+            url,
+            auth_token,
+            quic_port,
+        })
         .collect()
 }
 

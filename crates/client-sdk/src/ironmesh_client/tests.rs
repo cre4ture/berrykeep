@@ -140,6 +140,48 @@ fn route_reconciliation_preserves_static_state_and_retires_dynamic_routes() {
     assert_eq!(static_client.connection_route_snapshot().endpoints.len(), 1);
 }
 
+#[tokio::test]
+async fn newly_discovered_direct_quic_is_ranked_first_and_probed() {
+    let static_client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let dynamic_quic = IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+        ConnectionCandidate {
+            kind: CandidateKind::DirectQuic,
+            endpoint: "iroh://dynamic-node-key".to_string(),
+            rtt_ms: None,
+            transport_hints: None,
+        },
+        Some(NodeId::new_v4()),
+    );
+    let refreshed = IronMeshClient::combine(vec![
+        dynamic_quic,
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/"),
+    ])
+    .expect("refreshed routes should combine");
+
+    static_client.reconcile_transport_membership(&refreshed, true);
+    let before_probe = static_client.connection_route_snapshot();
+    let direct_quic = before_probe
+        .endpoints
+        .iter()
+        .find(|route| route.path_kind == TransportPathKind::DirectQuic)
+        .expect("dynamic Direct QUIC route should exist");
+    assert_eq!(
+        before_probe.ranked_indices.first(),
+        Some(&direct_quic.index),
+        "new Direct QUIC should receive the first exploration attempt"
+    );
+    assert!(!direct_quic.active);
+
+    static_client.spawn_due_connection_route_refresh();
+    let after_probe_scheduled = static_client.connection_route_snapshot();
+    let direct_quic = after_probe_scheduled
+        .endpoints
+        .iter()
+        .find(|route| route.path_kind == TransportPathKind::DirectQuic)
+        .expect("dynamic Direct QUIC route should remain");
+    assert!(direct_quic.last_background_probe_unix_ms.is_some());
+}
+
 #[test]
 fn exhausted_route_set_notifies_managed_refresh_once() {
     let client = IronMeshClient::combine(vec![
@@ -264,11 +306,20 @@ fn route_score_strongly_prefers_direct_over_relay_and_stabilizes_active_route() 
         locator: "relay://node@example".to_string(),
         bootstrap_rank: 0,
     };
+    let direct_quic = ClientEndpointDescriptor {
+        route_key: "direct-quic-route".to_string(),
+        path_kind: ClientEndpointPathKind::Direct,
+        transport_path_kind: TransportPathKind::DirectQuic,
+        locator: "iroh://direct-quic".to_string(),
+        bootstrap_rank: 0,
+    };
 
     assert_eq!(endpoint_score(0, None, &direct, &state), 100.0);
     assert_eq!(endpoint_score(0, None, &relay, &state), 600.0);
+    assert_eq!(endpoint_score(0, None, &direct_quic, &state), 0.0);
     assert_eq!(endpoint_score(0, Some(0), &direct, &state), 50.0);
     assert_eq!(endpoint_score(0, Some(0), &relay, &state), 550.0);
+    assert_eq!(endpoint_score(0, Some(0), &direct_quic, &state), -50.0);
 }
 
 #[test]
@@ -2528,6 +2579,50 @@ async fn relay_transport_executes_generic_json_get_request() {
     let _ = server.await;
 }
 
+#[tokio::test]
+async fn first_successful_relay_request_notifies_dynamic_route_refresh_once() {
+    let (relay_state, server) = spawn_relay_test_server(
+        200,
+        vec![
+            RelayHttpHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            },
+            RelayHttpHeader {
+                name: "content-length".to_string(),
+                value: br#"{"status":"ok"}"#.len().to_string(),
+            },
+        ],
+        br#"{"status":"ok"}"#.to_vec(),
+    )
+    .await;
+    let client = relay_test_client(
+        &relay_state,
+        relay_test_identity(&relay_state.security, "relay-refresh-observer-device"),
+    );
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let observed_refreshes = Arc::clone(&refreshes);
+    let expected_target_node_id = relay_state.security.target_node_id;
+    client.set_relay_connection_refresh_observer(Some(Arc::new(move |target_node_id| {
+        assert_eq!(target_node_id, expected_target_node_id);
+        observed_refreshes.fetch_add(1, Ordering::SeqCst);
+    })));
+
+    client
+        .get_json_path("/cluster/status")
+        .await
+        .expect("first relay request should succeed");
+    client
+        .get_json_path("/cluster/status")
+        .await
+        .expect("reused relay request should succeed");
+
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+
+    server.abort();
+    let _ = server.await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_buffered_request_enforces_total_deadline() {
     let (relay_state, server) = spawn_relay_test_server(
@@ -3339,6 +3434,98 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
 }
 
 #[tokio::test]
+async fn direct_quic_continues_after_iroh_relay_ticket_timeout() {
+    let ticket_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("ticket listener should bind");
+    let ticket_url = format!(
+        "http://{}",
+        ticket_listener
+            .local_addr()
+            .expect("ticket listener address should be available")
+    );
+    let ticket_request_started = Arc::new(AtomicUsize::new(0));
+    let ticket_request_started_for_server = Arc::clone(&ticket_request_started);
+    let ticket_server = tokio::spawn(async move {
+        let (_stream, _) = ticket_listener
+            .accept()
+            .await
+            .expect("ticket listener should accept a connection");
+        ticket_request_started_for_server.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+    });
+
+    let target_node_id = NodeId::new_v4();
+    let response_body = br#"{"status":"ok","route":"direct-quic"}"#.to_vec();
+    let (direct_state, direct_server) = spawn_direct_quic_transport_test_server(
+        200,
+        vec![
+            RelayHttpHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            },
+            RelayHttpHeader {
+                name: "content-length".to_string(),
+                value: response_body.len().to_string(),
+            },
+        ],
+        response_body,
+        target_node_id,
+    )
+    .await;
+
+    let test_result = async {
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-quic-ticket-timeout-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let rendezvous = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id: identity.cluster_id,
+                rendezvous_urls: vec![ticket_url],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+        let client = IronMeshClient::from_direct_quic_candidate_with_rendezvous(
+            direct_state.candidate.clone(),
+            Some(target_node_id),
+            Some(rendezvous),
+            None,
+        )
+        .with_client_identity(identity);
+
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            crate::session_pool::RELAY_TICKET_REQUEST_TIMEOUT + Duration::from_secs(8),
+            client.get_json_path("/cluster/status"),
+        )
+        .await
+        .expect("relay ticket timeout should not prevent direct QUIC connection")
+        .expect("direct QUIC should succeed without a relay ticket");
+
+        assert_eq!(response["route"], "direct-quic");
+        assert!(started.elapsed() >= crate::session_pool::RELAY_TICKET_REQUEST_TIMEOUT);
+        assert_eq!(ticket_request_started.load(Ordering::SeqCst), 1);
+        assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    ticket_server.abort();
+    let _ = ticket_server.await;
+    direct_server.abort();
+    let _ = direct_server.await;
+
+    test_result.unwrap();
+}
+
+#[tokio::test]
 async fn direct_transport_executes_store_index_request_with_signed_device_identity() {
     let (direct_state, server) = spawn_direct_transport_test_server(
         200,
@@ -3531,6 +3718,7 @@ async fn single_direct_buffered_request_enforces_total_deadline() {
             session_pool,
             identity,
             connection_name: client.connection_name.as_deref(),
+            direct_quic_setup_waiter: DirectQuicSetupWaiter::SessionConsumer,
         };
         let url = client
             .relative_url("/cluster/status")
@@ -3573,7 +3761,7 @@ async fn single_direct_buffered_request_enforces_total_deadline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_route_stall_falls_back_to_relay_after_ten_second_deadline() {
+async fn direct_route_stall_falls_back_to_relay_after_warm_session_timeout() {
     let (direct_state, direct_server) =
         spawn_direct_transport_server_that_hangs_after_first_success().await;
     let relay_body = br#"{"status":"ok","route":"relay"}"#.to_vec();
@@ -3615,7 +3803,7 @@ async fn direct_route_stall_falls_back_to_relay_after_ten_second_deadline() {
 
         let started_at = std::time::Instant::now();
         let fallback = tokio::time::timeout(
-            Duration::from_secs(12),
+            Duration::from_secs(5),
             client.get_json_path("/cluster/status"),
         )
         .await;
@@ -3628,13 +3816,13 @@ async fn direct_route_stall_falls_back_to_relay_after_ten_second_deadline() {
             }
             Err(_) => {
                 return Err(anyhow::anyhow!(
-                    "request did not fall back to relay after the 10-second direct deadline"
+                    "request did not fall back to relay after the direct session stalled"
                 ));
             }
         };
 
-        assert!(started_at.elapsed() >= Duration::from_secs(10));
-        assert!(started_at.elapsed() < Duration::from_secs(12));
+        assert!(started_at.elapsed() >= CLIENT_WARM_MULTIPLEX_REQUEST_TIMEOUT);
+        assert!(started_at.elapsed() < Duration::from_secs(5));
         assert_eq!(fallback["route"], "relay");
         assert!(client.uses_relay_transport());
         assert_eq!(client.relay_target_node_id(), Some(target_node_id));

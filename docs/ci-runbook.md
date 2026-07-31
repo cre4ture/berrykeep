@@ -49,10 +49,11 @@ For branch `main`, require these stable aggregate status checks:
 The aggregate jobs are the branch-protection contract. `Required CI` covers
 `workspace-check`, `rustfmt`, `clippy`, `unit-tests`, and `ios-build`;
 `Required coverage` covers the coverage lane; and `Required system tests`
-covers every operating-system entry in the system-test matrix. The aggregate
-jobs always report a terminal result and accept an intentionally skipped
-dependency. This keeps branch protection stable when a future impact gate
-skips a lane that cannot be affected by the pull request.
+covers every operating-system entry in the system-test matrix plus the
+Linux-only QUIC network-namespace test. The aggregate jobs always report a
+terminal result and accept an intentionally skipped dependency. This keeps
+branch protection stable when a future impact gate skips a lane that cannot
+be affected by the pull request.
 
 Do not require the implementation job names directly. Matrix expansion and
 future job-level impact conditions may change those names or skip those jobs,
@@ -119,7 +120,10 @@ cd web && pnpm test:e2e:client-ui
 cd web && pnpm test:e2e:server-admin
 cd web && pnpm test:e2e:server-admin-rust
 cd web && pnpm test:e2e:server-admin-setup-rust
-cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
+cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml --lib
+# Linux only:
+cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml \
+	--test quic_network -- --test-threads=1 --nocapture
 ```
 
 Pass or fail rule:
@@ -185,6 +189,7 @@ Useful per-lane shortcuts:
 - `just coverage`
 - `just ci-web-smoke`
 - `just test-system-nightly`
+- `just test-quic-network` (Linux only)
 
 ## GitHub Actions cache scope
 
@@ -215,7 +220,7 @@ This usually means the failure is isolated to `tests/system-tests` and/or nightl
 ### 1) Reproduce locally with the same command
 
 ```bash
-cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
+cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml --lib
 ```
 
 For a single test:
@@ -223,6 +228,44 @@ For a single test:
 ```bash
 cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml --lib -- tests::<name> --exact --nocapture
 ```
+
+For the Linux-only NAT, firewall, and QUIC route tests:
+
+```bash
+sudo apt-get install iproute2 nftables
+sysctl kernel.unprivileged_userns_clone
+sysctl kernel.apparmor_restrict_unprivileged_userns  # Ubuntu 24.04+
+just test-quic-network
+```
+
+`kernel.unprivileged_userns_clone` must be `1`. On Ubuntu 24.04 and newer,
+`kernel.apparmor_restrict_unprivileged_userns` must be `0`. The test uses
+Patchbay network namespaces and therefore requires `nft`, `tc`, and
+unprivileged user namespaces; it does not require root at runtime.
+
+The serial test suite starts the real Rendezvous service, Server Node, and
+IronMesh Client CLI in separate Patchbay network namespaces. It covers:
+
+- IPv4 EIM/APDF (`Nat::Home`) on both peers, without an additional firewall,
+  and requires Iroh to migrate the pooled Direct QUIC connection from relay to
+  a direct hole-punched path;
+- the Patchbay `Hotel` profile (symmetric NAT and UDP blocked), with the Iroh
+  relay enabled, and requires a relay-assisted Direct QUIC path;
+- the same blocked-UDP profile with the Iroh relay disabled, and requires the
+  IronMesh relay tunnel to remain usable;
+- a fault endpoint placed before a healthy rendezvous endpoint. The client
+  must race both Iroh relay-ticket requests and establish relay-assisted Direct
+  QUIC through the healthy endpoint without exhausting the three-second budget.
+
+The CLI exercises the same client SDK and managed routing implementation used
+by app shells, so no phone simulator is needed for these transport assertions.
+Client-SDK tests separately hold every configured Iroh ticket endpoint open
+beyond the three-second budget and verify that Direct-only continuation or
+failure remains bounded. The blocked-UDP scenario without Iroh relay separately
+verifies the IronMesh relay fallback.
+The Home-NAT case also runs the Rendezvous relay's UDP QUIC Address Discovery
+(QAD) endpoint. Without QAD, peers behind separate NATs cannot learn their
+public UDP mappings and Iroh correctly remains on its packet-forwarding relay.
 
 ### 2) Verify stable lanes are still healthy
 
@@ -238,6 +281,7 @@ cargo +stable test --workspace
 - `bindeps`/artifact path changes.
 - Timing-sensitive system test behavior.
 - Environment assumptions in system tests (ports, startup timing).
+- Missing Linux network-namespace prerequisites (`nft`, `tc`, or user namespaces).
 
 ### 4) Fast mitigation options
 

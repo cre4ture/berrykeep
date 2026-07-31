@@ -19,6 +19,7 @@ use transport_sdk::{
     RendezvousControlClient, TransportPathKind,
 };
 
+use crate::ironmesh_client::blocking_runtime;
 use crate::latency_probe::LatencyProbeConfig;
 use crate::{IronMeshClient, PlannedConnectionBootstrapTarget};
 
@@ -556,10 +557,11 @@ fn order_clients_by_startup_probe(
     let worker = std::thread::Builder::new()
         .name("ironmesh-client-startup-probe".to_string())
         .spawn(move || -> Result<StartupProbeWorkerResult> {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed to build startup probe runtime")?;
+            // Direct QUIC endpoints and multiplex sessions spawn transport
+            // drivers on the runtime that performs their startup probe. Keep
+            // that runtime alive for the process lifetime so the successfully
+            // probed client remains usable after this worker returns.
+            let runtime = blocking_runtime()?;
 
             Ok(runtime.block_on(async move {
                 let mut probes = FuturesUnordered::new();

@@ -42,6 +42,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
 ] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+ctor = "1.0"
+patchbay = "0.6"
+
 [dev-dependencies]
 base64 = "0.22"
 server_node = { path = "../../apps/server-node", package = "server-node", artifact = "bin" }

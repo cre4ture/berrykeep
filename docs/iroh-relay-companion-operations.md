@@ -9,8 +9,10 @@ deployments.
 `ironmesh-rendezvous-service` runs the upstream Iroh relay protocol on its
 existing public origin and listener. Rendezvous control requests and Iroh
 `GET /relay` upgrades therefore use the same host, port, TLS certificate, and
-firewall rule. No relay-specific listener, reverse proxy route, public URL, or
-static shared token is required.
+TCP firewall rule. Iroh QUIC Address Discovery (QAD) uses UDP port `7842` with
+the same TLS identity; that UDP port must also be reachable for NAT hole
+punching. No relay-specific reverse proxy route, public hostname, or static
+shared token is required.
 
 The implementation and security model are summarized in
 [Embedded Iroh Relay: Same-Port Access Design](embedded-iroh-relay-same-port-design.md).
@@ -20,6 +22,12 @@ The implementation and security model are summarized in
 The embedded relay is enabled automatically. Its public origin is derived from
 `IRONMESH_RENDEZVOUS_PUBLIC_URL`, and its TLS behavior follows the Rendezvous
 listener.
+
+When Rendezvous TLS is configured, QAD is enabled automatically on
+`0.0.0.0:7842` and that port is advertised in authenticated relay tickets.
+Installations without a TLS identity keep QAD disabled unless they provide a
+dedicated identity, which is primarily useful for isolated development and
+system-test networks.
 
 Authenticated clients request short-lived relay tickets through the Rendezvous
 control API. Every ticket is bound to one Iroh endpoint ID. The relay checks
@@ -45,10 +53,20 @@ IRONMESH_IROH_RELAY_ENABLED=true
 IRONMESH_IROH_RELAY_TICKET_TTL_SECS=3600
 IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND=16777216
 IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES=33554432
+
+# Optional when the public UDP port differs from the default.
+IRONMESH_IROH_RELAY_QUIC_BIND=0.0.0.0:7842
+IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT=7842
+
+# Optional dedicated QAD identity; normally Rendezvous TLS is reused.
+IRONMESH_IROH_RELAY_QUIC_TLS_CERT=/etc/ironmesh/qad.pem
+IRONMESH_IROH_RELAY_QUIC_TLS_KEY=/etc/ironmesh/qad.key
 ```
 
 Ticket lifetime must be between 300 and 86400 seconds. Receive limits are
-applied per Iroh relay connection.
+applied per Iroh relay connection. The QAD certificate must cover every host
+in the advertised relay origins. Bind and public ports must be non-zero; use
+the public port setting when host-level port forwarding changes the UDP port.
 
 `IRONMESH_DIRECT_QUIC_RELAY_URLS` and
 `IRONMESH_DIRECT_QUIC_RELAY_AUTH_TOKEN` remain supported on server nodes for an
@@ -60,6 +78,7 @@ embedded same-port relay and remain authoritative for overlapping URLs.
 1. Check the normal Rendezvous `/health` endpoint and the Iroh-compatible
    `/ping` probe on the same origin. The health response's
    `iroh_relay_public_urls` field should contain the Rendezvous public origin.
+   Confirm that UDP `7842` (or the configured public port) is reachable.
 2. Confirm a node logs `reconciled direct QUIC endpoint from
    rendezvous-provided iroh relays`.
 3. Inspect authenticated `/control/discovery`: a `direct_quic` candidate should

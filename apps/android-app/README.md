@@ -49,6 +49,8 @@ In GitHub Actions, store the keystore itself as base64 in `IRONMESH_ANDROID_INTE
 
 - JNI bridge class: `io.ironmesh.android.data.RustClientBridge`
 - Rust exports implemented in: `apps/android-app/src/lib.rs`
+- `IronmeshApplication` initializes the process-wide Rust bridges with the
+  Android application context before Iroh can construct its system DNS resolver.
 - Current Rust-backed operations in repository:
   - `putObject`, `putObjectBytes`
   - `getObject`, `getObjectBytes` (latest-only path; snapshot/version still uses HTTP fallback)
