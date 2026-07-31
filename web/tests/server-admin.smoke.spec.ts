@@ -519,6 +519,7 @@ test("server-admin creates a hybrid map from configured raster and vector artifa
   await page.getByRole("button", { name: "Create hybrid variant" }).click();
 
   await expect.poll(() => savedConfiguration).not.toBeNull();
+  await expect(page.getByText("Relief with Natural Earth labels", { exact: true })).toBeVisible();
   const created = savedConfiguration?.variants.find(
     (variant) => variant.label === "Relief with Natural Earth labels"
   );
@@ -530,6 +531,26 @@ test("server-admin creates a hybrid map from configured raster and vector artifa
     raster_manifest_key: "sys/maps/natural-earth-one.mbtiles.manifest.json",
     vector_manifest_key: "sys/maps/natural-earth-vector.mbtiles.manifest.json"
   });
+
+  const createdVariantVisibility = page.getByRole("switch", { name: "Visible" }).last();
+  await expect(createdVariantVisibility).not.toBeChecked();
+  await page.getByText("Visible", { exact: true }).last().click();
+  await expect(createdVariantVisibility).toBeChecked();
+  await expect
+    .poll(() =>
+      savedConfiguration?.variants.find(
+        (variant) => variant.label === "Relief with Natural Earth labels"
+      )?.enabled
+    )
+    .toBe(true);
+
+  await page.getByRole("tab", { name: "Gallery" }).click();
+  await page.getByRole("button", { name: "Map" }).click();
+  const mapDisplay = page.getByRole("textbox", { name: "Map display", exact: true });
+  await mapDisplay.click();
+  await expect(
+    page.getByRole("option", { name: "Relief with Natural Earth labels" })
+  ).toBeVisible();
 });
 
 test("server-admin explorer restores snapshot entries", async ({ page }) => {

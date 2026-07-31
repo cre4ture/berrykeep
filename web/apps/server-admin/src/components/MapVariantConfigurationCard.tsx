@@ -19,6 +19,7 @@ import {
 } from "@mantine/core";
 import { useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
+import { galleryMapConfigurationQueryKey } from "../lib/gallery-query-keys";
 
 type MapVariant = AdminGalleryMapConfiguration["variants"][number];
 type HybridAssetSource = {
@@ -61,10 +62,7 @@ export function MapVariantConfigurationCard({
     mutationFn: (next: AdminGalleryMapConfiguration) =>
       updateAdminGalleryMapConfiguration(next, normalizedAdminTokenOverride || undefined),
     onSuccess: (response) => {
-      queryClient.setQueryData(
-        ["gallery-page", "map-configuration", normalizedAdminTokenOverride],
-        response
-      );
+      queryClient.setQueryData(galleryMapConfigurationQueryKey, response);
     }
   });
   const saveError = firstErrorMessage([error, saveMutation.error]);

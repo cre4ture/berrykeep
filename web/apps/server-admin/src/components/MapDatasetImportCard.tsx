@@ -25,6 +25,7 @@ import {
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 import { formatBytes, formatRelativeUnixTs, formatUnixTs } from "../lib/format";
+import { galleryMapConfigurationQueryKey } from "../lib/gallery-query-keys";
 import {
   MapDatasetImportWizard,
   type MapDatasetImportWizardTarget,
@@ -55,7 +56,7 @@ export function MapDatasetImportCard() {
   const [wizardStep, setWizardStep] = useState(0);
 
   const mapConfigurationQuery = useQuery({
-    queryKey: ["gallery-page", "map-configuration", normalizedAdminTokenOverride],
+    queryKey: galleryMapConfigurationQueryKey,
     queryFn: () => getAdminGalleryMapConfiguration(normalizedAdminTokenOverride || undefined),
     enabled: canInspectMapImport,
     staleTime: 5_000
