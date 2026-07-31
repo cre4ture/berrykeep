@@ -96,14 +96,17 @@ profile:
 
 1. choose **Natural Earth physical world map**, **Natural Earth physical world
    map + labels**, **Natural Earth vector world map**, **Natural Earth
-   hypsometric relief map**, **Natural Earth I relief and water map**, or **An existing MBTiles package**;
+   hypsometric relief map**, **Natural Earth I relief and water map**,
+   **OpenMapTiles Street**, or **An existing MBTiles package**;
 2. confirm the fixed official Natural Earth source, or paste one HTTP(S) URL
-   (or a copied `wget -c ...` command) for an existing MBTiles package;
+   (or a copied `wget -c ...` command) for the authorized OpenMapTiles Street
+   or existing MBTiles package;
 3. confirm the fixed `natural-earth-globe` raster destination, the fixed
    raster and vector destinations for the labels profile, the fixed
    `natural-earth-vector` vector destination, the fixed `natural-earth-hypso`
-   or `natural-earth-1` relief-raster destination, or select the configured variant artifact and
-   part size for an MBTiles package;
+   or `natural-earth-1` relief-raster destination, the fixed
+   `openmaptiles-street` vector destination, or select the configured variant
+   artifact and part size for an MBTiles package;
 4. review the source and destination, then start the background job.
 
 The source file name is never a destination. The selected cluster
@@ -210,16 +213,27 @@ or Web-Mercator conversion is performed. The package is generated through zoom
 
 ## Detailed street packages
 
-For a larger worldwide street map, create or obtain an MBTiles package that
-uses the OpenMapTiles source-layer schema, add its manifest key to a `vector`
-profile with `style: "openmaptiles"`, import it, then enable it. The standard
+For the included worldwide street profile, choose **OpenMapTiles Street** in
+the import wizard and paste the authorized HTTP(S) MBTiles URL or copied
+`wget -c ...` command from [MapTiler](https://www.maptiler.com/). The server then downloads,
+resumes, validates, and publishes the package through the normal background
+import job, with the configured `openmaptiles-street` vector artifact selected
+automatically. Provider URLs are account- and license-specific, so IronMesh
+does not embed a shared download token.
+
+MapTiler satellite MBTiles are supported too: select **An existing MBTiles
+package** and choose the configured **MapTiler Satellite (legacy)** target.
+
+For another street package, create or obtain an MBTiles file that uses the
+OpenMapTiles source-layer schema, add its manifest key to a `vector` profile
+with `style: "openmaptiles"`, import it, then enable it. The standard
 OpenMapTiles layer names (`transportation`, `place`, `boundary`, and so on) are
 rendered by the existing street style.
 
 Keep the legally required attribution in the profile's `attribution` field.
-IronMesh intentionally does not download a provider-specific global street
-dataset by default; the map variant document keeps that policy and its artifact
-URLs under administrator control.
+The source URL is supplied by the administrator because it may contain an
+account-specific authorization token; the destination remains under the shared
+map-variant configuration's control.
 
 ## Verify
 
