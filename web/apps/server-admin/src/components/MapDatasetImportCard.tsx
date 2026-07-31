@@ -91,6 +91,12 @@ export function MapDatasetImportCard() {
     importTargets.find(
       (target) => target.variantId === "natural-earth-1" && target.asset === "raster"
     ) ?? null;
+  const openMapTilesStreetTarget =
+    importTargets.find(
+      (target) => target.variantId === "openmaptiles-street" && target.asset === "vector"
+    ) ?? null;
+  const selectedProfileTarget =
+    selectedImportProfile === "openmaptiles-street" ? openMapTilesStreetTarget : selectedTarget;
   useEffect(() => {
     if (!selectedTargetKey || !importTargets.some((target) => target.key === selectedTargetKey)) {
       setSelectedTargetKey(importTargets[0]?.key ?? null);
@@ -112,13 +118,13 @@ export function MapDatasetImportCard() {
       query.state.data?.active_job?.state === "running" ? 2_000 : false
   });
   const startMapImportMutation = useMutation({
-    mutationFn: () =>
+    mutationFn: (target: MapImportTarget) =>
       startAdminMapDatasetImport(
         {
           source: mapImportSource.trim(),
           part_size_bytes: Math.round(partSizeGiB * GIB_BYTES),
-          variant_id: selectedTarget?.variantId,
-          asset: selectedTarget?.asset
+          variant_id: target.variantId,
+          asset: target.asset
         },
         normalizedAdminTokenOverride || undefined
       ),
@@ -164,7 +170,7 @@ export function MapDatasetImportCard() {
   const canStartMapImport =
     canInspectMapImport &&
     mapImportStatus?.can_start_new !== false &&
-    Boolean(selectedTarget) &&
+    Boolean(selectedProfileTarget) &&
     mapImportSource.trim().length > 0 &&
     Number.isFinite(partSizeGiB) &&
     partSizeGiB > 0;
@@ -186,7 +192,9 @@ export function MapDatasetImportCard() {
             ? canStartNaturalEarthImport && naturalEarthOneTarget !== null
           : selectedImportProfile === "natural-earth-vector"
             ? canStartNaturalEarthImport && naturalEarthVectorTarget !== null
-          : canStartMapImport;
+            : selectedImportProfile === "openmaptiles-street"
+              ? canStartMapImport && openMapTilesStreetTarget !== null
+              : canStartMapImport;
   const importControlsLocked =
     mapImportStatus?.can_start_new === false ||
     naturalEarthImportStatus?.can_start_new === false ||
@@ -219,8 +227,12 @@ export function MapDatasetImportCard() {
       void startNaturalEarthImportMutation.mutateAsync("natural_earth_one");
       return;
     }
-    if (selectedImportProfile === "remote-mbtiles") {
-      void startMapImportMutation.mutateAsync();
+    if (
+      (selectedImportProfile === "remote-mbtiles" ||
+        selectedImportProfile === "openmaptiles-street") &&
+      selectedProfileTarget
+    ) {
+      void startMapImportMutation.mutateAsync(selectedProfileTarget);
     }
   }
 
@@ -262,13 +274,14 @@ export function MapDatasetImportCard() {
             partSizeGiB={partSizeGiB}
             selectedTargetKey={selectedTargetKey}
             targets={importTargets}
-            selectedTarget={selectedTarget}
+            selectedTarget={selectedProfileTarget}
             naturalEarthTarget={naturalEarthTarget}
             naturalEarthLabelsRasterTarget={naturalEarthLabelsRasterTarget}
             naturalEarthLabelsVectorTarget={naturalEarthLabelsVectorTarget}
             naturalEarthVectorTarget={naturalEarthVectorTarget}
             naturalEarthHypsoTarget={naturalEarthHypsoTarget}
             naturalEarthOneTarget={naturalEarthOneTarget}
+            openMapTilesStreetTarget={openMapTilesStreetTarget}
             mapConfigurationLoading={mapConfigurationQuery.isLoading}
             controlsLocked={importControlsLocked}
             canStartImport={canStartSelectedImport}

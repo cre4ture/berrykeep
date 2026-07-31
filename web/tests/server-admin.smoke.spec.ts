@@ -96,6 +96,17 @@ function defaultServerAdminGalleryMapConfiguration(): GalleryMapConfiguration {
         style: "raster",
         enabled: false,
         raster_manifest_key: "sys/maps/natural-earth-one.mbtiles.manifest.json"
+      },
+      {
+        id: "openmaptiles-street",
+        label: "OpenMapTiles Street",
+        mode_label: "Street",
+        description: "Detailed global OpenMapTiles street map.",
+        attribution: "Map data © OpenStreetMap contributors.",
+        kind: "vector",
+        style: "openmaptiles",
+        enabled: false,
+        vector_manifest_key: "sys/maps/openmaptiles-street.mbtiles.manifest.json"
       }
     ]
   };
@@ -1245,6 +1256,78 @@ test("server-admin map import wizard imports the Natural Earth I relief and wate
   await expect(
     page.getByText("Rendering the Natural Earth I shaded-relief and water map", { exact: true })
   ).toBeVisible();
+});
+
+test("server-admin map import wizard imports the predefined OpenMapTiles Street artifact", async ({ page }) => {
+  let mapImportRequest: Record<string, unknown> | null = null;
+
+  await installServerAdminMocks(page);
+  await page.route(`**${apiV1("/auth/maps/import")}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return json(route, { active_job: null, can_start_new: true });
+    }
+    if (route.request().method() === "POST") {
+      mapImportRequest = JSON.parse(route.request().postData() ?? "{}");
+      return json(route, {
+        started: true,
+        status: {
+          active_job: null,
+          can_start_new: false
+        }
+      });
+    }
+    return route.fallback();
+  });
+  await page.route(`**${apiV1("/auth/maps/import/natural-earth")}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return json(route, { active_job: null, can_start_new: true });
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByText("Gallery", { exact: true }).click();
+  await openMapConfiguration(page);
+
+  await page.getByRole("radio", { name: "OpenMapTiles Street" }).check();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText("OpenMapTiles Street source", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "MapTiler" })).toHaveAttribute(
+    "href",
+    "https://www.maptiler.com/"
+  );
+  await expect(
+    page.getByText("MapTiler satellite MBTiles are also supported", { exact: false })
+  ).toBeVisible();
+  await page
+    .getByLabel("OpenMapTiles Street URL or pasted CLI command")
+    .fill("https://maps.example.test/openmaptiles-street.mbtiles");
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(
+    page.getByText("Configured OpenMapTiles Street destination", { exact: true })
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("alert", { name: "Configured OpenMapTiles Street destination" })
+      .getByText("sys/maps/openmaptiles-street.mbtiles.manifest.json", { exact: true })
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText("Review before starting the background job", { exact: true })).toBeVisible();
+  await expect(page.getByText("OpenMapTiles Street", { exact: true }).last()).toBeVisible();
+  await page.getByRole("button", { name: "Start background import" }).click();
+
+  await expect.poll(() => mapImportRequest).not.toBeNull();
+  expect(mapImportRequest).toMatchObject({
+    source: "https://maps.example.test/openmaptiles-street.mbtiles",
+    variant_id: "openmaptiles-street",
+    asset: "vector",
+    part_size_bytes: 10 * 1024 ** 3
+  });
 });
 
 test("server-admin map import wizard forwards remote MBTiles details to its background job", async ({ page }) => {
