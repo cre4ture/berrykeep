@@ -3,6 +3,10 @@ module(
     version = "1.0.38",
 )
 
+# Declare platform constraints directly so platform-specific native targets do
+# not depend on a transitive repository mapping.
+bazel_dep(name = "platforms", version = "1.1.0")
+
 # Rust rules are kept in lock-step with the initial Bazel toolchain. Cargo
 # remains the source of truth for third-party dependency versions.
 bazel_dep(name = "rules_rust", version = "0.71.3")
