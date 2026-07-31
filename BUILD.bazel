@@ -3,11 +3,13 @@ package(default_visibility = ["//visibility:public"])
 test_suite(
     name = "unit",
     tests = [
+        "//crates/adapter-linux-fuse:unit_test",
         "//crates/client-sdk:unit_test",
         "//crates/common:unit_test",
         "//crates/desktop-client-config:unit_test",
         "//crates/desktop-status:unit_test",
         "//crates/rendezvous-server:unit_test",
+        "//crates/stats-collector-server:unit_test",
         "//crates/sync-agent-core:unit_test",
         "//crates/sync-core:unit_test",
         "//crates/transport-sdk:unit_test",
