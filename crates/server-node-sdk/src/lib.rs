@@ -140,6 +140,7 @@ mod map_config;
 mod map_dataset_import;
 mod natural_earth_import;
 mod reliability_telemetry;
+mod rendezvous_contact_config;
 mod replication;
 mod s3_frontend;
 mod setup;
@@ -7420,6 +7421,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/maps/config", get(map_config::public_config))
+        .route(
+            "/cluster/rendezvous-contacts",
+            get(rendezvous_contact_config::public_config),
+        )
         .route("/media/cache/retry", post(retry_media_cache))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
@@ -7536,6 +7541,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route(
             "/auth/rendezvous-config",
             get(get_rendezvous_config).put(update_rendezvous_config),
+        )
+        .route(
+            "/auth/cluster/rendezvous-contacts",
+            get(rendezvous_contact_config::admin_get_config)
+                .put(rendezvous_contact_config::admin_put_config),
         )
         .route("/auth/s3/status", get(get_s3_control_plane_status))
         .route(
@@ -13304,6 +13314,42 @@ async fn enqueue_autonomous_post_write_replication(
         tokio::spawn(async move {
             run_autonomous_post_write_replication(state_for_repair).await;
         });
+    }
+}
+
+/// Register a confirmed object write with the cluster's ordinary metadata and
+/// replication machinery. System configuration documents deliberately use the
+/// same path as other versioned objects in the first rollout.
+pub(crate) async fn register_cluster_object_put_outcome(
+    state: &ServerState,
+    key: &str,
+    version_id: &str,
+) {
+    publish_namespace_change(state);
+
+    let mut cluster = state.cluster.lock().await;
+    cluster.note_replica(key, state.node_id);
+    cluster.note_replica(format!("{key}@{version_id}"), state.node_id);
+    drop(cluster);
+
+    if let Err(err) = persist_cluster_replicas_state(state).await {
+        warn!(
+            error = %err,
+            key,
+            version_id,
+            "failed to persist cluster replicas after object put"
+        );
+    }
+
+    if should_trigger_autonomous_post_write_replication(
+        state.autonomous_replication_on_put_enabled,
+        false,
+    ) {
+        enqueue_autonomous_post_write_replication(
+            state,
+            autonomous_post_write_replication_subjects(key, version_id),
+        )
+        .await;
     }
 }
 

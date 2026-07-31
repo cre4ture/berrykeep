@@ -893,32 +893,7 @@ async fn ingest_import_chunk(
 }
 
 pub(crate) async fn register_put_outcome(state: &ServerState, key: &str, version_id: &str) {
-    publish_namespace_change(state);
-
-    let mut cluster = state.cluster.lock().await;
-    cluster.note_replica(key, state.node_id);
-    cluster.note_replica(format!("{key}@{version_id}"), state.node_id);
-    drop(cluster);
-
-    if let Err(err) = persist_cluster_replicas_state(state).await {
-        warn!(
-            error = %err,
-            key,
-            version_id,
-            "failed to persist cluster replicas after map dataset import put"
-        );
-    }
-
-    if should_trigger_autonomous_post_write_replication(
-        state.autonomous_replication_on_put_enabled,
-        false,
-    ) {
-        enqueue_autonomous_post_write_replication(
-            state,
-            autonomous_post_write_replication_subjects(key, version_id),
-        )
-        .await;
-    }
+    register_cluster_object_put_outcome(state, key, version_id).await;
 }
 
 pub(crate) async fn invalidate_cached_mbtiles_source(state: &ServerState, manifest_key: &str) {

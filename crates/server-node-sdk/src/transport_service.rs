@@ -23,13 +23,13 @@ use crate::{
     list_store_index_response, list_tombstone_archives, list_versions, list_versions_response,
     placement_for_key, process_stats_current, process_stats_history, put_object,
     reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
-    renew_device_rendezvous_identity, replication, replication_plan, request_has_admin_auth,
-    require_client_auth, require_client_or_admin_auth, require_internal_caller,
-    restore_snapshot_path, restore_version_path, run_cleanup, run_tombstone_archive_purge,
-    run_tombstone_archive_restore, run_tombstone_compaction, s3_frontend, start_upload_session,
-    storage_stats_current, storage_stats_history, transport_headers_from_response,
-    trigger_replication_audit, upload_session_chunk, validate_client_auth_request,
-    wait_for_store_index_change,
+    rendezvous_contact_config, renew_device_rendezvous_identity, replication, replication_plan,
+    request_has_admin_auth, require_client_auth, require_client_or_admin_auth,
+    require_internal_caller, restore_snapshot_path, restore_version_path, run_cleanup,
+    run_tombstone_archive_purge, run_tombstone_archive_restore, run_tombstone_compaction,
+    s3_frontend, start_upload_session, storage_stats_current, storage_stats_history,
+    transport_headers_from_response, trigger_replication_audit, upload_session_chunk,
+    validate_client_auth_request, wait_for_store_index_change,
 };
 
 #[derive(Clone)]
@@ -528,6 +528,10 @@ fn build_public_transport_router(state: ServerState) -> Router {
         )
         .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/maps/config", get(crate::map_config::public_config))
+        .route(
+            "/cluster/rendezvous-contacts",
+            get(rendezvous_contact_config::public_config),
+        )
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))

@@ -2,6 +2,7 @@ import {
   exportManagedControlPlanePromotion,
   exportManagedRendezvousFailover,
   getDirectEndpointsConfig,
+  getRendezvousContactConfiguration,
   getRendezvousConfig,
   importManagedControlPlanePromotion,
   importManagedRendezvousFailover,
@@ -11,8 +12,10 @@ import {
   type ManagedControlPlanePromotionPackage,
   type ManagedRendezvousFailoverImportResponse,
   type ManagedRendezvousFailoverPackage,
+  type RendezvousContactConfigurationResponse,
   type RendezvousConfigView,
   updateDirectEndpointsConfig,
+  updateRendezvousContactConfiguration,
   updateRendezvousConfig
 } from "@ironmesh/api";
 import { JsonBlock } from "@ironmesh/ui";
@@ -47,6 +50,12 @@ export function ControlPlanePage() {
   const [rendezvousUrlsDirty, setRendezvousUrlsDirty] = useState(false);
   const rendezvousUrlsDirtyRef = useRef(false);
   const [rendezvousConfigLoading, setRendezvousConfigLoading] = useState(true);
+  const [rendezvousContactConfiguration, setRendezvousContactConfiguration] =
+    useState<RendezvousContactConfigurationResponse | null>(null);
+  const [rendezvousContactUrlsText, setRendezvousContactUrlsText] = useState("");
+  const [rendezvousContactUrlsDirty, setRendezvousContactUrlsDirty] = useState(false);
+  const rendezvousContactUrlsDirtyRef = useRef(false);
+  const [rendezvousContactConfigurationLoading, setRendezvousContactConfigurationLoading] = useState(true);
   const [rendezvousPassphrase, setRendezvousPassphrase] = useState("");
   const [rendezvousTargetNodeId, setRendezvousTargetNodeId] = useState("");
   const [rendezvousPublicUrl, setRendezvousPublicUrl] = useState("");
@@ -69,6 +78,7 @@ export function ControlPlanePage() {
   const [pendingAction, setPendingAction] = useState<
     | "direct-endpoints-save"
     | "rendezvous-config-save"
+    | "rendezvous-contacts-save"
     | "rendezvous-export"
     | "rendezvous-import"
     | "promotion-export"
@@ -85,17 +95,23 @@ export function ControlPlanePage() {
   }, [rendezvousUrlsDirty]);
 
   useEffect(() => {
+    rendezvousContactUrlsDirtyRef.current = rendezvousContactUrlsDirty;
+  }, [rendezvousContactUrlsDirty]);
+
+  useEffect(() => {
     let cancelled = false;
 
     async function refreshConfigs(showLoading: boolean, preserveDraft: boolean) {
       if (showLoading) {
         setDirectEndpointsConfigLoading(true);
         setRendezvousConfigLoading(true);
+        setRendezvousContactConfigurationLoading(true);
       }
       try {
-        const [directEndpointsPayload, rendezvousPayload] = await Promise.all([
+        const [directEndpointsPayload, rendezvousPayload, rendezvousContactsPayload] = await Promise.all([
           getDirectEndpointsConfig(adminTokenOverride),
-          getRendezvousConfig(adminTokenOverride)
+          getRendezvousConfig(adminTokenOverride),
+          getRendezvousContactConfiguration(adminTokenOverride)
         ]);
         if (cancelled) {
           return;
@@ -111,6 +127,11 @@ export function ControlPlanePage() {
           setEditableRendezvousUrlsText(rendezvousPayload.editable_urls.join("\n"));
           setRendezvousUrlsDirty(false);
         }
+        setRendezvousContactConfiguration(rendezvousContactsPayload);
+        if (!preserveDraft || !rendezvousContactUrlsDirtyRef.current) {
+          setRendezvousContactUrlsText(rendezvousContactsPayload.configuration.rendezvous_urls.join("\n"));
+          setRendezvousContactUrlsDirty(false);
+        }
       } catch (actionError) {
         if (cancelled) {
           return;
@@ -120,6 +141,7 @@ export function ControlPlanePage() {
         if (!cancelled && showLoading) {
           setDirectEndpointsConfigLoading(false);
           setRendezvousConfigLoading(false);
+          setRendezvousContactConfigurationLoading(false);
         }
       }
     }
@@ -171,6 +193,31 @@ export function ControlPlanePage() {
       setRendezvousConfig(payload);
       setEditableRendezvousUrlsText(payload.editable_urls.join("\n"));
       setRendezvousUrlsDirty(false);
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : String(actionError));
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  async function handleSaveRendezvousContactConfiguration() {
+    setPendingAction("rendezvous-contacts-save");
+    setError(null);
+    try {
+      const rendezvous_urls = rendezvousContactUrlsText
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      const payload = await updateRendezvousContactConfiguration(
+        {
+          schema_version: rendezvousContactConfiguration?.configuration.schema_version ?? 1,
+          rendezvous_urls
+        },
+        adminTokenOverride
+      );
+      setRendezvousContactConfiguration(payload);
+      setRendezvousContactUrlsText(payload.configuration.rendezvous_urls.join("\n"));
+      setRendezvousContactUrlsDirty(false);
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : String(actionError));
     } finally {
@@ -426,6 +473,66 @@ export function ControlPlanePage() {
           {rendezvousConfig ? (
             <RendezvousRegistrationStateSection rendezvousConfig={rendezvousConfig} />
           ) : null}
+        </Stack>
+      </Card>
+
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="md">
+          <Group justify="space-between">
+            <Text fw={700}>Cluster rendezvous contact list</Text>
+            <Badge variant="light">
+              {rendezvousContactConfiguration
+                ? `${rendezvousContactConfiguration.configuration.rendezvous_urls.length} contacts`
+                : "loading"}
+            </Badge>
+          </Group>
+          <Text c="dimmed">
+            This cluster-owned list is stored as a confirmed, versioned object. Authenticated clients can download it
+            after they have connected directly or through a relay. It does not replace this node&apos;s listener or
+            bootstrap configuration.
+          </Text>
+          <Grid>
+            <Grid.Col span={{ base: 12, xl: 6 }}>
+              <Stack gap="sm">
+                <Text fw={600}>Replicated object state</Text>
+                <JsonBlock
+                  value={
+                    rendezvousContactConfiguration ?? {
+                      status: rendezvousContactConfigurationLoading ? "loading" : "unavailable"
+                    }
+                  }
+                />
+              </Stack>
+            </Grid.Col>
+            <Grid.Col span={{ base: 12, xl: 6 }}>
+              <Stack gap="sm">
+                <Text fw={600}>Client contact URLs</Text>
+                <Textarea
+                  label="Rendezvous contact URLs"
+                  minRows={6}
+                  autosize
+                  value={rendezvousContactUrlsText}
+                  onChange={(event) => {
+                    setRendezvousContactUrlsText(event.currentTarget.value);
+                    setRendezvousContactUrlsDirty(true);
+                  }}
+                  placeholder={"https://relay.example:19080\nhttps://fallback.example:19080"}
+                />
+                <Text size="sm" c="dimmed">
+                  One URL per line. Keep at least one stable bootstrap or fallback rendezvous service configured outside
+                  this list so newly enrolled and offline clients can still reach the cluster.
+                </Text>
+                <Group>
+                  <Button
+                    onClick={() => void handleSaveRendezvousContactConfiguration()}
+                    loading={pendingAction === "rendezvous-contacts-save"}
+                  >
+                    Save cluster contact list
+                  </Button>
+                </Group>
+              </Stack>
+            </Grid.Col>
+          </Grid>
         </Stack>
       </Card>
 

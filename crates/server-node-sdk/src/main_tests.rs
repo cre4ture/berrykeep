@@ -11543,6 +11543,139 @@ run_on_main_metadata_backends!(
     multiplex_transport_map_config_routes_to_authenticated_client_api_turso
 );
 
+async fn rendezvous_contact_configuration_is_versioned_and_available_over_authenticated_transport_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.client_auth_control.require_client_auth = true;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+
+    let app = super::build_server_apps(&state).public_app;
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/api/v1/auth/cluster/rendezvous-contacts")
+        .header(super::ADMIN_TOKEN_HEADER, TEST_ADMIN_TOKEN)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "schema_version": 1,
+                "rendezvous_urls": [
+                    "https://rendezvous.example:19080",
+                    "https://fallback.example:19080"
+                ]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let response_payload: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+    assert_eq!(response_payload["stored"], true);
+    assert!(response_payload["version_id"].is_string());
+    assert_eq!(
+        response_payload["configuration"]["rendezvous_urls"],
+        serde_json::json!([
+            "https://rendezvous.example:19080/",
+            "https://fallback.example:19080/"
+        ])
+    );
+
+    let mut identity =
+        transport_sdk::ClientIdentityMaterial::generate(state.cluster_id, None, None).unwrap();
+    let credential_pem = super::generate_client_credential_pem(
+        state.cluster_id,
+        &identity.device_id.to_string(),
+        &identity.public_key_pem,
+        super::unix_ts(),
+        None,
+    );
+    identity.credential_pem = Some(credential_pem.clone());
+    {
+        let mut credentials = state.access.client_credentials.lock().await;
+        credentials.credentials.push(super::ClientCredentialRecord {
+            device_id: identity.device_id.to_string(),
+            label: Some("Rendezvous contact transport test".to_string()),
+            public_key_pem: Some(identity.public_key_pem.clone()),
+            public_key_fingerprint: None,
+            issued_credential_pem: Some(credential_pem),
+            credential_fingerprint: None,
+            created_at_unix: super::unix_ts(),
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
+            revoked_at_unix: None,
+        });
+    }
+
+    let path = "/api/v1/cluster/rendezvous-contacts";
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        path,
+        super::unix_ts(),
+        Some("rendezvous-contacts-transport".to_string()),
+    )
+    .unwrap();
+    let headers = vec![
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_CLUSTER_ID.to_string(),
+            value: signed_headers.cluster_id.to_string(),
+        },
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_DEVICE_ID.to_string(),
+            value: signed_headers.device_id,
+        },
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_CREDENTIAL_FINGERPRINT.to_string(),
+            value: signed_headers.credential_fingerprint,
+        },
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_AUTH_TIMESTAMP.to_string(),
+            value: signed_headers.timestamp_unix.to_string(),
+        },
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_AUTH_NONCE.to_string(),
+            value: signed_headers.nonce,
+        },
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_AUTH_SIGNATURE.to_string(),
+            value: signed_headers.signature_base64,
+        },
+    ];
+    let request = transport_sdk::BufferedTransportRequest::new(
+        transport_sdk::TransportStreamKind::Rpc,
+        "GET",
+        path,
+        headers,
+        Vec::new(),
+    );
+    let response = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &super::transport_service::TransportExecutionScope::Public,
+        &request,
+    )
+    .await
+    .expect("transport rendezvous contact request should execute");
+
+    assert_eq!(response.status, StatusCode::OK.as_u16());
+    let payload = serde_json::from_slice::<serde_json::Value>(&response.body)
+        .expect("transport rendezvous contact response should be JSON");
+    assert_eq!(payload["version_id"], response_payload["version_id"]);
+    assert_eq!(
+        payload["configuration"]["rendezvous_urls"],
+        response_payload["configuration"]["rendezvous_urls"]
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    rendezvous_contact_configuration_is_versioned_and_available_over_authenticated_transport_impl,
+    rendezvous_contact_configuration_is_versioned_and_available_over_authenticated_transport,
+    rendezvous_contact_configuration_is_versioned_and_available_over_authenticated_transport_turso
+);
+
 async fn multiplex_transport_get_upload_session_routes_to_handler_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let upload_id = "transport-upload-session-route".to_string();

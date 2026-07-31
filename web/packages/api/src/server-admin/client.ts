@@ -54,6 +54,8 @@ import type {
   ProcessStatsSample,
   RepairActivityStatusResponse,
   RepairHistoryResponse,
+  RendezvousContactConfiguration,
+  RendezvousContactConfigurationResponse,
   RendezvousConfigView,
   ReplicationPlan,
   S3AccessKeyView,
@@ -1149,6 +1151,29 @@ export async function getRendezvousConfig(
   return fetchAdminJson<RendezvousConfigView>(apiV1("/auth/rendezvous-config"), {
     adminTokenOverride
   });
+}
+
+export async function getRendezvousContactConfiguration(
+  adminTokenOverride?: string
+): Promise<RendezvousContactConfigurationResponse> {
+  return fetchAdminJson<RendezvousContactConfigurationResponse>(
+    apiV1("/auth/cluster/rendezvous-contacts"),
+    { adminTokenOverride }
+  );
+}
+
+export async function updateRendezvousContactConfiguration(
+  configuration: RendezvousContactConfiguration,
+  adminTokenOverride?: string
+): Promise<RendezvousContactConfigurationResponse> {
+  return fetchAdminJson<RendezvousContactConfigurationResponse>(
+    apiV1("/auth/cluster/rendezvous-contacts"),
+    {
+      method: "PUT",
+      adminTokenOverride,
+      body: configuration
+    }
+  );
 }
 
 export async function getDirectEndpointsConfig(

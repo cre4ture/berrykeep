@@ -369,6 +369,12 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
     .fill("https://rendezvous-a.local:9443\nhttps://rendezvous-b.local:9443");
   await page.getByRole("button", { name: "Save rendezvous URLs" }).click();
   await expect(page.locator("pre").filter({ hasText: "rendezvous-b.local:9443" }).first()).toBeVisible();
+  await expect(page.getByText("Cluster rendezvous contact list")).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "Rendezvous contact URLs" })
+    .fill("https://home-router.example:19080\nhttps://relay.example:19080");
+  await page.getByRole("button", { name: "Save cluster contact list" }).click();
+  await expect(page.locator("pre").filter({ hasText: "home-router.example:19080" }).first()).toBeVisible();
 
   await page.getByLabel("Standalone ironmesh-rendezvous-service").click();
   await expect(page.getByRole("textbox", { name: "Target node ID" })).toHaveCount(1);
@@ -432,6 +438,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
       apiV1("/storage/stats/current"),
       apiV1("/auth/bootstrap-claims/issue"),
       apiV1("/auth/rendezvous-config"),
+      apiV1("/auth/cluster/rendezvous-contacts"),
       apiV1("/auth/client-connections"),
       apiV1("/auth/s3/status"),
       apiV1("/auth/s3/buckets"),
@@ -1646,6 +1653,14 @@ async function installServerAdminMocks(
     mtls_required: true,
     persistence_source: "node_enrollment",
     persisted: true
+  };
+  let rendezvousContactConfiguration = {
+    configuration: {
+      schema_version: 1,
+      rendezvous_urls: ["https://rendezvous-a.local:9443/"]
+    },
+    stored: true,
+    version_id: "rendezvous-contact-version-1"
   };
   const galleryEntries = options?.galleryEntries ?? createDefaultAdminGalleryEntries();
   let storagePoolConfig: StoragePoolMockConfig = {
@@ -2941,6 +2956,30 @@ async function installServerAdminMocks(
         ]
       };
       return json(route, rendezvousConfig);
+    }
+
+    if (pathname === apiV1("/auth/cluster/rendezvous-contacts") && method === "GET") {
+      if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
+        await route.fulfill({ status: 401 });
+        return;
+      }
+      return json(route, rendezvousContactConfiguration);
+    }
+
+    if (pathname === apiV1("/auth/cluster/rendezvous-contacts") && method === "PUT") {
+      const body = route.request().postDataJSON() as {
+        schema_version?: number;
+        rendezvous_urls?: string[];
+      };
+      rendezvousContactConfiguration = {
+        configuration: {
+          schema_version: body.schema_version ?? 1,
+          rendezvous_urls: body.rendezvous_urls ?? []
+        },
+        stored: true,
+        version_id: "rendezvous-contact-version-2"
+      };
+      return json(route, rendezvousContactConfiguration);
     }
 
     if (pathname.startsWith(apiV1("/auth/client-credentials/")) && method === "DELETE") {
