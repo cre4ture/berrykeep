@@ -407,6 +407,7 @@ jobs:
       IOS_PROJECT_PATH: apps/apple-file-provider/IronmeshAppleFileProvider.xcodeproj
       IOS_TEST_SCHEME: IronmeshIosApp
       IOS_XCRESULT_PATH: ${{ github.workspace }}/.tmp/IronmeshIosProject.xcresult
+      IOS_RELEASE_REQUESTED: ${{ contains(github.event.pull_request.labels.*.name, 'ci:ios-release') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -523,10 +524,15 @@ jobs:
             -resultBundlePath "$IOS_XCRESULT_PATH"
 
       - name: Setup iOS signing assets
-        if: env.IOS_SIGNED_EXPORT_ENABLED == 'true'
+        if: ${{ env.IOS_SIGNED_EXPORT_ENABLED == 'true' && (github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true') }}
         run: apps/apple-file-provider/scripts/setup-ios-signing.sh "$GITHUB_ENV"
 
       - name: Archive iOS release app
+        # The release archive mirrors the Android release-variant build: it is
+        # not needed for the simulator test suite above, so pull requests skip
+        # it by default and only pay for it on request via the
+        # ci:ios-release label (see docs/ci-runbook.md).
+        if: ${{ github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true' }}
         run: |
           rm -rf "$IOS_ARCHIVE_PATH" "$IOS_EXPORT_PATH"
           if [ "$IOS_SIGNED_EXPORT_ENABLED" = "true" ]; then
@@ -556,10 +562,11 @@ jobs:
           fi
 
       - name: Verify archived iOS File Provider extension
+        if: ${{ github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true' }}
         run: apps/apple-file-provider/scripts/verify-ios-app-archive.sh "$IOS_ARCHIVE_PATH"
 
       - name: Write iOS export options
-        if: env.IOS_SIGNED_EXPORT_ENABLED == 'true'
+        if: ${{ env.IOS_SIGNED_EXPORT_ENABLED == 'true' && (github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true') }}
         run: |
           cat >"$IOS_EXPORT_OPTIONS_PATH" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -590,7 +597,7 @@ jobs:
           EOF
 
       - name: Export signed iOS IPA
-        if: env.IOS_SIGNED_EXPORT_ENABLED == 'true'
+        if: ${{ env.IOS_SIGNED_EXPORT_ENABLED == 'true' && (github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true') }}
         run: |
           xcodebuild -exportArchive \
             -archivePath "$IOS_ARCHIVE_PATH" \
@@ -599,7 +606,7 @@ jobs:
             OTHER_CODE_SIGN_FLAGS="--keychain $IRONMESH_IOS_KEYCHAIN_PATH"
 
       - name: Upload signed iOS IPA for manual installs
-        if: env.IOS_SIGNED_EXPORT_ENABLED == 'true'
+        if: ${{ env.IOS_SIGNED_EXPORT_ENABLED == 'true' && (github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true') }}
         uses: actions/upload-artifact@v4
         with:
           name: ios-manual-install-${{ env.BUILD_NAME_SUFFIX }}
@@ -609,7 +616,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload unsigned iOS release archive
-        if: env.IOS_SIGNED_EXPORT_ENABLED != 'true'
+        if: ${{ env.IOS_SIGNED_EXPORT_ENABLED != 'true' && (github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true') }}
         uses: actions/upload-artifact@v4
         with:
           name: ios-release-archive-unsigned-${{ env.BUILD_NAME_SUFFIX }}
