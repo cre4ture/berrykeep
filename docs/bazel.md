@@ -81,6 +81,10 @@ action stores Bazelisk downloads, the Bazel disk cache, and the external
 repository cache in GitHub Actions cache. Disk-cache entries are separated by
 workflow and derived from the modeled build files. Pull requests restore these
 caches without saving them, while trusted non-PR runs can refresh them.
+Manual dispatches retain the Bazelisk and repository caches but disable this
+action-output disk cache, so controlled seed and read-only evaluation runs
+exercise the fine-grained remote adapter instead of terminating at a local
+cache hit.
 
 The workflow also uses
 [`cre4ture/bazel-github-actions-cache-v2`](https://github.com/cre4ture/bazel-github-actions-cache-v2)
@@ -129,15 +133,16 @@ current protocol, quota, compression, and runner-platform limitations.
 Evaluate the two layers with separate workflow runs rather than treating a
 successful seed as proof of a useful cache:
 
-1. Run a normal read-only build and record Bazel elapsed time, action count,
-   adapter hit/miss and action-result validation statistics, and the
-   `setup-bazel` restore/save duration.
+1. Dispatch a read-only build without `write_cache` and record Bazel elapsed
+   time, action count, adapter hit/miss and action-result validation
+   statistics, and the `setup-bazel` restore duration. Manual dispatches
+   deliberately bypass its action-output disk cache.
 2. When a controlled fine-grained comparison is needed, dispatch one
    `write_cache` seed and record its published-object count, throttling,
    duration, and repository cache usage before and after the run.
-3. Run the same revision, or a small descendant change, again without
-   `write_cache`. Confirm that the disk cache restores, the adapter publishes
-   no objects, and useful hits reduce total runtime.
+3. Dispatch the same revision, or a small descendant change, again without
+   `write_cache`. Confirm that the adapter publishes no objects and useful
+   remote hits reduce total runtime.
 4. Keep routine runs read-only unless the separate warm run demonstrates a
    repeatable gain without quota churn. If the per-object adapter remains the
    bottleneck, remove it from routine CI or replace its backend with a
