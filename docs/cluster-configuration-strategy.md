@@ -83,14 +83,25 @@ client API. The list is deliberately separate from a node's local listener,
 TLS, and bootstrap configuration. Those settings must exist before a client
 can make its first authenticated connection.
 
-Clients must retain their original bootstrap contacts as recovery anchors.
-Subsequent work can add client-side persistence keyed by the object
-`version_id`; the initial implementation only makes the authoritative list
-available to clients.
+Clients retain their original bootstrap contacts as recovery anchors. The
+managed client refreshes this document only after it has a signed client
+identity and can call the authenticated cluster API. It accepts the response
+over either direct or relay transport, validates `schema_version`, and stores
+the returned `version_id` with the contact URLs. At the next startup, cached
+contacts are attempted before the immutable bootstrap contacts; the latter are
+never replaced.
 
-## First implementation scope
+A missing object (`stored: false`) is deliberately not treated as an empty
+update, since the selected node may not have received the replicated metadata
+yet. An explicitly stored empty list is a valid update and leaves the client
+with only its bootstrap recovery contacts. The managed SDK offers a durable
+persistence callback and a pending-bootstrap-update API for platform-owned
+storage. The CLI bootstrap file and Android preferences use the callback; the
+iOS FFI exposes the update for the Swift/App Group owner to persist.
 
-This change implements only the minimum object-backed rendezvous contact list:
+## Implemented reference scope
+
+The reference implementation now includes:
 
 1. typed, validated object content;
 2. confirmed object writes from the Admin Web UI/API;
@@ -98,10 +109,12 @@ This change implements only the minimum object-backed rendezvous contact list:
    path;
 4. authenticated direct and relay client reads;
 5. display of the stored object version in the Admin Web UI.
+6. managed-client retrieval, versioned local persistence, and reuse on later
+   starts while preserving immutable bootstrap fallbacks.
 
 It intentionally does **not** add a new synchronization loop, control-plane
-priority, all-node chunk fan-out, client-side persistence, automatic bootstrap
-rewrites, or dynamic reconfiguration of the standalone rendezvous service.
+priority, all-node chunk fan-out, or dynamic reconfiguration of the standalone
+rendezvous service.
 
 ## Future delivery priority
 

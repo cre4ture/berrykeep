@@ -80,6 +80,7 @@ pub fn resolve_connection_config(
         version: 1,
         cluster_id: Uuid::now_v7(),
         rendezvous_urls: vec![base_url.to_string()],
+        rendezvous_contact_list: None,
         rendezvous_mtls_required: false,
         direct_endpoints: vec![BootstrapEndpoint {
             url: base_url.to_string(),
@@ -231,6 +232,7 @@ mod tests {
             version: 1,
             cluster_id: Uuid::now_v7(),
             rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: true,
             direct_endpoints: vec![BootstrapEndpoint {
                 url: "https://public.example".to_string(),
@@ -290,6 +292,7 @@ mod tests {
             version: 1,
             cluster_id: Uuid::now_v7(),
             rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
             direct_endpoints: vec![BootstrapEndpoint {
                 url: "https://public.invalid".to_string(),
@@ -345,6 +348,7 @@ mod tests {
             version: 1,
             cluster_id: Uuid::now_v7(),
             rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
             direct_endpoints: vec![BootstrapEndpoint {
                 url: "https://public.example".to_string(),
@@ -398,6 +402,7 @@ mod tests {
             version: 1,
             cluster_id: Uuid::now_v7(),
             rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
             direct_endpoints: vec![BootstrapEndpoint {
                 url: "https://public.example".to_string(),

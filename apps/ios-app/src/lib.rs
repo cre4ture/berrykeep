@@ -484,6 +484,17 @@ impl IosStorageApp {
             .transpose()
     }
 
+    /// Returns a serialized bootstrap update containing an authenticated
+    /// cluster-managed Rendezvous contact list. The Swift/App Group owner
+    /// persists it beside the original immutable bootstrap bundle.
+    pub fn take_connection_bootstrap_update_json(&self) -> Result<Option<String>> {
+        self.managed_client
+            .as_ref()
+            .and_then(ManagedIronMeshClient::take_connection_bootstrap_update)
+            .map(|bootstrap| bootstrap.to_json_pretty())
+            .transpose()
+    }
+
     pub fn configure_title_latency_monitor(
         &self,
         config: TitleLatencyProbeConfig,
@@ -887,6 +898,14 @@ fn take_client_identity_update_json(handle: *mut c_void) -> Result<String> {
 }
 
 #[allow(unsafe_code)]
+fn take_connection_bootstrap_update_json(handle: *mut c_void) -> Result<String> {
+    let app = unsafe { handle_to_app(handle)? };
+    Ok(app
+        .take_connection_bootstrap_update_json()?
+        .unwrap_or_default())
+}
+
+#[allow(unsafe_code)]
 fn configure_title_latency_monitor_json(
     handle: *mut c_void,
     enabled: bool,
@@ -1163,6 +1182,23 @@ pub extern "C" fn ironmesh_ios_facade_take_client_identity_update_json(
     clear_error(out_error);
     run_ffi_string_result(out_json, out_error, || {
         take_client_identity_update_json(handle)
+    })
+}
+
+/// Returns a serialized bootstrap update once for the Swift/App Group owner to
+/// persist. It only contains a list returned by the authenticated cluster API;
+/// an empty string means that no new version has been learned.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_take_connection_bootstrap_update_json(
+    handle: *mut c_void,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        take_connection_bootstrap_update_json(handle)
     })
 }
 
@@ -2060,6 +2096,7 @@ mod tests {
             version: 1,
             cluster_id,
             rendezvous_urls: Vec::new(),
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
             direct_endpoints: vec![client_sdk::BootstrapEndpoint {
                 url: server_base_url,

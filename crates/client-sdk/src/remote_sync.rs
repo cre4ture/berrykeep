@@ -565,6 +565,7 @@ mod tests {
             version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
             cluster_id: ClusterId::now_v7(),
             rendezvous_urls: vec![base_url.to_string()],
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
             direct_endpoints: vec![BootstrapEndpoint {
                 url: base_url.to_string(),
