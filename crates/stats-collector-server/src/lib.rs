@@ -17,8 +17,9 @@
 //!
 //! Left for later work (seams are in place):
 //! - moving the on-request aggregation to a periodic batch job if the fleet ever outgrows it,
-//! - production TLS/deployment wiring (this crate binds a plain HTTP listener; terminating TLS at
-//!   `creax.de:44044` is a deployment concern, not something hardcoded here).
+//! - packaging, process supervision, backup, and monitoring beyond the deterministic deployment
+//!   helper in `scripts/deploy-stats-collector-service.sh`. The binary supports direct TLS through
+//!   environment-provided certificate/key paths and reloads renewed certificates without restart.
 
 pub mod aggregate;
 pub mod country;

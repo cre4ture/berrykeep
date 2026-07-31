@@ -82,17 +82,28 @@ The core of this strategy is implemented across the node and a new central colle
   best-effort and lazy: it never blocks or breaks the main send path, and a rotated
   `telemetry_subject_id` (`rotate_identity`) clears the persisted token, since it was scoped to the
   subject id that no longer applies going forward.
+- **First-run disclosure** (Section 4.4): both new-cluster and join-existing-cluster setup flows
+  expose the pre-selected telemetry toggle and pass the explicit choice into setup.
+- **Production TLS and deployment helper** (Section 5.2): `stats-collector-server` supports direct
+  TLS from environment-provided PEM files and reloads renewed certificates periodically.
+  `scripts/deploy-stats-collector-service.sh` provides checksum-verified MUSL deployment with
+  remote-only admin-token initialization and rollback, while
+  `scripts/deploy-home-stats-collector-service.sh` fixes the intended `creature@creax.de`,
+  `/home/creature/ironmesh/telemetry`, and `https://creax.de:44044` layout. The first deployment was
+  verified end to end on 2026-07-31 (registration, token-authenticated ingestion, admin access,
+  erasure, k-anonymous summary, and cleanup of the synthetic test subject).
 
 Deliberately **deferred** (documented at their respective sections, not blockers for the above):
 
-- The first-run bootstrap consent screen (Section 4.4) — the opt-out env/admin toggle is live, but
-  the guided setup-time disclosure is left to the `zero-touch-cluster-setup` work.
-- Deploying a real `CountryResolver` in production (Section 4.2) — the seam, the no-op default,
-  and an opt-in `BundledCountryResolver` (RIR-delegated-stats-backed, via the `iptocc` crate, no
-  API key/account required) all ship in `crates/stats-collector-server/src/country.rs` behind the
-  `bundled-country-db` Cargo feature; wiring it up at deployment time is still a deployment concern.
-- Production TLS termination / deployment wiring for the collector at `creax.de:44044` — a
-  deployment concern, not hardcoded in the crate.
+- Effective country derivation on the current Uberspace direct-port deployment (Section 4.2): the
+  production binary includes and activates `BundledCountryResolver`, but Uberspace presents direct
+  high-port connections to the process through a non-global CGNAT source address. The resolver
+  therefore correctly returns no country for current traffic. Preserving a trustworthy original
+  source address (for example through a separately trusted HTTPS reverse-proxy listener) remains a
+  follow-up; raw IP addresses continue not to be stored or logged.
+- Production process supervision, database backup, and external monitoring/alerting. The first
+  deployment deliberately follows the existing standalone rendezvous PID/nohup layout and has
+  health/version/rollback checks, but it does not yet install a boot-persistent supervisor entry.
 - The legal review of the opt-out-by-default posture (Section 4.4/8) remains a prerequisite before
   any production rollout that actually transmits data off-cluster.
 
