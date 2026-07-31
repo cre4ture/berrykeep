@@ -193,6 +193,8 @@ export type GalleryLoadEntriesOptions = {
   mediaFilter?: GalleryMediaFilter;
 };
 
+export type GalleryDataUpdateKind = "snapshots" | "entries";
+
 type GalleryLoadedScope = {
   prefix: string;
   depth: number;
@@ -260,6 +262,10 @@ export type GalleryDataSource = {
     entry: GalleryEntry,
     snapshotId: string | null
   ) => Promise<GalleryEntry["media"] | null>;
+  /** Marks the next reads of this resource kind for a network revalidation. */
+  requestRevalidation?: (kind: GalleryDataUpdateKind) => void;
+  /** Announces that a background revalidation replaced cached data. */
+  subscribeToUpdates?: (listener: (kind: GalleryDataUpdateKind) => void) => () => void;
 };
 
 type GallerySurfaceProps = {
@@ -296,7 +302,9 @@ export function GallerySurface({
     getMediaRequests,
     loadVersions,
     restoreVersion,
-    retryMediaEntry
+    retryMediaEntry,
+    requestRevalidation,
+    subscribeToUpdates
   } = dataSource;
   const [prefix, setPrefix] = useState("");
   const [depth, setDepth] = useState(4);
@@ -337,11 +345,24 @@ export function GallerySurface({
   const galleryRequestVersionRef = useRef(0);
 
   useEffect(() => {
-    void refreshSnapshots();
+    if (!subscribeToUpdates) {
+      return;
+    }
+    return subscribeToUpdates((kind) => {
+      if (kind === "snapshots") {
+        void refreshSnapshots(false);
+      } else {
+        void reloadAppliedEntries();
+      }
+    });
+  }, [subscribeToUpdates]);
+
+  useEffect(() => {
+    void refreshSnapshots(false);
   }, [loadSnapshots]);
 
   useEffect(() => {
-    void refreshEntries();
+    void refreshEntries(undefined, undefined, false);
   }, [loadEntries]);
 
   useEffect(() => {
@@ -604,7 +625,10 @@ export function GallerySurface({
     void reloadAppliedEntries();
   }, [galleryVirtualPageSize, mediaFilter, sortOrder, viewMode]);
 
-  async function refreshSnapshots() {
+  async function refreshSnapshots(forceRevalidation = true) {
+    if (forceRevalidation) {
+      requestRevalidation?.("snapshots");
+    }
     setLoading("snapshots");
     setError(null);
     setNotice(null);
@@ -621,7 +645,14 @@ export function GallerySurface({
     }
   }
 
-  async function refreshEntries(nextPrefix?: string, nextSnapshotId?: string | null) {
+  async function refreshEntries(
+    nextPrefix?: string,
+    nextSnapshotId?: string | null,
+    forceRevalidation = true
+  ) {
+    if (forceRevalidation) {
+      requestRevalidation?.("entries");
+    }
     const targetScope: GalleryLoadedScope = {
       prefix: (nextPrefix ?? prefix).trim(),
       depth,

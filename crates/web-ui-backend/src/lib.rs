@@ -306,6 +306,7 @@ struct WebState {
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     service_name: String,
+    client_cache_scope: Option<String>,
     log_buffer: Arc<LogBuffer>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<mbtiles::LogicalMbtilesSource>>>>,
     runtime: Arc<RwLock<WebRuntime>>,
@@ -328,6 +329,8 @@ struct WebRendezvousRuntimeConfig {
 
 pub fn router(config: WebUiConfig) -> Router {
     let embedded_session_authorization = config.embedded_session_authorization.clone();
+    let client_cache_scope =
+        client_cache_scope(&config.service_name, config.client_identity.as_ref());
     let sdk = match config.transport_client {
         Some(client) => client,
         None if config.connection_bootstrap.is_some() => config
@@ -368,6 +371,7 @@ pub fn router(config: WebUiConfig) -> Router {
         map_perf_logging_enabled,
         map_glyphs_root: resolve_map_glyphs_root(config.map_glyphs_root),
         service_name: config.service_name,
+        client_cache_scope,
         log_buffer,
         mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
         runtime: Arc::new(RwLock::new(WebRuntime {
@@ -386,6 +390,7 @@ pub fn router(config: WebUiConfig) -> Router {
     };
 
     let api_v1 = Router::new()
+        .route("/cache-context", get(web_cache_context))
         .route("/media/thumbnail", get(web_media_thumbnail))
         .route("/media/cache/retry", post(web_media_cache_retry))
         .route("/maps/config", get(web_map_config))
@@ -1983,6 +1988,37 @@ async fn web_ping(State(state): State<WebState>, headers: HeaderMap) -> impl Int
         .into_response()
 }
 
+fn client_cache_scope(
+    service_name: &str,
+    identity: Option<&ClientIdentityMaterial>,
+) -> Option<String> {
+    let identity = identity?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ironmesh-client-cache-scope-v1\0");
+    hasher.update(service_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(identity.cluster_id.as_bytes());
+    hasher.update(identity.device_id.as_bytes());
+    hasher.update(identity.public_key_pem.as_bytes());
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+async fn web_cache_context(State(state): State<WebState>) -> impl IntoResponse {
+    (
+        [
+            ("cache-control", "no-store, private"),
+            ("pragma", "no-cache"),
+        ],
+        Json(serde_json::json!({
+            "schema_version": 1,
+            // This opaque digest contains no credential material. Its only
+            // purpose is partitioning browser storage by the authenticated
+            // cluster/device/application profile.
+            "scope": state.client_cache_scope,
+        })),
+    )
+}
+
 async fn web_logs(
     State(state): State<WebState>,
     Query(query): Query<WebLogsQuery>,
@@ -3570,16 +3606,17 @@ async fn web_update_rendezvous(
 mod tests {
     use super::{
         DIAGNOSTIC_CONTEXT_HEADER, EMBEDDED_WEB_UI_SESSION_COOKIE, EMBEDDED_WEB_UI_SESSION_HEADER,
-        EmbeddedWebUiSessionAuthorization, ErrorResponseBody, WebUiConfig, error_response,
-        normalize_store_restore_path, router, web_latency_probe_timeout,
+        EmbeddedWebUiSessionAuthorization, ErrorResponseBody, WebUiConfig, client_cache_scope,
+        error_response, normalize_store_restore_path, router, web_latency_probe_timeout,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
-    use client_sdk::{IronMeshClient, LatencyProbeConfig};
+    use client_sdk::{ClientIdentityMaterial, IronMeshClient, LatencyProbeConfig};
     use common::logging::LogBuffer;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::task::JoinHandle;
+    use uuid::Uuid;
 
     async fn start_session_test_server(
         authorization: EmbeddedWebUiSessionAuthorization,
@@ -3644,6 +3681,85 @@ mod tests {
         });
 
         assert_eq!(timeout, Duration::from_millis(28_375));
+    }
+
+    #[test]
+    fn client_cache_scope_is_stable_and_identity_partitioned() {
+        let cluster_id = Uuid::now_v7();
+        let identity = ClientIdentityMaterial::generate(
+            cluster_id,
+            Some(Uuid::now_v7()),
+            Some("gallery-device".to_string()),
+        )
+        .expect("identity should be generated");
+        let other_identity = ClientIdentityMaterial::generate(
+            cluster_id,
+            Some(Uuid::now_v7()),
+            Some("other-device".to_string()),
+        )
+        .expect("other identity should be generated");
+
+        let scope = client_cache_scope("ironmesh-ios", Some(&identity));
+        assert_eq!(scope, client_cache_scope("ironmesh-ios", Some(&identity)));
+        assert_ne!(
+            scope,
+            client_cache_scope("ironmesh-android", Some(&identity))
+        );
+        assert_ne!(
+            scope,
+            client_cache_scope("ironmesh-ios", Some(&other_identity))
+        );
+        assert_eq!(client_cache_scope("ironmesh-ios", None), None);
+    }
+
+    #[tokio::test]
+    async fn cache_context_is_non_secret_and_never_http_cached() {
+        let identity = ClientIdentityMaterial::generate(
+            Uuid::now_v7(),
+            Some(Uuid::now_v7()),
+            Some("gallery-device".to_string()),
+        )
+        .expect("identity should be generated");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have a local address");
+        let app = router(
+            WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
+                .with_service_name("client-cache-test")
+                .with_client_identity(identity),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::get(format!("http://{address}/api/v1/cache-context"))
+            .await
+            .expect("cache context request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private")
+        );
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .expect("cache context should return JSON");
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(
+            payload["scope"].as_str().map(str::len),
+            Some(64),
+            "scope should expose only a fixed-size digest"
+        );
+        assert!(payload.get("cluster_id").is_none());
+        assert!(payload.get("device_id").is_none());
+
+        server.abort();
     }
 
     #[tokio::test]

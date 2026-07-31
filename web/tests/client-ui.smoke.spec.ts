@@ -262,6 +262,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
   await expect(page.getByText("docs/quick-a.bin", { exact: true })).toBeVisible();
   await expect(page.getByText("docs/quick-b.bin", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Uploads 4/5 · 1 canceled" })).toBeVisible();
   await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
   await page.getByRole("row", { name: /^docs\/\s+prefix/i }).getByRole("button", { name: "Open" }).click();
@@ -447,6 +448,97 @@ test("client-ui keeps the direct iOS gallery map inside the WebView viewport", a
       fullscreenMap.evaluate((element) => element.getBoundingClientRect().height / window.innerHeight)
     )
     .toBeGreaterThan(0.9);
+});
+
+test("client-ui gallery restores its persistent cache while the upstream is offline", async ({
+  page
+}) => {
+  const mocks = await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  const initialRequestCount = mocks.galleryStoreListRequestCount();
+  mocks.setGalleryOffline(true);
+  await page.reload();
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  await expect
+    .poll(() => mocks.galleryStoreListRequestCount())
+    .toBeGreaterThan(initialRequestCount);
+  await expect(page.getByText("mock gallery is offline")).toHaveCount(0);
+});
+
+test("client-ui gallery visibly replaces restored data after background revalidation", async ({
+  page
+}) => {
+  const mocks = await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  const initialRequestCount = mocks.galleryStoreListRequestCount();
+  expect(initialRequestCount).toBe(2);
+
+  mocks.replaceStoreEntries(createRevalidatedGalleryMockStoreEntries());
+  mocks.setGalleryStoreListDelay(400);
+  await page.reload();
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  await expect(page.getByText("gallery/revalidated.png", { exact: true })).toBeVisible();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toHaveCount(0);
+  expect(mocks.galleryStoreListRequestCount()).toBe(initialRequestCount + 2);
+});
+
+test("client-ui gallery cache is isolated when the authenticated cache scope changes", async ({
+  page
+}) => {
+  const mocks = await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  mocks.setCacheScope("b".repeat(64));
+  mocks.setGalleryOffline(true);
+  await page.reload();
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await expect(page.getByText("mock gallery is offline")).toBeVisible();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toHaveCount(0);
+});
+
+test("client-ui gallery never persists data without an authenticated cache scope", async ({
+  page
+}) => {
+  const mocks = await installClientUiMocks(page, { cacheScope: null });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  expect(await galleryCacheDatabaseExists(page)).toBe(false);
+
+  mocks.setGalleryOffline(true);
+  await page.reload();
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await expect(page.getByText("mock gallery is offline")).toBeVisible();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toHaveCount(0);
+});
+
+test("client-ui gallery ignores old-schema IndexedDB records and falls back safely", async ({
+  page
+}) => {
+  const mocks = await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  await expireGalleryCacheSchema(page);
+  mocks.setGalleryOffline(true);
+  await page.reload();
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await expect(page.getByText("mock gallery is offline")).toBeVisible();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toHaveCount(0);
 });
 
 test("client-ui gallery cards stay compact on narrow viewports", async ({ page }) => {
@@ -836,6 +928,7 @@ test("client-ui mobile drawer reveals and navigates its menu items", async ({ pa
 
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
+  cacheScope?: string | null;
   mapMetadataStatus?: number;
   mapConfigurationStatus?: number;
   mapConfiguration?: MockGalleryMapConfiguration;
@@ -881,6 +974,10 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const diagnosticContexts = new Set<string>();
   let diagnosticContextRequestCount = 0;
   const storeEntries = options?.storeEntries ?? createMockStoreEntries();
+  let cacheScope = options?.cacheScope === undefined ? "a".repeat(64) : options.cacheScope;
+  let galleryOffline = false;
+  let galleryStoreListRequestCount = 0;
+  let galleryStoreListDelayMs = 0;
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
   const connectionRoutesPayload = {
@@ -1014,6 +1111,13 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         service: "cli-client-web",
         backend_version: "0.1.0",
         backend_revision: "v0.1.0-3-gmocked"
+      });
+    }
+
+    if (pathname === apiV1("/cache-context") && method === "GET") {
+      return json(route, {
+        schema_version: 1,
+        scope: cacheScope
       });
     }
 
@@ -1335,6 +1439,18 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
 
     if (pathname === apiV1("/store/list") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
+      galleryStoreListRequestCount += 1;
+      if (galleryOffline) {
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({ message: "mock gallery is offline" })
+        });
+        return;
+      }
+      if (galleryStoreListDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, galleryStoreListDelayMs));
+      }
       return json(route, buildMockStoreListResponse(storeEntries, searchParams));
     }
 
@@ -1348,6 +1464,14 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     }
 
     if (pathname === apiV1("/snapshots") && method === "GET") {
+      if (galleryOffline) {
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({ message: "mock gallery is offline" })
+        });
+        return;
+      }
       return json(route, [{ id: "snapshot-001" }]);
     }
 
@@ -1510,7 +1634,20 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     requestedPaths: () => Array.from(requestedPaths),
     diagnosticContexts: () => Array.from(diagnosticContexts),
     diagnosticContextRequestCount: () => diagnosticContextRequestCount,
-    restoredVersions: () => restoredVersions.slice()
+    restoredVersions: () => restoredVersions.slice(),
+    galleryStoreListRequestCount: () => galleryStoreListRequestCount,
+    replaceStoreEntries: (entries: MockStoreEntry[]) => {
+      storeEntries.splice(0, storeEntries.length, ...entries);
+    },
+    setGalleryOffline: (offline: boolean) => {
+      galleryOffline = offline;
+    },
+    setGalleryStoreListDelay: (delayMs: number) => {
+      galleryStoreListDelayMs = delayMs;
+    },
+    setCacheScope: (scope: string | null) => {
+      cacheScope = scope;
+    }
   };
 }
 
@@ -1628,6 +1765,68 @@ function createMockStoreEntries(): MockStoreEntry[] {
       }
     }
   ];
+}
+
+function createRevalidatedGalleryMockStoreEntries(): MockStoreEntry[] {
+  return createMockStoreEntries().map((entry) => {
+    if (entry.path !== "gallery/cat.png" || !entry.media) {
+      return entry;
+    }
+    return {
+      ...entry,
+      path: "gallery/revalidated.png",
+      media: {
+        ...entry.media,
+        content_fingerprint: "fingerprint-revalidated",
+        thumbnail: {
+          url: "/media/thumbnail?key=gallery%2Frevalidated.png",
+          profile: "grid",
+          width: 256,
+          height: 192,
+          format: "jpeg",
+          size_bytes: 1234
+        }
+      }
+    };
+  });
+}
+
+async function expireGalleryCacheSchema(page: Page): Promise<void> {
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        const request = indexedDB.open("ironmesh-client-gallery-cache", 1);
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => {
+          const database = request.result;
+          const transaction = database.transaction("records", "readwrite");
+          const store = transaction.objectStore("records");
+          const recordsRequest = store.getAll();
+          recordsRequest.onerror = () => reject(recordsRequest.error);
+          recordsRequest.onsuccess = () => {
+            for (const record of recordsRequest.result as Array<Record<string, unknown>>) {
+              store.put({ ...record, schemaVersion: 0, payload: { corrupt: true } });
+            }
+          };
+          transaction.oncomplete = () => {
+            database.close();
+            resolve();
+          };
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error);
+        };
+      })
+  );
+}
+
+async function galleryCacheDatabaseExists(page: Page): Promise<boolean> {
+  return page.evaluate(async () => {
+    if (!("databases" in indexedDB)) {
+      return false;
+    }
+    const databases = await indexedDB.databases();
+    return databases.some((database) => database.name === "ironmesh-client-gallery-cache");
+  });
 }
 
 function createGalleryPaginationMockStoreEntries(mediaCount: number): MockStoreEntry[] {
