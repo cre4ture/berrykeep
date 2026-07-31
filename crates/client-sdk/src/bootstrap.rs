@@ -747,6 +747,25 @@ impl ConnectionBootstrap {
         &self,
         identity: Option<&ClientIdentityMaterial>,
     ) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
+        self.refresh_dynamic_targets_with_updates(identity, |_| Ok(()))
+            .await
+    }
+
+    /// Fetches the currently trusted Rendezvous candidate set and reports each
+    /// usable partial route set as soon as one target node finishes discovery.
+    ///
+    /// The callback is deliberately synchronous: it lets callers enqueue the
+    /// update without making the remaining Rendezvous requests wait for route
+    /// construction or probing. The returned targets still contain the complete
+    /// discovery result after all bounded requests have finished.
+    pub(crate) async fn refresh_dynamic_targets_with_updates<F>(
+        &self,
+        identity: Option<&ClientIdentityMaterial>,
+        mut on_targets_available: F,
+    ) -> Result<Vec<PlannedConnectionBootstrapTarget>>
+    where
+        F: FnMut(Vec<PlannedConnectionBootstrapTarget>) -> Result<()>,
+    {
         self.validate()?;
         if let Some(identity) = identity {
             identity.validate()?;
@@ -778,7 +797,7 @@ impl ConnectionBootstrap {
 
         let discovery = match tokio::time::timeout(
             DISCOVERY_REFRESH_TIMEOUT,
-            self.fetch_dynamic_discovery(identity, discovery_run_id),
+            self.fetch_dynamic_discovery(identity, discovery_run_id, &mut on_targets_available),
         )
         .await
         {
@@ -1054,6 +1073,7 @@ impl ConnectionBootstrap {
         &self,
         identity: Option<&ClientIdentityMaterial>,
         discovery_run_id: Uuid,
+        on_targets_available: &mut impl FnMut(Vec<PlannedConnectionBootstrapTarget>) -> Result<()>,
     ) -> Result<DynamicDiscoveryState> {
         let concurrency = Arc::new(Semaphore::new(DISCOVERY_MAX_CONCURRENCY));
         let mesh_discovery = self
@@ -1109,13 +1129,32 @@ impl ConnectionBootstrap {
                     .filter(|url| !base_rendezvous_url_set.contains(*url))
                     .cloned(),
             );
-            if !node_discovery.candidates.is_empty() {
+            let discovered_candidate_count = node_discovery.candidates.len();
+            if discovered_candidate_count > 0 {
                 discovery
                     .direct_candidates_by_node
                     .insert(node_id, node_discovery.candidates);
             }
             if node_discovery.relay_capable {
                 discovery.relay_capable_nodes.insert(node_id);
+            }
+            if discovered_candidate_count > 0 {
+                discovery.rendezvous_urls = merge_parallel_rendezvous_url_results(
+                    &base_rendezvous_urls,
+                    &self.rendezvous_urls,
+                    additional_rendezvous_urls.clone(),
+                )?;
+                let targets = self.build_refreshed_targets(&discovery)?;
+                tracing::info!(
+                    event = "dynamic_discovery_partial_targets_available",
+                    discovery_run_id = %discovery_run_id,
+                    target_node_id = %node_id,
+                    discovered_candidate_count,
+                    planned_target_count = targets.len(),
+                    pending_node_discovery_count = node_discoveries.len(),
+                    "forwarding usable Rendezvous routes before all node discovery completes"
+                );
+                on_targets_available(targets)?;
             }
         }
         discovery.rendezvous_urls = merge_parallel_rendezvous_url_results(
