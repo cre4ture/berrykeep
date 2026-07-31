@@ -262,9 +262,10 @@ mod tests {
 use client_sdk::{
     ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent, ClientIdentityMaterial,
     ClientNode, ConnectionBootstrap, EnrolledClientConnection, IronMeshClient,
-    ManagedClientOptions, ManagedIronMeshClient, StoreIndexMediaFilter, StoreIndexRequestOptions,
-    StoreIndexSortOrder, StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig,
-    enroll_client_connection_blocking, set_connection_diagnostics_observer,
+    ManagedBootstrapPersistence, ManagedClientOptions, ManagedIronMeshClient,
+    StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView,
+    TitleLatencyMonitor, TitleLatencyProbeConfig, enroll_client_connection_blocking,
+    set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -1579,10 +1580,15 @@ fn configured_sdk_build(
     match parsed_identity {
         Some(identity) => {
             let original_identity = identity.clone();
-            let managed_client = runtime()?.block_on(
-                bootstrap
-                    .build_managed_client_with_identity(identity, ManagedClientOptions::default()),
-            )?;
+            let options = ManagedClientOptions {
+                connection_bootstrap_persistence: Some(ManagedBootstrapPersistence::new(
+                    "android_preferences",
+                    persist_android_connection_bootstrap,
+                )),
+                ..ManagedClientOptions::default()
+            };
+            let managed_client = runtime()?
+                .block_on(bootstrap.build_managed_client_with_identity(identity, options))?;
             let client_identity = managed_client
                 .take_identity_update()
                 .unwrap_or(original_identity.clone());
@@ -2020,7 +2026,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_not
             return Ok(());
         };
         runtime()?.spawn(async move {
-            let _ = managed_client.notify_network_changed_async().await;
+            let _ = Box::pin(managed_client.notify_network_changed_async()).await;
             if let Some(identity) = managed_client.take_identity_update()
                 && let Err(error) = persist_android_client_identity(&identity)
             {
@@ -2060,7 +2066,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_not
             return Ok(());
         };
         runtime()?.spawn(async move {
-            let _ = managed_client.notify_foregrounded().await;
+            let _ = Box::pin(managed_client.notify_foregrounded()).await;
             if let Some(identity) = managed_client.take_identity_update()
                 && let Err(error) = persist_android_client_identity(&identity)
             {

@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +18,46 @@ use crate::{
 const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 const MIN_PERIODIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
+type PersistConnectionBootstrapFn = dyn Fn(&ConnectionBootstrap) -> Result<()> + Send + Sync;
+
+/// Optional durable storage for contact-list updates learned by a managed
+/// client. The callback is invoked only after an authenticated cluster API
+/// response changes the cached `version_id`.
+#[derive(Clone)]
+pub struct ManagedBootstrapPersistence {
+    source: &'static str,
+    persist: Arc<PersistConnectionBootstrapFn>,
+}
+
+impl ManagedBootstrapPersistence {
+    pub fn new<F>(source: &'static str, persist: F) -> Self
+    where
+        F: Fn(&ConnectionBootstrap) -> Result<()> + Send + Sync + 'static,
+    {
+        Self {
+            source,
+            persist: Arc::new(persist),
+        }
+    }
+
+    fn persist(&self, bootstrap: &ConnectionBootstrap) -> Result<()> {
+        (self.persist)(bootstrap)
+    }
+
+    fn source(&self) -> &'static str {
+        self.source
+    }
+}
+
+impl std::fmt::Debug for ManagedBootstrapPersistence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedBootstrapPersistence")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Policy for shared, Rendezvous-managed client routes.
 #[derive(Debug, Clone)]
 pub struct ManagedClientOptions {
@@ -33,6 +73,9 @@ pub struct ManagedClientOptions {
     /// Lets a caller forward an all-route transport failure without duplicating
     /// discovery or fallback policy in a platform wrapper.
     pub refresh_on_transport_failure: bool,
+    /// Optional durable storage for authenticated cluster-managed Rendezvous
+    /// contact-list updates.
+    pub connection_bootstrap_persistence: Option<ManagedBootstrapPersistence>,
 }
 
 impl Default for ManagedClientOptions {
@@ -42,6 +85,7 @@ impl Default for ManagedClientOptions {
             discovery_ttl: Duration::from_secs(2 * 60),
             route_retirement_grace: Duration::from_secs(10 * 60),
             refresh_on_transport_failure: true,
+            connection_bootstrap_persistence: None,
         }
     }
 }
@@ -104,7 +148,7 @@ pub struct ManagedIronMeshClient {
 
 struct ManagedRouteController {
     client: IronMeshClient,
-    bootstrap: ConnectionBootstrap,
+    bootstrap: Mutex<ConnectionBootstrap>,
     identity: Mutex<Option<ClientIdentityMaterial>>,
     options: ManagedClientOptions,
     refresh_lock: AsyncMutex<()>,
@@ -113,6 +157,7 @@ struct ManagedRouteController {
     last_success: Mutex<Option<Instant>>,
     last_outcome: Mutex<RouteRefreshOutcome>,
     pending_identity_update: Mutex<Option<ClientIdentityMaterial>>,
+    pending_connection_bootstrap_update: Mutex<Option<ConnectionBootstrap>>,
     periodic_refresh_started: AtomicBool,
     /// Present for blocking consumers such as desktop daemons. It keeps the
     /// executor used for initial discovery and later refreshes alive for the
@@ -134,6 +179,20 @@ struct ManagedDynamicRoute {
 struct ManagedRouteRefreshAttempt {
     started_at: Instant,
     reason: RouteRefreshReason,
+}
+
+#[derive(Debug, Deserialize)]
+struct RendezvousContactConfigurationResponse {
+    configuration: RendezvousContactConfiguration,
+    stored: bool,
+    version_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RendezvousContactConfiguration {
+    schema_version: u32,
+    #[serde(default)]
+    rendezvous_urls: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -199,7 +258,7 @@ impl ConnectionBootstrap {
         let client = self.build_client_with_optional_identity(identity.as_ref())?;
         let controller = Arc::new(ManagedRouteController {
             client: client.clone(),
-            bootstrap: self.clone(),
+            bootstrap: Mutex::new(self.clone()),
             identity: Mutex::new(identity),
             options: options.clone(),
             refresh_lock: AsyncMutex::new(()),
@@ -208,6 +267,7 @@ impl ConnectionBootstrap {
             last_success: Mutex::new(None),
             last_outcome: Mutex::new(RouteRefreshOutcome::default()),
             pending_identity_update: Mutex::new(None),
+            pending_connection_bootstrap_update: Mutex::new(None),
             periodic_refresh_started: AtomicBool::new(false),
             runtime_guard: Mutex::new(None),
         });
@@ -271,7 +331,11 @@ impl ConnectionBootstrap {
         identity: ClientIdentityMaterial,
         options: ManagedClientOptions,
     ) -> Result<ManagedIronMeshClient> {
-        self.build_managed_client(Some(identity), options).await
+        // Keep the public async wrapper shallow for FFI and CLI callers. The
+        // managed refresh path includes multiplexed direct and relay request
+        // futures; boxing it here avoids requiring every consumer crate to
+        // raise its compiler recursion limit.
+        Box::pin(self.build_managed_client(Some(identity), options)).await
     }
 
     /// Synchronous counterpart for desktop daemons and shell integrations that
@@ -345,6 +409,26 @@ impl ManagedIronMeshClient {
             .clone()
     }
 
+    /// Returns and clears an authenticated cluster-managed Rendezvous contact
+    /// list update. Platform owners without a Rust-side persistence callback
+    /// can persist this bootstrap with their own secure/preferences storage.
+    pub fn take_connection_bootstrap_update(&self) -> Option<ConnectionBootstrap> {
+        self.controller
+            .pending_connection_bootstrap_update
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// Reads a pending contact-list bootstrap update without acknowledging it.
+    pub fn latest_connection_bootstrap_update(&self) -> Option<ConnectionBootstrap> {
+        self.controller
+            .pending_connection_bootstrap_update
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub async fn refresh_routes(&self, reason: RouteRefreshReason) -> RouteRefreshOutcome {
         if matches!(reason, RouteRefreshReason::Stale) && !self.discovery_is_stale() {
             return self.last_outcome();
@@ -381,7 +465,12 @@ impl ManagedIronMeshClient {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let identity_updated = if let Some(current_identity) = identity.clone() {
-            let bootstrap = self.controller.bootstrap.clone();
+            let bootstrap = self
+                .controller
+                .bootstrap
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             let original_identity = current_identity.clone();
             let renewed = tokio::task::spawn_blocking(move || {
                 let mut identity = current_identity;
@@ -444,8 +533,27 @@ impl ManagedIronMeshClient {
             false
         };
 
+        if identity.is_some()
+            && let Err(error) = self.refresh_cluster_rendezvous_contact_list().await
+        {
+            // This is intentionally advisory: a client with a valid immutable
+            // bootstrap must remain usable while the replicated configuration
+            // has not reached its current node yet.
+            tracing::warn!(
+                event = "rendezvous_contact_list_refresh_failed",
+                refresh_reason = telemetry.reason.as_str(),
+                error = %format!("{error:#}"),
+                "failed refreshing authenticated cluster-managed rendezvous contacts"
+            );
+        }
+
         let (updates_sender, mut updates_receiver) = mpsc::unbounded_channel();
-        let bootstrap = self.controller.bootstrap.clone();
+        let bootstrap = self
+            .controller
+            .bootstrap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let discovery_identity = identity.clone();
         let discovery = bootstrap.refresh_dynamic_targets_with_updates(
             discovery_identity.as_ref(),
@@ -638,6 +746,83 @@ impl ManagedIronMeshClient {
         Ok(membership)
     }
 
+    async fn refresh_cluster_rendezvous_contact_list(&self) -> Result<()> {
+        let response = self
+            .client
+            .get_json_path("/cluster/rendezvous-contacts")
+            .await
+            .context("failed requesting cluster rendezvous contacts")?;
+        let response = serde_json::from_value::<RendezvousContactConfigurationResponse>(response)
+            .context("failed parsing cluster rendezvous contacts")?;
+
+        self.apply_cluster_rendezvous_contact_response(response)
+    }
+
+    fn apply_cluster_rendezvous_contact_response(
+        &self,
+        response: RendezvousContactConfigurationResponse,
+    ) -> Result<()> {
+        // A missing config object is not an update. In particular, do not wipe
+        // a previously persisted contact list merely because this node has not
+        // received the object's metadata yet.
+        if !response.stored {
+            return Ok(());
+        }
+        let version_id = response
+            .version_id
+            .ok_or_else(|| anyhow!("stored cluster rendezvous contacts are missing version_id"))?;
+
+        let updated_bootstrap = {
+            let mut bootstrap = self
+                .controller
+                .bootstrap
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !bootstrap.apply_rendezvous_contact_list(
+                response.configuration.schema_version,
+                version_id,
+                response.configuration.rendezvous_urls,
+            )? {
+                return Ok(());
+            }
+            bootstrap.clone()
+        };
+
+        *self
+            .controller
+            .pending_connection_bootstrap_update
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(updated_bootstrap.clone());
+
+        if let Some(persistence) = self
+            .controller
+            .options
+            .connection_bootstrap_persistence
+            .as_ref()
+        {
+            if let Err(error) = persistence.persist(&updated_bootstrap) {
+                tracing::warn!(
+                    event = "rendezvous_contact_list_persistence_failed",
+                    persistence_source = persistence.source(),
+                    error = %error,
+                    "failed persisting authenticated cluster-managed rendezvous contacts"
+                );
+            } else {
+                tracing::info!(
+                    event = "rendezvous_contact_list_persisted",
+                    persistence_source = persistence.source(),
+                    version_id = ?updated_bootstrap
+                        .rendezvous_contact_list
+                        .as_ref()
+                        .map(|contacts| contacts.version_id.as_str()),
+                    "persisted authenticated cluster-managed rendezvous contacts"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     fn reconcile_target_set(
         &self,
         refreshed_targets: Vec<PlannedConnectionBootstrapTarget>,
@@ -645,6 +830,9 @@ impl ManagedIronMeshClient {
         let static_targets = self
             .controller
             .bootstrap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
             .planned_targets()
             // The managed constructor already validated these targets. Retaining an
             // empty list here still lets the existing client survive a malformed
@@ -762,7 +950,15 @@ impl ManagedIronMeshClient {
     }
 
     fn start_periodic_refresh(&self) {
-        if self.controller.bootstrap.rendezvous_urls.is_empty() {
+        if self
+            .controller
+            .bootstrap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .effective_rendezvous_urls()
+            .unwrap_or_default()
+            .is_empty()
+        {
             return;
         }
         self.controller.clone().start_periodic_refresh();
@@ -1001,6 +1197,7 @@ mod tests {
             version: 1,
             cluster_id: Uuid::now_v7(),
             rendezvous_urls: Vec::new(),
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
             direct_endpoints: vec![BootstrapEndpoint {
                 url: "http://127.0.0.1:9".to_string(),
@@ -1130,6 +1327,7 @@ mod tests {
             version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
             cluster_id,
             rendezvous_urls: vec![route_url.clone()],
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
             direct_endpoints: vec![
                 BootstrapEndpoint {
@@ -1192,5 +1390,106 @@ mod tests {
         let _ = discovery_server.await;
         candidate_server.abort();
         let _ = candidate_server.await;
+    }
+
+    #[test]
+    fn managed_client_persists_cluster_rendezvous_contacts() {
+        let cluster_id = Uuid::now_v7();
+        let persisted = Arc::new(Mutex::new(Vec::<ConnectionBootstrap>::new()));
+        let persisted_updates = Arc::clone(&persisted);
+        let bootstrap = ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: vec!["https://bootstrap.example".to_string()],
+            rendezvous_contact_list: None,
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: "http://127.0.0.1:9".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: None,
+            }],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+        };
+        let mut identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+            .expect("test identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let client = bootstrap
+            .build_client_with_identity(&identity)
+            .expect("test client should build");
+        let managed = ManagedIronMeshClient {
+            client: client.clone(),
+            controller: Arc::new(ManagedRouteController {
+                client,
+                bootstrap: Mutex::new(bootstrap),
+                identity: Mutex::new(Some(identity)),
+                options: ManagedClientOptions {
+                    connection_bootstrap_persistence: Some(ManagedBootstrapPersistence::new(
+                        "test",
+                        move |bootstrap| {
+                            persisted_updates
+                                .lock()
+                                .expect("persisted updates lock should not be poisoned")
+                                .push(bootstrap.clone());
+                            Ok(())
+                        },
+                    )),
+                    ..ManagedClientOptions::default()
+                },
+                refresh_lock: AsyncMutex::new(()),
+                routes: Mutex::new(ManagedRouteState::default()),
+                last_attempt: Mutex::new(None),
+                last_success: Mutex::new(None),
+                last_outcome: Mutex::new(RouteRefreshOutcome::default()),
+                pending_identity_update: Mutex::new(None),
+                pending_connection_bootstrap_update: Mutex::new(None),
+                periodic_refresh_started: AtomicBool::new(false),
+                runtime_guard: Mutex::new(None),
+            }),
+        };
+        managed
+            .apply_cluster_rendezvous_contact_response(RendezvousContactConfigurationResponse {
+                configuration: RendezvousContactConfiguration {
+                    schema_version: 1,
+                    rendezvous_urls: vec!["https://home.example:19080".to_string()],
+                },
+                stored: true,
+                version_id: Some("019d-contact-list-version".to_string()),
+            })
+            .expect("cluster contact response should be persisted");
+        let updated = managed
+            .take_connection_bootstrap_update()
+            .expect("contact list update should be available to platform persistence");
+        assert_eq!(
+            updated
+                .rendezvous_contact_list
+                .as_ref()
+                .expect("updated bootstrap should contain contacts")
+                .version_id,
+            "019d-contact-list-version"
+        );
+        assert_eq!(
+            updated
+                .effective_rendezvous_urls()
+                .expect("updated contact list should be usable"),
+            vec![
+                "https://home.example:19080/".to_string(),
+                "https://bootstrap.example/".to_string(),
+            ]
+        );
+        assert_eq!(
+            persisted
+                .lock()
+                .expect("persisted updates lock should not be poisoned")
+                .len(),
+            1
+        );
     }
 }

@@ -1053,6 +1053,7 @@ mod tests {
             version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
             cluster_id,
             rendezvous_urls: vec![rendezvous_public_url.clone()],
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: true,
             direct_endpoints: vec![BootstrapEndpoint {
                 url: "https://unreachable.example".to_string(),

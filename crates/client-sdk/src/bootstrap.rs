@@ -35,12 +35,40 @@ const DISCOVERY_MAX_CONCURRENCY: usize = 8;
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 const DISCOVERY_SUCCESS_GRACE: Duration = Duration::from_millis(250);
+const RENDEZVOUS_CONTACT_LIST_SCHEMA_VERSION: u32 = 1;
+
+/// A cluster-provided Rendezvous contact list cached alongside a client's
+/// immutable bootstrap bundle.
+///
+/// `rendezvous_urls` on [`ConnectionBootstrap`] remains the recovery anchor
+/// supplied during enrollment. The cached contacts are learned only from an
+/// authenticated cluster API response and are considered before that anchor
+/// when a client constructs relay or discovery routes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedRendezvousContactList {
+    #[serde(default = "default_rendezvous_contact_list_schema_version")]
+    pub schema_version: u32,
+    pub version_id: String,
+    #[serde(default)]
+    pub rendezvous_urls: Vec<String>,
+}
+
+fn default_rendezvous_contact_list_schema_version() -> u32 {
+    RENDEZVOUS_CONTACT_LIST_SCHEMA_VERSION
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionBootstrap {
     pub version: u32,
     pub cluster_id: ClusterId,
+    /// Immutable bootstrap/recovery Rendezvous URLs distributed during
+    /// enrollment. They are never replaced by `rendezvous_contact_list`.
     pub rendezvous_urls: Vec<String>,
+    /// The most recently authenticated, cluster-managed Rendezvous contact
+    /// list. Older bootstrap files do not contain this field and continue to
+    /// deserialize as normal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendezvous_contact_list: Option<PersistedRendezvousContactList>,
     #[serde(default)]
     pub rendezvous_mtls_required: bool,
     #[serde(default)]
@@ -330,6 +358,57 @@ impl ConnectionBootstrap {
         self.to_transport_bootstrap()?.validate()
     }
 
+    /// Returns the contact set used for Rendezvous discovery and relay routes.
+    /// Cluster-managed contacts are tried first; the enrollment-time bootstrap
+    /// URLs remain appended as a durable recovery fallback.
+    pub fn effective_rendezvous_urls(&self) -> Result<Vec<String>> {
+        let mut urls = Vec::new();
+        if let Some(contact_list) = self.rendezvous_contact_list.as_ref() {
+            if contact_list.schema_version != RENDEZVOUS_CONTACT_LIST_SCHEMA_VERSION {
+                bail!(
+                    "unsupported persisted rendezvous contact-list schema version {}",
+                    contact_list.schema_version
+                );
+            }
+            if contact_list.version_id.trim().is_empty() {
+                bail!("persisted rendezvous contact list is missing version_id");
+            }
+            urls.extend(contact_list.rendezvous_urls.iter().cloned());
+        }
+        urls.extend(self.rendezvous_urls.iter().cloned());
+        normalized_unique_rendezvous_urls(&urls)
+    }
+
+    /// Records a contact list returned from the authenticated cluster API.
+    ///
+    /// Returns `true` only when the cached version changed. Callers can use
+    /// that signal to avoid rewriting their persisted bootstrap unnecessarily.
+    pub fn apply_rendezvous_contact_list(
+        &mut self,
+        schema_version: u32,
+        version_id: impl Into<String>,
+        rendezvous_urls: Vec<String>,
+    ) -> Result<bool> {
+        if schema_version != RENDEZVOUS_CONTACT_LIST_SCHEMA_VERSION {
+            bail!("unsupported cluster rendezvous contact-list schema version {schema_version}");
+        }
+        let version_id = version_id.into().trim().to_string();
+        if version_id.is_empty() {
+            bail!("cluster rendezvous contact list is missing version_id");
+        }
+        let rendezvous_urls = normalized_unique_rendezvous_urls(&rendezvous_urls)?;
+        let next = PersistedRendezvousContactList {
+            schema_version,
+            version_id,
+            rendezvous_urls,
+        };
+        if self.rendezvous_contact_list.as_ref() == Some(&next) {
+            return Ok(false);
+        }
+        self.rendezvous_contact_list = Some(next);
+        Ok(true)
+    }
+
     pub fn candidate_endpoints(&self) -> Result<Vec<Url>> {
         self.normalized_candidate_direct_endpoints()?
             .into_iter()
@@ -375,11 +454,12 @@ impl ConnectionBootstrap {
 
     pub fn planned_targets(&self) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
         self.validate()?;
+        let rendezvous_urls = self.effective_rendezvous_urls()?;
 
         let direct_targets = self.direct_https_targets()?.into_iter().collect::<Vec<_>>();
 
         let relay_targets = if self.relay_mode != RelayMode::Disabled {
-            if self.rendezvous_urls.is_empty() {
+            if rendezvous_urls.is_empty() {
                 if self.relay_mode == RelayMode::Required {
                     bail!(
                         "bootstrap requires relay connectivity but does not include rendezvous_urls"
@@ -389,7 +469,7 @@ impl ConnectionBootstrap {
             } else {
                 let relay_targets = relay_targets_for_node_ids(
                     self,
-                    &self.rendezvous_urls,
+                    &rendezvous_urls,
                     direct_targets
                         .iter()
                         .filter_map(|target| target.target_node_id),
@@ -431,12 +511,13 @@ impl ConnectionBootstrap {
     /// the bootstrap file recorded for it. Used by diagnostic tooling to enumerate the nodes a
     /// bootstrap file can address directly (see `diagnostic_targets_selecting`).
     pub fn direct_https_targets(&self) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
+        let rendezvous_urls = self.effective_rendezvous_urls()?;
         Ok(self
             .normalized_candidate_direct_endpoints()?
             .into_iter()
             .map(|endpoint| PlannedConnectionBootstrapTarget {
                 cluster_id: self.cluster_id,
-                rendezvous_urls: self.rendezvous_urls.clone(),
+                rendezvous_urls: rendezvous_urls.clone(),
                 rendezvous_mtls_required: self.rendezvous_mtls_required,
                 relay_mode: self.relay_mode,
                 path_kind: TransportPathKind::DirectHttps,
@@ -641,6 +722,7 @@ impl ConnectionBootstrap {
         rendezvous_url: Option<&str>,
     ) -> Result<ConnectionBootstrapDiagnosticTargets> {
         self.validate()?;
+        let rendezvous_urls = self.effective_rendezvous_urls()?;
 
         let direct_targets = self.direct_https_targets()?;
         let direct = match node_id {
@@ -660,7 +742,7 @@ impl ConnectionBootstrap {
             None => direct_targets.first().cloned(),
         };
 
-        let relay = if self.relay_mode == RelayMode::Disabled || self.rendezvous_urls.is_empty() {
+        let relay = if self.relay_mode == RelayMode::Disabled || rendezvous_urls.is_empty() {
             Vec::new()
         } else {
             let resolved_target_node_id = match node_id {
@@ -680,19 +762,18 @@ impl ConnectionBootstrap {
                 .map(|url| url.trim().trim_end_matches('/').to_string())
                 .filter(|url| !url.is_empty());
             if let Some(selected_url) = normalized_selected_url.as_deref()
-                && !self
-                    .rendezvous_urls
+                && !rendezvous_urls
                     .iter()
                     .any(|url| url.trim().trim_end_matches('/') == selected_url)
             {
                 bail!(
                     "bootstrap does not contain rendezvous URL {selected_url}; known rendezvous URLs: {}",
-                    known_rendezvous_urls(&self.rendezvous_urls)
+                    known_rendezvous_urls(&rendezvous_urls)
                 );
             }
 
             let mut seen_urls = BTreeSet::new();
-            self.rendezvous_urls
+            rendezvous_urls
                 .iter()
                 .filter_map(|url| {
                     let normalized = url.trim().trim_end_matches('/').to_string();
@@ -778,7 +859,8 @@ impl ConnectionBootstrap {
             }
         }
 
-        if self.rendezvous_urls.is_empty() {
+        let rendezvous_urls = self.effective_rendezvous_urls()?;
+        if rendezvous_urls.is_empty() {
             return self.planned_targets();
         }
 
@@ -787,7 +869,7 @@ impl ConnectionBootstrap {
         tracing::info!(
             event = "dynamic_discovery_started",
             discovery_run_id = %discovery_run_id,
-            rendezvous_endpoint_count = self.rendezvous_urls.len(),
+            rendezvous_endpoint_count = rendezvous_urls.len(),
             target_node_count = self.discovery_target_node_ids()?.len(),
             max_concurrency = DISCOVERY_MAX_CONCURRENCY,
             request_timeout_ms = DISCOVERY_REQUEST_TIMEOUT.as_millis() as u64,
@@ -797,7 +879,12 @@ impl ConnectionBootstrap {
 
         let discovery = match tokio::time::timeout(
             DISCOVERY_REFRESH_TIMEOUT,
-            self.fetch_dynamic_discovery(identity, discovery_run_id, &mut on_targets_available),
+            self.fetch_dynamic_discovery(
+                identity,
+                &rendezvous_urls,
+                discovery_run_id,
+                &mut on_targets_available,
+            ),
         )
         .await
         {
@@ -1023,7 +1110,7 @@ impl ConnectionBootstrap {
         Ok(TransportClientBootstrap {
             version: self.version,
             cluster_id: self.cluster_id,
-            rendezvous_urls: self.rendezvous_urls.clone(),
+            rendezvous_urls: self.effective_rendezvous_urls()?,
             rendezvous_mtls_required: self.rendezvous_mtls_required,
             direct_endpoints: self.direct_endpoints.clone(),
             relay_mode: self.relay_mode,
@@ -1072,6 +1159,7 @@ impl ConnectionBootstrap {
     async fn fetch_dynamic_discovery(
         &self,
         identity: Option<&ClientIdentityMaterial>,
+        rendezvous_urls: &[String],
         discovery_run_id: Uuid,
         on_targets_available: &mut impl FnMut(Vec<PlannedConnectionBootstrapTarget>) -> Result<()>,
     ) -> Result<DynamicDiscoveryState> {
@@ -1079,7 +1167,7 @@ impl ConnectionBootstrap {
         let mesh_discovery = self
             .fetch_first_discovery_response(
                 identity,
-                &self.rendezvous_urls,
+                rendezvous_urls,
                 None,
                 "mesh",
                 discovery_run_id,
@@ -1088,7 +1176,7 @@ impl ConnectionBootstrap {
             .await?;
         let mut discovery = DynamicDiscoveryState {
             rendezvous_urls: merge_connected_rendezvous_urls(
-                &self.rendezvous_urls,
+                rendezvous_urls,
                 &mesh_discovery.rendezvous_peers,
             )?,
             direct_candidates_by_node: BTreeMap::new(),
@@ -1141,7 +1229,7 @@ impl ConnectionBootstrap {
             if discovered_candidate_count > 0 {
                 discovery.rendezvous_urls = merge_parallel_rendezvous_url_results(
                     &base_rendezvous_urls,
-                    &self.rendezvous_urls,
+                    rendezvous_urls,
                     additional_rendezvous_urls.clone(),
                 )?;
                 let targets = self.build_refreshed_targets(&discovery)?;
@@ -1159,7 +1247,7 @@ impl ConnectionBootstrap {
         }
         discovery.rendezvous_urls = merge_parallel_rendezvous_url_results(
             &base_rendezvous_urls,
-            &self.rendezvous_urls,
+            rendezvous_urls,
             additional_rendezvous_urls,
         )?;
 
@@ -2015,6 +2103,7 @@ fn connection_bootstrap_from_transport(
         version: bootstrap.version,
         cluster_id: bootstrap.cluster_id,
         rendezvous_urls: bootstrap.rendezvous_urls.clone(),
+        rendezvous_contact_list: None,
         rendezvous_mtls_required: bootstrap.rendezvous_mtls_required,
         direct_endpoints: bootstrap.direct_endpoints.clone(),
         relay_mode: bootstrap.relay_mode,
@@ -2123,6 +2212,7 @@ mod tests {
             version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
             cluster_id,
             rendezvous_urls: vec![],
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
             direct_endpoints: vec![BootstrapEndpoint {
                 url: url.to_string(),
@@ -2170,6 +2260,7 @@ mod tests {
             version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
             cluster_id: ClusterId::now_v7(),
             rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: true,
             direct_endpoints: vec![
                 BootstrapEndpoint {
@@ -2200,6 +2291,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn persisted_cluster_contacts_are_preferred_without_replacing_bootstrap_fallbacks() {
+        let mut bootstrap = sample_bootstrap();
+        bootstrap
+            .apply_rendezvous_contact_list(
+                1,
+                "019d-cached-contact-list",
+                vec![
+                    "https://home.example:19080/".to_string(),
+                    "https://home.example:19080".to_string(),
+                ],
+            )
+            .expect("cluster contact list should be accepted");
+
+        assert_eq!(
+            bootstrap
+                .effective_rendezvous_urls()
+                .expect("effective contacts should be valid"),
+            vec![
+                "https://home.example:19080/".to_string(),
+                "https://rendezvous.example/".to_string(),
+            ]
+        );
+
+        let restored = ConnectionBootstrap::from_json_str(
+            &bootstrap
+                .to_json_pretty()
+                .expect("bootstrap should serialize"),
+        )
+        .expect("persisted bootstrap should deserialize");
+        assert_eq!(
+            restored
+                .rendezvous_contact_list
+                .as_ref()
+                .expect("contact list should survive persistence")
+                .version_id,
+            "019d-cached-contact-list"
+        );
+        assert_eq!(
+            restored
+                .effective_rendezvous_urls()
+                .expect("restored contacts should be valid"),
+            bootstrap
+                .effective_rendezvous_urls()
+                .expect("original contacts should be valid")
+        );
+    }
+
     fn sample_claim() -> ClientBootstrapClaim {
         ClientBootstrapClaim {
             version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
@@ -2225,6 +2364,7 @@ mod tests {
             version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
             cluster_id,
             rendezvous_urls: vec![rendezvous_url],
+            rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
             direct_endpoints: vec![BootstrapEndpoint {
                 url: "https://public.example".to_string(),

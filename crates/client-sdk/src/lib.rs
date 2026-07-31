@@ -11,9 +11,9 @@ mod session_pool;
 
 pub use bootstrap::{
     BootstrapEnrollmentResult, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
-    EnrolledClientConnection, PlannedConnectionBootstrapTarget, ResolvedConnectionBootstrap,
-    enroll_bootstrap_claim_blocking, enroll_client_connection_blocking,
-    enroll_connection_input_blocking,
+    EnrolledClientConnection, PersistedRendezvousContactList, PlannedConnectionBootstrapTarget,
+    ResolvedConnectionBootstrap, enroll_bootstrap_claim_blocking,
+    enroll_client_connection_blocking, enroll_connection_input_blocking,
 };
 pub use client_node::ClientNode;
 pub use connection::{
@@ -52,8 +52,8 @@ pub use latency_probe::{
     TitleLatencyProbeState, TitleLatencyProbeStatus, compare_direct_and_relay_latency,
 };
 pub use managed_client::{
-    ManagedClientOptions, ManagedIronMeshClient, RouteDiscoveryError, RouteRefreshOutcome,
-    RouteRefreshReason,
+    ManagedBootstrapPersistence, ManagedClientOptions, ManagedIronMeshClient, RouteDiscoveryError,
+    RouteRefreshOutcome, RouteRefreshReason,
 };
 pub use remote_sync::{
     RemoteSnapshotFetchProgress, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,

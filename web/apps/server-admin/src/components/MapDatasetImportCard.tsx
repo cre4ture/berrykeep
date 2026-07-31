@@ -60,7 +60,7 @@ export function MapDatasetImportCard() {
 
   const mapConfigurationQuery = useQuery({
     queryKey: galleryQueryKeys.mapConfiguration(),
-    queryFn: () => getAdminGalleryMapConfiguration(),
+    queryFn: () => getAdminGalleryMapConfiguration(normalizedAdminTokenOverride || undefined),
     ...galleryMapConfigurationQueryPolicy,
     enabled: canInspectMapImport
   });

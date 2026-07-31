@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
     IronMeshClient, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,
-    ManagedClientOptions, ManagedIronMeshClient,
+    ManagedBootstrapPersistence, ManagedClientOptions, ManagedIronMeshClient,
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     enroll_connection_input_blocking, normalize_server_base_url,
@@ -140,6 +140,7 @@ impl CliClientHolder {
 fn build_managed_cli_client(
     bootstrap: ConnectionBootstrap,
     identity: ClientIdentityMaterial,
+    options: ManagedClientOptions,
 ) -> Result<(ManagedIronMeshClient, ManagedCliRuntime)> {
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -158,10 +159,8 @@ fn build_managed_cli_client(
                     return;
                 }
             };
-            match runtime.block_on(
-                bootstrap
-                    .build_managed_client_with_identity(identity, ManagedClientOptions::default()),
-            ) {
+            match runtime.block_on(bootstrap.build_managed_client_with_identity(identity, options))
+            {
                 Ok(managed_client) => {
                     if result_tx.send(Ok(managed_client)).is_ok() {
                         runtime.block_on(async {
@@ -754,7 +753,16 @@ async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> 
         let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
         let client_holder = match client_identity.as_ref() {
             Some(identity) => {
-                let (managed, runtime) = build_managed_cli_client(bootstrap, identity.clone())?;
+                let persistence_path = bootstrap_path.to_path_buf();
+                let options = ManagedClientOptions {
+                    connection_bootstrap_persistence: Some(ManagedBootstrapPersistence::new(
+                        "bootstrap_file",
+                        move |bootstrap| bootstrap.write_to_path(&persistence_path),
+                    )),
+                    ..ManagedClientOptions::default()
+                };
+                let (managed, runtime) =
+                    build_managed_cli_client(bootstrap, identity.clone(), options)?;
                 if let Some(renewed_identity) = managed.take_identity_update() {
                     match persist_renewed_client_identity(
                         client_identity_path.as_deref(),
