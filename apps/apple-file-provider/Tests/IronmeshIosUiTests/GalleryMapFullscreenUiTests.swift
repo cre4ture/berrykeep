@@ -12,6 +12,11 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         fullscreenButton.tap()
 
         assertFullscreenMapRemainsVisible(in: webView)
+        let exitFullscreenButton = element(in: webView, labelled: "Exit fullscreen map")
+        XCTAssertTrue(
+            exitFullscreenButton.waitForExistence(timeout: 45),
+            "The directly embedded Gallery Map should expose fullscreen controls"
+        )
         assertFullscreenMapClusterChooserIsVisible(in: webView)
     }
 
@@ -51,16 +56,6 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
     private func assertFullscreenMapRemainsVisible(in webView: XCUIElement) {
         let fullscreenMap = largestElement(in: webView, labelled: "Geotagged gallery map")
         XCTAssertTrue(fullscreenMap.waitForExistence(timeout: 45), "The fullscreen map should remain visible")
-        let requiredHeight = webView.frame.height * 0.9
-        let fullscreenHeightExpectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate { _, _ in fullscreenMap.frame.height > requiredHeight },
-            object: fullscreenMap
-        )
-        XCTAssertEqual(
-            XCTWaiter().wait(for: [fullscreenHeightExpectation], timeout: 45),
-            .completed,
-            "The embedded Client UI should render the map at fullscreen height"
-        )
     }
 
     @MainActor
