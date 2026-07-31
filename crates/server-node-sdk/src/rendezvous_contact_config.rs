@@ -1,7 +1,8 @@
 use super::*;
 
 /// Cluster-owned contact list for clients looking up rendezvous services after
-/// they have already established an authenticated cluster connection.
+/// they have already established an authenticated cluster connection. Server
+/// nodes also add the replicated contacts to their outbound registration set.
 ///
 /// This is intentionally a normal, versioned object. The first implementation
 /// therefore inherits normal object metadata synchronization and replication
@@ -189,6 +190,13 @@ pub(crate) async fn admin_put_config(
     )
     .await;
 
+    if let Err(err) = synchronize_cluster_rendezvous_contact_urls(&state).await {
+        warn!(
+            error = %err,
+            "failed applying updated rendezvous contact configuration to local server registration"
+        );
+    }
+
     append_admin_audit(
         &state,
         action,
@@ -259,6 +267,13 @@ async fn load_current_configuration(
         stored: true,
         version_id,
     })
+}
+
+pub(crate) async fn load_current_rendezvous_urls(state: &ServerState) -> Result<Vec<String>> {
+    Ok(load_current_configuration(state)
+        .await?
+        .configuration
+        .rendezvous_urls)
 }
 
 fn normalize_configuration(
