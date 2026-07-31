@@ -2134,9 +2134,15 @@ function GalleryMapPanel({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const pushedFullscreenHistoryRef = useRef(false);
   const toggleFullscreen = () => setIsFullscreen((current) => !current);
-  const usesEmbeddedClient =
-    typeof window !== "undefined" &&
-    ["android", "ios"].includes(new URLSearchParams(window.location.search).get("embedded_client") ?? "");
+  const embeddedClient =
+    typeof window === "undefined"
+      ? null
+      : new URLSearchParams(window.location.search).get("embedded_client");
+  const usesEmbeddedClient = embeddedClient === "android" || embeddedClient === "ios";
+  // Android WebView can resolve dynamic viewport units to zero while this
+  // surface is fullscreen, whereas iOS WebView needs an explicit height for
+  // fixed inset bounds to be reflected in its rendered accessibility frame.
+  const fullscreenViewportHeight = embeddedClient === "android" ? undefined : "100dvh";
   const switchToGrid = () => {
     if (isFullscreen && pushedFullscreenHistoryRef.current && typeof window !== "undefined") {
       window.history.back();
@@ -2207,7 +2213,7 @@ function GalleryMapPanel({
       isFullscreen={isFullscreen}
       allowFullscreenPortal={!usesEmbeddedClient}
       usesEmbeddedViewport={usesEmbeddedClient}
-      fullscreenViewportHeight={usesEmbeddedClient ? undefined : "100dvh"}
+      fullscreenViewportHeight={fullscreenViewportHeight}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
@@ -2224,7 +2230,7 @@ function GalleryMapPanel({
       isFullscreen={isFullscreen}
       allowFullscreenPortal={!usesEmbeddedClient}
       usesEmbeddedViewport={usesEmbeddedClient}
-      fullscreenViewportHeight={usesEmbeddedClient ? undefined : "100dvh"}
+      fullscreenViewportHeight={fullscreenViewportHeight}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
