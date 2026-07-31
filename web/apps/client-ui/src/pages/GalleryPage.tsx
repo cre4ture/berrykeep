@@ -10,11 +10,14 @@ import {
 import {
   GallerySurface,
   galleryBasemapsFromConfiguration,
+  galleryMapConfigurationQueryPolicy,
+  galleryQueryKeys,
   PageHeader,
   type GalleryDataSource,
   type GallerySurfaceViewMode
 } from "@ironmesh/ui";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { useMemo } from "react";
 
 const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
 
@@ -22,67 +25,17 @@ type GalleryPageProps = {
   initialViewMode?: GallerySurfaceViewMode;
 };
 
+type ClientGalleryMapConfiguration = Awaited<ReturnType<typeof getClientGalleryMapConfiguration>>;
+
 export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
-  const [mapConfiguration, setMapConfiguration] = useState<
-    Awaited<ReturnType<typeof getClientGalleryMapConfiguration>> | null
-  >(null);
-  const [mapConfigurationLoading, setMapConfigurationLoading] = useState(true);
-  const [mapConfigurationError, setMapConfigurationError] = useState<string | null>(null);
-  const mapConfigurationMountedRef = useRef(true);
-  const mapConfigurationRequestVersionRef = useRef(0);
-
-  useEffect(() => {
-    mapConfigurationMountedRef.current = true;
-    return () => {
-      mapConfigurationMountedRef.current = false;
-    };
-  }, []);
-
-  const refreshMapConfiguration = useCallback(async () => {
-    if (!mapConfigurationMountedRef.current) {
-      return;
-    }
-    const requestVersion = mapConfigurationRequestVersionRef.current + 1;
-    mapConfigurationRequestVersionRef.current = requestVersion;
-    setMapConfigurationLoading(true);
-    try {
-      const next = await getClientGalleryMapConfiguration();
-      if (
-        !mapConfigurationMountedRef.current ||
-        requestVersion !== mapConfigurationRequestVersionRef.current
-      ) {
-        return;
-      }
-      // Polling must not replace an equivalent response: `basemaps` then
-      // keeps its identity and the map does not get recreated every 15s.
-      setMapConfiguration((current) =>
-        sameMapConfiguration(current, next) ? current : next
-      );
-      setMapConfigurationError(null);
-    } catch (error) {
-      if (
-        mapConfigurationMountedRef.current &&
-        requestVersion === mapConfigurationRequestVersionRef.current
-      ) {
-        setMapConfigurationError(mapConfigurationErrorMessage(error));
-      }
-    } finally {
-      if (
-        mapConfigurationMountedRef.current &&
-        requestVersion === mapConfigurationRequestVersionRef.current
-      ) {
-        setMapConfigurationLoading(false);
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    void refreshMapConfiguration();
-    const interval = window.setInterval(() => void refreshMapConfiguration(), 15_000);
-    return () => {
-      window.clearInterval(interval);
-    };
-  }, [refreshMapConfiguration]);
+  const mapConfigurationQuery = useQuery<ClientGalleryMapConfiguration>({
+    queryKey: galleryQueryKeys.mapConfiguration(),
+    queryFn: getClientGalleryMapConfiguration,
+    ...galleryMapConfigurationQueryPolicy,
+    structuralSharing: retainEquivalentMapConfiguration
+  });
+  const mapConfiguration = mapConfigurationQuery.data ?? null;
+  const mapConfigurationError = mapConfigurationErrorMessage(mapConfigurationQuery.error);
   const basemaps = useMemo(
     () => galleryBasemapsFromConfiguration(mapConfiguration?.configuration.variants ?? []),
     [mapConfiguration]
@@ -135,9 +88,9 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
         allowedMediaKinds={["image", "video"]}
         basemaps={basemaps}
         preferredBasemapId={mapConfiguration?.configuration.active_variant_id}
-        basemapConfigurationLoading={mapConfigurationLoading}
+        basemapConfigurationLoading={mapConfigurationQuery.isLoading}
         basemapConfigurationError={mapConfigurationError}
-        retryBasemapConfiguration={() => void refreshMapConfiguration()}
+        retryBasemapConfiguration={() => void mapConfigurationQuery.refetch()}
         dataSource={galleryDataSource}
       />
     </>
@@ -153,8 +106,8 @@ function mapConfigurationErrorMessage(error: unknown): string {
 }
 
 function sameMapConfiguration(
-  current: Awaited<ReturnType<typeof getClientGalleryMapConfiguration>> | null,
-  next: Awaited<ReturnType<typeof getClientGalleryMapConfiguration>>
+  current: ClientGalleryMapConfiguration | null,
+  next: ClientGalleryMapConfiguration
 ): boolean {
   // `stored` communicates server-side initialization state only; it has no
   // effect on gallery rendering. The API serializes configuration fields in a
@@ -164,6 +117,15 @@ function sameMapConfiguration(
     current !== null &&
     JSON.stringify(current.configuration) === JSON.stringify(next.configuration)
   );
+}
+
+function retainEquivalentMapConfiguration(current: unknown, next: unknown): unknown {
+  // TanStack intentionally accepts unknown cache values here because callers
+  // may set query data manually. This query's fetcher always returns the
+  // client map-configuration response.
+  const currentConfiguration = (current as ClientGalleryMapConfiguration | undefined) ?? null;
+  const nextConfiguration = next as ClientGalleryMapConfiguration;
+  return sameMapConfiguration(currentConfiguration, nextConfiguration) ? current : next;
 }
 
 function binaryMediaUrl(

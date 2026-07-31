@@ -9,6 +9,8 @@ import {
 import {
   GallerySurface,
   galleryBasemapsFromConfiguration,
+  galleryMapConfigurationQueryPolicy,
+  galleryQueryKeys,
   type GalleryDataSource
 } from "@ironmesh/ui";
 import { Stack, Tabs } from "@mantine/core";
@@ -17,7 +19,6 @@ import { useMemo } from "react";
 import { MapDatasetImportCard } from "../components/MapDatasetImportCard";
 import { MapVariantConfigurationCard } from "../components/MapVariantConfigurationCard";
 import { useAdminAccess } from "../lib/admin-access";
-import { galleryMapConfigurationQueryKey } from "../lib/gallery-query-keys";
 
 const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
 
@@ -27,10 +28,10 @@ export function GalleryPage() {
   const canInspectMapConfiguration =
     !sessionLoading && (!loginRequired || Boolean(sessionStatus?.authenticated));
   const mapConfigurationQuery = useQuery({
-    queryKey: galleryMapConfigurationQueryKey,
+    queryKey: galleryQueryKeys.mapConfiguration(),
     queryFn: () => getAdminGalleryMapConfiguration(),
-    enabled: canInspectMapConfiguration,
-    staleTime: 5_000
+    ...galleryMapConfigurationQueryPolicy,
+    enabled: canInspectMapConfiguration
   });
   const mapConfiguration = mapConfigurationQuery.data ?? null;
   const mapConfigurationError = errorMessage(mapConfigurationQuery.error);

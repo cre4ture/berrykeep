@@ -1,5 +1,10 @@
+import { IronmeshQueryProvider } from "@ironmesh/ui";
 import { ClientShell } from "./app-shell/ClientShell";
 
 export function App() {
-  return <ClientShell />;
+  return (
+    <IronmeshQueryProvider>
+      <ClientShell />
+    </IronmeshQueryProvider>
+  );
 }
