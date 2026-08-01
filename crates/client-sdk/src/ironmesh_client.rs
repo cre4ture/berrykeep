@@ -749,13 +749,12 @@ impl ClientEndpointRouter {
         }
 
         if !validated_available.is_empty() {
-            if let Some(active_index) = active_index {
-                if let Some(active_position) = validated_available
+            if let Some(active_index) = active_index
+                && let Some(active_position) = validated_available
                     .iter()
                     .position(|index| *index == active_index)
-                {
-                    validated_available.swap(0, active_position);
-                }
+            {
+                validated_available.swap(0, active_position);
             }
             validated_available.extend(probation_available);
             validated_available.extend(cooling);
