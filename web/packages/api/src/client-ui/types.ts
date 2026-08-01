@@ -19,6 +19,16 @@ export type ClientUiPingResponse = {
   backend_revision?: string;
 };
 
+/**
+ * Non-secret browser-cache partition assigned by the local client runtime.
+ * A null scope means the runtime has no authenticated identity and persistent
+ * client data must remain disabled.
+ */
+export type ClientCacheContextResponse = {
+  schema_version: 1;
+  scope: string | null;
+};
+
 export type ClientUiRuntimeInfo = {
   app_name: string;
   transport_mode: "direct" | "relay-capable";

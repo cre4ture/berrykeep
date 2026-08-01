@@ -4,6 +4,7 @@ import type { StoreIndexMedia } from "../shared/store-index";
 import type {
   StoreIndexDeltaResponse,
   ClientConnectionRouteSnapshot,
+  ClientCacheContextResponse,
   ClientDiagnosticLogExport,
   ClientLatencyTestResponse,
   ClientRendezvousView,
@@ -56,6 +57,13 @@ export async function getClientPing(
   options?: ClientDiagnosticRequestOptions
 ): Promise<ClientUiPingResponse> {
   return fetchJson<ClientUiPingResponse>(apiV1("/ping"), diagnosticRequestInit(options));
+}
+
+export async function getClientCacheContext(): Promise<ClientCacheContextResponse> {
+  return fetchJson<ClientCacheContextResponse>(apiV1("/cache-context"), {
+    cache: "no-store",
+    credentials: "same-origin"
+  });
 }
 
 export async function getClientGalleryMapConfiguration(): Promise<GalleryMapConfigurationResponse> {

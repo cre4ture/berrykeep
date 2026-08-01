@@ -16,8 +16,9 @@ import {
   type GalleryDataSource,
   type GallerySurfaceViewMode
 } from "@ironmesh/ui";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
+import { createPersistentGalleryDataSource } from "../gallery-cache/gallery-persistent-data-source";
 
 const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
 
@@ -28,6 +29,7 @@ type GalleryPageProps = {
 type ClientGalleryMapConfiguration = Awaited<ReturnType<typeof getClientGalleryMapConfiguration>>;
 
 export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
+  const queryClient = useQueryClient();
   const mapConfigurationQuery = useQuery<ClientGalleryMapConfiguration>({
     queryKey: galleryQueryKeys.mapConfiguration(),
     queryFn: getClientGalleryMapConfiguration,
@@ -40,7 +42,7 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
     () => galleryBasemapsFromConfiguration(mapConfiguration?.configuration.variants ?? []),
     [mapConfiguration]
   );
-  const galleryDataSource = useMemo<GalleryDataSource>(
+  const liveGalleryDataSource = useMemo<GalleryDataSource>(
     () => ({
       loadSnapshots: () => listSnapshots(),
       loadEntries: (prefix, depth, snapshotId, options) =>
@@ -74,6 +76,10 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
         })
     }),
     []
+  );
+  const galleryDataSource = useMemo(
+    () => createPersistentGalleryDataSource(queryClient, liveGalleryDataSource),
+    [liveGalleryDataSource, queryClient]
   );
 
   return (
