@@ -10,15 +10,21 @@ Read [references/ironmesh-pr-facts.md](references/ironmesh-pr-facts.md) before t
 ## Workflow
 
 1. Resolve the PR number, head branch, and target branch from the current branch or the caller's explicit PR.
-2. Check regularly, but at most once per 20-minute interval. Start or re-arm a 20-minute sleep timer after any relevant PR activity, then do one poll when it expires. Do not do any investigation during that waiting time to save token costs.
-3. After sleeping, treat remote GitHub state for the latest pushed head commit as the source of truth. On each poll, inspect and address.
-6. If review feedback is concrete and actionable, apply the fix directly. If the feedback is ambiguous, conflicting, or changes product direction, ask the user.
-7. After every push, assume a fresh cycle starts. Reset the sleep timer from that push time like starting from step 2 again.
-8. Stop only when one of these is true:
+2. Run the bundled blocking watcher instead of manual polling:
+
+   `python3 <pr-follow-up-skill-dir>/scripts/watch_pr.py [PR] --base main`
+
+3. Use the watcher exit codes as the primary control flow:
+   - `1`, `2`, `3`: fix the issue and push, then start the watcher again.
+   - `0`: timeout expired without actionable events; decide whether to rerun or hand over.
+   - `4`: PR is closed or merged; stop.
+   - `64` / `70`: resolve tooling or configuration problems, then rerun.
+4. If review feedback is concrete and actionable, apply the fix directly. If the feedback is ambiguous, conflicting, or changes product direction, ask the user.
+5. Stop only when one of these is true:
    - the PR is merged or closed,
    - the latest head commit is up to date with the target branch, required checks are complete and green, there are no actionable unresolved review findings, and there is nothing else to change,
    - progress requires user input, approval, missing credentials, or an external state change outside the agent's control.
-9. When stopping, leave a concise status summary covering branch freshness, CI state, review state, and the exact blocker if any.
+6. When stopping, leave a concise status summary covering branch freshness, CI state, review state, and the exact blocker if any.
 
 ## Review And CI Handling
 
