@@ -275,6 +275,18 @@ tokio::task_local! {
 
 type RuntimeLogReloadHandle = reload::Handle<EnvFilter, Registry>;
 
+type MetadataBundleImportObserverFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+type MetadataBundleImportObserverHandler =
+    fn(ServerState, MetadataExportBundle) -> MetadataBundleImportObserverFuture;
+
+type MetadataBundleKeyMatch = fn(&str) -> bool;
+
+struct MetadataBundleImportObserver {
+    key_match: MetadataBundleKeyMatch,
+    handler: MetadataBundleImportObserverHandler,
+}
+
 #[derive(Clone)]
 struct ServerState {
     data_dir: PathBuf,
@@ -11517,19 +11529,8 @@ pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
                 }
             };
 
-            if import_changed
-                && bundle.key
-                    == rendezvous_contact_config::RENDEZVOUS_CONTACT_CONFIGURATION_STORAGE_KEY
-            {
-                if let Err(err) =
-                    synchronize_cluster_rendezvous_contact_urls(state).await
-                {
-                    warn!(
-                        key = %bundle.key,
-                        error = %err,
-                        "failed to apply rendezvous contact configuration after metadata import"
-                    );
-                }
+            if import_changed {
+                notify_metadata_bundle_import_handlers(state, &bundle);
             }
 
             if import_changed {
@@ -11548,6 +11549,48 @@ pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
 
     if imported_any {
         publish_namespace_change(state);
+    }
+}
+
+fn metadata_bundle_import_observers() -> &'static [MetadataBundleImportObserver] {
+    static OBSERVERS: [MetadataBundleImportObserver; 1] = [MetadataBundleImportObserver {
+        key_match: is_rendezvous_contact_configuration_key,
+        handler: apply_rendezvous_contacts_configuration_after_metadata_import,
+    }];
+
+    &OBSERVERS
+}
+
+fn is_rendezvous_contact_configuration_key(key: &str) -> bool {
+    key == rendezvous_contact_config::RENDEZVOUS_CONTACT_CONFIGURATION_STORAGE_KEY
+}
+
+fn apply_rendezvous_contacts_configuration_after_metadata_import(
+    state: ServerState,
+    _: MetadataExportBundle,
+) -> MetadataBundleImportObserverFuture {
+    Box::pin(async move {
+        if let Err(err) = synchronize_cluster_rendezvous_contact_urls(&state).await {
+            warn!(
+                error = %err,
+                "failed to apply rendezvous contact configuration after metadata import"
+            );
+        }
+    })
+}
+
+fn notify_metadata_bundle_import_handlers(state: &ServerState, bundle: &MetadataExportBundle) {
+    for observer in metadata_bundle_import_observers() {
+        if !(observer.key_match)(&bundle.key) {
+            continue;
+        }
+
+        let state = state.clone();
+        let bundle = bundle.clone();
+        let handler = observer.handler;
+        tokio::spawn(async move {
+            (handler)(state, bundle).await;
+        });
     }
 }
 
