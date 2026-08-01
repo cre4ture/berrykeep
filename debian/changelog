@@ -1,3 +1,10 @@
+ironmesh (1.0.43-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Re-apply the rendezvous contact list on metadata import changes.
+  * Roll the workspace release to 1.0.43.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 01 Aug 2026 17:46:22 +0200
+
 ironmesh (1.0.42-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Strengthen managed QUIC route handling, relay fallback, and diagnostics.
