@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""Wait for GitHub PR events that require attention.
+
+Requires an authenticated GitHub CLI (`gh`). No Python packages are required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from textwrap import shorten
+from typing import Any
+from urllib.parse import urlparse
+
+EXIT_CHECK_FAILED = 1
+EXIT_NEW_ACTIVITY = 2
+EXIT_MERGE_CONFLICT = 3
+EXIT_PR_NOT_OPEN = 4
+EXIT_TIMEOUT = 0
+EXIT_CONFIGURATION = 64
+EXIT_RUNTIME = 70
+
+DEFAULT_TIMEOUT_SECONDS = 20 * 60
+
+QUERY = r"""
+query WatchPr($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      title
+      url
+      state
+      baseRefName
+      mergeable
+      mergeStateStatus
+      comments(last: 100) {
+        nodes { id author { login } body createdAt url }
+      }
+      reviews(last: 100) {
+        nodes { id author { login } body submittedAt state }
+      }
+    }
+  }
+}
+"""
+
+
+class GhError(RuntimeError):
+    pass
+
+
+class ConfigError(GhError):
+    pass
+
+
+class WatchTimeout(RuntimeError):
+    pass
+
+
+def remaining_time(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise WatchTimeout
+    return remaining
+
+
+def gh_json(
+    args: list[str],
+    *,
+    allowed: tuple[int, ...] = (0,),
+    empty: Any = None,
+    deadline: float | None = None,
+) -> Any:
+    command = ["gh", *args]
+    remaining = remaining_time(deadline)
+    command_timeout = 60.0 if remaining is None else min(60.0, remaining)
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=command_timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise WatchTimeout from exc
+        raise GhError(f"Konnte {' '.join(command)} nicht ausführen: {exc}") from exc
+    except OSError as exc:
+        raise GhError(f"Konnte {' '.join(command)} nicht ausführen: {exc}") from exc
+
+    if result.returncode not in allowed:
+        detail = result.stderr.strip() or result.stdout.strip() or "unbekannter Fehler"
+        raise GhError(
+            f"{' '.join(command)} endete mit Status {result.returncode}: {detail}"
+        )
+
+    if not result.stdout.strip():
+        return empty
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise GhError(f"Ungültige JSON-Ausgabe von gh: {result.stdout[:400]!r}") from exc
+
+
+def identify_pr(
+    pr: str | None,
+    repo_arg: str | None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    args = ["pr", "view"]
+    if pr:
+        args.append(pr)
+    args += ["--json", "number,url"]
+    if repo_arg:
+        args += ["--repo", repo_arg]
+
+    data = gh_json(args, empty={}, deadline=deadline)
+    if not isinstance(data, dict) or not data.get("number") or not data.get("url"):
+        raise GhError("Der Pull Request konnte nicht ermittelt werden.")
+    return data
+
+
+def repo_from_url(url: str) -> dict[str, str]:
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parsed.hostname or len(parts) < 4 or parts[2] != "pull":
+        raise GhError(f"Unerwartete Pull-Request-URL: {url}")
+
+    owner, name = parts[0], parts[1]
+    host = parsed.hostname
+    gh_repo = f"{owner}/{name}" if host == "github.com" else f"{host}/{owner}/{name}"
+    return {"owner": owner, "name": name, "host": host, "gh_repo": gh_repo}
+
+
+def snapshot(
+    repo: dict[str, str],
+    number: int,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    response = gh_json(
+        [
+            "api",
+            "graphql",
+            "--hostname",
+            repo["host"],
+            "-f",
+            f"query={QUERY}",
+            "-f",
+            f"owner={repo['owner']}",
+            "-f",
+            f"name={repo['name']}",
+            "-F",
+            f"number={number}",
+        ],
+        empty={},
+        deadline=deadline,
+    )
+    if not isinstance(response, dict):
+        raise GhError("Unerwartete GraphQL-Antwort.")
+    if response.get("errors"):
+        raise GhError(f"GitHub GraphQL meldet Fehler: {response['errors']}")
+
+    pr = (((response.get("data") or {}).get("repository") or {}).get("pullRequest"))
+    if not isinstance(pr, dict):
+        raise GhError(f"PR #{number} wurde nicht gefunden.")
+    return pr
+
+
+def connection_nodes(pr: dict[str, Any], field: str) -> list[dict[str, Any]]:
+    nodes = ((pr.get(field) or {}).get("nodes") or [])
+    if not isinstance(nodes, list):
+        raise GhError(f"Unerwartete GraphQL-Daten für {field}.")
+    return [item for item in nodes if isinstance(item, dict)]
+
+
+def inline_comments(
+    repo: dict[str, str],
+    number: int,
+    deadline: float | None = None,
+) -> list[dict[str, Any]]:
+    endpoint = (
+        f"repos/{repo['owner']}/{repo['name']}/pulls/{number}/comments"
+        "?per_page=100&sort=created&direction=desc"
+    )
+    data = gh_json(
+        [
+            "api",
+            "--hostname",
+            repo["host"],
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            "X-GitHub-Api-Version: 2022-11-28",
+            endpoint,
+        ],
+        empty=[],
+        deadline=deadline,
+    )
+    if not isinstance(data, list):
+        raise GhError("Unerwartete Antwort für Inline-Kommentare.")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def checks(
+    repo: dict[str, str],
+    number: int,
+    deadline: float | None = None,
+) -> list[dict[str, Any]]:
+    data = gh_json(
+        [
+            "pr",
+            "checks",
+            str(number),
+            "--repo",
+            repo["gh_repo"],
+            "--json",
+            "bucket,name,state,link",
+        ],
+        # gh returns 1 for failed checks and 8 while checks are pending.
+        allowed=(0, 1, 8),
+        empty=[],
+        deadline=deadline,
+    )
+    if not isinstance(data, list):
+        raise GhError("Unerwartete Antwort von gh pr checks.")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def failed_checks(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in items if item.get("bucket") == "fail"]
+
+
+def check_identity(item: dict[str, Any]) -> str:
+    """Identify one check run well enough to distinguish later workflow runs."""
+    name = str(item.get("name") or "unbekannt")
+    link = str(item.get("link") or "")
+    return f"{name}\n{link}"
+
+
+def failed_check_ids(items: list[dict[str, Any]]) -> set[str]:
+    return {check_identity(item) for item in failed_checks(items)}
+
+
+def matching_ignore_pattern(name: str, patterns: tuple[str, ...]) -> str | None:
+    return next(
+        (pattern for pattern in patterns if fnmatch.fnmatchcase(name, pattern)),
+        None,
+    )
+
+
+def classify_failed_checks(
+    items: list[dict[str, Any]],
+    ignore_patterns: tuple[str, ...],
+    ignored_existing_ids: set[str],
+) -> tuple[
+    list[dict[str, Any]],
+    list[tuple[dict[str, Any], str]],
+    set[str],
+]:
+    actionable: list[dict[str, Any]] = []
+    ignored: list[tuple[dict[str, Any], str]] = []
+    current_ids: set[str] = set()
+
+    for item in failed_checks(items):
+        identity = check_identity(item)
+        current_ids.add(identity)
+        name = str(item.get("name") or "unbekannt")
+        pattern = matching_ignore_pattern(name, ignore_patterns)
+        if pattern is not None:
+            ignored.append((item, f"Ignore-Regel: {pattern}"))
+        elif identity in ignored_existing_ids:
+            ignored.append((item, "bereits beim Start fehlgeschlagen"))
+        else:
+            actionable.append(item)
+
+    return actionable, ignored, current_ids
+
+
+_DURATION_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([smh]?)$", re.IGNORECASE)
+
+
+def parse_duration(value: str) -> float | None:
+    normalized = value.strip().lower()
+    if normalized in {"off", "none", "disabled"}:
+        return None
+
+    match = _DURATION_RE.fullmatch(normalized)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "erwartet eine Dauer wie 30s, 20m oder 2h; ohne Suffix werden Minuten verwendet"
+        )
+
+    amount = float(match.group(1))
+    unit = match.group(2).lower() or "m"
+    seconds = amount * {"s": 1, "m": 60, "h": 3600}[unit]
+    return None if seconds == 0 else seconds
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "deaktiviert"
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds / 3600:g} h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds / 60:g} min"
+    return f"{seconds:g} s"
+
+
+def ids(items: list[dict[str, Any]]) -> set[str]:
+    return {str(item["id"]) for item in items if item.get("id") is not None}
+
+
+def review_items(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item for item in connection_nodes(pr, "reviews") if item.get("submittedAt")]
+
+
+def compact(text: Any) -> str:
+    value = " ".join(str(text or "").split())
+    return shorten(value, width=180, placeholder=" …") if value else "(ohne Text)"
+
+
+def graph_author(item: dict[str, Any]) -> str:
+    return str((item.get("author") or {}).get("login") or "unbekannt")
+
+
+def collect_new_events(
+    pr: dict[str, Any],
+    inline: list[dict[str, Any]],
+    seen: dict[str, set[str]],
+) -> list[dict[str, str]]:
+    events: list[dict[str, str]] = []
+
+    comments = connection_nodes(pr, "comments")
+    for item in comments:
+        item_id = str(item.get("id") or "")
+        if item_id and item_id not in seen["comments"]:
+            events.append(
+                {
+                    "time": str(item.get("createdAt") or ""),
+                    "kind": "PR-Kommentar",
+                    "author": graph_author(item),
+                    "text": compact(item.get("body")),
+                    "url": str(item.get("url") or pr["url"]),
+                }
+            )
+    seen["comments"].update(ids(comments))
+
+    reviews = review_items(pr)
+    for item in reviews:
+        item_id = str(item.get("id") or "")
+        if item_id and item_id not in seen["reviews"]:
+            events.append(
+                {
+                    "time": str(item.get("submittedAt") or ""),
+                    "kind": f"Review {item.get('state') or 'REVIEW'}",
+                    "author": graph_author(item),
+                    "text": compact(item.get("body")),
+                    "url": str(pr["url"]),
+                }
+            )
+    seen["reviews"].update(ids(reviews))
+
+    for item in inline:
+        item_id = str(item.get("id") or "")
+        if item_id and item_id not in seen["inline"]:
+            user = item.get("user") or {}
+            path = str(item.get("path") or "unbekannte Datei")
+            line = item.get("line") or item.get("original_line")
+            location = f"{path}:{line}" if line is not None else path
+            events.append(
+                {
+                    "time": str(item.get("created_at") or ""),
+                    "kind": f"Inline-Kommentar ({location})",
+                    "author": str(user.get("login") or "unbekannt"),
+                    "text": compact(item.get("body")),
+                    "url": str(item.get("html_url") or pr["url"]),
+                }
+            )
+    seen["inline"].update(ids(inline))
+
+    return sorted(events, key=lambda event: event["time"])
+
+
+def ensure_base(pr: dict[str, Any], expected: str) -> None:
+    actual = str(pr.get("baseRefName") or "")
+    if actual != expected:
+        raise ConfigError(
+            f"PR #{pr['number']} zielt auf '{actual}', nicht auf '{expected}'. "
+            "GitHubs Konfliktstatus gilt immer gegenüber dem tatsächlichen PR-Zielbranch."
+        )
+
+
+def notify(title: str, body: str, enabled: bool) -> None:
+    print("\a", end="", flush=True)
+    if enabled and shutil.which("notify-send"):
+        subprocess.run(
+            ["notify-send", "--app-name=PR Watcher", title, body],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+def timestamp() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def react(
+    pr: dict[str, Any],
+    current_checks: list[dict[str, Any]],
+    events: list[dict[str, str]],
+    notify_enabled: bool,
+    *,
+    ignore_patterns: tuple[str, ...] = (),
+    ignored_existing_failure_ids: set[str] | None = None,
+    reported_ignored_failures: set[str] | None = None,
+) -> int | None:
+    if pr.get("state") != "OPEN":
+        state = str(pr.get("state") or "UNKNOWN")
+        print(f"\n[{timestamp()}] PR #{pr['number']} ist nicht mehr offen: {state}")
+        notify(f"GitHub PR #{pr['number']}", f"PR ist jetzt {state}", notify_enabled)
+        return EXIT_PR_NOT_OPEN
+
+    conflict = (
+        pr.get("mergeable") == "CONFLICTING"
+        or pr.get("mergeStateStatus") == "DIRTY"
+    )
+    if ignored_existing_failure_ids is None:
+        ignored_existing_failure_ids = set()
+    if reported_ignored_failures is None:
+        reported_ignored_failures = set()
+    failed, ignored, current_failure_ids = classify_failed_checks(
+        current_checks,
+        ignore_patterns,
+        ignored_existing_failure_ids,
+    )
+
+    for item, reason in ignored:
+        report_key = f"{check_identity(item)}\n{reason}"
+        if report_key in reported_ignored_failures:
+            continue
+        reported_ignored_failures.add(report_key)
+        print(
+            f"\n[{timestamp()}] Ignoriere fehlgeschlagenen Check auf "
+            f"PR #{pr['number']}:"
+        )
+        print(f"  - {item.get('name', 'unbekannt')}: {item.get('state', 'UNKNOWN')}")
+        print(f"    Grund: {reason}")
+        if item.get("link"):
+            print(f"    {item['link']}")
+
+    # A failure present at startup is ignored only while that exact check run
+    # remains failed. Once it becomes pending/pass/disappears, a later failure
+    # of the same check is actionable again.
+    ignored_existing_failure_ids.intersection_update(current_failure_ids)
+
+    if conflict:
+        print(
+            f"\n[{timestamp()}] Merge-Konflikt auf PR #{pr['number']} "
+            f"mit '{pr.get('baseRefName')}'.\n  {pr['url']}"
+        )
+
+    if failed:
+        print(f"\n[{timestamp()}] Fehlgeschlagener Build/Test auf PR #{pr['number']}:")
+        for item in failed:
+            print(f"  - {item.get('name', 'unbekannt')}: {item.get('state', 'UNKNOWN')}")
+            if item.get("link"):
+                print(f"    {item['link']}")
+
+    if events:
+        print(f"\n[{timestamp()}] Neue Aktivität auf PR #{pr['number']}:")
+        for event in events:
+            print(f"  - {event['kind']} von @{event['author']}")
+            print(f"    {event['text']}")
+            print(f"    {event['url']}")
+
+    if conflict:
+        notify(
+            f"GitHub PR #{pr['number']}",
+            f"Merge-Konflikt mit {pr.get('baseRefName')}",
+            notify_enabled,
+        )
+        return EXIT_MERGE_CONFLICT
+    if failed:
+        notify(
+            f"GitHub PR #{pr['number']}",
+            f"Check fehlgeschlagen: {failed[0].get('name', 'unbekannt')}",
+            notify_enabled,
+        )
+        return EXIT_CHECK_FAILED
+    if events:
+        notify(
+            f"GitHub PR #{pr['number']}",
+            f"Neue Aktivität: {events[0]['kind']}",
+            notify_enabled,
+        )
+        return EXIT_NEW_ACTIVITY
+    return None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Wartet auf fehlgeschlagene PR-Checks, neue Kommentare/Reviews "
+            "oder Merge-Konflikte."
+        )
+    )
+    parser.add_argument(
+        "pr",
+        nargs="?",
+        help="PR-Nummer, URL oder Branch; Standard: PR des aktuellen Branches",
+    )
+    parser.add_argument("-R", "--repo", help="[HOST/]OWNER/REPO")
+    parser.add_argument(
+        "--base",
+        default="main",
+        help="Erwarteter PR-Zielbranch (Standard: main)",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=15.0,
+        help="Polling-Intervall in Sekunden (Standard: 15)",
+    )
+    parser.add_argument(
+        "--ignore-check",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help=(
+            "fehlgeschlagenen Check anhand seines Namens ignorieren; "
+            "Shell-Globs wie 'Deploy *' sind erlaubt; mehrfach verwendbar"
+        ),
+    )
+    parser.add_argument(
+        "--ignore-existing-failures",
+        action="store_true",
+        help=(
+            "beim Start bereits rote Check-Läufe ignorieren; ein späterer neuer "
+            "oder erneut fehlschlagender Lauf wird weiterhin gemeldet"
+        ),
+    )
+    timeout_group = parser.add_mutually_exclusive_group()
+    timeout_group.add_argument(
+        "--timeout",
+        dest="timeout_seconds",
+        type=parse_duration,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        metavar="DAUER",
+        help=(
+            "maximale Laufzeit, z. B. 30s, 20m oder 2h; eine Zahl ohne Suffix "
+            "bedeutet Minuten; 0/off deaktiviert (Standard: 20m)"
+        ),
+    )
+    timeout_group.add_argument(
+        "--no-timeout",
+        dest="timeout_seconds",
+        action="store_const",
+        const=None,
+        help="maximale Laufzeit deaktivieren",
+    )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="Desktop-Benachrichtigung via notify-send deaktivieren",
+    )
+    args = parser.parse_args()
+    if args.interval < 5:
+        parser.error("--interval muss mindestens 5 Sekunden betragen")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    notify_enabled = not args.no_notify
+    started_at = time.monotonic()
+    deadline = (
+        None
+        if args.timeout_seconds is None
+        else started_at + float(args.timeout_seconds)
+    )
+
+    if not shutil.which("gh"):
+        print("Fehler: GitHub CLI 'gh' wurde nicht gefunden.", file=sys.stderr)
+        return EXIT_RUNTIME
+
+    try:
+        identity = identify_pr(args.pr, args.repo, deadline)
+        repo = repo_from_url(str(identity["url"]))
+        number = int(identity["number"])
+        pr = snapshot(repo, number, deadline)
+        ensure_base(pr, args.base)
+        inline = inline_comments(repo, number, deadline)
+        current_checks = checks(repo, number, deadline)
+        remaining_time(deadline)
+    except WatchTimeout:
+        print(
+            f"[{timestamp()}] Timeout nach {format_duration(args.timeout_seconds)}; "
+            "kein relevantes Ereignis festgestellt."
+        )
+        return EXIT_TIMEOUT
+    except GhError as exc:
+        print(f"Fehler: {exc}", file=sys.stderr)
+        return EXIT_CONFIGURATION
+
+    seen = {
+        "comments": ids(connection_nodes(pr, "comments")),
+        "reviews": ids(review_items(pr)),
+        "inline": ids(inline),
+    }
+    ignore_patterns = tuple(args.ignore_check)
+    ignored_existing_failure_ids = (
+        failed_check_ids(current_checks) if args.ignore_existing_failures else set()
+    )
+    reported_ignored_failures: set[str] = set()
+
+    print(
+        f"Überwache {repo['owner']}/{repo['name']} PR #{number}: {pr.get('title', '')}\n"
+        f"Zielbranch: {pr.get('baseRefName')} | Intervall: {args.interval:g} s | "
+        f"Timeout: {format_duration(args.timeout_seconds)}\n"
+        f"{pr['url']}"
+    )
+    print("Vorhandene Kommentare und Reviews gelten als Ausgangsstand.")
+    if ignore_patterns:
+        print("Dauerhafte Check-Ignore-Regeln: " + ", ".join(ignore_patterns))
+    if args.ignore_existing_failures:
+        print("Beim Start bereits fehlgeschlagene Check-Läufe werden ignoriert.")
+
+    # Vorhandene Fehler oder Konflikte erfordern sofortige Aufmerksamkeit.
+    exit_code = react(
+        pr,
+        current_checks,
+        [],
+        notify_enabled,
+        ignore_patterns=ignore_patterns,
+        ignored_existing_failure_ids=ignored_existing_failure_ids,
+        reported_ignored_failures=reported_ignored_failures,
+    )
+    if exit_code is not None:
+        return exit_code
+
+    errors = 0
+    while True:
+        try:
+            remaining = remaining_time(deadline)
+            sleep_seconds = args.interval if remaining is None else min(args.interval, remaining)
+            time.sleep(sleep_seconds)
+            remaining_time(deadline)
+
+            pr = snapshot(repo, number, deadline)
+            ensure_base(pr, args.base)
+            inline = inline_comments(repo, number, deadline)
+            current_checks = checks(repo, number, deadline)
+            remaining_time(deadline)
+            events = collect_new_events(pr, inline, seen)
+            errors = 0
+        except KeyboardInterrupt:
+            print("\nÜberwachung beendet.")
+            return 130
+        except WatchTimeout:
+            print(
+                f"\n[{timestamp()}] Timeout nach "
+                f"{format_duration(args.timeout_seconds)}; "
+                "kein relevantes Ereignis festgestellt."
+            )
+            return EXIT_TIMEOUT
+        except ConfigError as exc:
+            print(f"\nKonfigurationsfehler: {exc}", file=sys.stderr)
+            notify(f"GitHub PR #{number}", "PR-Zielbranch wurde geändert", notify_enabled)
+            return EXIT_CONFIGURATION
+        except GhError as exc:
+            errors += 1
+            print(f"[{timestamp()}] Temporärer Abruffehler ({errors}): {exc}", file=sys.stderr)
+            continue
+
+        exit_code = react(
+            pr,
+            current_checks,
+            events,
+            notify_enabled,
+            ignore_patterns=ignore_patterns,
+            ignored_existing_failure_ids=ignored_existing_failure_ids,
+            reported_ignored_failures=reported_ignored_failures,
+        )
+        if exit_code is not None:
+            return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
