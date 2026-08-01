@@ -278,6 +278,9 @@ impl ClientEndpointPathKind {
 
 #[derive(Debug, Default)]
 struct ClientEndpointState {
+    /// Every newly constructed route remains on probation until a foreground
+    /// request or a background health probe succeeds on that exact route.
+    foreground_validated: bool,
     ewma_latency_ms: Option<f64>,
     ewma_throughput_bytes_per_sec: Option<f64>,
     consecutive_failures: u32,
@@ -716,6 +719,118 @@ impl ClientEndpointRouter {
             .collect()
     }
 
+    /// Foreground traffic is intentionally more conservative than quality
+    /// ranking. A selectable, validated active route is sticky. Routes still
+    /// on probation are ordered behind every selectable validated route, so
+    /// they remain available only as same-request fallback or bootstrap paths.
+    fn foreground_route_indices(&self) -> Vec<usize> {
+        let now_unix_ms = unix_ts_ms();
+        let active_index = self.active_index();
+        let endpoints = self.endpoints_snapshot();
+        let mut validated_available = Vec::new();
+        let mut probation_available = Vec::new();
+        let mut cooling = Vec::new();
+
+        for index in self.rank_indices() {
+            let Some(endpoint) = endpoints.get(index) else {
+                continue;
+            };
+            let state = lock_endpoint_state(&endpoint.state);
+            if state
+                .circuit_open_until_unix_ms
+                .is_some_and(|until_unix_ms| until_unix_ms > now_unix_ms)
+            {
+                cooling.push(index);
+            } else if state.foreground_validated {
+                validated_available.push(index);
+            } else {
+                probation_available.push(index);
+            }
+        }
+
+        if !validated_available.is_empty() {
+            if let Some(active_index) = active_index {
+                if let Some(active_position) = validated_available
+                    .iter()
+                    .position(|index| *index == active_index)
+                {
+                    validated_available.swap(0, active_position);
+                }
+            }
+            validated_available.extend(probation_available);
+            validated_available.extend(cooling);
+            return validated_available;
+        }
+
+        if !probation_available.is_empty() {
+            probation_available.extend(cooling);
+            return probation_available;
+        }
+
+        cooling
+    }
+
+    /// A successful background probe both validates a route and allows it to
+    /// become active when it beats the current active route even after the
+    /// active-route hysteresis bonus. This preserves background optimization
+    /// while foreground requests remain active-first.
+    fn promote_validated_route_if_better(&self, index: usize) {
+        let Some(candidate) = self.endpoint(index) else {
+            return;
+        };
+        let now_unix_ms = unix_ts_ms();
+        let active_index = self.active_index();
+        let candidate_state = lock_endpoint_state(&candidate.state);
+        if !candidate_state.foreground_validated
+            || candidate_state
+                .circuit_open_until_unix_ms
+                .is_some_and(|until_unix_ms| until_unix_ms > now_unix_ms)
+        {
+            return;
+        }
+        let Some(active_index) = active_index else {
+            drop(candidate_state);
+            self.set_active_index(index);
+            return;
+        };
+        if active_index == index {
+            return;
+        }
+        let candidate_score = endpoint_score(
+            index,
+            Some(active_index),
+            &candidate.descriptor,
+            &candidate_state,
+        );
+        drop(candidate_state);
+
+        let Some(active) = self.endpoint(active_index) else {
+            if self.active_index() == Some(active_index) {
+                self.set_active_index(index);
+            }
+            return;
+        };
+        let active_state = lock_endpoint_state(&active.state);
+        let active_is_cooling = active_state
+            .circuit_open_until_unix_ms
+            .is_some_and(|until_unix_ms| until_unix_ms > now_unix_ms);
+        let active_is_validated = active_state.foreground_validated;
+        let active_score = endpoint_score(
+            active_index,
+            Some(active_index),
+            &active.descriptor,
+            &active_state,
+        );
+        drop(active_state);
+
+        let should_promote = !active_is_validated
+            || active_is_cooling
+            || compare_scores(candidate_score, active_score, index, active_index).is_lt();
+        if should_promote && self.active_index() == Some(active_index) {
+            self.set_active_index(index);
+        }
+    }
+
     fn claim_background_probe_candidates(&self) -> Vec<(usize, ClientEndpoint)> {
         let endpoints = self.endpoints_snapshot();
         if endpoints.len() <= 1 {
@@ -757,6 +872,7 @@ impl ClientEndpointRouter {
         let Some(endpoint) = self.endpoint(index) else {
             return;
         };
+        let probe_succeeded = !latency_samples_ms.is_empty();
         let mut state = lock_endpoint_state(&endpoint.state);
         let first_relay_connection = !latency_samples_ms.is_empty()
             && state.total_successes == 0
@@ -773,6 +889,9 @@ impl ClientEndpointRouter {
             state.background_probe_in_flight = false;
         }
         drop(state);
+        if probe_succeeded {
+            self.promote_validated_route_if_better(index);
+        }
         if first_relay_connection {
             self.notify_first_relay_connection(index, &endpoint);
         }
@@ -1280,6 +1399,7 @@ fn record_endpoint_success_sample(
     bytes_transferred: usize,
     background_probe: bool,
 ) {
+    state.foreground_validated = true;
     state.ewma_latency_ms = Some(update_ewma(state.ewma_latency_ms, latency_ms));
     if latency_ms > 0.0 && bytes_transferred > 0 {
         let throughput_bytes_per_sec = bytes_transferred as f64 / (latency_ms / 1000.0);
@@ -3092,7 +3212,7 @@ impl IronMeshClient {
     }
 
     fn route_indices_for_affinity(&self, affinity: Option<&UploadSessionAffinity>) -> Vec<usize> {
-        let ranked = self.transport_router.rank_indices();
+        let ranked = self.transport_router.foreground_route_indices();
         let Some(affinity) = affinity else {
             return ranked;
         };
@@ -3434,7 +3554,7 @@ impl IronMeshClient {
             url,
             headers,
             body,
-            &self.transport_router.rank_indices(),
+            &self.transport_router.foreground_route_indices(),
         )
         .await
     }
@@ -4027,7 +4147,7 @@ impl IronMeshClient {
         auth_headers.append(&mut headers);
         let mut last_error = None;
 
-        for index in self.transport_router.rank_indices() {
+        for index in self.transport_router.foreground_route_indices() {
             let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
@@ -4137,7 +4257,7 @@ impl IronMeshClient {
         let mut last_error = None;
         let mut body_stream = Some(Box::pin(body_stream) as RequestBodyStream);
 
-        for index in self.transport_router.rank_indices() {
+        for index in self.transport_router.foreground_route_indices() {
             let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
@@ -4320,10 +4440,10 @@ impl IronMeshClient {
                 url,
                 vec![json_content_type_header()],
                 Some(payload),
-                &self.transport_router.rank_indices(),
-            )
-            .await
-            .with_context(|| format!("failed to start upload session for key={key}"))?;
+            &self.transport_router.foreground_route_indices(),
+        )
+        .await
+        .with_context(|| format!("failed to start upload session for key={key}"))?;
         let response = routed.response;
         if !response.status.is_success() {
             bail!(
@@ -4571,7 +4691,7 @@ impl IronMeshClient {
 
         let mut last_error = None;
         let mut response = None;
-        for index in self.transport_router.rank_indices() {
+        for index in self.transport_router.foreground_route_indices() {
             let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
