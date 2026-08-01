@@ -4276,7 +4276,10 @@ async fn background_probe_reprioritizes_recovered_direct_endpoint() {
         .get_json_path("/cluster/status")
         .await
         .expect("third request should attempt the reprobed route");
-    assert!(matches!(third["route"].as_str(), Some("fallback" | "primary")));
+    assert!(matches!(
+        third["route"].as_str(),
+        Some("fallback" | "primary")
+    ));
     assert!(primary_state.health_hits.load(Ordering::SeqCst) >= 1);
     assert!(fallback_state.cluster_status_hits.load(Ordering::SeqCst) >= 2);
 
@@ -4518,7 +4521,10 @@ async fn background_probe_reprioritizes_recovered_relay_endpoint() {
         .get_json_path("/cluster/status")
         .await
         .expect("request after background probe should succeed");
-    assert!(matches!(third["route"].as_str(), Some("fallback" | "primary")));
+    assert!(matches!(
+        third["route"].as_str(),
+        Some("fallback" | "primary")
+    ));
     assert!(primary_state.health_hits.load(Ordering::SeqCst) >= 1);
     assert!(fallback_state.paired_session_count.load(Ordering::SeqCst) >= 1);
 

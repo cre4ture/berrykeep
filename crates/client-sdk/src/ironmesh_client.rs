@@ -4440,10 +4440,10 @@ impl IronMeshClient {
                 url,
                 vec![json_content_type_header()],
                 Some(payload),
-            &self.transport_router.foreground_route_indices(),
-        )
-        .await
-        .with_context(|| format!("failed to start upload session for key={key}"))?;
+                &self.transport_router.foreground_route_indices(),
+            )
+            .await
+            .with_context(|| format!("failed to start upload session for key={key}"))?;
         let response = routed.response;
         if !response.status.is_success() {
             bail!(
