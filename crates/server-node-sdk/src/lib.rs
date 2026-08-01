@@ -351,6 +351,8 @@ struct ServerNetworkRuntime {
     primary_public_direct_url: Option<String>,
     primary_peer_direct_url: Option<String>,
     advertised_direct_endpoints: Arc<StdMutex<Vec<BootstrapEndpoint>>>,
+    configured_rendezvous_urls: Arc<StdMutex<Vec<String>>>,
+    cluster_rendezvous_contact_urls: Arc<StdMutex<Vec<String>>>,
     rendezvous_urls: Arc<StdMutex<Vec<String>>>,
     rendezvous_registration_enabled: bool,
     rendezvous_mtls_required: bool,
@@ -4523,12 +4525,102 @@ fn current_rendezvous_urls(state: &ServerState) -> Vec<String> {
         .clone()
 }
 
-fn replace_rendezvous_urls(state: &ServerState, urls: Vec<String>) {
+fn current_configured_rendezvous_urls(state: &ServerState) -> Vec<String> {
+    state
+        .network
+        .configured_rendezvous_urls
+        .lock()
+        .expect("configured rendezvous URL mutex poisoned")
+        .clone()
+}
+
+fn current_cluster_rendezvous_contact_urls(state: &ServerState) -> Vec<String> {
+    state
+        .network
+        .cluster_rendezvous_contact_urls
+        .lock()
+        .expect("cluster rendezvous contact URL mutex poisoned")
+        .clone()
+}
+
+fn combine_rendezvous_urls(
+    configured_urls: &[String],
+    cluster_contact_urls: &[String],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut combined = Vec::with_capacity(configured_urls.len() + cluster_contact_urls.len());
+
+    for url in configured_urls.iter().chain(cluster_contact_urls) {
+        if seen.insert(url.clone()) {
+            combined.push(url.clone());
+        }
+    }
+
+    combined
+}
+
+fn replace_configured_rendezvous_urls(state: &ServerState, configured_urls: Vec<String>) -> bool {
+    let cluster_contact_urls = current_cluster_rendezvous_contact_urls(state);
+    let effective_urls = combine_rendezvous_urls(&configured_urls, &cluster_contact_urls);
+
+    *state
+        .network
+        .configured_rendezvous_urls
+        .lock()
+        .expect("configured rendezvous URL mutex poisoned") = configured_urls;
+
+    let mut current_urls = state
+        .network
+        .rendezvous_urls
+        .lock()
+        .expect("rendezvous URL mutex poisoned");
+    if *current_urls == effective_urls {
+        return false;
+    }
+    *current_urls = effective_urls;
+    true
+}
+
+async fn synchronize_cluster_rendezvous_contact_urls(state: &ServerState) -> Result<bool> {
+    let cluster_contact_urls =
+        rendezvous_contact_config::load_current_rendezvous_urls(state).await?;
+    let configured_urls = current_configured_rendezvous_urls(state);
+    let effective_urls = combine_rendezvous_urls(&configured_urls, &cluster_contact_urls);
+
+    let contacts_changed = {
+        let mut current_contacts = state
+            .network
+            .cluster_rendezvous_contact_urls
+            .lock()
+            .expect("cluster rendezvous contact URL mutex poisoned");
+        if *current_contacts == cluster_contact_urls {
+            false
+        } else {
+            *current_contacts = cluster_contact_urls;
+            true
+        }
+    };
+
+    if !contacts_changed {
+        return Ok(false);
+    }
+
     *state
         .network
         .rendezvous_urls
         .lock()
-        .expect("rendezvous URL mutex poisoned") = urls;
+        .expect("rendezvous URL mutex poisoned") = effective_urls;
+    reload_live_outbound_clients(state).await?;
+    sync_rendezvous_registration_state(state).await;
+
+    info!(
+        node_id = %state.node_id,
+        configured_rendezvous_url_count = configured_urls.len(),
+        cluster_rendezvous_contact_url_count = current_cluster_rendezvous_contact_urls(state).len(),
+        effective_rendezvous_url_count = current_rendezvous_urls(state).len(),
+        "applied replicated rendezvous contact list to server registration"
+    );
+    Ok(true)
 }
 
 async fn try_start_direct_quic_runtime(
@@ -4948,8 +5040,8 @@ async fn rendezvous_registration_views(
 }
 
 fn current_editable_rendezvous_urls(state: &ServerState) -> Vec<String> {
-    let urls = normalize_rendezvous_url_list(&current_rendezvous_urls(state))
-        .unwrap_or_else(|_| current_rendezvous_urls(state));
+    let urls = normalize_rendezvous_url_list(&current_configured_rendezvous_urls(state))
+        .unwrap_or_else(|_| current_configured_rendezvous_urls(state));
     match state
         .network
         .managed_rendezvous_public_url
@@ -7208,6 +7300,8 @@ async fn run_inner(
             primary_public_direct_url: normalize_optional_url(Some(public_url.as_str())),
             primary_peer_direct_url: normalize_optional_url(Some(internal_url.as_str())),
             advertised_direct_endpoints: Arc::new(StdMutex::new(advertised_direct_endpoints)),
+            configured_rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls.clone())),
+            cluster_rendezvous_contact_urls: Arc::new(StdMutex::new(Vec::new())),
             rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls)),
             rendezvous_registration_enabled: config.rendezvous_registration_enabled,
             rendezvous_mtls_required: config.rendezvous_mtls_required,
@@ -7363,6 +7457,13 @@ async fn start_background_runtimes(
     }
 
     if state.network.rendezvous_registration_enabled {
+        if let Err(err) = synchronize_cluster_rendezvous_contact_urls(state).await {
+            warn!(
+                error = %err,
+                node_id = %state.node_id,
+                "failed applying replicated rendezvous contact list during startup"
+            );
+        }
         spawn_rendezvous_peer_discovery(state.clone(), config.replica_view_sync_interval_secs);
         spawn_rendezvous_presence_heartbeat(state.clone(), config.peer_heartbeat_interval_secs);
 
@@ -8381,6 +8482,13 @@ fn spawn_rendezvous_presence_heartbeat(
             .min(connected_interval);
 
         loop {
+            if let Err(err) = synchronize_cluster_rendezvous_contact_urls(&state).await {
+                warn!(
+                    error = %err,
+                    node_id = %state.node_id,
+                    "failed refreshing replicated rendezvous contact list for server registration"
+                );
+            }
             refresh_local_node_storage(&state).await;
 
             let local_descriptor = {
@@ -23963,7 +24071,7 @@ async fn update_rendezvous_config(
         Err(status) => return status.into_response(),
     };
 
-    let effective_urls = match build_effective_rendezvous_urls(&state, &request.editable_urls) {
+    let configured_urls = match build_effective_rendezvous_urls(&state, &request.editable_urls) {
         Ok(urls) => urls,
         Err(err) => {
             append_admin_audit(
@@ -23984,6 +24092,11 @@ async fn update_rendezvous_config(
                 .into_response();
         }
     };
+
+    let effective_urls = combine_rendezvous_urls(
+        &configured_urls,
+        &current_cluster_rendezvous_contact_urls(&state),
+    );
 
     let outbound_clients = match build_outbound_clients_with_urls(&state, &effective_urls) {
         Ok(clients) => clients,
@@ -24007,7 +24120,7 @@ async fn update_rendezvous_config(
         }
     };
 
-    let persisted = match persist_rendezvous_urls_if_possible(&state, &effective_urls) {
+    let persisted = match persist_rendezvous_urls_if_possible(&state, &configured_urls) {
         Ok(persisted) => persisted,
         Err(err) => {
             append_admin_audit(
@@ -24029,7 +24142,7 @@ async fn update_rendezvous_config(
         }
     };
 
-    replace_rendezvous_urls(&state, effective_urls);
+    replace_configured_rendezvous_urls(&state, configured_urls);
     replace_outbound_clients(&state, outbound_clients).await;
     sync_rendezvous_registration_state(&state).await;
     let view = build_rendezvous_config_view(&state, persisted).await;

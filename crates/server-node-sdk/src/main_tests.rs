@@ -16168,6 +16168,10 @@ async fn build_test_state(
             rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
                 "http://127.0.0.1:39080".to_string(),
             ])),
+            configured_rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
+                "http://127.0.0.1:39080".to_string(),
+            ])),
+            cluster_rendezvous_contact_urls: Arc::new(std::sync::Mutex::new(Vec::new())),
             rendezvous_registration_enabled: false,
             rendezvous_mtls_required: false,
             managed_rendezvous_public_url: None,

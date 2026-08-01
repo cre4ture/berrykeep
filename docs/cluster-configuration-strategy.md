@@ -83,6 +83,14 @@ client API. The list is deliberately separate from a node's local listener,
 TLS, and bootstrap configuration. Those settings must exist before a client
 can make its first authenticated connection.
 
+Each server node periodically applies the locally replicated document to its
+outbound rendezvous registration set. The listed services are added alongside,
+not instead of, the node's local bootstrap services, so existing recovery
+anchors remain usable. A node reloads the affected registration clients when
+the document changes. This lets an operator publish a replacement service once
+through the cluster configuration and have every node register there after the
+object has replicated.
+
 Clients retain their original bootstrap contacts as recovery anchors. The
 managed client refreshes this document only after it has a signed client
 identity and can call the authenticated cluster API. It accepts the response
