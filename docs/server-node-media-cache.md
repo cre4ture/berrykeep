@@ -69,6 +69,7 @@ This prevents repeated expensive decode attempts on every listing while still al
 Related design note:
 
 - `docs/gallery-map-view-design-note.md`
+- `docs/gallery-sync-and-viewport-api.md`
 
 ## API
 

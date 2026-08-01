@@ -1,6 +1,7 @@
 import type { LogsResponse, ServerLogEntry } from "../shared/logs";
 import type {
   StoreIndexEntry,
+  StoreIndexDeltaResponse,
   StoreIndexMediaSummary,
   StoreIndexResponse,
   StoreListMediaFilter,
@@ -244,6 +245,7 @@ export type StoreEntry = StoreIndexEntry;
 export type StoreListResponse = StoreIndexResponse;
 
 export type {
+  StoreIndexDeltaResponse,
   LogsResponse,
   ServerLogEntry,
   StoreIndexMediaSummary,

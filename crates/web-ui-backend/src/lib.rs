@@ -16,9 +16,10 @@ use client_sdk::{
     LatencyProbeConfig, LatencyProbeResult, RelayMode, RendezvousClientConfig,
     RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
     RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
-    StoreIndexView, UploadMode, build_client_with_optional_identity_from_planned_target,
-    build_http_client_from_pem, build_http_client_with_identity_from_pem,
-    compare_direct_and_relay_latency, ironmesh_client::DownloadRangeRequest,
+    StoreIndexView, StoreIndexViewport, UploadMode,
+    build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
+    ironmesh_client::DownloadRangeRequest,
 };
 use common::logging::{LogBuffer, LogBufferEntry};
 use reqwest::Url;
@@ -407,6 +408,7 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/cluster/nodes", get(web_cluster_nodes))
         .route("/cluster/replication/plan", get(web_replication_plan))
         .route("/store/list", get(web_store_list))
+        .route("/store/index/delta", get(web_store_index_delta))
         .route("/store/get", get(web_store_get))
         .route("/store/put", post(web_store_put))
         .route("/store/rename", post(web_store_rename))
@@ -468,6 +470,7 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/cluster/nodes", get(web_cluster_nodes))
         .route("/api/cluster/replication/plan", get(web_replication_plan))
         .route("/api/store/list", get(web_store_list))
+        .route("/api/store/index/delta", get(web_store_index_delta))
         .route("/api/store/get", get(web_store_get))
         .route("/api/store/put", post(web_store_put))
         .route("/api/store/rename", post(web_store_rename))
@@ -616,6 +619,16 @@ struct WebStoreListQuery {
     limit: Option<usize>,
     sort: Option<String>,
     media_filter: Option<String>,
+    south: Option<f64>,
+    west: Option<f64>,
+    north: Option<f64>,
+    east: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreIndexDeltaQuery {
+    token: String,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2715,6 +2728,21 @@ async fn web_store_list(
             );
         }
     };
+    let viewport = match (query.south, query.west, query.north, query.east) {
+        (None, None, None, None) => None,
+        (Some(south), Some(west), Some(north), Some(east)) => Some(StoreIndexViewport {
+            south,
+            west,
+            north,
+            east,
+        }),
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "south, west, north, and east must be provided together",
+            );
+        }
+    };
 
     match current_sdk(&state)
         .await
@@ -2730,6 +2758,7 @@ async fn web_store_list(
                 limit: query.limit,
                 sort,
                 media_filter,
+                viewport,
                 synthesize_missing_folder_markers: matches!(view, Some(StoreIndexView::Tree))
                     && query.offset.is_none()
                     && query.limit.is_none()
@@ -2744,6 +2773,39 @@ async fn web_store_list(
             &state,
             StatusCode::BAD_GATEWAY,
             "store list request failed",
+            err.to_string(),
+        ),
+    }
+}
+
+async fn web_store_index_delta(
+    State(state): State<WebState>,
+    Query(query): Query<WebStoreIndexDeltaQuery>,
+) -> impl IntoResponse {
+    if query.token.trim().is_empty()
+        || !query
+            .token
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return error_response(StatusCode::BAD_REQUEST, "token is malformed");
+    }
+    let mut path = format!("/store/index/delta?token={}", query.token);
+    if let Some(limit) = query.limit {
+        path.push_str(&format!("&limit={}", limit.max(1)));
+    }
+    match current_sdk(&state).await.get_relative_path(&path).await {
+        Ok(response) => {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+                headers.insert(CONTENT_TYPE, value);
+            }
+            (response.status, headers, response.body).into_response()
+        }
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store index delta request failed",
             err.to_string(),
         ),
     }

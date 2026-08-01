@@ -7,6 +7,7 @@ import type {
 } from "../shared/map-config";
 import type {
   StoreIndexEntry,
+  StoreIndexDeltaResponse,
   StoreIndexMediaSummary,
   StoreIndexResponse,
   StoreListMediaFilter,
@@ -43,6 +44,7 @@ export type AdminStoreGetResponse = {
 export type AdminVersionGraphResponse = VersionGraphResponse;
 
 export type {
+  StoreIndexDeltaResponse,
   StoreIndexMediaSummary,
   StoreListMediaFilter,
   StoreListRequestOptions,
