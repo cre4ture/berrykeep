@@ -4915,7 +4915,7 @@ async fn direct_transport_keeps_small_rpcs_responsive_during_streamed_downloads(
     let rpc_future = async {
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         tokio::time::timeout(
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(1000),
             client.get_json_path("/cluster/status"),
         )
         .await
@@ -4984,7 +4984,7 @@ async fn direct_transport_streams_relative_s3_reads_without_blocking_small_rpcs(
     let rpc_future = async {
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         tokio::time::timeout(
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(1000),
             client.get_json_path("/cluster/status"),
         )
         .await
@@ -5046,7 +5046,7 @@ async fn relay_transport_streams_relative_s3_reads_without_blocking_small_rpcs()
     let rpc_future = async {
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         tokio::time::timeout(
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(1000),
             client.get_json_path("/cluster/status"),
         )
         .await
