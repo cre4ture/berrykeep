@@ -11517,6 +11517,21 @@ pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
                 }
             };
 
+            if import_changed
+                && bundle.key
+                    == rendezvous_contact_config::RENDEZVOUS_CONTACT_CONFIGURATION_STORAGE_KEY
+            {
+                if let Err(err) =
+                    synchronize_cluster_rendezvous_contact_urls(state).await
+                {
+                    warn!(
+                        key = %bundle.key,
+                        error = %err,
+                        "failed to apply rendezvous contact configuration after metadata import"
+                    );
+                }
+            }
+
             if import_changed {
                 imported_any = true;
             }
