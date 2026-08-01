@@ -38,20 +38,6 @@ and the corresponding release-signing credentials. For pull requests from
 forks, GitHub does not expose these secrets to the standard `pull_request`
 workflow, so the release legs remain unavailable there by design.
 
-## iOS release archive builds on pull requests
-
-Pull requests run the `ios-build` simulator test suite by default but skip the
-`Release` archive, signing/export, and artifact-upload steps. To request them,
-add the `ci:ios-release` label to the pull request. The label triggers a
-workflow run immediately and remains effective for later pushes to the pull
-request while it is present.
-
-Ordinary `main` pushes, tag pushes, and manual `workflow_dispatch` runs always
-build the `Release` archive, matching the Android release-variant behavior.
-The `ios-build` job still reports `success` on a pull request without the
-label: the skipped steps are not failures, so the `Required CI` aggregate
-check (which depends on `ios-build`) is unaffected.
-
 ## Required checks (branch protection alignment)
 
 For branch `main`, require these stable aggregate status checks:
@@ -161,9 +147,7 @@ The `ios-build` lane runs on `macos-latest` and covers:
 - `cargo test -p ios-app`
 - `swift test` in `apps/apple-file-provider`
 - `xcodebuild test` for the `IronmeshIosProject` scheme on a dynamically selected iPhone simulator, with an explicit boot-and-wait step to avoid flaky first-launch failures on macOS runners
-- a `Release` archive for `IronmeshIosApp`, on pushes/tags/manual runs or on a
-  pull request labeled `ci:ios-release` (see
-  [iOS release archive builds on pull requests](#ios-release-archive-builds-on-pull-requests))
+- a `Release` archive for `IronmeshIosApp`
 
 The `IronmeshIosProject` XCTest bundle is intentionally unhosted: it links only the shared Apple modules and no longer depends on launching `IronmeshIosApp` in the simulator.
 
