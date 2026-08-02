@@ -2622,7 +2622,19 @@ async fn web_map_font_range(
     }
 
     let path = glyphs_root.join(&fontstack).join(&range);
-    if !path.starts_with(&glyphs_root) {
+    // Defense in depth: even though `is_safe_fontstack_segment` and
+    // `is_safe_glyph_range_segment` should already reject path separators and
+    // literal ".." components, guard against any lexical path traversal by
+    // rejecting `..`/`.` components outright and verifying the joined path is
+    // still lexically contained within `glyphs_root`. `Path::starts_with`
+    // compares components, not resolved filesystem locations, so it must be
+    // combined with the component check to be meaningful for unresolved
+    // (non-canonicalized) paths like this one.
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+        || !path.starts_with(&glyphs_root)
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
@@ -2647,11 +2659,16 @@ async fn web_map_font_range(
 }
 
 fn is_safe_fontstack_segment(value: &str) -> bool {
-    !value.trim().is_empty()
+    // Note: `value.split('.').any(|segment| segment == "..")` would NOT catch
+    // `value == ".."` (splitting ".." on '.' yields ["", "", ""], never "..").
+    // Compare the whole (trimmed) value against "." / ".." directly instead.
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed != "."
+        && trimmed != ".."
         && !value.contains('/')
         && !value.contains('\\')
         && !value.contains('\0')
-        && !value.split('.').any(|segment| segment == "..")
 }
 
 fn is_safe_glyph_range_segment(value: &str) -> bool {
@@ -4027,5 +4044,48 @@ mod tests {
 
         server.abort();
         upstream.abort();
+    }
+
+    #[test]
+    fn is_safe_fontstack_segment_rejects_traversal_and_separators() {
+        use super::is_safe_fontstack_segment;
+
+        // Legitimate fontstack names should still be accepted.
+        assert!(is_safe_fontstack_segment("Open Sans Regular"));
+        assert!(is_safe_fontstack_segment("Arial Unicode MS Regular"));
+
+        // Path traversal / separator attempts must be rejected.
+        assert!(!is_safe_fontstack_segment(".."));
+        assert!(!is_safe_fontstack_segment("."));
+        assert!(!is_safe_fontstack_segment("../../etc/passwd"));
+        assert!(!is_safe_fontstack_segment("..\\..\\windows"));
+        assert!(!is_safe_fontstack_segment("foo/../bar"));
+        assert!(!is_safe_fontstack_segment(""));
+        assert!(!is_safe_fontstack_segment("   "));
+    }
+
+    #[tokio::test]
+    async fn web_map_font_range_rejects_path_traversal_segments() {
+        use super::{is_safe_fontstack_segment, is_safe_glyph_range_segment};
+
+        // Regression coverage for the route-level guard used by
+        // `web_map_font_range`: a ".." fontstack must never be treated as a
+        // safe path component, since `Path::starts_with` alone does not
+        // resolve ".." components in a non-canonicalized joined path.
+        assert!(!is_safe_fontstack_segment(".."));
+        assert!(is_safe_glyph_range_segment("0-255.pbf"));
+
+        let glyphs_root = std::path::PathBuf::from("/tmp/ironmesh-test-glyphs-root");
+        let fontstack = "..".to_string();
+        let range = "0-255.pbf".to_string();
+        let path = glyphs_root.join(&fontstack).join(&range);
+        let escapes_root = path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+            || !path.starts_with(&glyphs_root);
+        assert!(
+            escapes_root,
+            "a '..' fontstack segment must be detected as escaping the glyphs root"
+        );
     }
 }
