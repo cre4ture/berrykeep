@@ -31,7 +31,7 @@ use super::{
 pub(super) struct TursoMetadataStore {
     _database: turso::Database,
     connection: turso::Connection,
-    gallery_writer_lock: tokio::sync::Mutex<()>,
+    writer_lock: tokio::sync::Mutex<()>,
     gallery_readers: Vec<tokio::sync::Mutex<turso::Connection>>,
     next_gallery_reader: AtomicUsize,
     metadata_path: PathBuf,
@@ -76,7 +76,7 @@ impl TursoMetadataStore {
         let store = Self {
             _database: db,
             connection: conn,
-            gallery_writer_lock: tokio::sync::Mutex::new(()),
+            writer_lock: tokio::sync::Mutex::new(()),
             gallery_readers,
             next_gallery_reader: AtomicUsize::new(0),
             metadata_path: metadata_path.to_path_buf(),
@@ -253,6 +253,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         attempts: &HashMap<String, RepairAttemptRecord>,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -573,6 +574,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -622,6 +624,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -749,6 +752,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_s3_control_plane_state(&self, state: &S3ControlPlaneState) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -1650,6 +1654,7 @@ impl MetadataStore for TursoMetadataStore {
             return Ok(());
         }
 
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             for chunk in snapshot_ids.chunks(TURSO_SNAPSHOT_DELETE_BATCH_SIZE) {
@@ -2070,6 +2075,7 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
         let payload = serde_json::to_vec_pretty(sample)?;
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection

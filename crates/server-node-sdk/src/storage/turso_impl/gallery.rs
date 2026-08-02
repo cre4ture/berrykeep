@@ -173,7 +173,7 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
 
 impl TursoMetadataStore {
     pub(super) async fn backfill_gallery_objects(&self) -> Result<()> {
-        let _writer = self.gallery_writer_lock.lock().await;
+        let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -217,7 +217,7 @@ impl TursoMetadataStore {
         key: &str,
         entry: &CurrentObjectEntry,
     ) -> Result<()> {
-        let _writer = self.gallery_writer_lock.lock().await;
+        let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -239,7 +239,7 @@ impl TursoMetadataStore {
     }
 
     pub(super) async fn remove_current_object_with_gallery(&self, key: &str) -> Result<()> {
-        let _writer = self.gallery_writer_lock.lock().await;
+        let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -262,7 +262,7 @@ impl TursoMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(metadata)?;
         let content_fingerprint = metadata.content_fingerprint.clone();
-        let _writer = self.gallery_writer_lock.lock().await;
+        let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -296,7 +296,7 @@ impl TursoMetadataStore {
         &self,
         content_fingerprint: &str,
     ) -> Result<()> {
-        let _writer = self.gallery_writer_lock.lock().await;
+        let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -327,7 +327,7 @@ impl TursoMetadataStore {
         content_fingerprint: &str,
         payload: &[u8],
     ) -> Result<bool> {
-        let _writer = self.gallery_writer_lock.lock().await;
+        let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -362,7 +362,7 @@ impl TursoMetadataStore {
     ) -> Result<()> {
         let total_size_bytes =
             i64::try_from(summary.total_size_bytes).context("manifest summary size overflow")?;
-        let _writer = self.gallery_writer_lock.lock().await;
+        let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -401,7 +401,7 @@ impl TursoMetadataStore {
         index: &FileVersionIndex,
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
-        let _writer = self.gallery_writer_lock.lock().await;
+        let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -1270,7 +1270,7 @@ fn row_opt_f64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<f64>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::MediaCacheStatus;
+    use crate::storage::{MediaCacheStatus, MetadataStore, RepairAttemptRecord};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn turso_test_db_path(name: &str) -> std::path::PathBuf {
@@ -1629,6 +1629,35 @@ mod tests {
             2,
             "both writes should remain committed"
         );
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_writes_share_the_turso_writer_with_other_transactions() {
+        let metadata_db_path = turso_test_db_path("gallery-shared-writer-lock");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let entry = CurrentObjectEntry {
+            manifest_hash: "manifest-shared-writer".to_string(),
+            object_id: "object-shared-writer".to_string(),
+        };
+        let attempts = std::collections::HashMap::from([(
+            "gallery/shared-writer.jpg".to_string(),
+            RepairAttemptRecord {
+                attempts: 1,
+                last_failure_unix: 2,
+            },
+        )]);
+
+        let (gallery, repair) = tokio::join!(
+            store.upsert_current_object_with_gallery("gallery/shared-writer.jpg", &entry),
+            store.persist_repair_attempts(&attempts),
+        );
+        gallery.expect("gallery write should commit");
+        repair.expect("repair attempt write should commit");
 
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
