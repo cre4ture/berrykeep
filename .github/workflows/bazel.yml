@@ -65,7 +65,7 @@ jobs:
 
       - name: Start GitHub-backed Bazel cache
         id: bazel-cache
-        uses: cre4ture/bazel-github-actions-cache-v2@282fea6d5654cf9f04567f9208a3612f97b2ba41 # v0.2.0
+        uses: cre4ture/bazel-github-actions-cache-v2@732009fa8c3555f17b44de75ede21c62cc627b35 # v0.2.1
         with:
           # Fine-grained publication is intentionally limited to an explicit
           # maintainer seed because one GitHub cache entry per Bazel object can
