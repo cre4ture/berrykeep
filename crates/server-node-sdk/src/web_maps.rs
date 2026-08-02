@@ -786,11 +786,18 @@ async fn get_or_create_mbtiles_source(
 }
 
 fn is_safe_fontstack_segment(value: &str) -> bool {
-    !value.trim().is_empty()
+    // Note: `value.split('.').any(|segment| segment == "..")` would NOT catch
+    // `value == ".."` (splitting ".." on '.' yields ["", "", ""], never "..").
+    // Compare the whole (trimmed) value against "." / ".." directly instead.
+    // `resolve_glyph_asset_path` also independently rejects non-single-segment
+    // and "."/".." components, so this is defense in depth.
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed != "."
+        && trimmed != ".."
         && !value.contains('/')
         && !value.contains('\\')
         && !value.contains('\0')
-        && !value.split('.').any(|segment| segment == "..")
 }
 
 fn is_safe_glyph_range_segment(value: &str) -> bool {
@@ -834,7 +841,9 @@ fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorResponseBody, error_response, resolve_glyph_asset_path};
+    use super::{
+        ErrorResponseBody, error_response, is_safe_fontstack_segment, resolve_glyph_asset_path,
+    };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use std::path::Path as FsPath;
@@ -868,6 +877,21 @@ mod tests {
         assert!(
             resolve_glyph_asset_path(glyphs_root, "Noto Sans Regular", "../0-255.pbf").is_none()
         );
+        // A bare ".." fontstack (no slash) must also be rejected: it is a
+        // single path component that still traverses to the parent directory.
+        assert!(resolve_glyph_asset_path(glyphs_root, "..", "0-255.pbf").is_none());
+        assert!(resolve_glyph_asset_path(glyphs_root, ".", "0-255.pbf").is_none());
+    }
+
+    #[test]
+    fn is_safe_fontstack_segment_rejects_dot_segments() {
+        // Regression test: splitting on '.' would never produce the literal
+        // segment ".." for a value that IS "..", so the check must compare
+        // the whole trimmed value instead.
+        assert!(!is_safe_fontstack_segment(".."));
+        assert!(!is_safe_fontstack_segment("."));
+        assert!(!is_safe_fontstack_segment(""));
+        assert!(is_safe_fontstack_segment("Noto Sans Regular"));
     }
 
     #[test]
