@@ -1,6 +1,7 @@
 import type { LogsResponse, ServerLogEntry } from "../shared/logs";
 import type {
   StoreIndexEntry,
+  StoreIndexDeltaResponse,
   StoreIndexMediaSummary,
   StoreIndexResponse,
   StoreListMediaFilter,
@@ -16,6 +17,16 @@ export type ClientUiPingResponse = {
   service: string;
   backend_version?: string;
   backend_revision?: string;
+};
+
+/**
+ * Non-secret browser-cache partition assigned by the local client runtime.
+ * A null scope means the runtime has no authenticated identity and persistent
+ * client data must remain disabled.
+ */
+export type ClientCacheContextResponse = {
+  schema_version: 1;
+  scope: string | null;
 };
 
 export type ClientUiRuntimeInfo = {
@@ -244,6 +255,7 @@ export type StoreEntry = StoreIndexEntry;
 export type StoreListResponse = StoreIndexResponse;
 
 export type {
+  StoreIndexDeltaResponse,
   LogsResponse,
   ServerLogEntry,
   StoreIndexMediaSummary,

@@ -7,7 +7,9 @@ mod cluster_test;
 mod config_app_test;
 mod framework;
 mod global_rendezvous_system_test;
+mod managed_cluster_test_support;
 mod relay_security_e2e_test;
+mod rendezvous_contact_failover_test;
 mod s3_test;
 #[path = "web-ui-backend_test.rs"]
 mod web_ui_backend_test;

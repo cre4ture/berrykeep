@@ -1815,6 +1815,246 @@ run_on_main_metadata_backends!(
     admin_authorization_requires_token_when_configured_turso
 );
 
+#[tokio::test]
+async fn gallery_delta_admin_route_requires_authorization_and_accepts_current_token() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let admin_token = fresh_test_secret("gallery-delta-admin");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
+    let app = super::build_server_apps(&state).public_app;
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/auth/store/index/delta?token=unauthorized")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let bootstrap = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/api/v1/auth/store/index?depth=64&view=tree&offset=0&limit=10&sort=captured_desc&media_filter=all",
+                )
+                .header(super::ADMIN_TOKEN_HEADER, admin_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bootstrap.status(), StatusCode::OK);
+    let bootstrap_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(bootstrap.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let sync_token = bootstrap_payload["sync_token"]
+        .as_str()
+        .expect("SQLite gallery bootstrap should return a token")
+        .to_string();
+    let uri = format!("/api/v1/auth/store/index/delta?token={sync_token}");
+
+    let malformed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/auth/store/index/delta?token=not-a-token")
+                .header(super::ADMIN_TOKEN_HEADER, admin_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    let malformed_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(malformed.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(malformed_payload["code"], "store_index_delta_invalid_token");
+    assert_eq!(malformed_payload["reset"], true);
+
+    let mut ahead_token_payload = super::decode_gallery_sync_token(&sync_token).unwrap();
+    ahead_token_payload.revision += 1;
+    let ahead_token = super::encode_gallery_sync_token(&ahead_token_payload);
+    let ahead = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/auth/store/index/delta?token={ahead_token}"
+                ))
+                .header(super::ADMIN_TOKEN_HEADER, admin_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ahead.status(), StatusCode::CONFLICT);
+    let ahead_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(ahead.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(ahead_payload["code"], "store_index_delta_reset_required");
+    assert_eq!(ahead_payload["reset"], true);
+    assert_eq!(ahead_payload["current_token"], sync_token);
+
+    let mut foreign_token_payload = super::decode_gallery_sync_token(&sync_token).unwrap();
+    foreign_token_payload.history_id = uuid::Uuid::new_v4().to_string();
+    let foreign_token = super::encode_gallery_sync_token(&foreign_token_payload);
+    let foreign = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/auth/store/index/delta?token={foreign_token}"
+                ))
+                .header(super::ADMIN_TOKEN_HEADER, admin_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::CONFLICT);
+    let foreign_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(foreign.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(foreign_payload["code"], "store_index_delta_reset_required");
+    assert_eq!(foreign_payload["current_token"], sync_token);
+
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header(super::ADMIN_TOKEN_HEADER, admin_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(authorized.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(payload["next_token"], sync_token);
+    assert_eq!(payload["has_more"], false);
+    assert_eq!(payload["upserts"], serde_json::json!([]));
+    assert_eq!(payload["removals"], serde_json::json!([]));
+
+    cleanup_test_state(&state).await;
+}
+
+#[test]
+fn gallery_sync_token_is_opaque_versioned_and_rejects_malformed_values() {
+    let payload = super::GallerySyncTokenPayload {
+        history_id: uuid::Uuid::new_v4().to_string(),
+        revision: 42,
+        scope: super::GallerySyncScope {
+            prefix: "gallery".to_string(),
+            depth: 64,
+            media_filter: super::StoreIndexMediaFilter::Image,
+            captured_sort: super::StoreIndexSortOrder::CapturedDesc,
+            viewport: None,
+        },
+    };
+    let token = super::encode_gallery_sync_token(&payload);
+    assert_eq!(super::decode_gallery_sync_token(&token), Some(payload));
+    assert_eq!(super::decode_gallery_sync_token("42"), None);
+    assert_eq!(super::decode_gallery_sync_token("g2_AAAAAAAAAAA"), None);
+    assert_eq!(super::decode_gallery_sync_token("g1_not-base64"), None);
+}
+
+#[test]
+fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
+    let query = |south, west, north, east| super::StoreIndexQuery {
+        prefix: Some("gallery".to_string()),
+        depth: Some(64),
+        snapshot: None,
+        view: Some(super::StoreIndexView::Tree),
+        cursor: None,
+        page_size: None,
+        offset: Some(0),
+        limit: Some(100),
+        sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+        media_filter: Some(super::StoreIndexMediaFilter::Image),
+        south,
+        west,
+        north,
+        east,
+    };
+    assert!(
+        super::store_index_viewport_bounds(&query(Some(1.0), None, Some(2.0), Some(3.0))).is_err()
+    );
+    assert!(
+        super::store_index_viewport_bounds(&query(Some(f64::NAN), Some(1.0), Some(2.0), Some(3.0)))
+            .is_err()
+    );
+    assert!(
+        super::store_index_viewport_bounds(&query(Some(-91.0), Some(1.0), Some(2.0), Some(3.0)))
+            .is_err()
+    );
+    let antimeridian = super::store_index_viewport_bounds(&query(
+        Some(-20.0),
+        Some(170.0),
+        Some(-10.0),
+        Some(-170.0),
+    ))
+    .unwrap()
+    .unwrap();
+    assert!(antimeridian.west > antimeridian.east);
+}
+
+#[cfg(feature = "turso-metadata")]
+#[tokio::test]
+async fn gallery_delta_and_viewport_return_not_implemented_for_turso() {
+    let state = build_test_state(1, false, MainTestBackend::Turso).await;
+    let token = super::encode_gallery_sync_token(&super::GallerySyncTokenPayload {
+        history_id: uuid::Uuid::new_v4().to_string(),
+        revision: 0,
+        scope: super::GallerySyncScope {
+            prefix: "gallery".to_string(),
+            depth: 64,
+            media_filter: super::StoreIndexMediaFilter::Image,
+            captured_sort: super::StoreIndexSortOrder::CapturedDesc,
+            viewport: None,
+        },
+    });
+    let delta = super::store_index_delta_response(
+        &state,
+        super::StoreIndexDeltaQuery {
+            token: Some(token),
+            limit: None,
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(delta.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let viewport = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(64),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(100),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+                south: Some(45.0),
+                west: Some(5.0),
+                north: Some(49.0),
+                east: Some(11.0),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(viewport.status(), StatusCode::NOT_IMPLEMENTED);
+
+    cleanup_test_state(&state).await;
+}
+
 fn storage_pool_config_request(
     method: Method,
     path: &str,
@@ -13180,6 +13420,10 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13260,6 +13504,10 @@ async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13333,6 +13581,10 @@ async fn list_store_index_keeps_batch_media_lookup_failures_best_effort_impl(
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13402,6 +13654,10 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13476,6 +13732,10 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13546,6 +13806,10 @@ async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13616,6 +13880,10 @@ async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTest
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13682,6 +13950,10 @@ async fn list_store_index_sets_timing_headers_impl(backend: MainTestBackend) {
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13758,6 +14030,10 @@ async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBa
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13790,6 +14066,10 @@ async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBa
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13850,6 +14130,10 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13885,6 +14169,10 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -13925,6 +14213,10 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         limit: Some(1),
         sort: Some(super::StoreIndexSortOrder::CapturedDesc),
         media_filter: None,
+        south: None,
+        west: None,
+        north: None,
+        east: None,
     };
     let cached_sequence = state
         .storage
@@ -13983,6 +14275,10 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -14086,6 +14382,10 @@ async fn list_store_index_uses_sqlite_gallery_projection_for_captured_pagination
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -14136,6 +14436,10 @@ async fn list_store_index_uses_sqlite_gallery_projection_for_captured_pagination
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -14149,6 +14453,10 @@ async fn list_store_index_uses_sqlite_gallery_projection_for_captured_pagination
     .unwrap();
     assert_eq!(second_payload["entries"][0]["path"], "gallery/older.png");
     assert_eq!(second_payload["entries"][0]["media"]["taken_at_unix"], 100);
+    assert_eq!(
+        first_payload["sync_token"], second_payload["sync_token"],
+        "offset and limit are pagination state, not sync-token scope"
+    );
 
     assert_ne!(older.manifest_hash, newer.manifest_hash);
     cleanup_test_state(&state).await;
@@ -14183,6 +14491,10 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::PathAsc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -14209,6 +14521,10 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -14226,6 +14542,7 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
             .unwrap(),
     )
     .unwrap();
+    assert!(gallery_payload["sync_token"].as_str().is_some());
     assert_eq!(
         gallery_payload["entries"][0]["media"], generic_payload["entries"][0]["media"],
         "a missing media-cache record must retain the generic pending-media response"
@@ -14319,6 +14636,10 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
                 limit: Some(10),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -14345,6 +14666,10 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
                 limit: Some(10),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -14742,6 +15067,10 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -15183,6 +15512,10 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
                 limit: None,
                 sort: None,
                 media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
             }),
         )
         .await,
@@ -16168,6 +16501,10 @@ async fn build_test_state(
             rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
                 "http://127.0.0.1:39080".to_string(),
             ])),
+            configured_rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
+                "http://127.0.0.1:39080".to_string(),
+            ])),
+            cluster_rendezvous_contact_urls: Arc::new(std::sync::Mutex::new(Vec::new())),
             rendezvous_registration_enabled: false,
             rendezvous_mtls_required: false,
             managed_rendezvous_public_url: None,

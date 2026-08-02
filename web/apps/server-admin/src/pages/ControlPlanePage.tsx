@@ -488,8 +488,9 @@ export function ControlPlanePage() {
           </Group>
           <Text c="dimmed">
             This cluster-owned list is stored as a confirmed, versioned object. Authenticated clients can download it
-            after they have connected directly or through a relay. It does not replace this node&apos;s listener or
-            bootstrap configuration.
+            after they have connected directly or through a relay. Each server node adds replicated contacts to its
+            outbound rendezvous registrations, alongside its local bootstrap configuration. It does not replace this
+            node&apos;s listener or recovery anchors.
           </Text>
           <Grid>
             <Grid.Col span={{ base: 12, xl: 6 }}>

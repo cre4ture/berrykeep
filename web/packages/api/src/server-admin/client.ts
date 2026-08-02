@@ -1,6 +1,7 @@
 import { fetchJson } from "../shared/http";
 import type { StoreIndexMedia } from "../shared/store-index";
 import type {
+  StoreIndexDeltaResponse,
   AdminMapDatasetImportStatusResponse,
   AdminGalleryMapConfiguration,
   AdminGalleryMapConfigurationResponse,
@@ -183,9 +184,30 @@ export async function listAdminStoreEntries(
   if (options.mediaFilter) {
     query.set("media_filter", options.mediaFilter);
   }
+  if (options.viewport) {
+    query.set("south", String(options.viewport.south));
+    query.set("west", String(options.viewport.west));
+    query.set("north", String(options.viewport.north));
+    query.set("east", String(options.viewport.east));
+  }
   return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
     adminTokenOverride
   });
+}
+
+export async function getAdminStoreIndexDelta(
+  token: string,
+  limit?: number,
+  adminTokenOverride?: string
+): Promise<StoreIndexDeltaResponse> {
+  const query = new URLSearchParams({ token });
+  if (typeof limit === "number" && Number.isFinite(limit) && limit > 0) {
+    query.set("limit", String(Math.floor(limit)));
+  }
+  return fetchAdminJson<StoreIndexDeltaResponse>(
+    `${apiV1("/auth/store/index/delta")}?${query.toString()}`,
+    { adminTokenOverride }
+  );
 }
 
 export function getAdminStoreDownloadUrl(

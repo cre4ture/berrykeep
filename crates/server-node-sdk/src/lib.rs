@@ -133,6 +133,7 @@ use x509_parser::prelude::FromDer;
 
 mod cluster;
 mod embedded_rendezvous;
+mod gallery_sync;
 mod hardware_health;
 mod host_storage;
 mod listing;
@@ -148,6 +149,13 @@ mod storage;
 mod transport_service;
 mod ui;
 mod web_maps;
+
+#[cfg(test)]
+use gallery_sync::GallerySyncScope;
+use gallery_sync::{
+    GallerySyncTokenPayload, decode_gallery_sync_token, encode_gallery_sync_token,
+    gallery_delta_scope_from_sync, gallery_sync_scope_from_query,
+};
 
 const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -267,6 +275,18 @@ tokio::task_local! {
 
 type RuntimeLogReloadHandle = reload::Handle<EnvFilter, Registry>;
 
+type MetadataBundleImportObserverFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+type MetadataBundleImportObserverHandler =
+    fn(ServerState, MetadataExportBundle) -> MetadataBundleImportObserverFuture;
+
+type MetadataBundleKeyMatch = fn(&str) -> bool;
+
+struct MetadataBundleImportObserver {
+    key_match: MetadataBundleKeyMatch,
+    handler: MetadataBundleImportObserverHandler,
+}
+
 #[derive(Clone)]
 struct ServerState {
     data_dir: PathBuf,
@@ -351,6 +371,8 @@ struct ServerNetworkRuntime {
     primary_public_direct_url: Option<String>,
     primary_peer_direct_url: Option<String>,
     advertised_direct_endpoints: Arc<StdMutex<Vec<BootstrapEndpoint>>>,
+    configured_rendezvous_urls: Arc<StdMutex<Vec<String>>>,
+    cluster_rendezvous_contact_urls: Arc<StdMutex<Vec<String>>>,
     rendezvous_urls: Arc<StdMutex<Vec<String>>>,
     rendezvous_registration_enabled: bool,
     rendezvous_mtls_required: bool,
@@ -4523,12 +4545,102 @@ fn current_rendezvous_urls(state: &ServerState) -> Vec<String> {
         .clone()
 }
 
-fn replace_rendezvous_urls(state: &ServerState, urls: Vec<String>) {
+fn current_configured_rendezvous_urls(state: &ServerState) -> Vec<String> {
+    state
+        .network
+        .configured_rendezvous_urls
+        .lock()
+        .expect("configured rendezvous URL mutex poisoned")
+        .clone()
+}
+
+fn current_cluster_rendezvous_contact_urls(state: &ServerState) -> Vec<String> {
+    state
+        .network
+        .cluster_rendezvous_contact_urls
+        .lock()
+        .expect("cluster rendezvous contact URL mutex poisoned")
+        .clone()
+}
+
+fn combine_rendezvous_urls(
+    configured_urls: &[String],
+    cluster_contact_urls: &[String],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut combined = Vec::with_capacity(configured_urls.len() + cluster_contact_urls.len());
+
+    for url in configured_urls.iter().chain(cluster_contact_urls) {
+        if seen.insert(url.clone()) {
+            combined.push(url.clone());
+        }
+    }
+
+    combined
+}
+
+fn replace_configured_rendezvous_urls(state: &ServerState, configured_urls: Vec<String>) -> bool {
+    let cluster_contact_urls = current_cluster_rendezvous_contact_urls(state);
+    let effective_urls = combine_rendezvous_urls(&configured_urls, &cluster_contact_urls);
+
+    *state
+        .network
+        .configured_rendezvous_urls
+        .lock()
+        .expect("configured rendezvous URL mutex poisoned") = configured_urls;
+
+    let mut current_urls = state
+        .network
+        .rendezvous_urls
+        .lock()
+        .expect("rendezvous URL mutex poisoned");
+    if *current_urls == effective_urls {
+        return false;
+    }
+    *current_urls = effective_urls;
+    true
+}
+
+async fn synchronize_cluster_rendezvous_contact_urls(state: &ServerState) -> Result<bool> {
+    let cluster_contact_urls =
+        rendezvous_contact_config::load_current_rendezvous_urls(state).await?;
+    let configured_urls = current_configured_rendezvous_urls(state);
+    let effective_urls = combine_rendezvous_urls(&configured_urls, &cluster_contact_urls);
+
+    let contacts_changed = {
+        let mut current_contacts = state
+            .network
+            .cluster_rendezvous_contact_urls
+            .lock()
+            .expect("cluster rendezvous contact URL mutex poisoned");
+        if *current_contacts == cluster_contact_urls {
+            false
+        } else {
+            *current_contacts = cluster_contact_urls;
+            true
+        }
+    };
+
+    if !contacts_changed {
+        return Ok(false);
+    }
+
     *state
         .network
         .rendezvous_urls
         .lock()
-        .expect("rendezvous URL mutex poisoned") = urls;
+        .expect("rendezvous URL mutex poisoned") = effective_urls;
+    reload_live_outbound_clients(state).await?;
+    sync_rendezvous_registration_state(state).await;
+
+    info!(
+        node_id = %state.node_id,
+        configured_rendezvous_url_count = configured_urls.len(),
+        cluster_rendezvous_contact_url_count = current_cluster_rendezvous_contact_urls(state).len(),
+        effective_rendezvous_url_count = current_rendezvous_urls(state).len(),
+        "applied replicated rendezvous contact list to server registration"
+    );
+    Ok(true)
 }
 
 async fn try_start_direct_quic_runtime(
@@ -4948,8 +5060,8 @@ async fn rendezvous_registration_views(
 }
 
 fn current_editable_rendezvous_urls(state: &ServerState) -> Vec<String> {
-    let urls = normalize_rendezvous_url_list(&current_rendezvous_urls(state))
-        .unwrap_or_else(|_| current_rendezvous_urls(state));
+    let urls = normalize_rendezvous_url_list(&current_configured_rendezvous_urls(state))
+        .unwrap_or_else(|_| current_configured_rendezvous_urls(state));
     match state
         .network
         .managed_rendezvous_public_url
@@ -7208,6 +7320,8 @@ async fn run_inner(
             primary_public_direct_url: normalize_optional_url(Some(public_url.as_str())),
             primary_peer_direct_url: normalize_optional_url(Some(internal_url.as_str())),
             advertised_direct_endpoints: Arc::new(StdMutex::new(advertised_direct_endpoints)),
+            configured_rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls.clone())),
+            cluster_rendezvous_contact_urls: Arc::new(StdMutex::new(Vec::new())),
             rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls)),
             rendezvous_registration_enabled: config.rendezvous_registration_enabled,
             rendezvous_mtls_required: config.rendezvous_mtls_required,
@@ -7363,6 +7477,13 @@ async fn start_background_runtimes(
     }
 
     if state.network.rendezvous_registration_enabled {
+        if let Err(err) = synchronize_cluster_rendezvous_contact_urls(state).await {
+            warn!(
+                error = %err,
+                node_id = %state.node_id,
+                "failed applying replicated rendezvous contact list during startup"
+            );
+        }
         spawn_rendezvous_peer_discovery(state.clone(), config.replica_view_sync_interval_secs);
         spawn_rendezvous_presence_heartbeat(state.clone(), config.peer_heartbeat_interval_secs);
 
@@ -7402,6 +7523,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/index/delta", get(get_store_index_delta))
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
@@ -7487,6 +7609,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/scrub/run", post(trigger_data_scrub_public))
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
+        .route("/auth/store/index/delta", get(get_store_index_delta_admin))
         .route("/auth/data-changes", get(list_data_change_events))
         .route(
             "/auth/maps/config",
@@ -7814,6 +7937,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/cluster/replication/plan", get(replication_plan))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/index/delta", get(get_store_index_delta))
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
@@ -8381,6 +8505,13 @@ fn spawn_rendezvous_presence_heartbeat(
             .min(connected_interval);
 
         loop {
+            if let Err(err) = synchronize_cluster_rendezvous_contact_urls(&state).await {
+                warn!(
+                    error = %err,
+                    node_id = %state.node_id,
+                    "failed refreshing replicated rendezvous contact list for server registration"
+                );
+            }
             refresh_local_node_storage(&state).await;
 
             let local_descriptor = {
@@ -11399,6 +11530,10 @@ pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
             };
 
             if import_changed {
+                notify_metadata_bundle_import_handlers(state, &bundle);
+            }
+
+            if import_changed {
                 imported_any = true;
             }
 
@@ -11414,6 +11549,48 @@ pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
 
     if imported_any {
         publish_namespace_change(state);
+    }
+}
+
+fn metadata_bundle_import_observers() -> &'static [MetadataBundleImportObserver] {
+    static OBSERVERS: [MetadataBundleImportObserver; 1] = [MetadataBundleImportObserver {
+        key_match: is_rendezvous_contact_configuration_key,
+        handler: apply_rendezvous_contacts_configuration_after_metadata_import,
+    }];
+
+    &OBSERVERS
+}
+
+fn is_rendezvous_contact_configuration_key(key: &str) -> bool {
+    key == rendezvous_contact_config::RENDEZVOUS_CONTACT_CONFIGURATION_STORAGE_KEY
+}
+
+fn apply_rendezvous_contacts_configuration_after_metadata_import(
+    state: ServerState,
+    _: MetadataExportBundle,
+) -> MetadataBundleImportObserverFuture {
+    Box::pin(async move {
+        if let Err(err) = synchronize_cluster_rendezvous_contact_urls(&state).await {
+            warn!(
+                error = %err,
+                "failed to apply rendezvous contact configuration after metadata import"
+            );
+        }
+    })
+}
+
+fn notify_metadata_bundle_import_handlers(state: &ServerState, bundle: &MetadataExportBundle) {
+    for observer in metadata_bundle_import_observers() {
+        if !(observer.key_match)(&bundle.key) {
+            continue;
+        }
+
+        let state = state.clone();
+        let bundle = bundle.clone();
+        let handler = observer.handler;
+        tokio::spawn(async move {
+            (handler)(state, bundle).await;
+        });
     }
 }
 
@@ -12821,6 +12998,16 @@ struct StoreIndexQuery {
     limit: Option<usize>,
     sort: Option<StoreIndexSortOrder>,
     media_filter: Option<StoreIndexMediaFilter>,
+    south: Option<f64>,
+    west: Option<f64>,
+    north: Option<f64>,
+    east: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct StoreIndexDeltaQuery {
+    token: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -12959,8 +13146,26 @@ struct StoreIndexResponse {
     has_more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_token: Option<String>,
     media_summary: StoreIndexMediaSummary,
     entries: Vec<StoreIndexEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreIndexDeltaResponse {
+    next_token: String,
+    has_more: bool,
+    upserts: Vec<StoreIndexEntry>,
+    removals: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreIndexDeltaResetResponse {
+    code: &'static str,
+    reset: bool,
+    message: &'static str,
+    current_token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15039,6 +15244,10 @@ async fn list_store_index_admin(
             "limit": query.limit,
             "sort": query.sort,
             "media_filter": query.media_filter,
+            "south": query.south,
+            "west": query.west,
+            "north": query.north,
+            "east": query.east,
         }),
     )
     .await
@@ -15049,11 +15258,173 @@ async fn list_store_index_admin(
     list_store_index_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
 }
 
+async fn get_store_index_delta(
+    State(state): State<ServerState>,
+    Query(query): Query<StoreIndexDeltaQuery>,
+) -> impl IntoResponse {
+    store_index_delta_response(&state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn get_store_index_delta_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<StoreIndexDeltaQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "auth/store/index/delta/get",
+        true,
+        true,
+        json!({ "limit": query.limit }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    store_index_delta_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn store_index_delta_response(
+    state: &ServerState,
+    query: StoreIndexDeltaQuery,
+    thumbnail_route: &str,
+) -> Response {
+    let Some(token) = query.token.as_deref() else {
+        return store_index_delta_reset_response(
+            StatusCode::BAD_REQUEST,
+            "store_index_delta_invalid_token",
+            "a sync token from a current store-index response is required",
+            None,
+        );
+    };
+    let Some(token_payload) = decode_gallery_sync_token(token) else {
+        return store_index_delta_reset_response(
+            StatusCode::BAD_REQUEST,
+            "store_index_delta_invalid_token",
+            "the supplied sync token is malformed or uses an unsupported version",
+            None,
+        );
+    };
+    let limit = query.limit.unwrap_or(500).clamp(1, 2_000);
+    let scope = gallery_delta_scope_from_sync(&token_payload.scope);
+    let delta = {
+        let store = read_store(state, "store_index.delta").await;
+        store
+            .query_gallery_delta(
+                &token_payload.history_id,
+                token_payload.revision,
+                limit,
+                &scope,
+            )
+            .await
+    };
+    let page = match delta {
+        Ok(Some(Ok(page))) => page,
+        Ok(Some(Err(storage::GalleryDeltaCursorError::Expired {
+            history_id,
+            current_revision,
+        }))) => {
+            return store_index_delta_reset_response(
+                StatusCode::CONFLICT,
+                "store_index_delta_reset_required",
+                "the sync token has expired; reload the current gallery index",
+                Some(encode_gallery_sync_token(&GallerySyncTokenPayload {
+                    history_id,
+                    revision: current_revision,
+                    scope: token_payload.scope,
+                })),
+            );
+        }
+        Ok(Some(Err(
+            storage::GalleryDeltaCursorError::Ahead {
+                history_id,
+                current_revision,
+            }
+            | storage::GalleryDeltaCursorError::HistoryMismatch {
+                history_id,
+                current_revision,
+            },
+        ))) => {
+            return store_index_delta_reset_response(
+                StatusCode::CONFLICT,
+                "store_index_delta_reset_required",
+                "the sync token does not belong to this gallery history; reload the current gallery index",
+                Some(encode_gallery_sync_token(&GallerySyncTokenPayload {
+                    history_id,
+                    revision: current_revision,
+                    scope: token_payload.scope,
+                })),
+            );
+        }
+        Ok(None) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "error": "durable gallery deltas require the SQLite metadata backend"
+                })),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query durable gallery deltas");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut latest_by_key = BTreeMap::new();
+    for change in page.changes {
+        latest_by_key.insert(change.key.clone(), change);
+    }
+    let mut upserts = Vec::new();
+    let mut removals = Vec::new();
+    for change in latest_by_key.into_values() {
+        match (change.kind, change.entry) {
+            (storage::GalleryDeltaKind::Upsert, Some(entry)) => {
+                upserts.push(store_index_entry_from_gallery_entry(entry, thumbnail_route));
+            }
+            _ => removals.push(change.key),
+        }
+    }
+    Json(StoreIndexDeltaResponse {
+        next_token: encode_gallery_sync_token(&GallerySyncTokenPayload {
+            history_id: page.history_id,
+            revision: page.next_revision,
+            scope: token_payload.scope,
+        }),
+        has_more: page.has_more,
+        upserts,
+        removals,
+    })
+    .into_response()
+}
+
+fn store_index_delta_reset_response(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+    current_token: Option<String>,
+) -> Response {
+    (
+        status,
+        Json(StoreIndexDeltaResetResponse {
+            code,
+            reset: true,
+            message,
+            current_token,
+        }),
+    )
+        .into_response()
+}
+
 fn store_index_page_cache_key(
     query: &StoreIndexQuery,
     thumbnail_route: &str,
 ) -> Option<StoreIndexPageCacheKey> {
-    if !matches!(query.view, Some(StoreIndexView::Tree)) || query.limit.is_none() {
+    if !matches!(query.view, Some(StoreIndexView::Tree))
+        || query.limit.is_none()
+        || store_index_has_viewport(query)
+    {
         return None;
     }
 
@@ -15066,6 +15437,38 @@ fn store_index_page_cache_key(
         media_filter: query.media_filter,
         thumbnail_route: thumbnail_route.to_string(),
     })
+}
+
+fn store_index_has_viewport(query: &StoreIndexQuery) -> bool {
+    query.south.is_some() || query.west.is_some() || query.north.is_some() || query.east.is_some()
+}
+
+fn store_index_viewport_bounds(
+    query: &StoreIndexQuery,
+) -> std::result::Result<Option<storage::GalleryViewportBounds>, &'static str> {
+    if !store_index_has_viewport(query) {
+        return Ok(None);
+    }
+    let (Some(south), Some(west), Some(north), Some(east)) =
+        (query.south, query.west, query.north, query.east)
+    else {
+        return Err("south, west, north, and east must be provided together");
+    };
+    if !south.is_finite() || !north.is_finite() || !west.is_finite() || !east.is_finite() {
+        return Err("viewport bounds must be finite numbers");
+    }
+    if !(-90.0..=90.0).contains(&south) || !(-90.0..=90.0).contains(&north) || south > north {
+        return Err("viewport latitude bounds must satisfy -90 <= south <= north <= 90");
+    }
+    if !(-180.0..=180.0).contains(&west) || !(-180.0..=180.0).contains(&east) {
+        return Err("viewport longitude bounds must be between -180 and 180");
+    }
+    Ok(Some(storage::GalleryViewportBounds {
+        south,
+        west,
+        north,
+        east,
+    }))
 }
 
 fn store_index_gallery_query(
@@ -15093,49 +15496,30 @@ fn store_index_gallery_query(
         captured_sort,
         offset: query.offset.unwrap_or(0),
         limit: query.limit?.max(1),
+        viewport: store_index_viewport_bounds(query).ok()?,
     })
 }
 
 fn store_index_response_from_gallery_index_page(
     page: storage::GalleryIndexPage,
+    gallery_query: &storage::GalleryIndexQuery,
     query: &StoreIndexQuery,
     prefix: String,
     depth: usize,
     thumbnail_route: &str,
 ) -> StoreIndexResponse {
+    let sync_token = encode_gallery_sync_token(&GallerySyncTokenPayload {
+        history_id: page.history_id,
+        revision: page.revision,
+        scope: gallery_sync_scope_from_query(gallery_query),
+    });
     let total_entry_count = page.total_entry_count;
     let offset = query.offset.unwrap_or(0).min(total_entry_count);
     let limit = query.limit.map(|value| value.max(1));
     let entries = page
         .entries
         .into_iter()
-        .map(|entry| {
-            let media = entry
-                .content_fingerprint
-                .as_ref()
-                .map(|content_fingerprint| {
-                    build_media_index_response(
-                        &entry.key,
-                        None,
-                        None,
-                        &MediaCacheLookup {
-                            content_fingerprint: content_fingerprint.clone(),
-                            metadata: entry.media_metadata,
-                        },
-                        thumbnail_route,
-                    )
-                });
-            StoreIndexEntry {
-                path: entry.key,
-                entry_type: "key".to_string(),
-                version: None,
-                content_hash: Some(entry.manifest_hash),
-                size_bytes: entry.size_bytes,
-                modified_at_unix: entry.modified_at_unix,
-                content_fingerprint: entry.content_fingerprint,
-                media,
-            }
-        })
+        .map(|entry| store_index_entry_from_gallery_entry(entry, thumbnail_route))
         .collect::<Vec<_>>();
     StoreIndexResponse {
         prefix,
@@ -15148,6 +15532,7 @@ fn store_index_response_from_gallery_index_page(
             .map(|limit| offset.saturating_add(limit) < total_entry_count)
             .unwrap_or(false),
         next_cursor: None,
+        sync_token: Some(sync_token),
         media_summary: StoreIndexMediaSummary {
             ready_count: page.media_summary.ready_count,
             pending_count: page.media_summary.pending_count,
@@ -15157,6 +15542,37 @@ fn store_index_response_from_gallery_index_page(
             geotagged_count: page.media_summary.geotagged_count,
         },
         entries,
+    }
+}
+
+fn store_index_entry_from_gallery_entry(
+    entry: storage::GalleryIndexEntry,
+    thumbnail_route: &str,
+) -> StoreIndexEntry {
+    let media = entry
+        .content_fingerprint
+        .as_ref()
+        .map(|content_fingerprint| {
+            build_media_index_response(
+                &entry.key,
+                None,
+                None,
+                &MediaCacheLookup {
+                    content_fingerprint: content_fingerprint.clone(),
+                    metadata: entry.media_metadata,
+                },
+                thumbnail_route,
+            )
+        });
+    StoreIndexEntry {
+        path: entry.key,
+        entry_type: "key".to_string(),
+        version: None,
+        content_hash: Some(entry.manifest_hash),
+        size_bytes: entry.size_bytes,
+        modified_at_unix: entry.modified_at_unix,
+        content_fingerprint: entry.content_fingerprint,
+        media,
     }
 }
 
@@ -15235,6 +15651,7 @@ fn cached_store_index_page_response(
             limit,
             has_more,
             next_cursor: None,
+            sync_token: None,
             media_summary: cached.media_summary.clone(),
             entries,
         }),
@@ -15265,6 +15682,12 @@ async fn list_store_index_response_attempt(
     thumbnail_route: &str,
     allow_namespace_retry: bool,
 ) -> Response {
+    let viewport = match store_index_viewport_bounds(&query) {
+        Ok(viewport) => viewport,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
     let request_id = Uuid::new_v4();
     let request_started_at = Instant::now();
     let prefix = query.prefix.clone().unwrap_or_default();
@@ -15277,7 +15700,17 @@ async fn list_store_index_response_attempt(
         .namespace_change_sequence
         .load(Ordering::SeqCst);
 
-    if let Some(gallery_query) = store_index_gallery_query(&query, &prefix, depth) {
+    let gallery_query = store_index_gallery_query(&query, &prefix, depth);
+    if viewport.is_some() && gallery_query.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "viewport bounds require a current, paginated gallery query sorted by captured time"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(gallery_query) = gallery_query {
         let gallery_index_started_at = Instant::now();
         let gallery_page = {
             let store = read_store(state, "store_index.gallery_index").await;
@@ -15308,6 +15741,7 @@ async fn list_store_index_response_attempt(
                 let materialized_entry_count = page.entries.len();
                 let response = Json(store_index_response_from_gallery_index_page(
                     page,
+                    &gallery_query,
                     &query,
                     prefix,
                     depth,
@@ -15325,6 +15759,15 @@ async fn list_store_index_response_attempt(
                     total_entry_count,
                     materialized_entry_count,
                 );
+            }
+            Ok(None) if viewport.is_some() => {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(json!({
+                        "error": "viewport gallery queries require the SQLite metadata backend"
+                    })),
+                )
+                    .into_response();
             }
             Ok(None) => {}
             Err(err) => {
@@ -15734,6 +16177,7 @@ async fn list_store_index_response_attempt(
             limit,
             has_more,
             next_cursor: None,
+            sync_token: None,
             media_summary,
             entries,
         }),
@@ -16052,6 +16496,7 @@ async fn list_store_index_response_cursor_mode(
             limit: Some(page_size),
             has_more: page.has_more,
             next_cursor: page.next_cursor,
+            sync_token: None,
             media_summary,
             entries,
         }),
@@ -23963,7 +24408,7 @@ async fn update_rendezvous_config(
         Err(status) => return status.into_response(),
     };
 
-    let effective_urls = match build_effective_rendezvous_urls(&state, &request.editable_urls) {
+    let configured_urls = match build_effective_rendezvous_urls(&state, &request.editable_urls) {
         Ok(urls) => urls,
         Err(err) => {
             append_admin_audit(
@@ -23984,6 +24429,11 @@ async fn update_rendezvous_config(
                 .into_response();
         }
     };
+
+    let effective_urls = combine_rendezvous_urls(
+        &configured_urls,
+        &current_cluster_rendezvous_contact_urls(&state),
+    );
 
     let outbound_clients = match build_outbound_clients_with_urls(&state, &effective_urls) {
         Ok(clients) => clients,
@@ -24007,7 +24457,7 @@ async fn update_rendezvous_config(
         }
     };
 
-    let persisted = match persist_rendezvous_urls_if_possible(&state, &effective_urls) {
+    let persisted = match persist_rendezvous_urls_if_possible(&state, &configured_urls) {
         Ok(persisted) => persisted,
         Err(err) => {
             append_admin_audit(
@@ -24029,7 +24479,7 @@ async fn update_rendezvous_config(
         }
     };
 
-    replace_rendezvous_urls(&state, effective_urls);
+    replace_configured_rendezvous_urls(&state, configured_urls);
     replace_outbound_clients(&state, outbound_clients).await;
     sync_rendezvous_registration_state(&state).await;
     let view = build_rendezvous_config_view(&state, persisted).await;

@@ -2,7 +2,9 @@ import { fetchJson } from "../shared/http";
 import type { GalleryMapConfigurationResponse } from "../shared/map-config";
 import type { StoreIndexMedia } from "../shared/store-index";
 import type {
+  StoreIndexDeltaResponse,
   ClientConnectionRouteSnapshot,
+  ClientCacheContextResponse,
   ClientDiagnosticLogExport,
   ClientLatencyTestResponse,
   ClientRendezvousView,
@@ -55,6 +57,13 @@ export async function getClientPing(
   options?: ClientDiagnosticRequestOptions
 ): Promise<ClientUiPingResponse> {
   return fetchJson<ClientUiPingResponse>(apiV1("/ping"), diagnosticRequestInit(options));
+}
+
+export async function getClientCacheContext(): Promise<ClientCacheContextResponse> {
+  return fetchJson<ClientCacheContextResponse>(apiV1("/cache-context"), {
+    cache: "no-store",
+    credentials: "same-origin"
+  });
 }
 
 export async function getClientGalleryMapConfiguration(): Promise<GalleryMapConfigurationResponse> {
@@ -196,7 +205,24 @@ export async function listStoreEntries(
   if (options.mediaFilter) {
     query.set("media_filter", options.mediaFilter);
   }
+  if (options.viewport) {
+    query.set("south", String(options.viewport.south));
+    query.set("west", String(options.viewport.west));
+    query.set("north", String(options.viewport.north));
+    query.set("east", String(options.viewport.east));
+  }
   return fetchJson<StoreListResponse>(`${apiV1("/store/list")}?${query.toString()}`);
+}
+
+export async function getStoreIndexDelta(
+  token: string,
+  limit?: number
+): Promise<StoreIndexDeltaResponse> {
+  const query = new URLSearchParams({ token });
+  if (typeof limit === "number" && Number.isFinite(limit) && limit > 0) {
+    query.set("limit", String(Math.floor(limit)));
+  }
+  return fetchJson<StoreIndexDeltaResponse>(`${apiV1("/store/index/delta")}?${query.toString()}`);
 }
 
 export async function retryStoreMediaCacheEntry(

@@ -924,6 +924,7 @@ mod tests {
                 limit: None,
                 has_more: false,
                 next_cursor: None,
+                sync_token: None,
                 media_summary: client_sdk::StoreIndexMediaSummary::default(),
                 entries: vec![client_sdk::StoreIndexEntry {
                     path: "readme.txt".to_string(),

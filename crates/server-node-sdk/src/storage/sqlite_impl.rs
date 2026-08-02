@@ -9,21 +9,24 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use tokio_rusqlite::Connection as TokioConnection;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::cluster::NodeDescriptor;
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GalleryIndexCapturedSort, GalleryIndexEntry,
-    GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery, ManifestSummary,
-    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
-    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
-    decompress_snapshot_json, gallery_index_media_status, gallery_index_media_type_from_metadata,
+    DataScrubRunRecord, FileVersionIndex, GalleryDeltaChange, GalleryDeltaCursorError,
+    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
+    GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery,
+    ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
+    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
+    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
+    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
+    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    compress_snapshot_json, current_media_cache_metadata, decompress_snapshot_json,
+    gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_media_type_for_path, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
 };
@@ -31,6 +34,7 @@ use super::{
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SQLITE_READ_CONNECTION_COUNT: usize = 4;
+const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
 
 pub(super) struct SqliteMetadataStore {
     metadata_db_path: PathBuf,
@@ -141,7 +145,7 @@ impl SqliteMetadataStore {
         content_fingerprint: String,
         payload: Vec<u8>,
     ) -> Result<bool> {
-        self.write(move |db| {
+        self.write_tx(move |db| {
             let deleted = db.execute(
                 "DELETE FROM media_cache
                  WHERE content_fingerprint = ?1
@@ -149,7 +153,11 @@ impl SqliteMetadataStore {
                 params![content_fingerprint, payload],
             )?;
             if deleted > 0 {
+                let revision_before = current_gallery_revision_from_db(db)?;
                 refresh_gallery_objects_for_content_fingerprint(db, &content_fingerprint)?;
+                if current_gallery_revision_from_db(db)? == revision_before {
+                    record_gallery_upserts_for_content_fingerprint(db, &content_fingerprint)?;
+                }
             }
             Ok(deleted > 0)
         })
@@ -157,14 +165,18 @@ impl SqliteMetadataStore {
     }
 
     async fn backfill_gallery_objects(&self) -> Result<()> {
-        self.write(|db| {
+        self.write_tx(|db| {
             let mut statement = db.prepare(
                 "SELECT current_objects.key, current_objects.manifest_hash, current_objects.object_id
                  FROM current_objects
                  LEFT JOIN gallery_objects ON gallery_objects.key = current_objects.key
                  WHERE gallery_objects.key IS NULL
                     OR gallery_objects.manifest_hash != current_objects.manifest_hash
-                    OR gallery_objects.object_id != current_objects.object_id",
+                    OR gallery_objects.object_id != current_objects.object_id
+                    OR (
+                        gallery_objects.geotagged != 0
+                        AND (gallery_objects.latitude IS NULL OR gallery_objects.longitude IS NULL)
+                    )",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((
@@ -197,8 +209,10 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              media_type,
              captured_at_unix,
              media_status,
-             geotagged
-         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0)
+             geotagged,
+             latitude,
+             longitude
+         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL)
          ON CONFLICT(key) DO UPDATE SET
              manifest_hash = excluded.manifest_hash,
              object_id = excluded.object_id,
@@ -206,7 +220,12 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              media_type = excluded.inferred_media_type,
              captured_at_unix = 0,
              media_status = NULL,
-             geotagged = 0",
+             geotagged = 0,
+             latitude = NULL,
+             longitude = NULL
+         WHERE gallery_objects.manifest_hash != excluded.manifest_hash
+            OR gallery_objects.object_id != excluded.object_id
+            OR gallery_objects.inferred_media_type IS NOT excluded.inferred_media_type",
         params![
             key,
             entry.manifest_hash,
@@ -238,22 +257,31 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
         .and_then(|metadata| metadata.taken_at_unix)
         .unwrap_or(0);
     let media_status = gallery_index_media_status(metadata.as_ref());
-    let geotagged = metadata
+    let gps = metadata
         .as_ref()
         .and_then(|metadata| metadata.gps.as_ref())
-        .is_some();
+        .filter(|gps| {
+            gps.latitude.is_finite()
+                && (-90.0..=90.0).contains(&gps.latitude)
+                && gps.longitude.is_finite()
+                && (-180.0..=180.0).contains(&gps.longitude)
+        });
     db.execute(
         "UPDATE gallery_objects
          SET media_type = COALESCE(?1, inferred_media_type),
              captured_at_unix = ?2,
              media_status = ?3,
-             geotagged = ?4
-         WHERE manifest_hash = ?5",
+             geotagged = ?4,
+             latitude = ?5,
+             longitude = ?6
+         WHERE manifest_hash = ?7",
         params![
             media_type,
             u64_to_i64(captured_at_unix)?,
             media_status,
-            if geotagged { 1i64 } else { 0i64 },
+            if gps.is_some() { 1i64 } else { 0i64 },
+            gps.map(|gps| gps.latitude),
+            gps.map(|gps| gps.longitude),
             manifest_hash,
         ],
     )?;
@@ -278,9 +306,88 @@ fn refresh_gallery_objects_for_content_fingerprint(
     Ok(())
 }
 
+fn record_gallery_upserts_for_query(db: &Connection, sql: &str, parameter: &str) -> Result<()> {
+    let mut statement = db.prepare(sql)?;
+    let keys = statement
+        .query_map(params![parameter], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+    for key in keys {
+        record_gallery_change(db, &key, "upsert")?;
+    }
+    Ok(())
+}
+
+fn record_gallery_upserts_for_content_fingerprint(
+    db: &Connection,
+    content_fingerprint: &str,
+) -> Result<()> {
+    record_gallery_upserts_for_query(
+        db,
+        "SELECT gallery_objects.key
+         FROM gallery_objects
+         JOIN manifest_summaries
+           ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
+         WHERE manifest_summaries.content_fingerprint = ?1",
+        content_fingerprint,
+    )
+}
+
+fn record_gallery_upserts_for_manifest(db: &Connection, manifest_hash: &str) -> Result<()> {
+    record_gallery_upserts_for_query(
+        db,
+        "SELECT key FROM gallery_objects WHERE manifest_hash = ?1",
+        manifest_hash,
+    )
+}
+
+fn record_gallery_upserts_for_object_id(db: &Connection, object_id: &str) -> Result<()> {
+    record_gallery_upserts_for_query(
+        db,
+        "SELECT key FROM gallery_objects WHERE object_id = ?1",
+        object_id,
+    )
+}
+
+fn record_gallery_change(db: &Connection, key: &str, change_kind: &str) -> Result<()> {
+    db.execute(
+        "UPDATE metadata_meta
+         SET value = CAST(value AS INTEGER) + 1
+         WHERE key = 'gallery_revision'",
+        [],
+    )?;
+    let revision = current_gallery_revision_from_db(db)?;
+    db.execute(
+        "INSERT INTO gallery_changes(revision, key, change_kind) VALUES (?1, ?2, ?3)",
+        params![revision, key, change_kind],
+    )?;
+    db.execute(
+        "DELETE FROM gallery_changes WHERE revision <= ?1",
+        params![revision.saturating_sub(GALLERY_CHANGE_LOG_RETENTION)],
+    )?;
+    Ok(())
+}
+
 fn query_gallery_index_from_db(
     db: &Connection,
     query: &GalleryIndexQuery,
+) -> Result<GalleryIndexPage> {
+    let transaction = db.unchecked_transaction()?;
+    // Reading the revision first establishes the SQLite snapshot. Any write that
+    // commits afterwards is therefore guaranteed to be available from the delta
+    // feed rather than being hidden behind a newer token paired with stale rows.
+    let history_id = current_gallery_history_id_from_db(&transaction)?;
+    let revision = current_gallery_revision_from_db(&transaction)?;
+    let page = query_gallery_index_in_transaction(&transaction, query, history_id, revision)?;
+    transaction.commit()?;
+    Ok(page)
+}
+
+fn query_gallery_index_in_transaction(
+    db: &Connection,
+    query: &GalleryIndexQuery,
+    history_id: String,
+    revision: u64,
 ) -> Result<GalleryIndexPage> {
     let prefix = query.prefix.trim().trim_matches('/').to_string();
     let prefix_pattern = if prefix.is_empty() {
@@ -303,7 +410,28 @@ fn query_gallery_index_from_db(
                  - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
         END <= ?3
         AND gallery_objects.inferred_media_type IS NOT NULL
-        AND (?4 IS NULL OR gallery_objects.media_type = ?4)";
+        AND (?4 IS NULL OR gallery_objects.media_type = ?4)
+        AND (
+            ?5 IS NULL
+            OR (
+                gallery_objects.latitude BETWEEN ?5 AND ?6
+                AND (
+                    (?7 <= ?8 AND gallery_objects.longitude BETWEEN ?7 AND ?8)
+                    OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
+                )
+            )
+        )";
+    let (south, north, west, east) = query
+        .viewport
+        .map(|bounds| {
+            (
+                Some(bounds.south),
+                Some(bounds.north),
+                Some(bounds.west),
+                Some(bounds.east),
+            )
+        })
+        .unwrap_or((None, None, None, None));
     let summary_sql = format!(
         "SELECT
              COUNT(*),
@@ -318,7 +446,16 @@ fn query_gallery_index_from_db(
     );
     let (total_entry_count, media_summary) = db.query_row(
         &summary_sql,
-        params![prefix, prefix_pattern, depth, media_type],
+        params![
+            prefix,
+            prefix_pattern,
+            depth,
+            media_type,
+            south,
+            north,
+            west,
+            east
+        ],
         |row| {
             let count = |index| {
                 row.get::<_, i64>(index).and_then(|value| {
@@ -365,13 +502,24 @@ fn query_gallery_index_from_db(
            ON version_indexes.object_id = gallery_objects.object_id
          WHERE {scope}
          ORDER BY gallery_objects.captured_at_unix {sort_direction}, gallery_objects.key ASC
-         LIMIT ?5 OFFSET ?6"
+         LIMIT ?9 OFFSET ?10"
     );
     let limit = i64::try_from(query.limit).context("gallery index limit overflow")?;
     let offset = i64::try_from(query.offset).context("gallery index offset overflow")?;
     let mut statement = db.prepare(&page_sql)?;
     let rows = statement.query_map(
-        params![prefix, prefix_pattern, depth, media_type, limit, offset],
+        params![
+            prefix,
+            prefix_pattern,
+            depth,
+            media_type,
+            south,
+            north,
+            west,
+            east,
+            limit,
+            offset
+        ],
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -393,40 +541,310 @@ fn query_gallery_index_from_db(
             metadata_payload,
             version_index_payload,
         ) = row?;
-        let size_bytes = size_bytes
-            .map(|value| u64::try_from(value).context("negative gallery entry size in sqlite"))
-            .transpose()?;
-        let media_metadata = metadata_payload
-            .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
-            .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
-        let modified_at_unix = version_index_payload
-            .map(|payload| {
-                serde_json::from_slice::<FileVersionIndex>(&payload)
-                    .context("invalid version index while reading gallery projection")
-            })
-            .transpose()?
-            .and_then(|index| {
-                index
-                    .versions
-                    .values()
-                    .filter(|record| record.manifest_hash == manifest_hash)
-                    .map(|record| record.created_at_unix)
-                    .max()
-            });
-        entries.push(GalleryIndexEntry {
+        entries.push(materialize_gallery_index_entry(
             key,
             manifest_hash,
             size_bytes,
-            modified_at_unix,
             content_fingerprint,
-            media_metadata,
-        });
+            metadata_payload,
+            version_index_payload,
+        )?);
     }
     Ok(GalleryIndexPage {
+        history_id,
+        revision,
         total_entry_count,
         media_summary,
         entries,
     })
+}
+
+fn materialize_gallery_index_entry(
+    key: String,
+    manifest_hash: String,
+    size_bytes: Option<i64>,
+    content_fingerprint: Option<String>,
+    metadata_payload: Option<Vec<u8>>,
+    version_index_payload: Option<Vec<u8>>,
+) -> Result<GalleryIndexEntry> {
+    let size_bytes = size_bytes
+        .map(|value| u64::try_from(value).context("negative gallery entry size in sqlite"))
+        .transpose()?;
+    let media_metadata = metadata_payload
+        .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
+        .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
+    let modified_at_unix = version_index_payload
+        .map(|payload| {
+            serde_json::from_slice::<FileVersionIndex>(&payload)
+                .context("invalid version index while reading gallery projection")
+        })
+        .transpose()?
+        .and_then(|index| {
+            index
+                .versions
+                .values()
+                .filter(|record| record.manifest_hash == manifest_hash)
+                .map(|record| record.created_at_unix)
+                .max()
+        });
+    Ok(GalleryIndexEntry {
+        key,
+        manifest_hash,
+        size_bytes,
+        modified_at_unix,
+        content_fingerprint,
+        media_metadata,
+    })
+}
+
+fn query_gallery_entry_from_db(
+    db: &Connection,
+    key: &str,
+    scope: &GalleryDeltaScope,
+) -> Result<Option<GalleryIndexEntry>> {
+    let row = db
+        .query_row(
+            "SELECT
+                 gallery_objects.key,
+                 gallery_objects.manifest_hash,
+                 manifest_summaries.total_size_bytes,
+                 manifest_summaries.content_fingerprint,
+                 media_cache.metadata_json,
+                 version_indexes.index_json,
+                 gallery_objects.media_type,
+                 gallery_objects.latitude,
+                 gallery_objects.longitude
+             FROM gallery_objects
+             LEFT JOIN manifest_summaries
+               ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
+             LEFT JOIN media_cache
+               ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
+             LEFT JOIN version_indexes
+               ON version_indexes.object_id = gallery_objects.object_id
+             WHERE gallery_objects.key = ?1
+               AND gallery_objects.inferred_media_type IS NOT NULL",
+            params![key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, Option<f64>>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.filter(|(key, _, _, _, _, _, media_type, latitude, longitude)| {
+        gallery_entry_matches_delta_scope(key, media_type.as_deref(), *latitude, *longitude, scope)
+    })
+    .map(
+        |(key, manifest_hash, size, fingerprint, metadata, versions, _, _, _)| {
+            materialize_gallery_index_entry(
+                key,
+                manifest_hash,
+                size,
+                fingerprint,
+                metadata,
+                versions,
+            )
+        },
+    )
+    .transpose()
+}
+
+fn gallery_entry_matches_delta_scope(
+    key: &str,
+    media_type: Option<&str>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    scope: &GalleryDeltaScope,
+) -> bool {
+    let prefix = scope.prefix.trim().trim_matches('/');
+    let relative_key = if prefix.is_empty() {
+        Some(key)
+    } else if key == prefix {
+        Some("")
+    } else {
+        key.strip_prefix(prefix)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+    };
+    let Some(relative_key) = relative_key else {
+        return false;
+    };
+    let relative_depth = if relative_key.is_empty() {
+        0
+    } else {
+        relative_key.bytes().filter(|byte| *byte == b'/').count() + 1
+    };
+    if relative_depth > scope.depth {
+        return false;
+    }
+    let media_matches = match scope.media_filter {
+        super::GalleryIndexMediaFilter::All => true,
+        super::GalleryIndexMediaFilter::Image => media_type == Some("image"),
+        super::GalleryIndexMediaFilter::Video => media_type == Some("video"),
+    };
+    if !media_matches {
+        return false;
+    }
+    let Some(viewport) = scope.viewport else {
+        return true;
+    };
+    let (Some(latitude), Some(longitude)) = (latitude, longitude) else {
+        return false;
+    };
+    let longitude_matches = if viewport.west <= viewport.east {
+        (viewport.west..=viewport.east).contains(&longitude)
+    } else {
+        longitude >= viewport.west || longitude <= viewport.east
+    };
+    (viewport.south..=viewport.north).contains(&latitude) && longitude_matches
+}
+
+fn current_gallery_revision_from_db(db: &Connection) -> Result<u64> {
+    let raw = db.query_row(
+        "SELECT value FROM metadata_meta WHERE key = 'gallery_revision'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    raw.parse::<u64>()
+        .with_context(|| format!("invalid persisted gallery revision: {raw}"))
+}
+
+fn current_gallery_history_id_from_db(db: &Connection) -> Result<String> {
+    let history_id = db.query_row(
+        "SELECT value FROM metadata_meta WHERE key = 'gallery_history_id'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    Uuid::parse_str(&history_id)
+        .with_context(|| format!("invalid persisted gallery history id: {history_id}"))?;
+    Ok(history_id)
+}
+
+fn query_gallery_delta_from_db(
+    db: &Connection,
+    history_id: &str,
+    since_revision: u64,
+    limit: usize,
+    scope: &GalleryDeltaScope,
+) -> Result<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>> {
+    let transaction = db.unchecked_transaction()?;
+    let page =
+        query_gallery_delta_in_transaction(&transaction, history_id, since_revision, limit, scope)?;
+    transaction.commit()?;
+    Ok(page)
+}
+
+fn query_gallery_delta_in_transaction(
+    db: &Connection,
+    history_id: &str,
+    since_revision: u64,
+    limit: usize,
+    scope: &GalleryDeltaScope,
+) -> Result<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>> {
+    let current_history_id = current_gallery_history_id_from_db(db)?;
+    let current_revision = current_gallery_revision_from_db(db)?;
+    if history_id != current_history_id {
+        return Ok(Err(GalleryDeltaCursorError::HistoryMismatch {
+            history_id: current_history_id,
+            current_revision,
+        }));
+    }
+    if since_revision > current_revision {
+        return Ok(Err(GalleryDeltaCursorError::Ahead {
+            history_id: current_history_id,
+            current_revision,
+        }));
+    }
+    let oldest_revision = db
+        .query_row("SELECT MIN(revision) FROM gallery_changes", [], |row| {
+            row.get::<_, Option<u64>>(0)
+        })?
+        .unwrap_or(current_revision.saturating_add(1));
+    if since_revision.saturating_add(1) < oldest_revision {
+        return Ok(Err(GalleryDeltaCursorError::Expired {
+            history_id: current_history_id,
+            current_revision,
+        }));
+    }
+
+    let sql_limit =
+        i64::try_from(limit.saturating_add(1)).context("gallery delta limit overflow")?;
+    let mut statement = db.prepare(
+        "SELECT
+             revision,
+             key,
+             previous_inferred_media_type,
+             previous_media_type,
+             previous_latitude,
+             previous_longitude
+         FROM gallery_changes
+         WHERE revision > ?1
+         ORDER BY revision ASC
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![since_revision, sql_limit], |row| {
+        Ok((
+            row.get::<_, u64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<f64>>(4)?,
+            row.get::<_, Option<f64>>(5)?,
+        ))
+    })?;
+    let mut raw_changes = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let has_more = raw_changes.len() > limit;
+    raw_changes.truncate(limit);
+    let next_revision = raw_changes
+        .last()
+        .map(|(revision, ..)| *revision)
+        .unwrap_or(current_revision);
+    let mut changes = Vec::with_capacity(raw_changes.len());
+    for (
+        _revision,
+        key,
+        previous_inferred_media_type,
+        previous_media_type,
+        previous_latitude,
+        previous_longitude,
+    ) in raw_changes
+    {
+        let entry = query_gallery_entry_from_db(db, &key, scope)?;
+        if entry.is_some() {
+            changes.push(GalleryDeltaChange {
+                key,
+                kind: GalleryDeltaKind::Upsert,
+                entry,
+            });
+        } else if previous_inferred_media_type.is_some()
+            && gallery_entry_matches_delta_scope(
+                &key,
+                previous_media_type.as_deref(),
+                previous_latitude,
+                previous_longitude,
+                scope,
+            )
+        {
+            changes.push(GalleryDeltaChange {
+                key,
+                kind: GalleryDeltaKind::Removal,
+                entry: None,
+            });
+        }
+    }
+    Ok(Ok(GalleryDeltaPage {
+        history_id: current_history_id,
+        next_revision,
+        has_more,
+        changes,
+    }))
 }
 
 async fn open_sqlite_writer_connection(metadata_db_path: &Path) -> Result<TokioConnection> {
@@ -514,7 +932,7 @@ impl MetadataStore for SqliteMetadataStore {
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()> {
         let key = key.to_string();
         let entry = entry.clone();
-        self.write(move |db| {
+        self.write_tx(move |db| {
             db.execute(
                 "INSERT INTO current_objects (key, manifest_hash, object_id)
                  VALUES (?1, ?2, ?3)
@@ -530,7 +948,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn remove_current_object(&self, key: &str) -> Result<()> {
         let key = key.to_string();
-        self.write(move |db| {
+        self.write_tx(move |db| {
             db.execute("DELETE FROM current_objects WHERE key = ?1", params![key])?;
             db.execute("DELETE FROM gallery_objects WHERE key = ?1", params![key])?;
             Ok(())
@@ -545,6 +963,21 @@ impl MetadataStore for SqliteMetadataStore {
         let query = query.clone();
         self.read(move |db| query_gallery_index_from_db(db, &query).map(Some))
             .await
+    }
+
+    async fn query_gallery_delta(
+        &self,
+        history_id: &str,
+        since_revision: u64,
+        limit: usize,
+        scope: &GalleryDeltaScope,
+    ) -> Result<Option<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>>> {
+        let history_id = history_id.to_string();
+        let scope = scope.clone();
+        self.read(move |db| {
+            query_gallery_delta_from_db(db, &history_id, since_revision, limit, &scope).map(Some)
+        })
+        .await
     }
 
     async fn count_current_objects(&self) -> Result<usize> {
@@ -1504,14 +1937,23 @@ impl MetadataStore for SqliteMetadataStore {
     async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
         let payload = serde_json::to_vec_pretty(metadata)?;
         let content_fingerprint = metadata.content_fingerprint.clone();
-        self.write(move |db| {
-            db.execute(
+        self.write_tx(move |db| {
+            let changed = db.execute(
                 "INSERT INTO media_cache (content_fingerprint, metadata_json)
                  VALUES (?1, ?2)
-                 ON CONFLICT(content_fingerprint) DO UPDATE SET metadata_json = excluded.metadata_json",
+                 ON CONFLICT(content_fingerprint) DO UPDATE
+                 SET metadata_json = excluded.metadata_json
+                 WHERE media_cache.metadata_json != excluded.metadata_json",
                 params![content_fingerprint, payload],
             )?;
-            refresh_gallery_objects_for_content_fingerprint(db, &content_fingerprint)
+            if changed > 0 {
+                let revision_before = current_gallery_revision_from_db(db)?;
+                refresh_gallery_objects_for_content_fingerprint(db, &content_fingerprint)?;
+                if current_gallery_revision_from_db(db)? == revision_before {
+                    record_gallery_upserts_for_content_fingerprint(db, &content_fingerprint)?;
+                }
+            }
+            Ok(())
         })
         .await
     }
@@ -1534,12 +1976,19 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn delete_media_cache_record(&self, content_fingerprint: &str) -> Result<()> {
         let content_fingerprint = content_fingerprint.to_string();
-        self.write(move |db| {
-            db.execute(
+        self.write_tx(move |db| {
+            let deleted = db.execute(
                 "DELETE FROM media_cache WHERE content_fingerprint = ?1",
                 params![content_fingerprint],
             )?;
-            refresh_gallery_objects_for_content_fingerprint(db, &content_fingerprint)
+            if deleted > 0 {
+                let revision_before = current_gallery_revision_from_db(db)?;
+                refresh_gallery_objects_for_content_fingerprint(db, &content_fingerprint)?;
+                if current_gallery_revision_from_db(db)? == revision_before {
+                    record_gallery_upserts_for_content_fingerprint(db, &content_fingerprint)?;
+                }
+            }
+            Ok(())
         })
         .await
     }
@@ -2105,20 +2554,29 @@ impl MetadataStore for SqliteMetadataStore {
         let manifest_hash = manifest_hash.to_string();
         let total_size_bytes = summary.total_size_bytes;
         let content_fingerprint = summary.content_fingerprint.clone();
-        self.write(move |db| {
-            db.execute(
+        self.write_tx(move |db| {
+            let changed = db.execute(
                 "INSERT INTO manifest_summaries (manifest_hash, total_size_bytes, content_fingerprint)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(manifest_hash) DO UPDATE
                  SET total_size_bytes = excluded.total_size_bytes,
-                     content_fingerprint = excluded.content_fingerprint",
+                     content_fingerprint = excluded.content_fingerprint
+                 WHERE manifest_summaries.total_size_bytes != excluded.total_size_bytes
+                    OR manifest_summaries.content_fingerprint != excluded.content_fingerprint",
                 params![
                     manifest_hash,
                     u64_to_i64(total_size_bytes)?,
                     content_fingerprint
                 ],
             )?;
-            refresh_gallery_objects_for_manifest(db, &manifest_hash)
+            if changed > 0 {
+                let revision_before = current_gallery_revision_from_db(db)?;
+                refresh_gallery_objects_for_manifest(db, &manifest_hash)?;
+                if current_gallery_revision_from_db(db)? == revision_before {
+                    record_gallery_upserts_for_manifest(db, &manifest_hash)?;
+                }
+            }
+            Ok(())
         })
         .await
     }
@@ -2130,13 +2588,17 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
         let object_id = object_id.to_string();
-        self.write(move |db| {
-            db.execute(
+        self.write_tx(move |db| {
+            let changed = db.execute(
                 "INSERT INTO version_indexes (object_id, index_json)
                  VALUES (?1, ?2)
-                 ON CONFLICT(object_id) DO UPDATE SET index_json = excluded.index_json",
+                 ON CONFLICT(object_id) DO UPDATE SET index_json = excluded.index_json
+                 WHERE version_indexes.index_json != excluded.index_json",
                 params![object_id, payload],
             )?;
+            if changed > 0 {
+                record_gallery_upserts_for_object_id(db, &object_id)?;
+            }
             Ok(())
         })
         .await
@@ -2822,7 +3284,19 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             media_type TEXT,
             captured_at_unix INTEGER NOT NULL DEFAULT 0,
             media_status TEXT,
-            geotagged INTEGER NOT NULL DEFAULT 0
+            geotagged INTEGER NOT NULL DEFAULT 0,
+            latitude REAL,
+            longitude REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS gallery_changes (
+            revision INTEGER PRIMARY KEY,
+            key TEXT NOT NULL,
+            change_kind TEXT NOT NULL CHECK(change_kind IN ('upsert', 'removal')),
+            previous_inferred_media_type TEXT,
+            previous_media_type TEXT,
+            previous_latitude REAL,
+            previous_longitude REAL
         );
 
         CREATE TABLE IF NOT EXISTS version_indexes (
@@ -3041,6 +3515,23 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON s3_object_versions(bucket_name, ironmesh_key, created_at_unix DESC, version_id DESC);
         ",
     )?;
+    add_sqlite_column_if_missing(db, "gallery_objects", "latitude", "REAL")?;
+    add_sqlite_column_if_missing(db, "gallery_objects", "longitude", "REAL")?;
+    add_sqlite_column_if_missing(
+        db,
+        "gallery_changes",
+        "previous_inferred_media_type",
+        "TEXT",
+    )?;
+    add_sqlite_column_if_missing(db, "gallery_changes", "previous_media_type", "TEXT")?;
+    add_sqlite_column_if_missing(db, "gallery_changes", "previous_latitude", "REAL")?;
+    add_sqlite_column_if_missing(db, "gallery_changes", "previous_longitude", "REAL")?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gallery_objects_viewport
+         ON gallery_objects(latitude, longitude, media_type, captured_at_unix DESC, key ASC)",
+        [],
+    )?;
+    init_gallery_change_log(db)?;
     if let Err(err) = db.execute(
         "ALTER TABLE s3_access_keys ADD COLUMN allow_manage INTEGER NOT NULL DEFAULT 0",
         [],
@@ -3088,6 +3579,122 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     .context("failed to persist sqlite metadata schema version")?;
 
     Ok(())
+}
+
+fn add_sqlite_column_if_missing(
+    db: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    if let Err(err) = db.execute(&sql, [])
+        && !err.to_string().contains("duplicate column name")
+    {
+        return Err(err).with_context(|| format!("failed to add {table}.{column}"));
+    }
+    Ok(())
+}
+
+fn init_gallery_change_log(db: &Connection) -> Result<()> {
+    db.execute(
+        "INSERT INTO metadata_meta(key, value) VALUES('gallery_history_id', ?1)
+         ON CONFLICT(key) DO NOTHING",
+        params![Uuid::new_v4().to_string()],
+    )?;
+    db.execute(
+        "INSERT INTO metadata_meta(key, value) VALUES('gallery_revision', '0')
+         ON CONFLICT(key) DO NOTHING",
+        [],
+    )?;
+    db.execute_batch(
+        "DROP TRIGGER IF EXISTS gallery_objects_change_insert;
+         DROP TRIGGER IF EXISTS gallery_objects_change_update;
+         DROP TRIGGER IF EXISTS gallery_objects_change_delete;",
+    )?;
+    let trigger_sql = format!(
+        "
+        CREATE TRIGGER gallery_objects_change_insert
+        AFTER INSERT ON gallery_objects
+        BEGIN
+            UPDATE metadata_meta
+               SET value = CAST(value AS INTEGER) + 1
+             WHERE key = 'gallery_revision';
+            INSERT INTO gallery_changes(revision, key, change_kind)
+            SELECT CAST(value AS INTEGER), NEW.key, 'upsert'
+              FROM metadata_meta WHERE key = 'gallery_revision';
+            DELETE FROM gallery_changes
+             WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};
+        END;
+
+        CREATE TRIGGER gallery_objects_change_update
+        AFTER UPDATE ON gallery_objects
+        WHEN OLD.manifest_hash IS NOT NEW.manifest_hash
+          OR OLD.object_id IS NOT NEW.object_id
+          OR OLD.inferred_media_type IS NOT NEW.inferred_media_type
+          OR OLD.media_type IS NOT NEW.media_type
+          OR OLD.captured_at_unix IS NOT NEW.captured_at_unix
+          OR OLD.media_status IS NOT NEW.media_status
+          OR OLD.geotagged IS NOT NEW.geotagged
+          OR OLD.latitude IS NOT NEW.latitude
+          OR OLD.longitude IS NOT NEW.longitude
+        BEGIN
+            UPDATE metadata_meta
+               SET value = CAST(value AS INTEGER) + 1
+             WHERE key = 'gallery_revision';
+            INSERT INTO gallery_changes(
+                revision,
+                key,
+                change_kind,
+                previous_inferred_media_type,
+                previous_media_type,
+                previous_latitude,
+                previous_longitude
+            )
+            SELECT
+                CAST(value AS INTEGER),
+                NEW.key,
+                'upsert',
+                OLD.inferred_media_type,
+                OLD.media_type,
+                OLD.latitude,
+                OLD.longitude
+              FROM metadata_meta WHERE key = 'gallery_revision';
+            DELETE FROM gallery_changes
+             WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};
+        END;
+
+        CREATE TRIGGER gallery_objects_change_delete
+        AFTER DELETE ON gallery_objects
+        BEGIN
+            UPDATE metadata_meta
+               SET value = CAST(value AS INTEGER) + 1
+             WHERE key = 'gallery_revision';
+            INSERT INTO gallery_changes(
+                revision,
+                key,
+                change_kind,
+                previous_inferred_media_type,
+                previous_media_type,
+                previous_latitude,
+                previous_longitude
+            )
+            SELECT
+                CAST(value AS INTEGER),
+                OLD.key,
+                'removal',
+                OLD.inferred_media_type,
+                OLD.media_type,
+                OLD.latitude,
+                OLD.longitude
+              FROM metadata_meta WHERE key = 'gallery_revision';
+            DELETE FROM gallery_changes
+             WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};
+        END;
+        "
+    );
+    db.execute_batch(&trigger_sql)
+        .context("failed to initialize sqlite gallery change log")
 }
 
 fn load_current_state_from_db(db: &Connection) -> Result<CurrentState> {
@@ -3165,6 +3772,10 @@ fn u64_to_i64(value: u64) -> Result<i64> {
 fn usize_to_i64(value: usize) -> Result<i64> {
     i64::try_from(value).context("integer overflow converting usize to i64")
 }
+
+#[cfg(test)]
+#[path = "sqlite_impl/gallery_tests.rs"]
+mod gallery_tests;
 
 #[cfg(test)]
 mod tests {

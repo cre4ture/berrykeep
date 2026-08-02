@@ -22,6 +22,7 @@ export type MapImportProfile =
   | "natural-earth-vector"
   | "natural-earth-cross-blended-hypso"
   | "natural-earth-one"
+  | "openmaptiles-street"
   | "remote-mbtiles";
 
 export type MapDatasetImportWizardTarget = {
@@ -51,6 +52,7 @@ type MapDatasetImportWizardProps = {
   naturalEarthVectorTarget: MapDatasetImportWizardTarget | null;
   naturalEarthHypsoTarget: MapDatasetImportWizardTarget | null;
   naturalEarthOneTarget: MapDatasetImportWizardTarget | null;
+  openMapTilesStreetTarget: MapDatasetImportWizardTarget | null;
   mapConfigurationLoading: boolean;
   controlsLocked: boolean;
   canStartImport: boolean;
@@ -78,6 +80,7 @@ export function MapDatasetImportWizard({
   naturalEarthVectorTarget,
   naturalEarthHypsoTarget,
   naturalEarthOneTarget,
+  openMapTilesStreetTarget,
   mapConfigurationLoading,
   controlsLocked,
   canStartImport,
@@ -119,11 +122,29 @@ export function MapDatasetImportWizard({
           ? naturalEarthVectorTarget !== null
           : profile === "natural-earth-cross-blended-hypso"
             ? naturalEarthHypsoTarget !== null
-            : naturalEarthOneTarget !== null;
+            : profile === "natural-earth-one"
+              ? naturalEarthOneTarget !== null
+              : false;
+  const hasFixedDestination =
+    hasNaturalEarthDestination ||
+    (profile === "openmaptiles-street" && openMapTilesStreetTarget !== null);
+  const usesFixedDestination =
+    profile === "natural-earth-physical" ||
+    profile === "natural-earth-physical-with-labels" ||
+    profile === "natural-earth-vector" ||
+    profile === "natural-earth-cross-blended-hypso" ||
+    profile === "natural-earth-one" ||
+    profile === "openmaptiles-street";
+  const usesAutomaticNaturalEarthSource =
+    profile === "natural-earth-physical" ||
+    profile === "natural-earth-physical-with-labels" ||
+    profile === "natural-earth-vector" ||
+    profile === "natural-earth-cross-blended-hypso" ||
+    profile === "natural-earth-one";
   const canContinue =
     (step === 0 && profile !== null) ||
-    (step === 1 && (naturalEarthTargets.length > 0 || source.trim().length > 0)) ||
-    (step === 2 && (naturalEarthTargets.length > 0 ? hasNaturalEarthDestination : selectedTarget !== null));
+    (step === 1 && (usesAutomaticNaturalEarthSource || source.trim().length > 0)) ||
+    (step === 2 && (usesFixedDestination ? hasFixedDestination : selectedTarget !== null));
 
   return (
     <>
@@ -160,6 +181,7 @@ export function MapDatasetImportWizard({
           naturalEarthVectorTarget={naturalEarthVectorTarget}
           naturalEarthHypsoTarget={naturalEarthHypsoTarget}
           naturalEarthOneTarget={naturalEarthOneTarget}
+          openMapTilesStreetTarget={openMapTilesStreetTarget}
           mapConfigurationLoading={mapConfigurationLoading}
           partSizeGiB={partSizeGiB}
           controlsLocked={controlsLocked}
@@ -239,6 +261,12 @@ function MapTypeStep({
           disabled={controlsLocked}
         />
         <Radio
+          value="openmaptiles-street"
+          label="OpenMapTiles Street"
+          description="Download an authorized OpenMapTiles Street MBTiles package into the predefined street-map artifact."
+          disabled={controlsLocked}
+        />
+        <Radio
           value="remote-mbtiles"
           label="An existing MBTiles package"
           description="Download a compatible MBTiles file from an HTTP URL and publish it to one configured map artifact."
@@ -289,6 +317,31 @@ function MapSourceStep({
     );
   }
 
+  if (profile === "openmaptiles-street") {
+    return (
+      <Stack gap="sm">
+        <Alert color="blue" variant="light" title="OpenMapTiles Street source">
+          Open <Anchor href="https://www.maptiler.com/" target="_blank" rel="noreferrer">MapTiler</Anchor>{" "}
+          to obtain an authorized, range-capable URL or copied <Code>wget</Code> command for the
+          OpenStreetMap vector tiles. Paste it below and the server resumes and publishes the
+          download in the background while this profile keeps the OpenMapTiles Street destination
+          fixed. MapTiler satellite MBTiles are also supported through <Code>An existing MBTiles
+          package</Code> by choosing the configured MapTiler Satellite target.
+        </Alert>
+        <Textarea
+          label="OpenMapTiles Street URL or pasted CLI command"
+          description="The source URL is persisted server-side for resumable retries and restart-safe continuation, but the admin UI only shows a redacted display form afterward."
+          placeholder="wget -c https://data.maptiler.com/download/<token>/openmaptiles-street.mbtiles"
+          minRows={3}
+          autosize
+          value={source}
+          onChange={(event) => onSourceChange(event.currentTarget.value)}
+          disabled={controlsLocked}
+        />
+      </Stack>
+    );
+  }
+
   return (
     <Textarea
       label="MBTiles URL or pasted CLI command"
@@ -314,6 +367,7 @@ function MapDestinationStep({
   naturalEarthVectorTarget,
   naturalEarthHypsoTarget,
   naturalEarthOneTarget,
+  openMapTilesStreetTarget,
   mapConfigurationLoading,
   partSizeGiB,
   controlsLocked,
@@ -331,6 +385,7 @@ function MapDestinationStep({
   | "naturalEarthVectorTarget"
   | "naturalEarthHypsoTarget"
   | "naturalEarthOneTarget"
+  | "openMapTilesStreetTarget"
   | "mapConfigurationLoading"
   | "partSizeGiB"
   | "controlsLocked"
@@ -420,6 +475,29 @@ function MapDestinationStep({
     );
   }
 
+  if (profile === "openmaptiles-street") {
+    return openMapTilesStreetTarget ? (
+      <Stack gap="sm">
+        <Alert color="blue" variant="light" title="Configured OpenMapTiles Street destination">
+          The downloaded vector tiles will replace <Code>{openMapTilesStreetTarget.label}</Code> at
+          <Code> {openMapTilesStreetTarget.manifestKey} </Code>. This target is fixed so the map
+          keeps its OpenMapTiles source-layer style.
+        </Alert>
+        <TargetProviderHint target={openMapTilesStreetTarget} />
+        <MapImportPartSizeInput
+          partSizeGiB={partSizeGiB}
+          controlsLocked={controlsLocked}
+          onPartSizeChange={onPartSizeChange}
+        />
+      </Stack>
+    ) : (
+      <Alert color="red" title="OpenMapTiles Street destination is not configured">
+        Add a vector artifact for the <Code>openmaptiles-street</Code> variant before starting this
+        profile.
+      </Alert>
+    );
+  }
+
   return (
     <Stack gap="sm">
       <Select
@@ -439,22 +517,39 @@ function MapDestinationStep({
         nothingFoundMessage="No configured map artifact"
       />
       {selectedTarget ? <TargetProviderHint target={selectedTarget} /> : null}
-      <NumberInput
-        label="Part size"
-        description="Each finalized part object keeps its own BerryKeep object key under sys/maps/."
-        value={partSizeGiB}
-        min={1}
-        max={64}
-        step={1}
-        suffix=" GiB"
-        allowDecimal={false}
-        onChange={(value) =>
-          onPartSizeChange(typeof value === "number" && Number.isFinite(value) ? value : 10)
-        }
-        w={220}
-        disabled={controlsLocked}
+      <MapImportPartSizeInput
+        partSizeGiB={partSizeGiB}
+        controlsLocked={controlsLocked}
+        onPartSizeChange={onPartSizeChange}
       />
     </Stack>
+  );
+}
+
+function MapImportPartSizeInput({
+  partSizeGiB,
+  controlsLocked,
+  onPartSizeChange
+}: Pick<
+  MapDatasetImportWizardProps,
+  "partSizeGiB" | "controlsLocked" | "onPartSizeChange"
+>) {
+  return (
+    <NumberInput
+      label="Part size"
+      description="Each finalized part object keeps its own BerryKeep object key under sys/maps/."
+      value={partSizeGiB}
+      min={1}
+      max={64}
+      step={1}
+      suffix=" GiB"
+      allowDecimal={false}
+      onChange={(value) =>
+        onPartSizeChange(typeof value === "number" && Number.isFinite(value) ? value : 10)
+      }
+      w={220}
+      disabled={controlsLocked}
+    />
   );
 }
 
@@ -507,7 +602,9 @@ function MapReviewStep({
                       ? "Natural Earth hypsometric relief map"
                       : profile === "natural-earth-one"
                         ? "Natural Earth I relief and water map"
-                        : "Existing MBTiles package"}
+                        : profile === "openmaptiles-street"
+                          ? "OpenMapTiles Street"
+                          : "Existing MBTiles package"}
             </Text>
           </WizardDetail>
           <WizardDetail label="Source">
@@ -542,7 +639,7 @@ function MapReviewStep({
               <Code>{target.manifestKey}</Code>
             </WizardDetail>
           ) : null}
-          {profile === "remote-mbtiles" ? (
+          {profile === "remote-mbtiles" || profile === "openmaptiles-street" ? (
             <WizardDetail label="Part size">
               <Text size="sm">{partSizeGiB} GiB</Text>
             </WizardDetail>

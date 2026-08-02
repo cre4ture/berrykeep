@@ -4,19 +4,20 @@ use futures_util::StreamExt;
 use iroh::SecretKey;
 use iroh::endpoint::{Connection, PathList};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore, watch};
 use transport_sdk::{
     ClientIdentityMaterial, ConnectionCandidate, DEFAULT_DIRECT_QUIC_ALPN, DirectQuicEndpoint,
-    DirectQuicEndpointConfig, DirectQuicSession, ExpectedNodeServerIdentity, MultiplexConfig,
-    MultiplexMode, MultiplexedSession, PeerIdentity, RelayTicketRequest, RelayTunnelSession,
-    RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig, RendezvousControlClient,
-    TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
-    WebSocketByteStream, build_signed_request_headers,
-    connect_websocket_with_expected_server_identity, has_usable_peer_addresses,
-    perform_transport_client_handshake, websocket_url,
+    DirectQuicEndpointConfig, DirectQuicSession, ExpectedNodeServerIdentity, IrohRelayTicket,
+    IrohRelayTicketCollection, MultiplexConfig, MultiplexMode, MultiplexedSession, PeerIdentity,
+    RelayTicketRequest, RelayTunnelSession, RelayTunnelSessionKind,
+    RelayTunnelSourceSecurityConfig, RendezvousControlClient, TRANSPORT_PROTOCOL_VERSION,
+    TransportSessionControlMessage, TransportSessionRole, WebSocketByteStream,
+    build_signed_request_headers, connect_websocket_with_expected_server_identity,
+    has_usable_peer_addresses, perform_transport_client_handshake, websocket_url,
 };
 
 const IROH_RELAY_TICKET_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -65,6 +66,56 @@ struct CachedTransportSession {
 struct ManagedDirectQuicEndpoint {
     endpoint: DirectQuicEndpoint,
     relay_ticket_refresh: Option<tokio::task::AbortHandle>,
+}
+
+#[derive(Clone, Default)]
+struct ManagedIrohRelayTickets {
+    relays: BTreeMap<String, ManagedIrohRelayTicket>,
+}
+
+#[derive(Clone)]
+struct ManagedIrohRelayTicket {
+    auth_token: String,
+    expires_at_unix: u64,
+    quic_port: Option<u16>,
+}
+
+impl ManagedIrohRelayTickets {
+    fn insert(&mut self, ticket: &IrohRelayTicket) {
+        for url in &ticket.public_urls {
+            self.relays.insert(
+                normalize_iroh_relay_url(url),
+                ManagedIrohRelayTicket {
+                    auth_token: ticket.auth_token.clone(),
+                    expires_at_unix: ticket.expires_at_unix,
+                    quic_port: ticket.quic_port,
+                },
+            );
+        }
+    }
+
+    fn relay_configs(&self) -> Vec<transport_sdk::DirectQuicRelayConfig> {
+        self.relays
+            .iter()
+            .map(|(url, ticket)| transport_sdk::DirectQuicRelayConfig {
+                url: url.clone(),
+                auth_token: Some(ticket.auth_token.clone()),
+                quic_port: ticket.quic_port,
+            })
+            .collect()
+    }
+
+    fn earliest_expiry(&self) -> u64 {
+        self.relays
+            .values()
+            .map(|ticket| ticket.expires_at_unix)
+            .min()
+            .unwrap_or_else(unix_ts)
+    }
+}
+
+fn normalize_iroh_relay_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
 }
 
 type SharedSessionSetupResult = std::result::Result<Arc<MultiplexedSession>, Arc<str>>;
@@ -1094,7 +1145,7 @@ async fn ensure_direct_quic_endpoint(
     let has_usable_peer_addresses = has_usable_peer_addresses(candidate)?;
     let secret_key = SecretKey::generate();
     let endpoint_id = secret_key.public().to_string();
-    let relay_ticket = match rendezvous {
+    let relay_ticket_collection = match rendezvous {
         Some(rendezvous) => {
             let ticket_started = Instant::now();
             tracing::info!(
@@ -1113,11 +1164,11 @@ async fn ensure_direct_quic_endpoint(
             );
             match tokio::time::timeout(
                 RELAY_TICKET_REQUEST_TIMEOUT,
-                rendezvous.issue_iroh_relay_ticket(&endpoint_id),
+                rendezvous.issue_iroh_relay_tickets_progressively(&endpoint_id),
             )
             .await
             {
-                Ok(Ok(ticket)) => {
+                Ok(Ok(collection)) => {
                     tracing::info!(
                         target: MOBILE_CONNECTION_LOG_TARGET,
                         event = "iroh_relay_ticket_completed",
@@ -1128,11 +1179,11 @@ async fn ensure_direct_quic_endpoint(
                         endpoint_id = %endpoint_id,
                         target_node_id = %target_node_id,
                         relay_scope = "endpoint_bound",
-                        relay_urls = ?ticket.public_urls,
+                        relay_urls = ?collection.first_ticket().public_urls,
                         duration_us = duration_as_u64_micros(ticket_started.elapsed()),
                         "iroh_relay_ticket_completed"
                     );
-                    Some(ticket)
+                    Some(collection)
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(
@@ -1176,6 +1227,10 @@ async fn ensure_direct_quic_endpoint(
         None => None,
     };
 
+    let first_relay_ticket = relay_ticket_collection
+        .as_ref()
+        .map(|collection| collection.first_ticket().clone());
+
     let static_relay_authorized = rendezvous.is_none()
         && candidate
             .transport_hints
@@ -1187,7 +1242,7 @@ async fn ensure_direct_quic_endpoint(
             .as_ref()
             .and_then(|hints| hints.relay_auth_token.as_deref())
             .is_some_and(|token| !token.trim().is_empty());
-    let relay_enabled = relay_ticket.is_some() || static_relay_authorized;
+    let relay_enabled = first_relay_ticket.is_some() || static_relay_authorized;
     if !relay_enabled && !has_usable_peer_addresses {
         tracing::warn!(
             target: MOBILE_CONNECTION_LOG_TARGET,
@@ -1265,26 +1320,29 @@ async fn ensure_direct_quic_endpoint(
         direct_socket_addrs = ?endpoint_snapshot.direct_socket_addrs,
         "iroh_endpoint_created"
     );
-    if let Some(ticket) = relay_ticket.as_ref() {
+    let initial_relay_tickets = first_relay_ticket.as_ref().map(|ticket| {
+        let mut tickets = ManagedIrohRelayTickets::default();
+        tickets.insert(ticket);
+        tickets
+    });
+    if let Some(tickets) = initial_relay_tickets.as_ref() {
         bound_endpoint
-            .reconcile_dynamic_relays(&iroh_relay_configs_from_ticket(ticket))
+            .reconcile_dynamic_relays(&tickets.relay_configs())
             .await
             .context("failed applying endpoint-bound iroh relay ticket")?;
     }
-    let initial_expires_at_unix = relay_ticket
-        .as_ref()
-        .map(|ticket| ticket.expires_at_unix)
-        .unwrap_or_else(unix_ts);
-    let relay_ticket_refresh = rendezvous
-        .filter(|_| relay_ticket.is_some())
-        .map(|rendezvous| {
-            spawn_iroh_relay_ticket_refresh(
+    let relay_ticket_refresh = match (rendezvous, relay_ticket_collection, initial_relay_tickets) {
+        (Some(rendezvous), Some(collection), Some(tickets)) => {
+            Some(spawn_iroh_relay_ticket_refresh(
                 bound_endpoint.clone(),
                 rendezvous.clone(),
                 endpoint_id,
-                initial_expires_at_unix,
-            )
-        });
+                tickets,
+                collection,
+            ))
+        }
+        _ => None,
+    };
     let managed_endpoint = ManagedDirectQuicEndpoint {
         endpoint: bound_endpoint.clone(),
         relay_ticket_refresh,
@@ -1312,33 +1370,69 @@ fn spawn_iroh_relay_ticket_refresh(
     endpoint: DirectQuicEndpoint,
     rendezvous: RendezvousControlClient,
     endpoint_id: String,
-    initial_expires_at_unix: u64,
+    mut relay_tickets: ManagedIrohRelayTickets,
+    initial_collection: IrohRelayTicketCollection,
 ) -> tokio::task::AbortHandle {
     let task = tokio::spawn(async move {
-        let mut expires_at_unix = initial_expires_at_unix;
+        let mut pending_collection = Some(initial_collection);
         loop {
-            tokio::time::sleep(iroh_relay_ticket_refresh_delay(expires_at_unix)).await;
-            match rendezvous.issue_iroh_relay_ticket(&endpoint_id).await {
-                Ok(ticket) => {
-                    let relays = iroh_relay_configs_from_ticket(&ticket);
-                    match endpoint.reconcile_dynamic_relays(&relays).await {
-                        Ok(_) => expires_at_unix = ticket.expires_at_unix,
-                        Err(error) => {
-                            tracing::warn!(
+            let refresh_delay = iroh_relay_ticket_refresh_delay(relay_tickets.earliest_expiry());
+            if let Some(collection) = pending_collection.as_mut() {
+                tokio::select! {
+                    ticket = collection.next_ticket() => match ticket {
+                        Some(Ok(ticket)) => {
+                            if let Err(error) = install_iroh_relay_ticket(
+                                &endpoint,
+                                &mut relay_tickets,
+                                &ticket,
+                            ).await {
+                                tracing::warn!(
+                                    %error,
+                                    %endpoint_id,
+                                    "failed applying additional endpoint-bound iroh relay ticket"
+                                );
+                            } else {
+                                tracing::info!(
+                                    target: MOBILE_CONNECTION_LOG_TARGET,
+                                    event = "iroh_relay_ticket_additional_completed",
+                                    endpoint_id = %endpoint_id,
+                                    relay_scope = "endpoint_bound",
+                                    relay_urls = ?ticket.public_urls,
+                                    "iroh_relay_ticket_additional_completed"
+                                );
+                            }
+                        }
+                        Some(Err(error)) => {
+                            tracing::debug!(
                                 %error,
                                 %endpoint_id,
-                                "failed applying refreshed endpoint-bound iroh relay ticket"
+                                "additional endpoint-bound iroh relay ticket request failed"
                             );
+                        }
+                        None => pending_collection = None,
+                    },
+                    _ = tokio::time::sleep(refresh_delay) => {
+                        pending_collection = refresh_iroh_relay_ticket_collection(
+                            &endpoint,
+                            &rendezvous,
+                            &endpoint_id,
+                            &mut relay_tickets,
+                        ).await;
+                        if pending_collection.is_none() {
                             tokio::time::sleep(Duration::from_secs(30)).await;
                         }
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        %endpoint_id,
-                        "failed refreshing endpoint-bound iroh relay ticket"
-                    );
+            } else {
+                tokio::time::sleep(refresh_delay).await;
+                pending_collection = refresh_iroh_relay_ticket_collection(
+                    &endpoint,
+                    &rendezvous,
+                    &endpoint_id,
+                    &mut relay_tickets,
+                )
+                .await;
+                if pending_collection.is_none() {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                 }
             }
@@ -1347,18 +1441,53 @@ fn spawn_iroh_relay_ticket_refresh(
     task.abort_handle()
 }
 
-fn iroh_relay_configs_from_ticket(
-    ticket: &transport_sdk::IrohRelayTicket,
-) -> Vec<transport_sdk::DirectQuicRelayConfig> {
-    ticket
-        .public_urls
-        .iter()
-        .map(|url| transport_sdk::DirectQuicRelayConfig {
-            url: url.clone(),
-            auth_token: Some(ticket.auth_token.clone()),
-            quic_port: ticket.quic_port,
-        })
-        .collect()
+async fn refresh_iroh_relay_ticket_collection(
+    endpoint: &DirectQuicEndpoint,
+    rendezvous: &RendezvousControlClient,
+    endpoint_id: &str,
+    relay_tickets: &mut ManagedIrohRelayTickets,
+) -> Option<IrohRelayTicketCollection> {
+    match rendezvous
+        .issue_iroh_relay_tickets_progressively(endpoint_id)
+        .await
+    {
+        Ok(collection) => {
+            let ticket = collection.first_ticket().clone();
+            match install_iroh_relay_ticket(endpoint, relay_tickets, &ticket).await {
+                Ok(()) => Some(collection),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        %endpoint_id,
+                        "failed applying refreshed endpoint-bound iroh relay ticket"
+                    );
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %endpoint_id,
+                "failed refreshing endpoint-bound iroh relay ticket"
+            );
+            None
+        }
+    }
+}
+
+async fn install_iroh_relay_ticket(
+    endpoint: &DirectQuicEndpoint,
+    relay_tickets: &mut ManagedIrohRelayTickets,
+    ticket: &IrohRelayTicket,
+) -> Result<()> {
+    let mut updated_tickets = relay_tickets.clone();
+    updated_tickets.insert(ticket);
+    endpoint
+        .reconcile_dynamic_relays(&updated_tickets.relay_configs())
+        .await?;
+    *relay_tickets = updated_tickets;
+    Ok(())
 }
 
 fn iroh_relay_ticket_refresh_delay(expires_at_unix: u64) -> Duration {
@@ -1666,5 +1795,33 @@ mod tests {
             iroh_relay_ticket_refresh_delay_at(1_000, 1_000),
             Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn endpoint_bound_relay_tickets_keep_each_relay_configuration() {
+        let mut tickets = ManagedIrohRelayTickets::default();
+        tickets.insert(&IrohRelayTicket {
+            public_urls: vec!["https://creax.de:44043/".to_string()],
+            auth_token: "creax-ticket".to_string(),
+            expires_at_unix: 1_000,
+            quic_port: Some(7842),
+        });
+        tickets.insert(&IrohRelayTicket {
+            public_urls: vec!["https://217.160.159.105:9443".to_string()],
+            auth_token: "strato-ticket".to_string(),
+            expires_at_unix: 2_000,
+            quic_port: Some(7842),
+        });
+
+        assert_eq!(tickets.earliest_expiry(), 1_000);
+        let relay_configs = tickets.relay_configs();
+        assert_eq!(relay_configs.len(), 2);
+        assert_eq!(relay_configs[0].url, "https://217.160.159.105:9443");
+        assert_eq!(
+            relay_configs[0].auth_token.as_deref(),
+            Some("strato-ticket")
+        );
+        assert_eq!(relay_configs[1].url, "https://creax.de:44043");
+        assert_eq!(relay_configs[1].auth_token.as_deref(), Some("creax-ticket"));
     }
 }
