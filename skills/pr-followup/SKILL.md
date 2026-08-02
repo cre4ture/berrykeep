@@ -14,6 +14,11 @@ Read [references/ironmesh-pr-facts.md](references/ironmesh-pr-facts.md) before t
 
    `python3 <pr-follow-up-skill-dir>/scripts/watch_pr.py [PR] --base main`
 
+   After starting it, wait only for its exit result. Do not run separate
+   GitHub/`gh` status queries or periodically read the watcher's output for
+   interim updates: the watcher performs the polling itself and returns as
+   soon as an actionable event or its timeout occurs.
+
 3. Use the watcher exit codes as the primary control flow:
    - `1`, `2`, `3`: fix the issue and push, then start the watcher again.
    - `0`: timeout expired without actionable events; decide whether to rerun or hand over.
@@ -36,7 +41,7 @@ Read [references/ironmesh-pr-facts.md](references/ironmesh-pr-facts.md) before t
 <!-- BEGIN pr-follow-up watch-pr integration -->
 ## Wait for actionable pull-request events
 
-After creating or updating a pull request, use the bundled blocking watcher instead of repeatedly polling by hand. Resolve the directory containing this `SKILL.md`, then run:
+After creating or updating a pull request, use the bundled blocking watcher instead of repeatedly polling by hand. Resolve the directory containing this `SKILL.md`, then run it once as a blocking command and wait for its exit result:
 
 ```bash
 python3 <pr-follow-up-skill-dir>/scripts/watch_pr.py [PR] --base main --no-notify
@@ -44,7 +49,7 @@ python3 <pr-follow-up-skill-dir>/scripts/watch_pr.py [PR] --base main --no-notif
 
 The optional `PR` selector may be a pull-request number, URL, or branch. Without it, the script selects the pull request associated with the current branch. Use `--repo OWNER/REPO` when the working directory does not identify the repository. If the pull request intentionally targets a branch other than `main`, pass that actual target with `--base <branch>`.
 
-The watcher stops after 20 minutes by default when no actionable event occurs. Set another upper bound with `--timeout 45m`, `--timeout 2h`, or a bare number interpreted as minutes. Disable the limit with `--no-timeout` or `--timeout 0`.
+The watcher stops after 20 minutes by default when no actionable event occurs. Set another upper bound with `--timeout 45m`, `--timeout 2h`, or a bare number interpreted as minutes. Disable the limit with `--no-timeout` or `--timeout 0`. Do not issue independent GitHub queries or periodic terminal reads while it runs; those add no information beyond the watcher's own polling.
 
 By default, every failed check is actionable. Use repeated shell-glob rules such as `--ignore-check 'Deploy *'` for a known permanently non-actionable check. Use `--ignore-existing-failures` to accept only check runs that are already red at startup. A new run, or the same run becoming pending/green and later red again, remains actionable.
 
