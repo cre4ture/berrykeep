@@ -1006,6 +1006,24 @@ fn request_attempt_matches_path(attempt_url: &str, path: &str) -> bool {
         .unwrap_or_else(|_| attempt_url.contains(path))
 }
 
+fn request_attempt_status_code(
+    snapshot: &ClientConnectionRouteSnapshot,
+    path: &str,
+    request_started_unix_ms: u64,
+) -> Option<u16> {
+    snapshot
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| endpoint.recent_attempts.iter())
+        .filter(|attempt| {
+            attempt.started_unix_ms >= request_started_unix_ms
+                && attempt.method == "GET"
+                && request_attempt_matches_path(&attempt.url, path)
+        })
+        .max_by_key(|attempt| attempt.started_unix_ms)
+        .and_then(|attempt| attempt.status_code)
+}
+
 fn log_local_diagnostic_request(
     state: &WebState,
     diagnostic_context: Option<&str>,
@@ -2239,13 +2257,48 @@ async fn web_media_cache_retry(
 }
 
 async fn web_map_config(State(state): State<WebState>) -> impl IntoResponse {
-    let response = match current_sdk(&state)
-        .await
-        .get_relative_path("/maps/config")
-        .await
-    {
-        Ok(response) => response,
+    let request_started_unix_ms = unix_ts_ms();
+    let started_at = Instant::now();
+    let sdk = current_sdk(&state).await;
+    let result = sdk.get_relative_path("/maps/config").await;
+    let connection_snapshot = sdk.connection_route_snapshot();
+    let transport_diagnostics = format_transport_attempt_diagnostics(
+        &connection_snapshot,
+        "/maps/config",
+        request_started_unix_ms,
+    );
+    let upstream_status_code = request_attempt_status_code(
+        &connection_snapshot,
+        "/maps/config",
+        request_started_unix_ms,
+    );
+
+    let response = match result {
+        Ok(response) if response.status.is_success() => response,
+        Ok(response) => {
+            push_runtime_log(
+                &state,
+                "WARN",
+                format!(
+                    "upstream map configuration request finished path=/maps/config outcome=http_error status_code={} duration_ms={} {transport_diagnostics}",
+                    response.status,
+                    started_at.elapsed().as_millis(),
+                ),
+            );
+            response
+        }
         Err(err) => {
+            push_runtime_log(
+                &state,
+                "ERROR",
+                format!(
+                    "upstream map configuration request finished path=/maps/config outcome=transport_error upstream_status_code={} duration_ms={} {transport_diagnostics}",
+                    upstream_status_code
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|| "unavailable".to_string()),
+                    started_at.elapsed().as_millis(),
+                ),
+            );
             return logged_error_response(
                 &state,
                 StatusCode::BAD_GATEWAY,
@@ -4041,6 +4094,81 @@ mod tests {
                 .contains("transport_attempts=[endpoint_index=0")
         );
         assert!(log_entry.line.contains("total_us=Some("));
+
+        server.abort();
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn map_config_retryable_http_error_is_retained_with_transport_diagnostics() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream listener should have a local address");
+        let upstream = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/v1/maps/config",
+                axum::routing::get(|| async {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({ "error": "temporarily unavailable" })),
+                    )
+                }),
+            );
+            let _ = axum::serve(upstream_listener, app).await;
+        });
+
+        let buffer = Arc::new(LogBuffer::new(32));
+        let client = IronMeshClient::from_direct_base_url(format!("http://{upstream_address}"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web UI listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("web UI listener should have a local address");
+        let app = router(WebUiConfig::from_client(client).with_log_buffer(Arc::clone(&buffer)));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/api/v1/maps/config"))
+            .send()
+            .await
+            .expect("map configuration request should complete");
+        let response_status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .expect("map configuration response body should be readable");
+        assert_eq!(
+            response_status,
+            StatusCode::BAD_GATEWAY,
+            "unexpected map configuration response: {response_body}; diagnostics={:?}",
+            buffer.recent(32),
+        );
+
+        let log_entry = buffer
+            .recent(32)
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .line
+                    .contains("upstream map configuration request finished")
+            })
+            .expect("map configuration HTTP error should create a diagnostic entry");
+        assert!(log_entry.line.contains("path=/maps/config"));
+        assert!(log_entry.line.contains("outcome=transport_error"));
+        assert!(log_entry.line.contains("upstream_status_code=503"));
+        assert!(log_entry.line.contains("duration_ms="));
+        assert!(
+            log_entry
+                .line
+                .contains("transport_attempts=[endpoint_index=0")
+        );
+        assert!(log_entry.line.contains("status_code=Some(503)"));
 
         server.abort();
         upstream.abort();
