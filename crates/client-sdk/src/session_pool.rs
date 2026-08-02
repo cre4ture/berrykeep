@@ -1439,7 +1439,7 @@ fn spawn_iroh_relay_ticket_refresh(
                                 &endpoint,
                                 &mut relay_tickets,
                                 &ticket,
-                                &lifecycle.stats,
+                                &lifecycle,
                             ).await {
                                 tracing::warn!(
                                     %error,
@@ -1499,7 +1499,7 @@ fn spawn_iroh_relay_ticket_refresh(
                                 &endpoint,
                                 &mut relay_tickets,
                                 &ticket,
-                                &lifecycle.stats,
+                                &lifecycle,
                             ).await {
                                 tracing::warn!(
                                     %error,
@@ -1546,7 +1546,7 @@ fn spawn_iroh_relay_ticket_refresh(
                         &endpoint,
                         &mut relay_tickets,
                         &ticket,
-                        &lifecycle.stats,
+                        &lifecycle,
                     )
                     .await
                     {
@@ -1606,7 +1606,7 @@ async fn install_iroh_relay_ticket(
     endpoint: &DirectQuicEndpoint,
     relay_tickets: &mut IrohRelayTicketSet,
     ticket: &IrohRelayTicket,
-    stats: &TransportSessionPoolStats,
+    lifecycle: &DirectQuicEndpointLifecycle,
 ) -> Result<()> {
     let mut updated_tickets = relay_tickets.clone();
     updated_tickets.insert(ticket);
@@ -1614,11 +1614,13 @@ async fn install_iroh_relay_ticket(
         .reconcile_dynamic_relays(&updated_tickets.relay_configs())
         .await?;
     set_configured_iroh_relay_urls(
-        stats,
-        updated_tickets
-            .relay_configs()
-            .into_iter()
-            .map(|relay| relay.url),
+        &lifecycle.stats,
+        lifecycle.endpoint_config.relay_urls.iter().cloned().chain(
+            updated_tickets
+                .relay_configs()
+                .into_iter()
+                .map(|relay| relay.url),
+        ),
     );
     *relay_tickets = updated_tickets;
     Ok(())
@@ -2030,16 +2032,17 @@ mod tests {
     }
 
     #[test]
-    fn configured_iroh_relay_diagnostics_keep_each_normalized_url() {
+    fn configured_iroh_relay_diagnostics_keep_static_and_dynamic_urls() {
         let stats = TransportSessionPoolStats::default();
+        let static_relay_urls = vec!["https://creax.de:44043/".to_string()];
+        let dynamic_relay_urls = vec![
+            "https://217.160.159.105:9443".to_string(),
+            "https://creax.de:44043".to_string(),
+        ];
 
         set_configured_iroh_relay_urls(
             &stats,
-            [
-                "https://creax.de:44043/".to_string(),
-                "https://217.160.159.105:9443".to_string(),
-                "https://creax.de:44043".to_string(),
-            ],
+            static_relay_urls.into_iter().chain(dynamic_relay_urls),
         );
 
         assert_eq!(
