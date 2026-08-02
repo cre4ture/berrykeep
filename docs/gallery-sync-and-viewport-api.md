@@ -7,7 +7,7 @@ same admin authorization as the existing admin store index.
 ## Cache bootstrap and delta feed
 
 Request a current, paginated gallery view through `GET /api/v1/store/index` (or
-`GET /api/v1/auth/store/index`). SQLite-backed gallery fast-path responses include an opaque
+`GET /api/v1/auth/store/index`). Gallery fast-path responses backed by persistent metadata include an opaque
 `sync_token`. Store the response and token atomically on the client. The token is versioned but
 must not be parsed by clients. It binds the persistent server history and the normalized query
 membership (`prefix`, `depth`, media filter, captured sort, and optional viewport). Offset and
@@ -57,10 +57,10 @@ the cache but is deleted or no longer matches the filter or viewport is a remova
 is part of token identity so mixed-query pages cannot be mistaken for one bootstrap, although
 clients remain responsible for ordering their local materialized set.
 
-The SQLite projection and its revision log are updated in the same metadata transaction. Object
-adds, replacements, removals, manifest/version metadata changes, and material media-cache changes
+The persistent metadata projection and its revision log are updated in the same metadata
+transaction. Object adds, replacements, removals, manifest/version metadata changes, and material media-cache changes
 (including thumbnail metadata, capture time, and GPS) advance the revision. Rewriting identical
-metadata does not advance it. The full-index token is captured at the start of the SQLite read
+metadata does not advance it. The full-index token is captured at the start of the metadata read
 snapshot: rows committed later are intentionally absent from that response and are replayed by
 the delta feed. A persistent history UUID and revisions survive process restarts.
 
@@ -102,10 +102,8 @@ library.
 
 ## Metadata backend capability
 
-SQLite is the default server-node metadata backend and owns the persistent gallery projection,
-viewport index, and revision log. The optional `turso-metadata` backend already uses the generic
-store-index fallback and does not maintain that projection. It therefore returns deterministic
-HTTP `501 Not Implemented` responses for viewport and delta requests instead of returning partial
-or non-durable results. Clients can capability-detect this response and continue using ordinary
-full store-index requests. Turso parity requires first porting the gallery projection itself; the
-API contracts above remain suitable for that future implementation.
+SQLite is the default server-node metadata backend. The optional `turso-metadata` backend provides
+the same durable gallery projection, viewport index, and revision log. Both maintain changes as
+part of their metadata updates, and preserve the history identifier and revision across a restart.
+Gallery queries, viewport queries, and delta requests therefore have the same API contract on both
+backends.

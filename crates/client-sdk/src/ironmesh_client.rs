@@ -1142,6 +1142,17 @@ impl ClientEndpointRouter {
         error: &str,
         impact: ClientConnectionDiagnosticImpact,
     ) {
+        self.record_request_failure_with_status(index, attempt, error, None, impact);
+    }
+
+    fn record_request_failure_with_status(
+        &self,
+        index: usize,
+        attempt: ClientRequestAttemptContext<'_>,
+        error: &str,
+        status: Option<StatusCode>,
+        impact: ClientConnectionDiagnosticImpact,
+    ) {
         let Some(endpoint) = self.endpoint(index) else {
             return;
         };
@@ -1165,6 +1176,7 @@ impl ClientEndpointRouter {
                 impact,
                 timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
                 outcome: "failure".to_string(),
+                status_code: status.map(|status| status.as_u16()),
                 total_duration_us: Some(
                     unix_ts_ms()
                         .saturating_sub(attempt.started_unix_ms)
@@ -3244,6 +3256,22 @@ impl IronMeshClient {
         );
     }
 
+    fn record_request_failure_with_status(
+        &self,
+        index: usize,
+        attempt: ClientRequestAttemptContext<'_>,
+        error: &str,
+        status: Option<StatusCode>,
+    ) {
+        self.transport_router.record_request_failure_with_status(
+            index,
+            attempt,
+            error,
+            status,
+            self.connection_diagnostic_impact,
+        );
+    }
+
     fn publish_connection_diagnostics(&self) {
         let observer = connection_diagnostics_observer()
             .read()
@@ -3446,7 +3474,7 @@ impl IronMeshClient {
             .await
             {
                 Ok(response) if is_retryable_transport_status(response.status) => {
-                    self.record_request_failure(
+                    self.record_request_failure_with_status(
                         index,
                         ClientRequestAttemptContext {
                             method: &method,
@@ -3456,6 +3484,7 @@ impl IronMeshClient {
                             session_pool_before,
                         },
                         &format!("retryable HTTP {} ({endpoint_context})", response.status,),
+                        Some(response.status),
                     );
                     self.publish_connection_diagnostics();
                     last_error = Some(anyhow!(
@@ -3579,7 +3608,7 @@ impl IronMeshClient {
                 Ok(candidate_response)
                     if is_retryable_transport_status(candidate_response.status) =>
                 {
-                    self.record_request_failure(
+                    self.record_request_failure_with_status(
                         route_index,
                         ClientRequestAttemptContext {
                             method: &Method::PUT,
@@ -3596,6 +3625,7 @@ impl IronMeshClient {
                             "retryable HTTP {} from {}",
                             candidate_response.status, endpoint.descriptor.locator
                         ),
+                        Some(candidate_response.status),
                     );
                     self.publish_connection_diagnostics();
                     last_error = Some(anyhow!(

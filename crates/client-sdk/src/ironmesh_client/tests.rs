@@ -4841,6 +4841,16 @@ async fn direct_transport_retryable_head_error_includes_endpoint_and_target_node
         "missing target node ID: {message}"
     );
 
+    let attempt = client
+        .connection_diagnostics()
+        .endpoints
+        .into_iter()
+        .flat_map(|endpoint| endpoint.recent_attempts)
+        .last()
+        .expect("retryable response should retain a failed request attempt");
+    assert_eq!(attempt.outcome, "failure");
+    assert_eq!(attempt.status_code, Some(503));
+
     let captured = direct_state
         .captured_request
         .lock()

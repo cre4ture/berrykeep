@@ -6092,6 +6092,22 @@ async fn metadata_db_logical_distribution_reports_table_content_impl(backend: St
             .any(|column| column == "key")
     );
 
+    let gallery_objects = distribution
+        .tables
+        .iter()
+        .find(|table| table.table == "gallery_objects")
+        .expect("missing gallery_objects breakdown");
+    assert!(gallery_objects.row_count > 0);
+    assert!(gallery_objects.tracked_value_bytes > 0);
+
+    let gallery_changes = distribution
+        .tables
+        .iter()
+        .find(|table| table.table == "gallery_changes")
+        .expect("missing gallery_changes breakdown");
+    assert!(gallery_changes.row_count > 0);
+    assert!(gallery_changes.tracked_value_bytes > 0);
+
     let version_indexes = distribution
         .tables
         .iter()

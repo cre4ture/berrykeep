@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.WindowInsets
@@ -45,6 +46,7 @@ fun IronmeshAppShell(
     snackbarHostState: SnackbarHostState,
     deviceLabel: String?,
     titleLatencyStatus: TitleLatencyProbeStatus,
+    onOpenConnectionDiagnostics: () -> Unit,
     onExportDiagnosticLog: () -> Unit,
     onNavigateBack: (() -> Unit)? = null,
     topBarActions: @Composable RowScope.() -> Unit = {},
@@ -88,6 +90,7 @@ fun IronmeshAppShell(
                             selectedSection = selectedSection,
                             deviceLabel = deviceLabel,
                             titleLatencyStatus = titleLatencyStatus,
+                            onOpenConnectionDiagnostics = onOpenConnectionDiagnostics,
                             onExportDiagnosticLog = onExportDiagnosticLog,
                             onNavigateBack = onNavigateBack,
                             actions = topBarActions,
@@ -111,6 +114,7 @@ fun IronmeshAppShell(
                         selectedSection = selectedSection,
                         deviceLabel = deviceLabel,
                         titleLatencyStatus = titleLatencyStatus,
+                        onOpenConnectionDiagnostics = onOpenConnectionDiagnostics,
                         onExportDiagnosticLog = onExportDiagnosticLog,
                         onNavigateBack = onNavigateBack,
                         actions = topBarActions,
@@ -148,6 +152,7 @@ private fun IronmeshTopBar(
     selectedSection: MainSection,
     deviceLabel: String?,
     titleLatencyStatus: TitleLatencyProbeStatus,
+    onOpenConnectionDiagnostics: () -> Unit,
     onExportDiagnosticLog: () -> Unit,
     onNavigateBack: (() -> Unit)?,
     actions: @Composable RowScope.() -> Unit,
@@ -175,7 +180,10 @@ private fun IronmeshTopBar(
             }
         },
         actions = {
-            TitleLatencyIndicator(titleLatencyStatus)
+            TitleLatencyIndicator(
+                status = titleLatencyStatus,
+                onClick = onOpenConnectionDiagnostics,
+            )
             TextButton(onClick = onExportDiagnosticLog) {
                 Text(stringResource(R.string.export_diagnostic_log))
             }
@@ -185,7 +193,10 @@ private fun IronmeshTopBar(
 }
 
 @Composable
-private fun TitleLatencyIndicator(status: TitleLatencyProbeStatus) {
+private fun TitleLatencyIndicator(
+    status: TitleLatencyProbeStatus,
+    onClick: () -> Unit,
+) {
     val text = titleLatencyIndicatorText(status) ?: return
     val color = when {
         status.state == "failed" -> MaterialTheme.colorScheme.error
@@ -204,14 +215,17 @@ private fun TitleLatencyIndicator(status: TitleLatencyProbeStatus) {
         text,
     )
 
-    Text(
-        text = text,
-        style = MaterialTheme.typography.labelSmall,
-        color = color,
-        modifier = Modifier
-            .padding(end = 4.dp)
-            .semantics { contentDescription = description },
-    )
+    TextButton(
+        onClick = onClick,
+        contentPadding = PaddingValues(horizontal = 4.dp),
+        modifier = Modifier.semantics { contentDescription = description },
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+        )
+    }
 }
 
 internal fun titleLatencyIndicatorText(status: TitleLatencyProbeStatus): String? {

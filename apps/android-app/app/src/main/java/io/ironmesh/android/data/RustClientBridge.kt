@@ -130,6 +130,13 @@ object RustClientBridge {
     @JvmStatic
     external fun getDiagnosticLog(): String
 
+    /**
+     * Mirrors an already-sanitized embedded WebView diagnostic into the native retained log.
+     * The native side applies its own length and line-break guard before storing it.
+     */
+    @JvmStatic
+    external fun recordEmbeddedWebUiDiagnostic(message: String)
+
     @JvmStatic
     external fun getConnectionRouteSnapshot(
         connectionInput: String,
