@@ -80,9 +80,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
             (),
         )
         .await?;
-    connection
-        .execute_batch(
-            "
+    let trigger_sql = format!(
+        "
             DROP TRIGGER IF EXISTS gallery_objects_change_insert;
             DROP TRIGGER IF EXISTS gallery_objects_change_update;
             DROP TRIGGER IF EXISTS gallery_objects_change_delete;
@@ -97,7 +96,7 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                 SELECT CAST(value AS INTEGER), NEW.key, 'upsert'
                   FROM metadata_meta WHERE key = 'gallery_revision';
                 DELETE FROM gallery_changes
-                 WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - 100000;
+                 WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};
             END;
 
             CREATE TRIGGER gallery_objects_change_update
@@ -134,7 +133,7 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                     OLD.longitude
                   FROM metadata_meta WHERE key = 'gallery_revision';
                 DELETE FROM gallery_changes
-                 WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - 100000;
+                 WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};
             END;
 
             CREATE TRIGGER gallery_objects_change_delete
@@ -162,10 +161,12 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                     OLD.longitude
                   FROM metadata_meta WHERE key = 'gallery_revision';
                 DELETE FROM gallery_changes
-                 WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - 100000;
+                 WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};
             END;
             ",
-        )
+    );
+    connection
+        .execute_batch(&trigger_sql)
         .await
         .context("failed to initialize Turso gallery change log")
 }
