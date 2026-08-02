@@ -179,6 +179,8 @@
     <string name="connection_paths_details">Details</string>
     <string name="connection_paths_hide_details">Hide details</string>
     <string name="connection_paths_target_server_node">Target server node</string>
+    <string name="connection_paths_configured_iroh_relays">Configured Iroh relays</string>
+    <string name="connection_paths_last_successful_iroh_relay">Last successful Iroh relay</string>
     <string name="connection_paths_endpoint">Iroh endpoint</string>
     <string name="connection_paths_copy_endpoint">Copy Iroh endpoint</string>
     <string name="connection_paths_success_rate">Success rate</string>

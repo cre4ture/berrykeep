@@ -155,6 +155,20 @@ private fun ConnectionRouteDetails(
             selectable = true,
         )
     }
+    if (endpoint.irohRelayUrls.isNotEmpty()) {
+        ConnectionDetail(
+            label = stringResource(R.string.connection_paths_configured_iroh_relays),
+            value = endpoint.irohRelayUrls.joinToString(separator = "\n"),
+            selectable = true,
+        )
+    }
+    endpoint.lastSuccessfulIrohRelayUrl?.let { relayUrl ->
+        ConnectionDetail(
+            label = stringResource(R.string.connection_paths_last_successful_iroh_relay),
+            value = relayUrl,
+            selectable = true,
+        )
+    }
     ConnectionDetail(
         label = stringResource(R.string.connection_paths_selection_rank),
         value = routeSelectionRankValue(route),

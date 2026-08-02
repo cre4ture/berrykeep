@@ -147,6 +147,12 @@ pub struct ClientEndpointDiagnostics {
     pub transport_path_kind: Option<String>,
     #[serde(default)]
     pub target_node_id: Option<NodeId>,
+    /// Iroh relay URLs currently configured for this Direct QUIC endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh_relay_urls: Option<Vec<String>>,
+    /// Relay selected by Iroh for the most recently established QUIC path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_iroh_relay_url: Option<String>,
     pub locator: String,
     pub request_base_url: String,
     pub active: bool,
@@ -320,6 +326,12 @@ pub struct ClientConnectionRouteEndpointSnapshot {
     pub bootstrap_rank: usize,
     #[serde(default)]
     pub target_node_id: Option<NodeId>,
+    /// Iroh relay URLs currently configured for this Direct QUIC endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh_relay_urls: Option<Vec<String>>,
+    /// Relay selected by Iroh for the most recently established QUIC path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_iroh_relay_url: Option<String>,
     #[serde(default)]
     pub active: bool,
     pub score: f64,
@@ -471,6 +483,20 @@ impl ClientTransport {
             Self::DirectQuic { session_pool, .. } => {
                 session_pool.hole_punching_mode().map(str::to_string)
             }
+            Self::DirectHttp { .. } | Self::Relay(_) => None,
+        }
+    }
+
+    fn iroh_relay_urls(&self) -> Option<Vec<String>> {
+        match self {
+            Self::DirectQuic { session_pool, .. } => Some(session_pool.iroh_relay_urls()),
+            Self::DirectHttp { .. } | Self::Relay(_) => None,
+        }
+    }
+
+    fn last_successful_iroh_relay_url(&self) -> Option<String> {
+        match self {
+            Self::DirectQuic { session_pool, .. } => session_pool.last_successful_iroh_relay_url(),
             Self::DirectHttp { .. } | Self::Relay(_) => None,
         }
     }
@@ -927,6 +953,10 @@ impl ClientEndpointRouter {
                     locator: endpoint.descriptor.locator.clone(),
                     bootstrap_rank: endpoint.descriptor.bootstrap_rank,
                     target_node_id: endpoint.transport.target_node_id(),
+                    iroh_relay_urls: endpoint.transport.iroh_relay_urls(),
+                    last_successful_iroh_relay_url: endpoint
+                        .transport
+                        .last_successful_iroh_relay_url(),
                     active: active_index == Some(index),
                     score: endpoint_score(index, active_index, &endpoint.descriptor, &state),
                     ewma_latency_ms: state.ewma_latency_ms,
@@ -1189,6 +1219,10 @@ impl ClientEndpointRouter {
                             .to_string(),
                     ),
                     target_node_id: endpoint.transport.target_node_id(),
+                    iroh_relay_urls: endpoint.transport.iroh_relay_urls(),
+                    last_successful_iroh_relay_url: endpoint
+                        .transport
+                        .last_successful_iroh_relay_url(),
                     locator: endpoint.descriptor.locator.clone(),
                     request_base_url: endpoint.transport.request_base_url().to_string(),
                     active: active_index == Some(index),

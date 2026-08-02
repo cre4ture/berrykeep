@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use common::NodeId;
 use futures_util::StreamExt;
-use iroh::SecretKey;
 use iroh::endpoint::{Connection, PathList};
+use iroh::{SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore, watch};
 use transport_sdk::{
@@ -211,6 +212,12 @@ struct TransportSessionPoolStats {
     connect_duration_us: AtomicU64,
     relay_pairing_duration_us: AtomicU64,
     direct_connection_mode: AtomicU64,
+    // A direct QUIC endpoint can receive independently authorized relays from
+    // multiple Rendezvous servers.  Keep their non-secret URLs for diagnostics.
+    configured_iroh_relay_urls: RwLock<Vec<String>>,
+    // Preserved across direct-path migration so diagnostics can show which
+    // relay last carried a successfully established Iroh QUIC path.
+    last_successful_iroh_relay_url: RwLock<Option<String>>,
 }
 
 const DIRECT_CONNECTION_MODE_UNKNOWN: u64 = 0;
@@ -316,6 +323,28 @@ impl TransportSessionPool {
         )
     }
 
+    pub(crate) fn iroh_relay_urls(&self) -> Vec<String> {
+        if !matches!(&self.target, SessionPoolTarget::DirectQuic { .. }) {
+            return Vec::new();
+        }
+        self.stats
+            .configured_iroh_relay_urls
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn last_successful_iroh_relay_url(&self) -> Option<String> {
+        if !matches!(&self.target, SessionPoolTarget::DirectQuic { .. }) {
+            return None;
+        }
+        self.stats
+            .last_successful_iroh_relay_url
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub(crate) async fn invalidate(&self) {
         let mut guard = self.cached_session.lock().await;
         if guard.take().is_some() {
@@ -323,6 +352,11 @@ impl TransportSessionPool {
             self.stats
                 .direct_connection_mode
                 .store(DIRECT_CONNECTION_MODE_UNKNOWN, Ordering::Relaxed);
+            *self
+                .stats
+                .last_successful_iroh_relay_url
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
     }
 
@@ -393,6 +427,7 @@ impl TransportSessionPool {
 
         let connect_started = Instant::now();
         let mut cold_quic_setup_started = None;
+        let mut direct_quic_connection = None;
 
         let (multiplexed, handshake_context, target) = match &self.target {
             SessionPoolTarget::DirectHttps {
@@ -454,11 +489,8 @@ impl TransportSessionPool {
                         setup_started,
                     })
                     .await?;
-                self.stats.direct_connection_mode.store(
-                    direct_connection_mode_from_paths(&direct_quic.connection.paths()),
-                    Ordering::Relaxed,
-                );
-                self.spawn_hole_punching_monitor(direct_quic.connection.clone());
+                record_direct_quic_path_mode(&self.stats, &direct_quic.connection.paths());
+                direct_quic_connection = Some(direct_quic.connection.clone());
                 (
                     direct_quic.session,
                     format!("failed performing direct QUIC transport handshake for {target_label}"),
@@ -504,6 +536,10 @@ impl TransportSessionPool {
             None => handshake.await,
         };
         handshake_result.with_context(|| handshake_context)?;
+        if let Some(connection) = direct_quic_connection {
+            record_direct_quic_path_state(&self.stats, &connection.paths());
+            self.spawn_hole_punching_monitor(connection);
+        }
 
         let session = Arc::new(multiplexed);
         let (session, inserted) = self.cache_session(session, None).await;
@@ -650,9 +686,7 @@ impl TransportSessionPool {
         tokio::spawn(async move {
             let mut paths = connection.paths_stream();
             while let Some(paths) = paths.next().await {
-                stats
-                    .direct_connection_mode
-                    .store(direct_connection_mode_from_paths(&paths), Ordering::Relaxed);
+                record_direct_quic_path_state(&stats, &paths);
             }
         });
     }
@@ -1068,20 +1102,52 @@ fn relay_session_role_for_source(source: &PeerIdentity) -> TransportSessionRole 
     }
 }
 
-fn direct_connection_mode_from_paths(paths: &PathList<'_>) -> u64 {
-    paths
-        .iter()
-        .find(|path| path.is_selected())
-        .map(|path| {
-            if path.is_ip() {
-                DIRECT_CONNECTION_MODE_DIRECT
-            } else if path.is_relay() {
-                DIRECT_CONNECTION_MODE_RELAY
-            } else {
-                DIRECT_CONNECTION_MODE_UNKNOWN
-            }
-        })
-        .unwrap_or(DIRECT_CONNECTION_MODE_UNKNOWN)
+fn record_direct_quic_path_mode(stats: &TransportSessionPoolStats, paths: &PathList<'_>) {
+    let (mode, _) = direct_quic_path_state(paths);
+    stats.direct_connection_mode.store(mode, Ordering::Relaxed);
+}
+
+fn record_direct_quic_path_state(stats: &TransportSessionPoolStats, paths: &PathList<'_>) {
+    let (mode, relay_url) = direct_quic_path_state(paths);
+    stats.direct_connection_mode.store(mode, Ordering::Relaxed);
+    if let Some(relay_url) = relay_url {
+        *stats
+            .last_successful_iroh_relay_url
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(relay_url);
+    }
+}
+
+fn direct_quic_path_state(paths: &PathList<'_>) -> (u64, Option<String>) {
+    let Some(path) = paths.iter().find(|path| path.is_selected()) else {
+        return (DIRECT_CONNECTION_MODE_UNKNOWN, None);
+    };
+
+    if path.is_ip() {
+        return (DIRECT_CONNECTION_MODE_DIRECT, None);
+    }
+    let TransportAddr::Relay(relay_url) = path.remote_addr() else {
+        return (DIRECT_CONNECTION_MODE_UNKNOWN, None);
+    };
+
+    (DIRECT_CONNECTION_MODE_RELAY, Some(relay_url.to_string()))
+}
+
+fn set_configured_iroh_relay_urls(
+    stats: &TransportSessionPoolStats,
+    relay_urls: impl IntoIterator<Item = String>,
+) {
+    let relay_urls = relay_urls
+        .into_iter()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    *stats
+        .configured_iroh_relay_urls
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = relay_urls;
 }
 
 async fn ensure_direct_quic_endpoint(
@@ -1273,6 +1339,15 @@ async fn ensure_direct_quic_endpoint(
         .as_ref()
         .map(IrohRelayTicketSet::relay_configs)
         .unwrap_or_default();
+    set_configured_iroh_relay_urls(
+        stats,
+        config.relay_urls.iter().cloned().chain(
+            config
+                .initial_dynamic_relays
+                .iter()
+                .map(|relay| relay.url.clone()),
+        ),
+    );
 
     let bound_endpoint = DirectQuicEndpoint::bind(config.clone())
         .await
@@ -1364,6 +1439,7 @@ fn spawn_iroh_relay_ticket_refresh(
                                 &endpoint,
                                 &mut relay_tickets,
                                 &ticket,
+                                &lifecycle.stats,
                             ).await {
                                 tracing::warn!(
                                     %error,
@@ -1423,6 +1499,7 @@ fn spawn_iroh_relay_ticket_refresh(
                                 &endpoint,
                                 &mut relay_tickets,
                                 &ticket,
+                                &lifecycle.stats,
                             ).await {
                                 tracing::warn!(
                                     %error,
@@ -1465,8 +1542,13 @@ fn spawn_iroh_relay_ticket_refresh(
                     .as_ref()
                     .map(|collection| collection.first_ticket().clone());
                 if let Some(ticket) = first_ticket {
-                    if let Err(error) =
-                        install_iroh_relay_ticket(&endpoint, &mut relay_tickets, &ticket).await
+                    if let Err(error) = install_iroh_relay_ticket(
+                        &endpoint,
+                        &mut relay_tickets,
+                        &ticket,
+                        &lifecycle.stats,
+                    )
+                    .await
                     {
                         tracing::warn!(
                             %error,
@@ -1524,12 +1606,20 @@ async fn install_iroh_relay_ticket(
     endpoint: &DirectQuicEndpoint,
     relay_tickets: &mut IrohRelayTicketSet,
     ticket: &IrohRelayTicket,
+    stats: &TransportSessionPoolStats,
 ) -> Result<()> {
     let mut updated_tickets = relay_tickets.clone();
     updated_tickets.insert(ticket);
     endpoint
         .reconcile_dynamic_relays(&updated_tickets.relay_configs())
         .await?;
+    set_configured_iroh_relay_urls(
+        stats,
+        updated_tickets
+            .relay_configs()
+            .into_iter()
+            .map(|relay| relay.url),
+    );
     *relay_tickets = updated_tickets;
     Ok(())
 }
@@ -1937,5 +2027,28 @@ mod tests {
         );
         assert_eq!(relay_configs[1].url, "https://creax.de:44043");
         assert_eq!(relay_configs[1].auth_token.as_deref(), Some("creax-ticket"));
+    }
+
+    #[test]
+    fn configured_iroh_relay_diagnostics_keep_each_normalized_url() {
+        let stats = TransportSessionPoolStats::default();
+
+        set_configured_iroh_relay_urls(
+            &stats,
+            [
+                "https://creax.de:44043/".to_string(),
+                "https://217.160.159.105:9443".to_string(),
+                "https://creax.de:44043".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            stats
+                .configured_iroh_relay_urls
+                .read()
+                .expect("relay diagnostic lock should remain usable")
+                .as_slice(),
+            ["https://217.160.159.105:9443", "https://creax.de:44043"]
+        );
     }
 }

@@ -814,7 +814,19 @@ private struct IronmeshConnectionPathRow: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    IronmeshKeyValueRow(label: "Endpoint", value: endpoint.locator)
+                    if let targetNodeId = endpoint.targetNodeId {
+                        IronmeshKeyValueRow(label: "Target server node", value: targetNodeId)
+                    }
+                    if let relayUrls = endpoint.irohRelayUrls, !relayUrls.isEmpty {
+                        IronmeshKeyValueRow(
+                            label: "Configured Iroh relays",
+                            value: relayUrls.joined(separator: "\n")
+                        )
+                    }
+                    if let relayUrl = endpoint.lastSuccessfulIrohRelayUrl {
+                        IronmeshKeyValueRow(label: "Last successful Iroh relay", value: relayUrl)
+                    }
+                    IronmeshKeyValueRow(label: "Iroh endpoint", value: endpoint.locator)
                     Group {
                         IronmeshKeyValueRow(label: "EWMA latency", value: milliseconds(endpoint.ewmaLatencyMs))
                         IronmeshKeyValueRow(
@@ -830,9 +842,6 @@ private struct IronmeshConnectionPathRow: View {
                         IronmeshKeyValueRow(label: "Bootstrap rank", value: "\(endpoint.bootstrapRank)")
                         if let holePunchingMode = endpoint.holePunchingMode {
                             IronmeshKeyValueRow(label: "QUIC path", value: holePunchingMode.capitalized)
-                        }
-                        if let targetNodeId = endpoint.targetNodeId {
-                            IronmeshKeyValueRow(label: "Target node", value: targetNodeId)
                         }
                         IronmeshKeyValueRow(
                             label: "Last measurement",

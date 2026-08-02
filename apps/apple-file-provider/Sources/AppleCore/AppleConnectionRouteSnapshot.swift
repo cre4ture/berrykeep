@@ -63,6 +63,8 @@ public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Se
     public var locator: String
     public var bootstrapRank: Int
     public var targetNodeId: String?
+    public var irohRelayUrls: [String]? = nil
+    public var lastSuccessfulIrohRelayUrl: String? = nil
     public var active: Bool
     public var score: Double
     public var ewmaLatencyMs: Double?

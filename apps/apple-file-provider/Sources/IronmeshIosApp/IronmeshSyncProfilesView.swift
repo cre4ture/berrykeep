@@ -122,6 +122,15 @@ struct IronmeshFilesView: View {
                         if let targetNodeId = endpoint.targetNodeId {
                             IronmeshKeyValueRow(label: "Target server node", value: targetNodeId)
                         }
+                        if let relayUrls = endpoint.irohRelayUrls, !relayUrls.isEmpty {
+                            IronmeshKeyValueRow(
+                                label: "Configured Iroh relays",
+                                value: relayUrls.joined(separator: "\n")
+                            )
+                        }
+                        if let relayUrl = endpoint.lastSuccessfulIrohRelayUrl {
+                            IronmeshKeyValueRow(label: "Last successful Iroh relay", value: relayUrl)
+                        }
                         IronmeshKeyValueRow(label: "Path", value: endpoint.pathKind)
                         IronmeshKeyValueRow(label: "Base URL", value: endpoint.requestBaseUrl)
                         IronmeshKeyValueRow(label: "Failures", value: "\(endpoint.consecutiveFailures) consecutive, \(endpoint.totalFailures) total")

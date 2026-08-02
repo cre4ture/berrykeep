@@ -3385,6 +3385,14 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
             route_snapshot.endpoints[0].hole_punching_mode.as_deref(),
             Some("direct")
         );
+        assert_eq!(
+            route_snapshot.endpoints[0].iroh_relay_urls,
+            Some(Vec::new())
+        );
+        assert_eq!(
+            route_snapshot.endpoints[0].last_successful_iroh_relay_url,
+            None
+        );
         assert!(
             route_snapshot.endpoints[0]
                 .recent_attempts
