@@ -26,7 +26,7 @@ use super::{
 };
 
 pub(super) struct TursoMetadataStore {
-    _database: turso::Database,
+    database: turso::Database,
     connection: turso::Connection,
     metadata_path: PathBuf,
 }
@@ -56,7 +56,7 @@ impl TursoMetadataStore {
         })?;
 
         let store = Self {
-            _database: db,
+            database: db,
             connection: conn,
             metadata_path: metadata_path.to_path_buf(),
         };
@@ -66,6 +66,15 @@ impl TursoMetadataStore {
 
     async fn rollback(&self) {
         let _ = self.connection.execute_batch("ROLLBACK").await;
+    }
+
+    fn gallery_connection(&self) -> Result<turso::Connection> {
+        self.database.connect().with_context(|| {
+            format!(
+                "failed to open a Turso gallery connection to {}",
+                self.metadata_path.display()
+            )
+        })
     }
 
     fn decode_json<T: serde::de::DeserializeOwned>(
