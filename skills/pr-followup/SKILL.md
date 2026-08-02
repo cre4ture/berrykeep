@@ -63,5 +63,5 @@ The watcher ignores comments and reviews that already exist when it starts, but 
 - exit `64` or `70`: fix configuration or local tooling before retrying;
 - exit `130`: the watcher was interrupted manually.
 
-After handling exit `1`, `2`, or `3`, push the fix and start the watcher again. The helper requires Python 3 and an authenticated GitHub CLI (`gh auth status`).
+After handling exit `1`, `2`, or `3`, push the fix and start the watcher again. The helper requires Python 3 and an authenticated GitHub CLI (`gh auth status`). It retrieves check states through GitHub's API, so it does not depend on the optional JSON output of `gh pr checks`.
 <!-- END pr-follow-up watch-pr integration -->

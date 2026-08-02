@@ -51,6 +51,48 @@ query WatchPr($owner: String!, $name: String!, $number: Int!) {
 }
 """
 
+CHECKS_QUERY = r"""
+query WatchPrChecks(
+  $owner: String!
+  $name: String!
+  $number: Int!
+  $after: String
+) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              contexts(first: 100, after: $after) {
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                    detailsUrl
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                    targetUrl
+                  }
+                }
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 
 class GhError(RuntimeError):
     pass
@@ -212,29 +254,129 @@ def inline_comments(
     return [item for item in data if isinstance(item, dict)]
 
 
+def check_context_page(
+    repo: dict[str, str],
+    number: int,
+    after: str | None,
+    deadline: float | None = None,
+) -> tuple[list[dict[str, Any]], bool, str | None]:
+    args = [
+        "api",
+        "graphql",
+        "--hostname",
+        repo["host"],
+        "-f",
+        f"query={CHECKS_QUERY}",
+        "-f",
+        f"owner={repo['owner']}",
+        "-f",
+        f"name={repo['name']}",
+        "-F",
+        f"number={number}",
+    ]
+    if after is not None:
+        args += ["-f", f"after={after}"]
+
+    response = gh_json(
+        args,
+        empty={},
+        deadline=deadline,
+    )
+    if not isinstance(response, dict):
+        raise GhError("Unerwartete GraphQL-Antwort für PR-Checks.")
+    if response.get("errors"):
+        raise GhError(f"GitHub GraphQL meldet Fehler für PR-Checks: {response['errors']}")
+
+    pr = (((response.get("data") or {}).get("repository") or {}).get("pullRequest"))
+    commits = (pr or {}).get("commits") if isinstance(pr, dict) else None
+    commit_nodes = (commits or {}).get("nodes") if isinstance(commits, dict) else None
+    if not isinstance(commit_nodes, list) or not commit_nodes:
+        raise GhError(f"PR #{number} enthält keinen Commit für die Check-Abfrage.")
+
+    commit = (commit_nodes[0] or {}).get("commit")
+    rollup = commit.get("statusCheckRollup") if isinstance(commit, dict) else None
+    if rollup is None:
+        return [], False, None
+    contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+    if not isinstance(contexts, dict):
+        raise GhError("Unerwartete GraphQL-Daten für PR-Checks.")
+
+    nodes = contexts.get("nodes")
+    page_info = contexts.get("pageInfo")
+    if not isinstance(nodes, list) or not isinstance(page_info, dict):
+        raise GhError("Unvollständige GraphQL-Daten für PR-Checks.")
+    has_next_page = bool(page_info.get("hasNextPage"))
+    end_cursor = page_info.get("endCursor")
+    if has_next_page and not isinstance(end_cursor, str):
+        raise GhError("GitHub hat eine weitere Check-Seite ohne Cursor gemeldet.")
+    return (
+        [item for item in nodes if isinstance(item, dict)],
+        has_next_page,
+        end_cursor if isinstance(end_cursor, str) else None,
+    )
+
+
+def check_context_item(context: dict[str, Any]) -> dict[str, Any] | None:
+    kind = context.get("__typename")
+    if kind == "CheckRun":
+        name = str(context.get("name") or "unbekannt")
+        status = str(context.get("status") or "UNKNOWN")
+        conclusion = str(context.get("conclusion") or "UNKNOWN")
+        if status != "COMPLETED":
+            bucket = "pending"
+            state = status
+        elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
+            bucket = "pass"
+            state = conclusion
+        else:
+            bucket = "fail"
+            state = conclusion
+        return {
+            "bucket": bucket,
+            "name": name,
+            "state": state,
+            "link": str(context.get("detailsUrl") or ""),
+        }
+
+    if kind == "StatusContext":
+        name = str(context.get("context") or "unbekannt")
+        state = str(context.get("state") or "UNKNOWN")
+        bucket = (
+            "pass"
+            if state == "SUCCESS"
+            else "pending"
+            if state in {"EXPECTED", "PENDING"}
+            else "fail"
+        )
+        return {
+            "bucket": bucket,
+            "name": name,
+            "state": state,
+            "link": str(context.get("targetUrl") or ""),
+        }
+
+    return None
+
+
 def checks(
     repo: dict[str, str],
     number: int,
     deadline: float | None = None,
 ) -> list[dict[str, Any]]:
-    data = gh_json(
-        [
-            "pr",
-            "checks",
-            str(number),
-            "--repo",
-            repo["gh_repo"],
-            "--json",
-            "bucket,name,state,link",
-        ],
-        # gh returns 1 for failed checks and 8 while checks are pending.
-        allowed=(0, 1, 8),
-        empty=[],
-        deadline=deadline,
-    )
-    if not isinstance(data, list):
-        raise GhError("Unerwartete Antwort von gh pr checks.")
-    return [item for item in data if isinstance(item, dict)]
+    items: list[dict[str, Any]] = []
+    after: str | None = None
+    while True:
+        contexts, has_next_page, after = check_context_page(
+            repo,
+            number,
+            after,
+            deadline,
+        )
+        items.extend(
+            item for context in contexts if (item := check_context_item(context)) is not None
+        )
+        if not has_next_page:
+            return items
 
 
 def failed_checks(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
