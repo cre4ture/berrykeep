@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -35,6 +36,17 @@ const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SQLITE_READ_CONNECTION_COUNT: usize = 4;
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
+
+#[derive(Debug, PartialEq)]
+struct GalleryProjectionState {
+    key: String,
+    media_type: Option<String>,
+    captured_at_unix: u64,
+    media_status: Option<String>,
+    geotagged: u64,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+}
 
 pub(super) struct SqliteMetadataStore {
     metadata_db_path: PathBuf,
@@ -153,11 +165,12 @@ impl SqliteMetadataStore {
                 params![content_fingerprint, payload],
             )?;
             if deleted > 0 {
-                let revision_before = current_gallery_revision_from_db(db)?;
-                refresh_gallery_objects_for_content_fingerprint(db, &content_fingerprint)?;
-                if current_gallery_revision_from_db(db)? == revision_before {
-                    record_gallery_upserts_for_content_fingerprint(db, &content_fingerprint)?;
-                }
+                let unchanged_projection_keys =
+                    refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
+                        db,
+                        &content_fingerprint,
+                    )?;
+                record_gallery_upserts_for_keys(db, &unchanged_projection_keys)?;
             }
             Ok(deleted > 0)
         })
@@ -306,6 +319,104 @@ fn refresh_gallery_objects_for_content_fingerprint(
     Ok(())
 }
 
+fn refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
+    db: &Connection,
+    content_fingerprint: &str,
+) -> Result<Vec<String>> {
+    let before = gallery_projection_states_for_content_fingerprint(db, content_fingerprint)?;
+    refresh_gallery_objects_for_content_fingerprint(db, content_fingerprint)?;
+    let after = gallery_projection_states_for_content_fingerprint(db, content_fingerprint)?;
+    Ok(unchanged_gallery_projection_keys(before, after))
+}
+
+fn refresh_gallery_objects_for_manifest_and_collect_unchanged_keys(
+    db: &Connection,
+    manifest_hash: &str,
+) -> Result<Vec<String>> {
+    let before = gallery_projection_states_for_manifest(db, manifest_hash)?;
+    refresh_gallery_objects_for_manifest(db, manifest_hash)?;
+    let after = gallery_projection_states_for_manifest(db, manifest_hash)?;
+    Ok(unchanged_gallery_projection_keys(before, after))
+}
+
+fn gallery_projection_states_for_content_fingerprint(
+    db: &Connection,
+    content_fingerprint: &str,
+) -> Result<Vec<GalleryProjectionState>> {
+    gallery_projection_states_for_query(
+        db,
+        "SELECT
+             gallery_objects.key,
+             gallery_objects.media_type,
+             gallery_objects.captured_at_unix,
+             gallery_objects.media_status,
+             gallery_objects.geotagged,
+             gallery_objects.latitude,
+             gallery_objects.longitude
+         FROM gallery_objects
+         JOIN manifest_summaries
+           ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
+         WHERE manifest_summaries.content_fingerprint = ?1",
+        content_fingerprint,
+    )
+}
+
+fn gallery_projection_states_for_manifest(
+    db: &Connection,
+    manifest_hash: &str,
+) -> Result<Vec<GalleryProjectionState>> {
+    gallery_projection_states_for_query(
+        db,
+        "SELECT
+             key,
+             media_type,
+             captured_at_unix,
+             media_status,
+             geotagged,
+             latitude,
+             longitude
+         FROM gallery_objects
+         WHERE manifest_hash = ?1",
+        manifest_hash,
+    )
+}
+
+fn gallery_projection_states_for_query(
+    db: &Connection,
+    sql: &str,
+    parameter: &str,
+) -> Result<Vec<GalleryProjectionState>> {
+    let mut statement = db.prepare(sql)?;
+    let states = statement
+        .query_map(params![parameter], |row| {
+            Ok(GalleryProjectionState {
+                key: row.get(0)?,
+                media_type: row.get(1)?,
+                captured_at_unix: row.get(2)?,
+                media_status: row.get(3)?,
+                geotagged: row.get(4)?,
+                latitude: row.get(5)?,
+                longitude: row.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(states)
+}
+
+fn unchanged_gallery_projection_keys(
+    before: Vec<GalleryProjectionState>,
+    after: Vec<GalleryProjectionState>,
+) -> Vec<String> {
+    let after_by_key = after
+        .into_iter()
+        .map(|state| (state.key.clone(), state))
+        .collect::<HashMap<_, _>>();
+    before
+        .into_iter()
+        .filter_map(|state| (after_by_key.get(&state.key) == Some(&state)).then_some(state.key))
+        .collect()
+}
+
 fn record_gallery_upserts_for_query(db: &Connection, sql: &str, parameter: &str) -> Result<()> {
     let mut statement = db.prepare(sql)?;
     let keys = statement
@@ -318,35 +429,19 @@ fn record_gallery_upserts_for_query(db: &Connection, sql: &str, parameter: &str)
     Ok(())
 }
 
-fn record_gallery_upserts_for_content_fingerprint(
-    db: &Connection,
-    content_fingerprint: &str,
-) -> Result<()> {
-    record_gallery_upserts_for_query(
-        db,
-        "SELECT gallery_objects.key
-         FROM gallery_objects
-         JOIN manifest_summaries
-           ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
-         WHERE manifest_summaries.content_fingerprint = ?1",
-        content_fingerprint,
-    )
-}
-
-fn record_gallery_upserts_for_manifest(db: &Connection, manifest_hash: &str) -> Result<()> {
-    record_gallery_upserts_for_query(
-        db,
-        "SELECT key FROM gallery_objects WHERE manifest_hash = ?1",
-        manifest_hash,
-    )
-}
-
 fn record_gallery_upserts_for_object_id(db: &Connection, object_id: &str) -> Result<()> {
     record_gallery_upserts_for_query(
         db,
         "SELECT key FROM gallery_objects WHERE object_id = ?1",
         object_id,
     )
+}
+
+fn record_gallery_upserts_for_keys(db: &Connection, keys: &[String]) -> Result<()> {
+    for key in keys {
+        record_gallery_change(db, key, "upsert")?;
+    }
+    Ok(())
 }
 
 fn record_gallery_change(db: &Connection, key: &str, change_kind: &str) -> Result<()> {
@@ -1947,11 +2042,12 @@ impl MetadataStore for SqliteMetadataStore {
                 params![content_fingerprint, payload],
             )?;
             if changed > 0 {
-                let revision_before = current_gallery_revision_from_db(db)?;
-                refresh_gallery_objects_for_content_fingerprint(db, &content_fingerprint)?;
-                if current_gallery_revision_from_db(db)? == revision_before {
-                    record_gallery_upserts_for_content_fingerprint(db, &content_fingerprint)?;
-                }
+                let unchanged_projection_keys =
+                    refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
+                        db,
+                        &content_fingerprint,
+                    )?;
+                record_gallery_upserts_for_keys(db, &unchanged_projection_keys)?;
             }
             Ok(())
         })
@@ -1982,11 +2078,12 @@ impl MetadataStore for SqliteMetadataStore {
                 params![content_fingerprint],
             )?;
             if deleted > 0 {
-                let revision_before = current_gallery_revision_from_db(db)?;
-                refresh_gallery_objects_for_content_fingerprint(db, &content_fingerprint)?;
-                if current_gallery_revision_from_db(db)? == revision_before {
-                    record_gallery_upserts_for_content_fingerprint(db, &content_fingerprint)?;
-                }
+                let unchanged_projection_keys =
+                    refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
+                        db,
+                        &content_fingerprint,
+                    )?;
+                record_gallery_upserts_for_keys(db, &unchanged_projection_keys)?;
             }
             Ok(())
         })
@@ -2570,11 +2667,12 @@ impl MetadataStore for SqliteMetadataStore {
                 ],
             )?;
             if changed > 0 {
-                let revision_before = current_gallery_revision_from_db(db)?;
-                refresh_gallery_objects_for_manifest(db, &manifest_hash)?;
-                if current_gallery_revision_from_db(db)? == revision_before {
-                    record_gallery_upserts_for_manifest(db, &manifest_hash)?;
-                }
+                let unchanged_projection_keys =
+                    refresh_gallery_objects_for_manifest_and_collect_unchanged_keys(
+                        db,
+                        &manifest_hash,
+                    )?;
+                record_gallery_upserts_for_keys(db, &unchanged_projection_keys)?;
             }
             Ok(())
         })

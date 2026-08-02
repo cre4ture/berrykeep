@@ -1270,7 +1270,9 @@ fn row_opt_f64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<f64>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MediaCacheStatus, MetadataStore, RepairAttemptRecord};
+    use crate::storage::{
+        ClientCredentialState, MediaCacheStatus, MetadataStore, RepairAttemptRecord,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn turso_test_db_path(name: &str) -> std::path::PathBuf {
@@ -1651,13 +1653,16 @@ mod tests {
                 last_failure_unix: 2,
             },
         )]);
+        let credentials = ClientCredentialState::default();
 
-        let (gallery, repair) = tokio::join!(
+        let (gallery, repair, credentials) = tokio::join!(
             store.upsert_current_object_with_gallery("gallery/shared-writer.jpg", &entry),
             store.persist_repair_attempts(&attempts),
+            store.persist_client_credential_state(&credentials),
         );
         gallery.expect("gallery write should commit");
         repair.expect("repair attempt write should commit");
+        credentials.expect("client credential write should commit");
 
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);

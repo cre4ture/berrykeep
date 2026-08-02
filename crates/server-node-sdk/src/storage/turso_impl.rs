@@ -341,6 +341,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_repair_run_record(&self, record: &RepairRunRecord) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -357,6 +358,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_repair_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM repair_run_history\n                 WHERE finished_at_unix < ?1",
@@ -430,6 +432,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         record: &ManualRepairActionRunRecord,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -449,6 +452,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         finished_before_unix: u64,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM manual_repair_action_run_history\n                 WHERE finished_at_unix < ?1",
@@ -519,6 +523,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_data_scrub_run_record(&self, record: &DataScrubRunRecord) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -535,6 +540,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_data_scrub_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM data_scrub_run_history\n                 WHERE finished_at_unix < ?1",
@@ -667,6 +673,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(state)?;
         self.connection
             .execute(
@@ -905,6 +912,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         state: Option<&ActiveSnapshotBatch>,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         match state {
             Some(state) => {
                 let payload = serde_json::to_vec_pretty(state)?;
@@ -1143,6 +1151,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec(event)?;
         self.connection
             .execute(
@@ -1163,6 +1172,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn append_data_change_event(&self, event: &DataChangeEvent) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec(event)?;
         self.connection
             .execute(
@@ -1318,6 +1328,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         metadata: &ObjectVersionMetadataRecord,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO object_version_metadata (
@@ -1361,6 +1372,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_object_version_metadata(&self, version_id: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM object_version_metadata WHERE version_id = ?1",
@@ -1478,6 +1490,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO s3_object_versions (
@@ -1508,6 +1521,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_s3_object_version(&self, bucket_name: &str, version_id: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM s3_object_versions
@@ -1571,6 +1585,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = compress_snapshot_json(&serde_json::to_vec_pretty(manifest)?)?;
         self.connection
             .execute(
@@ -1680,6 +1695,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn vacuum_metadata_store(&self) -> Result<bool> {
+        let _writer = self.writer_lock.lock().await;
         match self.connection.execute("VACUUM", ()).await {
             Ok(_) => Ok(true),
             Err(err) => {
@@ -1718,6 +1734,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(state)?;
         self.connection
             .execute(
@@ -1755,6 +1772,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_storage_location(&self, location: &StorageLocationRecord) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO storage_locations
@@ -1777,6 +1795,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_storage_location(&self, kind: StorageContentKind, hash: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM storage_locations WHERE content_kind = ?1 AND content_hash = ?2",
@@ -1805,6 +1824,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_cached_chunk_record(&self, record: &CachedChunkRecord) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -1818,6 +1838,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_cached_chunk_record(&self, hash: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute("DELETE FROM cached_chunks WHERE hash = ?1", (hash,))
             .await?;
@@ -1847,6 +1868,7 @@ impl MetadataStore for TursoMetadataStore {
         manifest_hash: &str,
         owned_at_unix: u64,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO locally_owned_manifests (manifest_hash, owned_at_unix)
@@ -1862,6 +1884,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_locally_owned_manifest(&self, manifest_hash: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM locally_owned_manifests WHERE manifest_hash = ?1",
@@ -2108,6 +2131,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_storage_stats_history_before(&self, collected_before_unix: u64) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM storage_stats_history
@@ -2131,6 +2155,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM version_indexes WHERE object_id = ?1",
@@ -2177,6 +2202,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn mark_reconciled(&self, marker: &ReconcileMarker) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO reconcile_markers (
