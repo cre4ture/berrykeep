@@ -136,8 +136,7 @@ private fun sanitizeDiagnosticDetail(detail: String?): String? {
 
 private val URL_PATTERN = Regex("https?://[^\\s\\\"'<>]+", RegexOption.IGNORE_CASE)
 private val SECRET_VALUE_PATTERN = Regex(
-    "\\b(authorization|token|password|secret|cookie|session)(\\s*[:=]\\s*)[^\\s,;]+",
-    RegexOption.IGNORE_CASE,
+    """(?i)((?:["'][^"']*(?:authorization|token|password|secret|cookie|session|key)[^"']*["']|[A-Za-z0-9_.-]*(?:authorization|token|password|secret|cookie|session|key)[A-Za-z0-9_.-]*))(\s*[:=]\s*)(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)""",
 )
 private val BEARER_TOKEN_PATTERN = Regex("\\bBearer\\s+[A-Za-z0-9._~+/-]+=*", RegexOption.IGNORE_CASE)
 private val WHITESPACE_PATTERN = Regex("\\s+")

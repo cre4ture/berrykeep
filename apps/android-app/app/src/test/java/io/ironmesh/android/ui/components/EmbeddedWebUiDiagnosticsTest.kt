@@ -47,6 +47,30 @@ class EmbeddedWebUiDiagnosticsTest {
     }
 
     @Test
+    fun javascriptDiagnosticRedactsCompoundAndJsonSecretKeys() {
+        val rendered = EmbeddedWebUiDiagnostic(
+            level = EmbeddedWebUiDiagnosticLevel.ERROR,
+            event = "javascript_console",
+            detail = "sessionToken=session-value authToken=auth-value access_token=access-value " +
+                "api_secret=secret-value apiKey=key-value \"token\":\"json-token\" " +
+                "\"apiSecret\": \"json-secret\"",
+        ).render()
+
+        assertTrue(rendered.contains("sessionToken=<redacted>"))
+        assertTrue(rendered.contains("access_token=<redacted>"))
+        assertTrue(rendered.contains("apiKey=<redacted>"))
+        assertTrue(rendered.contains("'token':<redacted>"))
+        assertTrue(rendered.contains("'apiSecret': <redacted>"))
+        assertFalse(rendered.contains("session-value"))
+        assertFalse(rendered.contains("auth-value"))
+        assertFalse(rendered.contains("access-value"))
+        assertFalse(rendered.contains("secret-value"))
+        assertFalse(rendered.contains("key-value"))
+        assertFalse(rendered.contains("json-token"))
+        assertFalse(rendered.contains("json-secret"))
+    }
+
+    @Test
     fun reporterSuppressesShortBurstOfIdenticalFailures() {
         var now = 1_000L
         val emitted = mutableListOf<String>()
