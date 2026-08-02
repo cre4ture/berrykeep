@@ -22,7 +22,7 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use transport_sdk::{
     BufferedTransportResponse as MultiplexBufferedTransportResponse, CandidateKind,
     ConnectionCandidate, DecodedWebSocketMessage, DirectQuicEndpoint, DirectQuicEndpointConfig,
@@ -722,6 +722,13 @@ struct UploadSessionHttpServerState {
     start_hits: Arc<AtomicUsize>,
     chunk_hits: Arc<AtomicUsize>,
     complete_hits: Arc<AtomicUsize>,
+    start_gate: Option<UploadSessionHttpStartGate>,
+}
+
+#[derive(Clone)]
+struct UploadSessionHttpStartGate {
+    request_started: Arc<Notify>,
+    release_response: Arc<Notify>,
 }
 
 async fn upload_session_http_start(
@@ -765,6 +772,10 @@ async fn upload_session_http_start(
         .lock()
         .await
         .insert(view.upload_id.clone(), view.clone());
+    if let Some(start_gate) = state.start_gate.as_ref() {
+        start_gate.request_started.notify_one();
+        start_gate.release_response.notified().await;
+    }
     (StatusCode::CREATED, Json(view)).into_response()
 }
 
@@ -838,6 +849,18 @@ async fn spawn_upload_session_http_server(
     UploadSessionHttpServerState,
     tokio::task::JoinHandle<()>,
 ) {
+    spawn_upload_session_http_server_with_start_gate(bind_addr, shared, None).await
+}
+
+async fn spawn_upload_session_http_server_with_start_gate(
+    bind_addr: std::net::SocketAddr,
+    shared: UploadSessionHttpSharedState,
+    start_gate: Option<UploadSessionHttpStartGate>,
+) -> (
+    String,
+    UploadSessionHttpServerState,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .expect("listener should bind");
@@ -847,6 +870,7 @@ async fn spawn_upload_session_http_server(
         start_hits: Arc::new(AtomicUsize::new(0)),
         chunk_hits: Arc::new(AtomicUsize::new(0)),
         complete_hits: Arc::new(AtomicUsize::new(0)),
+        start_gate,
     };
     let router = Router::new()
         .route(
@@ -3212,6 +3236,93 @@ async fn upload_session_affinity_uses_same_node_after_path_change() {
     let _ = node_b_server.await;
     node_a_secondary_server.abort();
     let _ = node_a_secondary_server.await;
+}
+
+#[tokio::test]
+async fn upload_session_affinity_survives_route_reconciliation_during_start() {
+    let node_a = NodeId::new_v4();
+    let node_b = NodeId::new_v4();
+    let start_gate = UploadSessionHttpStartGate {
+        request_started: Arc::new(Notify::new()),
+        release_response: Arc::new(Notify::new()),
+    };
+    let (node_a_url, node_a_state, node_a_server) =
+        spawn_upload_session_http_server_with_start_gate(
+            "127.0.0.1:0".parse().expect("bind addr should parse"),
+            UploadSessionHttpSharedState::default(),
+            Some(start_gate.clone()),
+        )
+        .await;
+    let (node_b_url, node_b_state, node_b_server) = spawn_upload_session_http_server(
+        "127.0.0.1:0".parse().expect("bind addr should parse"),
+        UploadSessionHttpSharedState::default(),
+    )
+    .await;
+
+    let client = IronMeshClient::combine(vec![
+        IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+            node_a_url.clone(),
+            HttpClient::new(),
+            Some(node_a),
+            None,
+            None,
+        ),
+        IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+            node_b_url.clone(),
+            HttpClient::new(),
+            Some(node_b),
+            None,
+            None,
+        ),
+    ])
+    .expect("combined direct client should build");
+
+    let start_client = client.clone();
+    let start_task = tokio::spawn(async move {
+        start_client
+            .begin_upload_session("photos/reconciliation-race.bin", 5)
+            .await
+    });
+    start_gate.request_started.notified().await;
+
+    let reordered_routes = IronMeshClient::combine(vec![
+        IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+            node_b_url,
+            HttpClient::new(),
+            Some(node_b),
+            None,
+            None,
+        ),
+        IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+            node_a_url,
+            HttpClient::new(),
+            Some(node_a),
+            None,
+            None,
+        ),
+    ])
+    .expect("reordered direct client should build");
+    client.reconcile_transport_membership(&reordered_routes, true);
+    start_gate.release_response.notify_one();
+
+    let session = start_task
+        .await
+        .expect("upload-session start task should not panic")
+        .expect("upload session should start");
+    let chunk_result = client
+        .upload_session_chunk_bytes(&session.upload_id, 0, b"hello".to_vec())
+        .await;
+
+    node_a_server.abort();
+    let _ = node_a_server.await;
+    node_b_server.abort();
+    let _ = node_b_server.await;
+
+    let chunk = chunk_result
+        .expect("route reconciliation must not move a started upload session to another node");
+    assert_eq!(chunk.received_index, 0);
+    assert_eq!(node_a_state.chunk_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(node_b_state.chunk_hits.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
