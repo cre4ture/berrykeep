@@ -108,6 +108,37 @@ impl IrohRelayTicket {
     }
 }
 
+/// Endpoint-bound iroh relay tickets that arrive from independent Rendezvous
+/// endpoints. The first ticket is available immediately; further valid tickets
+/// can be consumed as their concurrent requests complete.
+pub struct IrohRelayTicketCollection {
+    first_ticket: IrohRelayTicket,
+    additional_tickets: tokio::sync::mpsc::UnboundedReceiver<Result<IrohRelayTicket>>,
+    _collection_task: AbortOnDrop,
+}
+
+impl IrohRelayTicketCollection {
+    pub fn first_ticket(&self) -> &IrohRelayTicket {
+        &self.first_ticket
+    }
+
+    /// Returns the next result from a request that was already started in
+    /// parallel with the request that produced [`Self::first_ticket`].
+    pub async fn next_ticket(&mut self) -> Option<Result<IrohRelayTicket>> {
+        self.additional_tickets.recv().await
+    }
+}
+
+struct AbortOnDrop {
+    abort_handle: tokio::task::AbortHandle,
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportCapability {
@@ -464,6 +495,64 @@ impl RendezvousControlClient {
         Ok(ticket)
     }
 
+    /// Starts requests against every configured Rendezvous endpoint at once.
+    ///
+    /// The returned collection is ready as soon as the first validated ticket
+    /// arrives. It deliberately does not wait for slower endpoints, whose
+    /// valid endpoint-bound tickets remain available through
+    /// [`IrohRelayTicketCollection::next_ticket`].
+    pub async fn issue_iroh_relay_tickets_progressively(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<IrohRelayTicketCollection> {
+        let request = IrohRelayTicketRequest {
+            cluster_id: self.config.cluster_id,
+            endpoint_id: endpoint_id.trim().to_string(),
+        };
+        request.validate()?;
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let client = self.clone();
+        let task = tokio::spawn(async move {
+            let mut attempts = FuturesUnordered::new();
+            for base_url in &client.config.rendezvous_urls {
+                let client = client.clone();
+                let base_url = base_url.clone();
+                let request = request.clone();
+                attempts.push(async move {
+                    client
+                        .issue_iroh_relay_ticket_from_endpoint(base_url, request)
+                        .await
+                });
+            }
+
+            while let Some(result) = attempts.next().await {
+                if sender.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        let collection_task = AbortOnDrop {
+            abort_handle: task.abort_handle(),
+        };
+        let mut last_error = None;
+
+        while let Some(result) = receiver.recv().await {
+            match result {
+                Ok(first_ticket) => {
+                    return Ok(IrohRelayTicketCollection {
+                        first_ticket,
+                        additional_tickets: receiver,
+                        _collection_task: collection_task,
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
+    }
+
     pub async fn publish_bootstrap_claim(
         &self,
         request: &ClientBootstrapClaimPublishRequest,
@@ -809,6 +898,41 @@ impl RendezvousControlClient {
             .flatten()
             .next()
             .unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
+    }
+
+    async fn issue_iroh_relay_ticket_from_endpoint(
+        &self,
+        base_url: String,
+        request: IrohRelayTicketRequest,
+    ) -> Result<IrohRelayTicket> {
+        let url = control_url(&base_url, "/control/iroh-relay/ticket")?;
+        let result = match self.http.post(url.clone()).json(&request).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<IrohRelayTicket>().await {
+                    Ok(ticket) => ticket.validate().map(|()| ticket).map_err(|error| {
+                        format!("invalid rendezvous response from {url}: {error}")
+                    }),
+                    Err(error) => Err(format!(
+                        "failed decoding rendezvous response from {url}: {error}"
+                    )),
+                }
+            }
+            Ok(response) => Err(rendezvous_response_error(&url, response).await),
+            Err(error) => Err(self.decorate_transport_error(format!(
+                "failed contacting rendezvous endpoint {url}: {error}"
+            ))),
+        };
+
+        match result {
+            Ok(ticket) => {
+                self.record_endpoint_result(&base_url, Ok(()), true);
+                Ok(ticket)
+            }
+            Err(message) => {
+                self.record_endpoint_result(&base_url, Err(message.clone()), true);
+                Err(anyhow!(message))
+            }
+        }
     }
 
     fn record_endpoint_result(
@@ -1323,6 +1447,116 @@ mod tests {
         let _ = stalled_server.await;
         healthy_server.abort();
         let _ = healthy_server.await;
+    }
+
+    #[tokio::test]
+    async fn issue_iroh_relay_tickets_progressively_keeps_slow_valid_tickets() {
+        let cluster_id = ClusterId::now_v7();
+        let endpoint_id = iroh::SecretKey::generate().public().to_string();
+        let slow_request_started = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let release_slow_response = Arc::new(tokio::sync::Notify::new());
+
+        let expected_endpoint_id = endpoint_id.clone();
+        let slow_request_started_for_handler = Arc::clone(&slow_request_started);
+        let release_slow_response_for_handler = Arc::clone(&release_slow_response);
+        let slow_router = Router::new().route(
+            "/control/iroh-relay/ticket",
+            post(move |Json(request): Json<IrohRelayTicketRequest>| {
+                let expected_endpoint_id = expected_endpoint_id.clone();
+                let slow_request_started = Arc::clone(&slow_request_started_for_handler);
+                let release_slow_response = Arc::clone(&release_slow_response_for_handler);
+                async move {
+                    assert_eq!(request.cluster_id, cluster_id);
+                    assert_eq!(request.endpoint_id, expected_endpoint_id);
+                    slow_request_started.store(1, std::sync::atomic::Ordering::SeqCst);
+                    release_slow_response.notified().await;
+                    Json(IrohRelayTicket {
+                        public_urls: vec!["https://strato-relay.example".to_string()],
+                        auth_token: "strato-endpoint-ticket".to_string(),
+                        expires_at_unix: unix_timestamp() + 60,
+                        quic_port: Some(7842),
+                    })
+                }
+            }),
+        );
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("slow listener should bind");
+        let slow_addr = slow_listener.local_addr().expect("slow listener address");
+        let slow_server = tokio::spawn(async move {
+            axum::serve(slow_listener, slow_router)
+                .await
+                .expect("slow rendezvous server should run");
+        });
+
+        let expected_endpoint_id = endpoint_id.clone();
+        let fast_router = Router::new().route(
+            "/control/iroh-relay/ticket",
+            post(move |Json(request): Json<IrohRelayTicketRequest>| {
+                let expected_endpoint_id = expected_endpoint_id.clone();
+                async move {
+                    assert_eq!(request.cluster_id, cluster_id);
+                    assert_eq!(request.endpoint_id, expected_endpoint_id);
+                    Json(IrohRelayTicket {
+                        public_urls: vec!["https://relay.example".to_string()],
+                        auth_token: "fast-endpoint-ticket".to_string(),
+                        expires_at_unix: unix_timestamp() + 60,
+                        quic_port: Some(7842),
+                    })
+                }
+            }),
+        );
+        let fast_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fast listener should bind");
+        let fast_addr = fast_listener.local_addr().expect("fast listener address");
+        let fast_server = tokio::spawn(async move {
+            axum::serve(fast_listener, fast_router)
+                .await
+                .expect("fast rendezvous server should run");
+        });
+
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![format!("http://{slow_addr}"), format!("http://{fast_addr}")],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        let mut tickets = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.issue_iroh_relay_tickets_progressively(&endpoint_id),
+        )
+        .await
+        .expect("first ticket should not wait for the slow rendezvous endpoint")
+        .expect("fast rendezvous endpoint should issue a valid ticket");
+        assert_eq!(tickets.first_ticket().auth_token, "fast-endpoint-ticket");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while slow_request_started.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow request should have started alongside the fast request");
+        release_slow_response.notify_one();
+
+        let slow_ticket =
+            tokio::time::timeout(std::time::Duration::from_secs(1), tickets.next_ticket())
+                .await
+                .expect("slow valid ticket should arrive after the first ticket")
+                .expect("ticket collection should still be open")
+                .expect("slow rendezvous endpoint should issue a valid ticket");
+        assert_eq!(slow_ticket.auth_token, "strato-endpoint-ticket");
+
+        slow_server.abort();
+        let _ = slow_server.await;
+        fast_server.abort();
+        let _ = fast_server.await;
     }
 
     #[tokio::test]
