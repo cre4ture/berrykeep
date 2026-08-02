@@ -4,8 +4,8 @@
 //! how this binds is a deployment concern, see
 //! `docs/server-node-hardware-reliability-telemetry-strategy.md` Section 5.2):
 //! - `STATS_COLLECTOR_BIND_ADDR`: address to bind, defaults to `127.0.0.1:44044`.
-//! - `STATS_COLLECTOR_DB_PATH`: path to the SQLite database file, defaults to
-//!   `stats-collector.sqlite3` in the current working directory.
+//! - `STATS_COLLECTOR_DB_PATH`: path to the Turso (embedded, SQLite-compatible) database file,
+//!   defaults to `stats-collector.sqlite3` in the current working directory.
 //! - `STATS_COLLECTOR_ADMIN_TOKEN`: bearer token guarding the raw-access / erasure endpoints
 //!   (doc Sections 4.5, 5.3). When unset, those endpoints return 412 instead of operating
 //!   unauthenticated.
@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
     }
 
     let storage = IngestStorage::open(&db_path)
+        .await
         .with_context(|| format!("failed to open stats-collector database at {db_path}"))?;
     let state = StatsCollectorAppState::new(storage)
         .with_admin_token(admin_token)
@@ -214,7 +215,7 @@ fn spawn_retention_sweeper(state: StatsCollectorAppState, retention_days: u64) {
         let mut interval = tokio::time::interval(RETENTION_SWEEP_INTERVAL);
         loop {
             interval.tick().await;
-            match state.prune_expired(retention_days) {
+            match state.prune_expired(retention_days).await {
                 Ok(removed) if removed > 0 => {
                     info!(removed, retention_days, "pruned expired telemetry records")
                 }

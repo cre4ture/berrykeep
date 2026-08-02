@@ -105,7 +105,8 @@ pub const RATE_LIMIT_UNTOKENED_PER_SUBJECT_WINDOW: Duration = Duration::from_sec
 /// Default local bind address, overridable via `STATS_COLLECTOR_BIND_ADDR`.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:44044";
 
-/// Default SQLite path, overridable via `STATS_COLLECTOR_DB_PATH`.
+/// Default Turso (embedded, SQLite-compatible) database path, overridable via
+/// `STATS_COLLECTOR_DB_PATH`.
 pub const DEFAULT_DB_PATH: &str = "stats-collector.sqlite3";
 
 #[derive(Clone)]
@@ -231,13 +232,13 @@ impl StatsCollectorAppState {
 
     /// Deletes raw rows older than `retention_days` (doc Section 4.6). Returns the number pruned.
     /// Intended to be called periodically (see `main.rs`).
-    pub fn prune_expired(&self, retention_days: u64) -> anyhow::Result<usize> {
+    pub async fn prune_expired(&self, retention_days: u64) -> anyhow::Result<usize> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         let cutoff = now.saturating_sub((retention_days.saturating_mul(24 * 60 * 60)) as i64);
-        self.storage.delete_older_than(cutoff)
+        self.storage.delete_older_than(cutoff).await
     }
 }
 
@@ -372,6 +373,7 @@ async fn ingest_hardware_reliability(
             let expected = match state
                 .storage
                 .token_for_subject(&validated.telemetry_subject_id)
+                .await
             {
                 Ok(expected) => expected,
                 Err(error) => {
@@ -419,13 +421,16 @@ async fn ingest_hardware_reliability(
     let country_code = state.country_resolver.resolve(source_addr.ip());
 
     let raw_payload_json = payload.to_string();
-    let insert_result = state.storage.insert(
-        received_at_unix,
-        &validated.telemetry_subject_id,
-        validated.schema_version,
-        country_code.as_deref(),
-        &raw_payload_json,
-    );
+    let insert_result = state
+        .storage
+        .insert(
+            received_at_unix,
+            &validated.telemetry_subject_id,
+            validated.schema_version,
+            country_code.as_deref(),
+            &raw_payload_json,
+        )
+        .await;
 
     if let Err(error) = insert_result {
         warn!(%error, "failed to persist hardware-reliability ingestion record");
@@ -489,11 +494,11 @@ async fn register_ingestion_token(
         .unwrap_or_default()
         .as_secs() as i64;
     let candidate_token = generate_ingestion_token();
-    match state.storage.get_or_create_ingestion_token(
-        &telemetry_subject_id,
-        created_at_unix,
-        &candidate_token,
-    ) {
+    match state
+        .storage
+        .get_or_create_ingestion_token(&telemetry_subject_id, created_at_unix, &candidate_token)
+        .await
+    {
         Ok(token) => (
             StatusCode::OK,
             Json(RegisterResponse {
@@ -523,7 +528,7 @@ fn internal_error(message: &str) -> Response {
 /// small target fleet makes this cheap, and the code is structured so a periodic batch job could
 /// replace the on-request computation later without changing the response shape.
 async fn stats_summary(State(state): State<StatsCollectorAppState>) -> Response {
-    match state.storage.all_records() {
+    match state.storage.all_records().await {
         Ok(records) => {
             let summary: FleetSummary = summarize(&records, state.k_anonymity_min);
             (StatusCode::OK, Json(summary)).into_response()
@@ -606,6 +611,7 @@ async fn admin_raw_records(
     match state
         .storage
         .records_for_subject(&query.telemetry_subject_id)
+        .await
     {
         Ok(records) => {
             let records = records.into_iter().map(raw_record_view).collect();
@@ -642,7 +648,7 @@ async fn admin_delete_subject(
     if let Err(status) = authorize_admin(&state, &headers) {
         return status.into_response();
     }
-    match state.storage.delete_subject(&telemetry_subject_id) {
+    match state.storage.delete_subject(&telemetry_subject_id).await {
         Ok(deleted_records) => {
             info!(deleted_records, "erased telemetry subject on request");
             (
@@ -670,9 +676,11 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
-    fn test_state() -> StatsCollectorAppState {
+    async fn test_state() -> StatsCollectorAppState {
         StatsCollectorAppState::with_rate_limits(
-            IngestStorage::open_in_memory().expect("storage should open"),
+            IngestStorage::open_in_memory()
+                .await
+                .expect("storage should open"),
             RATE_LIMIT_PER_IP_MAX_REQUESTS,
             RATE_LIMIT_PER_IP_WINDOW,
             RATE_LIMIT_PER_SUBJECT_MAX_REQUESTS,
@@ -719,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_route_reports_ok() {
-        let router = build_router(test_state());
+        let router = build_router(test_state().await);
         let response = router
             .oneshot(
                 Request::builder()
@@ -734,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_ingest_then_row_exists() {
-        let state = test_state();
+        let state = test_state().await;
         let router = build_router(state.clone());
         let payload = json!({
             "schema_version": 1,
@@ -759,6 +767,7 @@ mod tests {
         let records = state
             .storage
             .records_for_subject("subject-happy-path")
+            .await
             .expect("query should succeed");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].schema_version, 1);
@@ -769,7 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn tolerates_unknown_top_level_fields() {
-        let state = test_state();
+        let state = test_state().await;
         let router = build_router(state.clone());
         let payload = json!({
             "schema_version": 1,
@@ -782,12 +791,15 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert_eq!(state.storage.count().expect("count should succeed"), 1);
+        assert_eq!(
+            state.storage.count().await.expect("count should succeed"),
+            1
+        );
     }
 
     #[tokio::test]
     async fn rejects_unsupported_schema_version() {
-        let state = test_state();
+        let state = test_state().await;
         let router = build_router(state.clone());
         let payload = json!({
             "schema_version": 2,
@@ -799,12 +811,15 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(state.storage.count().expect("count should succeed"), 0);
+        assert_eq!(
+            state.storage.count().await.expect("count should succeed"),
+            0
+        );
     }
 
     #[tokio::test]
     async fn rejects_missing_telemetry_subject_id() {
-        let router = build_router(test_state());
+        let router = build_router(test_state().await);
         let payload = json!({ "schema_version": 1 });
 
         let response = router
@@ -817,7 +832,9 @@ mod tests {
     #[tokio::test]
     async fn rate_limits_after_n_requests_from_same_subject() {
         let state = StatsCollectorAppState::with_rate_limits(
-            IngestStorage::open_in_memory().expect("storage should open"),
+            IngestStorage::open_in_memory()
+                .await
+                .expect("storage should open"),
             RATE_LIMIT_PER_IP_MAX_REQUESTS,
             RATE_LIMIT_PER_IP_WINDOW,
             2,
@@ -848,13 +865,18 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(state.storage.count().expect("count should succeed"), 2);
+        assert_eq!(
+            state.storage.count().await.expect("count should succeed"),
+            2
+        );
     }
 
     #[tokio::test]
     async fn rate_limits_after_n_requests_from_same_ip() {
         let state = StatsCollectorAppState::with_rate_limits(
-            IngestStorage::open_in_memory().expect("storage should open"),
+            IngestStorage::open_in_memory()
+                .await
+                .expect("storage should open"),
             2,
             Duration::from_secs(60 * 60),
             RATE_LIMIT_PER_SUBJECT_MAX_REQUESTS,
@@ -906,7 +928,9 @@ mod tests {
     #[tokio::test]
     async fn ingest_stores_server_derived_country_not_payload_country() {
         let state = StatsCollectorAppState::with_rate_limits(
-            IngestStorage::open_in_memory().expect("storage should open"),
+            IngestStorage::open_in_memory()
+                .await
+                .expect("storage should open"),
             RATE_LIMIT_PER_IP_MAX_REQUESTS,
             RATE_LIMIT_PER_IP_WINDOW,
             RATE_LIMIT_PER_SUBJECT_MAX_REQUESTS,
@@ -930,13 +954,16 @@ mod tests {
         let records = state
             .storage
             .records_for_subject("subject-country")
+            .await
             .unwrap();
         assert_eq!(records[0].country_code.as_deref(), Some("DE"));
     }
 
     #[tokio::test]
     async fn stats_summary_applies_k_anonymity_suppression() {
-        let storage = IngestStorage::open_in_memory().expect("storage should open");
+        let storage = IngestStorage::open_in_memory()
+            .await
+            .expect("storage should open");
         // 5 subjects on "common" (visible at k=5), 1 on "rare" (suppressed).
         for i in 0..5 {
             storage
@@ -947,10 +974,12 @@ mod tests {
                     None,
                     "{\"hardware_profile_id\":\"common\"}",
                 )
+                .await
                 .unwrap();
         }
         storage
             .insert(100, "s-rare", 1, None, "{\"hardware_profile_id\":\"rare\"}")
+            .await
             .unwrap();
         let state = StatsCollectorAppState::new(storage).with_k_anonymity_min(5);
         let router = build_router(state);
@@ -974,7 +1003,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_endpoints_return_412_when_no_token_configured() {
-        let router = build_router(test_state());
+        let router = build_router(test_state().await);
         let response = router
             .oneshot(
                 Request::builder()
@@ -989,7 +1018,9 @@ mod tests {
 
     #[tokio::test]
     async fn admin_raw_requires_matching_token() {
-        let state = test_state().with_admin_token(Some("secret".to_string()));
+        let state = test_state()
+            .await
+            .with_admin_token(Some("secret".to_string()));
         let router = build_router(state);
         let response = router
             .oneshot(
@@ -1006,12 +1037,16 @@ mod tests {
 
     #[tokio::test]
     async fn admin_access_then_erasure_roundtrip() {
-        let storage = IngestStorage::open_in_memory().expect("storage should open");
+        let storage = IngestStorage::open_in_memory()
+            .await
+            .expect("storage should open");
         storage
             .insert(1, "subject-x", 1, None, "{\"hardware_profile_id\":\"p\"}")
+            .await
             .unwrap();
         storage
             .insert(2, "subject-x", 1, None, "{\"hardware_profile_id\":\"p\"}")
+            .await
             .unwrap();
         let state = StatsCollectorAppState::new(storage).with_admin_token(Some("tok".to_string()));
         let router = build_router(state.clone());
@@ -1047,12 +1082,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         assert_eq!(body["deleted_records"], 2);
-        assert_eq!(state.storage.count().unwrap(), 0);
+        assert_eq!(state.storage.count().await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn registration_is_idempotent_and_returns_the_same_token() {
-        let router = build_router(test_state());
+        let router = build_router(test_state().await);
         let addr = source_addr(30);
 
         let first = router
@@ -1079,7 +1114,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_gives_different_subjects_different_tokens() {
-        let router = build_router(test_state());
+        let router = build_router(test_state().await);
         let addr = source_addr(31);
 
         let a = router
@@ -1100,7 +1135,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_accepts_a_matching_ingestion_token() {
-        let state = test_state();
+        let state = test_state().await;
         let router = build_router(state.clone());
         let addr = source_addr(32);
 
@@ -1127,6 +1162,7 @@ mod tests {
             state
                 .storage
                 .records_for_subject("subject-token-match")
+                .await
                 .unwrap()
                 .len(),
             1
@@ -1135,7 +1171,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_rejects_a_mismatched_ingestion_token() {
-        let state = test_state();
+        let state = test_state().await;
         let router = build_router(state.clone());
         let addr = source_addr(33);
 
@@ -1162,6 +1198,7 @@ mod tests {
             state
                 .storage
                 .records_for_subject("subject-token-mismatch")
+                .await
                 .unwrap()
                 .len(),
             0,
@@ -1171,7 +1208,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_rejects_a_token_when_none_is_registered_for_the_subject() {
-        let state = test_state();
+        let state = test_state().await;
         let router = build_router(state.clone());
         let addr = source_addr(34);
 
@@ -1194,6 +1231,7 @@ mod tests {
             state
                 .storage
                 .records_for_subject("subject-never-registered")
+                .await
                 .unwrap()
                 .len(),
             0
@@ -1202,7 +1240,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_still_accepts_a_request_with_no_token_at_all() {
-        let state = test_state();
+        let state = test_state().await;
         let router = build_router(state.clone());
         let addr = source_addr(35);
 
@@ -1228,6 +1266,7 @@ mod tests {
             state
                 .storage
                 .records_for_subject("subject-tokenless-ok")
+                .await
                 .unwrap()
                 .len(),
             1
@@ -1239,7 +1278,9 @@ mod tests {
         // A tight untokened limit (1/hour) so the test doesn't need to wait out a real window,
         // while the baseline subject_limiter stays generous enough not to interfere.
         let state = StatsCollectorAppState::with_rate_limits(
-            IngestStorage::open_in_memory().expect("storage should open"),
+            IngestStorage::open_in_memory()
+                .await
+                .expect("storage should open"),
             RATE_LIMIT_PER_IP_MAX_REQUESTS,
             RATE_LIMIT_PER_IP_WINDOW,
             10,
@@ -1274,7 +1315,9 @@ mod tests {
 
     #[tokio::test]
     async fn registration_endpoint_is_rate_limited_per_ip() {
-        let state = test_state().with_register_rate_limit(2, Duration::from_secs(60 * 60));
+        let state = test_state()
+            .await
+            .with_register_rate_limit(2, Duration::from_secs(60 * 60));
         let router = build_router(state);
         let addr = source_addr(37);
 
@@ -1298,7 +1341,7 @@ mod tests {
 
     #[tokio::test]
     async fn registration_rejects_an_empty_subject_id() {
-        let router = build_router(test_state());
+        let router = build_router(test_state().await);
         let addr = source_addr(38);
 
         // A path segment of only whitespace, percent-encoded, trims down to empty.

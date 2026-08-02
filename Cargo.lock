@@ -5873,13 +5873,13 @@ dependencies = [
  "axum-server",
  "iptocc",
  "rand 0.8.7",
- "rusqlite",
  "serde",
  "serde_json",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "turso",
 ]
 
 [[package]]
