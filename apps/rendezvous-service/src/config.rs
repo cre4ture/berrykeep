@@ -41,12 +41,6 @@ pub struct RendezvousServiceCliConfig {
         value_name = "FILE"
     )]
     pub failover_package_path: Option<PathBuf>,
-    #[arg(
-        long = "failover-passphrase",
-        env = "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE",
-        value_name = "PASSPHRASE"
-    )]
-    pub failover_passphrase: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,13 +69,6 @@ impl RendezvousServiceCliConfig {
     }
 
     fn validate(self) -> Result<Self> {
-        match (&self.failover_package_path, &self.failover_passphrase) {
-            (Some(_), Some(_)) | (None, None) => {}
-            _ => bail!(
-                "IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE and IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE must be set together"
-            ),
-        }
-
         if self.failover_package_path.is_some() && self.bind_addr.is_none() {
             bail!("--bind-addr is required when using a failover package");
         }
@@ -104,6 +91,14 @@ impl RendezvousServiceConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
+        let failover_passphrase = lookup_env("IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE");
+
+        if args.failover_package_path.is_none() && failover_passphrase.is_some() {
+            bail!(
+                "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE requires IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE to be set"
+            );
+        }
+
         if args.failover_package_path.is_some() && args.bind_addr.is_none() {
             bail!("--bind-addr is required when using a failover package");
         }
@@ -116,13 +111,19 @@ impl RendezvousServiceConfig {
                 .context("invalid IRONMESH_RENDEZVOUS_BIND")?,
         };
 
+        if args.failover_package_path.is_some() && failover_passphrase.is_none() {
+            bail!(
+                "IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE requires IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE"
+            );
+        }
+
         let failover_package = args
             .failover_package_path
             .as_deref()
             .map(|package_path| {
                 load_rendezvous_failover_package(
                     package_path,
-                    args.failover_passphrase
+                    failover_passphrase
                         .as_deref()
                         .expect("failover package passphrase should be present"),
                 )
@@ -807,7 +808,6 @@ mod tests {
             "--bind-addr=0.0.0.0:44042",
             "--failover-package",
             "/tmp/failover.json",
-            "--failover-passphrase=swordfish",
         ])
         .expect("cli config should parse")
         .validate()
@@ -821,7 +821,16 @@ mod tests {
             cli.failover_package_path,
             Some(PathBuf::from("/tmp/failover.json"))
         );
-        assert_eq!(cli.failover_passphrase.as_deref(), Some("swordfish"));
+    }
+
+    #[test]
+    fn cli_config_rejects_failover_passphrase_flag() {
+        let err = RendezvousServiceCliConfig::try_parse_from([
+            "ironmesh-rendezvous-service",
+            "--failover-passphrase=super-secret",
+        ])
+        .expect_err("failover passphrase should not be a CLI flag");
+        assert!(err.to_string().contains("failover-passphrase"));
     }
 
     #[test]
@@ -846,9 +855,11 @@ mod tests {
         let cli = RendezvousServiceCliConfig {
             bind_addr: Some("0.0.0.0:44042".parse().expect("bind addr should parse")),
             failover_package_path: Some(package_path.clone()),
-            failover_passphrase: Some("correct horse battery staple".to_string()),
         };
-        let env = HashMap::<String, String>::new();
+        let env = HashMap::<String, String>::from([(
+            "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
+            "correct horse battery staple".to_string(),
+        )]);
         let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
             .expect("config should load failover package");
 
@@ -913,9 +924,11 @@ mod tests {
         let cli = RendezvousServiceCliConfig {
             bind_addr: Some("0.0.0.0:44042".parse().expect("bind addr should parse")),
             failover_package_path: Some(package_path),
-            failover_passphrase: Some("correct horse battery staple".to_string()),
         };
-        let env = HashMap::<String, String>::new();
+        let env = HashMap::<String, String>::from([(
+            "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
+            "correct horse battery staple".to_string(),
+        )]);
         let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
             .expect("standalone-labeled failover package should load");
 
@@ -951,12 +964,17 @@ mod tests {
         let cli = RendezvousServiceCliConfig {
             bind_addr: Some("0.0.0.0:44042".parse().expect("bind addr should parse")),
             failover_package_path: Some(package_path),
-            failover_passphrase: Some("correct horse battery staple".to_string()),
         };
-        let env = HashMap::from([(
-            "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
-            "https://other.example:44042".to_string(),
-        )]);
+        let env = HashMap::from([
+            (
+                "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
+                "https://other.example:44042".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
+                "correct horse battery staple".to_string(),
+            ),
+        ]);
         let err = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
             .expect_err("mismatched public URL should fail");
         assert!(
@@ -989,12 +1007,17 @@ mod tests {
         let cli = RendezvousServiceCliConfig {
             bind_addr: Some("0.0.0.0:44042".parse().expect("bind addr should parse")),
             failover_package_path: Some(package_path),
-            failover_passphrase: Some("correct horse battery staple".to_string()),
         };
-        let env = HashMap::from([(
-            "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
-            "/tmp/cluster-ca.pem".to_string(),
-        )]);
+        let env = HashMap::from([
+            (
+                "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
+                "correct horse battery staple".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
+                "/tmp/cluster-ca.pem".to_string(),
+            ),
+        ]);
 
         let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
             .expect("legacy failover package should still load");
