@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -8,6 +9,10 @@ use tracing::warn;
 use turso::params_from_iter;
 
 use crate::cluster::NodeDescriptor;
+
+mod gallery;
+
+const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
@@ -26,6 +31,9 @@ use super::{
 pub(super) struct TursoMetadataStore {
     _database: turso::Database,
     connection: turso::Connection,
+    writer_lock: tokio::sync::Mutex<()>,
+    gallery_readers: Vec<tokio::sync::Mutex<turso::Connection>>,
+    next_gallery_reader: AtomicUsize,
     metadata_path: PathBuf,
 }
 
@@ -53,15 +61,38 @@ impl TursoMetadataStore {
             )
         })?;
 
-        Ok(Self {
+        let mut gallery_readers = Vec::with_capacity(DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT);
+        for _ in 0..DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT {
+            gallery_readers.push(tokio::sync::Mutex::new(db.connect().with_context(
+                || {
+                    format!(
+                        "failed to open a Turso gallery read connection to {}",
+                        metadata_path.display()
+                    )
+                },
+            )?));
+        }
+
+        let store = Self {
             _database: db,
             connection: conn,
+            writer_lock: tokio::sync::Mutex::new(()),
+            gallery_readers,
+            next_gallery_reader: AtomicUsize::new(0),
             metadata_path: metadata_path.to_path_buf(),
-        })
+        };
+        store.backfill_gallery_objects().await?;
+        Ok(store)
     }
 
     async fn rollback(&self) {
         let _ = self.connection.execute_batch("ROLLBACK").await;
+    }
+
+    async fn gallery_read_connection(&self) -> tokio::sync::MutexGuard<'_, turso::Connection> {
+        let index =
+            self.next_gallery_reader.fetch_add(1, Ordering::Relaxed) % self.gallery_readers.len();
+        self.gallery_readers[index].lock().await
     }
 
     fn decode_json<T: serde::de::DeserializeOwned>(
@@ -128,45 +159,30 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO current_objects (key, manifest_hash, object_id)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(key) DO UPDATE SET
-                    manifest_hash = excluded.manifest_hash,
-                    object_id = excluded.object_id",
-                (key, entry.manifest_hash.as_str(), entry.object_id.as_str()),
-            )
-            .await?;
-        Ok(())
+        self.upsert_current_object_with_gallery(key, entry).await
     }
 
     async fn remove_current_object(&self, key: &str) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM current_objects WHERE key = ?1", (key,))
-            .await?;
-        Ok(())
+        self.remove_current_object_with_gallery(key).await
     }
 
     async fn query_gallery_index(
         &self,
-        _query: &GalleryIndexQuery,
+        query: &GalleryIndexQuery,
     ) -> Result<Option<GalleryIndexPage>> {
-        // Keep the existing implementation as the safe fallback until the same
-        // projection is available for the optional Turso metadata backend.
-        Ok(None)
+        self.query_turso_gallery_index(query).await.map(Some)
     }
 
     async fn query_gallery_delta(
         &self,
-        _history_id: &str,
-        _since_revision: u64,
-        _limit: usize,
-        _scope: &GalleryDeltaScope,
+        history_id: &str,
+        since_revision: u64,
+        limit: usize,
+        scope: &GalleryDeltaScope,
     ) -> Result<Option<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>>> {
-        // The optional Turso backend still uses the generic gallery listing path,
-        // so it cannot offer a durable projection cursor yet.
-        Ok(None)
+        self.query_turso_gallery_delta(history_id, since_revision, limit, scope)
+            .await
+            .map(Some)
     }
 
     async fn count_current_objects(&self) -> Result<usize> {
@@ -237,6 +253,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         attempts: &HashMap<String, RepairAttemptRecord>,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -324,6 +341,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_repair_run_record(&self, record: &RepairRunRecord) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -340,6 +358,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_repair_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM repair_run_history\n                 WHERE finished_at_unix < ?1",
@@ -413,6 +432,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         record: &ManualRepairActionRunRecord,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -432,6 +452,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         finished_before_unix: u64,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM manual_repair_action_run_history\n                 WHERE finished_at_unix < ?1",
@@ -502,6 +523,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_data_scrub_run_record(&self, record: &DataScrubRunRecord) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -518,6 +540,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_data_scrub_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM data_scrub_run_history\n                 WHERE finished_at_unix < ?1",
@@ -557,6 +580,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -606,6 +630,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -648,6 +673,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(state)?;
         self.connection
             .execute(
@@ -733,6 +759,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_s3_control_plane_state(&self, state: &S3ControlPlaneState) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -885,6 +912,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         state: Option<&ActiveSnapshotBatch>,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         match state {
             Some(state) => {
                 let payload = serde_json::to_vec_pretty(state)?;
@@ -925,13 +953,13 @@ impl MetadataStore for TursoMetadataStore {
 
             row_blob(&row, 0, "media_cache.metadata_json")?
         };
-        match self.decode_json::<CachedMediaMetadata>(payload, "media metadata") {
+        match self.decode_json::<CachedMediaMetadata>(payload.clone(), "media metadata") {
             Ok(metadata) => Ok(Some(metadata)),
             Err(err) => {
-                self.connection
-                    .execute(
-                        "DELETE FROM media_cache WHERE content_fingerprint = ?1",
-                        (content_fingerprint,),
+                let deleted = self
+                    .delete_invalid_media_cache_record_if_payload_matches(
+                        content_fingerprint,
+                        &payload,
                     )
                     .await
                     .with_context(|| {
@@ -939,11 +967,13 @@ impl MetadataStore for TursoMetadataStore {
                             "failed to delete invalid media metadata row for {content_fingerprint}"
                         )
                     })?;
-                warn!(
-                    content_fingerprint = %content_fingerprint,
-                    error = %err,
-                    "deleted invalid cached media metadata row from Turso"
-                );
+                if deleted {
+                    warn!(
+                        content_fingerprint = %content_fingerprint,
+                        error = %err,
+                        "deleted invalid cached media metadata row from Turso"
+                    );
+                }
                 Ok(None)
             }
         }
@@ -982,19 +1012,19 @@ impl MetadataStore for TursoMetadataStore {
             while let Some(row) = rows.next().await? {
                 let content_fingerprint = row_string(&row, 0, "media_cache.content_fingerprint")?;
                 let payload = row_blob(&row, 1, "media_cache.metadata_json")?;
-                match self.decode_json::<CachedMediaMetadata>(payload, "media metadata") {
+                match self.decode_json::<CachedMediaMetadata>(payload.clone(), "media metadata") {
                     Ok(metadata) => {
                         metadata_by_content_fingerprint.insert(content_fingerprint, metadata);
                     }
-                    Err(err) => invalid_rows.push((content_fingerprint, err.to_string())),
+                    Err(err) => invalid_rows.push((content_fingerprint, payload, err.to_string())),
                 }
             }
 
-            for (content_fingerprint, error) in invalid_rows {
-                self.connection
-                    .execute(
-                        "DELETE FROM media_cache WHERE content_fingerprint = ?1",
-                        (content_fingerprint.as_str(),),
+            for (content_fingerprint, payload, error) in invalid_rows {
+                let deleted = self
+                    .delete_invalid_media_cache_record_if_payload_matches(
+                        &content_fingerprint,
+                        &payload,
                     )
                     .await
                     .with_context(|| {
@@ -1002,11 +1032,13 @@ impl MetadataStore for TursoMetadataStore {
                             "failed to delete invalid media metadata row for {content_fingerprint}"
                         )
                     })?;
-                warn!(
-                    content_fingerprint = %content_fingerprint,
-                    error,
-                    "deleted invalid cached media metadata row from Turso"
-                );
+                if deleted {
+                    warn!(
+                        content_fingerprint = %content_fingerprint,
+                        error,
+                        "deleted invalid cached media metadata row from Turso"
+                    );
+                }
             }
         }
 
@@ -1014,16 +1046,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
-        let payload = serde_json::to_vec_pretty(metadata)?;
-        self.connection
-            .execute(
-                "INSERT INTO media_cache (content_fingerprint, metadata_json)
-                 VALUES (?1, ?2)
-                 ON CONFLICT(content_fingerprint) DO UPDATE SET metadata_json = excluded.metadata_json",
-                (metadata.content_fingerprint.as_str(), payload),
-            )
-            .await?;
-        Ok(())
+        self.persist_media_cache_record_with_gallery(metadata).await
     }
 
     #[cfg(test)]
@@ -1045,13 +1068,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_media_cache_record(&self, content_fingerprint: &str) -> Result<()> {
-        self.connection
-            .execute(
-                "DELETE FROM media_cache WHERE content_fingerprint = ?1",
-                (content_fingerprint,),
-            )
-            .await?;
-        Ok(())
+        self.delete_media_cache_record_with_gallery(content_fingerprint)
+            .await
     }
 
     async fn list_snapshot_infos(&self) -> Result<Vec<SnapshotInfo>> {
@@ -1133,6 +1151,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec(event)?;
         self.connection
             .execute(
@@ -1153,6 +1172,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn append_data_change_event(&self, event: &DataChangeEvent) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec(event)?;
         self.connection
             .execute(
@@ -1308,6 +1328,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         metadata: &ObjectVersionMetadataRecord,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO object_version_metadata (
@@ -1351,6 +1372,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_object_version_metadata(&self, version_id: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM object_version_metadata WHERE version_id = ?1",
@@ -1468,6 +1490,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO s3_object_versions (
@@ -1498,6 +1521,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_s3_object_version(&self, bucket_name: &str, version_id: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM s3_object_versions
@@ -1513,22 +1537,8 @@ impl MetadataStore for TursoMetadataStore {
         manifest_hash: &str,
         summary: &ManifestSummary,
     ) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO manifest_summaries (manifest_hash, total_size_bytes, content_fingerprint)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(manifest_hash) DO UPDATE
-                 SET total_size_bytes = excluded.total_size_bytes,
-                     content_fingerprint = excluded.content_fingerprint",
-                (
-                    manifest_hash,
-                    i64::try_from(summary.total_size_bytes)
-                        .context("manifest summary size overflow")?,
-                    summary.content_fingerprint.as_str(),
-                ),
-            )
-            .await?;
-        Ok(())
+        self.persist_manifest_summary_with_gallery(manifest_hash, summary)
+            .await
     }
 
     async fn persist_version_index_by_object_id(
@@ -1536,16 +1546,8 @@ impl MetadataStore for TursoMetadataStore {
         object_id: &str,
         index: &FileVersionIndex,
     ) -> Result<()> {
-        let payload = serde_json::to_vec_pretty(index)?;
-        self.connection
-            .execute(
-                "INSERT INTO version_indexes (object_id, index_json)
-                 VALUES (?1, ?2)
-                 ON CONFLICT(object_id) DO UPDATE SET index_json = excluded.index_json",
-                (object_id, payload),
-            )
-            .await?;
-        Ok(())
+        self.persist_version_index_with_gallery(object_id, index)
+            .await
     }
 
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
@@ -1583,6 +1585,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = compress_snapshot_json(&serde_json::to_vec_pretty(manifest)?)?;
         self.connection
             .execute(
@@ -1666,6 +1669,7 @@ impl MetadataStore for TursoMetadataStore {
             return Ok(());
         }
 
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             for chunk in snapshot_ids.chunks(TURSO_SNAPSHOT_DELETE_BATCH_SIZE) {
@@ -1691,6 +1695,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn vacuum_metadata_store(&self) -> Result<bool> {
+        let _writer = self.writer_lock.lock().await;
         match self.connection.execute("VACUUM", ()).await {
             Ok(_) => Ok(true),
             Err(err) => {
@@ -1729,6 +1734,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(state)?;
         self.connection
             .execute(
@@ -1766,6 +1772,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_storage_location(&self, location: &StorageLocationRecord) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO storage_locations
@@ -1788,6 +1795,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_storage_location(&self, kind: StorageContentKind, hash: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM storage_locations WHERE content_kind = ?1 AND content_hash = ?2",
@@ -1816,6 +1824,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_cached_chunk_record(&self, record: &CachedChunkRecord) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -1829,6 +1838,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_cached_chunk_record(&self, hash: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute("DELETE FROM cached_chunks WHERE hash = ?1", (hash,))
             .await?;
@@ -1858,6 +1868,7 @@ impl MetadataStore for TursoMetadataStore {
         manifest_hash: &str,
         owned_at_unix: u64,
     ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO locally_owned_manifests (manifest_hash, owned_at_unix)
@@ -1873,6 +1884,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_locally_owned_manifest(&self, manifest_hash: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM locally_owned_manifests WHERE manifest_hash = ?1",
@@ -2086,6 +2098,7 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
         let payload = serde_json::to_vec_pretty(sample)?;
+        let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -2118,6 +2131,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_storage_stats_history_before(&self, collected_before_unix: u64) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM storage_stats_history
@@ -2141,6 +2155,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM version_indexes WHERE object_id = ?1",
@@ -2187,6 +2202,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn mark_reconciled(&self, marker: &ReconcileMarker) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO reconcile_markers (
@@ -2453,6 +2469,7 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             return Err(err).context("failed to migrate turso s3_access_keys.allow_manage");
         }
     }
+    gallery::init_gallery_projection(connection).await?;
     Ok(())
 }
 

@@ -1817,9 +1817,10 @@ run_on_main_metadata_backends!(
     admin_authorization_requires_token_when_configured_turso
 );
 
-#[tokio::test]
-async fn gallery_delta_admin_route_requires_authorization_and_accepts_current_token() {
-    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+async fn gallery_delta_admin_route_requires_authorization_and_accepts_current_token_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
     let admin_token = fresh_test_secret("gallery-delta-admin");
     state.access.admin_control.admin_token = Some(admin_token.clone());
     let app = super::build_server_apps(&state).public_app;
@@ -1855,7 +1856,7 @@ async fn gallery_delta_admin_route_requires_authorization_and_accepts_current_to
             .unwrap();
     let sync_token = bootstrap_payload["sync_token"]
         .as_str()
-        .expect("SQLite gallery bootstrap should return a token")
+        .expect("gallery bootstrap should return a token")
         .to_string();
     let uri = format!("/api/v1/auth/store/index/delta?token={sync_token}");
 
@@ -1944,6 +1945,12 @@ async fn gallery_delta_admin_route_requires_authorization_and_accepts_current_to
     cleanup_test_state(&state).await;
 }
 
+run_on_main_metadata_backends!(
+    gallery_delta_admin_route_requires_authorization_and_accepts_current_token_impl,
+    gallery_delta_admin_route_requires_authorization_and_accepts_current_token,
+    gallery_delta_admin_route_requires_authorization_and_accepts_current_token_turso
+);
+
 #[test]
 fn gallery_sync_token_is_opaque_versioned_and_rejects_malformed_values() {
     let payload = super::GallerySyncTokenPayload {
@@ -2006,29 +2013,31 @@ fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
 
 #[cfg(feature = "turso-metadata")]
 #[tokio::test]
-async fn gallery_delta_and_viewport_return_not_implemented_for_turso() {
+async fn turso_gallery_projection_supports_viewport_and_delta() {
     let state = build_test_state(1, false, MainTestBackend::Turso).await;
-    let token = super::encode_gallery_sync_token(&super::GallerySyncTokenPayload {
-        history_id: uuid::Uuid::new_v4().to_string(),
-        revision: 0,
-        scope: super::GallerySyncScope {
-            prefix: "gallery".to_string(),
-            depth: 64,
-            media_filter: super::StoreIndexMediaFilter::Image,
-            captured_sort: super::StoreIndexSortOrder::CapturedDesc,
-            viewport: None,
-        },
-    });
-    let delta = super::store_index_delta_response(
-        &state,
-        super::StoreIndexDeltaQuery {
-            token: Some(token),
-            limit: None,
-        },
-        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
-    )
-    .await;
-    assert_eq!(delta.status(), StatusCode::NOT_IMPLEMENTED);
+    let manifest_hash = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let version = locked
+            .put_object_versioned(
+                "gallery/zurich.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut metadata = locked
+            .ensure_media_metadata(&version.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        metadata.taken_at_unix = Some(123);
+        metadata.gps = Some(super::storage::MediaGpsCoordinates {
+            latitude: 47.3769,
+            longitude: 8.5417,
+        });
+        locked.persist_media_cache_record(&metadata).await.unwrap();
+        version.manifest_hash
+    };
 
     let viewport = axum::response::IntoResponse::into_response(
         super::list_store_index(
@@ -2052,7 +2061,42 @@ async fn gallery_delta_and_viewport_return_not_implemented_for_turso() {
         )
         .await,
     );
-    assert_eq!(viewport.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(viewport.status(), StatusCode::OK);
+    let viewport_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(viewport.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(viewport_payload["entries"][0]["path"], "gallery/zurich.png");
+    assert_eq!(viewport_payload["media_summary"]["geotagged_count"], 1);
+    let token = viewport_payload["sync_token"]
+        .as_str()
+        .expect("viewport gallery response should return a token")
+        .to_string();
+
+    {
+        let locked = lock_store(&state, "tests.state.store").await;
+        let mut metadata = locked
+            .ensure_media_metadata(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        metadata.width = Some(123);
+        locked.persist_media_cache_record(&metadata).await.unwrap();
+    }
+
+    let delta = super::store_index_delta_response(
+        &state,
+        super::StoreIndexDeltaQuery {
+            token: Some(token),
+            limit: None,
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(delta.status(), StatusCode::OK);
+    let delta_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(delta.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(delta_payload["upserts"][0]["path"], "gallery/zurich.png");
+    assert_eq!(delta_payload["upserts"][0]["media"]["width"], 123);
+    assert_eq!(delta_payload["removals"], serde_json::json!([]));
 
     cleanup_test_state(&state).await;
 }
@@ -14328,9 +14372,10 @@ run_on_main_metadata_backends!(
     list_store_index_reuses_paginated_page_cache_turso
 );
 
-#[tokio::test]
-async fn list_store_index_uses_sqlite_gallery_projection_for_captured_pagination() {
-    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
     let second_png = {
         let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 255]));
         let mut bytes = std::io::Cursor::new(Vec::new());
@@ -14408,8 +14453,8 @@ async fn list_store_index_uses_sqlite_gallery_projection_for_captured_pagination
             .headers()
             .get("server-timing")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.contains("gallery-index;desc=sqlite")),
-        "the SQLite projection should bypass the full store-index scan"
+            .is_some_and(|value| value.contains("gallery-index;desc=metadata")),
+        "the persistent gallery projection should bypass the full store-index scan"
     );
     assert_eq!(
         first_response
@@ -14473,6 +14518,12 @@ async fn list_store_index_uses_sqlite_gallery_projection_for_captured_pagination
     assert_ne!(older.manifest_hash, newer.manifest_hash);
     cleanup_test_state(&state).await;
 }
+
+run_on_main_metadata_backends!(
+    list_store_index_uses_gallery_projection_for_captured_pagination_impl,
+    list_store_index_uses_gallery_projection_for_captured_pagination,
+    list_store_index_uses_gallery_projection_for_captured_pagination_turso
+);
 
 #[tokio::test]
 async fn list_store_index_gallery_projection_matches_generic_pending_media_on_cache_miss() {
@@ -14546,7 +14597,7 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
             .headers()
             .get("server-timing")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.contains("gallery-index;desc=sqlite"))
+            .is_some_and(|value| value.contains("gallery-index;desc=metadata"))
     );
     let gallery_payload: serde_json::Value = serde_json::from_slice(
         &to_bytes(gallery_response.into_body(), usize::MAX)
