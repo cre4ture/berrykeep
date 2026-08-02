@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
 use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Value, params_from_iter};
@@ -14,6 +16,17 @@ use super::super::{
 use super::{TursoMetadataStore, row_string, row_u64};
 
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
+
+#[derive(Debug, PartialEq)]
+struct GalleryProjectionState {
+    key: String,
+    media_type: Option<String>,
+    captured_at_unix: u64,
+    media_status: Option<String>,
+    geotagged: u64,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+}
 
 pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> Result<()> {
     connection
@@ -258,19 +271,14 @@ impl TursoMetadataStore {
                 )
                 .await?;
             if changed > 0 {
-                let revision_before = current_gallery_revision(&self.connection).await?;
-                refresh_gallery_objects_for_content_fingerprint(
-                    &self.connection,
-                    &content_fingerprint,
-                )
-                .await?;
-                if current_gallery_revision(&self.connection).await? == revision_before {
-                    record_gallery_upserts_for_content_fingerprint(
+                let unchanged_projection_keys =
+                    refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
                         &self.connection,
                         &content_fingerprint,
                     )
                     .await?;
-                }
+                record_gallery_upserts_for_keys(&self.connection, &unchanged_projection_keys)
+                    .await?;
             }
             Ok(())
         }
@@ -293,19 +301,14 @@ impl TursoMetadataStore {
                 )
                 .await?;
             if deleted > 0 {
-                let revision_before = current_gallery_revision(&self.connection).await?;
-                refresh_gallery_objects_for_content_fingerprint(
-                    &self.connection,
-                    content_fingerprint,
-                )
-                .await?;
-                if current_gallery_revision(&self.connection).await? == revision_before {
-                    record_gallery_upserts_for_content_fingerprint(
+                let unchanged_projection_keys =
+                    refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
                         &self.connection,
                         content_fingerprint,
                     )
                     .await?;
-                }
+                record_gallery_upserts_for_keys(&self.connection, &unchanged_projection_keys)
+                    .await?;
             }
             Ok(())
         }
@@ -331,19 +334,14 @@ impl TursoMetadataStore {
                 )
                 .await?;
             if deleted > 0 {
-                let revision_before = current_gallery_revision(&self.connection).await?;
-                refresh_gallery_objects_for_content_fingerprint(
-                    &self.connection,
-                    content_fingerprint,
-                )
-                .await?;
-                if current_gallery_revision(&self.connection).await? == revision_before {
-                    record_gallery_upserts_for_content_fingerprint(
+                let unchanged_projection_keys =
+                    refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
                         &self.connection,
                         content_fingerprint,
                     )
                     .await?;
-                }
+                record_gallery_upserts_for_keys(&self.connection, &unchanged_projection_keys)
+                    .await?;
             }
             Ok(deleted > 0)
         }
@@ -372,14 +370,17 @@ impl TursoMetadataStore {
                      WHERE manifest_summaries.total_size_bytes != excluded.total_size_bytes
                         OR manifest_summaries.content_fingerprint != excluded.content_fingerprint",
                     (manifest_hash, total_size_bytes, summary.content_fingerprint.as_str()),
-                )
-                .await?;
+            )
+            .await?;
             if changed > 0 {
-                let revision_before = current_gallery_revision(&self.connection).await?;
-                refresh_gallery_objects_for_manifest(&self.connection, manifest_hash).await?;
-                if current_gallery_revision(&self.connection).await? == revision_before {
-                    record_gallery_upserts_for_manifest(&self.connection, manifest_hash).await?;
-                }
+                let unchanged_projection_keys =
+                    refresh_gallery_objects_for_manifest_and_collect_unchanged_keys(
+                        &self.connection,
+                        manifest_hash,
+                    )
+                    .await?;
+                record_gallery_upserts_for_keys(&self.connection, &unchanged_projection_keys)
+                    .await?;
             }
             Ok(())
         }
@@ -580,13 +581,42 @@ async fn refresh_gallery_objects_for_content_fingerprint(
     Ok(())
 }
 
-async fn record_gallery_upserts_for_content_fingerprint(
+async fn refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
     connection: &turso::Connection,
     content_fingerprint: &str,
-) -> Result<()> {
-    record_gallery_upserts_for_query(
+) -> Result<Vec<String>> {
+    let before =
+        gallery_projection_states_for_content_fingerprint(connection, content_fingerprint).await?;
+    refresh_gallery_objects_for_content_fingerprint(connection, content_fingerprint).await?;
+    let after =
+        gallery_projection_states_for_content_fingerprint(connection, content_fingerprint).await?;
+    Ok(unchanged_gallery_projection_keys(before, after))
+}
+
+async fn refresh_gallery_objects_for_manifest_and_collect_unchanged_keys(
+    connection: &turso::Connection,
+    manifest_hash: &str,
+) -> Result<Vec<String>> {
+    let before = gallery_projection_states_for_manifest(connection, manifest_hash).await?;
+    refresh_gallery_objects_for_manifest(connection, manifest_hash).await?;
+    let after = gallery_projection_states_for_manifest(connection, manifest_hash).await?;
+    Ok(unchanged_gallery_projection_keys(before, after))
+}
+
+async fn gallery_projection_states_for_content_fingerprint(
+    connection: &turso::Connection,
+    content_fingerprint: &str,
+) -> Result<Vec<GalleryProjectionState>> {
+    gallery_projection_states_for_query(
         connection,
-        "SELECT gallery_objects.key
+        "SELECT
+             gallery_objects.key,
+             gallery_objects.media_type,
+             gallery_objects.captured_at_unix,
+             gallery_objects.media_status,
+             gallery_objects.geotagged,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -596,13 +626,22 @@ async fn record_gallery_upserts_for_content_fingerprint(
     .await
 }
 
-async fn record_gallery_upserts_for_manifest(
+async fn gallery_projection_states_for_manifest(
     connection: &turso::Connection,
     manifest_hash: &str,
-) -> Result<()> {
-    record_gallery_upserts_for_query(
+) -> Result<Vec<GalleryProjectionState>> {
+    gallery_projection_states_for_query(
         connection,
-        "SELECT key FROM gallery_objects WHERE manifest_hash = ?1",
+        "SELECT
+             key,
+             media_type,
+             captured_at_unix,
+             media_status,
+             geotagged,
+             latitude,
+             longitude
+         FROM gallery_objects
+         WHERE manifest_hash = ?1",
         manifest_hash,
     )
     .await
@@ -620,6 +659,51 @@ async fn record_gallery_upserts_for_object_id(
     .await
 }
 
+async fn gallery_projection_states_for_query(
+    connection: &turso::Connection,
+    sql: &str,
+    parameter: &str,
+) -> Result<Vec<GalleryProjectionState>> {
+    let mut rows = connection.query(sql, (parameter,)).await?;
+    let mut states = Vec::new();
+    while let Some(row) = rows.next().await? {
+        states.push(GalleryProjectionState {
+            key: row_string(&row, 0, "gallery_objects.key")?,
+            media_type: row_opt_string(&row, 1, "gallery_objects.media_type")?,
+            captured_at_unix: row_u64(&row, 2, "gallery_objects.captured_at_unix")?,
+            media_status: row_opt_string(&row, 3, "gallery_objects.media_status")?,
+            geotagged: row_u64(&row, 4, "gallery_objects.geotagged")?,
+            latitude: row_opt_f64(&row, 5, "gallery_objects.latitude")?,
+            longitude: row_opt_f64(&row, 6, "gallery_objects.longitude")?,
+        });
+    }
+    Ok(states)
+}
+
+fn unchanged_gallery_projection_keys(
+    before: Vec<GalleryProjectionState>,
+    after: Vec<GalleryProjectionState>,
+) -> Vec<String> {
+    let after_by_key = after
+        .into_iter()
+        .map(|state| (state.key.clone(), state))
+        .collect::<HashMap<_, _>>();
+    before
+        .into_iter()
+        .filter_map(|state| (after_by_key.get(&state.key) == Some(&state)).then_some(state.key))
+        .collect()
+}
+
+async fn record_gallery_upserts_for_keys(
+    connection: &turso::Connection,
+    keys: &[String],
+) -> Result<()> {
+    for key in keys {
+        record_gallery_change(connection, key, "upsert").await?;
+    }
+    Ok(())
+}
+
 async fn record_gallery_upserts_for_query(
     connection: &turso::Connection,
     sql: &str,
@@ -630,10 +714,7 @@ async fn record_gallery_upserts_for_query(
     while let Some(row) = rows.next().await? {
         keys.push(row_string(&row, 0, "gallery_objects.key")?);
     }
-    for key in keys {
-        record_gallery_change(connection, &key, "upsert").await?;
-    }
-    Ok(())
+    record_gallery_upserts_for_keys(connection, &keys).await
 }
 
 async fn record_gallery_change(
@@ -1162,6 +1243,7 @@ fn row_opt_f64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<f64>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::MediaCacheStatus;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn turso_test_db_path(name: &str) -> std::path::PathBuf {
@@ -1427,6 +1509,99 @@ mod tests {
             row_u64(&row, 0, "gallery_backfill_updates.count").unwrap(),
             1
         );
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_media_delta_tracks_each_shared_content_fingerprint_entry() {
+        let metadata_db_path = turso_test_db_path("gallery-media-delta-shared-fingerprint");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        store
+            .connection
+            .execute_batch(
+                "
+                INSERT INTO manifest_summaries (manifest_hash, total_size_bytes, content_fingerprint)
+                VALUES
+                    ('manifest-a', 100, 'fingerprint-shared'),
+                    ('manifest-b', 100, 'fingerprint-shared');
+                INSERT INTO gallery_objects (
+                    key, manifest_hash, object_id, inferred_media_type, media_type,
+                    captured_at_unix, media_status, geotagged, latitude, longitude
+                ) VALUES
+                    ('gallery/a.jpg', 'manifest-a', 'object-a', 'image', 'image', 10, 'ready', 0, NULL, NULL),
+                    ('gallery/b.jpg', 'manifest-b', 'object-b', 'image', 'image', 10, 'ready', 0, NULL, NULL);
+                ",
+            )
+            .await
+            .expect("gallery fixtures should persist");
+
+        let media_metadata = |width| CachedMediaMetadata {
+            schema_version: 5,
+            content_fingerprint: "fingerprint-shared".to_string(),
+            source_manifest_hash: "manifest-a".to_string(),
+            status: MediaCacheStatus::Ready,
+            media_type: Some("image".to_string()),
+            mime_type: Some("image/jpeg".to_string()),
+            width: Some(width),
+            height: Some(48),
+            orientation: Some(1),
+            taken_at_unix: Some(10),
+            gps: None,
+            thumbnail: None,
+            source_size_bytes: 100,
+            generated_at_unix: 2,
+            retry_after_unix: None,
+            error: None,
+        };
+        store
+            .persist_media_cache_record_with_gallery(&media_metadata(64))
+            .await
+            .expect("initial media metadata should persist");
+        store
+            .connection
+            .execute(
+                "UPDATE gallery_objects SET captured_at_unix = 0 WHERE key = 'gallery/a.jpg'",
+                (),
+            )
+            .await
+            .expect("first gallery entry should become stale");
+        let history_id = current_gallery_history_id(&store.connection)
+            .await
+            .expect("gallery history should load");
+        let revision = current_gallery_revision(&store.connection)
+            .await
+            .expect("gallery revision should load");
+
+        store
+            .persist_media_cache_record_with_gallery(&media_metadata(128))
+            .await
+            .expect("changed media metadata should persist");
+        let page = store
+            .query_turso_gallery_delta(&history_id, revision, 10, &gallery_delta_scope())
+            .await
+            .expect("gallery delta should load")
+            .expect("gallery token should remain current");
+        assert_eq!(page.changes.len(), 2);
+        let mut changed_keys = page
+            .changes
+            .iter()
+            .map(|change| change.key.as_str())
+            .collect::<Vec<_>>();
+        changed_keys.sort_unstable();
+        assert_eq!(changed_keys, ["gallery/a.jpg", "gallery/b.jpg"]);
+        assert!(page.changes.iter().all(|change| {
+            change.kind == GalleryDeltaKind::Upsert
+                && change
+                    .entry
+                    .as_ref()
+                    .and_then(|entry| entry.media_metadata.as_ref())
+                    .and_then(|metadata| metadata.width)
+                    == Some(128)
+        }));
 
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
