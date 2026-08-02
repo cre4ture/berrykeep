@@ -148,6 +148,13 @@ private fun ConnectionRouteDetails(
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+    endpoint.targetNodeId?.let { targetNodeId ->
+        ConnectionDetail(
+            label = stringResource(R.string.connection_paths_target_server_node),
+            value = targetNodeId,
+            selectable = true,
+        )
+    }
     ConnectionDetail(
         label = stringResource(R.string.connection_paths_selection_rank),
         value = routeSelectionRankValue(route),

@@ -16,8 +16,8 @@ use transport_sdk::{
     RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig, RendezvousControlClient,
     TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
     WebSocketByteStream, build_signed_request_headers,
-    connect_websocket_with_expected_server_identity, has_usable_peer_addresses,
-    perform_transport_client_handshake, websocket_url,
+    connect_websocket_with_expected_server_identity, endpoint_id_from_candidate,
+    has_usable_peer_addresses, perform_transport_client_handshake, websocket_url,
 };
 
 const IROH_RELAY_TICKET_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -75,7 +75,9 @@ struct DirectQuicEndpointLifecycle {
     stats: Arc<TransportSessionPoolStats>,
     endpoint_config: DirectQuicEndpointConfig,
     rendezvous: RendezvousControlClient,
-    endpoint_id: String,
+    local_iroh_endpoint_id: String,
+    remote_iroh_endpoint_id: String,
+    target_node_id: NodeId,
 }
 
 type SharedSessionSetupResult = std::result::Result<Arc<MultiplexedSession>, Arc<str>>;
@@ -523,9 +525,10 @@ impl TransportSessionPool {
         let target_node_id = context.target_node_id;
         let setup_attempt_id = context.setup_attempt_id;
         let target_label = context.candidate.endpoint.clone();
+        let remote_iroh_endpoint_id = endpoint_id_from_candidate(candidate)?;
         let setup_started = context.setup_started;
         let mut iroh_connect_started = None;
-        let mut iroh_connect_endpoint_id = None;
+        let mut local_iroh_endpoint_id = None;
         let direct_quic_result =
             tokio::time::timeout(remaining_cold_quic_setup_budget(setup_started)?, async {
                 let endpoint = ensure_direct_quic_endpoint(&context, self.route_index()).await?;
@@ -533,7 +536,7 @@ impl TransportSessionPool {
                 let remaining_setup_budget = remaining_cold_quic_setup_budget(setup_started)?;
                 let connect_started = Instant::now();
                 iroh_connect_started = Some(connect_started);
-                iroh_connect_endpoint_id = Some(endpoint_id.clone());
+                local_iroh_endpoint_id = Some(endpoint_id.clone());
                 tracing::info!(
                     target: MOBILE_CONNECTION_LOG_TARGET,
                     event = "iroh_connect_scheduled",
@@ -541,7 +544,8 @@ impl TransportSessionPool {
                     candidate_index = ?self.route_index(),
                     path_kind = "direct_quic",
                     locator = %candidate.endpoint,
-                    endpoint_id = %endpoint_id,
+                    local_iroh_endpoint_id = %endpoint_id,
+                    remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
                     target_node_id = %target_node_id,
                     setup_elapsed_us = duration_as_u64_micros(setup_started.elapsed()),
                     remaining_setup_budget_ms = remaining_setup_budget.as_millis(),
@@ -554,7 +558,8 @@ impl TransportSessionPool {
                     candidate_index = ?self.route_index(),
                     path_kind = "direct_quic",
                     locator = %candidate.endpoint,
-                    endpoint_id = %endpoint_id,
+                    local_iroh_endpoint_id = %endpoint_id,
+                    remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
                     target_node_id = %target_node_id,
                     setup_elapsed_us = duration_as_u64_micros(setup_started.elapsed()),
                     remaining_setup_budget_ms = remaining_setup_budget.as_millis(),
@@ -572,7 +577,8 @@ impl TransportSessionPool {
                             candidate_index = ?self.route_index(),
                             path_kind = "direct_quic",
                             locator = %candidate.endpoint,
-                            endpoint_id = %endpoint_id,
+                            local_iroh_endpoint_id = %endpoint_id,
+                            remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
                             target_node_id = %target_node_id,
                             duration_us = duration_as_u64_micros(connect_started.elapsed()),
                             "iroh_connect_completed"
@@ -587,7 +593,8 @@ impl TransportSessionPool {
                             candidate_index = ?self.route_index(),
                             path_kind = "direct_quic",
                             locator = %candidate.endpoint,
-                            endpoint_id = %endpoint_id,
+                            local_iroh_endpoint_id = %endpoint_id,
+                            remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
                             target_node_id = %target_node_id,
                             duration_us = duration_as_u64_micros(connect_started.elapsed()),
                             reason = "connect_error",
@@ -608,7 +615,7 @@ impl TransportSessionPool {
             Ok(result) => result,
             Err(_) => {
                 let failed_stage = if let (Some(connect_started), Some(endpoint_id)) =
-                    (iroh_connect_started, iroh_connect_endpoint_id.as_deref())
+                    (iroh_connect_started, local_iroh_endpoint_id.as_deref())
                 {
                     tracing::warn!(
                         target: MOBILE_CONNECTION_LOG_TARGET,
@@ -617,7 +624,8 @@ impl TransportSessionPool {
                         candidate_index = ?self.route_index(),
                         path_kind = "direct_quic",
                         locator = %candidate.endpoint,
-                        endpoint_id,
+                        local_iroh_endpoint_id = endpoint_id,
+                        remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
                         target_node_id = %target_node_id,
                         duration_us = duration_as_u64_micros(connect_started.elapsed()),
                         reason = "cold_session_setup_timeout",
@@ -1097,7 +1105,8 @@ async fn ensure_direct_quic_endpoint(
 
     let has_usable_peer_addresses = has_usable_peer_addresses(candidate)?;
     let secret_key = SecretKey::generate();
-    let endpoint_id = secret_key.public().to_string();
+    let local_iroh_endpoint_id = secret_key.public().to_string();
+    let remote_iroh_endpoint_id = endpoint_id_from_candidate(candidate)?;
     let relay_ticket_collection = match rendezvous {
         Some(rendezvous) => {
             let ticket_started = Instant::now();
@@ -1108,7 +1117,8 @@ async fn ensure_direct_quic_endpoint(
                 candidate_index = ?route_index,
                 path_kind = "direct_quic",
                 locator = %candidate.endpoint,
-                endpoint_id = %endpoint_id,
+                local_iroh_endpoint_id = %local_iroh_endpoint_id,
+                remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
                 target_node_id = %target_node_id,
                 relay_scope = "endpoint_bound",
                 rendezvous_urls = ?rendezvous.config().rendezvous_urls,
@@ -1117,7 +1127,7 @@ async fn ensure_direct_quic_endpoint(
             );
             match tokio::time::timeout(
                 RELAY_TICKET_REQUEST_TIMEOUT,
-                rendezvous.issue_iroh_relay_tickets_progressively(&endpoint_id),
+                rendezvous.issue_iroh_relay_tickets_progressively(&local_iroh_endpoint_id),
             )
             .await
             {
@@ -1129,7 +1139,8 @@ async fn ensure_direct_quic_endpoint(
                         candidate_index = ?route_index,
                         path_kind = "direct_quic",
                         locator = %candidate.endpoint,
-                        endpoint_id = %endpoint_id,
+                        local_iroh_endpoint_id = %local_iroh_endpoint_id,
+                        remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
                         target_node_id = %target_node_id,
                         relay_scope = "endpoint_bound",
                         relay_urls = ?collection.first_ticket().public_urls,
@@ -1146,7 +1157,8 @@ async fn ensure_direct_quic_endpoint(
                         candidate_index = ?route_index,
                         path_kind = "direct_quic",
                         locator = %candidate.endpoint,
-                        endpoint_id = %endpoint_id,
+                        local_iroh_endpoint_id = %local_iroh_endpoint_id,
+                        remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
                         target_node_id = %target_node_id,
                         relay_scope = "endpoint_bound",
                         error_class = "request",
@@ -1164,7 +1176,8 @@ async fn ensure_direct_quic_endpoint(
                         candidate_index = ?route_index,
                         path_kind = "direct_quic",
                         locator = %candidate.endpoint,
-                        endpoint_id = %endpoint_id,
+                        local_iroh_endpoint_id = %local_iroh_endpoint_id,
+                        remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
                         target_node_id = %target_node_id,
                         relay_scope = "endpoint_bound",
                         error_class = "timeout",
@@ -1204,7 +1217,8 @@ async fn ensure_direct_quic_endpoint(
             candidate_index = ?route_index,
             path_kind = "direct_quic",
             locator = %candidate.endpoint,
-            endpoint_id = %endpoint_id,
+            local_iroh_endpoint_id = %local_iroh_endpoint_id,
+            remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
             target_node_id = %target_node_id,
             reason = "no_relay_ticket_or_usable_peer_addresses",
             "iroh_endpoint_setup_failed"
@@ -1219,7 +1233,8 @@ async fn ensure_direct_quic_endpoint(
             candidate_index = ?route_index,
             path_kind = "direct_quic",
             locator = %candidate.endpoint,
-            endpoint_id = %endpoint_id,
+            local_iroh_endpoint_id = %local_iroh_endpoint_id,
+            remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
             target_node_id = %target_node_id,
             relay_scope = "disabled",
             usable_peer_addresses = has_usable_peer_addresses,
@@ -1268,7 +1283,7 @@ async fn ensure_direct_quic_endpoint(
             )
         })?;
     let endpoint_snapshot = bound_endpoint.snapshot();
-    if endpoint_snapshot.endpoint_id != endpoint_id {
+    if endpoint_snapshot.endpoint_id != local_iroh_endpoint_id {
         bail!("direct QUIC endpoint id changed while installing an endpoint-bound relay ticket");
     }
     tracing::info!(
@@ -1278,7 +1293,8 @@ async fn ensure_direct_quic_endpoint(
         candidate_index = ?route_index,
         path_kind = "direct_quic",
         locator = %candidate.endpoint,
-        endpoint_id = %endpoint_snapshot.endpoint_id,
+        local_iroh_endpoint_id = %endpoint_snapshot.endpoint_id,
+        remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
         target_node_id = %target_node_id,
         relay_enabled = relay_enabled,
         relay_url = ?endpoint_snapshot.relay_url,
@@ -1293,7 +1309,9 @@ async fn ensure_direct_quic_endpoint(
                 stats: stats.clone(),
                 endpoint_config: config,
                 rendezvous: rendezvous.clone(),
-                endpoint_id,
+                local_iroh_endpoint_id,
+                remote_iroh_endpoint_id,
+                target_node_id,
             };
             Some(spawn_iroh_relay_ticket_refresh(
                 bound_endpoint.clone(),
@@ -1349,14 +1367,18 @@ fn spawn_iroh_relay_ticket_refresh(
                             ).await {
                                 tracing::warn!(
                                     %error,
-                                    endpoint_id = %lifecycle.endpoint_id,
+                                    local_iroh_endpoint_id = %lifecycle.local_iroh_endpoint_id,
+                                    remote_iroh_endpoint_id = %lifecycle.remote_iroh_endpoint_id,
+                                    target_node_id = %lifecycle.target_node_id,
                                     "failed applying additional endpoint-bound iroh relay ticket"
                                 );
                             } else {
                                 tracing::info!(
                                     target: MOBILE_CONNECTION_LOG_TARGET,
                                     event = "iroh_relay_ticket_additional_completed",
-                                    endpoint_id = %lifecycle.endpoint_id,
+                                    local_iroh_endpoint_id = %lifecycle.local_iroh_endpoint_id,
+                                    remote_iroh_endpoint_id = %lifecycle.remote_iroh_endpoint_id,
+                                    target_node_id = %lifecycle.target_node_id,
                                     relay_scope = "endpoint_bound",
                                     relay_urls = ?ticket.public_urls,
                                     "iroh_relay_ticket_additional_completed"
@@ -1372,7 +1394,9 @@ fn spawn_iroh_relay_ticket_refresh(
                                     Ok(()) => return,
                                     Err(error) => tracing::warn!(
                                         %error,
-                                        endpoint_id = %lifecycle.endpoint_id,
+                                        local_iroh_endpoint_id = %lifecycle.local_iroh_endpoint_id,
+                                        remote_iroh_endpoint_id = %lifecycle.remote_iroh_endpoint_id,
+                                        target_node_id = %lifecycle.target_node_id,
                                         "failed rotating endpoint-bound iroh relay ticket"
                                     ),
                                 }
@@ -1381,17 +1405,16 @@ fn spawn_iroh_relay_ticket_refresh(
                         Some(Err(error)) => {
                             tracing::debug!(
                                 %error,
-                                endpoint_id = %lifecycle.endpoint_id,
+                                local_iroh_endpoint_id = %lifecycle.local_iroh_endpoint_id,
+                                remote_iroh_endpoint_id = %lifecycle.remote_iroh_endpoint_id,
+                                target_node_id = %lifecycle.target_node_id,
                                 "additional endpoint-bound iroh relay ticket request failed"
                             );
                         }
                         None => pending_collection = None,
                     },
                     _ = tokio::time::sleep(refresh_delay) => {
-                        pending_collection = request_iroh_relay_ticket_collection(
-                            &lifecycle.rendezvous,
-                            &lifecycle.endpoint_id,
-                        ).await;
+                        pending_collection = request_iroh_relay_ticket_collection(&lifecycle).await;
                         let first_ticket = pending_collection
                             .as_ref()
                             .map(|collection| collection.first_ticket().clone());
@@ -1403,7 +1426,9 @@ fn spawn_iroh_relay_ticket_refresh(
                             ).await {
                                 tracing::warn!(
                                     %error,
-                                    endpoint_id = %lifecycle.endpoint_id,
+                                    local_iroh_endpoint_id = %lifecycle.local_iroh_endpoint_id,
+                                    remote_iroh_endpoint_id = %lifecycle.remote_iroh_endpoint_id,
+                                    target_node_id = %lifecycle.target_node_id,
                                     "failed applying refreshed endpoint-bound iroh relay ticket"
                                 );
                                 pending_collection = None;
@@ -1417,7 +1442,9 @@ fn spawn_iroh_relay_ticket_refresh(
                                     Ok(()) => return,
                                     Err(error) => tracing::warn!(
                                         %error,
-                                        endpoint_id = %lifecycle.endpoint_id,
+                                        local_iroh_endpoint_id = %lifecycle.local_iroh_endpoint_id,
+                                        remote_iroh_endpoint_id = %lifecycle.remote_iroh_endpoint_id,
+                                        target_node_id = %lifecycle.target_node_id,
                                         "failed rotating endpoint-bound iroh relay ticket"
                                     ),
                                 }
@@ -1429,11 +1456,7 @@ fn spawn_iroh_relay_ticket_refresh(
                 }
             } else {
                 tokio::time::sleep(refresh_delay).await;
-                pending_collection = request_iroh_relay_ticket_collection(
-                    &lifecycle.rendezvous,
-                    &lifecycle.endpoint_id,
-                )
-                .await;
+                pending_collection = request_iroh_relay_ticket_collection(&lifecycle).await;
                 if pending_collection.is_none() {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
@@ -1447,7 +1470,9 @@ fn spawn_iroh_relay_ticket_refresh(
                     {
                         tracing::warn!(
                             %error,
-                            endpoint_id = %lifecycle.endpoint_id,
+                            local_iroh_endpoint_id = %lifecycle.local_iroh_endpoint_id,
+                            remote_iroh_endpoint_id = %lifecycle.remote_iroh_endpoint_id,
+                            target_node_id = %lifecycle.target_node_id,
                             "failed applying refreshed endpoint-bound iroh relay ticket"
                         );
                         pending_collection = None;
@@ -1459,7 +1484,9 @@ fn spawn_iroh_relay_ticket_refresh(
                             Ok(()) => return,
                             Err(error) => tracing::warn!(
                                 %error,
-                                endpoint_id = %lifecycle.endpoint_id,
+                                local_iroh_endpoint_id = %lifecycle.local_iroh_endpoint_id,
+                                remote_iroh_endpoint_id = %lifecycle.remote_iroh_endpoint_id,
+                                target_node_id = %lifecycle.target_node_id,
                                 "failed rotating endpoint-bound iroh relay ticket"
                             ),
                         }
@@ -1472,18 +1499,20 @@ fn spawn_iroh_relay_ticket_refresh(
 }
 
 async fn request_iroh_relay_ticket_collection(
-    rendezvous: &RendezvousControlClient,
-    endpoint_id: &str,
+    lifecycle: &DirectQuicEndpointLifecycle,
 ) -> Option<IrohRelayTicketCollection> {
-    match rendezvous
-        .issue_iroh_relay_tickets_progressively(endpoint_id)
+    match lifecycle
+        .rendezvous
+        .issue_iroh_relay_tickets_progressively(&lifecycle.local_iroh_endpoint_id)
         .await
     {
         Ok(collection) => Some(collection),
         Err(error) => {
             tracing::warn!(
                 %error,
-                %endpoint_id,
+                local_iroh_endpoint_id = %lifecycle.local_iroh_endpoint_id,
+                remote_iroh_endpoint_id = %lifecycle.remote_iroh_endpoint_id,
+                target_node_id = %lifecycle.target_node_id,
                 "failed refreshing endpoint-bound iroh relay ticket"
             );
             None
@@ -1515,7 +1544,7 @@ async fn rollover_direct_quic_endpoint(
     let next_endpoint = DirectQuicEndpoint::bind(next_config.clone())
         .await
         .context("failed binding replacement direct QUIC endpoint")?;
-    if next_endpoint.endpoint_id() != lifecycle.endpoint_id {
+    if next_endpoint.endpoint_id() != lifecycle.local_iroh_endpoint_id {
         bail!("direct QUIC endpoint id changed while rotating relay tickets");
     }
 
@@ -1531,7 +1560,7 @@ async fn rollover_direct_quic_endpoint(
             refresh.abort();
             return Ok(());
         };
-        if current.endpoint.endpoint_id() != lifecycle.endpoint_id {
+        if current.endpoint.endpoint_id() != lifecycle.local_iroh_endpoint_id {
             refresh.abort();
             return Ok(());
         }
@@ -1554,7 +1583,9 @@ async fn rollover_direct_quic_endpoint(
     tracing::info!(
         target: MOBILE_CONNECTION_LOG_TARGET,
         event = "iroh_endpoint_ticket_rollover_completed",
-        endpoint_id = %lifecycle.endpoint_id,
+        local_iroh_endpoint_id = %lifecycle.local_iroh_endpoint_id,
+        remote_iroh_endpoint_id = %lifecycle.remote_iroh_endpoint_id,
+        target_node_id = %lifecycle.target_node_id,
         relay_count,
         "iroh_endpoint_ticket_rollover_completed"
     );

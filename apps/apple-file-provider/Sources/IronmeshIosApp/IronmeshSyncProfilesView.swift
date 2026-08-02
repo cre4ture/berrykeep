@@ -119,6 +119,9 @@ struct IronmeshFilesView: View {
                                 .font(.caption)
                                 .foregroundStyle(endpoint.active ? .green : .secondary)
                         }
+                        if let targetNodeId = endpoint.targetNodeId {
+                            IronmeshKeyValueRow(label: "Target server node", value: targetNodeId)
+                        }
                         IronmeshKeyValueRow(label: "Path", value: endpoint.pathKind)
                         IronmeshKeyValueRow(label: "Base URL", value: endpoint.requestBaseUrl)
                         IronmeshKeyValueRow(label: "Failures", value: "\(endpoint.consecutiveFailures) consecutive, \(endpoint.totalFailures) total")

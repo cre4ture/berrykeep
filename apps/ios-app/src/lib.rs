@@ -144,6 +144,8 @@ pub struct AppleConnectionAttempt {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct AppleEndpointDiagnostics {
     pub path_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_id: Option<String>,
     pub locator: String,
     pub request_base_url: String,
     pub active: bool,
@@ -210,6 +212,7 @@ impl AppleEndpointDiagnostics {
         let path_kind = value.path_kind.clone();
         Self {
             path_kind: path_kind.clone(),
+            target_node_id: value.target_node_id.map(|node_id| node_id.to_string()),
             locator: endpoint_locator.clone(),
             request_base_url: value.request_base_url,
             active: value.active,
@@ -2126,6 +2129,23 @@ mod tests {
             error
                 .to_string()
                 .contains("failed to parse iOS connection bootstrap JSON")
+        );
+    }
+
+    #[test]
+    fn apple_endpoint_diagnostics_preserve_target_server_node() {
+        let target_node_id = common::NodeId::new_v4();
+        let expected_target_node_id = target_node_id.to_string();
+
+        let diagnostics =
+            AppleEndpointDiagnostics::from_client_endpoint(ClientEndpointDiagnostics {
+                target_node_id: Some(target_node_id),
+                ..ClientEndpointDiagnostics::default()
+            });
+
+        assert_eq!(
+            diagnostics.target_node_id.as_deref(),
+            Some(expected_target_node_id.as_str())
         );
     }
 

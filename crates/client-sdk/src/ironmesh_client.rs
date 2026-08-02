@@ -145,6 +145,8 @@ pub struct ClientEndpointDiagnostics {
     pub path_kind: String,
     #[serde(default)]
     pub transport_path_kind: Option<String>,
+    #[serde(default)]
+    pub target_node_id: Option<NodeId>,
     pub locator: String,
     pub request_base_url: String,
     pub active: bool,
@@ -1186,6 +1188,7 @@ impl ClientEndpointRouter {
                         transport_path_kind_label(endpoint.descriptor.transport_path_kind)
                             .to_string(),
                     ),
+                    target_node_id: endpoint.transport.target_node_id(),
                     locator: endpoint.descriptor.locator.clone(),
                     request_base_url: endpoint.transport.request_base_url().to_string(),
                     active: active_index == Some(index),
