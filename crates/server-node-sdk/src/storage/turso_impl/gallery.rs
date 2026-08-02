@@ -173,9 +173,9 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
 
 impl TursoMetadataStore {
     pub(super) async fn backfill_gallery_objects(&self) -> Result<()> {
-        let connection = self.gallery_connection()?;
+        let connection = &self.connection;
         let transaction =
-            Transaction::new_unchecked(&connection, TransactionBehavior::Immediate).await?;
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
         let result = async {
             let mut rows = connection
                 .query(
@@ -203,7 +203,7 @@ impl TursoMetadataStore {
                 ));
             }
             for (key, entry) in entries {
-                upsert_gallery_object(&connection, &key, &entry).await?;
+                upsert_gallery_object(connection, &key, &entry).await?;
             }
             Ok(())
         }
@@ -216,9 +216,9 @@ impl TursoMetadataStore {
         key: &str,
         entry: &CurrentObjectEntry,
     ) -> Result<()> {
-        let connection = self.gallery_connection()?;
+        let connection = &self.connection;
         let transaction =
-            Transaction::new_unchecked(&connection, TransactionBehavior::Immediate).await?;
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
         let result = async {
             connection
                 .execute(
@@ -230,16 +230,16 @@ impl TursoMetadataStore {
                     (key, entry.manifest_hash.as_str(), entry.object_id.as_str()),
                 )
                 .await?;
-            upsert_gallery_object(&connection, key, entry).await
+            upsert_gallery_object(connection, key, entry).await
         }
         .await;
         finish_gallery_transaction(transaction, result).await
     }
 
     pub(super) async fn remove_current_object_with_gallery(&self, key: &str) -> Result<()> {
-        let connection = self.gallery_connection()?;
+        let connection = &self.connection;
         let transaction =
-            Transaction::new_unchecked(&connection, TransactionBehavior::Immediate).await?;
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
         let result = async {
             connection
                 .execute("DELETE FROM current_objects WHERE key = ?1", (key,))
@@ -259,9 +259,9 @@ impl TursoMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(metadata)?;
         let content_fingerprint = metadata.content_fingerprint.clone();
-        let connection = self.gallery_connection()?;
+        let connection = &self.connection;
         let transaction =
-            Transaction::new_unchecked(&connection, TransactionBehavior::Immediate).await?;
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
         let result = async {
             let changed = connection
                 .execute(
@@ -276,11 +276,11 @@ impl TursoMetadataStore {
             if changed > 0 {
                 let unchanged_projection_keys =
                     refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
-                        &connection,
+                        connection,
                         &content_fingerprint,
                     )
                     .await?;
-                record_gallery_upserts_for_keys(&connection, &unchanged_projection_keys).await?;
+                record_gallery_upserts_for_keys(connection, &unchanged_projection_keys).await?;
             }
             Ok(())
         }
@@ -292,9 +292,9 @@ impl TursoMetadataStore {
         &self,
         content_fingerprint: &str,
     ) -> Result<()> {
-        let connection = self.gallery_connection()?;
+        let connection = &self.connection;
         let transaction =
-            Transaction::new_unchecked(&connection, TransactionBehavior::Immediate).await?;
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
         let result = async {
             let deleted = connection
                 .execute(
@@ -305,11 +305,11 @@ impl TursoMetadataStore {
             if deleted > 0 {
                 let unchanged_projection_keys =
                     refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
-                        &connection,
+                        connection,
                         content_fingerprint,
                     )
                     .await?;
-                record_gallery_upserts_for_keys(&connection, &unchanged_projection_keys).await?;
+                record_gallery_upserts_for_keys(connection, &unchanged_projection_keys).await?;
             }
             Ok(())
         }
@@ -322,9 +322,9 @@ impl TursoMetadataStore {
         content_fingerprint: &str,
         payload: &[u8],
     ) -> Result<bool> {
-        let connection = self.gallery_connection()?;
+        let connection = &self.connection;
         let transaction =
-            Transaction::new_unchecked(&connection, TransactionBehavior::Immediate).await?;
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
         let result = async {
             let deleted = connection
                 .execute(
@@ -337,11 +337,11 @@ impl TursoMetadataStore {
             if deleted > 0 {
                 let unchanged_projection_keys =
                     refresh_gallery_objects_for_content_fingerprint_and_collect_unchanged_keys(
-                        &connection,
+                        connection,
                         content_fingerprint,
                     )
                     .await?;
-                record_gallery_upserts_for_keys(&connection, &unchanged_projection_keys).await?;
+                record_gallery_upserts_for_keys(connection, &unchanged_projection_keys).await?;
             }
             Ok(deleted > 0)
         }
@@ -356,9 +356,9 @@ impl TursoMetadataStore {
     ) -> Result<()> {
         let total_size_bytes =
             i64::try_from(summary.total_size_bytes).context("manifest summary size overflow")?;
-        let connection = self.gallery_connection()?;
+        let connection = &self.connection;
         let transaction =
-            Transaction::new_unchecked(&connection, TransactionBehavior::Immediate).await?;
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
         let result = async {
             let changed = connection
                 .execute(
@@ -375,11 +375,11 @@ impl TursoMetadataStore {
             if changed > 0 {
                 let unchanged_projection_keys =
                     refresh_gallery_objects_for_manifest_and_collect_unchanged_keys(
-                        &connection,
+                        connection,
                         manifest_hash,
                     )
                     .await?;
-                record_gallery_upserts_for_keys(&connection, &unchanged_projection_keys)
+                record_gallery_upserts_for_keys(connection, &unchanged_projection_keys)
                     .await?;
             }
             Ok(())
@@ -394,9 +394,9 @@ impl TursoMetadataStore {
         index: &FileVersionIndex,
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
-        let connection = self.gallery_connection()?;
+        let connection = &self.connection;
         let transaction =
-            Transaction::new_unchecked(&connection, TransactionBehavior::Immediate).await?;
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
         let result = async {
             let changed = connection
                 .execute(
@@ -408,7 +408,7 @@ impl TursoMetadataStore {
                 )
                 .await?;
             if changed > 0 {
-                record_gallery_upserts_for_object_id(&connection, object_id).await?;
+                record_gallery_upserts_for_object_id(connection, object_id).await?;
             }
             Ok(())
         }
@@ -420,7 +420,7 @@ impl TursoMetadataStore {
         &self,
         query: &GalleryIndexQuery,
     ) -> Result<GalleryIndexPage> {
-        let connection = self.gallery_connection()?;
+        let connection = self.gallery_read_connection()?;
         let transaction =
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
         let result = async {
@@ -439,7 +439,7 @@ impl TursoMetadataStore {
         limit: usize,
         scope: &GalleryDeltaScope,
     ) -> Result<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>> {
-        let connection = self.gallery_connection()?;
+        let connection = self.gallery_read_connection()?;
         let transaction =
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
         let result =

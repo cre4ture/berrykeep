@@ -68,10 +68,10 @@ impl TursoMetadataStore {
         let _ = self.connection.execute_batch("ROLLBACK").await;
     }
 
-    fn gallery_connection(&self) -> Result<turso::Connection> {
+    fn gallery_read_connection(&self) -> Result<turso::Connection> {
         self.database.connect().with_context(|| {
             format!(
-                "failed to open a Turso gallery connection to {}",
+                "failed to open a Turso gallery read connection to {}",
                 self.metadata_path.display()
             )
         })
