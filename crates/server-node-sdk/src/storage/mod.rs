@@ -2003,6 +2003,33 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["key", "manifest_hash", "object_id"],
     },
     MetadataDbLogicalTableSpec {
+        table: "gallery_objects",
+        tracked_columns: &[
+            "key",
+            "manifest_hash",
+            "object_id",
+            "inferred_media_type",
+            "media_type",
+            "captured_at_unix",
+            "media_status",
+            "geotagged",
+            "latitude",
+            "longitude",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "gallery_changes",
+        tracked_columns: &[
+            "revision",
+            "key",
+            "change_kind",
+            "previous_inferred_media_type",
+            "previous_media_type",
+            "previous_latitude",
+            "previous_longitude",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
         table: "version_indexes",
         tracked_columns: &["object_id", "index_json"],
     },

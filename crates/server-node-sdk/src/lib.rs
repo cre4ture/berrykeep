@@ -15437,7 +15437,7 @@ async fn store_index_delta_response(
             return (
                 StatusCode::NOT_IMPLEMENTED,
                 Json(json!({
-                    "error": "durable gallery deltas require the SQLite metadata backend"
+                    "error": "durable gallery deltas require a metadata backend with gallery projection support"
                 })),
             )
                 .into_response();
@@ -15829,7 +15829,7 @@ async fn list_store_index_response_attempt(
                     request_id,
                     response,
                     format!(
-                        "gallery-index;desc=sqlite, gallery-index-query;dur={gallery_index_ms}, total;dur={total_ms}"
+                        "gallery-index;desc=metadata, gallery-index-query;dur={gallery_index_ms}, total;dur={total_ms}"
                     ),
                     total_entry_count,
                     total_entry_count,
@@ -15840,7 +15840,7 @@ async fn list_store_index_response_attempt(
                 return (
                     StatusCode::NOT_IMPLEMENTED,
                     Json(json!({
-                        "error": "viewport gallery queries require the SQLite metadata backend"
+                        "error": "viewport gallery queries require a metadata backend with gallery projection support"
                     })),
                 )
                     .into_response();
