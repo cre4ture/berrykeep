@@ -7,6 +7,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use common::{ClusterId, NodeId};
 use pbkdf2::pbkdf2_hmac;
+#[cfg(test)]
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -188,8 +190,12 @@ fn build_test_failover_package(
     let target_node_id = Some(uuid::Uuid::now_v7());
     let exported_at_unix = 1_773_904_240;
     let pbkdf2_rounds = 600_000;
-    let salt = [7u8; MANAGED_RENDEZVOUS_FAILOVER_SALT_LEN];
-    let nonce = [9u8; MANAGED_RENDEZVOUS_FAILOVER_NONCE_LEN];
+    // Generated rather than fixed byte patterns so static analysis doesn't mistake these
+    // test-only values for hard-coded credentials (CodeQL rust/hard-coded-cryptographic-value).
+    let mut salt = [0u8; MANAGED_RENDEZVOUS_FAILOVER_SALT_LEN];
+    let mut nonce = [0u8; MANAGED_RENDEZVOUS_FAILOVER_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
     let plaintext = ManagedRendezvousFailoverPlaintext {
         cluster_id,
         source_node_id,

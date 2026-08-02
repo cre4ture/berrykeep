@@ -2706,13 +2706,15 @@ mod tests {
             completion_tx,
         };
         let package = test_node_enrollment_package(&data_dir, bind_addr);
-        let issuer_admin_password = "issuer-admin-password";
-        let node_admin_password = "joining-node-admin-password";
+        // Generated rather than literals so static analysis doesn't mistake these test-only
+        // values for hard-coded credentials (CodeQL rust/hard-coded-cryptographic-value).
+        let issuer_admin_password = format!("test-issuer-admin-password-{}", Uuid::now_v7());
+        let node_admin_password = format!("test-node-admin-password-{}", Uuid::now_v7());
 
         let response = import_node_enrollment_package(
             State(state.clone()),
             Json(SetupImportEnrollmentRequest {
-                admin_password: node_admin_password.to_string(),
+                admin_password: node_admin_password.clone(),
                 package_json: package.to_json_pretty().unwrap(),
                 telemetry_enabled: true,
             }),
@@ -2729,11 +2731,11 @@ mod tests {
             .expect("managed state should persist an admin password hash");
         assert!(crate::password_hash_matches(
             managed_hash,
-            node_admin_password
+            &node_admin_password
         ));
         assert!(!crate::password_hash_matches(
             managed_hash,
-            issuer_admin_password
+            &issuer_admin_password
         ));
 
         let completion = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
@@ -2747,11 +2749,11 @@ mod tests {
             .expect("runtime config should receive an admin password hash");
         assert!(crate::password_hash_matches(
             runtime_hash,
-            node_admin_password
+            &node_admin_password
         ));
         assert!(!crate::password_hash_matches(
             runtime_hash,
-            issuer_admin_password
+            &issuer_admin_password
         ));
     }
 

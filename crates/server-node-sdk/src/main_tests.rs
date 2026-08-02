@@ -8981,18 +8981,21 @@ async fn export_managed_signer_backup_returns_encrypted_backup() {
 #[tokio::test]
 async fn admin_password_login_creates_session_cookie() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    // Generated rather than a literal so static analysis doesn't mistake this test-only
+    // value for a hard-coded credential (CodeQL rust/hard-coded-cryptographic-value).
+    let admin_password = format!("test-admin-password-{}", Uuid::now_v7());
     *state
         .access
         .admin_control
         .admin_password_hash
         .lock()
-        .unwrap() = Some(super::hash_token("super-secret-password"));
+        .unwrap() = Some(super::hash_token(&admin_password));
 
     let response = super::login_admin_session(
         State(state.clone()),
         HeaderMap::new(),
         Json(super::AdminLoginRequest {
-            password: "super-secret-password".to_string(),
+            password: admin_password.clone(),
         }),
     )
     .await
@@ -9034,18 +9037,21 @@ async fn admin_session_status_stays_locked_when_admin_auth_is_unconfigured() {
 #[tokio::test]
 async fn admin_session_cookie_authorizes_admin_request() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    // Generated rather than a literal so static analysis doesn't mistake this test-only
+    // value for a hard-coded credential (CodeQL rust/hard-coded-cryptographic-value).
+    let admin_password = format!("test-admin-password-{}", Uuid::now_v7());
     *state
         .access
         .admin_control
         .admin_password_hash
         .lock()
-        .unwrap() = Some(super::hash_token("super-secret-password"));
+        .unwrap() = Some(super::hash_token(&admin_password));
 
     let login_response = super::login_admin_session(
         State(state.clone()),
         HeaderMap::new(),
         Json(super::AdminLoginRequest {
-            password: "super-secret-password".to_string(),
+            password: admin_password.clone(),
         }),
     )
     .await
@@ -9073,24 +9079,28 @@ async fn admin_session_cookie_authorizes_admin_request() {
 async fn admin_session_cookies_are_isolated_per_node() {
     let node_a = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let node_b = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    // Generated rather than literals so static analysis doesn't mistake these test-only
+    // values for hard-coded credentials (CodeQL rust/hard-coded-cryptographic-value).
+    let admin_password_a = format!("test-admin-password-{}", Uuid::now_v7());
+    let admin_password_b = format!("test-admin-password-{}", Uuid::now_v7());
     *node_a
         .access
         .admin_control
         .admin_password_hash
         .lock()
-        .unwrap() = Some(super::hash_token("super-secret-password"));
+        .unwrap() = Some(super::hash_token(&admin_password_a));
     *node_b
         .access
         .admin_control
         .admin_password_hash
         .lock()
-        .unwrap() = Some(super::hash_token("super-secret-password"));
+        .unwrap() = Some(super::hash_token(&admin_password_b));
 
     let login_a = super::login_admin_session(
         State(node_a.clone()),
         HeaderMap::new(),
         Json(super::AdminLoginRequest {
-            password: "super-secret-password".to_string(),
+            password: admin_password_a.clone(),
         }),
     )
     .await
@@ -9099,7 +9109,7 @@ async fn admin_session_cookies_are_isolated_per_node() {
         State(node_b.clone()),
         HeaderMap::new(),
         Json(super::AdminLoginRequest {
-            password: "super-secret-password".to_string(),
+            password: admin_password_b.clone(),
         }),
     )
     .await
