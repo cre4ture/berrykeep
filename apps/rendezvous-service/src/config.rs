@@ -94,7 +94,9 @@ impl RendezvousServiceConfig {
         let failover_passphrase = lookup_env("IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE");
 
         if args.failover_package_path.is_none() && failover_passphrase.is_some() {
-            bail!("IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE requires IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE to be set");
+            bail!(
+                "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE requires IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE to be set"
+            );
         }
 
         if args.failover_package_path.is_some() && args.bind_addr.is_none() {
@@ -110,7 +112,9 @@ impl RendezvousServiceConfig {
         };
 
         if args.failover_package_path.is_some() && failover_passphrase.is_none() {
-            bail!("IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE requires IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE");
+            bail!(
+                "IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE requires IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE"
+            );
         }
 
         let failover_package = args
