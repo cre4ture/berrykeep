@@ -31,6 +31,7 @@ use super::{
 pub(super) struct TursoMetadataStore {
     _database: turso::Database,
     connection: turso::Connection,
+    gallery_writer_lock: tokio::sync::Mutex<()>,
     gallery_readers: Vec<tokio::sync::Mutex<turso::Connection>>,
     next_gallery_reader: AtomicUsize,
     metadata_path: PathBuf,
@@ -75,6 +76,7 @@ impl TursoMetadataStore {
         let store = Self {
             _database: db,
             connection: conn,
+            gallery_writer_lock: tokio::sync::Mutex::new(()),
             gallery_readers,
             next_gallery_reader: AtomicUsize::new(0),
             metadata_path: metadata_path.to_path_buf(),
