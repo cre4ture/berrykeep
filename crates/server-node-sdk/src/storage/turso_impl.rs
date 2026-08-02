@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -10,6 +11,8 @@ use turso::params_from_iter;
 use crate::cluster::NodeDescriptor;
 
 mod gallery;
+
+const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
@@ -26,8 +29,10 @@ use super::{
 };
 
 pub(super) struct TursoMetadataStore {
-    database: turso::Database,
+    _database: turso::Database,
     connection: turso::Connection,
+    gallery_readers: Vec<tokio::sync::Mutex<turso::Connection>>,
+    next_gallery_reader: AtomicUsize,
     metadata_path: PathBuf,
 }
 
@@ -55,9 +60,23 @@ impl TursoMetadataStore {
             )
         })?;
 
+        let mut gallery_readers = Vec::with_capacity(DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT);
+        for _ in 0..DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT {
+            gallery_readers.push(tokio::sync::Mutex::new(db.connect().with_context(
+                || {
+                    format!(
+                        "failed to open a Turso gallery read connection to {}",
+                        metadata_path.display()
+                    )
+                },
+            )?));
+        }
+
         let store = Self {
-            database: db,
+            _database: db,
             connection: conn,
+            gallery_readers,
+            next_gallery_reader: AtomicUsize::new(0),
             metadata_path: metadata_path.to_path_buf(),
         };
         store.backfill_gallery_objects().await?;
@@ -68,13 +87,10 @@ impl TursoMetadataStore {
         let _ = self.connection.execute_batch("ROLLBACK").await;
     }
 
-    fn gallery_read_connection(&self) -> Result<turso::Connection> {
-        self.database.connect().with_context(|| {
-            format!(
-                "failed to open a Turso gallery read connection to {}",
-                self.metadata_path.display()
-            )
-        })
+    async fn gallery_read_connection(&self) -> tokio::sync::MutexGuard<'_, turso::Connection> {
+        let index =
+            self.next_gallery_reader.fetch_add(1, Ordering::Relaxed) % self.gallery_readers.len();
+        self.gallery_readers[index].lock().await
     }
 
     fn decode_json<T: serde::de::DeserializeOwned>(

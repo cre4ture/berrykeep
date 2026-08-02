@@ -420,7 +420,7 @@ impl TursoMetadataStore {
         &self,
         query: &GalleryIndexQuery,
     ) -> Result<GalleryIndexPage> {
-        let connection = self.gallery_read_connection()?;
+        let connection = self.gallery_read_connection().await;
         let transaction =
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
         let result = async {
@@ -439,7 +439,7 @@ impl TursoMetadataStore {
         limit: usize,
         scope: &GalleryDeltaScope,
     ) -> Result<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>> {
-        let connection = self.gallery_read_connection()?;
+        let connection = self.gallery_read_connection().await;
         let transaction =
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
         let result =
@@ -1535,11 +1535,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gallery_queries_use_a_dedicated_turso_connection() {
-        let metadata_db_path = turso_test_db_path("gallery-dedicated-connection");
+    async fn gallery_queries_use_pooled_turso_read_connections() {
+        let metadata_db_path = turso_test_db_path("gallery-read-connection-pool");
         let store = TursoMetadataStore::open(&metadata_db_path)
             .await
             .expect("turso metadata store should open");
+        assert_eq!(
+            store.gallery_readers.len(),
+            super::super::DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT
+        );
         store
             .connection
             .execute_batch("BEGIN")
