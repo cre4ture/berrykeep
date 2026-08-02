@@ -1,6 +1,7 @@
 package io.ironmesh.android.ui.screens
 
 import io.ironmesh.android.data.APP_CONNECTION_HEALTH_MAX_AGE_MS
+import io.ironmesh.android.data.APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE
 import io.ironmesh.android.data.APP_CONNECTION_STATE_CONNECTED
 import io.ironmesh.android.data.APP_CONNECTION_STATE_ERROR
 import io.ironmesh.android.data.AppConnectionStatus
@@ -153,5 +154,31 @@ class AppConnectionPresentationTest {
 
         assertEquals("Server is reachable", appConnectionHeadline(status, nowUnixMs))
         assertEquals("Reachable", appConnectionStatusBadge(status, nowUnixMs))
+    }
+
+    @Test
+    fun backgroundMaintenanceFailureDoesNotDegradeTheHomeConnectionCard() {
+        val nowUnixMs = 1_750_000_000_000L
+        val status = AppConnectionStatus(
+            state = APP_CONNECTION_STATE_CONNECTED,
+            lastSuccessfulConnectionUnixMs = nowUnixMs,
+            lastSuccessfulConnectionUrl =
+                "https://example.test/api/v1/diagnostics/latency?response_bytes=0",
+            lastSuccessfulFunctionalRequestUnixMs = nowUnixMs - 1_000L,
+            lastSuccessfulFunctionalRequestUrl = "https://example.test/api/v1/store/index",
+            failedAttempts = listOf(
+                AppFailedConnectionAttempt(
+                    impact = APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE,
+                    startedUnixMs = nowUnixMs - 500L,
+                    method = "GET",
+                    url = "iroh://candidate/api/v1/cluster/status",
+                    error = "candidate timed out",
+                ),
+            ),
+        )
+
+        assertEquals("App connection is healthy", appConnectionHeadline(status, nowUnixMs))
+        assertEquals("Healthy", appConnectionStatusBadge(status, nowUnixMs))
+        assertTrue(isAppConnectionHealthy(status, nowUnixMs))
     }
 }

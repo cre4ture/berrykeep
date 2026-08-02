@@ -92,6 +92,7 @@ pub struct IronMeshClient {
     transport_router: ClientEndpointRouter,
     auth: ClientRequestAuth,
     connection_name: Option<String>,
+    connection_diagnostic_impact: ClientConnectionDiagnosticImpact,
     upload_session_affinities: Arc<Mutex<HashMap<String, UploadSessionAffinity>>>,
 }
 
@@ -180,9 +181,29 @@ pub struct ClientConnectionDiagnostics {
     pub last_success_unix_ms: Option<u64>,
 }
 
+/// Describes whether a connection's diagnostics represent a user-visible
+/// operation or internal route maintenance.
+///
+/// Consumers can retain both kinds of diagnostics while only using
+/// [`Self::UserFacing`] failures to drive user-facing connection health.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientConnectionDiagnosticImpact {
+    #[default]
+    UserFacing,
+    BackgroundMaintenance,
+}
+
+impl ClientConnectionDiagnosticImpact {
+    pub const fn affects_user_facing_connection_status(self) -> bool {
+        matches!(self, Self::UserFacing)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientConnectionDiagnosticsEvent {
     pub connection_name: Option<String>,
+    pub impact: ClientConnectionDiagnosticImpact,
     pub diagnostics: ClientConnectionDiagnostics,
 }
 
@@ -2913,6 +2934,7 @@ impl IronMeshClient {
             )]),
             auth: ClientRequestAuth::None,
             connection_name: None,
+            connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -2949,6 +2971,7 @@ impl IronMeshClient {
             )]),
             auth: ClientRequestAuth::None,
             connection_name: None,
+            connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -2974,6 +2997,7 @@ impl IronMeshClient {
             )]),
             auth: ClientRequestAuth::None,
             connection_name: None,
+            connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -3010,6 +3034,7 @@ impl IronMeshClient {
             transport_router: ClientEndpointRouter::new(endpoints),
             auth: combined_auth.unwrap_or(ClientRequestAuth::None),
             connection_name: None,
+            connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -3052,6 +3077,20 @@ impl IronMeshClient {
     pub fn with_connection_name(mut self, connection_name: impl Into<String>) -> Self {
         self.connection_name = normalize_connection_name(&connection_name.into());
         self
+    }
+
+    /// Sets how emitted connection diagnostics affect user-facing connection
+    /// status. This is independent from the optional display/telemetry name.
+    pub fn with_connection_diagnostic_impact(
+        mut self,
+        impact: ClientConnectionDiagnosticImpact,
+    ) -> Self {
+        self.connection_diagnostic_impact = impact;
+        self
+    }
+
+    pub const fn connection_diagnostic_impact(&self) -> ClientConnectionDiagnosticImpact {
+        self.connection_diagnostic_impact
     }
 
     pub fn connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
@@ -3156,6 +3195,7 @@ impl IronMeshClient {
         };
         observer(ClientConnectionDiagnosticsEvent {
             connection_name: self.connection_name.clone(),
+            impact: self.connection_diagnostic_impact,
             diagnostics: self.connection_diagnostics(),
         });
     }

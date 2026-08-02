@@ -92,6 +92,28 @@ fn client_clones_keep_the_same_connection_runtime_id() {
 }
 
 #[test]
+fn connection_diagnostic_impact_is_explicit_and_clone_specific() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let maintenance_client = client
+        .clone()
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::BackgroundMaintenance);
+
+    assert_eq!(
+        client.connection_diagnostic_impact(),
+        ClientConnectionDiagnosticImpact::UserFacing
+    );
+    assert_eq!(
+        maintenance_client.connection_diagnostic_impact(),
+        ClientConnectionDiagnosticImpact::BackgroundMaintenance
+    );
+    assert!(ClientConnectionDiagnosticImpact::UserFacing.affects_user_facing_connection_status());
+    assert!(
+        !ClientConnectionDiagnosticImpact::BackgroundMaintenance
+            .affects_user_facing_connection_status()
+    );
+}
+
+#[test]
 fn route_reconciliation_preserves_static_state_and_retires_dynamic_routes() {
     let static_client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
     let original_endpoint = static_client

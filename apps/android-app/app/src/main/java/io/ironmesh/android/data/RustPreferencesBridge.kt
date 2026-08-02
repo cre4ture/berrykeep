@@ -6,7 +6,8 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import org.json.JSONObject
 
 object RustPreferencesBridge {
-    private const val MAX_FAILED_CONNECTION_ATTEMPTS = 12
+    private const val MAX_USER_FACING_FAILED_CONNECTION_ATTEMPTS = 12
+    private const val MAX_BACKGROUND_FAILED_CONNECTION_ATTEMPTS = 12
 
     @Volatile
     private var appContext: Context? = null
@@ -70,12 +71,19 @@ object RustPreferencesBridge {
         current: AppConnectionStatus,
         update: AppConnectionDiagnosticsUpdate,
     ): AppConnectionStatus {
-        val mergedFailures = (current.failedAttempts + update.failedAttempts)
-            .distinctBy { attempt -> failedAttemptKey(attempt) }
-            .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
-            .take(MAX_FAILED_CONNECTION_ATTEMPTS)
+        val updateAffectsAppConnectionStatus = update.impact.affectsAppConnectionStatus()
+        val scopedUpdateFailures = update.failedAttempts.map { attempt ->
+            attempt.copy(impact = update.impact)
+        }
+        val mergedFailures = retainRecentFailuresByImpact(
+            current.failedAttempts + scopedUpdateFailures,
+        )
+        val statusRelevantFailures = mergedFailures.filter { attempt ->
+            attempt.affectsAppConnectionStatus()
+        }
 
         val effectiveLastSuccessUnixMs = when {
+            !updateAffectsAppConnectionStatus -> current.lastSuccessfulConnectionUnixMs
             current.lastSuccessfulConnectionUnixMs == null -> update.lastSuccessfulConnectionUnixMs
             update.lastSuccessfulConnectionUnixMs == null -> current.lastSuccessfulConnectionUnixMs
             update.lastSuccessfulConnectionUnixMs >= current.lastSuccessfulConnectionUnixMs ->
@@ -84,12 +92,14 @@ object RustPreferencesBridge {
         }
         val effectiveLastSuccessUrl = when {
             effectiveLastSuccessUnixMs == null -> null
-            effectiveLastSuccessUnixMs == update.lastSuccessfulConnectionUnixMs ->
+            updateAffectsAppConnectionStatus &&
+                effectiveLastSuccessUnixMs == update.lastSuccessfulConnectionUnixMs ->
                 update.lastSuccessfulConnectionUrl?.takeIf { it.isNotBlank() }
                     ?: current.lastSuccessfulConnectionUrl
             else -> current.lastSuccessfulConnectionUrl
         }
         val effectiveLastFunctionalSuccessUnixMs = when {
+            !updateAffectsAppConnectionStatus -> current.lastSuccessfulFunctionalRequestUnixMs
             current.lastSuccessfulFunctionalRequestUnixMs == null ->
                 update.lastSuccessfulFunctionalRequestUnixMs
             update.lastSuccessfulFunctionalRequestUnixMs == null ->
@@ -101,21 +111,23 @@ object RustPreferencesBridge {
         }
         val effectiveLastFunctionalSuccessUrl = when {
             effectiveLastFunctionalSuccessUnixMs == null -> null
-            effectiveLastFunctionalSuccessUnixMs ==
+            updateAffectsAppConnectionStatus &&
+                effectiveLastFunctionalSuccessUnixMs ==
                 update.lastSuccessfulFunctionalRequestUnixMs ->
                 update.lastSuccessfulFunctionalRequestUrl?.takeIf { it.isNotBlank() }
                     ?: current.lastSuccessfulFunctionalRequestUrl
             else -> current.lastSuccessfulFunctionalRequestUrl
         }
 
-        val latestFailure = mergedFailures.maxByOrNull { attempt ->
+        val latestFailure = statusRelevantFailures.maxByOrNull { attempt ->
             attempt.finishedUnixMs ?: attempt.startedUnixMs
         }
         val latestFailureUnixMs = latestFailure?.finishedUnixMs ?: latestFailure?.startedUnixMs
         val latestSuccessUnixMs = effectiveLastSuccessUnixMs
         val latestEventUnixMs = listOfNotNull(latestSuccessUnixMs, latestFailureUnixMs).maxOrNull()
 
-        val shouldRefreshState = latestEventUnixMs != null && latestEventUnixMs >= current.updatedUnixMs
+        val shouldRefreshState = updateAffectsAppConnectionStatus &&
+            latestEventUnixMs != null && latestEventUnixMs >= current.updatedUnixMs
         val nextState = when {
             !shouldRefreshState -> current.state
             latestSuccessUnixMs != null &&
@@ -139,7 +151,11 @@ object RustPreferencesBridge {
         return current.copy(
             state = nextState,
             message = nextMessage,
-            updatedUnixMs = latestEventUnixMs ?: current.updatedUnixMs,
+            updatedUnixMs = if (shouldRefreshState) {
+                latestEventUnixMs ?: current.updatedUnixMs
+            } else {
+                current.updatedUnixMs
+            },
             retryAttemptCount = if (shouldRefreshState) 0L else current.retryAttemptCount,
             nextRetryUnixMs = if (shouldRefreshState) null else current.nextRetryUnixMs,
             lastSuccessfulConnectionUnixMs = effectiveLastSuccessUnixMs,
@@ -148,6 +164,27 @@ object RustPreferencesBridge {
             lastSuccessfulFunctionalRequestUrl = effectiveLastFunctionalSuccessUrl,
             failedAttempts = mergedFailures,
         )
+    }
+
+    private fun retainRecentFailuresByImpact(
+        failures: List<AppFailedConnectionAttempt>,
+    ): List<AppFailedConnectionAttempt> {
+        val distinctFailures = failures.distinctBy { attempt -> failedAttemptKey(attempt) }
+        return listOf(
+            distinctFailures
+                .asSequence()
+                .filter { attempt -> attempt.affectsAppConnectionStatus() }
+                .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
+                .take(MAX_USER_FACING_FAILED_CONNECTION_ATTEMPTS)
+                .toList(),
+            distinctFailures
+                .asSequence()
+                .filterNot { attempt -> attempt.affectsAppConnectionStatus() }
+                .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
+                .take(MAX_BACKGROUND_FAILED_CONNECTION_ATTEMPTS)
+                .toList(),
+        ).flatten()
+            .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
     }
 
     @JvmStatic
@@ -177,6 +214,7 @@ object RustPreferencesBridge {
     private fun failedAttemptKey(attempt: AppFailedConnectionAttempt): String {
         return listOf(
             attempt.sourceLabel.orEmpty(),
+            attempt.impact,
             attempt.endpointLocator,
             attempt.pathKind,
             attempt.startedUnixMs.toString(),

@@ -9,6 +9,7 @@ import androidx.compose.runtime.setValue
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.AppFailedConnectionAttempt
+import io.ironmesh.android.data.APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncProfileStatus
 import io.ironmesh.android.data.FolderSyncRuntimeMetrics
@@ -24,6 +25,7 @@ import io.ironmesh.android.data.APP_CONNECTION_HEALTH_MAX_AGE_MS
 import io.ironmesh.android.data.formatAllowedWifiSsidsInput
 import io.ironmesh.android.data.isConnected
 import io.ironmesh.android.data.isRetryPending
+import io.ironmesh.android.data.affectsAppConnectionStatus
 import io.ironmesh.android.ui.FolderSyncActivityFilter
 import kotlinx.coroutines.delay
 import java.time.Instant
@@ -184,6 +186,7 @@ internal fun AppConnectionStatus.lastSuccessfulRequestWasConnectivityProbe(): Bo
 internal fun AppConnectionStatus.hasUnresolvedFunctionalRequestFailure(): Boolean {
     val latestFunctionalFailureUnixMs = failedAttempts
         .asSequence()
+        .filter { attempt -> attempt.affectsAppConnectionStatus() }
         .filterNot { attempt -> attempt.isConnectivityProbeRequest() }
         .map { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
         .maxOrNull()
@@ -255,6 +258,9 @@ fun shouldShowRetryConnectionAction(
 fun appFailedAttemptSummary(attempt: AppFailedConnectionAttempt): String {
     val parts = mutableListOf<String>()
     parts += attempt.sourceLabel?.takeIf { it.isNotBlank() } ?: displayStatusToken(attempt.pathKind)
+    if (attempt.impact == APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE) {
+        parts += "Background maintenance"
+    }
     parts += attempt.method.ifBlank { "Request" }
     parts += formatTimestamp(attempt.finishedUnixMs ?: attempt.startedUnixMs)
     attempt.timeoutMs?.let { timeoutMs ->

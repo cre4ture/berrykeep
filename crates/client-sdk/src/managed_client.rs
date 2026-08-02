@@ -10,9 +10,9 @@ use tokio::{
 };
 
 use crate::{
-    ClientConnectionRouteEndpointSnapshot, ClientConnectionRouteSnapshot, ClientIdentityMaterial,
-    ConnectionBootstrap, IronMeshClient, PlannedConnectionBootstrapTarget,
-    build_client_with_optional_identity_from_planned_targets,
+    ClientConnectionDiagnosticImpact, ClientConnectionRouteEndpointSnapshot,
+    ClientConnectionRouteSnapshot, ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
+    PlannedConnectionBootstrapTarget, build_client_with_optional_identity_from_planned_targets,
 };
 
 const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
@@ -255,7 +255,11 @@ impl ConnectionBootstrap {
                 );
             }
         }
-        let client = self.build_client_with_optional_identity(identity.as_ref())?;
+        let client = self
+            .build_client_with_optional_identity(identity.as_ref())?
+            .with_connection_diagnostic_impact(
+                ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+            );
         let controller = Arc::new(ManagedRouteController {
             client: client.clone(),
             bootstrap: Mutex::new(self.clone()),
@@ -356,7 +360,9 @@ impl ConnectionBootstrap {
 
 impl ManagedIronMeshClient {
     pub fn client(&self) -> IronMeshClient {
-        self.client.clone()
+        self.client
+            .clone()
+            .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::UserFacing)
     }
 
     pub fn route_snapshot(&self) -> ClientConnectionRouteSnapshot {
@@ -1228,6 +1234,14 @@ mod tests {
             managed.route_snapshot().endpoints[0]
                 .locator
                 .starts_with("http://127.0.0.1:9")
+        );
+        assert_eq!(
+            managed.client.connection_diagnostic_impact(),
+            ClientConnectionDiagnosticImpact::BackgroundMaintenance
+        );
+        assert_eq!(
+            managed.client().connection_diagnostic_impact(),
+            ClientConnectionDiagnosticImpact::UserFacing
         );
     }
 

@@ -12,6 +12,9 @@ const val APP_CONNECTION_STATE_ERROR = "error"
 private const val RETRY_BASE_DELAY_MS = 2_000L
 private const val RETRY_MAX_DELAY_MS = 60_000L
 internal const val APP_CONNECTION_HEALTH_MAX_AGE_MS = 60 * 60 * 1_000L
+internal const val APP_CONNECTION_DIAGNOSTIC_IMPACT_USER_FACING = "user_facing"
+internal const val APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE =
+    "background_maintenance"
 
 // App-wide connection status shared by sync, gallery, and other foreground requests.
 data class AppConnectionStatus(
@@ -29,6 +32,7 @@ data class AppConnectionStatus(
 
 data class AppFailedConnectionAttempt(
     val sourceLabel: String? = null,
+    val impact: String = APP_CONNECTION_DIAGNOSTIC_IMPACT_USER_FACING,
     val endpointLocator: String = "",
     val pathKind: String = "",
     val startedUnixMs: Long = 0L,
@@ -41,12 +45,21 @@ data class AppFailedConnectionAttempt(
 
 data class AppConnectionDiagnosticsUpdate(
     val sourceLabel: String? = null,
+    val impact: String = APP_CONNECTION_DIAGNOSTIC_IMPACT_USER_FACING,
     val lastSuccessfulConnectionUnixMs: Long? = null,
     val lastSuccessfulConnectionUrl: String? = null,
     val lastSuccessfulFunctionalRequestUnixMs: Long? = null,
     val lastSuccessfulFunctionalRequestUrl: String? = null,
     val failedAttempts: List<AppFailedConnectionAttempt> = emptyList(),
 )
+
+internal fun String.affectsAppConnectionStatus(): Boolean {
+    return this != APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE
+}
+
+internal fun AppFailedConnectionAttempt.affectsAppConnectionStatus(): Boolean {
+    return impact.affectsAppConnectionStatus()
+}
 
 fun nextAppConnectionRetryDelayMs(attempt: Int): Long {
     if (attempt <= 1) {
