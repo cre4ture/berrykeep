@@ -23,7 +23,8 @@ The core of this strategy is implemented across the node and a new central colle
 - **RAM ECC (EDAC) and CPU thermal-throttle collectors** (Section 2.4): real Linux sysfs
   collection feeding `memory_ecc` and the findings summary.
 - **Central collector** (Section 5): `crates/stats-collector-server` — tolerant ingestion with
-  per-IP/per-subject rate limiting and append-only SQLite storage, a k-anonymity-safe public
+  per-IP/per-subject rate limiting and append-only Turso (embedded, pure-Rust, SQLite-compatible)
+  storage, a k-anonymity-safe public
   `GET /v1/stats/summary` (Section 4.3), admin-token-guarded GDPR access/erasure endpoints
   (Section 4.5), a retention sweeper (Section 4.6), and a server-side country-derivation seam
   (Section 4.2).
@@ -109,6 +110,13 @@ Deliberately **deferred** (documented at their respective sections, not blockers
   health/version/rollback checks, but it does not yet install a boot-persistent supervisor entry.
 - The legal review of the opt-out-by-default posture (Section 4.4/8) remains a prerequisite before
   any production rollout that actually transmits data off-cluster.
+- The storage engine switched from `rusqlite` (bundled C `libsqlite3`) to `turso` (a pure-Rust,
+  embedded SQLite-compatible engine — same crate already used by `server-node-sdk`'s optional
+  Turso metadata backend), removing the crate's only C-toolchain dependency. Turso is pre-1.0 and
+  its on-disk file format is not guaranteed byte-compatible with `libsqlite3`'s: the STRATO
+  deployment's existing `stats-collector.sqlite3` (verified 2026-07-31 with only a synthetic test
+  subject, since cleaned up) should be replaced with a fresh, empty file on redeploy rather than
+  reused in place.
 
 Related documents:
 
