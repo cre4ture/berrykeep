@@ -165,7 +165,16 @@ impl TursoMetadataStore {
             let mut rows = self
                 .connection
                 .query(
-                    "SELECT key, manifest_hash, object_id FROM current_objects",
+                    "SELECT current_objects.key, current_objects.manifest_hash, current_objects.object_id
+                     FROM current_objects
+                     LEFT JOIN gallery_objects ON gallery_objects.key = current_objects.key
+                     WHERE gallery_objects.key IS NULL
+                        OR gallery_objects.manifest_hash != current_objects.manifest_hash
+                        OR gallery_objects.object_id != current_objects.object_id
+                        OR (
+                            gallery_objects.geotagged != 0
+                            AND (gallery_objects.latitude IS NULL OR gallery_objects.longitude IS NULL)
+                        )",
                     (),
                 )
                 .await?;
@@ -1342,6 +1351,84 @@ mod tests {
 
         drop(connection);
         drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_backfill_skips_current_entries_with_a_fresh_projection() {
+        let metadata_db_path = turso_test_db_path("gallery-backfill-stale-filter");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let entry = CurrentObjectEntry {
+            manifest_hash: "manifest-fresh".to_string(),
+            object_id: "object-fresh".to_string(),
+        };
+        store
+            .upsert_current_object_with_gallery("gallery/fresh.jpg", &entry)
+            .await
+            .expect("current object should persist");
+        store
+            .connection
+            .execute_batch(
+                "
+                CREATE TABLE gallery_backfill_updates (marker INTEGER NOT NULL);
+                CREATE TRIGGER gallery_backfill_updates_marker
+                AFTER UPDATE ON gallery_objects
+                BEGIN
+                    INSERT INTO gallery_backfill_updates(marker) VALUES(1);
+                END;
+                ",
+            )
+            .await
+            .expect("backfill marker should initialize");
+
+        store
+            .backfill_gallery_objects()
+            .await
+            .expect("fresh projection backfill should succeed");
+        let mut rows = store
+            .connection
+            .query("SELECT COUNT(*) FROM gallery_backfill_updates", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row_u64(&row, 0, "gallery_backfill_updates.count").unwrap(),
+            0
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE gallery_objects
+                 SET geotagged = 1, latitude = NULL, longitude = NULL
+                 WHERE key = 'gallery/fresh.jpg'",
+                (),
+            )
+            .await
+            .unwrap();
+        store
+            .connection
+            .execute("DELETE FROM gallery_backfill_updates", ())
+            .await
+            .unwrap();
+        store
+            .backfill_gallery_objects()
+            .await
+            .expect("stale projection backfill should succeed");
+        let mut rows = store
+            .connection
+            .query("SELECT COUNT(*) FROM gallery_backfill_updates", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row_u64(&row, 0, "gallery_backfill_updates.count").unwrap(),
+            1
+        );
+
+        drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }
 }
