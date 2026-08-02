@@ -83,11 +83,11 @@ use transport_sdk::{
     ClientBootstrapClaimTrust, ClientEnrollmentRequest, ClusterRegistrationChallengeRequest,
     ClusterRegistrationChallengeResponse, ClusterRegistrationCompleteRequest,
     ClusterRegistrationProofAlgorithm, ClusterRegistrationRecord, ConnectionCandidate,
-    DirectQuicEndpoint, DirectQuicEndpointConfig, DirectQuicRelayConfig, DirectQuicSession,
+    DirectQuicEndpoint, DirectQuicEndpointConfig, DirectQuicSession,
     HEADER_SERVER_PROCESSING_DURATION_US, HEADER_SERVER_RECEIVED_UNIX_MS,
-    HEADER_SERVER_RESPONDED_UNIX_MS, IrohRelayTicket, MultiplexConfig, MultiplexMode,
-    MultiplexedSession, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
-    NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
+    HEADER_SERVER_RESPONDED_UNIX_MS, IrohRelayTicket, IrohRelayTicketRollover, IrohRelayTicketSet,
+    MultiplexConfig, MultiplexMode, MultiplexedSession, NodeBootstrap as TransportNodeBootstrap,
+    NodeBootstrapMode, NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
     PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
     RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSecurityMode,
     RelayTunnelSession, RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig,
@@ -797,8 +797,20 @@ struct EstablishedPeerDirectQuicSession {
 
 #[derive(Clone)]
 struct ServerDirectQuicRuntime {
-    endpoint: Arc<DirectQuicEndpoint>,
+    endpoint: Arc<StdMutex<DirectQuicEndpoint>>,
+    endpoint_config: Arc<DirectQuicEndpointConfig>,
+    ticket_rollover: Arc<StdMutex<Option<IrohRelayTicketRollover>>>,
+    generation: Arc<AtomicU64>,
     peer_sessions: PeerDirectQuicSessionPool,
+}
+
+impl ServerDirectQuicRuntime {
+    fn endpoint(&self) -> DirectQuicEndpoint {
+        self.endpoint
+            .lock()
+            .expect("server direct QUIC endpoint mutex poisoned")
+            .clone()
+    }
 }
 
 #[derive(Clone)]
@@ -4518,7 +4530,7 @@ async fn shutdown_direct_quic_runtime(state: &ServerState) {
     };
 
     clear_peer_direct_quic_sessions(state).await;
-    direct_quic.endpoint.close().await;
+    direct_quic.endpoint().close().await;
 }
 
 async fn replace_outbound_clients(state: &ServerState, outbound_clients: OutboundClients) {
@@ -4678,7 +4690,7 @@ async fn try_start_direct_quic_runtime(
         }
     };
     let configured_relay_urls = endpoint_config.relay_urls.clone();
-    match DirectQuicEndpoint::bind(endpoint_config).await {
+    match DirectQuicEndpoint::bind(endpoint_config.clone()).await {
         Ok(endpoint) => {
             let endpoint_id = endpoint.endpoint_id();
             info!(
@@ -4689,7 +4701,10 @@ async fn try_start_direct_quic_runtime(
                 "server node direct QUIC endpoint started"
             );
             Some(ServerDirectQuicRuntime {
-                endpoint: Arc::new(endpoint),
+                endpoint: Arc::new(StdMutex::new(endpoint)),
+                endpoint_config: Arc::new(endpoint_config),
+                ticket_rollover: Arc::new(StdMutex::new(None)),
+                generation: Arc::new(AtomicU64::new(0)),
                 peer_sessions: PeerDirectQuicSessionPool::default(),
             })
         }
@@ -4926,7 +4941,7 @@ fn normalize_connection_candidates(
 fn local_direct_quic_candidate(
     direct_quic: Option<&ServerDirectQuicRuntime>,
 ) -> Option<ConnectionCandidate> {
-    direct_quic.map(|runtime| runtime.endpoint.candidate())
+    direct_quic.map(|runtime| runtime.endpoint().candidate())
 }
 
 fn node_reachability_from_direct_endpoints(
@@ -8654,13 +8669,13 @@ async fn refresh_endpoint_bound_iroh_relay(
     client: &RendezvousControlClient,
     relay_advertised: bool,
 ) -> bool {
-    let Some(direct_quic) = state.network.direct_quic.as_ref() else {
+    let Some(direct_quic) = current_direct_quic_runtime(state) else {
         return true;
     };
-    let relay_configs = if relay_advertised {
+    let relay_tickets = if relay_advertised {
         let ticket = tokio::time::timeout(
             Duration::from_secs(RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS),
-            client.issue_iroh_relay_ticket(&direct_quic.endpoint.endpoint_id()),
+            client.issue_iroh_relay_ticket(&direct_quic.endpoint().endpoint_id()),
         )
         .await;
         match ticket {
@@ -8688,9 +8703,41 @@ async fn refresh_endpoint_bound_iroh_relay(
     } else {
         update_rendezvous_iroh_relay_ticket(state, rendezvous_url, None)
     };
+    let relay_configs = relay_tickets.relay_configs();
+
+    let rollover_due = {
+        let now_unix = unix_ts();
+        let mut rollover = direct_quic
+            .ticket_rollover
+            .lock()
+            .expect("server direct QUIC ticket rollover mutex poisoned");
+        match *rollover {
+            Some(current) if current.replacement_is_due(&relay_tickets, now_unix) => true,
+            Some(_) => false,
+            None => {
+                *rollover = IrohRelayTicketRollover::from_ticket_set(&relay_tickets, now_unix);
+                false
+            }
+        }
+    };
+    if rollover_due {
+        return match rollover_server_direct_quic_endpoint(state, &direct_quic, relay_tickets).await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    %error,
+                    node_id = %state.node_id,
+                    %rendezvous_url,
+                    "failed rotating server direct QUIC endpoint after relay ticket refresh"
+                );
+                false
+            }
+        };
+    }
 
     match direct_quic
-        .endpoint
+        .endpoint()
         .reconcile_dynamic_relays(&relay_configs)
         .await
     {
@@ -8716,11 +8763,63 @@ async fn refresh_endpoint_bound_iroh_relay(
     }
 }
 
+fn iroh_relay_ticket_set_from_tickets(
+    tickets: &HashMap<String, IrohRelayTicket>,
+) -> IrohRelayTicketSet {
+    let mut sources = tickets.iter().collect::<Vec<_>>();
+    sources.sort_by_key(|(source, _)| *source);
+    let mut relay_tickets = IrohRelayTicketSet::default();
+    for (_, ticket) in sources {
+        relay_tickets.insert(ticket);
+    }
+    relay_tickets
+}
+
+async fn rollover_server_direct_quic_endpoint(
+    state: &ServerState,
+    direct_quic: &ServerDirectQuicRuntime,
+    relay_tickets: IrohRelayTicketSet,
+) -> Result<()> {
+    let mut endpoint_config = direct_quic.endpoint_config.as_ref().clone();
+    endpoint_config.initial_dynamic_relays = relay_tickets.relay_configs();
+    let relay_count = endpoint_config.initial_dynamic_relays.len();
+    let replacement = DirectQuicEndpoint::bind(endpoint_config)
+        .await
+        .context("failed binding replacement server direct QUIC endpoint")?;
+    let active_endpoint_id = direct_quic.endpoint().endpoint_id();
+    if replacement.endpoint_id() != active_endpoint_id {
+        bail!("server direct QUIC endpoint id changed while rotating relay tickets");
+    }
+
+    let previous = {
+        let mut endpoint = direct_quic
+            .endpoint
+            .lock()
+            .expect("server direct QUIC endpoint mutex poisoned");
+        std::mem::replace(&mut *endpoint, replacement)
+    };
+    *direct_quic
+        .ticket_rollover
+        .lock()
+        .expect("server direct QUIC ticket rollover mutex poisoned") =
+        IrohRelayTicketRollover::from_ticket_set(&relay_tickets, unix_ts());
+    direct_quic.generation.fetch_add(1, Ordering::AcqRel);
+    clear_peer_direct_quic_sessions(state).await;
+    previous.close().await;
+    info!(
+        node_id = %state.node_id,
+        endpoint_id = %active_endpoint_id,
+        relay_count,
+        "rotated server direct QUIC endpoint with refreshed relay tickets"
+    );
+    Ok(())
+}
+
 fn update_rendezvous_iroh_relay_ticket(
     state: &ServerState,
     rendezvous_url: &str,
     relay: Option<IrohRelayTicket>,
-) -> Vec<DirectQuicRelayConfig> {
+) -> IrohRelayTicketSet {
     let mut tickets = state
         .network
         .rendezvous_iroh_relays
@@ -8732,34 +8831,7 @@ fn update_rendezvous_iroh_relay_ticket(
         tickets.remove(rendezvous_url);
     }
 
-    direct_quic_relay_configs_from_tickets(&tickets)
-}
-
-fn direct_quic_relay_configs_from_tickets(
-    tickets: &HashMap<String, IrohRelayTicket>,
-) -> Vec<DirectQuicRelayConfig> {
-    let mut sources = tickets.iter().collect::<Vec<_>>();
-    sources.sort_by_key(|(source, _)| *source);
-    let mut relays = BTreeMap::<String, (Option<String>, Option<u16>)>::new();
-    for (_, advertisement) in sources {
-        for public_url in &advertisement.public_urls {
-            relays.insert(
-                public_url.trim().trim_end_matches('/').to_string(),
-                (
-                    Some(advertisement.auth_token.clone()),
-                    advertisement.quic_port,
-                ),
-            );
-        }
-    }
-    relays
-        .into_iter()
-        .map(|(url, (auth_token, quic_port))| DirectQuicRelayConfig {
-            url,
-            auth_token,
-            quic_port,
-        })
-        .collect()
+    iroh_relay_ticket_set_from_tickets(&tickets)
 }
 
 fn build_rendezvous_presence_registration(
@@ -9425,7 +9497,7 @@ async fn open_direct_quic_peer_session(
     let direct_quic = current_direct_quic_runtime(state)
         .context("direct QUIC peer transport requires a local direct QUIC runtime")?;
     let session = direct_quic
-        .endpoint
+        .endpoint()
         .connect_session(candidate, MultiplexConfig::default())
         .await
         .with_context(|| {
@@ -10790,7 +10862,8 @@ fn spawn_direct_quic_multiplex_agent(state: ServerState) {
 
     tokio::spawn(async move {
         loop {
-            match direct_quic.endpoint.accept_connection().await {
+            let generation = direct_quic.generation.load(Ordering::Acquire);
+            match direct_quic.endpoint().accept_connection().await {
                 Ok(Some(accepted)) => {
                     let state = state.clone();
                     tokio::spawn(async move {
@@ -10835,6 +10908,9 @@ fn spawn_direct_quic_multiplex_agent(state: ServerState) {
                     });
                 }
                 Ok(None) => {
+                    if direct_quic.generation.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
                     tracing::debug!(
                         node_id = %state.node_id,
                         "direct QUIC endpoint closed"

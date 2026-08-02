@@ -3,7 +3,7 @@ use super::{
     ServerNodeConfig, ServerRequestTiming, ServerState, StartupRepairStatus,
     apply_server_timing_to_buffered_response, await_repair_busy_threshold,
     build_rendezvous_presence_registration, build_store_index_entries, cluster, constant_time_eq,
-    direct_quic_relay_configs_from_tickets, jittered_backoff_secs, lock_store, new_store_rwlock,
+    iroh_relay_ticket_set_from_tickets, jittered_backoff_secs, lock_store, new_store_rwlock,
     node_descriptor_from_presence_entry, parse_direct_quic_relay_urls, plan_peer_transport,
     read_store,
     replication::{build_replication_bundle_push_path, build_replication_export_path},
@@ -73,7 +73,7 @@ fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
     ]);
 
     assert_eq!(
-        direct_quic_relay_configs_from_tickets(&tickets),
+        iroh_relay_ticket_set_from_tickets(&tickets).relay_configs(),
         vec![
             transport_sdk::DirectQuicRelayConfig {
                 url: "https://relay-a.example".to_string(),
@@ -763,14 +763,16 @@ async fn install_direct_quic_runtime(
         .join(format!("test-direct-quic-{}.txt", state.node_id));
     let secret_key = transport_sdk::load_or_create_secret_key(&secret_key_path)
         .expect("test direct QUIC secret key should persist");
-    let endpoint = transport_sdk::DirectQuicEndpoint::bind(
-        transport_sdk::DirectQuicEndpointConfig::new(secret_key),
-    )
-    .await
-    .expect("test direct QUIC endpoint should bind");
+    let endpoint_config = transport_sdk::DirectQuicEndpointConfig::new(secret_key);
+    let endpoint = transport_sdk::DirectQuicEndpoint::bind(endpoint_config.clone())
+        .await
+        .expect("test direct QUIC endpoint should bind");
     let candidate = endpoint.candidate();
     state.network.direct_quic = Some(super::ServerDirectQuicRuntime {
-        endpoint: Arc::new(endpoint),
+        endpoint: Arc::new(std::sync::Mutex::new(endpoint)),
+        endpoint_config: Arc::new(endpoint_config),
+        ticket_rollover: Arc::new(std::sync::Mutex::new(None)),
+        generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         peer_sessions: super::PeerDirectQuicSessionPool::default(),
     });
     super::refresh_local_node_reachability(state)
@@ -18959,7 +18961,7 @@ async fn execute_peer_request_routes_direct_quic_over_iroh() {
             .clone()
             .expect("target direct QUIC runtime should exist");
         let session = direct_quic
-            .endpoint
+            .endpoint()
             .accept_session(transport_sdk::MultiplexConfig::default())
             .await
             .expect("target direct QUIC accept should succeed")
