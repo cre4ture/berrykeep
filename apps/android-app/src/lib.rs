@@ -20,6 +20,32 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
+    #[test]
+    fn embedded_web_ui_diagnostic_is_normalized_before_native_log_export() {
+        let buffer = common::logging::LogBuffer::new(2);
+        record_embedded_web_ui_diagnostic_into(
+            &buffer,
+            "event=http_error\n request_path=/api/v1/maps/config\tstatus=503",
+        );
+        assert!(buffer.render_text().contains(
+            "WARN ironmesh_android_webview event=embedded_web_ui_diagnostic event=http_error request_path=/api/v1/maps/config status=503"
+        ));
+    }
+
+    #[test]
+    fn embedded_web_ui_diagnostic_has_a_bounded_native_log_size() {
+        let normalized = normalize_embedded_web_ui_diagnostic(
+            &"x".repeat(MAX_EMBEDDED_WEB_UI_DIAGNOSTIC_LENGTH + 32),
+        )
+        .expect("non-empty diagnostic should be retained");
+
+        assert_eq!(
+            normalized.chars().count(),
+            MAX_EMBEDDED_WEB_UI_DIAGNOSTIC_LENGTH
+        );
+        assert_eq!(normalize_embedded_web_ui_diagnostic("\n\t "), None);
+    }
+
     fn sample_profile(
         profile_id: &str,
         label: &str,
@@ -289,6 +315,8 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 const ANDROID_CONNECTION_LOG_TARGET: &str = "ironmesh_android_connection";
+const ANDROID_WEBVIEW_LOG_TARGET: &str = "ironmesh_android_webview";
+const MAX_EMBEDDED_WEB_UI_DIAGNOSTIC_LENGTH: usize = 1_024;
 
 /// # Safety
 /// This function is intended to be called from Java via JNI during application startup.
@@ -358,6 +386,35 @@ fn android_web_log_buffer() -> Arc<common::logging::LogBuffer> {
             common::logging::LogBuffer::MOBILE_DIAGNOSTIC_CAPACITY,
         ))
     }))
+}
+
+fn record_embedded_web_ui_diagnostic(message: &str) {
+    record_embedded_web_ui_diagnostic_into(android_web_log_buffer().as_ref(), message);
+}
+
+fn record_embedded_web_ui_diagnostic_into(log_buffer: &common::logging::LogBuffer, message: &str) {
+    let Some(message) = normalize_embedded_web_ui_diagnostic(message) else {
+        return;
+    };
+    log_buffer.push(format!(
+        "WARN {ANDROID_WEBVIEW_LOG_TARGET} event=embedded_web_ui_diagnostic {message}"
+    ));
+}
+
+fn normalize_embedded_web_ui_diagnostic(message: &str) -> Option<String> {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let mut truncated = String::new();
+    for character in normalized
+        .chars()
+        .take(MAX_EMBEDDED_WEB_UI_DIAGNOSTIC_LENGTH)
+    {
+        truncated.push(character);
+    }
+    Some(truncated)
 }
 
 struct WebUiServer {
@@ -1952,6 +2009,29 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
             );
             std::ptr::null_mut()
         }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_recordEmbeddedWebUiDiagnostic(
+    mut env: JNIEnv,
+    _class: JClass,
+    message: JString,
+) {
+    let result = (|| -> Result<()> {
+        let message: String = env.get_string(&message)?.into();
+        record_embedded_web_ui_diagnostic(&message);
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        throw_java_error(
+            &mut env,
+            format!("rust recordEmbeddedWebUiDiagnostic failed: {err:#}"),
+        );
     }
 }
 
