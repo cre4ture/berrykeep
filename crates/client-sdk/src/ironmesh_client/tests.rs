@@ -114,6 +114,72 @@ fn connection_diagnostic_impact_is_explicit_and_clone_specific() {
 }
 
 #[test]
+fn shared_route_diagnostics_retain_each_attempts_impact() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let maintenance_client = client
+        .clone()
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::BackgroundMaintenance);
+    let foreground_client = client
+        .clone()
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::UserFacing);
+    let request_url = client
+        .relative_url("/api/v1/cluster/status")
+        .expect("relative URL should build");
+
+    maintenance_client.record_request_failure(
+        0,
+        ClientRequestAttemptContext {
+            method: &Method::GET,
+            url: &request_url,
+            timeout: None,
+            started_unix_ms: 1_000,
+            session_pool_before: TransportSessionPoolSnapshot::default(),
+        },
+        "background candidate timed out",
+    );
+    foreground_client.record_request_failure(
+        0,
+        ClientRequestAttemptContext {
+            method: &Method::GET,
+            url: &request_url,
+            timeout: None,
+            started_unix_ms: 2_000,
+            session_pool_before: TransportSessionPoolSnapshot::default(),
+        },
+        "foreground request timed out",
+    );
+
+    let attempts = &foreground_client.connection_diagnostics().endpoints[0].recent_attempts;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].impact,
+        ClientConnectionDiagnosticImpact::BackgroundMaintenance
+    );
+    assert_eq!(
+        attempts[1].impact,
+        ClientConnectionDiagnosticImpact::UserFacing
+    );
+}
+
+#[test]
+fn background_probe_failures_are_scoped_as_maintenance_attempts() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+
+    client
+        .transport_router
+        .record_background_probe_failure(0, "candidate probe timed out");
+
+    let attempts = &client.connection_diagnostics().endpoints[0].recent_attempts;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].method, "PROBE");
+    assert_eq!(attempts[0].outcome, "failure");
+    assert_eq!(
+        attempts[0].impact,
+        ClientConnectionDiagnosticImpact::BackgroundMaintenance
+    );
+}
+
+#[test]
 fn route_reconciliation_preserves_static_state_and_retires_dynamic_routes() {
     let static_client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
     let original_endpoint = static_client

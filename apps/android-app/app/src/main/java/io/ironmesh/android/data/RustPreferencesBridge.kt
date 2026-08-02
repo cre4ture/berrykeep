@@ -71,10 +71,14 @@ object RustPreferencesBridge {
         current: AppConnectionStatus,
         update: AppConnectionDiagnosticsUpdate,
     ): AppConnectionStatus {
-        val updateAffectsAppConnectionStatus = update.impact.affectsAppConnectionStatus()
-        val scopedUpdateFailures = update.failedAttempts.map { attempt ->
-            attempt.copy(impact = update.impact)
-        }
+        val scopedUpdateFailures = update.failedAttempts
+        val updateCarriesUserFacingSuccess =
+            update.impact.affectsAppConnectionStatus() &&
+                (update.lastSuccessfulConnectionUnixMs != null ||
+                    update.lastSuccessfulFunctionalRequestUnixMs != null)
+        val updateAffectsAppConnectionStatus =
+            updateCarriesUserFacingSuccess ||
+                scopedUpdateFailures.any { attempt -> attempt.affectsAppConnectionStatus() }
         val mergedFailures = retainRecentFailuresByImpact(
             current.failedAttempts + scopedUpdateFailures,
         )

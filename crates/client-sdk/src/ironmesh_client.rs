@@ -103,6 +103,12 @@ pub struct ClientConnectionAttempt {
     pub finished_unix_ms: Option<u64>,
     pub method: String,
     pub url: String,
+    /// Classification captured when this individual operation was recorded.
+    ///
+    /// Route state is shared between client clones, so this must not be inferred
+    /// later from the client that happens to publish a diagnostics snapshot.
+    #[serde(default)]
+    pub impact: ClientConnectionDiagnosticImpact,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     pub outcome: String,
@@ -950,7 +956,28 @@ impl ClientEndpointRouter {
             return;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
+        let started_unix_ms = state
+            .last_background_probe_unix_ms
+            .unwrap_or_else(unix_ts_ms);
         record_endpoint_failure_sample(&mut state, error, true);
+        record_endpoint_attempt(
+            &mut state,
+            ClientConnectionAttempt {
+                started_unix_ms,
+                finished_unix_ms: Some(unix_ts_ms()),
+                method: "PROBE".to_string(),
+                url: endpoint.transport.request_base_url().to_string(),
+                impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+                outcome: "failure".to_string(),
+                total_duration_us: Some(
+                    unix_ts_ms()
+                        .saturating_sub(started_unix_ms)
+                        .saturating_mul(1_000),
+                ),
+                error: Some(error.to_string()),
+                ..ClientConnectionAttempt::default()
+            },
+        );
         drop(state);
         if is_timeout_error_message(error) {
             self.log_timeout_route_not_switched(index, error);
@@ -1022,6 +1049,7 @@ impl ClientEndpointRouter {
         index: usize,
         attempt: ClientRequestAttemptContext<'_>,
         measurement: ClientRequestSuccessMeasurement<'_>,
+        impact: ClientConnectionDiagnosticImpact,
     ) {
         let Some(endpoint) = self.endpoint(index) else {
             return;
@@ -1079,6 +1107,7 @@ impl ClientEndpointRouter {
                 finished_unix_ms: Some(finished_unix_ms),
                 method: attempt.method.to_string(),
                 url: attempt_display_url(&endpoint, attempt.url),
+                impact,
                 timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
                 outcome: "success".to_string(),
                 status_code: Some(measurement.status.as_u16()),
@@ -1111,6 +1140,7 @@ impl ClientEndpointRouter {
         index: usize,
         attempt: ClientRequestAttemptContext<'_>,
         error: &str,
+        impact: ClientConnectionDiagnosticImpact,
     ) {
         let Some(endpoint) = self.endpoint(index) else {
             return;
@@ -1132,6 +1162,7 @@ impl ClientEndpointRouter {
                 finished_unix_ms: Some(unix_ts_ms()),
                 method: attempt.method.to_string(),
                 url: attempt_display_url(&endpoint, attempt.url),
+                impact,
                 timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
                 outcome: "failure".to_string(),
                 total_duration_us: Some(
@@ -3185,6 +3216,34 @@ impl IronMeshClient {
         self.transport_router.diagnostics_snapshot()
     }
 
+    fn record_request_success(
+        &self,
+        index: usize,
+        attempt: ClientRequestAttemptContext<'_>,
+        measurement: ClientRequestSuccessMeasurement<'_>,
+    ) {
+        self.transport_router.record_request_success(
+            index,
+            attempt,
+            measurement,
+            self.connection_diagnostic_impact,
+        );
+    }
+
+    fn record_request_failure(
+        &self,
+        index: usize,
+        attempt: ClientRequestAttemptContext<'_>,
+        error: &str,
+    ) {
+        self.transport_router.record_request_failure(
+            index,
+            attempt,
+            error,
+            self.connection_diagnostic_impact,
+        );
+    }
+
     fn publish_connection_diagnostics(&self) {
         let observer = connection_diagnostics_observer()
             .read()
@@ -3387,7 +3446,7 @@ impl IronMeshClient {
             .await
             {
                 Ok(response) if is_retryable_transport_status(response.status) => {
-                    self.transport_router.record_request_failure(
+                    self.record_request_failure(
                         index,
                         ClientRequestAttemptContext {
                             method: &method,
@@ -3405,7 +3464,7 @@ impl IronMeshClient {
                     ));
                 }
                 Ok(response) => {
-                    self.transport_router.record_request_success(
+                    self.record_request_success(
                         index,
                         ClientRequestAttemptContext {
                             method: &method,
@@ -3431,7 +3490,7 @@ impl IronMeshClient {
                 }
                 Err(error) => {
                     let error = error.context(endpoint_context);
-                    self.transport_router.record_request_failure(
+                    self.record_request_failure(
                         index,
                         ClientRequestAttemptContext {
                             method: &method,
@@ -3520,7 +3579,7 @@ impl IronMeshClient {
                 Ok(candidate_response)
                     if is_retryable_transport_status(candidate_response.status) =>
                 {
-                    self.transport_router.record_request_failure(
+                    self.record_request_failure(
                         route_index,
                         ClientRequestAttemptContext {
                             method: &Method::PUT,
@@ -3546,7 +3605,7 @@ impl IronMeshClient {
                     ));
                 }
                 Ok(candidate_response) => {
-                    self.transport_router.record_request_success(
+                    self.record_request_success(
                         route_index,
                         ClientRequestAttemptContext {
                             method: &Method::PUT,
@@ -3575,7 +3634,7 @@ impl IronMeshClient {
                     });
                 }
                 Err(error) => {
-                    self.transport_router.record_request_failure(
+                    self.record_request_failure(
                         route_index,
                         ClientRequestAttemptContext {
                             method: &Method::PUT,
@@ -4262,7 +4321,7 @@ impl IronMeshClient {
                         .and_then(|value| value.to_str().ok())
                         .and_then(|value| value.parse::<usize>().ok())
                         .unwrap_or_default();
-                    self.transport_router.record_request_success(
+                    self.record_request_success(
                         index,
                         ClientRequestAttemptContext {
                             method: &method,
@@ -4284,7 +4343,7 @@ impl IronMeshClient {
                     return Ok(response);
                 }
                 Err(error) => {
-                    self.transport_router.record_request_failure(
+                    self.record_request_failure(
                         index,
                         ClientRequestAttemptContext {
                             method: &method,
@@ -4369,7 +4428,7 @@ impl IronMeshClient {
             .await
             {
                 Ok(response) => {
-                    self.transport_router.record_request_success(
+                    self.record_request_success(
                         index,
                         ClientRequestAttemptContext {
                             method: &method,
@@ -4395,7 +4454,7 @@ impl IronMeshClient {
                     });
                 }
                 Err(error) => {
-                    self.transport_router.record_request_failure(
+                    self.record_request_failure(
                         index,
                         ClientRequestAttemptContext {
                             method: &method,
@@ -4799,7 +4858,7 @@ impl IronMeshClient {
             .await
             {
                 Ok(candidate_response) => {
-                    self.transport_router.record_request_success(
+                    self.record_request_success(
                         index,
                         ClientRequestAttemptContext {
                             method: &Method::GET,
@@ -4822,7 +4881,7 @@ impl IronMeshClient {
                     break;
                 }
                 Err(error) => {
-                    self.transport_router.record_request_failure(
+                    self.record_request_failure(
                         index,
                         ClientRequestAttemptContext {
                             method: &Method::GET,

@@ -64,6 +64,7 @@ class RustPreferencesBridgeTest {
             lastSuccessfulFunctionalRequestUrl = functionalUrl,
         )
         val backgroundFailure = AppFailedConnectionAttempt(
+            impact = APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE,
             startedUnixMs = 2_900L,
             finishedUnixMs = 3_000L,
             method = "GET",
@@ -131,6 +132,7 @@ class RustPreferencesBridgeTest {
 
         val backgroundFailures = (1L..20L).map { index ->
             AppFailedConnectionAttempt(
+                impact = APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE,
                 startedUnixMs = 2_000L + index,
                 method = "GET",
                 url = "iroh://candidate-$index/api/v1/cluster/status",

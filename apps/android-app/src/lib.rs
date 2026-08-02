@@ -125,6 +125,7 @@ mod tests {
                         finished_unix_ms: Some(1_000),
                         method: "GET".to_string(),
                         url: "iroh://candidate/api/v1/cluster/status".to_string(),
+                        impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
                         outcome: "failure".to_string(),
                         error: Some("candidate timed out".to_string()),
                         ..client_sdk::ClientConnectionAttempt::default()
@@ -149,6 +150,50 @@ mod tests {
         assert_eq!(
             json["failedAttempts"][0]["impact"],
             serde_json::json!("background_maintenance")
+        );
+    }
+
+    #[test]
+    fn connection_diagnostics_retain_attempt_scope_in_foreground_snapshot() {
+        let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
+            connection_name: Some("android-foreground".to_string()),
+            impact: ClientConnectionDiagnosticImpact::UserFacing,
+            diagnostics: ClientConnectionDiagnostics {
+                endpoints: vec![client_sdk::ClientEndpointDiagnostics {
+                    locator: "iroh://candidate".to_string(),
+                    path_kind: "direct".to_string(),
+                    recent_attempts: vec![
+                        client_sdk::ClientConnectionAttempt {
+                            started_unix_ms: 900,
+                            finished_unix_ms: Some(1_000),
+                            method: "PROBE".to_string(),
+                            url: "iroh://candidate/api/v1/cluster/status".to_string(),
+                            impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+                            outcome: "failure".to_string(),
+                            error: Some("candidate timed out".to_string()),
+                            ..client_sdk::ClientConnectionAttempt::default()
+                        },
+                        client_sdk::ClientConnectionAttempt {
+                            started_unix_ms: 1_900,
+                            finished_unix_ms: Some(2_000),
+                            method: "GET".to_string(),
+                            url: "iroh://candidate/api/v1/store/index".to_string(),
+                            impact: ClientConnectionDiagnosticImpact::UserFacing,
+                            outcome: "success".to_string(),
+                            ..client_sdk::ClientConnectionAttempt::default()
+                        },
+                    ],
+                    ..client_sdk::ClientEndpointDiagnostics::default()
+                }],
+                ..ClientConnectionDiagnostics::default()
+            },
+        });
+
+        assert_eq!(update.last_successful_connection_unix_ms, Some(2_000));
+        assert_eq!(update.failed_attempts.len(), 1);
+        assert_eq!(
+            update.failed_attempts[0].impact,
+            ClientConnectionDiagnosticImpact::BackgroundMaintenance
         );
     }
 
@@ -604,24 +649,21 @@ fn summarize_android_connection_diagnostics(
     let mut failed_attempts = Vec::new();
 
     for endpoint in diagnostics.endpoints {
-        if let Some(last_success) = endpoint.last_success_unix_ms
-            && last_successful_connection_unix_ms.is_none_or(|current| last_success >= current)
-        {
-            last_successful_connection_unix_ms = Some(last_success);
-            last_successful_connection_url = endpoint
-                .recent_attempts
-                .iter()
-                .rev()
-                .find(|attempt| attempt.outcome == "success")
-                .map(|attempt| attempt.url.clone())
-                .or_else(|| Some(endpoint.locator.clone()));
-        }
-
         for attempt in &endpoint.recent_attempts {
-            if attempt.outcome != "success" || is_android_connectivity_probe_url(&attempt.url) {
+            if attempt.outcome != "success"
+                || !attempt.impact.affects_user_facing_connection_status()
+            {
                 continue;
             }
             let finished_unix_ms = attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms);
+            if last_successful_connection_unix_ms.is_none_or(|current| finished_unix_ms >= current)
+            {
+                last_successful_connection_unix_ms = Some(finished_unix_ms);
+                last_successful_connection_url = Some(attempt.url.clone());
+            }
+            if is_android_connectivity_probe_url(&attempt.url) {
+                continue;
+            }
             if last_successful_functional_request_unix_ms
                 .is_none_or(|current| finished_unix_ms >= current)
             {
@@ -637,7 +679,7 @@ fn summarize_android_connection_diagnostics(
                 .filter(|attempt| attempt.outcome == "failure")
                 .map(|attempt| AndroidAppFailedConnectionAttempt {
                     source_label: source_label.clone(),
-                    impact,
+                    impact: attempt.impact,
                     endpoint_locator: endpoint.locator.clone(),
                     path_kind: endpoint.path_kind.clone(),
                     started_unix_ms: attempt.started_unix_ms,
