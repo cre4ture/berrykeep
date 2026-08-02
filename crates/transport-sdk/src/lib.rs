@@ -44,9 +44,10 @@ pub use cluster_registration::{
 pub use direct_quic::{
     DEFAULT_DIRECT_QUIC_ALPN, DirectQuicAcceptedConnection, DirectQuicEndpoint,
     DirectQuicEndpointConfig, DirectQuicEndpointSnapshot, DirectQuicRelayConfig, DirectQuicSession,
-    direct_quic_endpoint_url, endpoint_addr_from_candidate, endpoint_id_from_candidate,
-    has_usable_peer_addresses, load_or_create_secret_key, read_secret_key_from_path,
-    usable_peer_socket_addrs_from_candidate, write_secret_key_to_path,
+    IrohRelayTicketRollover, IrohRelayTicketSet, direct_quic_endpoint_url,
+    endpoint_addr_from_candidate, endpoint_id_from_candidate, has_usable_peer_addresses,
+    load_or_create_secret_key, read_secret_key_from_path, usable_peer_socket_addrs_from_candidate,
+    write_secret_key_to_path,
 };
 
 /// Publishes the Android JVM and application context to Iroh before its DNS

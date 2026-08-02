@@ -20,6 +20,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::candidates::{CandidateKind, ConnectionCandidate, ConnectionCandidateTransportHints};
 use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
+use crate::rendezvous::IrohRelayTicket;
 
 const DIRECT_QUIC_ENDPOINT_SCHEME: &str = "iroh";
 pub const DEFAULT_DIRECT_QUIC_ALPN: &str = "ironmesh/transport/1";
@@ -33,6 +34,10 @@ pub struct DirectQuicEndpointConfig {
     pub relay_enabled: bool,
     pub relay_urls: Vec<String>,
     pub relay_auth_token: Option<String>,
+    /// Endpoint-bound relay tickets that are already available when the
+    /// endpoint is bound.  Installing them at bind time ensures Iroh starts
+    /// each relay actor with a current authorization token.
+    pub initial_dynamic_relays: Vec<DirectQuicRelayConfig>,
     pub relay_ca_pem: Option<String>,
     pub alpn: String,
 }
@@ -48,6 +53,10 @@ impl std::fmt::Debug for DirectQuicEndpointConfig {
                 "relay_auth_token",
                 &self.relay_auth_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "initial_dynamic_relay_count",
+                &self.initial_dynamic_relays.len(),
+            )
             .field("relay_ca_pem_configured", &self.relay_ca_pem.is_some())
             .field("alpn", &self.alpn)
             .finish()
@@ -59,6 +68,121 @@ pub struct DirectQuicRelayConfig {
     pub url: String,
     pub auth_token: Option<String>,
     pub quic_port: Option<u16>,
+}
+
+/// The endpoint-bound Iroh relay tickets currently known for one local
+/// endpoint, indexed by their normalized public relay URL.
+///
+/// Tickets from different Rendezvous servers remain independent.  This lets a
+/// caller configure all reachable relays without conflating their credentials.
+#[derive(Clone, Default)]
+pub struct IrohRelayTicketSet {
+    relays: BTreeMap<String, ManagedIrohRelayTicket>,
+}
+
+#[derive(Clone)]
+struct ManagedIrohRelayTicket {
+    auth_token: String,
+    expires_at_unix: u64,
+    quic_port: Option<u16>,
+}
+
+impl std::fmt::Debug for IrohRelayTicketSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IrohRelayTicketSet")
+            .field("relay_count", &self.relays.len())
+            .field("earliest_expiry", &self.earliest_expiry())
+            .finish()
+    }
+}
+
+impl IrohRelayTicketSet {
+    /// Adds or replaces every relay URL covered by `ticket`.
+    pub fn insert(&mut self, ticket: &IrohRelayTicket) {
+        for url in &ticket.public_urls {
+            self.relays.insert(
+                normalize_relay_url(url).to_string(),
+                ManagedIrohRelayTicket {
+                    auth_token: ticket.auth_token.clone(),
+                    expires_at_unix: ticket.expires_at_unix,
+                    quic_port: ticket.quic_port,
+                },
+            );
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.relays.is_empty()
+    }
+
+    pub fn relay_configs(&self) -> Vec<DirectQuicRelayConfig> {
+        self.relays
+            .iter()
+            .map(|(url, ticket)| DirectQuicRelayConfig {
+                url: url.clone(),
+                auth_token: Some(ticket.auth_token.clone()),
+                quic_port: ticket.quic_port,
+            })
+            .collect()
+    }
+
+    pub fn earliest_expiry(&self) -> Option<u64> {
+        self.relays
+            .values()
+            .map(|ticket| ticket.expires_at_unix)
+            .min()
+    }
+
+    /// Returns whether every retained ticket outlives `expires_at_unix`.
+    ///
+    /// Rebinding only after the complete active relay set has moved to a newer
+    /// ticket generation avoids recreating an endpoint with one immediately
+    /// expiring relay credential.
+    pub fn all_expire_after(&self, expires_at_unix: u64) -> bool {
+        !self.relays.is_empty()
+            && self
+                .relays
+                .values()
+                .all(|ticket| ticket.expires_at_unix > expires_at_unix)
+    }
+}
+
+/// Determines when an endpoint should be rebound so its relay actors use a
+/// newer generation of endpoint-bound tickets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrohRelayTicketRollover {
+    active_expires_at_unix: u64,
+    rollover_at_unix: u64,
+}
+
+impl IrohRelayTicketRollover {
+    /// Schedules a rollover after two thirds of the ticket's remaining life.
+    /// This leaves one third as retry and reconnection margin.
+    pub fn from_ticket_set(tickets: &IrohRelayTicketSet, now_unix: u64) -> Option<Self> {
+        let active_expires_at_unix = tickets.earliest_expiry()?;
+        let remaining = active_expires_at_unix.saturating_sub(now_unix);
+        let rollover_at_unix = now_unix.saturating_add(remaining.saturating_mul(2) / 3);
+        Some(Self {
+            active_expires_at_unix,
+            rollover_at_unix,
+        })
+    }
+
+    pub fn active_expires_at_unix(self) -> u64 {
+        self.active_expires_at_unix
+    }
+
+    pub fn rollover_at_unix(self) -> u64 {
+        self.rollover_at_unix
+    }
+
+    /// A rebind is safe once the scheduled time has arrived and every active
+    /// relay has received a ticket from a newer generation.
+    pub fn replacement_is_due(self, replacement: &IrohRelayTicketSet, now_unix: u64) -> bool {
+        now_unix >= self.rollover_at_unix
+            && replacement.all_expire_after(self.active_expires_at_unix)
+    }
 }
 
 impl std::fmt::Debug for DirectQuicRelayConfig {
@@ -125,6 +249,7 @@ impl DirectQuicEndpointConfig {
             relay_enabled: true,
             relay_urls: Vec::new(),
             relay_auth_token: None,
+            initial_dynamic_relays: Vec::new(),
             relay_ca_pem: None,
             alpn: DEFAULT_DIRECT_QUIC_ALPN.to_string(),
         }
@@ -150,11 +275,17 @@ impl DirectQuicEndpointConfig {
         if !self.relay_enabled && (!self.relay_urls.is_empty() || self.relay_auth_token.is_some()) {
             bail!("direct QUIC relay configuration requires relay transport to be enabled");
         }
+        if !self.relay_enabled && !self.initial_dynamic_relays.is_empty() {
+            bail!("direct QUIC relay configuration requires relay transport to be enabled");
+        }
         if self.relay_urls.is_empty() && self.relay_auth_token.is_some() {
             bail!("direct QUIC relay auth token requires at least one relay URL");
         }
         if let Some(relay_ca_pem) = self.relay_ca_pem.as_deref() {
             relay_ca_config(relay_ca_pem)?;
+        }
+        for relay in &self.initial_dynamic_relays {
+            validate_relay_config(relay)?;
         }
         Ok(())
     }
@@ -164,7 +295,7 @@ impl DirectQuicEndpoint {
     pub async fn bind(config: DirectQuicEndpointConfig) -> Result<Self> {
         config.validate()?;
 
-        let configured_relays = config
+        let configured_static_relays = config
             .relay_urls
             .iter()
             .map(|url| DirectQuicRelayConfig {
@@ -173,12 +304,20 @@ impl DirectQuicEndpoint {
                 quic_port: None,
             })
             .collect::<Vec<_>>();
+        let static_relays = configured_relays_from_configs(&configured_static_relays)?;
+        let dynamic_relays = configured_relays_from_configs(&config.initial_dynamic_relays)?;
+        let mut configured_relays = dynamic_relays.clone();
+        configured_relays.extend(
+            static_relays
+                .iter()
+                .map(|(url, config)| (url.clone(), config.clone())),
+        );
         // Keep the relay transport present when tickets may be installed later.
         // Direct-only fallback endpoints deliberately use RelayMode::Disabled:
         // a candidate relay address alone must never bypass endpoint-ticket
         // authentication on an IronMesh relay.
         let relay_mode = if config.relay_enabled {
-            RelayMode::Custom(relay_map(&configured_relays)?)
+            RelayMode::Custom(relay_map_from_configured_relays(&configured_relays)?)
         } else {
             RelayMode::Disabled
         };
@@ -195,25 +334,13 @@ impl DirectQuicEndpoint {
             .await
             .context("failed binding direct QUIC endpoint")?;
 
-        let static_relays = configured_relays
-            .into_iter()
-            .map(|relay| {
-                (
-                    normalize_relay_url(&relay.url).to_string(),
-                    ConfiguredRelay {
-                        auth_token: relay.auth_token,
-                        quic_port: relay.quic_port,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
         Ok(Self {
             endpoint,
             alpn: config.alpn,
             relay_enabled: config.relay_enabled,
             static_relays: Arc::new(static_relays.clone()),
-            dynamic_relays: Arc::new(Mutex::new(BTreeMap::new())),
-            configured_relays: Arc::new(Mutex::new(static_relays)),
+            dynamic_relays: Arc::new(Mutex::new(dynamic_relays)),
+            configured_relays: Arc::new(Mutex::new(configured_relays)),
         })
     }
 
@@ -424,10 +551,32 @@ impl DirectQuicEndpointSnapshot {
     }
 }
 
-fn relay_map(relays: &[DirectQuicRelayConfig]) -> Result<RelayMap> {
+fn configured_relays_from_configs(relays: &[DirectQuicRelayConfig]) -> Result<ConfiguredRelays> {
     relays
         .iter()
-        .map(iroh_relay_config)
+        .map(|relay| {
+            validate_relay_config(relay)?;
+            Ok((
+                normalize_relay_url(&relay.url).to_string(),
+                ConfiguredRelay {
+                    auth_token: relay.auth_token.clone(),
+                    quic_port: relay.quic_port,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn relay_map_from_configured_relays(relays: &ConfiguredRelays) -> Result<RelayMap> {
+    relays
+        .iter()
+        .map(|(url, config)| {
+            iroh_relay_config(&DirectQuicRelayConfig {
+                url: url.clone(),
+                auth_token: config.auth_token.clone(),
+                quic_port: config.quic_port,
+            })
+        })
         .map(|result| result.map(|(_, config)| config))
         .collect::<Result<Vec<_>>>()
         .map(RelayMap::from_iter)
@@ -749,6 +898,61 @@ mod tests {
                 .and_then(|hints| hints.transport_id.as_deref()),
             Some("peer-key-1")
         );
+    }
+
+    #[test]
+    fn ticket_set_keeps_each_relay_credential_and_requires_a_complete_replacement() {
+        let mut active = IrohRelayTicketSet::default();
+        active.insert(&IrohRelayTicket {
+            public_urls: vec!["https://relay-a.example/".to_string()],
+            auth_token: "token-a".to_string(),
+            expires_at_unix: 1_000,
+            quic_port: Some(7842),
+        });
+        active.insert(&IrohRelayTicket {
+            public_urls: vec!["https://relay-b.example".to_string()],
+            auth_token: "token-b".to_string(),
+            expires_at_unix: 1_000,
+            quic_port: Some(7843),
+        });
+
+        assert_eq!(active.earliest_expiry(), Some(1_000));
+        assert_eq!(
+            active.relay_configs(),
+            vec![
+                DirectQuicRelayConfig {
+                    url: "https://relay-a.example".to_string(),
+                    auth_token: Some("token-a".to_string()),
+                    quic_port: Some(7842),
+                },
+                DirectQuicRelayConfig {
+                    url: "https://relay-b.example".to_string(),
+                    auth_token: Some("token-b".to_string()),
+                    quic_port: Some(7843),
+                },
+            ]
+        );
+
+        let rollover = IrohRelayTicketRollover::from_ticket_set(&active, 100)
+            .expect("active tickets have an expiry");
+        assert_eq!(rollover.rollover_at_unix(), 700);
+
+        let mut partial_replacement = active.clone();
+        partial_replacement.insert(&IrohRelayTicket {
+            public_urls: vec!["https://relay-a.example".to_string()],
+            auth_token: "new-token-a".to_string(),
+            expires_at_unix: 1_900,
+            quic_port: Some(7842),
+        });
+        assert!(!rollover.replacement_is_due(&partial_replacement, 700));
+
+        partial_replacement.insert(&IrohRelayTicket {
+            public_urls: vec!["https://relay-b.example".to_string()],
+            auth_token: "new-token-b".to_string(),
+            expires_at_unix: 1_900,
+            quic_port: Some(7843),
+        });
+        assert!(rollover.replacement_is_due(&partial_replacement, 700));
     }
 
     #[test]
