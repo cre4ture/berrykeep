@@ -917,10 +917,15 @@ struct IronmeshTitleLatencyToolbarItem: View {
     var body: some View {
         HStack(spacing: 8) {
             if model.titleLatencyStatus.state != "disabled" {
-                Text(label)
-                    .font(.caption2.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(color)
-                    .accessibilityLabel(accessibilityLabel)
+                NavigationLink {
+                    IronmeshConnectionPathsView()
+                } label: {
+                    Text(label)
+                        .font(.caption2.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(color)
+                }
+                .accessibilityLabel(accessibilityLabel)
+                .accessibilityHint("Opens connection diagnostics")
             }
 
             Button {

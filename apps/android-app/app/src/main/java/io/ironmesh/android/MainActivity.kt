@@ -204,6 +204,9 @@ class MainActivity : ComponentActivity() {
                         snackbarHostState = snackbarHostState,
                         deviceLabel = state.deviceAuthState.label,
                         titleLatencyStatus = state.titleLatencyStatus,
+                        onOpenConnectionDiagnostics = {
+                            vm.selectSection(MainSection.CONNECTIVITY)
+                        },
                         onExportDiagnosticLog = {
                             runCatching {
                                 diagnosticLogLauncher.launch(diagnosticLogFileName())
