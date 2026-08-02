@@ -3360,6 +3360,10 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
         assert_eq!(diagnostics.endpoints.len(), 1);
         assert_eq!(diagnostics.endpoints[0].path_kind, "direct");
         assert_eq!(
+            diagnostics.endpoints[0].target_node_id,
+            Some(target_node_id)
+        );
+        assert_eq!(
             diagnostics.endpoints[0].transport_path_kind.as_deref(),
             Some("direct_quic")
         );
@@ -3380,6 +3384,14 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
         assert_eq!(
             route_snapshot.endpoints[0].hole_punching_mode.as_deref(),
             Some("direct")
+        );
+        assert_eq!(
+            route_snapshot.endpoints[0].iroh_relay_urls,
+            Some(Vec::new())
+        );
+        assert_eq!(
+            route_snapshot.endpoints[0].last_successful_iroh_relay_url,
+            None
         );
         assert!(
             route_snapshot.endpoints[0]

@@ -23,6 +23,10 @@ data class ConnectionRouteEndpointSnapshot(
     val bootstrapRank: Int,
     @Json(name = "target_node_id")
     val targetNodeId: String? = null,
+    @Json(name = "iroh_relay_urls")
+    val irohRelayUrls: List<String> = emptyList(),
+    @Json(name = "last_successful_iroh_relay_url")
+    val lastSuccessfulIrohRelayUrl: String? = null,
     val active: Boolean,
     val score: Double,
     @Json(name = "ewma_latency_ms")

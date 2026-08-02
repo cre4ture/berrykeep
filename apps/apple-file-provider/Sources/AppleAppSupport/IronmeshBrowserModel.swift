@@ -79,6 +79,9 @@ struct IronmeshConnectionAttemptStatus: Codable, Equatable, Identifiable, Sendab
 
 struct IronmeshConnectionEndpointStatus: Codable, Equatable, Identifiable, Sendable {
     var pathKind: String
+    var targetNodeId: String?
+    var irohRelayUrls: [String]? = nil
+    var lastSuccessfulIrohRelayUrl: String? = nil
     var locator: String
     var requestBaseUrl: String
     var active: Bool
