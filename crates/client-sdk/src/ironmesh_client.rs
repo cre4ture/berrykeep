@@ -404,6 +404,7 @@ struct BufferedTransportResponse {
 #[derive(Debug)]
 struct RoutedBufferedTransportResponse {
     route_index: usize,
+    route_affinity: UploadSessionAffinity,
     response: BufferedTransportResponse,
 }
 
@@ -3444,17 +3445,6 @@ impl IronMeshClient {
         affinities.insert(upload_id.to_string(), affinity);
     }
 
-    fn remember_upload_session_affinity_from_route(&self, upload_id: &str, route_index: usize) {
-        let Some(endpoint) = self.transport_router.endpoint(route_index) else {
-            return;
-        };
-
-        self.remember_upload_session_affinity(
-            upload_id,
-            UploadSessionAffinity::from_endpoint(&endpoint),
-        );
-    }
-
     fn clear_upload_session_affinity(&self, upload_id: &str) {
         let mut affinities = lock_upload_session_affinities(&self.upload_session_affinities);
         affinities.remove(upload_id);
@@ -3551,6 +3541,7 @@ impl IronMeshClient {
                     self.publish_connection_diagnostics();
                     return Ok(RoutedBufferedTransportResponse {
                         route_index: index,
+                        route_affinity: UploadSessionAffinity::from_endpoint(&endpoint),
                         response,
                     });
                 }
@@ -3697,6 +3688,7 @@ impl IronMeshClient {
                     self.publish_connection_diagnostics();
                     return Ok(RoutedBufferedTransportResponse {
                         route_index,
+                        route_affinity: UploadSessionAffinity::from_endpoint(&endpoint),
                         response: candidate_response,
                     });
                 }
@@ -4656,7 +4648,7 @@ impl IronMeshClient {
 
         let view = serde_json::from_slice::<UploadSessionView>(&response.body)
             .with_context(|| format!("failed to parse upload session start response for {key}"))?;
-        self.remember_upload_session_affinity_from_route(&view.upload_id, routed.route_index);
+        self.remember_upload_session_affinity(&view.upload_id, routed.route_affinity);
         Ok(view)
     }
 
@@ -4699,7 +4691,7 @@ impl IronMeshClient {
             StatusCode::OK => {
                 let view = serde_json::from_slice::<UploadSessionView>(&response.body)
                     .with_context(|| format!("failed to parse upload session {upload_id}"))?;
-                self.remember_upload_session_affinity_from_route(upload_id, routed.route_index);
+                self.remember_upload_session_affinity(upload_id, routed.route_affinity);
                 Ok(Some(view))
             }
             StatusCode::NOT_FOUND => {
@@ -4738,7 +4730,7 @@ impl IronMeshClient {
             );
         }
 
-        self.remember_upload_session_affinity_from_route(upload_id, routed.route_index);
+        self.remember_upload_session_affinity(upload_id, routed.route_affinity);
 
         serde_json::from_slice::<UploadSessionChunkResponse>(&response.body).with_context(|| {
             format!("failed to parse upload session chunk response for session={upload_id}")
@@ -4786,7 +4778,7 @@ impl IronMeshClient {
             .with_context(|| {
                 format!("failed to parse upload session completion response for {upload_id}")
             })?;
-        self.remember_upload_session_affinity_from_route(upload_id, routed.route_index);
+        self.remember_upload_session_affinity(upload_id, routed.route_affinity);
         self.clear_upload_session_affinity(upload_id);
         Ok(completed)
     }
