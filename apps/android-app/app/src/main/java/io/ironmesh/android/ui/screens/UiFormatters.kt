@@ -8,6 +8,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.AppConnectionStatus
+import io.ironmesh.android.data.AppFailedConnectionAttempt
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncProfileStatus
 import io.ironmesh.android.data.FolderSyncRuntimeMetrics
