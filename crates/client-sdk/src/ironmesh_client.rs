@@ -171,6 +171,10 @@ pub struct ClientEndpointDiagnostics {
     #[serde(default)]
     pub last_success_unix_ms: Option<u64>,
     #[serde(default)]
+    pub last_user_facing_success_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_user_facing_success_url: Option<String>,
+    #[serde(default)]
     pub last_failure_unix_ms: Option<u64>,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -323,6 +327,8 @@ struct ClientEndpointState {
     total_successes: u64,
     last_measurement_unix_ms: Option<u64>,
     last_success_unix_ms: Option<u64>,
+    last_user_facing_success_unix_ms: Option<u64>,
+    last_user_facing_success_url: Option<String>,
     last_failure_unix_ms: Option<u64>,
     circuit_open_until_unix_ms: Option<u64>,
     background_probe_in_flight: bool,
@@ -1100,13 +1106,18 @@ impl ClientEndpointRouter {
             server_responded_unix_ms,
             transport_overhead_us,
         );
+        let display_url = attempt_display_url(&endpoint, attempt.url);
+        if impact.affects_user_facing_connection_status() {
+            state.last_user_facing_success_unix_ms = Some(finished_unix_ms);
+            state.last_user_facing_success_url = Some(display_url.clone());
+        }
         record_endpoint_attempt(
             &mut state,
             ClientConnectionAttempt {
                 started_unix_ms: attempt.started_unix_ms,
                 finished_unix_ms: Some(finished_unix_ms),
                 method: attempt.method.to_string(),
-                url: attempt_display_url(&endpoint, attempt.url),
+                url: display_url,
                 impact,
                 timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
                 outcome: "success".to_string(),
@@ -1295,6 +1306,8 @@ impl ClientEndpointRouter {
                     total_successes: state.total_successes,
                     last_attempt_unix_ms: state.last_measurement_unix_ms,
                     last_success_unix_ms: state.last_success_unix_ms,
+                    last_user_facing_success_unix_ms: state.last_user_facing_success_unix_ms,
+                    last_user_facing_success_url: state.last_user_facing_success_url.clone(),
                     last_failure_unix_ms: state.last_failure_unix_ms,
                     last_error: state.last_error.clone(),
                     recent_attempts: state.recent_attempts.clone(),

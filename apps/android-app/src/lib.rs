@@ -188,6 +188,10 @@ mod tests {
                 endpoints: vec![client_sdk::ClientEndpointDiagnostics {
                     locator: "iroh://candidate".to_string(),
                     path_kind: "direct".to_string(),
+                    last_user_facing_success_unix_ms: Some(3_000),
+                    last_user_facing_success_url: Some(
+                        "iroh://candidate/api/v1/diagnostics/latency?response_bytes=0".to_string(),
+                    ),
                     recent_attempts: vec![
                         client_sdk::ClientConnectionAttempt {
                             started_unix_ms: 900,
@@ -215,7 +219,11 @@ mod tests {
             },
         });
 
-        assert_eq!(update.last_successful_connection_unix_ms, Some(2_000));
+        assert_eq!(update.last_successful_connection_unix_ms, Some(3_000));
+        assert_eq!(
+            update.last_successful_connection_url.as_deref(),
+            Some("iroh://candidate/api/v1/diagnostics/latency?response_bytes=0")
+        );
         assert_eq!(update.failed_attempts.len(), 1);
         assert_eq!(
             update.failed_attempts[0].impact,
@@ -706,6 +714,27 @@ fn summarize_android_connection_diagnostics(
     let mut failed_attempts = Vec::new();
 
     for endpoint in diagnostics.endpoints {
+        if let Some(last_success) = endpoint.last_user_facing_success_unix_ms
+            && last_successful_connection_unix_ms.is_none_or(|current| last_success >= current)
+        {
+            last_successful_connection_unix_ms = Some(last_success);
+            last_successful_connection_url = endpoint
+                .last_user_facing_success_url
+                .clone()
+                .or_else(|| {
+                    endpoint
+                        .recent_attempts
+                        .iter()
+                        .rev()
+                        .find(|attempt| {
+                            attempt.outcome == "success"
+                                && attempt.impact.affects_user_facing_connection_status()
+                        })
+                        .map(|attempt| attempt.url.clone())
+                })
+                .or_else(|| Some(endpoint.locator.clone()));
+        }
+
         for attempt in &endpoint.recent_attempts {
             if attempt.outcome != "success"
                 || !attempt.impact.affects_user_facing_connection_status()
