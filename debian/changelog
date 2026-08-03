@@ -1,3 +1,13 @@
+ironmesh (1.0.45-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Improve client connection diagnostics and Android diagnostic handling.
+  * Preserve upload-session routing across route refreshes and project gallery
+    state into Turso.
+  * Update the Bazel GitHub Actions remote-cache integration to v0.2.2.
+  * Roll the workspace release to 1.0.45.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 03 Aug 2026 22:35:37 +0200
+
 ironmesh (1.0.44-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Harden direct QUIC relay ticket rollover and prioritize validated client routes.
