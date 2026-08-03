@@ -76,8 +76,6 @@ class RustPreferencesBridgeTest {
             current = current,
             update = AppConnectionDiagnosticsUpdate(
                 impact = APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE,
-                lastSuccessfulConnectionUnixMs = 3_100L,
-                lastSuccessfulConnectionUrl = "iroh://candidate/api/v1/diagnostics/latency",
                 failedAttempts = listOf(backgroundFailure),
             ),
         )
@@ -110,6 +108,27 @@ class RustPreferencesBridgeTest {
 
         assertEquals(APP_CONNECTION_STATE_ERROR, afterFunctionalFailure.state)
         assertEquals(4_000L, afterFunctionalFailure.updatedUnixMs)
+    }
+
+    @Test
+    fun userFacingSuccessInBackgroundPublisherSnapshotUpdatesHomeConnectionState() {
+        val functionalUrl = "https://example.test/api/v1/store/index?media_filter=image"
+
+        val updated = RustPreferencesBridge.mergeAppConnectionDiagnostics(
+            current = AppConnectionStatus(),
+            update = AppConnectionDiagnosticsUpdate(
+                impact = APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE,
+                lastSuccessfulConnectionUnixMs = 3_000L,
+                lastSuccessfulConnectionUrl = functionalUrl,
+                lastSuccessfulFunctionalRequestUnixMs = 3_000L,
+                lastSuccessfulFunctionalRequestUrl = functionalUrl,
+            ),
+        )
+
+        assertEquals(APP_CONNECTION_STATE_CONNECTED, updated.state)
+        assertEquals(3_000L, updated.updatedUnixMs)
+        assertEquals(3_000L, updated.lastSuccessfulConnectionUnixMs)
+        assertEquals(3_000L, updated.lastSuccessfulFunctionalRequestUnixMs)
     }
 
     @Test

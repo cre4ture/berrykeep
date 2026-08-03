@@ -73,9 +73,8 @@ object RustPreferencesBridge {
     ): AppConnectionStatus {
         val scopedUpdateFailures = update.failedAttempts
         val updateCarriesUserFacingSuccess =
-            update.impact.affectsAppConnectionStatus() &&
-                (update.lastSuccessfulConnectionUnixMs != null ||
-                    update.lastSuccessfulFunctionalRequestUnixMs != null)
+            update.lastSuccessfulConnectionUnixMs != null ||
+                update.lastSuccessfulFunctionalRequestUnixMs != null
         val updateAffectsAppConnectionStatus =
             updateCarriesUserFacingSuccess ||
                 scopedUpdateFailures.any { attempt -> attempt.affectsAppConnectionStatus() }

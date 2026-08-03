@@ -180,10 +180,10 @@ mod tests {
     }
 
     #[test]
-    fn connection_diagnostics_retain_attempt_scope_in_foreground_snapshot() {
+    fn connection_diagnostics_retain_attempt_scope_in_background_published_snapshot() {
         let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
-            connection_name: Some("android-foreground".to_string()),
-            impact: ClientConnectionDiagnosticImpact::UserFacing,
+            connection_name: None,
+            impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
             diagnostics: ClientConnectionDiagnostics {
                 endpoints: vec![client_sdk::ClientEndpointDiagnostics {
                     locator: "iroh://candidate".to_string(),
