@@ -232,6 +232,64 @@ mod tests {
     }
 
     #[test]
+    fn connection_diagnostics_retain_user_facing_failures_alongside_background_failures() {
+        let mut recent_attempts = vec![client_sdk::ClientConnectionAttempt {
+            started_unix_ms: 9,
+            finished_unix_ms: Some(10),
+            method: "GET".to_string(),
+            url: "https://example.test/api/v1/store/index".to_string(),
+            impact: ClientConnectionDiagnosticImpact::UserFacing,
+            outcome: "failure".to_string(),
+            error: Some("request timed out".to_string()),
+            ..client_sdk::ClientConnectionAttempt::default()
+        }];
+        recent_attempts.extend((100_u64..109).map(|timestamp| {
+            client_sdk::ClientConnectionAttempt {
+                started_unix_ms: timestamp - 1,
+                finished_unix_ms: Some(timestamp),
+                method: "PROBE".to_string(),
+                url: "iroh://candidate/api/v1/cluster/status".to_string(),
+                impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+                outcome: "failure".to_string(),
+                error: Some("candidate timed out".to_string()),
+                ..client_sdk::ClientConnectionAttempt::default()
+            }
+        }));
+
+        let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
+            connection_name: None,
+            impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+            diagnostics: ClientConnectionDiagnostics {
+                endpoints: vec![client_sdk::ClientEndpointDiagnostics {
+                    locator: "iroh://candidate".to_string(),
+                    path_kind: "direct".to_string(),
+                    recent_attempts,
+                    ..client_sdk::ClientEndpointDiagnostics::default()
+                }],
+                ..ClientConnectionDiagnostics::default()
+            },
+        });
+
+        assert_eq!(update.failed_attempts.len(), 9);
+        assert_eq!(
+            update
+                .failed_attempts
+                .iter()
+                .filter(|attempt| { attempt.impact.affects_user_facing_connection_status() })
+                .count(),
+            1
+        );
+        assert_eq!(
+            update
+                .failed_attempts
+                .iter()
+                .filter(|attempt| { !attempt.impact.affects_user_facing_connection_status() })
+                .count(),
+            8
+        );
+    }
+
+    #[test]
     fn rebuild_service_summary_reports_stopped_when_no_profiles_are_active() {
         let mut status = AndroidFolderSyncServiceStatus::default();
 
@@ -696,6 +754,9 @@ fn install_android_connection_diagnostics_bridge() {
     });
 }
 
+const MAX_ANDROID_USER_FACING_FAILED_ATTEMPTS: usize = 8;
+const MAX_ANDROID_BACKGROUND_FAILED_ATTEMPTS: usize = 8;
+
 fn summarize_android_connection_diagnostics(
     event: ClientConnectionDiagnosticsEvent,
 ) -> AndroidAppConnectionDiagnosticsUpdate {
@@ -778,12 +839,7 @@ fn summarize_android_connection_diagnostics(
         );
     }
 
-    failed_attempts.sort_by(|left, right| {
-        let left_ts = left.finished_unix_ms.unwrap_or(left.started_unix_ms);
-        let right_ts = right.finished_unix_ms.unwrap_or(right.started_unix_ms);
-        right_ts.cmp(&left_ts)
-    });
-    failed_attempts.truncate(8);
+    failed_attempts = retain_android_failed_attempts_by_impact(failed_attempts);
 
     AndroidAppConnectionDiagnosticsUpdate {
         source_label,
@@ -794,6 +850,49 @@ fn summarize_android_connection_diagnostics(
         last_successful_functional_request_url,
         failed_attempts,
     }
+}
+
+fn retain_android_failed_attempts_by_impact(
+    failed_attempts: Vec<AndroidAppFailedConnectionAttempt>,
+) -> Vec<AndroidAppFailedConnectionAttempt> {
+    let mut user_facing = Vec::new();
+    let mut background_maintenance = Vec::new();
+
+    for attempt in failed_attempts {
+        if attempt.impact.affects_user_facing_connection_status() {
+            user_facing.push(attempt);
+        } else {
+            background_maintenance.push(attempt);
+        }
+    }
+
+    retain_recent_android_failed_attempts(
+        &mut user_facing,
+        MAX_ANDROID_USER_FACING_FAILED_ATTEMPTS,
+    );
+    retain_recent_android_failed_attempts(
+        &mut background_maintenance,
+        MAX_ANDROID_BACKGROUND_FAILED_ATTEMPTS,
+    );
+    user_facing.extend(background_maintenance);
+    sort_android_failed_attempts(&mut user_facing);
+    user_facing
+}
+
+fn retain_recent_android_failed_attempts(
+    failed_attempts: &mut Vec<AndroidAppFailedConnectionAttempt>,
+    limit: usize,
+) {
+    sort_android_failed_attempts(failed_attempts);
+    failed_attempts.truncate(limit);
+}
+
+fn sort_android_failed_attempts(failed_attempts: &mut [AndroidAppFailedConnectionAttempt]) {
+    failed_attempts.sort_by(|left, right| {
+        let left_ts = left.finished_unix_ms.unwrap_or(left.started_unix_ms);
+        let right_ts = right.finished_unix_ms.unwrap_or(right.started_unix_ms);
+        right_ts.cmp(&left_ts)
+    });
 }
 
 fn is_android_connectivity_probe_url(url: &str) -> bool {
