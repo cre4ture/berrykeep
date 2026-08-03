@@ -36,6 +36,14 @@ use transport_sdk::{
     write_buffered_transport_response, write_transport_response_head,
 };
 
+struct ConnectionDiagnosticsObserverReset;
+
+impl Drop for ConnectionDiagnosticsObserverReset {
+    fn drop(&mut self) {
+        set_connection_diagnostics_observer(None);
+    }
+}
+
 #[test]
 fn direct_quic_route_identity_changes_on_relay_token_rotation_without_exposing_tokens() {
     let mut candidate = ConnectionCandidate {
@@ -177,6 +185,50 @@ fn background_probe_failures_are_scoped_as_maintenance_attempts() {
         attempts[0].impact,
         ClientConnectionDiagnosticImpact::BackgroundMaintenance
     );
+}
+
+#[tokio::test]
+async fn background_probe_refresh_publishes_maintenance_diagnostics() {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("temporary listener should bind");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("listener should bind")
+    );
+    drop(listener);
+
+    let connection_name = "background-probe-diagnostics-test";
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_events = events.clone();
+    set_connection_diagnostics_observer(Some(Arc::new(move |event| {
+        if event.connection_name.as_deref() == Some(connection_name) {
+            captured_events
+                .lock()
+                .expect("captured events lock should not be poisoned")
+                .push(event);
+        }
+    })));
+    let _observer_reset = ConnectionDiagnosticsObserverReset;
+
+    let client = IronMeshClient::from_direct_base_url(endpoint)
+        .with_connection_name(connection_name)
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::UserFacing);
+    client.refresh_connection_route_snapshot().await;
+
+    let events = events
+        .lock()
+        .expect("captured events lock should not be poisoned");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].impact,
+        ClientConnectionDiagnosticImpact::BackgroundMaintenance
+    );
+    let attempts = &events[0].diagnostics.endpoints[0].recent_attempts;
+    assert!(attempts.iter().any(|attempt| {
+        attempt.method == "PROBE"
+            && attempt.outcome == "failure"
+            && attempt.impact == ClientConnectionDiagnosticImpact::BackgroundMaintenance
+    }));
 }
 
 #[test]

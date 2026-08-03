@@ -3184,15 +3184,21 @@ impl IronMeshClient {
             }
         });
 
+        let mut recorded_background_probe_failure = false;
         for (index, result) in join_all(tasks).await {
             match result {
                 Ok(latency_samples_ms) => self
                     .transport_router
                     .record_background_probe_successes(index, &latency_samples_ms),
-                Err(error) => self
-                    .transport_router
-                    .record_background_probe_failure(index, &error.to_string()),
+                Err(error) => {
+                    self.transport_router
+                        .record_background_probe_failure(index, &error.to_string());
+                    recorded_background_probe_failure = true;
+                }
             }
+        }
+        if recorded_background_probe_failure {
+            self.publish_background_connection_diagnostics();
         }
 
         self.connection_route_snapshot()
@@ -3219,15 +3225,21 @@ impl IronMeshClient {
             }
         });
 
+        let mut recorded_background_probe_failure = false;
         for (index, result) in join_all(tasks).await {
             match result {
                 Ok(latency_samples_ms) => self
                     .transport_router
                     .record_background_probe_successes(index, &latency_samples_ms),
-                Err(error) => self
-                    .transport_router
-                    .record_background_probe_failure(index, &error.to_string()),
+                Err(error) => {
+                    self.transport_router
+                        .record_background_probe_failure(index, &error.to_string());
+                    recorded_background_probe_failure = true;
+                }
             }
+        }
+        if recorded_background_probe_failure {
+            self.publish_background_connection_diagnostics();
         }
 
         self.connection_route_snapshot()
@@ -3286,6 +3298,16 @@ impl IronMeshClient {
     }
 
     fn publish_connection_diagnostics(&self) {
+        self.publish_connection_diagnostics_with_impact(self.connection_diagnostic_impact);
+    }
+
+    fn publish_background_connection_diagnostics(&self) {
+        self.publish_connection_diagnostics_with_impact(
+            ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+        );
+    }
+
+    fn publish_connection_diagnostics_with_impact(&self, impact: ClientConnectionDiagnosticImpact) {
         let observer = connection_diagnostics_observer()
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3295,7 +3317,7 @@ impl IronMeshClient {
         };
         observer(ClientConnectionDiagnosticsEvent {
             connection_name: self.connection_name.clone(),
-            impact: self.connection_diagnostic_impact,
+            impact,
             diagnostics: self.connection_diagnostics(),
         });
     }
@@ -3359,6 +3381,7 @@ impl IronMeshClient {
             let transport_router = self.transport_router.clone();
             let auth = self.auth.clone();
             let connection_name = self.connection_name.clone();
+            let diagnostics_client = self.clone();
             tokio::spawn(async move {
                 match probe_endpoint_background_quality(
                     &endpoint,
@@ -3373,6 +3396,7 @@ impl IronMeshClient {
                     }
                     Err(error) => {
                         transport_router.record_background_probe_failure(index, &error.to_string());
+                        diagnostics_client.publish_background_connection_diagnostics();
                     }
                 }
             });
