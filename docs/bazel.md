@@ -91,12 +91,14 @@ The workflow also uses
 at an immutable commit SHA. The action starts an HTTP cache on the runner's
 loopback interface and stores each validated Bazel AC/CAS object in GitHub
 Actions cache v2. It therefore needs no external server, repository secret, or
-manual repository setting. The pinned v0.2.1 action treats the canonical
-SHA-256 zero-byte digest as an implicit CAS object, then validates the complete
-REAPI action-result closure before serving or publishing an action-cache
-entry. If GitHub has independently evicted a referenced CAS object, the
-dangling action result becomes an ordinary cache miss instead of reaching
-Bazel as a lost input; the workflow therefore needs no correctness retry.
+manual repository setting. The pinned v0.2.2 action treats the canonical
+SHA-256 zero-byte digest as an implicit CAS object, coalesces duplicate
+immutable AC/CAS uploads within a runner before rate limiting, then validates
+the complete REAPI action-result closure before serving or publishing an
+action-cache entry. If GitHub has independently evicted a referenced CAS
+object, the dangling action result becomes an ordinary cache miss instead of
+reaching Bazel as a lost input; the workflow therefore needs no correctness
+retry.
 
 Fine-grained remote-cache publication is deliberately opt-in:
 
