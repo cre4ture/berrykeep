@@ -36,6 +36,14 @@ use transport_sdk::{
     write_buffered_transport_response, write_transport_response_head,
 };
 
+struct ConnectionDiagnosticsObserverReset;
+
+impl Drop for ConnectionDiagnosticsObserverReset {
+    fn drop(&mut self) {
+        set_connection_diagnostics_observer(None);
+    }
+}
+
 #[test]
 fn direct_quic_route_identity_changes_on_relay_token_rotation_without_exposing_tokens() {
     let mut candidate = ConnectionCandidate {
@@ -89,6 +97,138 @@ fn client_clones_keep_the_same_connection_runtime_id() {
         client.connection_runtime_id(),
         rebuilt.connection_runtime_id()
     );
+}
+
+#[test]
+fn connection_diagnostic_impact_is_explicit_and_clone_specific() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let maintenance_client = client
+        .clone()
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::BackgroundMaintenance);
+
+    assert_eq!(
+        client.connection_diagnostic_impact(),
+        ClientConnectionDiagnosticImpact::UserFacing
+    );
+    assert_eq!(
+        maintenance_client.connection_diagnostic_impact(),
+        ClientConnectionDiagnosticImpact::BackgroundMaintenance
+    );
+    assert!(ClientConnectionDiagnosticImpact::UserFacing.affects_user_facing_connection_status());
+    assert!(
+        !ClientConnectionDiagnosticImpact::BackgroundMaintenance
+            .affects_user_facing_connection_status()
+    );
+}
+
+#[test]
+fn shared_route_diagnostics_retain_each_attempts_impact() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let maintenance_client = client
+        .clone()
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::BackgroundMaintenance);
+    let foreground_client = client
+        .clone()
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::UserFacing);
+    let request_url = client
+        .relative_url("/api/v1/cluster/status")
+        .expect("relative URL should build");
+
+    maintenance_client.record_request_failure(
+        0,
+        ClientRequestAttemptContext {
+            method: &Method::GET,
+            url: &request_url,
+            timeout: None,
+            started_unix_ms: 1_000,
+            session_pool_before: TransportSessionPoolSnapshot::default(),
+        },
+        "background candidate timed out",
+    );
+    foreground_client.record_request_failure(
+        0,
+        ClientRequestAttemptContext {
+            method: &Method::GET,
+            url: &request_url,
+            timeout: None,
+            started_unix_ms: 2_000,
+            session_pool_before: TransportSessionPoolSnapshot::default(),
+        },
+        "foreground request timed out",
+    );
+
+    let attempts = &foreground_client.connection_diagnostics().endpoints[0].recent_attempts;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].impact,
+        ClientConnectionDiagnosticImpact::BackgroundMaintenance
+    );
+    assert_eq!(
+        attempts[1].impact,
+        ClientConnectionDiagnosticImpact::UserFacing
+    );
+}
+
+#[test]
+fn background_probe_failures_are_scoped_as_maintenance_attempts() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+
+    client
+        .transport_router
+        .record_background_probe_failure(0, "candidate probe timed out");
+
+    let attempts = &client.connection_diagnostics().endpoints[0].recent_attempts;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].method, "PROBE");
+    assert_eq!(attempts[0].outcome, "failure");
+    assert_eq!(
+        attempts[0].impact,
+        ClientConnectionDiagnosticImpact::BackgroundMaintenance
+    );
+}
+
+#[tokio::test]
+async fn background_probe_refresh_publishes_maintenance_diagnostics() {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("temporary listener should bind");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("listener should bind")
+    );
+    drop(listener);
+
+    let connection_name = "background-probe-diagnostics-test";
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_events = events.clone();
+    set_connection_diagnostics_observer(Some(Arc::new(move |event| {
+        if event.connection_name.as_deref() == Some(connection_name) {
+            captured_events
+                .lock()
+                .expect("captured events lock should not be poisoned")
+                .push(event);
+        }
+    })));
+    let _observer_reset = ConnectionDiagnosticsObserverReset;
+
+    let client = IronMeshClient::from_direct_base_url(endpoint)
+        .with_connection_name(connection_name)
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::UserFacing);
+    client.refresh_connection_route_snapshot().await;
+
+    let events = events
+        .lock()
+        .expect("captured events lock should not be poisoned");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].impact,
+        ClientConnectionDiagnosticImpact::BackgroundMaintenance
+    );
+    let attempts = &events[0].diagnostics.endpoints[0].recent_attempts;
+    assert!(attempts.iter().any(|attempt| {
+        attempt.method == "PROBE"
+            && attempt.outcome == "failure"
+            && attempt.impact == ClientConnectionDiagnosticImpact::BackgroundMaintenance
+    }));
 }
 
 #[test]

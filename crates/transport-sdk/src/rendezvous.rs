@@ -1729,7 +1729,6 @@ mod tests {
         let unused_addr = unused_listener
             .local_addr()
             .expect("unused listener should expose addr");
-        drop(unused_listener);
 
         let observed_presence_clusters = Arc::new(Mutex::new(Vec::new()));
         let observed_presence_clusters_for_handler = Arc::clone(&observed_presence_clusters);
@@ -1752,6 +1751,7 @@ mod tests {
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener addr");
+        drop(unused_listener);
         let server = tokio::spawn(async move {
             axum::serve(listener, router)
                 .await

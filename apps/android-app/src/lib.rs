@@ -67,6 +67,7 @@ mod tests {
     fn connection_diagnostics_track_functional_success_separately_from_probe() {
         let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
             connection_name: Some("android-foreground".to_string()),
+            impact: ClientConnectionDiagnosticImpact::UserFacing,
             diagnostics: ClientConnectionDiagnostics {
                 endpoints: vec![client_sdk::ClientEndpointDiagnostics {
                     locator: "https://example.test".to_string(),
@@ -128,6 +129,163 @@ mod tests {
         assert_eq!(
             json["lastSuccessfulFunctionalRequestUrl"],
             serde_json::json!("https://example.test/api/v1/store/index")
+        );
+        assert_eq!(json["impact"], serde_json::json!("user_facing"));
+        assert_eq!(
+            json["failedAttempts"][0]["impact"],
+            serde_json::json!("user_facing")
+        );
+    }
+
+    #[test]
+    fn connection_diagnostics_preserve_background_maintenance_impact() {
+        let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
+            connection_name: None,
+            impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+            diagnostics: ClientConnectionDiagnostics {
+                endpoints: vec![client_sdk::ClientEndpointDiagnostics {
+                    locator: "iroh://candidate".to_string(),
+                    path_kind: "direct".to_string(),
+                    recent_attempts: vec![client_sdk::ClientConnectionAttempt {
+                        started_unix_ms: 900,
+                        finished_unix_ms: Some(1_000),
+                        method: "GET".to_string(),
+                        url: "iroh://candidate/api/v1/cluster/status".to_string(),
+                        impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+                        outcome: "failure".to_string(),
+                        error: Some("candidate timed out".to_string()),
+                        ..client_sdk::ClientConnectionAttempt::default()
+                    }],
+                    ..client_sdk::ClientEndpointDiagnostics::default()
+                }],
+                ..ClientConnectionDiagnostics::default()
+            },
+        });
+
+        assert_eq!(
+            update.impact,
+            ClientConnectionDiagnosticImpact::BackgroundMaintenance
+        );
+        assert_eq!(update.failed_attempts.len(), 1);
+        assert_eq!(
+            update.failed_attempts[0].impact,
+            ClientConnectionDiagnosticImpact::BackgroundMaintenance
+        );
+        let json = serde_json::to_value(update).expect("diagnostics update should serialize");
+        assert_eq!(json["impact"], serde_json::json!("background_maintenance"));
+        assert_eq!(
+            json["failedAttempts"][0]["impact"],
+            serde_json::json!("background_maintenance")
+        );
+    }
+
+    #[test]
+    fn connection_diagnostics_retain_attempt_scope_in_background_published_snapshot() {
+        let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
+            connection_name: None,
+            impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+            diagnostics: ClientConnectionDiagnostics {
+                endpoints: vec![client_sdk::ClientEndpointDiagnostics {
+                    locator: "iroh://candidate".to_string(),
+                    path_kind: "direct".to_string(),
+                    last_user_facing_success_unix_ms: Some(3_000),
+                    last_user_facing_success_url: Some(
+                        "iroh://candidate/api/v1/diagnostics/latency?response_bytes=0".to_string(),
+                    ),
+                    recent_attempts: vec![
+                        client_sdk::ClientConnectionAttempt {
+                            started_unix_ms: 900,
+                            finished_unix_ms: Some(1_000),
+                            method: "PROBE".to_string(),
+                            url: "iroh://candidate/api/v1/cluster/status".to_string(),
+                            impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+                            outcome: "failure".to_string(),
+                            error: Some("candidate timed out".to_string()),
+                            ..client_sdk::ClientConnectionAttempt::default()
+                        },
+                        client_sdk::ClientConnectionAttempt {
+                            started_unix_ms: 1_900,
+                            finished_unix_ms: Some(2_000),
+                            method: "GET".to_string(),
+                            url: "iroh://candidate/api/v1/store/index".to_string(),
+                            impact: ClientConnectionDiagnosticImpact::UserFacing,
+                            outcome: "success".to_string(),
+                            ..client_sdk::ClientConnectionAttempt::default()
+                        },
+                    ],
+                    ..client_sdk::ClientEndpointDiagnostics::default()
+                }],
+                ..ClientConnectionDiagnostics::default()
+            },
+        });
+
+        assert_eq!(update.last_successful_connection_unix_ms, Some(3_000));
+        assert_eq!(
+            update.last_successful_connection_url.as_deref(),
+            Some("iroh://candidate/api/v1/diagnostics/latency?response_bytes=0")
+        );
+        assert_eq!(update.failed_attempts.len(), 1);
+        assert_eq!(
+            update.failed_attempts[0].impact,
+            ClientConnectionDiagnosticImpact::BackgroundMaintenance
+        );
+    }
+
+    #[test]
+    fn connection_diagnostics_retain_user_facing_failures_alongside_background_failures() {
+        let mut recent_attempts = vec![client_sdk::ClientConnectionAttempt {
+            started_unix_ms: 9,
+            finished_unix_ms: Some(10),
+            method: "GET".to_string(),
+            url: "https://example.test/api/v1/store/index".to_string(),
+            impact: ClientConnectionDiagnosticImpact::UserFacing,
+            outcome: "failure".to_string(),
+            error: Some("request timed out".to_string()),
+            ..client_sdk::ClientConnectionAttempt::default()
+        }];
+        recent_attempts.extend((100_u64..109).map(|timestamp| {
+            client_sdk::ClientConnectionAttempt {
+                started_unix_ms: timestamp - 1,
+                finished_unix_ms: Some(timestamp),
+                method: "PROBE".to_string(),
+                url: "iroh://candidate/api/v1/cluster/status".to_string(),
+                impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+                outcome: "failure".to_string(),
+                error: Some("candidate timed out".to_string()),
+                ..client_sdk::ClientConnectionAttempt::default()
+            }
+        }));
+
+        let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
+            connection_name: None,
+            impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+            diagnostics: ClientConnectionDiagnostics {
+                endpoints: vec![client_sdk::ClientEndpointDiagnostics {
+                    locator: "iroh://candidate".to_string(),
+                    path_kind: "direct".to_string(),
+                    recent_attempts,
+                    ..client_sdk::ClientEndpointDiagnostics::default()
+                }],
+                ..ClientConnectionDiagnostics::default()
+            },
+        });
+
+        assert_eq!(update.failed_attempts.len(), 9);
+        assert_eq!(
+            update
+                .failed_attempts
+                .iter()
+                .filter(|attempt| { attempt.impact.affects_user_facing_connection_status() })
+                .count(),
+            1
+        );
+        assert_eq!(
+            update
+                .failed_attempts
+                .iter()
+                .filter(|attempt| { !attempt.impact.affects_user_facing_connection_status() })
+                .count(),
+            8
         );
     }
 
@@ -286,12 +444,12 @@ mod tests {
     }
 }
 use client_sdk::{
-    ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent, ClientIdentityMaterial,
-    ClientNode, ConnectionBootstrap, EnrolledClientConnection, IronMeshClient,
-    ManagedBootstrapPersistence, ManagedClientOptions, ManagedIronMeshClient,
-    StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView,
-    TitleLatencyMonitor, TitleLatencyProbeConfig, enroll_client_connection_blocking,
-    set_connection_diagnostics_observer,
+    ClientConnectionDiagnosticImpact, ClientConnectionDiagnostics,
+    ClientConnectionDiagnosticsEvent, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
+    EnrolledClientConnection, IronMeshClient, ManagedBootstrapPersistence, ManagedClientOptions,
+    ManagedIronMeshClient, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
+    StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig,
+    enroll_client_connection_blocking, set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -442,6 +600,7 @@ struct AndroidPreferencesBridgeState {
 #[serde(rename_all = "camelCase")]
 struct AndroidAppConnectionDiagnosticsUpdate {
     source_label: Option<String>,
+    impact: ClientConnectionDiagnosticImpact,
     last_successful_connection_unix_ms: Option<u64>,
     last_successful_connection_url: Option<String>,
     last_successful_functional_request_unix_ms: Option<u64>,
@@ -453,6 +612,7 @@ struct AndroidAppConnectionDiagnosticsUpdate {
 #[serde(rename_all = "camelCase")]
 struct AndroidAppFailedConnectionAttempt {
     source_label: Option<String>,
+    impact: ClientConnectionDiagnosticImpact,
     endpoint_locator: String,
     path_kind: String,
     started_unix_ms: u64,
@@ -594,11 +754,18 @@ fn install_android_connection_diagnostics_bridge() {
     });
 }
 
+const MAX_ANDROID_USER_FACING_FAILED_ATTEMPTS: usize = 8;
+const MAX_ANDROID_BACKGROUND_FAILED_ATTEMPTS: usize = 8;
+
 fn summarize_android_connection_diagnostics(
     event: ClientConnectionDiagnosticsEvent,
 ) -> AndroidAppConnectionDiagnosticsUpdate {
-    let source_label = event
-        .connection_name
+    let ClientConnectionDiagnosticsEvent {
+        connection_name,
+        impact,
+        diagnostics,
+    } = event;
+    let source_label = connection_name
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let mut last_successful_connection_unix_ms = None;
@@ -607,25 +774,43 @@ fn summarize_android_connection_diagnostics(
     let mut last_successful_functional_request_url = None;
     let mut failed_attempts = Vec::new();
 
-    for endpoint in event.diagnostics.endpoints {
-        if let Some(last_success) = endpoint.last_success_unix_ms
+    for endpoint in diagnostics.endpoints {
+        if let Some(last_success) = endpoint.last_user_facing_success_unix_ms
             && last_successful_connection_unix_ms.is_none_or(|current| last_success >= current)
         {
             last_successful_connection_unix_ms = Some(last_success);
             last_successful_connection_url = endpoint
-                .recent_attempts
-                .iter()
-                .rev()
-                .find(|attempt| attempt.outcome == "success")
-                .map(|attempt| attempt.url.clone())
+                .last_user_facing_success_url
+                .clone()
+                .or_else(|| {
+                    endpoint
+                        .recent_attempts
+                        .iter()
+                        .rev()
+                        .find(|attempt| {
+                            attempt.outcome == "success"
+                                && attempt.impact.affects_user_facing_connection_status()
+                        })
+                        .map(|attempt| attempt.url.clone())
+                })
                 .or_else(|| Some(endpoint.locator.clone()));
         }
 
         for attempt in &endpoint.recent_attempts {
-            if attempt.outcome != "success" || is_android_connectivity_probe_url(&attempt.url) {
+            if attempt.outcome != "success"
+                || !attempt.impact.affects_user_facing_connection_status()
+            {
                 continue;
             }
             let finished_unix_ms = attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms);
+            if last_successful_connection_unix_ms.is_none_or(|current| finished_unix_ms >= current)
+            {
+                last_successful_connection_unix_ms = Some(finished_unix_ms);
+                last_successful_connection_url = Some(attempt.url.clone());
+            }
+            if is_android_connectivity_probe_url(&attempt.url) {
+                continue;
+            }
             if last_successful_functional_request_unix_ms
                 .is_none_or(|current| finished_unix_ms >= current)
             {
@@ -641,6 +826,7 @@ fn summarize_android_connection_diagnostics(
                 .filter(|attempt| attempt.outcome == "failure")
                 .map(|attempt| AndroidAppFailedConnectionAttempt {
                     source_label: source_label.clone(),
+                    impact: attempt.impact,
                     endpoint_locator: endpoint.locator.clone(),
                     path_kind: endpoint.path_kind.clone(),
                     started_unix_ms: attempt.started_unix_ms,
@@ -653,21 +839,60 @@ fn summarize_android_connection_diagnostics(
         );
     }
 
-    failed_attempts.sort_by(|left, right| {
-        let left_ts = left.finished_unix_ms.unwrap_or(left.started_unix_ms);
-        let right_ts = right.finished_unix_ms.unwrap_or(right.started_unix_ms);
-        right_ts.cmp(&left_ts)
-    });
-    failed_attempts.truncate(8);
+    failed_attempts = retain_android_failed_attempts_by_impact(failed_attempts);
 
     AndroidAppConnectionDiagnosticsUpdate {
         source_label,
+        impact,
         last_successful_connection_unix_ms,
         last_successful_connection_url,
         last_successful_functional_request_unix_ms,
         last_successful_functional_request_url,
         failed_attempts,
     }
+}
+
+fn retain_android_failed_attempts_by_impact(
+    failed_attempts: Vec<AndroidAppFailedConnectionAttempt>,
+) -> Vec<AndroidAppFailedConnectionAttempt> {
+    let mut user_facing = Vec::new();
+    let mut background_maintenance = Vec::new();
+
+    for attempt in failed_attempts {
+        if attempt.impact.affects_user_facing_connection_status() {
+            user_facing.push(attempt);
+        } else {
+            background_maintenance.push(attempt);
+        }
+    }
+
+    retain_recent_android_failed_attempts(
+        &mut user_facing,
+        MAX_ANDROID_USER_FACING_FAILED_ATTEMPTS,
+    );
+    retain_recent_android_failed_attempts(
+        &mut background_maintenance,
+        MAX_ANDROID_BACKGROUND_FAILED_ATTEMPTS,
+    );
+    user_facing.extend(background_maintenance);
+    sort_android_failed_attempts(&mut user_facing);
+    user_facing
+}
+
+fn retain_recent_android_failed_attempts(
+    failed_attempts: &mut Vec<AndroidAppFailedConnectionAttempt>,
+    limit: usize,
+) {
+    sort_android_failed_attempts(failed_attempts);
+    failed_attempts.truncate(limit);
+}
+
+fn sort_android_failed_attempts(failed_attempts: &mut [AndroidAppFailedConnectionAttempt]) {
+    failed_attempts.sort_by(|left, right| {
+        let left_ts = left.finished_unix_ms.unwrap_or(left.started_unix_ms);
+        let right_ts = right.finished_unix_ms.unwrap_or(right.started_unix_ms);
+        right_ts.cmp(&left_ts)
+    });
 }
 
 fn is_android_connectivity_probe_url(url: &str) -> bool {
@@ -757,6 +982,7 @@ fn log_android_connection_diagnostics(update: &AndroidAppConnectionDiagnosticsUp
         tracing::debug!(
             target: ANDROID_CONNECTION_LOG_TARGET,
             source_label = %source_label,
+            impact = ?update.impact,
             outcome = "failure",
             endpoint_locator = %attempt.endpoint_locator,
             path_kind = %attempt.path_kind,
@@ -780,6 +1006,7 @@ fn log_android_connection_diagnostics(update: &AndroidAppConnectionDiagnosticsUp
     tracing::debug!(
         target: ANDROID_CONNECTION_LOG_TARGET,
         source_label = %source_label,
+        impact = ?update.impact,
         outcome = "success",
         last_successful_connection_unix_ms = ?update.last_successful_connection_unix_ms,
         last_successful_connection_url = ?update.last_successful_connection_url,
