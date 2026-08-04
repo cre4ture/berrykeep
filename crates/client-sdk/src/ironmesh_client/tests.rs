@@ -4683,7 +4683,7 @@ async fn background_probe_reprioritizes_recovered_direct_endpoint() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refresh_connection_route_snapshot_times_out_stalled_probe() {
-    let stalled_delay_ms = duration_to_u64_ms(CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT)
+    let stalled_delay_ms = duration_to_u64_ms(CLIENT_ROUTE_INITIAL_BACKGROUND_PROBE_TIMEOUT)
         .expect("probe timeout should fit into u64")
         + 250;
     let (stalled_url, stalled_state, stalled_server) =
@@ -4698,7 +4698,7 @@ async fn refresh_connection_route_snapshot_times_out_stalled_probe() {
     .expect("combined direct client should build");
 
     let snapshot = tokio::time::timeout(
-        CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT + Duration::from_secs(1),
+        CLIENT_ROUTE_INITIAL_BACKGROUND_PROBE_TIMEOUT + Duration::from_secs(1),
         client.refresh_connection_route_snapshot(),
     )
     .await

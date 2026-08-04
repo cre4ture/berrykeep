@@ -3441,11 +3441,14 @@ impl IronMeshClient {
             .endpoints_snapshot()
             .into_iter()
             .enumerate()
-            .map(|(claimed_index, endpoint)| BackgroundProbeCandidate {
-                claimed_index,
-                route_key: endpoint.descriptor.route_key.clone(),
-                endpoint,
-                timeout: CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
+            .map(|(claimed_index, endpoint)| {
+                let timeout = background_probe_timeout(&lock_endpoint_state(&endpoint.state));
+                BackgroundProbeCandidate {
+                    claimed_index,
+                    route_key: endpoint.descriptor.route_key.clone(),
+                    endpoint,
+                    timeout,
+                }
             })
             .collect::<Vec<_>>();
         for candidate in &candidates {
