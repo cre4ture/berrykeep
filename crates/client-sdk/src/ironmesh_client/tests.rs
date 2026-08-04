@@ -368,12 +368,17 @@ fn completed_probe_does_not_update_replaced_endpoint_with_same_route_key() {
     let replacement = IronMeshClient::combine(vec![static_route(), dynamic_route()])
         .expect("replacement routes should combine");
     client.reconcile_transport_membership(&replacement);
-    client
+    let recorded = client
         .transport_router
         .record_background_probe_candidate_successes(&candidate, &[5.0]);
+    assert!(
+        !recorded,
+        "a replaced endpoint must reject the stale result"
+    );
 
-    let replacement_snapshot = client
-        .connection_route_snapshot()
+    let snapshot = client.connection_route_snapshot();
+    assert_eq!(snapshot.active_index, Some(0));
+    let replacement_snapshot = snapshot
         .endpoints
         .into_iter()
         .find(|endpoint| endpoint.locator.contains(":18081"))

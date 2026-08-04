@@ -896,15 +896,32 @@ impl ClientEndpointRouter {
 
     /// A successful background probe both validates a route and allows it to
     /// become active when it beats the current active route even after the
-    /// active-route hysteresis bonus. This preserves background optimization
-    /// while foreground requests remain active-first.
-    fn promote_validated_route_if_better(&self, index: usize) {
-        let Some(candidate) = self.endpoint(index) else {
+    /// active-route hysteresis bonus. Route membership stays read-locked while
+    /// scoring, and the active key is changed only if it did not change during
+    /// the decision. This prevents a concurrent reconciliation from turning a
+    /// candidate's old positional index into a different route.
+    fn promote_validated_background_candidate_if_better(
+        &self,
+        candidate: &BackgroundProbeCandidate,
+    ) {
+        let endpoints = self
+            .endpoints
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(index) = endpoints.iter().position(|endpoint| {
+            endpoint.descriptor.route_key == candidate.route_key
+                && Arc::ptr_eq(&endpoint.state, &candidate.endpoint.state)
+        }) else {
             return;
         };
         let now_unix_ms = unix_ts_ms();
-        let active_index = self.active_index();
-        let candidate_state = lock_endpoint_state(&candidate.state);
+        let expected_active_route_key = self.active_route_key();
+        let active_index = expected_active_route_key.as_ref().and_then(|route_key| {
+            endpoints
+                .iter()
+                .position(|endpoint| endpoint.descriptor.route_key == *route_key)
+        });
+        let candidate_state = lock_endpoint_state(&candidate.endpoint.state);
         if !candidate_state.foreground_validated
             || candidate_state
                 .circuit_open_until_unix_ms
@@ -914,7 +931,12 @@ impl ClientEndpointRouter {
         }
         let Some(active_index) = active_index else {
             drop(candidate_state);
-            self.set_active_index(index);
+            self.set_active_background_candidate_if_unchanged(
+                expected_active_route_key.as_deref(),
+                index,
+                &candidate.endpoint,
+                None,
+            );
             return;
         };
         if active_index == index {
@@ -923,17 +945,12 @@ impl ClientEndpointRouter {
         let candidate_score = endpoint_score(
             index,
             Some(active_index),
-            &candidate.descriptor,
+            &candidate.endpoint.descriptor,
             &candidate_state,
         );
         drop(candidate_state);
 
-        let Some(active) = self.endpoint(active_index) else {
-            if self.active_index() == Some(active_index) {
-                self.set_active_index(index);
-            }
-            return;
-        };
+        let active = &endpoints[active_index];
         let active_state = lock_endpoint_state(&active.state);
         let active_is_cooling = active_state
             .circuit_open_until_unix_ms
@@ -950,9 +967,44 @@ impl ClientEndpointRouter {
         let should_promote = !active_is_validated
             || active_is_cooling
             || compare_scores(candidate_score, active_score, index, active_index).is_lt();
-        if should_promote && self.active_index() == Some(active_index) {
-            self.set_active_index(index);
+        if should_promote {
+            self.set_active_background_candidate_if_unchanged(
+                expected_active_route_key.as_deref(),
+                index,
+                &candidate.endpoint,
+                Some(active_index),
+            );
         }
+    }
+
+    fn set_active_background_candidate_if_unchanged(
+        &self,
+        expected_active_route_key: Option<&str>,
+        candidate_index: usize,
+        candidate: &ClientEndpoint,
+        previous_active_index: Option<usize>,
+    ) {
+        let mut active_route_key = self
+            .active_route_key
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active_route_key.as_deref() != expected_active_route_key {
+            return;
+        }
+        active_route_key.clone_from(&Some(candidate.descriptor.route_key.clone()));
+        drop(active_route_key);
+
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "selected_route_index",
+            selected_route_index = candidate_index,
+            candidate_index,
+            path_kind = transport_path_kind_label(candidate.transport.transport_path_kind()),
+            locator = %candidate.descriptor.locator,
+            previous_active_index = ?previous_active_index,
+            selection_phase = "active_after_success",
+            "selected_route_index"
+        );
     }
 
     fn claim_background_probe_candidates(&self) -> Vec<BackgroundProbeCandidate> {
@@ -987,54 +1039,30 @@ impl ClientEndpointRouter {
         claimed
     }
 
-    fn registered_background_probe_index(
+    fn registered_background_probe_endpoint(
         &self,
         candidate: &BackgroundProbeCandidate,
-    ) -> Option<usize> {
-        self.endpoints_snapshot().iter().position(|endpoint| {
-            endpoint.descriptor.route_key == candidate.route_key
-                && Arc::ptr_eq(&endpoint.state, &candidate.endpoint.state)
-        })
+    ) -> Option<(usize, ClientEndpoint)> {
+        self.endpoints_snapshot()
+            .into_iter()
+            .enumerate()
+            .find(|(_, endpoint)| {
+                endpoint.descriptor.route_key == candidate.route_key
+                    && Arc::ptr_eq(&endpoint.state, &candidate.endpoint.state)
+            })
     }
 
     fn record_background_probe_candidate_successes(
         &self,
         candidate: &BackgroundProbeCandidate,
         latency_samples_ms: &[f64],
-    ) {
-        if let Some(index) = self.registered_background_probe_index(candidate) {
-            self.record_background_probe_successes(index, latency_samples_ms);
-        }
-    }
-
-    fn record_background_probe_candidate_failure(
-        &self,
-        candidate: &BackgroundProbeCandidate,
-        error: &str,
-    ) {
-        if let Some(index) = self.registered_background_probe_index(candidate) {
-            self.record_background_probe_failure(index, error);
-        }
-    }
-
-    fn record_failure(&self, index: usize, error: &str) {
-        let Some(endpoint) = self.endpoint(index) else {
-            return;
-        };
-        let had_selectable_route = self.has_selectable_route();
-        let mut state = lock_endpoint_state(&endpoint.state);
-        record_endpoint_failure_sample(&mut state, error, false);
-        drop(state);
-        self.notify_transport_failure_when_exhausted(had_selectable_route);
-    }
-
-    fn record_background_probe_successes(&self, index: usize, latency_samples_ms: &[f64]) {
-        let Some(endpoint) = self.endpoint(index) else {
-            return;
+    ) -> bool {
+        let Some((_index, endpoint)) = self.registered_background_probe_endpoint(candidate) else {
+            return false;
         };
         let probe_succeeded = !latency_samples_ms.is_empty();
         let mut state = lock_endpoint_state(&endpoint.state);
-        let first_relay_connection = !latency_samples_ms.is_empty()
+        let first_relay_connection = probe_succeeded
             && state.total_successes == 0
             && endpoint.transport.relay_target_node_id().is_some();
         for (sample_index, latency_ms) in latency_samples_ms.iter().copied().enumerate() {
@@ -1049,17 +1077,26 @@ impl ClientEndpointRouter {
             state.background_probe_in_flight = false;
         }
         drop(state);
+
         if probe_succeeded {
-            self.promote_validated_route_if_better(index);
+            self.promote_validated_background_candidate_if_better(candidate);
         }
-        if first_relay_connection {
-            self.notify_first_relay_connection(index, &endpoint);
+        if first_relay_connection
+            && let Some((current_index, current_endpoint)) =
+                self.registered_background_probe_endpoint(candidate)
+        {
+            self.notify_first_relay_connection(current_index, &current_endpoint);
         }
+        true
     }
 
-    fn record_background_probe_failure(&self, index: usize, error: &str) {
-        let Some(endpoint) = self.endpoint(index) else {
-            return;
+    fn record_background_probe_candidate_failure(
+        &self,
+        candidate: &BackgroundProbeCandidate,
+        error: &str,
+    ) -> bool {
+        let Some((_index, endpoint)) = self.registered_background_probe_endpoint(candidate) else {
+            return false;
         };
         let mut state = lock_endpoint_state(&endpoint.state);
         let started_unix_ms = state
@@ -1086,8 +1123,74 @@ impl ClientEndpointRouter {
         );
         drop(state);
         if is_timeout_error_message(error) {
-            self.log_timeout_route_not_switched(index, error);
+            self.log_background_probe_timeout(candidate, error);
         }
+        true
+    }
+
+    fn record_failure(&self, index: usize, error: &str) {
+        let Some(endpoint) = self.endpoint(index) else {
+            return;
+        };
+        let had_selectable_route = self.has_selectable_route();
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_failure_sample(&mut state, error, false);
+        drop(state);
+        self.notify_transport_failure_when_exhausted(had_selectable_route);
+    }
+
+    #[cfg(test)]
+    fn record_background_probe_successes(&self, index: usize, latency_samples_ms: &[f64]) {
+        let Some(candidate) = self.background_probe_candidate_at_index(index) else {
+            return;
+        };
+        self.record_background_probe_candidate_successes(&candidate, latency_samples_ms);
+    }
+
+    #[cfg(test)]
+    fn record_background_probe_failure(&self, index: usize, error: &str) {
+        let Some(candidate) = self.background_probe_candidate_at_index(index) else {
+            return;
+        };
+        self.record_background_probe_candidate_failure(&candidate, error);
+    }
+
+    #[cfg(test)]
+    fn background_probe_candidate_at_index(
+        &self,
+        index: usize,
+    ) -> Option<BackgroundProbeCandidate> {
+        let endpoint = self.endpoint(index)?;
+        Some(BackgroundProbeCandidate {
+            claimed_index: index,
+            route_key: endpoint.descriptor.route_key.clone(),
+            endpoint,
+            timeout: CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
+        })
+    }
+
+    fn log_background_probe_timeout(
+        &self,
+        candidate: &BackgroundProbeCandidate,
+        timeout_error: &str,
+    ) {
+        let Some((candidate_index, endpoint)) =
+            self.registered_background_probe_endpoint(candidate)
+        else {
+            return;
+        };
+        tracing::warn!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "route_not_switched_reason",
+            candidate_index,
+            timed_out_route_key = %candidate.route_key,
+            locator = %endpoint.descriptor.locator,
+            active_route_key = ?self.active_route_key(),
+            route_not_switched_reason =
+                "background_probe_failed_and_route_promotion_requires_success",
+            timeout_error = %timeout_error,
+            "route_not_switched_reason"
+        );
     }
 
     fn snapshot(&self) -> ClientConnectionRouteSnapshot {
@@ -3367,13 +3470,17 @@ impl IronMeshClient {
         let mut recorded_background_probe_failure = false;
         for (candidate, result) in join_all(tasks).await {
             match result {
-                Ok(latency_samples_ms) => self
-                    .transport_router
-                    .record_background_probe_candidate_successes(&candidate, &latency_samples_ms),
-                Err(error) => {
+                Ok(latency_samples_ms) => {
                     self.transport_router
+                        .record_background_probe_candidate_successes(
+                            &candidate,
+                            &latency_samples_ms,
+                        );
+                }
+                Err(error) => {
+                    recorded_background_probe_failure |= self
+                        .transport_router
                         .record_background_probe_candidate_failure(&candidate, &error.to_string());
-                    recorded_background_probe_failure = true;
                 }
             }
         }
@@ -3412,13 +3519,17 @@ impl IronMeshClient {
         let mut recorded_background_probe_failure = false;
         for (candidate, result) in join_all(tasks).await {
             match result {
-                Ok(latency_samples_ms) => self
-                    .transport_router
-                    .record_background_probe_candidate_successes(&candidate, &latency_samples_ms),
-                Err(error) => {
+                Ok(latency_samples_ms) => {
                     self.transport_router
+                        .record_background_probe_candidate_successes(
+                            &candidate,
+                            &latency_samples_ms,
+                        );
+                }
+                Err(error) => {
+                    recorded_background_probe_failure |= self
+                        .transport_router
                         .record_background_probe_candidate_failure(&candidate, &error.to_string());
-                    recorded_background_probe_failure = true;
                 }
             }
         }
@@ -3580,11 +3691,13 @@ impl IronMeshClient {
                         );
                     }
                     Err(error) => {
-                        transport_router.record_background_probe_candidate_failure(
+                        let recorded = transport_router.record_background_probe_candidate_failure(
                             &candidate,
                             &error.to_string(),
                         );
-                        diagnostics_client.publish_background_connection_diagnostics();
+                        if recorded {
+                            diagnostics_client.publish_background_connection_diagnostics();
+                        }
                     }
                 }
             });
