@@ -9,10 +9,13 @@ use tokio::{
     sync::{Mutex as AsyncMutex, mpsc},
 };
 
+use crate::connection::{
+    build_unprobed_client_with_optional_identity_from_planned_targets, planned_transport_route_key,
+};
 use crate::{
     ClientConnectionDiagnosticImpact, ClientConnectionRouteEndpointSnapshot,
     ClientConnectionRouteSnapshot, ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
-    PlannedConnectionBootstrapTarget, build_client_with_optional_identity_from_planned_targets,
+    PlannedConnectionBootstrapTarget,
 };
 
 const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
@@ -572,7 +575,6 @@ impl ManagedIronMeshClient {
         tokio::pin!(discovery);
 
         let mut changes = RouteMembershipChanges::default();
-        let mut preserve_existing = !identity_updated;
         let refreshed_targets = loop {
             tokio::select! {
                 Some(targets) = updates_receiver.recv() => {
@@ -580,7 +582,6 @@ impl ManagedIronMeshClient {
                         .adopt_discovered_targets(
                             targets,
                             identity.clone(),
-                            preserve_existing,
                             telemetry.reason,
                             "partial",
                         )
@@ -604,10 +605,6 @@ impl ManagedIronMeshClient {
                         }
                     };
                     changes.record(membership);
-                    // An identity renewal must replace the existing transports once. Later
-                    // partial updates retain the newly created sessions instead of rebuilding
-                    // them while another node is still being discovered.
-                    preserve_existing = true;
                 }
                 result = &mut discovery => break result,
             }
@@ -637,13 +634,7 @@ impl ManagedIronMeshClient {
         // the first usable candidate alive through final reconciliation.
         while let Ok(targets) = updates_receiver.try_recv() {
             let membership = match self
-                .adopt_discovered_targets(
-                    targets,
-                    identity.clone(),
-                    preserve_existing,
-                    telemetry.reason,
-                    "partial",
-                )
+                .adopt_discovered_targets(targets, identity.clone(), telemetry.reason, "partial")
                 .await
             {
                 Ok(membership) => membership,
@@ -666,17 +657,10 @@ impl ManagedIronMeshClient {
                 }
             };
             changes.record(membership);
-            preserve_existing = true;
         }
 
         let membership = match self
-            .adopt_discovered_targets(
-                refreshed_targets,
-                identity,
-                preserve_existing,
-                telemetry.reason,
-                "complete",
-            )
+            .adopt_discovered_targets(refreshed_targets, identity, telemetry.reason, "complete")
             .await
         {
             Ok(membership) => membership,
@@ -719,13 +703,12 @@ impl ManagedIronMeshClient {
         &self,
         refreshed_targets: Vec<PlannedConnectionBootstrapTarget>,
         identity: Option<ClientIdentityMaterial>,
-        preserve_existing: bool,
         refresh_reason: RouteRefreshReason,
         discovery_update: &'static str,
     ) -> Result<(usize, usize, usize)> {
         let desired_targets = self.reconcile_target_set(refreshed_targets);
         let refreshed_client = tokio::task::spawn_blocking(move || {
-            build_client_with_optional_identity_from_planned_targets(
+            build_unprobed_client_with_optional_identity_from_planned_targets(
                 &desired_targets,
                 identity.as_ref(),
             )
@@ -736,18 +719,19 @@ impl ManagedIronMeshClient {
         let routes_before = self.client.connection_route_snapshot();
         let membership = self
             .client
-            .reconcile_transport_membership(&refreshed_client, preserve_existing);
+            .reconcile_transport_membership(&refreshed_client);
         let routes_after = self.client.connection_route_snapshot();
         log_dynamic_route_membership_changes(&routes_before, &routes_after);
-        if membership.0 > 0 {
+        let routes_scheduled = self.client.spawn_due_connection_route_refresh();
+        if routes_scheduled > 0 {
             tracing::info!(
                 event = "dynamic_route_probe_scheduled",
                 refresh_reason = refresh_reason.as_str(),
                 discovery_update,
                 routes_added = membership.0,
-                "probing newly discovered routes without blocking the active fallback"
+                routes_scheduled,
+                "probing due discovered routes without blocking the active fallback"
             );
-            self.client.spawn_due_connection_route_refresh();
         }
         Ok(membership)
     }
@@ -1055,10 +1039,7 @@ fn refresh_attempt_is_coalesced(
 }
 
 fn planned_target_key(target: &PlannedConnectionBootstrapTarget) -> String {
-    // The target is normalized and validated by ConnectionBootstrap before it is
-    // passed here. JSON preserves all transport-relevant fields (including direct
-    // QUIC endpoint ID, ALPN, and relay identity) without relying on vector indices.
-    serde_json::to_string(target).unwrap_or_else(|_| {
+    planned_transport_route_key(target).unwrap_or_else(|_| {
         format!(
             "{:?}#{:?}#{:?}",
             target.path_kind, target.target_node_id, target.server_base_url

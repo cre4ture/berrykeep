@@ -254,7 +254,7 @@ fn route_reconciliation_preserves_static_state_and_retires_dynamic_routes() {
     .expect("refreshed routes should combine");
 
     let runtime_id = static_client.connection_runtime_id();
-    let (added, removed, retained) = static_client.reconcile_transport_membership(&refreshed, true);
+    let (added, removed, retained) = static_client.reconcile_transport_membership(&refreshed);
     assert_eq!((added, removed, retained), (1, 0, 1));
     assert_eq!(static_client.connection_runtime_id(), runtime_id);
     let retained_endpoint = static_client
@@ -274,10 +274,133 @@ fn route_reconciliation_preserves_static_state_and_retires_dynamic_routes() {
     );
 
     let static_only = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
-    let (added, removed, retained) =
-        static_client.reconcile_transport_membership(&static_only, true);
+    let (added, removed, retained) = static_client.reconcile_transport_membership(&static_only);
     assert_eq!((added, removed, retained), (0, 1, 1));
     assert_eq!(static_client.connection_route_snapshot().endpoints.len(), 1);
+}
+
+#[test]
+fn reintroduced_failed_route_retains_backoff_without_reusing_transport() {
+    let target_node_id = NodeId::new_v4();
+    let static_route = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let dynamic_route = || {
+        IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+            ConnectionCandidate {
+                kind: CandidateKind::DirectQuic,
+                endpoint: "iroh://retired-dynamic-node".to_string(),
+                rtt_ms: None,
+                transport_hints: None,
+            },
+            Some(target_node_id),
+        )
+    };
+    let client = IronMeshClient::combine(vec![static_route(), dynamic_route()])
+        .expect("initial routes should combine");
+    let retired_endpoint = client
+        .transport_router
+        .endpoint(1)
+        .expect("dynamic endpoint should exist");
+    record_endpoint_failure_sample(
+        &mut lock_endpoint_state(&retired_endpoint.state),
+        "simulated route failure",
+        true,
+    );
+    let failed_snapshot = client.connection_route_snapshot().endpoints[1].clone();
+
+    client.reconcile_transport_membership(&static_route());
+    let replacement = IronMeshClient::combine(vec![static_route(), dynamic_route()])
+        .expect("replacement routes should combine");
+    client.reconcile_transport_membership(&replacement);
+
+    let reintroduced_endpoint = client
+        .transport_router
+        .endpoint(1)
+        .expect("dynamic endpoint should be reintroduced");
+    assert!(
+        !Arc::ptr_eq(&retired_endpoint.state, &reintroduced_endpoint.state),
+        "a tombstone must not retain the old endpoint or session pool"
+    );
+    let reintroduced_snapshot = &client.connection_route_snapshot().endpoints[1];
+    assert_eq!(reintroduced_snapshot.consecutive_failures, 1);
+    assert_eq!(
+        reintroduced_snapshot.circuit_open_until_unix_ms,
+        failed_snapshot.circuit_open_until_unix_ms
+    );
+    assert!(
+        client
+            .transport_router
+            .claim_background_probe_candidates()
+            .is_empty(),
+        "the next route update must not immediately reclaim a cooling route"
+    );
+}
+
+#[test]
+fn first_background_probe_gets_startup_budget_but_retries_keep_short_budget() {
+    let mut state = ClientEndpointState::default();
+    assert_eq!(
+        background_probe_timeout(&state),
+        CLIENT_ROUTE_INITIAL_BACKGROUND_PROBE_TIMEOUT
+    );
+
+    state.last_measurement_unix_ms = Some(unix_ts_ms());
+    state.consecutive_failures = 1;
+    assert_eq!(
+        background_probe_timeout(&state),
+        CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT
+    );
+}
+
+#[test]
+fn completed_probe_does_not_update_replaced_endpoint_with_same_route_key() {
+    let static_route = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let dynamic_route = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18081/");
+    let client = IronMeshClient::combine(vec![static_route(), dynamic_route()])
+        .expect("initial routes should combine");
+    let candidate = client
+        .transport_router
+        .claim_background_probe_candidates()
+        .into_iter()
+        .find(|candidate| candidate.endpoint.descriptor.locator.contains(":18081"))
+        .expect("dynamic route should be claimed");
+
+    client.reconcile_transport_membership(&static_route());
+    let replacement = IronMeshClient::combine(vec![static_route(), dynamic_route()])
+        .expect("replacement routes should combine");
+    client.reconcile_transport_membership(&replacement);
+    client
+        .transport_router
+        .record_background_probe_candidate_successes(&candidate, &[5.0]);
+
+    let replacement_snapshot = client
+        .connection_route_snapshot()
+        .endpoints
+        .into_iter()
+        .find(|endpoint| endpoint.locator.contains(":18081"))
+        .expect("replacement route should exist");
+    assert_eq!(replacement_snapshot.total_successes, 0);
+    assert!(replacement_snapshot.last_measurement_unix_ms.is_none());
+}
+
+#[test]
+fn route_reconciliation_updates_shared_request_identity() {
+    let cluster_id = Uuid::now_v7();
+    let original_identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+        .expect("original identity should generate");
+    let renewed_identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+        .expect("renewed identity should generate");
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/")
+        .with_client_identity(original_identity);
+    let shared_clone = client.clone();
+    let refreshed = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/")
+        .with_client_identity(renewed_identity.clone());
+
+    client.reconcile_transport_membership(&refreshed);
+
+    let ClientRequestAuth::SignedIdentity(adopted_identity) = shared_clone.auth_snapshot() else {
+        panic!("renewed signed identity should remain configured");
+    };
+    assert_eq!(adopted_identity.device_id, renewed_identity.device_id);
 }
 
 #[tokio::test]
@@ -298,7 +421,7 @@ async fn newly_discovered_direct_quic_is_ranked_first_and_probed() {
     ])
     .expect("refreshed routes should combine");
 
-    static_client.reconcile_transport_membership(&refreshed, true);
+    static_client.reconcile_transport_membership(&refreshed);
     let before_probe = static_client.connection_route_snapshot();
     let direct_quic = before_probe
         .endpoints
@@ -2822,7 +2945,7 @@ async fn relay_buffered_request_enforces_total_deadline() {
     let ClientTransport::Relay(relay) = &endpoint.transport else {
         panic!("test client should use relay transport");
     };
-    let source = relay_source_identity_for_auth(&client.auth)
+    let source = relay_source_identity_for_auth(&client.auth_snapshot())
         .expect("relay source identity should be available");
     let url = client
         .relative_url("/cluster/status")
@@ -3199,7 +3322,7 @@ async fn relay_streamed_upload_chunk_enforces_response_head_deadline() {
     let ClientTransport::Relay(relay) = &endpoint.transport else {
         panic!("test client should use relay transport");
     };
-    let source = relay_source_identity_for_auth(&client.auth)
+    let source = relay_source_identity_for_auth(&client.auth_snapshot())
         .expect("relay source identity should be available");
     let url = client
         .relative_url("/store/uploads/upload-timeout/chunk/3")
@@ -3442,7 +3565,7 @@ async fn upload_session_affinity_survives_route_reconciliation_during_start() {
         ),
     ])
     .expect("reordered direct client should build");
-    client.reconcile_transport_membership(&reordered_routes, true);
+    client.reconcile_transport_membership(&reordered_routes);
     start_gate.release_response.notify_one();
 
     let session = start_task
@@ -3977,7 +4100,8 @@ async fn single_direct_buffered_request_enforces_total_deadline() {
         else {
             panic!("test client should use direct HTTP multiplex transport");
         };
-        let ClientRequestAuth::SignedIdentity(identity) = &client.auth else {
+        let auth = client.auth_snapshot();
+        let ClientRequestAuth::SignedIdentity(identity) = &auth else {
             panic!("test client should have signed identity");
         };
         let direct = DirectMultiplexSessionContext {

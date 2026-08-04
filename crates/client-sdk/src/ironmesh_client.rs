@@ -58,8 +58,10 @@ const CLIENT_ROUTE_FAILURE_PENALTY_MS: f64 = 250.0;
 const CLIENT_ROUTE_ACTIVE_BONUS_MS: f64 = 50.0;
 const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
 const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
+const CLIENT_ROUTE_RETIRED_FAILURE_STATE_TTL_MS: u64 = 10 * 60 * 1_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
+const CLIENT_ROUTE_INITIAL_BACKGROUND_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT: usize = 1;
 const CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT: usize = 3;
@@ -90,7 +92,7 @@ impl std::fmt::Display for RequestedRange {
 #[derive(Clone)]
 pub struct IronMeshClient {
     transport_router: ClientEndpointRouter,
-    auth: ClientRequestAuth,
+    auth: Arc<RwLock<ClientRequestAuth>>,
     connection_name: Option<String>,
     connection_diagnostic_impact: ClientConnectionDiagnosticImpact,
     upload_session_affinities: Arc<Mutex<HashMap<String, UploadSessionAffinity>>>,
@@ -262,6 +264,7 @@ struct ClientEndpointRouter {
     /// never holds this lock across a request or a probe.
     endpoints: Arc<RwLock<Vec<ClientEndpoint>>>,
     active_route_key: Arc<RwLock<Option<String>>>,
+    retired_failure_states: Arc<std::sync::Mutex<HashMap<String, RetiredRouteFailureState>>>,
     transport_failure_refresh_observer: Arc<TransportFailureRefreshObserverSlot>,
     relay_connection_refresh_observer: Arc<RelayConnectionRefreshObserverSlot>,
 }
@@ -289,6 +292,14 @@ struct ClientEndpoint {
     descriptor: ClientEndpointDescriptor,
     transport: ClientTransport,
     state: Arc<std::sync::Mutex<ClientEndpointState>>,
+}
+
+#[derive(Clone)]
+struct BackgroundProbeCandidate {
+    claimed_index: usize,
+    route_key: String,
+    endpoint: ClientEndpoint,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +347,52 @@ struct ClientEndpointState {
     last_error: Option<String>,
     recent_attempts: Vec<ClientConnectionAttempt>,
     timing_session_pool_baseline: TransportSessionPoolSnapshot,
+}
+
+#[derive(Debug)]
+struct RetiredRouteFailureState {
+    consecutive_failures: u32,
+    total_failures: u64,
+    last_measurement_unix_ms: Option<u64>,
+    last_failure_unix_ms: Option<u64>,
+    circuit_open_until_unix_ms: Option<u64>,
+    last_background_probe_unix_ms: Option<u64>,
+    last_error: Option<String>,
+    recent_attempts: Vec<ClientConnectionAttempt>,
+    expires_at_unix_ms: u64,
+}
+
+impl RetiredRouteFailureState {
+    fn capture(state: &ClientEndpointState, retired_at_unix_ms: u64) -> Option<Self> {
+        if state.consecutive_failures == 0 {
+            return None;
+        }
+
+        Some(Self {
+            consecutive_failures: state.consecutive_failures,
+            total_failures: state.total_failures,
+            last_measurement_unix_ms: state.last_measurement_unix_ms,
+            last_failure_unix_ms: state.last_failure_unix_ms,
+            circuit_open_until_unix_ms: state.circuit_open_until_unix_ms,
+            last_background_probe_unix_ms: state.last_background_probe_unix_ms,
+            last_error: state.last_error.clone(),
+            recent_attempts: state.recent_attempts.clone(),
+            expires_at_unix_ms: retired_at_unix_ms
+                .saturating_add(CLIENT_ROUTE_RETIRED_FAILURE_STATE_TTL_MS)
+                .max(state.circuit_open_until_unix_ms.unwrap_or_default()),
+        })
+    }
+
+    fn apply_to(&self, state: &mut ClientEndpointState) {
+        state.consecutive_failures = self.consecutive_failures;
+        state.total_failures = self.total_failures;
+        state.last_measurement_unix_ms = self.last_measurement_unix_ms;
+        state.last_failure_unix_ms = self.last_failure_unix_ms;
+        state.circuit_open_until_unix_ms = self.circuit_open_until_unix_ms;
+        state.last_background_probe_unix_ms = self.last_background_probe_unix_ms;
+        state.last_error = self.last_error.clone();
+        state.recent_attempts = self.recent_attempts.clone();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -578,6 +635,11 @@ impl ClientEndpoint {
             state: self.state.clone(),
         }
     }
+
+    fn with_retired_failure_state(self, retired: &RetiredRouteFailureState) -> Self {
+        retired.apply_to(&mut lock_endpoint_state(&self.state));
+        self
+    }
 }
 
 type ConnectionDiagnosticsObserver =
@@ -630,6 +692,7 @@ impl ClientEndpointRouter {
             runtime_id: Uuid::now_v7(),
             endpoints: Arc::new(RwLock::new(endpoints)),
             active_route_key: Arc::new(RwLock::new(initial_active)),
+            retired_failure_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             transport_failure_refresh_observer: Arc::new(RwLock::new(None)),
             relay_connection_refresh_observer: Arc::new(RwLock::new(None)),
         }
@@ -892,7 +955,7 @@ impl ClientEndpointRouter {
         }
     }
 
-    fn claim_background_probe_candidates(&self) -> Vec<(usize, ClientEndpoint)> {
+    fn claim_background_probe_candidates(&self) -> Vec<BackgroundProbeCandidate> {
         let endpoints = self.endpoints_snapshot();
         if endpoints.len() <= 1 {
             return Vec::new();
@@ -910,12 +973,48 @@ impl ClientEndpointRouter {
             if !background_probe_due(&state, now_unix_ms) {
                 continue;
             }
+            let timeout = background_probe_timeout(&state);
             state.background_probe_in_flight = true;
             state.last_background_probe_unix_ms = Some(now_unix_ms);
-            claimed.push((index, endpoint.clone()));
+            claimed.push(BackgroundProbeCandidate {
+                claimed_index: index,
+                route_key: endpoint.descriptor.route_key.clone(),
+                endpoint: endpoint.clone(),
+                timeout,
+            });
         }
 
         claimed
+    }
+
+    fn registered_background_probe_index(
+        &self,
+        candidate: &BackgroundProbeCandidate,
+    ) -> Option<usize> {
+        self.endpoints_snapshot().iter().position(|endpoint| {
+            endpoint.descriptor.route_key == candidate.route_key
+                && Arc::ptr_eq(&endpoint.state, &candidate.endpoint.state)
+        })
+    }
+
+    fn record_background_probe_candidate_successes(
+        &self,
+        candidate: &BackgroundProbeCandidate,
+        latency_samples_ms: &[f64],
+    ) {
+        if let Some(index) = self.registered_background_probe_index(candidate) {
+            self.record_background_probe_successes(index, latency_samples_ms);
+        }
+    }
+
+    fn record_background_probe_candidate_failure(
+        &self,
+        candidate: &BackgroundProbeCandidate,
+        error: &str,
+    ) {
+        if let Some(index) = self.registered_background_probe_index(candidate) {
+            self.record_background_probe_failure(index, error);
+        }
     }
 
     fn record_failure(&self, index: usize, error: &str) {
@@ -1327,17 +1426,20 @@ impl ClientEndpointRouter {
 
     /// Replace route membership while preserving the endpoint object (and therefore
     /// its circuit-breaker state and live session pool) for every stable route key
-    /// that is still desired. The caller builds replacement endpoints before taking
-    /// this lock, so no network I/O is performed here.
-    fn reconcile(
-        &self,
-        desired: Vec<ClientEndpoint>,
-        preserve_existing: bool,
-    ) -> (usize, usize, usize) {
+    /// that is still desired. A recently retired route recovers only its failure
+    /// history, never its old transport, so an open circuit survives disappearance
+    /// without reviving stale sessions. No network I/O is performed here.
+    fn reconcile(&self, desired: Vec<ClientEndpoint>) -> (usize, usize, usize) {
+        let now_unix_ms = unix_ts_ms();
         let mut routes = self
             .endpoints
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut retired_failure_states = self
+            .retired_failure_states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retired_failure_states.retain(|_, retired| retired.expires_at_unix_ms > now_unix_ms);
         let old_by_key = routes
             .iter()
             .cloned()
@@ -1353,16 +1455,38 @@ impl ClientEndpointRouter {
             if !desired_keys.insert(route_key.clone()) {
                 continue;
             }
-            if preserve_existing && let Some(existing) = old_by_key.get(&route_key) {
+            if let Some(existing) = old_by_key.get(&route_key) {
                 retained = retained.saturating_add(1);
                 next.push(existing.with_bootstrap_rank(endpoint.descriptor.bootstrap_rank));
             } else {
                 added = added.saturating_add(1);
+                let endpoint = match retired_failure_states.remove(&route_key) {
+                    Some(retired) => endpoint.with_retired_failure_state(&retired),
+                    None => endpoint,
+                };
                 next.push(endpoint);
             }
         }
 
-        let removed = old_by_key.len().saturating_sub(retained);
+        let removed_keys = old_by_key
+            .keys()
+            .filter(|route_key| !desired_keys.contains(*route_key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for route_key in &removed_keys {
+            let Some(endpoint) = old_by_key.get(route_key) else {
+                continue;
+            };
+            let state = lock_endpoint_state(&endpoint.state);
+            if let Some(retired) = RetiredRouteFailureState::capture(&state, now_unix_ms) {
+                retired_failure_states.insert(route_key.clone(), retired);
+            }
+        }
+        for route_key in &desired_keys {
+            retired_failure_states.remove(route_key);
+        }
+
+        let removed = removed_keys.len();
         let active_is_retained = self
             .active_route_key()
             .is_some_and(|route_key| desired_keys.contains(&route_key));
@@ -1688,6 +1812,14 @@ fn background_probe_due(state: &ClientEndpointState, now_unix_ms: u64) -> bool {
                 now_unix_ms.saturating_sub(last_measurement_unix_ms)
                     >= CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS
             })
+}
+
+fn background_probe_timeout(state: &ClientEndpointState) -> Duration {
+    if state.last_measurement_unix_ms.is_none() {
+        CLIENT_ROUTE_INITIAL_BACKGROUND_PROBE_TIMEOUT
+    } else {
+        CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT
+    }
 }
 
 fn is_retryable_transport_status(status: StatusCode) -> bool {
@@ -2392,6 +2524,7 @@ async fn probe_endpoint_background_quality(
     endpoint: &ClientEndpoint,
     auth: &ClientRequestAuth,
     connection_name: Option<&str>,
+    timeout: Duration,
 ) -> Result<Vec<f64>> {
     let base_url = Url::parse(endpoint.transport.request_base_url()).with_context(|| {
         format!(
@@ -2415,7 +2548,7 @@ async fn probe_endpoint_background_quality(
         let headers = request_auth_headers_for_auth(auth, &method, &url, connection_name)?;
         let started_at = std::time::Instant::now();
         let response = match tokio::time::timeout(
-            CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
+            timeout,
             execute_buffered_request_for_transport(
                 &endpoint.transport,
                 auth,
@@ -2438,12 +2571,12 @@ async fn probe_endpoint_background_quality(
                         transport_path_kind_label(endpoint.transport.transport_path_kind()),
                     locator = %endpoint.descriptor.locator,
                     probe_index,
-                    timeout_ms = CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
+                    timeout_ms = timeout.as_millis(),
                     "background_health_probe_timed_out"
                 );
                 bail!(
                     "background health probe timed out after {} ms for {}",
-                    CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
+                    timeout.as_millis(),
                     endpoint.descriptor.locator
                 );
             }
@@ -2989,7 +3122,7 @@ impl IronMeshClient {
                 },
                 0,
             )]),
-            auth: ClientRequestAuth::None,
+            auth: Arc::new(RwLock::new(ClientRequestAuth::None)),
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
@@ -3026,7 +3159,7 @@ impl IronMeshClient {
                 },
                 0,
             )]),
-            auth: ClientRequestAuth::None,
+            auth: Arc::new(RwLock::new(ClientRequestAuth::None)),
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
@@ -3052,7 +3185,7 @@ impl IronMeshClient {
                 }),
                 0,
             )]),
-            auth: ClientRequestAuth::None,
+            auth: Arc::new(RwLock::new(ClientRequestAuth::None)),
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
@@ -3068,7 +3201,8 @@ impl IronMeshClient {
         let mut endpoints = Vec::with_capacity(clients.len());
 
         for (bootstrap_rank, client) in clients.into_iter().enumerate() {
-            match (&combined_auth, &client.auth) {
+            let client_auth = client.auth_snapshot();
+            match (&combined_auth, &client_auth) {
                 (None, auth) => combined_auth = Some(auth.clone()),
                 (Some(ClientRequestAuth::None), ClientRequestAuth::None)
                 | (
@@ -3089,7 +3223,9 @@ impl IronMeshClient {
 
         Ok(Self {
             transport_router: ClientEndpointRouter::new(endpoints),
-            auth: combined_auth.unwrap_or(ClientRequestAuth::None),
+            auth: Arc::new(RwLock::new(
+                combined_auth.unwrap_or(ClientRequestAuth::None),
+            )),
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
@@ -3102,12 +3238,40 @@ impl IronMeshClient {
     pub(crate) fn reconcile_transport_membership(
         &self,
         refreshed: &IronMeshClient,
-        preserve_existing: bool,
     ) -> (usize, usize, usize) {
-        self.transport_router.reconcile(
-            refreshed.transport_router.endpoints_snapshot(),
-            preserve_existing,
-        )
+        let membership = self
+            .transport_router
+            .reconcile(refreshed.transport_router.endpoints_snapshot());
+        *self
+            .auth
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = refreshed.auth_snapshot();
+        membership
+    }
+
+    pub(crate) fn set_single_transport_route_key(&self, route_key: String) -> Result<()> {
+        let mut endpoints = self
+            .transport_router
+            .endpoints
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let [endpoint] = endpoints.as_mut_slice() else {
+            bail!("a planned transport route key requires exactly one client endpoint");
+        };
+        endpoint.descriptor.route_key.clone_from(&route_key);
+        *self
+            .transport_router
+            .active_route_key
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(route_key);
+        Ok(())
+    }
+
+    fn auth_snapshot(&self) -> ClientRequestAuth {
+        self.auth
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub(crate) fn set_transport_failure_refresh_observer(
@@ -3127,7 +3291,7 @@ impl IronMeshClient {
     }
 
     pub fn with_client_identity(mut self, identity: ClientIdentityMaterial) -> Self {
-        self.auth = ClientRequestAuth::SignedIdentity(identity);
+        self.auth = Arc::new(RwLock::new(ClientRequestAuth::SignedIdentity(identity)));
         self
     }
 
@@ -3169,31 +3333,46 @@ impl IronMeshClient {
     }
 
     pub async fn refresh_connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
-        let endpoints = self.transport_router.endpoints_snapshot();
-        for (index, endpoint) in endpoints.iter().enumerate() {
+        let candidates = self
+            .transport_router
+            .endpoints_snapshot()
+            .into_iter()
+            .enumerate()
+            .map(|(claimed_index, endpoint)| BackgroundProbeCandidate {
+                claimed_index,
+                route_key: endpoint.descriptor.route_key.clone(),
+                endpoint,
+                timeout: CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
+            })
+            .collect::<Vec<_>>();
+        for candidate in &candidates {
             self.transport_router
-                .log_route_candidate_scheduled(index, endpoint);
+                .log_route_candidate_scheduled(candidate.claimed_index, &candidate.endpoint);
         }
-        let tasks = endpoints.into_iter().enumerate().map(|(index, endpoint)| {
-            let auth = self.auth.clone();
+        let tasks = candidates.into_iter().map(|candidate| {
+            let auth = self.auth_snapshot();
             let connection_name = self.connection_name.clone();
             async move {
-                let result =
-                    probe_endpoint_background_quality(&endpoint, &auth, connection_name.as_deref())
-                        .await;
-                (index, result)
+                let result = probe_endpoint_background_quality(
+                    &candidate.endpoint,
+                    &auth,
+                    connection_name.as_deref(),
+                    candidate.timeout,
+                )
+                .await;
+                (candidate, result)
             }
         });
 
         let mut recorded_background_probe_failure = false;
-        for (index, result) in join_all(tasks).await {
+        for (candidate, result) in join_all(tasks).await {
             match result {
                 Ok(latency_samples_ms) => self
                     .transport_router
-                    .record_background_probe_successes(index, &latency_samples_ms),
+                    .record_background_probe_candidate_successes(&candidate, &latency_samples_ms),
                 Err(error) => {
                     self.transport_router
-                        .record_background_probe_failure(index, &error.to_string());
+                        .record_background_probe_candidate_failure(&candidate, &error.to_string());
                     recorded_background_probe_failure = true;
                 }
             }
@@ -3210,31 +3389,35 @@ impl IronMeshClient {
     /// Unlike [`Self::refresh_connection_route_snapshot`], this is cheap to call from a
     /// periodic status poll because recently measured routes are skipped.
     pub async fn refresh_due_connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
-        let endpoints = self.transport_router.claim_background_probe_candidates();
-        for (index, endpoint) in &endpoints {
+        let candidates = self.transport_router.claim_background_probe_candidates();
+        for candidate in &candidates {
             self.transport_router
-                .log_route_candidate_scheduled(*index, endpoint);
+                .log_route_candidate_scheduled(candidate.claimed_index, &candidate.endpoint);
         }
-        let tasks = endpoints.into_iter().map(|(index, endpoint)| {
-            let auth = self.auth.clone();
+        let tasks = candidates.into_iter().map(|candidate| {
+            let auth = self.auth_snapshot();
             let connection_name = self.connection_name.clone();
             async move {
-                let result =
-                    probe_endpoint_background_quality(&endpoint, &auth, connection_name.as_deref())
-                        .await;
-                (index, result)
+                let result = probe_endpoint_background_quality(
+                    &candidate.endpoint,
+                    &auth,
+                    connection_name.as_deref(),
+                    candidate.timeout,
+                )
+                .await;
+                (candidate, result)
             }
         });
 
         let mut recorded_background_probe_failure = false;
-        for (index, result) in join_all(tasks).await {
+        for (candidate, result) in join_all(tasks).await {
             match result {
                 Ok(latency_samples_ms) => self
                     .transport_router
-                    .record_background_probe_successes(index, &latency_samples_ms),
+                    .record_background_probe_candidate_successes(&candidate, &latency_samples_ms),
                 Err(error) => {
                     self.transport_router
-                        .record_background_probe_failure(index, &error.to_string());
+                        .record_background_probe_candidate_failure(&candidate, &error.to_string());
                     recorded_background_probe_failure = true;
                 }
             }
@@ -3246,8 +3429,8 @@ impl IronMeshClient {
         self.connection_route_snapshot()
     }
 
-    pub(crate) fn spawn_due_connection_route_refresh(&self) {
-        self.maybe_spawn_background_quality_refresh();
+    pub(crate) fn spawn_due_connection_route_refresh(&self) -> usize {
+        self.maybe_spawn_background_quality_refresh()
     }
 
     pub fn connection_diagnostics(&self) -> ClientConnectionDiagnostics {
@@ -3367,41 +3550,46 @@ impl IronMeshClient {
             .expect("ironmesh client must contain at least one transport endpoint")
     }
 
-    fn request_auth_headers(&self, method: &Method, url: &Url) -> Result<Vec<RelayHttpHeader>> {
-        request_auth_headers_for_auth(&self.auth, method, url, self.connection_name.as_deref())
-    }
-
-    fn maybe_spawn_background_quality_refresh(&self) {
+    fn maybe_spawn_background_quality_refresh(&self) -> usize {
         if tokio::runtime::Handle::try_current().is_err() {
-            return;
+            return 0;
         }
 
-        for (index, endpoint) in self.transport_router.claim_background_probe_candidates() {
+        let candidates = self.transport_router.claim_background_probe_candidates();
+        let scheduled = candidates.len();
+        for candidate in candidates {
             self.transport_router
-                .log_route_candidate_scheduled(index, &endpoint);
+                .log_route_candidate_scheduled(candidate.claimed_index, &candidate.endpoint);
             let transport_router = self.transport_router.clone();
-            let auth = self.auth.clone();
+            let auth = self.auth_snapshot();
             let connection_name = self.connection_name.clone();
             let diagnostics_client = self.clone();
             tokio::spawn(async move {
                 match probe_endpoint_background_quality(
-                    &endpoint,
+                    &candidate.endpoint,
                     &auth,
                     connection_name.as_deref(),
+                    candidate.timeout,
                 )
                 .await
                 {
                     Ok(latency_samples_ms) => {
-                        transport_router
-                            .record_background_probe_successes(index, &latency_samples_ms);
+                        transport_router.record_background_probe_candidate_successes(
+                            &candidate,
+                            &latency_samples_ms,
+                        );
                     }
                     Err(error) => {
-                        transport_router.record_background_probe_failure(index, &error.to_string());
+                        transport_router.record_background_probe_candidate_failure(
+                            &candidate,
+                            &error.to_string(),
+                        );
                         diagnostics_client.publish_background_connection_diagnostics();
                     }
                 }
             });
         }
+        scheduled
     }
 
     fn route_indices_for_upload_session(&self, upload_id: &str) -> Vec<usize> {
@@ -3462,7 +3650,9 @@ impl IronMeshClient {
         let request_timeout = buffered_request_timeout(&url);
         self.maybe_spawn_background_quality_refresh();
 
-        let mut auth_headers = self.request_auth_headers(&method, &url)?;
+        let auth = self.auth_snapshot();
+        let mut auth_headers =
+            request_auth_headers_for_auth(&auth, &method, &url, self.connection_name.as_deref())?;
         auth_headers.append(&mut headers);
 
         let mut last_error = None;
@@ -3491,7 +3681,7 @@ impl IronMeshClient {
             let started_unix_ms = unix_ts_ms();
             match execute_buffered_request_for_transport(
                 &endpoint.transport,
-                &self.auth,
+                &auth,
                 TransportRequestOptions::new(self.connection_name.as_deref(), request_timeout),
                 &method,
                 &endpoint_url,
@@ -3584,7 +3774,8 @@ impl IronMeshClient {
         let mut operation_headers = Vec::new();
         ensure_operation_id_header(&Method::PUT, &mut operation_headers);
         let request_timeout = buffered_request_timeout(&url);
-        if matches!(self.auth, ClientRequestAuth::None) {
+        let auth = self.auth_snapshot();
+        if matches!(&auth, ClientRequestAuth::None) {
             return self
                 .execute_buffered_request_on_route_indices(
                     Method::PUT,
@@ -3598,7 +3789,12 @@ impl IronMeshClient {
 
         self.maybe_spawn_background_quality_refresh();
 
-        let mut auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
+        let mut auth_headers = request_auth_headers_for_auth(
+            &auth,
+            &Method::PUT,
+            &url,
+            self.connection_name.as_deref(),
+        )?;
         auth_headers.append(&mut operation_headers);
         let mut last_error = None;
         for &route_index in route_indices {
@@ -3624,7 +3820,7 @@ impl IronMeshClient {
             let started_unix_ms = unix_ts_ms();
             match execute_streaming_object_write_request_for_transport(
                 &endpoint.transport,
-                &self.auth,
+                &auth,
                 TransportRequestOptions::new(self.connection_name.as_deref(), request_timeout),
                 &Method::PUT,
                 &endpoint_url,
@@ -3643,7 +3839,7 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: streaming_object_write_timeout_for_transport(
                                 &endpoint.transport,
-                                &self.auth,
+                                &auth,
                                 request_timeout,
                             ),
                             started_unix_ms,
@@ -3670,7 +3866,7 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: streaming_object_write_timeout_for_transport(
                                 &endpoint.transport,
-                                &self.auth,
+                                &auth,
                                 request_timeout,
                             ),
                             started_unix_ms,
@@ -3700,7 +3896,7 @@ impl IronMeshClient {
                             url: &endpoint_url,
                             timeout: streaming_object_write_timeout_for_transport(
                                 &endpoint.transport,
-                                &self.auth,
+                                &auth,
                                 request_timeout,
                             ),
                             started_unix_ms,
@@ -4337,7 +4533,9 @@ impl IronMeshClient {
             .into_iter()
             .map(|(name, value)| RelayHttpHeader { name, value })
             .collect::<Vec<_>>();
-        let mut auth_headers = self.request_auth_headers(&method, &url)?;
+        let auth = self.auth_snapshot();
+        let mut auth_headers =
+            request_auth_headers_for_auth(&auth, &method, &url, self.connection_name.as_deref())?;
         auth_headers.append(&mut headers);
         let mut last_error = None;
 
@@ -4364,7 +4562,7 @@ impl IronMeshClient {
             let started_unix_ms = unix_ts_ms();
             match execute_streaming_read_request_for_transport(
                 &endpoint.transport,
-                &self.auth,
+                &auth,
                 self.connection_name.as_deref(),
                 response_timeout,
                 &method,
@@ -4446,7 +4644,9 @@ impl IronMeshClient {
             .into_iter()
             .map(|(name, value)| RelayHttpHeader { name, value })
             .collect::<Vec<_>>();
-        let mut auth_headers = self.request_auth_headers(&method, &url)?;
+        let auth = self.auth_snapshot();
+        let mut auth_headers =
+            request_auth_headers_for_auth(&auth, &method, &url, self.connection_name.as_deref())?;
         auth_headers.append(&mut headers);
         let mut last_error = None;
         let mut body_stream = Some(Box::pin(body_stream) as RequestBodyStream);
@@ -4477,7 +4677,7 @@ impl IronMeshClient {
             };
             match execute_streaming_write_request_for_transport(
                 &endpoint.transport,
-                &self.auth,
+                &auth,
                 TransportRequestOptions::new(self.connection_name.as_deref(), response_timeout),
                 &method,
                 &endpoint_url,
@@ -4880,7 +5080,13 @@ impl IronMeshClient {
         if let Some(if_range) = if_range {
             headers.push(simple_header(IF_RANGE, if_range)?);
         }
-        let mut auth_headers = self.request_auth_headers(&Method::GET, &url)?;
+        let auth = self.auth_snapshot();
+        let mut auth_headers = request_auth_headers_for_auth(
+            &auth,
+            &Method::GET,
+            &url,
+            self.connection_name.as_deref(),
+        )?;
         auth_headers.append(&mut headers);
 
         let mut last_error = None;
@@ -4908,7 +5114,7 @@ impl IronMeshClient {
             let started_unix_ms = unix_ts_ms();
             match execute_streaming_object_read_request_for_transport(
                 &endpoint.transport,
-                &self.auth,
+                &auth,
                 self.connection_name.as_deref(),
                 &endpoint_url,
                 &auth_headers,
