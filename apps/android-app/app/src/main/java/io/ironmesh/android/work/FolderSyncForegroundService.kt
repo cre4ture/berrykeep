@@ -62,7 +62,7 @@ class FolderSyncForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        FolderSyncExecutionCoordinator.requestContinuous()
+        FolderSyncExecutionCoordinator.markContinuousServiceActive()
         ensureNotificationChannel()
         startForeground(
             NOTIFICATION_ID,
@@ -72,6 +72,7 @@ class FolderSyncForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        FolderSyncExecutionCoordinator.markContinuousServiceActive()
         when (intent?.action) {
             ACTION_STOP -> {
                 stopContinuousSyncAndSelf()
@@ -93,7 +94,7 @@ class FolderSyncForegroundService : Service() {
         retryJob?.cancel()
         unregisterNetworkCallback()
         repository.stopAllContinuousFolderSync()
-        FolderSyncExecutionCoordinator.releaseContinuous()
+        FolderSyncExecutionCoordinator.releaseContinuousService()
         scope.cancel()
         super.onDestroy()
     }
@@ -529,28 +530,31 @@ class FolderSyncForegroundService : Service() {
         private const val ACTION_STOP = "io.ironmesh.android.action.FOLDER_SYNC_STOP"
 
         fun syncConfigChanged(context: Context) {
-            FolderSyncExecutionCoordinator.requestContinuous()
-            ContextCompat.startForegroundService(
-                context,
-                Intent(context, FolderSyncForegroundService::class.java).apply {
-                    action = ACTION_REFRESH
-                },
-            )
+            startOwnedService(context, ACTION_REFRESH)
         }
 
         fun stop(context: Context) {
-            FolderSyncExecutionCoordinator.releaseContinuous()
+            FolderSyncExecutionCoordinator.cancelContinuousStartRequest()
             context.stopService(Intent(context, FolderSyncForegroundService::class.java))
         }
 
         fun syncNow(context: Context) {
-            FolderSyncExecutionCoordinator.requestContinuous()
-            ContextCompat.startForegroundService(
-                context,
-                Intent(context, FolderSyncForegroundService::class.java).apply {
-                    action = ACTION_SYNC_NOW
-                },
-            )
+            startOwnedService(context, ACTION_SYNC_NOW)
+        }
+
+        private fun startOwnedService(context: Context, action: String) {
+            FolderSyncExecutionCoordinator.requestContinuousStart()
+            try {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, FolderSyncForegroundService::class.java).apply {
+                        this.action = action
+                    },
+                )
+            } catch (error: RuntimeException) {
+                FolderSyncExecutionCoordinator.cancelContinuousStartRequest()
+                throw error
+            }
         }
 
     }

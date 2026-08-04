@@ -16,6 +16,7 @@ internal fun nextFolderSyncRetryDelayMs(attempt: Int): Long {
 
 data class FolderSyncExecutionSnapshot(
     val continuousRequested: Boolean = false,
+    val continuousServiceActive: Boolean = false,
     val oneShotRunning: Boolean = false,
     val oneShotProfileLabel: String? = null,
 )
@@ -28,25 +29,45 @@ data class FolderSyncExecutionSnapshot(
  */
 object FolderSyncExecutionCoordinator {
     private val lock = Any()
-    private var continuousRequested = false
+    private var continuousStartRequested = false
+    private var continuousServiceActive = false
     private var oneShotCompletion: CompletableDeferred<Unit>? = null
     private var oneShotProfileLabel: String? = null
 
-    fun requestContinuous() {
+    fun requestContinuousStart() {
         synchronized(lock) {
-            continuousRequested = true
+            continuousStartRequested = true
         }
     }
 
-    fun releaseContinuous() {
+    fun markContinuousServiceActive() {
         synchronized(lock) {
-            continuousRequested = false
+            continuousServiceActive = true
+            continuousStartRequested = false
+        }
+    }
+
+    fun cancelContinuousStartRequest() {
+        synchronized(lock) {
+            continuousStartRequested = false
+        }
+    }
+
+    fun releaseContinuousService() {
+        synchronized(lock) {
+            continuousServiceActive = false
+            continuousStartRequested = false
         }
     }
 
     fun tryBeginOneShot(nativeContinuousActive: Boolean): Boolean {
         synchronized(lock) {
-            if (nativeContinuousActive || continuousRequested || oneShotCompletion != null) {
+            if (
+                nativeContinuousActive ||
+                continuousStartRequested ||
+                continuousServiceActive ||
+                oneShotCompletion != null
+            ) {
                 return false
             }
             oneShotCompletion = CompletableDeferred()
@@ -81,7 +102,8 @@ object FolderSyncExecutionCoordinator {
     fun snapshot(): FolderSyncExecutionSnapshot {
         return synchronized(lock) {
             FolderSyncExecutionSnapshot(
-                continuousRequested = continuousRequested,
+                continuousRequested = continuousStartRequested || continuousServiceActive,
+                continuousServiceActive = continuousServiceActive,
                 oneShotRunning = oneShotCompletion != null,
                 oneShotProfileLabel = oneShotProfileLabel,
             )
@@ -91,7 +113,8 @@ object FolderSyncExecutionCoordinator {
     internal fun resetForTest() {
         val completion = synchronized(lock) {
             val activeCompletion = oneShotCompletion
-            continuousRequested = false
+            continuousStartRequested = false
+            continuousServiceActive = false
             oneShotCompletion = null
             oneShotProfileLabel = null
             activeCompletion

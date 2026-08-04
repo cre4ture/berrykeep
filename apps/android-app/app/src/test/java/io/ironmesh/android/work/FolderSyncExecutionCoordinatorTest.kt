@@ -29,7 +29,7 @@ class FolderSyncExecutionCoordinatorTest {
 
     @Test
     fun continuousRequestAtomicallyBlocksOneShotClaim() {
-        FolderSyncExecutionCoordinator.requestContinuous()
+        FolderSyncExecutionCoordinator.requestContinuousStart()
 
         assertFalse(
             FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive = false),
@@ -55,9 +55,29 @@ class FolderSyncExecutionCoordinatorTest {
     }
 
     @Test
+    fun failedServiceStartReleasesPendingClaim() {
+        FolderSyncExecutionCoordinator.requestContinuousStart()
+        FolderSyncExecutionCoordinator.cancelContinuousStartRequest()
+
+        assertTrue(FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive = false))
+    }
+
+    @Test
+    fun failedRefreshDoesNotReleaseAnAlreadyActiveService() {
+        FolderSyncExecutionCoordinator.markContinuousServiceActive()
+        FolderSyncExecutionCoordinator.requestContinuousStart()
+        FolderSyncExecutionCoordinator.cancelContinuousStartRequest()
+
+        val snapshot = FolderSyncExecutionCoordinator.snapshot()
+        assertTrue(snapshot.continuousRequested)
+        assertTrue(snapshot.continuousServiceActive)
+        assertFalse(FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive = false))
+    }
+
+    @Test
     fun continuousStartWaitsForClaimedOneShotToFinish() = runBlocking {
         assertTrue(FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive = false))
-        FolderSyncExecutionCoordinator.requestContinuous()
+        FolderSyncExecutionCoordinator.requestContinuousStart()
 
         val waiter = async {
             FolderSyncExecutionCoordinator.awaitOneShotCompletion()
