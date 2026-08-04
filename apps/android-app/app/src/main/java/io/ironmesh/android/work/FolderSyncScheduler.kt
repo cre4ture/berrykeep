@@ -3,9 +3,7 @@ package io.ironmesh.android.work
 import android.content.Context
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
-import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
-import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import io.ironmesh.android.data.IronmeshPreferences
@@ -13,7 +11,6 @@ import java.util.concurrent.TimeUnit
 
 object FolderSyncScheduler {
     private const val UNIQUE_PERIODIC_WORK = "ironmesh-folder-sync-periodic"
-    private const val UNIQUE_IMMEDIATE_WORK = "ironmesh-folder-sync-immediate"
     private const val PERIODIC_INTERVAL_MINUTES = 15L
 
     fun reschedule(context: Context) {
@@ -25,7 +22,6 @@ object FolderSyncScheduler {
 
         if (!hasEnabledProfiles) {
             workManager.cancelUniqueWork(UNIQUE_PERIODIC_WORK)
-            workManager.cancelUniqueWork(UNIQUE_IMMEDIATE_WORK)
             FolderSyncForegroundService.stop(context)
             return
         }
@@ -59,22 +55,7 @@ object FolderSyncScheduler {
             FolderSyncForegroundService.stop(context)
             return
         }
-
-        FolderSyncForegroundService.syncConfigChanged(context)
-
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(requiredNetworkType(enabledProfiles))
-            .build()
-
-        val request = OneTimeWorkRequestBuilder<FolderSyncWorker>()
-            .setConstraints(constraints)
-            .build()
-
-        WorkManager.getInstance(context).enqueueUniqueWork(
-            UNIQUE_IMMEDIATE_WORK,
-            ExistingWorkPolicy.REPLACE,
-            request,
-        )
+        FolderSyncForegroundService.syncNow(context)
     }
 
     private fun requiredNetworkType(enabledProfiles: List<io.ironmesh.android.data.FolderSyncConfig>): NetworkType {

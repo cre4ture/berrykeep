@@ -19,7 +19,7 @@ class AppConnectionPresentationTest {
             message = "store index timed out",
         )
 
-        assertEquals("App requests failed", appConnectionHeadline(status))
+        assertEquals("Connection failed", appConnectionHeadline(status))
         assertEquals("store index timed out", appConnectionSummary(status))
     }
 
@@ -31,13 +31,13 @@ class AppConnectionPresentationTest {
             lastSuccessfulConnectionUnixMs = nowUnixMs - APP_CONNECTION_HEALTH_MAX_AGE_MS - 1L,
         )
 
-        assertEquals("App connection status is stale", appConnectionHeadline(status, nowUnixMs))
+        assertEquals("Connection status is stale", appConnectionHeadline(status, nowUnixMs))
         assertEquals("Stale", appConnectionStatusBadge(status, nowUnixMs))
-        assertTrue(shouldShowRetryConnectionAction(status, hasProfiles = true, nowUnixMs = nowUnixMs))
+        assertTrue(shouldShowRetryConnectionAction(status, nowUnixMs = nowUnixMs))
     }
 
     @Test
-    fun connectivityProbeIsPresentedAsReachabilityRatherThanAppHealth() {
+    fun connectivityProbeEstablishesConnectionHealth() {
         val nowUnixMs = 1_750_000_000_000L
         val status = AppConnectionStatus(
             state = APP_CONNECTION_STATE_CONNECTED,
@@ -46,25 +46,24 @@ class AppConnectionPresentationTest {
                 "relay://node@https://example.test/api/v1/diagnostics/latency?response_bytes=0",
         )
 
-        assertEquals("Server is reachable", appConnectionHeadline(status, nowUnixMs))
-        assertEquals("Reachable", appConnectionStatusBadge(status, nowUnixMs))
-        assertFalse(isAppConnectionHealthy(status, nowUnixMs))
-        assertTrue(
+        assertEquals("Connection is healthy", appConnectionHeadline(status, nowUnixMs))
+        assertEquals("Healthy", appConnectionStatusBadge(status, nowUnixMs))
+        assertTrue(isAppConnectionHealthy(status, nowUnixMs))
+        assertFalse(
             shouldShowRetryConnectionAction(
                 status,
-                hasProfiles = true,
                 nowUnixMs = nowUnixMs,
             ),
         )
         assertTrue(
             appConnectionSummary(status).contains(
-                "library and sync requests are not verified",
+                "The server is reachable",
             ),
         )
     }
 
     @Test
-    fun connectivityProbeDoesNotHideFunctionalRequestFailures() {
+    fun functionalRequestFailureDoesNotChangeTransportHealth() {
         val nowUnixMs = 1_750_000_000_000L
         val status = AppConnectionStatus(
             state = APP_CONNECTION_STATE_CONNECTED,
@@ -82,24 +81,16 @@ class AppConnectionPresentationTest {
             ),
         )
 
-        assertEquals(
-            "Server reachable; app requests failed",
-            appConnectionHeadline(status, nowUnixMs),
-        )
-        assertEquals("Degraded", appConnectionStatusBadge(status, nowUnixMs))
-        assertFalse(isAppConnectionHealthy(status, nowUnixMs))
-        assertTrue(
+        assertEquals("Connection is healthy", appConnectionHeadline(status, nowUnixMs))
+        assertEquals("Healthy", appConnectionStatusBadge(status, nowUnixMs))
+        assertTrue(isAppConnectionHealthy(status, nowUnixMs))
+        assertFalse(
             shouldShowRetryConnectionAction(
                 status,
-                hasProfiles = true,
                 nowUnixMs = nowUnixMs,
             ),
         )
-        assertTrue(
-            appConnectionSummary(status).contains(
-                "a newer app request failed",
-            ),
-        )
+        assertTrue(appConnectionSummary(status).contains("The server is reachable"))
     }
 
     @Test
@@ -123,13 +114,12 @@ class AppConnectionPresentationTest {
             ),
         )
 
-        assertEquals("App connection is healthy", appConnectionHeadline(status, nowUnixMs))
+        assertEquals("Connection is healthy", appConnectionHeadline(status, nowUnixMs))
         assertEquals("Healthy", appConnectionStatusBadge(status, nowUnixMs))
         assertTrue(isAppConnectionHealthy(status, nowUnixMs))
         assertFalse(
             shouldShowRetryConnectionAction(
                 status,
-                hasProfiles = true,
                 nowUnixMs = nowUnixMs,
             ),
         )
@@ -152,8 +142,8 @@ class AppConnectionPresentationTest {
             ),
         )
 
-        assertEquals("Server is reachable", appConnectionHeadline(status, nowUnixMs))
-        assertEquals("Reachable", appConnectionStatusBadge(status, nowUnixMs))
+        assertEquals("Connection is healthy", appConnectionHeadline(status, nowUnixMs))
+        assertEquals("Healthy", appConnectionStatusBadge(status, nowUnixMs))
     }
 
     @Test
@@ -177,7 +167,7 @@ class AppConnectionPresentationTest {
             ),
         )
 
-        assertEquals("App connection is healthy", appConnectionHeadline(status, nowUnixMs))
+        assertEquals("Connection is healthy", appConnectionHeadline(status, nowUnixMs))
         assertEquals("Healthy", appConnectionStatusBadge(status, nowUnixMs))
         assertTrue(isAppConnectionHealthy(status, nowUnixMs))
     }

@@ -9,7 +9,8 @@ This is the IronMesh Android app.
 - Upload/download via the Rust `client-sdk` bridge
 - Open the client Web UI in a browser-powered Custom Tab when available, with fallback to an in-app `WebView`
 - Configure multiple folder-sync profiles (remote prefix <-> local folder)
-- Automatic periodic background folder sync (WorkManager) + manual "Sync Now"
+- Continuous foreground folder sync with a periodic WorkManager one-shot as a recovery fallback;
+  manual "Sync Now" wakes the continuous run instead of starting a competing reconciliation
 - Optional Rust-backed title latency monitor with configurable period; compact `D` (direct) or `R` (relay) result in the app bar
 - App-bar diagnostic export that writes retained Android application events (including sanitized embedded WebView/JavaScript failures), current connection state, and Rust tracing output to a user-selected text file
 

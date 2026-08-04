@@ -27,18 +27,20 @@ import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncModificationRecord
+import io.ironmesh.android.data.GlobalFolderSyncStatus
 import io.ironmesh.android.data.FolderSyncServiceStatus
+import io.ironmesh.android.data.mergeGlobalFolderSyncStatus
 import io.ironmesh.android.ui.screens.ThumbnailBitmapCache
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import io.ironmesh.android.data.TitleLatencyMonitorSettings
 import io.ironmesh.android.data.TitleLatencyProbeStatus
 import io.ironmesh.android.data.parseAllowedWifiSsidsInput
-import io.ironmesh.android.work.FolderSyncForegroundService
 import io.ironmesh.android.ui.theme.DEFAULT_IRONMESH_ACCENT_COLOR_HEX
 import io.ironmesh.android.ui.theme.normalizeIronmeshAccentColorHex
 import io.ironmesh.android.work.FolderSyncScheduler
 import io.ironmesh.android.work.FolderSyncNetworkGate
+import io.ironmesh.android.work.FolderSyncExecutionCoordinator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -159,6 +161,7 @@ data class MainUiState(
     val objectBody: String = "",
     val syncProfiles: List<FolderSyncConfig> = emptyList(),
     val folderSyncStatus: FolderSyncServiceStatus = FolderSyncServiceStatus(),
+    val globalFolderSyncStatus: GlobalFolderSyncStatus = GlobalFolderSyncStatus(),
     val appConnectionStatus: AppConnectionStatus = AppConnectionStatus(),
     val titleLatencyMonitorSettings: TitleLatencyMonitorSettings = TitleLatencyMonitorSettings(),
     val titleLatencyStatus: TitleLatencyProbeStatus = TitleLatencyProbeStatus(),
@@ -255,7 +258,7 @@ class MainViewModel(
         val persistedTitleLatencyMonitorSettings =
             IronmeshPreferences.getTitleLatencyMonitorSettings(getApplication())
         val persistedThemeAccentColor = IronmeshPreferences.getThemeAccentColor(getApplication())
-        uiState.value = uiState.value.copy(
+        val initialState = uiState.value.copy(
             syncProfiles = persistedProfiles,
             deviceAuthState = persistedDeviceAuth,
             deviceLabelInput = persistedDeviceAuth.label.orEmpty(),
@@ -266,6 +269,12 @@ class MainViewModel(
             status = persistedDeviceAuthResult.exceptionOrNull()?.let { error ->
                 "Device identity unavailable: ${error.message}"
             } ?: uiState.value.status,
+        )
+        uiState.value = initialState.copy(
+            globalFolderSyncStatus = buildGlobalFolderSyncStatus(
+                state = initialState,
+                runtimeStatus = initialState.folderSyncStatus,
+            ),
         )
         FolderSyncScheduler.reschedule(getApplication())
         observeFolderSyncStatus()
@@ -949,7 +958,6 @@ class MainViewModel(
         )
 
         FolderSyncScheduler.reschedule(getApplication())
-        FolderSyncScheduler.runNow(getApplication())
         return profile.networkPolicy
     }
 
@@ -1005,15 +1013,6 @@ class MainViewModel(
     }
 
     fun runFolderSyncNow() {
-        val status = uiState.value.folderSyncStatus
-        val continuousSyncActive = status.activeProfileCount > 0L &&
-            status.serviceState in setOf("starting", "running", "syncing")
-        if (continuousSyncActive) {
-            refreshExpandedFolderSyncHistory(force = true)
-            setStatus("Continuous folder sync already active; manual one-shot run skipped")
-            return
-        }
-
         val enabledProfiles = uiState.value.syncProfiles.filter { profile -> profile.enabled }
         if (enabledProfiles.isEmpty()) {
             setStatus("No enabled sync profile is configured")
@@ -1029,17 +1028,44 @@ class MainViewModel(
         }
 
         FolderSyncScheduler.runNow(getApplication())
-        setStatus("Folder sync scheduled")
+        refreshExpandedFolderSyncHistory(force = true)
+        setStatus("Requested immediate folder reconciliation")
     }
 
-    fun retryFolderSyncConnection() {
-        val enabledProfiles = uiState.value.syncProfiles.filter { profile -> profile.enabled }
-        if (enabledProfiles.isEmpty()) {
-            setStatus("No enabled sync profile is configured")
+    fun retryAppConnection() {
+        val deviceAuth = uiState.value.deviceAuthState
+        val connectionInput = deviceAuth.connectionBootstrapJson()
+        val clientIdentityJson = deviceAuth.toClientIdentityJson()
+        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+            setStatus("Enroll this device before checking the connection")
             return
         }
-        FolderSyncForegroundService.retryNow(getApplication())
-        setStatus("Requested a sync connection retry")
+        setStatus("Checking app connection")
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    repository.notifyNetworkChanged(
+                        connectionInput = connectionInput,
+                        serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                        clientIdentityJson = clientIdentityJson,
+                    )
+                    repository.storeIndex(
+                        connectionInput = connectionInput,
+                        depth = 1,
+                        serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                        clientIdentityJson = clientIdentityJson,
+                    )
+                }
+            }
+            val connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
+            uiState.value = uiState.value.copy(
+                appConnectionStatus = connectionStatus,
+                status = result.fold(
+                    onSuccess = { "Connection check succeeded" },
+                    onFailure = { error -> "Connection check failed: ${error.message}" },
+                ),
+            )
+        }
     }
 
     fun toggleFolderSyncHistory(profileId: String) {
@@ -1328,8 +1354,15 @@ class MainViewModel(
                         .getOrDefault(FolderSyncServiceStatus())
                 }
                 val connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
+                val globalStatus = withContext(Dispatchers.IO) {
+                    buildGlobalFolderSyncStatus(
+                        state = uiState.value,
+                        runtimeStatus = status,
+                    )
+                }
                 uiState.value = uiState.value.copy(
                     folderSyncStatus = status,
+                    globalFolderSyncStatus = globalStatus,
                     appConnectionStatus = connectionStatus,
                 )
                 historyRefreshTick += 1
@@ -1340,6 +1373,33 @@ class MainViewModel(
                 delay(1_000)
             }
         }
+    }
+
+    private fun buildGlobalFolderSyncStatus(
+        state: MainUiState,
+        runtimeStatus: FolderSyncServiceStatus,
+    ): GlobalFolderSyncStatus {
+        val enabledProfiles = state.syncProfiles.filter { profile -> profile.enabled }
+        val enrollmentReady = state.deviceAuthState.hasClientIdentity()
+        val blockedProfiles = if (enrollmentReady) {
+            runCatching {
+                FolderSyncNetworkGate
+                    .evaluateProfiles(getApplication(), enabledProfiles)
+                    .filterNot { evaluation -> evaluation.decision.allowed }
+            }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+        val execution = FolderSyncExecutionCoordinator.snapshot()
+        return mergeGlobalFolderSyncStatus(
+            configs = state.syncProfiles,
+            runtimeStatus = runtimeStatus,
+            blockedProfileCount = blockedProfiles.size,
+            blockedReason = blockedProfiles.firstOrNull()?.decision?.reason,
+            enrollmentReady = enrollmentReady,
+            oneShotRunning = execution.oneShotRunning,
+            oneShotProfileLabel = execution.oneShotProfileLabel,
+        )
     }
 
     private fun refreshExpandedFolderSyncHistory(force: Boolean = false) {

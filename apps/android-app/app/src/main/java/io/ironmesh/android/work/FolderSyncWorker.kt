@@ -4,9 +4,7 @@ import android.content.Context
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
-import io.ironmesh.android.data.APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT
 import io.ironmesh.android.data.AndroidDiagnosticLog as Log
-import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.IronmeshPreferences
@@ -24,71 +22,69 @@ class FolderSyncWorker(
     private val repository = IronmeshRepository()
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        if (repository.hasContinuousFolderSyncActive()) {
-            Log.i(TAG, "continuous folder sync is active; skipping one-shot worker run")
+        val nativeContinuousActive = repository.hasContinuousFolderSyncActive()
+        if (!FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive)) {
+            Log.i(TAG, "continuous folder sync is requested or active; skipping one-shot worker run")
             return@withContext Result.success()
         }
 
-        val deviceAuth = try {
-            IronmeshPreferences.getDeviceAuthState(applicationContext)
-        } catch (error: DeviceIdentityStorageException) {
-            val message = error.message ?: "Protected device identity is unavailable; enroll again."
-            Log.e(TAG, message, error)
-            IronmeshPreferences.setAppConnectionStatus(
-                applicationContext,
-                AppConnectionStatus(
-                    state = APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT,
-                    message = message,
-                    updatedUnixMs = System.currentTimeMillis(),
-                ),
-            )
-            return@withContext Result.failure(workDataOf(OUTPUT_ERROR to message))
-        }
-        val connectionInput = deviceAuth.connectionBootstrapJson()
-        val clientIdentityJson = deviceAuth.toClientIdentityJson()
-        val serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() }
-        val profiles = IronmeshPreferences
-            .getFolderSyncConfigs(applicationContext)
-            .filter { it.enabled }
-
-        if (profiles.isEmpty()) {
-            return@withContext Result.success()
-        }
-
-        val networkDecisions = FolderSyncNetworkGate.evaluateProfiles(applicationContext, profiles)
-        val eligibleProfiles = networkDecisions
-            .filter { evaluation -> evaluation.decision.allowed }
-            .map { evaluation -> evaluation.profile }
-        val skippedProfiles = networkDecisions
-            .filterNot { evaluation -> evaluation.decision.allowed }
-
-        skippedProfiles.forEach { evaluation ->
-            Log.i(
-                TAG,
-                "skipping one-shot sync profile=${evaluation.profile.id} reason=${evaluation.decision.reason}",
-            )
-        }
-
-        if (eligibleProfiles.isEmpty()) {
-            Log.i(TAG, "one-shot sync skipped because no enabled profile matches the current network policy")
-            return@withContext Result.success()
-        }
-
-        val failures = mutableListOf<String>()
-
-        for (profile in eligibleProfiles) {
-            runCatching {
-                syncProfile(connectionInput, serverCaPem, clientIdentityJson, profile)
-            }.onFailure { error ->
-                failures += "${profile.label}: ${error.message ?: "unknown"}"
-                Log.e(TAG, "folder sync failed for profile=${profile.id}", error)
+        try {
+            val deviceAuth = try {
+                IronmeshPreferences.getDeviceAuthState(applicationContext)
+            } catch (error: DeviceIdentityStorageException) {
+                val message = error.message ?: "Protected device identity is unavailable; enroll again."
+                Log.e(TAG, message, error)
+                return@withContext Result.failure(workDataOf(OUTPUT_ERROR to message))
             }
-        }
+            val connectionInput = deviceAuth.connectionBootstrapJson()
+            val clientIdentityJson = deviceAuth.toClientIdentityJson()
+            val serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() }
+            val profiles = IronmeshPreferences
+                .getFolderSyncConfigs(applicationContext)
+                .filter { it.enabled }
 
-        if (failures.isEmpty()) {
-            Result.success()
-        } else {
-            Result.retry()
+            if (profiles.isEmpty()) {
+                return@withContext Result.success()
+            }
+
+            val networkDecisions = FolderSyncNetworkGate.evaluateProfiles(applicationContext, profiles)
+            val eligibleProfiles = networkDecisions
+                .filter { evaluation -> evaluation.decision.allowed }
+                .map { evaluation -> evaluation.profile }
+            val skippedProfiles = networkDecisions
+                .filterNot { evaluation -> evaluation.decision.allowed }
+
+            skippedProfiles.forEach { evaluation ->
+                Log.i(
+                    TAG,
+                    "skipping one-shot sync profile=${evaluation.profile.id} reason=${evaluation.decision.reason}",
+                )
+            }
+
+            if (eligibleProfiles.isEmpty()) {
+                Log.i(TAG, "one-shot sync skipped because no enabled profile matches the current network policy")
+                return@withContext Result.success()
+            }
+
+            val failures = mutableListOf<String>()
+
+            for (profile in eligibleProfiles) {
+                FolderSyncExecutionCoordinator.updateOneShotProfile(profile.label)
+                runCatching {
+                    syncProfile(connectionInput, serverCaPem, clientIdentityJson, profile)
+                }.onFailure { error ->
+                    failures += "${profile.label}: ${error.message ?: "unknown"}"
+                    Log.e(TAG, "folder sync failed for profile=${profile.id}", error)
+                }
+            }
+
+            if (failures.isEmpty()) {
+                Result.success()
+            } else {
+                Result.retry()
+            }
+        } finally {
+            FolderSyncExecutionCoordinator.finishOneShot()
         }
     }
 

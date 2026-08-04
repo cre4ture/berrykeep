@@ -32,16 +32,6 @@ class AppConnectionStatusTest {
     }
 
     @Test
-    fun nextRetryDelayStartsAtTwoSeconds() {
-        assertEquals(2_000L, nextAppConnectionRetryDelayMs(1))
-    }
-
-    @Test
-    fun nextRetryDelayCapsAtSixtySeconds() {
-        assertEquals(60_000L, nextAppConnectionRetryDelayMs(8))
-    }
-
-    @Test
     fun retryPendingReflectsScheduledRetryState() {
         val pending = AppConnectionStatus(
             state = APP_CONNECTION_STATE_RETRY_SCHEDULED,

@@ -18,6 +18,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.R
+import io.ironmesh.android.data.GLOBAL_SYNC_STATE_ERROR
+import io.ironmesh.android.data.GLOBAL_SYNC_STATE_HEALTHY
+import io.ironmesh.android.data.GLOBAL_SYNC_STATE_WAITING
 import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainUiState
 import io.ironmesh.android.ui.components.EmptyStateCard
@@ -37,13 +40,19 @@ fun HomeScreen(
     onSelectSection: (MainSection) -> Unit,
 ) {
     val status = state.folderSyncStatus
+    val globalSyncStatus = state.globalFolderSyncStatus
     val connectionStatus = state.appConnectionStatus
     val connectionHealthNow = rememberConnectionHealthNow(connectionStatus)
     val hasProfiles = state.syncProfiles.isNotEmpty()
-    val heroTone = when {
-        status.errorProfileCount > 0L -> HeroTone.Error
+    val connectionTone = when {
         !isAppConnectionHealthy(connectionStatus, connectionHealthNow) -> HeroTone.Warning
         else -> HeroTone.Good
+    }
+    val syncTone = when (globalSyncStatus.state) {
+        GLOBAL_SYNC_STATE_ERROR -> HeroTone.Error
+        GLOBAL_SYNC_STATE_WAITING -> HeroTone.Warning
+        GLOBAL_SYNC_STATE_HEALTHY -> HeroTone.Good
+        else -> HeroTone.Neutral
     }
     val heroTitle = appConnectionHeadline(connectionStatus, connectionHealthNow)
     val heroBody = appConnectionSummary(connectionStatus)
@@ -57,19 +66,40 @@ fun HomeScreen(
         StatusHeroCard(
             title = heroTitle,
             subtitle = heroBody,
-            tone = heroTone,
+            tone = connectionTone,
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Button(onClick = onRunSyncNow) {
-                    Text(stringResource(R.string.sync_now))
-                }
-                if (shouldShowRetryConnectionAction(connectionStatus, hasProfiles, connectionHealthNow)) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (
+                    state.deviceAuthState.hasClientIdentity() &&
+                    shouldShowRetryConnectionAction(connectionStatus, connectionHealthNow)
+                ) {
                     OutlinedButton(onClick = onRetryConnection) {
                         Text(stringResource(R.string.retry_connection))
                     }
                 }
                 OutlinedButton(onClick = onOpenWebConsole) {
                     Text(stringResource(R.string.open_web_console))
+                }
+            }
+        }
+
+        StatusHeroCard(
+            title = syncOverviewHeadline(globalSyncStatus),
+            subtitle = syncOverviewSummary(globalSyncStatus),
+            tone = syncTone,
+        ) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Button(onClick = onRunSyncNow) {
+                    Text(stringResource(R.string.sync_now))
+                }
+                OutlinedButton(onClick = onOpenSync) {
+                    Text(stringResource(R.string.open_sync))
                 }
             }
         }
@@ -85,7 +115,7 @@ fun HomeScreen(
             )
             MetricPill(
                 label = stringResource(R.string.metric_last_success),
-                value = connectionStatus.lastSuccessfulConnectionUnixMs?.let(::formatTimestamp) ?: "None",
+                value = globalSyncStatus.lastSuccessUnixMs?.let(::formatTimestamp) ?: "None",
             )
             MetricPill(
                 label = stringResource(R.string.metric_uploads),
@@ -97,16 +127,18 @@ fun HomeScreen(
             )
         }
 
-        SectionCard(
-            title = stringResource(R.string.home_next_step),
-            supportingText = stringResource(R.string.home_next_step_body),
-        ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Button(onClick = { onSelectSection(MainSection.SYNC) }) {
-                    Text(stringResource(R.string.create_sync))
-                }
-                OutlinedButton(onClick = { onSelectSection(MainSection.LIBRARY) }) {
-                    Text(stringResource(R.string.open_library))
+        if (!hasProfiles) {
+            SectionCard(
+                title = stringResource(R.string.home_next_step),
+                supportingText = stringResource(R.string.home_next_step_body),
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Button(onClick = { onSelectSection(MainSection.SYNC) }) {
+                        Text(stringResource(R.string.create_sync))
+                    }
+                    OutlinedButton(onClick = { onSelectSection(MainSection.LIBRARY) }) {
+                        Text(stringResource(R.string.open_library))
+                    }
                 }
             }
         }
