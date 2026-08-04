@@ -9,7 +9,6 @@ import androidx.compose.runtime.setValue
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.AppFailedConnectionAttempt
-import io.ironmesh.android.data.APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncProfileStatus
 import io.ironmesh.android.data.FolderSyncRuntimeMetrics
@@ -253,20 +252,6 @@ fun shouldShowRetryConnectionAction(
     }
     return !isAppConnectionHealthy(connectionStatus, nowUnixMs) ||
         connectionStatus.isRetryPending()
-}
-
-fun appFailedAttemptSummary(attempt: AppFailedConnectionAttempt): String {
-    val parts = mutableListOf<String>()
-    parts += attempt.sourceLabel?.takeIf { it.isNotBlank() } ?: displayStatusToken(attempt.pathKind)
-    if (attempt.impact == APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE) {
-        parts += "Background maintenance"
-    }
-    parts += attempt.method.ifBlank { "Request" }
-    parts += formatTimestamp(attempt.finishedUnixMs ?: attempt.startedUnixMs)
-    attempt.timeoutMs?.let { timeoutMs ->
-        parts += "Timeout ${formatDurationMillis(timeoutMs)}"
-    }
-    return parts.joinToString(" | ")
 }
 
 fun formatDurationMillis(durationMs: Long): String {
