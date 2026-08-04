@@ -9,14 +9,13 @@ const val APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT = "waiting-for-enrollment"
 const val APP_CONNECTION_STATE_RETRY_SCHEDULED = "retry-scheduled"
 const val APP_CONNECTION_STATE_ERROR = "error"
 
-private const val RETRY_BASE_DELAY_MS = 2_000L
-private const val RETRY_MAX_DELAY_MS = 60_000L
 internal const val APP_CONNECTION_HEALTH_MAX_AGE_MS = 60 * 60 * 1_000L
 internal const val APP_CONNECTION_DIAGNOSTIC_IMPACT_USER_FACING = "user_facing"
 internal const val APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE =
     "background_maintenance"
 
-// App-wide connection status shared by sync, gallery, and other foreground requests.
+// App-wide transport reachability shared by sync, gallery, and other requests.
+// HTTP/application failures belong to their owning feature state, not this status.
 data class AppConnectionStatus(
     val state: String = APP_CONNECTION_STATE_STOPPED,
     val message: String = "No app connection activity yet",
@@ -59,15 +58,6 @@ internal fun String.affectsAppConnectionStatus(): Boolean {
 
 internal fun AppFailedConnectionAttempt.affectsAppConnectionStatus(): Boolean {
     return impact.affectsAppConnectionStatus()
-}
-
-fun nextAppConnectionRetryDelayMs(attempt: Int): Long {
-    if (attempt <= 1) {
-        return RETRY_BASE_DELAY_MS
-    }
-    val exponent = (attempt - 1).coerceAtMost(5)
-    val multiplier = 1L shl exponent
-    return (RETRY_BASE_DELAY_MS * multiplier).coerceAtMost(RETRY_MAX_DELAY_MS)
 }
 
 fun AppConnectionStatus.isRetryPending(): Boolean {

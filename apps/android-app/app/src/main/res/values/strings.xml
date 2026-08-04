@@ -29,6 +29,7 @@
     <string name="home_connected">Connected</string>
     <string name="home_not_connected">Setup needed</string>
     <string name="sync_now">Sync now</string>
+    <string name="open_sync">Open sync</string>
     <string name="create_sync">Create sync</string>
     <string name="open_library">Open library</string>
     <string name="open_web_console">Open web console</string>

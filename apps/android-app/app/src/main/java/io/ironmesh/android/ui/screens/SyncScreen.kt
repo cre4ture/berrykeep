@@ -40,6 +40,9 @@ import io.ironmesh.android.R
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
+import io.ironmesh.android.data.GLOBAL_SYNC_STATE_ERROR
+import io.ironmesh.android.data.GLOBAL_SYNC_STATE_HEALTHY
+import io.ironmesh.android.data.GLOBAL_SYNC_STATE_WAITING
 import io.ironmesh.android.ui.FolderSyncActivityFilter
 import io.ironmesh.android.ui.FolderSyncHistoryState
 import io.ironmesh.android.ui.MainUiState
@@ -58,18 +61,17 @@ fun SyncScreen(
     onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
 ) {
     val profileStatuses = state.folderSyncStatus.profiles.associateBy { it.profileId }
-    val connectionStatus = state.appConnectionStatus
-    val connectionHealthNow = rememberConnectionHealthNow(connectionStatus)
-    val hasProfiles = state.syncProfiles.isNotEmpty()
+    val globalSyncStatus = state.globalFolderSyncStatus
     var showCreateSheet by rememberSaveable { mutableStateOf(false) }
     var detailProfileId by rememberSaveable { mutableStateOf<String?>(null) }
     var editingProfileId by rememberSaveable { mutableStateOf<String?>(null) }
     val detailProfile = state.syncProfiles.firstOrNull { it.id == detailProfileId }
     val editingProfile = state.syncProfiles.firstOrNull { it.id == editingProfileId }
-    val heroTone = when {
-        state.folderSyncStatus.errorProfileCount > 0L -> HeroTone.Error
-        !isAppConnectionHealthy(connectionStatus, connectionHealthNow) -> HeroTone.Warning
-        else -> HeroTone.Good
+    val heroTone = when (globalSyncStatus.state) {
+        GLOBAL_SYNC_STATE_ERROR -> HeroTone.Error
+        GLOBAL_SYNC_STATE_WAITING -> HeroTone.Warning
+        GLOBAL_SYNC_STATE_HEALTHY -> HeroTone.Good
+        else -> HeroTone.Neutral
     }
 
     Column(
@@ -79,18 +81,16 @@ fun SyncScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         StatusHeroCard(
-            title = syncOverviewHeadline(state.folderSyncStatus, hasProfiles),
-            subtitle = syncOverviewSummary(state.folderSyncStatus),
+            title = syncOverviewHeadline(globalSyncStatus),
+            subtitle = syncOverviewSummary(globalSyncStatus),
             tone = heroTone,
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 Button(onClick = { showCreateSheet = true }) {
                     Text(stringResource(R.string.new_profile))
-                }
-                if (shouldShowRetryConnectionAction(connectionStatus, hasProfiles, connectionHealthNow)) {
-                    OutlinedButton(onClick = vm::retryFolderSyncConnection) {
-                        Text(stringResource(R.string.retry_connection))
-                    }
                 }
                 OutlinedButton(onClick = vm::runFolderSyncNow) {
                     Text(stringResource(R.string.sync_now))
@@ -104,14 +104,18 @@ fun SyncScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 SyncBadge("Configured ${state.syncProfiles.size}")
-                SyncBadge("Active ${state.folderSyncStatus.activeProfileCount}")
-                if (state.folderSyncStatus.syncingProfileCount > 0L) {
-                    SyncBadge("Syncing ${state.folderSyncStatus.syncingProfileCount}")
+                SyncBadge("Enabled ${globalSyncStatus.enabledProfileCount}")
+                SyncBadge("Active ${globalSyncStatus.activeProfileCount}")
+                if (globalSyncStatus.syncingProfileCount > 0L) {
+                    SyncBadge("Syncing ${globalSyncStatus.syncingProfileCount}")
                 }
-                if (state.folderSyncStatus.errorProfileCount > 0L) {
-                    SyncBadge("Errors ${state.folderSyncStatus.errorProfileCount}")
+                if (globalSyncStatus.waitingProfileCount > 0L) {
+                    SyncBadge("Waiting ${globalSyncStatus.waitingProfileCount}")
                 }
-                state.folderSyncStatus.lastSuccessUnixMs?.let { lastSuccess ->
+                if (globalSyncStatus.errorProfileCount > 0L) {
+                    SyncBadge("Errors ${globalSyncStatus.errorProfileCount}")
+                }
+                globalSyncStatus.lastSuccessUnixMs?.let { lastSuccess ->
                     SyncBadge("Last success ${formatTimestamp(lastSuccess)}")
                 }
             }
