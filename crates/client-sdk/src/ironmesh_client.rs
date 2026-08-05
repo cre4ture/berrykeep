@@ -59,6 +59,7 @@ const CLIENT_ROUTE_ACTIVE_BONUS_MS: f64 = 50.0;
 const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
 const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
 const CLIENT_ROUTE_RETIRED_FAILURE_STATE_TTL_MS: u64 = 10 * 60 * 1_000;
+const CLIENT_ROUTE_RETIRED_FAILURE_STATE_LIMIT: usize = 256;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
 const CLIENT_ROUTE_INITIAL_BACKGROUND_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1588,6 +1589,7 @@ impl ClientEndpointRouter {
         for route_key in &desired_keys {
             retired_failure_states.remove(route_key);
         }
+        prune_retired_failure_states(&mut retired_failure_states);
 
         let removed = removed_keys.len();
         let active_is_retained = self
@@ -1603,6 +1605,21 @@ impl ClientEndpointRouter {
         }
         *routes = next;
         (added, removed, retained)
+    }
+}
+
+fn prune_retired_failure_states(
+    retired_failure_states: &mut HashMap<String, RetiredRouteFailureState>,
+) {
+    while retired_failure_states.len() > CLIENT_ROUTE_RETIRED_FAILURE_STATE_LIMIT {
+        let Some(oldest_route_key) = retired_failure_states
+            .iter()
+            .min_by_key(|(_, retired)| retired.expires_at_unix_ms)
+            .map(|(route_key, _)| route_key.clone())
+        else {
+            break;
+        };
+        retired_failure_states.remove(&oldest_route_key);
     }
 }
 

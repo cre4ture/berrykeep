@@ -8,7 +8,7 @@ use reqwest::Url;
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::blocking::ClientBuilder as BlockingClientBuilder;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
@@ -537,6 +537,9 @@ fn normalize_socket_addr_list(values: &[String]) -> Vec<String> {
     values
         .iter()
         .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -1252,6 +1255,44 @@ mod tests {
         assert_eq!(
             planned_route_key(&metadata_update, Some(&identity)).expect("key should build"),
             baseline_key
+        );
+    }
+
+    #[test]
+    fn planned_route_key_treats_socket_addresses_as_canonical_sets() {
+        let identity = sample_identity();
+        let mut baseline = direct_quic_route_target(identity.cluster_id, NodeId::new_v4());
+        let hints = baseline
+            .direct_candidate
+            .as_mut()
+            .and_then(|candidate| candidate.transport_hints.as_mut())
+            .expect("candidate hints should exist");
+        hints.direct_socket_addrs.push("127.0.0.1:7001".to_string());
+        hints
+            .observed_socket_addrs
+            .push("198.51.100.9:7000".to_string());
+
+        let mut reordered = baseline.clone();
+        let hints = reordered
+            .direct_candidate
+            .as_mut()
+            .and_then(|candidate| candidate.transport_hints.as_mut())
+            .expect("candidate hints should exist");
+        hints.direct_socket_addrs = vec![
+            " 127.0.0.1:7001 ".to_string(),
+            "127.0.0.1:7000".to_string(),
+            "127.0.0.1:7001".to_string(),
+            "".to_string(),
+        ];
+        hints.observed_socket_addrs = vec![
+            "198.51.100.9:7000".to_string(),
+            "198.51.100.8:7000".to_string(),
+            " 198.51.100.8:7000 ".to_string(),
+        ];
+
+        assert_eq!(
+            planned_route_key(&baseline, Some(&identity)).expect("baseline key should build"),
+            planned_route_key(&reordered, Some(&identity)).expect("reordered key should build")
         );
     }
 

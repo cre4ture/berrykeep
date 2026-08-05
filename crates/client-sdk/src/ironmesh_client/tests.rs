@@ -336,6 +336,35 @@ fn reintroduced_failed_route_retains_backoff_without_reusing_transport() {
 }
 
 #[test]
+fn retired_failure_tombstones_are_capped_by_oldest_expiry() {
+    let mut retired_failure_states = HashMap::new();
+    for index in 0..CLIENT_ROUTE_RETIRED_FAILURE_STATE_LIMIT + 5 {
+        let state = ClientEndpointState {
+            consecutive_failures: 1,
+            total_failures: 1,
+            ..ClientEndpointState::default()
+        };
+        let retired = RetiredRouteFailureState::capture(&state, index as u64)
+            .expect("failed state should produce a tombstone");
+        retired_failure_states.insert(format!("route-{index}"), retired);
+    }
+
+    prune_retired_failure_states(&mut retired_failure_states);
+
+    assert_eq!(
+        retired_failure_states.len(),
+        CLIENT_ROUTE_RETIRED_FAILURE_STATE_LIMIT
+    );
+    for index in 0..5 {
+        assert!(!retired_failure_states.contains_key(&format!("route-{index}")));
+    }
+    assert!(retired_failure_states.contains_key(&format!(
+        "route-{}",
+        CLIENT_ROUTE_RETIRED_FAILURE_STATE_LIMIT + 4
+    )));
+}
+
+#[test]
 fn first_background_probe_gets_startup_budget_but_retries_keep_short_budget() {
     let mut state = ClientEndpointState::default();
     assert_eq!(
