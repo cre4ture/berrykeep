@@ -7,7 +7,6 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
         let snapshot = try decodeSnapshot(from: """
         {
           "generated_at_unix_ms": 1700000000000,
-          "active_index": 1,
           "ranked_indices": [1, 2, 0],
           "endpoints": [
             {
@@ -16,7 +15,6 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
               "locator": "https://node.example",
               "bootstrap_rank": 0,
               "target_node_id": null,
-              "active": false,
               "score": 45.5,
               "ewma_latency_ms": 31.25,
               "ewma_throughput_bytes_per_sec": 4096.5,
@@ -25,6 +23,7 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
               "total_successes": 12,
               "last_measurement_unix_ms": 1699999999000,
               "last_success_unix_ms": 1699999999000,
+              "last_used_unix_ms": 1699999998500,
               "last_failure_unix_ms": 1699999900000,
               "circuit_open_until_unix_ms": null,
               "background_probe_in_flight": false,
@@ -38,7 +37,6 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
               "locator": "node.example:4433",
               "bootstrap_rank": 1,
               "target_node_id": "018f7630-7b60-7000-8000-000000000001",
-              "active": true,
               "score": 12.75,
               "ewma_latency_ms": 8.5,
               "ewma_throughput_bytes_per_sec": null,
@@ -47,6 +45,7 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
               "total_successes": 30,
               "last_measurement_unix_ms": 1699999999500,
               "last_success_unix_ms": 1699999999500,
+              "last_used_unix_ms": 1699999999500,
               "last_failure_unix_ms": null,
               "circuit_open_until_unix_ms": null,
               "background_probe_in_flight": true,
@@ -59,7 +58,6 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
               "locator": "relay.example",
               "bootstrap_rank": 2,
               "target_node_id": null,
-              "active": false,
               "score": 99.0,
               "ewma_latency_ms": null,
               "ewma_throughput_bytes_per_sec": null,
@@ -68,6 +66,7 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
               "total_successes": 4,
               "last_measurement_unix_ms": 1699999900000,
               "last_success_unix_ms": 1699999800000,
+              "last_used_unix_ms": null,
               "last_failure_unix_ms": 1699999900000,
               "circuit_open_until_unix_ms": 1700000060000,
               "background_probe_in_flight": false,
@@ -78,12 +77,13 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
         }
         """)
 
-        XCTAssertEqual(snapshot.activeEndpoint?.pathKind, .directQUIC)
+        XCTAssertEqual(snapshot.mostRecentlyUsedEndpoint?.pathKind, .directQUIC)
+        XCTAssertEqual(snapshot.recentlyUsedEndpoints.map(\.index), [1, 0])
         XCTAssertEqual(snapshot.rankedEndpoints.map(\.index), [1, 2, 0])
         XCTAssertEqual(snapshot.directEndpointCount, 2)
         XCTAssertEqual(snapshot.relayEndpointCount, 1)
 
-        let quic = try XCTUnwrap(snapshot.activeEndpoint)
+        let quic = try XCTUnwrap(snapshot.mostRecentlyUsedEndpoint)
         XCTAssertEqual(quic.ewmaLatencyMs, 8.5)
         XCTAssertEqual(quic.totalSuccesses, 30)
         XCTAssertTrue(quic.backgroundProbeInFlight)
@@ -110,7 +110,6 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
             locator: "node-a@https://creax.de:44043/path",
             bootstrapRank: 0,
             targetNodeId: "7314c3bb-2e1d-4508-a4d1-d274d985f059",
-            active: true,
             score: 1,
             ewmaLatencyMs: nil,
             ewmaThroughputBytesPerSec: nil,
@@ -119,6 +118,7 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
             totalSuccesses: 1,
             lastMeasurementUnixMs: nil,
             lastSuccessUnixMs: nil,
+            lastUsedUnixMs: 1,
             lastFailureUnixMs: nil,
             circuitOpenUntilUnixMs: nil,
             backgroundProbeInFlight: false,
@@ -133,7 +133,6 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
         let snapshot = try decodeSnapshot(from: """
         {
           "generated_at_unix_ms": 1,
-          "active_index": null,
           "ranked_indices": [4],
           "endpoints": [{
             "index": 4,
@@ -141,7 +140,6 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
             "locator": "future.example",
             "bootstrap_rank": 0,
             "target_node_id": null,
-            "active": false,
             "score": 1.0,
             "ewma_latency_ms": null,
             "ewma_throughput_bytes_per_sec": null,
@@ -150,6 +148,7 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
             "total_successes": 0,
             "last_measurement_unix_ms": null,
             "last_success_unix_ms": null,
+            "last_used_unix_ms": null,
             "last_failure_unix_ms": null,
             "circuit_open_until_unix_ms": null,
             "background_probe_in_flight": false,
@@ -171,7 +170,6 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
             locator: "iroh://node.example",
             bootstrapRank: 0,
             targetNodeId: nil,
-            active: true,
             score: 1,
             ewmaLatencyMs: nil,
             ewmaThroughputBytesPerSec: nil,
@@ -180,6 +178,7 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
             totalSuccesses: 1,
             lastMeasurementUnixMs: nil,
             lastSuccessUnixMs: nil,
+            lastUsedUnixMs: 1,
             lastFailureUnixMs: nil,
             circuitOpenUntilUnixMs: nil,
             backgroundProbeInFlight: false,
@@ -188,7 +187,6 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
         )
         let snapshot = AppleConnectionRouteSnapshot(
             generatedAtUnixMs: 1,
-            activeIndex: endpoint.index,
             rankedIndices: [endpoint.index],
             endpoints: [endpoint]
         )

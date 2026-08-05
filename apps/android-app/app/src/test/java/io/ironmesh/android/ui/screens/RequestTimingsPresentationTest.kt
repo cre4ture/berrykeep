@@ -66,7 +66,6 @@ class RequestTimingsPresentationTest {
             pathKind = pathKind,
             locator = "https://node-$index.example",
             bootstrapRank = index,
-            active = index == 0,
             score = 0.0,
             consecutiveFailures = 0,
             totalFailures = 0L,

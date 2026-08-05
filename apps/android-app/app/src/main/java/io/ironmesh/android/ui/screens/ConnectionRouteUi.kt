@@ -16,7 +16,7 @@ internal data class RouteStateColors(
 internal fun routeStateColors(state: ConnectionRouteState): RouteStateColors {
     val colors = MaterialTheme.colorScheme
     return when (state) {
-        ConnectionRouteState.LAST_USED -> RouteStateColors(
+        ConnectionRouteState.ACTIVE -> RouteStateColors(
             container = colors.primaryContainer,
             badge = colors.primary,
             onBadge = colors.onPrimary,
@@ -55,7 +55,7 @@ internal fun formatConnectionLatency(value: Double): String {
 internal fun routeStatusLabel(state: ConnectionRouteState): String {
     return stringResource(
         when (state) {
-            ConnectionRouteState.LAST_USED -> R.string.connection_paths_state_last_used
+            ConnectionRouteState.ACTIVE -> R.string.connection_paths_state_active
             ConnectionRouteState.AVAILABLE -> R.string.connection_paths_state_available
             ConnectionRouteState.CHECKING -> R.string.connection_paths_state_checking
             ConnectionRouteState.COOL_DOWN -> R.string.connection_paths_state_cool_down

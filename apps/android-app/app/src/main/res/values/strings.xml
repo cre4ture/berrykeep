@@ -127,6 +127,8 @@
     <string name="connection_paths_direct_title">Connected directly</string>
     <string name="connection_paths_direct_quic_title">Connected directly via NAT (QUIC)</string>
     <string name="connection_paths_relay_title">Connected through relay</string>
+    <string name="connection_paths_multiple_title">Using multiple routes</string>
+    <string name="connection_paths_available_title">Routes available</string>
     <string name="connection_paths_improving_title">Improving connection</string>
     <string name="connection_paths_unavailable_title">No working connection</string>
     <string name="connection_paths_error_title">Connection check unavailable</string>
@@ -139,16 +141,17 @@
     <string name="connection_paths_selection_title">How the router chooses</string>
     <string name="connection_paths_selection_body">The lowest score wins. Routes in cooldown are placed after routes that can be tried now, regardless of score.</string>
     <string name="connection_paths_selection_score_additions">Score adds configured order, latency, 500 points for a relay path, and 250 points for each consecutive failure.</string>
-    <string name="connection_paths_selection_score_credits">Score subtracts up to 50 points for throughput and 50 points for the last-used route.</string>
+    <string name="connection_paths_selection_score_credits">Score subtracts up to 50 points for measured throughput.</string>
     <string name="connection_paths_empty_title">No routes reported yet</string>
     <string name="connection_paths_empty_body">Routes will appear after this device has attempted a connection.</string>
-    <string name="connection_paths_state_last_used">Last Used</string>
+    <string name="connection_paths_state_active">Active</string>
     <string name="connection_paths_state_available">Available</string>
     <string name="connection_paths_state_checking">Checking</string>
     <string name="connection_paths_state_cool_down">Cool down</string>
     <string name="connection_paths_state_unavailable">Unavailable</string>
     <string name="connection_paths_state_unknown">Unknown</string>
     <string name="connection_paths_route_last_used">Last successful route</string>
+    <string name="connection_paths_active_route_count">%1$d routes active</string>
     <string name="connection_paths_latency">%1$.1f ms</string>
     <string name="connection_paths_latency_label">Latency</string>
     <string name="connection_paths_selection_details_title">Route selection</string>
@@ -157,8 +160,8 @@
     <string name="connection_paths_compact_route_count">%1$d routes</string>
     <string name="connection_paths_route_score">Route score</string>
     <string name="connection_paths_route_score_value">%1$.1f points (lower is better)</string>
-    <string name="connection_paths_selection_reason_last_used_best">Last used and preferred next: it has the lowest score among routes that can be tried now.</string>
-    <string name="connection_paths_selection_reason_last_used_ranked">Last used; the router currently ranks this route %1$d. Its last-used-route credit is included in the score.</string>
+    <string name="connection_paths_selection_reason_active_best">Active now and preferred next: it has the lowest score among routes that can be tried now.</string>
+    <string name="connection_paths_selection_reason_active_ranked">Active now; the router currently ranks this route %1$d. Recent use does not affect its score.</string>
     <string name="connection_paths_route_score_compact">%1$.0f pts</string>
     <string name="connection_paths_selection_reason_preferred">Preferred next: it has the lowest score among routes that can be tried now.</string>
     <string name="connection_paths_selection_reason_ranked_after">Not selected: routes with lower scores are tried before this one.</string>
@@ -171,7 +174,6 @@
     <string name="connection_paths_score_relay_penalty">Relay path surcharge</string>
     <string name="connection_paths_score_failure_penalty">Consecutive-failure penalty</string>
     <string name="connection_paths_score_throughput_credit">Throughput credit</string>
-    <string name="connection_paths_score_last_used_route_credit">Last-used-route credit</string>
     <string name="connection_paths_score_points_added">+%1$.1f points</string>
     <string name="connection_paths_score_points_credited">-%1$.1f points</string>
     <string name="connection_paths_score_not_applied">Not applied</string>
@@ -188,6 +190,7 @@
     <string name="connection_paths_success_count">%1$d / %2$d successful</string>
     <string name="connection_paths_last_checked_label">Last checked</string>
     <string name="connection_paths_last_success_label">Last success</string>
+    <string name="connection_paths_last_used_label">Last active use</string>
     <string name="connection_paths_retry_after">Retry after</string>
     <string name="connection_paths_technical_details">Technical details</string>
     <string name="connection_paths_relay_note_title">About relay</string>

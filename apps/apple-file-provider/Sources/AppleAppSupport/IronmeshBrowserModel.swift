@@ -84,7 +84,7 @@ struct IronmeshConnectionEndpointStatus: Codable, Equatable, Identifiable, Senda
     var lastSuccessfulIrohRelayUrl: String? = nil
     var locator: String
     var requestBaseUrl: String
-    var active: Bool
+    var lastUsedUnixMs: UInt64?
     var consecutiveFailures: UInt32
     var totalFailures: UInt64
     var totalSuccesses: UInt64
@@ -286,7 +286,7 @@ final class IronmeshBrowserModel: ObservableObject {
         let generatedAt = Date()
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let activeRoute = connectionRouteSnapshot?.activeEndpoint
+        let activeRoutes = connectionRouteSnapshot?.recentlyUsedEndpoints ?? []
         let shortVersion = (
             Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         )?.nilIfBlank
@@ -328,7 +328,7 @@ final class IronmeshBrowserModel: ObservableObject {
         Domain: \(draft.domainIdentifier.nilIfBlank ?? "unavailable")
         UI status: \(statusText.replacingOccurrences(of: "\n", with: " "))
         Last error: \(lastErrorMessage?.replacingOccurrences(of: "\n", with: " ") ?? "none")
-        Active route: \(activeRoute.map { "\($0.pathKind.rawValue): \($0.locator)" } ?? "unavailable")
+        Active routes: \(activeRoutes.map { "\($0.pathKind.rawValue): \($0.locator)" }.joined(separator: "; ").nilIfBlank ?? "none")
         Title latency: state=\(titleLatencyStatus.state) route=\(titleLatencyStatus.connectionType) latency_ms=\(titleLatencyStatus.latencyMs.map { String($0) } ?? "unavailable") error=\(titleLatencyStatus.error ?? "none")
         Sync profile count: \(syncProfiles.count)
 
@@ -375,8 +375,8 @@ final class IronmeshBrowserModel: ObservableObject {
 
     var orderedConnectionEndpoints: [IronmeshConnectionEndpointStatus] {
         (connectionDiagnostics?.endpoints ?? []).sorted { lhs, rhs in
-            if lhs.active != rhs.active {
-                return lhs.active && !rhs.active
+            if lhs.lastUsedUnixMs != rhs.lastUsedUnixMs {
+                return (lhs.lastUsedUnixMs ?? 0) > (rhs.lastUsedUnixMs ?? 0)
             }
             if lhs.lastAttemptUnixMs != rhs.lastAttemptUnixMs {
                 return (lhs.lastAttemptUnixMs ?? 0) > (rhs.lastAttemptUnixMs ?? 0)
@@ -1054,6 +1054,26 @@ final class IronmeshBrowserModel: ObservableObject {
                 statusText = error.localizedDescription
                 addAction("Connection paths failed", detail: error.localizedDescription)
             }
+        }
+    }
+
+    func refreshCachedConnectionPaths() async {
+        guard let configuration = draft.connectionConfiguration else {
+            return
+        }
+        let remoteSession = remoteSession
+        do {
+            let snapshot = try await Task.detached(priority: .utility) {
+                try remoteSession.connectionRouteSnapshot(
+                    configuration: configuration,
+                    refresh: false
+                )
+            }.value
+            if snapshot.generatedAtUnixMs >= (connectionRouteSnapshot?.generatedAtUnixMs ?? 0) {
+                connectionRouteSnapshot = snapshot
+            }
+        } catch {
+            // The explicit refresh action owns user-visible route errors.
         }
     }
 

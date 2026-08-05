@@ -69,7 +69,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByText("Connection paths", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Connection Paths" })).toBeVisible();
   await expect(page.getByText("Overall search state")).toBeVisible();
-  await expect(page.getByText("Recovering")).toBeVisible();
+  await expect(page.getByText("Multiple routes active")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Direct HTTPS to node-alpha" }).first()).toBeVisible();
   await expect(page.getByText("Relay via rendezvous-a.local:9443 to node-alpha", { exact: true })).toBeVisible();
   await expect(page.getByText("Relay via rendezvous-b.local:9443 to node-alpha", { exact: true })).toBeVisible();
@@ -1012,7 +1012,6 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
   const connectionRoutesPayload = {
     generated_at_unix_ms: 1_712_345_600_000,
-    active_index: 0,
     ranked_indices: [0, 2, 3, 1],
     endpoints: [
       {
@@ -1021,7 +1020,6 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         locator: "https://node-alpha.local",
         bootstrap_rank: 0,
         target_node_id: "node-alpha",
-        active: true,
         score: 18.2,
         ewma_latency_ms: 18.2,
         ewma_throughput_bytes_per_sec: 225000,
@@ -1030,6 +1028,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         total_successes: 12,
         last_measurement_unix_ms: 1_712_345_600_000,
         last_success_unix_ms: 1_712_345_600_000,
+        last_used_unix_ms: 1_712_345_600_000,
         last_failure_unix_ms: null,
         circuit_open_until_unix_ms: null,
         background_probe_in_flight: false,
@@ -1042,7 +1041,6 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         locator: "https://node-beta.local",
         bootstrap_rank: 1,
         target_node_id: "node-beta",
-        active: false,
         score: 604.4,
         ewma_latency_ms: 104.4,
         ewma_throughput_bytes_per_sec: null,
@@ -1051,6 +1049,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         total_successes: 1,
         last_measurement_unix_ms: 1_712_345_590_000,
         last_success_unix_ms: 1_712_345_300_000,
+        last_used_unix_ms: null,
         last_failure_unix_ms: 1_712_345_590_000,
         circuit_open_until_unix_ms: 1_712_345_620_000,
         background_probe_in_flight: false,
@@ -1063,7 +1062,6 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         locator: "relay://node-alpha@https://rendezvous-a.local:9443",
         bootstrap_rank: 0,
         target_node_id: "node-alpha",
-        active: false,
         score: 43.6,
         ewma_latency_ms: 18.6,
         ewma_throughput_bytes_per_sec: 160000,
@@ -1072,6 +1070,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         total_successes: 7,
         last_measurement_unix_ms: 1_712_345_598_000,
         last_success_unix_ms: 1_712_345_598_000,
+        last_used_unix_ms: 1_712_345_598_500,
         last_failure_unix_ms: null,
         circuit_open_until_unix_ms: null,
         background_probe_in_flight: false,
@@ -1084,7 +1083,6 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         locator: "relay://node-alpha@https://rendezvous-b.local:9443",
         bootstrap_rank: 1,
         target_node_id: "node-alpha",
-        active: false,
         score: 58.4,
         ewma_latency_ms: 33.4,
         ewma_throughput_bytes_per_sec: 120000,
@@ -1093,6 +1091,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         total_successes: 4,
         last_measurement_unix_ms: 1_712_345_592_000,
         last_success_unix_ms: 1_712_345_550_000,
+        last_used_unix_ms: null,
         last_failure_unix_ms: 1_712_345_592_000,
         circuit_open_until_unix_ms: null,
         background_probe_in_flight: false,
@@ -1105,7 +1104,6 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         locator: "iroh://node-alpha",
         bootstrap_rank: 2,
         target_node_id: "node-alpha",
-        active: false,
         score: 74.2,
         ewma_latency_ms: 24.2,
         ewma_throughput_bytes_per_sec: 210000,
@@ -1114,6 +1112,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         total_successes: 2,
         last_measurement_unix_ms: 1_712_345_597_000,
         last_success_unix_ms: 1_712_345_597_000,
+        last_used_unix_ms: null,
         last_failure_unix_ms: null,
         circuit_open_until_unix_ms: null,
         background_probe_in_flight: false,

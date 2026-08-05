@@ -8,13 +8,15 @@ internal enum class ConnectionOverviewState {
     DIRECT,
     DIRECT_QUIC,
     RELAY,
+    MULTIPLE,
+    AVAILABLE,
     IMPROVING,
     UNAVAILABLE,
     ERROR,
 }
 
 internal enum class ConnectionRouteState {
-    LAST_USED,
+    ACTIVE,
     AVAILABLE,
     CHECKING,
     COOL_DOWN,
@@ -24,7 +26,8 @@ internal enum class ConnectionRouteState {
 
 internal data class ConnectionOverview(
     val state: ConnectionOverviewState,
-    val activeRoute: ConnectionRouteEndpointSnapshot? = null,
+    val displayRoute: ConnectionRouteEndpointSnapshot? = null,
+    val activeRouteCount: Int = 0,
     val checkedAtUnixMs: Long? = null,
     val error: String? = null,
 )
@@ -46,7 +49,6 @@ internal data class RouteScoreBreakdown(
     val relayPenaltyPoints: Double,
     val failurePenaltyPoints: Double,
     val throughputCreditPoints: Double,
-    val activeRouteCreditPoints: Double,
 )
 
 internal data class ConnectionPathsPresentation(
@@ -102,7 +104,11 @@ internal fun connectionOverview(
         return ConnectionOverview(state = ConnectionOverviewState.CHECKING)
     }
 
-    val active = snapshot.endpoints.firstOrNull { it.active } ?: orderedEndpoints.firstOrNull()
+    val activeRoutes = orderedEndpoints.filter { endpoint ->
+        wasRecentlyUsed(endpoint, snapshot.generatedAtUnixMs)
+    }
+    val active = activeRoutes.maxByOrNull { endpoint -> endpoint.lastUsedUnixMs ?: Long.MIN_VALUE }
+    val displayRoute = active ?: orderedEndpoints.firstOrNull()
     val hasSuccess = snapshot.endpoints.any { it.totalSuccesses > 0L }
     val hasProbeInFlight = snapshot.endpoints.any { it.backgroundProbeInFlight }
     val hasCoolingRoute = snapshot.endpoints.any { isCoolingDown(it, snapshot.generatedAtUnixMs) }
@@ -110,6 +116,7 @@ internal fun connectionOverview(
     val state = when {
         !hasSuccess && snapshot.endpoints.all { it.totalFailures == 0L } -> ConnectionOverviewState.CHECKING
         !hasSuccess -> ConnectionOverviewState.UNAVAILABLE
+        activeRoutes.size > 1 -> ConnectionOverviewState.MULTIPLE
         active != null &&
             isRelayPath(active) &&
             active.consecutiveFailures == 0 &&
@@ -130,11 +137,13 @@ internal fun connectionOverview(
             !hasProbeInFlight -> {
             ConnectionOverviewState.DIRECT
         }
+        active == null -> ConnectionOverviewState.AVAILABLE
         else -> ConnectionOverviewState.IMPROVING
     }
     return ConnectionOverview(
         state = state,
-        activeRoute = active,
+        displayRoute = displayRoute,
+        activeRouteCount = activeRoutes.size,
         checkedAtUnixMs = snapshot.generatedAtUnixMs,
     )
 }
@@ -144,7 +153,7 @@ internal fun connectionRouteState(
     snapshotUnixMs: Long?,
 ): ConnectionRouteState {
     return when {
-        endpoint.active -> ConnectionRouteState.LAST_USED
+        wasRecentlyUsed(endpoint, snapshotUnixMs) -> ConnectionRouteState.ACTIVE
         isCoolingDown(endpoint, snapshotUnixMs) -> ConnectionRouteState.COOL_DOWN
         endpoint.backgroundProbeInFlight -> ConnectionRouteState.CHECKING
         endpoint.totalSuccesses > 0L && endpoint.consecutiveFailures == 0 -> ConnectionRouteState.AVAILABLE
@@ -226,8 +235,17 @@ internal fun routeScoreBreakdown(endpoint: ConnectionRouteEndpointSnapshot): Rou
                 .coerceAtMost(ROUTE_MAX_THROUGHPUT_CREDIT_POINTS)
         }
             ?: 0.0,
-        activeRouteCreditPoints = if (endpoint.active) ROUTE_ACTIVE_ROUTE_CREDIT_POINTS else 0.0,
     )
+}
+
+internal fun wasRecentlyUsed(
+    endpoint: ConnectionRouteEndpointSnapshot,
+    snapshotUnixMs: Long?,
+): Boolean {
+    val lastUsedUnixMs = endpoint.lastUsedUnixMs ?: return false
+    val observedAtUnixMs = snapshotUnixMs ?: return false
+    return lastUsedUnixMs <= observedAtUnixMs &&
+        observedAtUnixMs - lastUsedUnixMs <= ROUTE_ACTIVE_WINDOW_MS
 }
 
 internal fun isCoolingDown(
@@ -250,7 +268,7 @@ private fun rankedConnectionEndpoints(snapshot: ConnectionRouteSnapshot?): List<
 
 private fun routeStatePriority(state: ConnectionRouteState): Int {
     return when (state) {
-        ConnectionRouteState.LAST_USED -> 0
+        ConnectionRouteState.ACTIVE -> 0
         ConnectionRouteState.AVAILABLE -> 1
         ConnectionRouteState.CHECKING -> 2
         ConnectionRouteState.COOL_DOWN -> 3
@@ -301,6 +319,6 @@ private const val ROUTE_RELAY_PENALTY_POINTS = 500.0
 private const val ROUTE_FAILURE_PENALTY_POINTS = 250.0
 private const val ROUTE_THROUGHPUT_BYTES_PER_POINT = 250_000.0
 private const val ROUTE_MAX_THROUGHPUT_CREDIT_POINTS = 50.0
-private const val ROUTE_ACTIVE_ROUTE_CREDIT_POINTS = 50.0
+internal const val ROUTE_ACTIVE_WINDOW_MS = 2_000L
 private const val HOLE_PUNCHING_MODE_DIRECT = "direct"
 private const val HOLE_PUNCHING_MODE_RELAY = "relay"

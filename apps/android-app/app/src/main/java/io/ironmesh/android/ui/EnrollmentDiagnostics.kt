@@ -122,7 +122,9 @@ private fun enrollmentRouteEndpoint(
         .asSequence()
         .mapNotNull { index -> connectionRoutes.endpoints.firstOrNull { it.index == index } }
         .firstOrNull()
-    return connectionRoutes.endpoints.firstOrNull { it.active }
+    return connectionRoutes.endpoints
+        .filter { it.lastUsedUnixMs != null }
+        .maxByOrNull { it.lastUsedUnixMs ?: Long.MIN_VALUE }
         ?: rankedEndpoint
         ?: connectionRoutes.endpoints.firstOrNull()
 }

@@ -201,7 +201,10 @@ private fun CompactConnectionOverview(presentation: ConnectionPathsPresentation)
 
 @Composable
 private fun compactOverviewSubtitle(overview: ConnectionOverview): String {
-    val activeRoute = overview.activeRoute
+    if (overview.activeRouteCount > 1) {
+        return stringResource(R.string.connection_paths_active_route_count, overview.activeRouteCount)
+    }
+    val activeRoute = overview.displayRoute
     if (
         activeRoute != null &&
         overview.state != ConnectionOverviewState.ERROR &&
@@ -300,7 +303,10 @@ private fun ConnectionOverviewCard(
 
 @Composable
 private fun overviewSubtitle(overview: ConnectionOverview): String {
-    val activeRoute = overview.activeRoute
+    if (overview.activeRouteCount > 1) {
+        return stringResource(R.string.connection_paths_active_route_count, overview.activeRouteCount)
+    }
+    val activeRoute = overview.displayRoute
     if (activeRoute != null && overview.state !in setOf(ConnectionOverviewState.ERROR, ConnectionOverviewState.UNAVAILABLE)) {
         val quality = activeRoute.ewmaLatencyMs?.let { latency -> formatConnectionLatency(latency) }
             ?: stringResource(R.string.connection_paths_route_last_used)
@@ -318,6 +324,8 @@ private fun overviewSubtitle(overview: ConnectionOverview): String {
             ConnectionOverviewState.DIRECT,
             ConnectionOverviewState.DIRECT_QUIC,
             ConnectionOverviewState.RELAY,
+            ConnectionOverviewState.MULTIPLE,
+            ConnectionOverviewState.AVAILABLE,
             ConnectionOverviewState.IMPROVING,
             -> R.string.connection_paths_checking_body
         },
@@ -330,6 +338,8 @@ private fun overviewTitle(state: ConnectionOverviewState): Int {
         ConnectionOverviewState.DIRECT -> R.string.connection_paths_direct_title
         ConnectionOverviewState.DIRECT_QUIC -> R.string.connection_paths_direct_quic_title
         ConnectionOverviewState.RELAY -> R.string.connection_paths_relay_title
+        ConnectionOverviewState.MULTIPLE -> R.string.connection_paths_multiple_title
+        ConnectionOverviewState.AVAILABLE -> R.string.connection_paths_available_title
         ConnectionOverviewState.IMPROVING -> R.string.connection_paths_improving_title
         ConnectionOverviewState.UNAVAILABLE -> R.string.connection_paths_unavailable_title
         ConnectionOverviewState.ERROR -> R.string.connection_paths_error_title
@@ -340,6 +350,8 @@ private fun overviewHeroTone(state: ConnectionOverviewState): HeroTone {
     return when (state) {
         ConnectionOverviewState.DIRECT -> HeroTone.Good
         ConnectionOverviewState.DIRECT_QUIC -> HeroTone.Good
+        ConnectionOverviewState.MULTIPLE -> HeroTone.Good
+        ConnectionOverviewState.AVAILABLE -> HeroTone.Good
         ConnectionOverviewState.RELAY,
         ConnectionOverviewState.IMPROVING,
         -> HeroTone.Warning

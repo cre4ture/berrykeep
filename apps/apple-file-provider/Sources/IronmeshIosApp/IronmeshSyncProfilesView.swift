@@ -115,9 +115,9 @@ struct IronmeshFilesView: View {
                         HStack {
                             Text(endpoint.locator).font(.headline)
                             Spacer()
-                            Text(endpoint.active ? "Active" : "Standby")
+                            Text(endpointWasRecentlyUsed(endpoint) ? "Active" : "Standby")
                                 .font(.caption)
-                                .foregroundStyle(endpoint.active ? .green : .secondary)
+                                .foregroundStyle(endpointWasRecentlyUsed(endpoint) ? .green : .secondary)
                         }
                         if let targetNodeId = endpoint.targetNodeId {
                             IronmeshKeyValueRow(label: "Target server node", value: targetNodeId)
@@ -162,6 +162,14 @@ struct IronmeshFilesView: View {
             }
         }
     }
+}
+
+private func endpointWasRecentlyUsed(_ endpoint: IronmeshConnectionEndpointStatus) -> Bool {
+    guard let lastUsedUnixMs = endpoint.lastUsedUnixMs else {
+        return false
+    }
+    let nowUnixMs = UInt64(Date().timeIntervalSince1970 * 1_000)
+    return lastUsedUnixMs <= nowUnixMs && nowUnixMs - lastUsedUnixMs <= 2_000
 }
 
 private struct IronmeshSyncProfileCard: View {

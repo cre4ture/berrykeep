@@ -55,7 +55,6 @@ const CLIENT_ROUTE_UNKNOWN_LATENCY_MS: f64 = 75.0;
 const CLIENT_ROUTE_RELAY_PENALTY_MS: f64 = 500.0;
 const CLIENT_ROUTE_DIRECT_QUIC_BONUS_MS: f64 = 100.0;
 const CLIENT_ROUTE_FAILURE_PENALTY_MS: f64 = 250.0;
-const CLIENT_ROUTE_ACTIVE_BONUS_MS: f64 = 50.0;
 const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
 const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
 const CLIENT_ROUTE_RETIRED_FAILURE_STATE_TTL_MS: u64 = 10 * 60 * 1_000;
@@ -165,7 +164,6 @@ pub struct ClientEndpointDiagnostics {
     pub last_successful_iroh_relay_url: Option<String>,
     pub locator: String,
     pub request_base_url: String,
-    pub active: bool,
     pub consecutive_failures: u32,
     pub total_failures: u64,
     pub total_successes: u64,
@@ -173,6 +171,8 @@ pub struct ClientEndpointDiagnostics {
     pub last_attempt_unix_ms: Option<u64>,
     #[serde(default)]
     pub last_success_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_used_unix_ms: Option<u64>,
     #[serde(default)]
     pub last_user_facing_success_unix_ms: Option<u64>,
     #[serde(default)]
@@ -264,7 +264,6 @@ struct ClientEndpointRouter {
     /// small immutable endpoint list before doing network I/O, so reconciliation
     /// never holds this lock across a request or a probe.
     endpoints: Arc<RwLock<Vec<ClientEndpoint>>>,
-    active_route_key: Arc<RwLock<Option<String>>>,
     retired_failure_states: Arc<std::sync::Mutex<HashMap<String, RetiredRouteFailureState>>>,
     transport_failure_refresh_observer: Arc<TransportFailureRefreshObserverSlot>,
     relay_connection_refresh_observer: Arc<RelayConnectionRefreshObserverSlot>,
@@ -339,6 +338,9 @@ struct ClientEndpointState {
     total_successes: u64,
     last_measurement_unix_ms: Option<u64>,
     last_success_unix_ms: Option<u64>,
+    /// Most recent real request attempt on this route. Synthetic background
+    /// probes deliberately do not update this value.
+    last_used_unix_ms: Option<u64>,
     last_user_facing_success_unix_ms: Option<u64>,
     last_user_facing_success_url: Option<String>,
     last_failure_unix_ms: Option<u64>,
@@ -400,8 +402,6 @@ impl RetiredRouteFailureState {
 pub struct ClientConnectionRouteSnapshot {
     pub generated_at_unix_ms: u64,
     #[serde(default)]
-    pub active_index: Option<usize>,
-    #[serde(default)]
     pub ranked_indices: Vec<usize>,
     #[serde(default)]
     pub endpoints: Vec<ClientConnectionRouteEndpointSnapshot>,
@@ -423,8 +423,6 @@ pub struct ClientConnectionRouteEndpointSnapshot {
     /// Relay selected by Iroh for the most recently established QUIC path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_successful_iroh_relay_url: Option<String>,
-    #[serde(default)]
-    pub active: bool,
     pub score: f64,
     #[serde(default)]
     pub ewma_latency_ms: Option<f64>,
@@ -437,6 +435,8 @@ pub struct ClientConnectionRouteEndpointSnapshot {
     pub last_measurement_unix_ms: Option<u64>,
     #[serde(default)]
     pub last_success_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_used_unix_ms: Option<u64>,
     #[serde(default)]
     pub last_failure_unix_ms: Option<u64>,
     #[serde(default)]
@@ -686,13 +686,9 @@ impl UploadSessionAffinity {
 
 impl ClientEndpointRouter {
     fn new(endpoints: Vec<ClientEndpoint>) -> Self {
-        let initial_active = endpoints
-            .first()
-            .map(|endpoint| endpoint.descriptor.route_key.clone());
         Self {
             runtime_id: Uuid::now_v7(),
             endpoints: Arc::new(RwLock::new(endpoints)),
-            active_route_key: Arc::new(RwLock::new(initial_active)),
             retired_failure_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             transport_failure_refresh_observer: Arc::new(RwLock::new(None)),
             relay_connection_refresh_observer: Arc::new(RwLock::new(None)),
@@ -714,54 +710,12 @@ impl ClientEndpointRouter {
         self.endpoints_snapshot().get(index).cloned()
     }
 
-    fn active_route_key(&self) -> Option<String> {
-        self.active_route_key
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    fn active_index(&self) -> Option<usize> {
-        let active_route_key = self.active_route_key()?;
-        self.endpoints_snapshot()
-            .iter()
-            .position(|endpoint| endpoint.descriptor.route_key == active_route_key)
-    }
-
     fn current_endpoint(&self) -> Option<ClientEndpoint> {
-        self.active_index()
+        self.foreground_route_indices()
+            .into_iter()
+            .next()
             .and_then(|index| self.endpoint(index))
-            .or_else(|| {
-                self.best_ranked_index()
-                    .and_then(|index| self.endpoint(index))
-            })
             .or_else(|| self.endpoints_snapshot().into_iter().next())
-    }
-
-    fn set_active_index(&self, index: usize) {
-        let previous_active_index = self.active_index();
-        let endpoint = self.endpoint(index);
-        let route_key = endpoint
-            .as_ref()
-            .map(|endpoint| endpoint.descriptor.route_key.clone());
-        *self
-            .active_route_key
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = route_key;
-
-        if let Some(endpoint) = endpoint {
-            tracing::info!(
-                target: MOBILE_CONNECTION_LOG_TARGET,
-                event = "selected_route_index",
-                selected_route_index = index,
-                candidate_index = index,
-                path_kind = transport_path_kind_label(endpoint.transport.transport_path_kind()),
-                locator = %endpoint.descriptor.locator,
-                previous_active_index = ?previous_active_index,
-                selection_phase = "active_after_success",
-                "selected_route_index"
-            );
-        }
     }
 
     fn log_route_candidate_scheduled(&self, index: usize, endpoint: &ClientEndpoint) {
@@ -773,37 +727,24 @@ impl ClientEndpointRouter {
             candidate_index = index,
             path_kind = transport_path_kind_label(endpoint.transport.transport_path_kind()),
             locator = %endpoint.descriptor.locator,
-            active_index = ?self.active_index(),
+            preferred_index = ?self.best_ranked_index(),
             ranked_indices = ?self.rank_indices(),
             selection_phase = "scheduled",
             "selected_route_index"
         );
     }
 
-    fn log_timeout_route_not_switched(&self, timed_out_index: usize, timeout_error: &str) {
-        let active_index = self.active_index();
+    fn log_timeout_route_reprioritized(&self, timed_out_index: usize, timeout_error: &str) {
         let ranked_indices = self.rank_indices();
-        let higher_ranked_indices = active_index
-            .and_then(|active_index| {
-                ranked_indices
-                    .iter()
-                    .position(|index| *index == active_index)
-                    .map(|active_rank| ranked_indices[..active_rank].to_vec())
-            })
-            .unwrap_or_default();
-        let route_not_switched_reason =
-            route_not_switched_reason(active_index, &higher_ranked_indices);
 
         tracing::warn!(
             target: MOBILE_CONNECTION_LOG_TARGET,
-            event = "route_not_switched_reason",
+            event = "route_reprioritized_after_timeout",
             timed_out_index,
-            active_index = ?active_index,
+            preferred_index = ?ranked_indices.first(),
             ranked_indices = ?ranked_indices,
-            higher_ranked_indices = ?higher_ranked_indices,
-            route_not_switched_reason,
             timeout_error = %timeout_error,
-            "route_not_switched_reason"
+            "route_reprioritized_after_timeout"
         );
     }
 
@@ -813,14 +754,13 @@ impl ClientEndpointRouter {
 
     fn rank_indices(&self) -> Vec<usize> {
         let now_unix_ms = unix_ts_ms();
-        let active_index = self.active_index();
         let mut available = Vec::new();
         let mut cooling = Vec::new();
         let endpoints = self.endpoints_snapshot();
 
         for (index, endpoint) in endpoints.iter().enumerate() {
             let state = lock_endpoint_state(&endpoint.state);
-            let score = endpoint_score(index, active_index, &endpoint.descriptor, &state);
+            let score = endpoint_score(&endpoint.descriptor, &state);
             if let Some(until_unix_ms) = state
                 .circuit_open_until_unix_ms
                 .filter(|until_unix_ms| *until_unix_ms > now_unix_ms)
@@ -845,13 +785,12 @@ impl ClientEndpointRouter {
             .collect()
     }
 
-    /// Foreground traffic is intentionally more conservative than quality
-    /// ranking. A selectable, validated active route is sticky. Routes still
-    /// on probation are ordered behind every selectable validated route, so
-    /// they remain available only as same-request fallback or bootstrap paths.
+    /// Foreground traffic follows score order among validated routes. Routes
+    /// still on probation are ordered behind every selectable validated route,
+    /// so they remain available only as same-request fallback or bootstrap
+    /// paths until a foreground request or background probe validates them.
     fn foreground_route_indices(&self) -> Vec<usize> {
         let now_unix_ms = unix_ts_ms();
-        let active_index = self.active_index();
         let endpoints = self.endpoints_snapshot();
         let mut validated_available = Vec::new();
         let mut probation_available = Vec::new();
@@ -875,13 +814,6 @@ impl ClientEndpointRouter {
         }
 
         if !validated_available.is_empty() {
-            if let Some(active_index) = active_index
-                && let Some(active_position) = validated_available
-                    .iter()
-                    .position(|index| *index == active_index)
-            {
-                validated_available.swap(0, active_position);
-            }
             validated_available.extend(probation_available);
             validated_available.extend(cooling);
             return validated_available;
@@ -895,119 +827,6 @@ impl ClientEndpointRouter {
         cooling
     }
 
-    /// A successful background probe both validates a route and allows it to
-    /// become active when it beats the current active route even after the
-    /// active-route hysteresis bonus. Route membership stays read-locked while
-    /// scoring, and the active key is changed only if it did not change during
-    /// the decision. This prevents a concurrent reconciliation from turning a
-    /// candidate's old positional index into a different route.
-    fn promote_validated_background_candidate_if_better(
-        &self,
-        candidate: &BackgroundProbeCandidate,
-    ) {
-        let endpoints = self
-            .endpoints
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(index) = endpoints.iter().position(|endpoint| {
-            endpoint.descriptor.route_key == candidate.route_key
-                && Arc::ptr_eq(&endpoint.state, &candidate.endpoint.state)
-        }) else {
-            return;
-        };
-        let now_unix_ms = unix_ts_ms();
-        let expected_active_route_key = self.active_route_key();
-        let active_index = expected_active_route_key.as_ref().and_then(|route_key| {
-            endpoints
-                .iter()
-                .position(|endpoint| endpoint.descriptor.route_key == *route_key)
-        });
-        let candidate_state = lock_endpoint_state(&candidate.endpoint.state);
-        if !candidate_state.foreground_validated
-            || candidate_state
-                .circuit_open_until_unix_ms
-                .is_some_and(|until_unix_ms| until_unix_ms > now_unix_ms)
-        {
-            return;
-        }
-        let Some(active_index) = active_index else {
-            drop(candidate_state);
-            self.set_active_background_candidate_if_unchanged(
-                expected_active_route_key.as_deref(),
-                index,
-                &candidate.endpoint,
-                None,
-            );
-            return;
-        };
-        if active_index == index {
-            return;
-        }
-        let candidate_score = endpoint_score(
-            index,
-            Some(active_index),
-            &candidate.endpoint.descriptor,
-            &candidate_state,
-        );
-        drop(candidate_state);
-
-        let active = &endpoints[active_index];
-        let active_state = lock_endpoint_state(&active.state);
-        let active_is_cooling = active_state
-            .circuit_open_until_unix_ms
-            .is_some_and(|until_unix_ms| until_unix_ms > now_unix_ms);
-        let active_is_validated = active_state.foreground_validated;
-        let active_score = endpoint_score(
-            active_index,
-            Some(active_index),
-            &active.descriptor,
-            &active_state,
-        );
-        drop(active_state);
-
-        let should_promote = !active_is_validated
-            || active_is_cooling
-            || compare_scores(candidate_score, active_score, index, active_index).is_lt();
-        if should_promote {
-            self.set_active_background_candidate_if_unchanged(
-                expected_active_route_key.as_deref(),
-                index,
-                &candidate.endpoint,
-                Some(active_index),
-            );
-        }
-    }
-
-    fn set_active_background_candidate_if_unchanged(
-        &self,
-        expected_active_route_key: Option<&str>,
-        candidate_index: usize,
-        candidate: &ClientEndpoint,
-        previous_active_index: Option<usize>,
-    ) {
-        let mut active_route_key = self
-            .active_route_key
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if active_route_key.as_deref() != expected_active_route_key {
-            return;
-        }
-        active_route_key.clone_from(&Some(candidate.descriptor.route_key.clone()));
-        drop(active_route_key);
-
-        tracing::info!(
-            target: MOBILE_CONNECTION_LOG_TARGET,
-            event = "selected_route_index",
-            selected_route_index = candidate_index,
-            candidate_index,
-            path_kind = transport_path_kind_label(candidate.transport.transport_path_kind()),
-            locator = %candidate.descriptor.locator,
-            previous_active_index = ?previous_active_index,
-            selection_phase = "active_after_success",
-            "selected_route_index"
-        );
-    }
-
     fn claim_background_probe_candidates(&self) -> Vec<BackgroundProbeCandidate> {
         let endpoints = self.endpoints_snapshot();
         if endpoints.len() <= 1 {
@@ -1015,14 +834,25 @@ impl ClientEndpointRouter {
         }
 
         let now_unix_ms = unix_ts_ms();
-        let active_index = self.active_index();
+        let preferred_index = self.foreground_route_indices().into_iter().next();
+        let has_foreground_route_use = endpoints.iter().any(|endpoint| {
+            lock_endpoint_state(&endpoint.state)
+                .last_used_unix_ms
+                .is_some()
+        });
         let mut claimed = Vec::new();
 
         for (index, endpoint) in endpoints.iter().enumerate() {
-            if Some(index) == active_index {
+            let mut state = lock_endpoint_state(&endpoint.state);
+            // At cold start, foreground traffic owns the preferred candidate
+            // while background work probes its alternatives. Once real traffic
+            // has used any route, a newly discovered preferred route still
+            // needs a probe before it can leave probation.
+            if Some(index) == preferred_index
+                && (state.foreground_validated || !has_foreground_route_use)
+            {
                 continue;
             }
-            let mut state = lock_endpoint_state(&endpoint.state);
             if !background_probe_due(&state, now_unix_ms) {
                 continue;
             }
@@ -1079,9 +909,6 @@ impl ClientEndpointRouter {
         }
         drop(state);
 
-        if probe_succeeded {
-            self.promote_validated_background_candidate_if_better(candidate);
-        }
         if first_relay_connection
             && let Some((current_index, current_endpoint)) =
                 self.registered_background_probe_endpoint(candidate)
@@ -1182,20 +1009,17 @@ impl ClientEndpointRouter {
         };
         tracing::warn!(
             target: MOBILE_CONNECTION_LOG_TARGET,
-            event = "route_not_switched_reason",
+            event = "background_probe_failed",
             candidate_index,
             timed_out_route_key = %candidate.route_key,
             locator = %endpoint.descriptor.locator,
-            active_route_key = ?self.active_route_key(),
-            route_not_switched_reason =
-                "background_probe_failed_and_route_promotion_requires_success",
+            preferred_index = ?self.best_ranked_index(),
             timeout_error = %timeout_error,
-            "route_not_switched_reason"
+            "background_probe_failed"
         );
     }
 
     fn snapshot(&self) -> ClientConnectionRouteSnapshot {
-        let active_index = self.active_index();
         let ranked_indices = self.rank_indices();
         let endpoints = self
             .endpoints_snapshot()
@@ -1215,8 +1039,7 @@ impl ClientEndpointRouter {
                     last_successful_iroh_relay_url: endpoint
                         .transport
                         .last_successful_iroh_relay_url(),
-                    active: active_index == Some(index),
-                    score: endpoint_score(index, active_index, &endpoint.descriptor, &state),
+                    score: endpoint_score(&endpoint.descriptor, &state),
                     ewma_latency_ms: state.ewma_latency_ms,
                     ewma_throughput_bytes_per_sec: state.ewma_throughput_bytes_per_sec,
                     consecutive_failures: state.consecutive_failures,
@@ -1224,6 +1047,7 @@ impl ClientEndpointRouter {
                     total_successes: state.total_successes,
                     last_measurement_unix_ms: state.last_measurement_unix_ms,
                     last_success_unix_ms: state.last_success_unix_ms,
+                    last_used_unix_ms: state.last_used_unix_ms,
                     last_failure_unix_ms: state.last_failure_unix_ms,
                     circuit_open_until_unix_ms: state.circuit_open_until_unix_ms,
                     background_probe_in_flight: state.background_probe_in_flight,
@@ -1240,7 +1064,6 @@ impl ClientEndpointRouter {
 
         ClientConnectionRouteSnapshot {
             generated_at_unix_ms: unix_ts_ms(),
-            active_index,
             ranked_indices,
             endpoints,
         }
@@ -1252,6 +1075,29 @@ impl ClientEndpointRouter {
             let mut state = lock_endpoint_state(&endpoint.state);
             reset_endpoint_timing_measurement(&mut state, session_pool_baseline);
         }
+    }
+
+    fn record_route_used(&self, index: usize, used_at_unix_ms: u64) {
+        let Some(endpoint) = self.endpoint(index) else {
+            return;
+        };
+        let mut state = lock_endpoint_state(&endpoint.state);
+        state.last_used_unix_ms = Some(
+            state
+                .last_used_unix_ms
+                .map_or(used_at_unix_ms, |previous| previous.max(used_at_unix_ms)),
+        );
+        drop(state);
+        tracing::info!(
+            target: MOBILE_CONNECTION_LOG_TARGET,
+            event = "route_used",
+            route_index = index,
+            path_kind = transport_path_kind_label(endpoint.transport.transport_path_kind()),
+            locator = %endpoint.descriptor.locator,
+            last_used_unix_ms = used_at_unix_ms,
+            preferred_index = ?self.best_ranked_index(),
+            "route_used"
+        );
     }
 
     fn record_request_success(
@@ -1344,7 +1190,6 @@ impl ClientEndpointRouter {
             },
         );
         drop(state);
-        self.set_active_index(index);
         if first_relay_connection {
             self.notify_first_relay_connection(index, &endpoint);
         }
@@ -1407,7 +1252,7 @@ impl ClientEndpointRouter {
         );
         drop(state);
         if is_timeout_error_message(error) {
-            self.log_timeout_route_not_switched(index, error);
+            self.log_timeout_route_reprioritized(index, error);
         }
         self.notify_transport_failure_when_exhausted(had_selectable_route);
     }
@@ -1484,12 +1329,10 @@ impl ClientEndpointRouter {
     }
 
     fn diagnostics_snapshot(&self) -> ClientConnectionDiagnostics {
-        let active_index = self.active_index();
         let endpoints = self
             .endpoints_snapshot()
             .iter()
-            .enumerate()
-            .map(|(index, endpoint)| {
+            .map(|endpoint| {
                 let state = lock_endpoint_state(&endpoint.state);
                 ClientEndpointDiagnostics {
                     path_kind: endpoint.descriptor.path_kind.as_str().to_string(),
@@ -1504,12 +1347,12 @@ impl ClientEndpointRouter {
                         .last_successful_iroh_relay_url(),
                     locator: endpoint.descriptor.locator.clone(),
                     request_base_url: endpoint.transport.request_base_url().to_string(),
-                    active: active_index == Some(index),
                     consecutive_failures: state.consecutive_failures,
                     total_failures: state.total_failures,
                     total_successes: state.total_successes,
                     last_attempt_unix_ms: state.last_measurement_unix_ms,
                     last_success_unix_ms: state.last_success_unix_ms,
+                    last_used_unix_ms: state.last_used_unix_ms,
                     last_user_facing_success_unix_ms: state.last_user_facing_success_unix_ms,
                     last_user_facing_success_url: state.last_user_facing_success_url.clone(),
                     last_failure_unix_ms: state.last_failure_unix_ms,
@@ -1592,17 +1435,6 @@ impl ClientEndpointRouter {
         prune_retired_failure_states(&mut retired_failure_states);
 
         let removed = removed_keys.len();
-        let active_is_retained = self
-            .active_route_key()
-            .is_some_and(|route_key| desired_keys.contains(&route_key));
-        if !active_is_retained {
-            *self
-                .active_route_key
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = next
-                .first()
-                .map(|endpoint| endpoint.descriptor.route_key.clone());
-        }
         *routes = next;
         (added, removed, retained)
     }
@@ -1670,12 +1502,7 @@ fn lock_endpoint_state(
     }
 }
 
-fn endpoint_score(
-    index: usize,
-    active_index: Option<usize>,
-    descriptor: &ClientEndpointDescriptor,
-    state: &ClientEndpointState,
-) -> f64 {
+fn endpoint_score(descriptor: &ClientEndpointDescriptor, state: &ClientEndpointState) -> f64 {
     let mut score = descriptor.bootstrap_rank as f64;
     score += state
         .ewma_latency_ms
@@ -1689,9 +1516,6 @@ fn endpoint_score(
     score += state.consecutive_failures as f64 * CLIENT_ROUTE_FAILURE_PENALTY_MS;
     if let Some(throughput_bytes_per_sec) = state.ewma_throughput_bytes_per_sec {
         score -= (throughput_bytes_per_sec / 250_000.0).min(50.0);
-    }
-    if active_index == Some(index) {
-        score -= CLIENT_ROUTE_ACTIVE_BONUS_MS;
     }
     score
 }
@@ -1719,22 +1543,6 @@ fn transport_path_kind_label(path_kind: TransportPathKind) -> &'static str {
 fn is_timeout_error_message(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("timed out") || error.contains("timeout")
-}
-
-fn route_not_switched_reason(
-    active_index: Option<usize>,
-    higher_ranked_indices: &[usize],
-) -> &'static str {
-    match active_index {
-        None => "there_is_no_active_route_to_switch",
-        Some(0) if higher_ranked_indices.is_empty() => {
-            "active_index=0_remains_the_highest_ranked_route"
-        }
-        Some(0) => {
-            "active_index=0_changes_only_after_a_successful_request;higher_ranked_candidates_remain_failover_candidates_until_then"
-        }
-        Some(_) => "active_route_is_not_index_0",
-    }
 }
 
 fn update_ewma(current: Option<f64>, sample: f64) -> f64 {
@@ -3378,12 +3186,7 @@ impl IronMeshClient {
         let [endpoint] = endpoints.as_mut_slice() else {
             bail!("a planned transport route key requires exactly one client endpoint");
         };
-        endpoint.descriptor.route_key.clone_from(&route_key);
-        *self
-            .transport_router
-            .active_route_key
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(route_key);
+        endpoint.descriptor.route_key = route_key;
         Ok(())
     }
 
@@ -3580,6 +3383,11 @@ impl IronMeshClient {
             measurement,
             self.connection_diagnostic_impact,
         );
+    }
+
+    fn record_route_used(&self, index: usize, used_at_unix_ms: u64) {
+        self.transport_router
+            .record_route_used(index, used_at_unix_ms);
     }
 
     fn record_request_failure(
@@ -3812,6 +3620,7 @@ impl IronMeshClient {
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
+            self.record_route_used(index, started_unix_ms);
             match execute_buffered_request_for_transport(
                 &endpoint.transport,
                 &auth,
@@ -3951,6 +3760,7 @@ impl IronMeshClient {
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
+            self.record_route_used(route_index, started_unix_ms);
             match execute_streaming_object_write_request_for_transport(
                 &endpoint.transport,
                 &auth,
@@ -4693,6 +4503,7 @@ impl IronMeshClient {
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
+            self.record_route_used(index, started_unix_ms);
             match execute_streaming_read_request_for_transport(
                 &endpoint.transport,
                 &auth,
@@ -4808,6 +4619,7 @@ impl IronMeshClient {
             let Some(request_body_stream) = body_stream.take() else {
                 bail!("streamed relative-path request body was already consumed");
             };
+            self.record_route_used(index, started_unix_ms);
             match execute_streaming_write_request_for_transport(
                 &endpoint.transport,
                 &auth,
@@ -5245,6 +5057,7 @@ impl IronMeshClient {
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
+            self.record_route_used(index, started_unix_ms);
             match execute_streaming_object_read_request_for_transport(
                 &endpoint.transport,
                 &auth,

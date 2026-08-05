@@ -35,7 +35,8 @@ type HolePunchingSummary = {
   color: string;
 };
 
-const SNAPSHOT_POLL_MS = 5000;
+const SNAPSHOT_POLL_MS = 1000;
+const ACTIVE_ROUTE_WINDOW_MS = 2000;
 
 export function ConnectionPathsPage() {
   const [routes, setRoutes] = useState<ClientConnectionRouteSnapshot | null>(null);
@@ -92,8 +93,11 @@ export function ConnectionPathsPage() {
   const summary = useMemo(() => buildConnectionSummary(routes), [routes]);
   const rankedEndpoints = useMemo(() => rankedRouteEndpoints(routes), [routes]);
   const snapshotUnixMs = routes?.generated_at_unix_ms ?? null;
-  const activeEndpoint =
-    routes?.endpoints.find((endpoint) => endpoint.active) ?? rankedEndpoints[0] ?? null;
+  const activeEndpoints =
+    routes?.endpoints
+      .filter((endpoint) => wasRecentlyUsed(endpoint, snapshotUnixMs))
+      .sort((left, right) => (right.last_used_unix_ms ?? 0) - (left.last_used_unix_ms ?? 0)) ?? [];
+  const activeEndpoint = activeEndpoints[0] ?? rankedEndpoints[0] ?? null;
   const preferredEndpoint = rankedEndpoints[0] ?? null;
   const holePunchingSummary = buildHolePunchingSummary(routes, activeEndpoint);
   const directCount = routes?.endpoints.filter(isDirectPath).length ?? 0;
@@ -148,8 +152,9 @@ export function ConnectionPathsPage() {
       <SimpleGrid cols={{ base: 1, md: 2, xl: 5 }}>
         <StatCard label="State" value={summary.headline} />
         <StatCard
-          label="Active path"
-          value={activeEndpoint ? routeDisplayLabel(activeEndpoint) : loading ? "Loading..." : "None"}
+          label="Active paths"
+          value={loading ? "Loading..." : activeEndpoints.length}
+          hint={activeEndpoints.map(routeDisplayLabel).join(", ") || "No route used in the last 2 seconds."}
         />
         <StatCard
           label="Preferred next"
@@ -212,7 +217,7 @@ export function ConnectionPathsPage() {
                       </Text>
                     </Stack>
                     <Group gap="xs">
-                      {endpoint.active ? (
+                      {wasRecentlyUsed(endpoint, snapshotUnixMs) ? (
                         <Badge color="blue" variant="light">
                           active
                         </Badge>
@@ -279,6 +284,10 @@ export function ConnectionPathsPage() {
                       <Table.Tr>
                         <Table.Th>Last success</Table.Th>
                         <Table.Td>{formatUnixTimestampMs(endpoint.last_success_unix_ms ?? null)}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Last active use</Table.Th>
+                        <Table.Td>{formatUnixTimestampMs(endpoint.last_used_unix_ms ?? null)}</Table.Td>
                       </Table.Tr>
                       <Table.Tr>
                         <Table.Th>Last failure</Table.Th>
@@ -467,7 +476,10 @@ function buildConnectionSummary(
   }
 
   const ranked = rankedRouteEndpoints(routes);
-  const active = routes.endpoints.find((endpoint) => endpoint.active) ?? ranked[0] ?? null;
+  const activeEndpoints = routes.endpoints
+    .filter((endpoint) => wasRecentlyUsed(endpoint, routes.generated_at_unix_ms))
+    .sort((left, right) => (right.last_used_unix_ms ?? 0) - (left.last_used_unix_ms ?? 0));
+  const active = activeEndpoints[0] ?? null;
   const hasSuccess = routes.endpoints.some((endpoint) => endpoint.total_successes > 0);
   const hasProbeInFlight = routes.endpoints.some((endpoint) => endpoint.background_probe_in_flight);
   const hasCooling = routes.endpoints.some((endpoint) =>
@@ -498,6 +510,14 @@ function buildConnectionSummary(
     };
   }
 
+  if (activeEndpoints.length > 1) {
+    return {
+      headline: "Multiple routes active",
+      detail: `${activeEndpoints.length} routes carried requests within the last 2 seconds. Route preference remains score-based.`,
+      color: "green"
+    };
+  }
+
   if (active && active.path_kind === "relay_tunnel" && active.consecutive_failures === 0 && !hasProbeInFlight) {
     return {
       headline: "Relay active",
@@ -512,6 +532,15 @@ function buildConnectionSummary(
       headline: "Direct settled",
       detail:
         "A direct cluster path is active and the router is not currently re-evaluating alternates.",
+      color: "green"
+    };
+  }
+
+  if (bestHealthy && !active) {
+    return {
+      headline: "Routes available",
+      detail:
+        "No route carried a request in the last 2 seconds. The preferred route remains the lowest-scored available candidate.",
       color: "green"
     };
   }
@@ -553,6 +582,19 @@ function rankedRouteEndpoints(
 function isDirectPath(endpoint: ClientConnectionRouteEndpointSnapshot): boolean {
   return (
     endpoint.path_kind === "direct_https" || endpoint.path_kind === "direct_quic"
+  );
+}
+
+function wasRecentlyUsed(
+  endpoint: ClientConnectionRouteEndpointSnapshot,
+  snapshotUnixMs: number | null
+): boolean {
+  const lastUsedUnixMs = endpoint.last_used_unix_ms;
+  return (
+    snapshotUnixMs != null &&
+    lastUsedUnixMs != null &&
+    lastUsedUnixMs <= snapshotUnixMs &&
+    snapshotUnixMs - lastUsedUnixMs <= ACTIVE_ROUTE_WINDOW_MS
   );
 }
 

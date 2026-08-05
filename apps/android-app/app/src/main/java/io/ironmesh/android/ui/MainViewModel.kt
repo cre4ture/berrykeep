@@ -84,7 +84,7 @@ private const val GALLERY_PAGE_KEEP_RADIUS = 2
 private const val GALLERY_FLATTENED_DEPTH = 64
 private const val FOLDER_SYNC_HISTORY_PAGE_SIZE = 20
 private const val FOLDER_SYNC_HISTORY_REFRESH_MS = 5_000L
-private const val CONNECTION_ROUTE_SNAPSHOT_POLL_MS = 5_000L
+private const val CONNECTION_ROUTE_SNAPSHOT_POLL_MS = 1_000L
 private const val TITLE_LATENCY_STATUS_POLL_MS = 1_000L
 private const val ENROLLMENT_VERIFICATION_POLL_MS = 5_000L
 private const val ENROLLMENT_LOG_TAG = "EnrollmentDiagnostics"
@@ -450,11 +450,16 @@ class MainViewModel(
 
     private fun diagnosticMetadata(state: MainUiState): List<Pair<String, String>> {
         val deviceAuth = state.deviceAuthState
-        val activeRoute = state.connectionRoutes
-            ?.activeIndex
-            ?.let { activeIndex ->
-                state.connectionRoutes.endpoints.firstOrNull { endpoint -> endpoint.index == activeIndex }
-            }
+        val activeRoutes = state.connectionRoutes?.let { routes ->
+            routes.endpoints
+                .filter { endpoint ->
+                    endpoint.lastUsedUnixMs?.let { lastUsed ->
+                        lastUsed <= routes.generatedAtUnixMs &&
+                            routes.generatedAtUnixMs - lastUsed <= 2_000L
+                    } == true
+                }
+                .sortedByDescending { endpoint -> endpoint.lastUsedUnixMs }
+        }.orEmpty()
         return listOf(
             "App version" to BuildConfig.LONG_VERSION,
             "Platform" to "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
@@ -465,7 +470,9 @@ class MainViewModel(
             "Visible section" to state.selectedSection.name,
             "UI status" to state.status,
             "Connection state" to "${state.appConnectionStatus.state}: ${state.appConnectionStatus.message}",
-            "Active route" to (activeRoute?.let { "${it.pathKind}: ${it.locator}" } ?: "unavailable"),
+            "Active routes" to activeRoutes
+                .joinToString(separator = "; ") { route -> "${route.pathKind}: ${route.locator}" }
+                .ifBlank { "none" },
             "Connection diagnostics error" to state.connectionRoutesError.orEmpty().ifBlank { "none" },
             "Title latency" to state.titleLatencyStatus.toString(),
             "Sync profile count" to state.syncProfiles.size.toString(),

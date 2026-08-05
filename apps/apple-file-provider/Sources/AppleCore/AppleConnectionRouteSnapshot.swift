@@ -65,7 +65,6 @@ public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Se
     public var targetNodeId: String?
     public var irohRelayUrls: [String]? = nil
     public var lastSuccessfulIrohRelayUrl: String? = nil
-    public var active: Bool
     public var score: Double
     public var ewmaLatencyMs: Double?
     public var ewmaThroughputBytesPerSec: Double?
@@ -74,6 +73,7 @@ public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Se
     public var totalSuccesses: UInt64
     public var lastMeasurementUnixMs: UInt64?
     public var lastSuccessUnixMs: UInt64?
+    public var lastUsedUnixMs: UInt64?
     public var lastFailureUnixMs: UInt64?
     public var circuitOpenUntilUnixMs: UInt64?
     public var backgroundProbeInFlight: Bool
@@ -146,6 +146,16 @@ public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Se
         }
         return circuitOpenUntilUnixMs > timestamp
     }
+
+    public func wasRecentlyUsed(
+        atUnixMs timestamp: UInt64,
+        withinMilliseconds window: UInt64 = 2_000
+    ) -> Bool {
+        guard let lastUsedUnixMs, lastUsedUnixMs <= timestamp else {
+            return false
+        }
+        return timestamp - lastUsedUnixMs <= window
+    }
 }
 
 private func compactRouteIdentifier(_ value: String) -> String {
@@ -178,16 +188,27 @@ private func compactRouteLocator(_ locator: String) -> String? {
 
 public struct AppleConnectionRouteSnapshot: Codable, Equatable, Sendable {
     public var generatedAtUnixMs: UInt64
-    public var activeIndex: Int?
     public var rankedIndices: [Int]
     public var endpoints: [AppleConnectionRouteEndpoint]
 
-    public var activeEndpoint: AppleConnectionRouteEndpoint? {
-        if let activeIndex,
-           let endpoint = endpoints.first(where: { $0.index == activeIndex }) {
-            return endpoint
-        }
-        return endpoints.first(where: \.active)
+    public var recentlyUsedEndpoints: [AppleConnectionRouteEndpoint] {
+        endpoints
+            .filter { $0.wasRecentlyUsed(atUnixMs: generatedAtUnixMs) }
+            .sorted { ($0.lastUsedUnixMs ?? 0) > ($1.lastUsedUnixMs ?? 0) }
+    }
+
+    public var mostRecentlyUsedEndpoint: AppleConnectionRouteEndpoint? {
+        endpoints
+            .filter { $0.lastUsedUnixMs != nil }
+            .max { ($0.lastUsedUnixMs ?? 0) < ($1.lastUsedUnixMs ?? 0) }
+    }
+
+    public var preferredEndpoint: AppleConnectionRouteEndpoint? {
+        rankedEndpoints.first
+    }
+
+    public var displayEndpoint: AppleConnectionRouteEndpoint? {
+        recentlyUsedEndpoints.first ?? preferredEndpoint
     }
 
     public var rankedEndpoints: [AppleConnectionRouteEndpoint] {
