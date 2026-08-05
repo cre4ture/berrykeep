@@ -7,14 +7,15 @@ use reqwest::ClientBuilder;
 use reqwest::Url;
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::blocking::ClientBuilder as BlockingClientBuilder;
-use std::collections::{HashMap, HashSet};
+use serde::Serialize;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 use transport_sdk::{
-    ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity,
+    CandidateKind, ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity,
     RelayTunnelSourceSecurityConfig, RelayTunnelTlsIdentity, RendezvousClientConfig,
     RendezvousControlClient, TransportPathKind,
 };
@@ -34,6 +35,61 @@ const STARTUP_PROBE_SUCCESS_GRACE: Duration = Duration::from_millis(250);
 
 type StartupProbeResult = (usize, Result<f64>);
 type StartupProbeWorkerResult = (Vec<IronMeshClient>, Vec<StartupProbeResult>);
+
+#[derive(Serialize)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+enum PlannedRouteKeyMaterial {
+    DirectHttps {
+        cluster_id: ClusterId,
+        target_node_id: Option<NodeId>,
+        server_base_url: String,
+        server_ca_fingerprint: Option<String>,
+        client_identity_fingerprint: Option<String>,
+    },
+    DirectQuic {
+        cluster_id: ClusterId,
+        target_node_id: Option<NodeId>,
+        candidate: DirectQuicRouteKeyMaterial,
+        rendezvous: Option<RendezvousRouteKeyMaterial>,
+        relay_ca_fingerprint: Option<String>,
+        client_identity_fingerprint: Option<String>,
+    },
+    RelayTunnel {
+        cluster_id: ClusterId,
+        target_node_id: Option<NodeId>,
+        rendezvous: RendezvousRouteKeyMaterial,
+        cluster_ca_fingerprint: Option<String>,
+        client_identity_fingerprint: Option<String>,
+    },
+}
+
+#[derive(Serialize)]
+struct DirectQuicRouteKeyMaterial {
+    kind: String,
+    endpoint: String,
+    transport_id: String,
+    relay_url: Option<String>,
+    relay_auth_fingerprint: Option<String>,
+    alpn: String,
+    direct_socket_addrs: Vec<String>,
+    observed_socket_addrs: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RendezvousRouteKeyMaterial {
+    urls: Vec<String>,
+    ca_fingerprint: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ClientIdentityRouteKeyMaterial<'a> {
+    cluster_id: ClusterId,
+    device_id: common::DeviceId,
+    private_key_pem: &'a str,
+    public_key_pem: &'a str,
+    credential_pem: Option<&'a str>,
+    rendezvous_client_identity_pem: Option<&'a str>,
+}
 
 pub fn load_root_certificate(path: &Path) -> Result<Certificate> {
     let pem = fs::read(path)
@@ -213,6 +269,15 @@ pub fn build_http_client_with_identity_from_planned_target(
     target: &PlannedConnectionBootstrapTarget,
     identity: &ClientIdentityMaterial,
 ) -> Result<IronMeshClient> {
+    let client = build_http_client_with_identity_from_planned_target_unkeyed(target, identity)?;
+    client.set_single_transport_route_key(planned_route_key(target, Some(identity))?)?;
+    Ok(client)
+}
+
+fn build_http_client_with_identity_from_planned_target_unkeyed(
+    target: &PlannedConnectionBootstrapTarget,
+    identity: &ClientIdentityMaterial,
+) -> Result<IronMeshClient> {
     match target.path_kind {
         TransportPathKind::DirectHttps => {
             let server_base_url =
@@ -338,10 +403,172 @@ fn build_rendezvous_control_client_for_target(
     )
 }
 
+fn planned_route_key(
+    target: &PlannedConnectionBootstrapTarget,
+    identity: Option<&ClientIdentityMaterial>,
+) -> Result<String> {
+    let client_identity_fingerprint = identity
+        .map(client_identity_route_fingerprint)
+        .transpose()?;
+    let effective_rendezvous_ca = target
+        .rendezvous_ca_pem
+        .as_deref()
+        .or(target.cluster_ca_pem.as_deref());
+    let rendezvous = || RendezvousRouteKeyMaterial {
+        urls: target
+            .rendezvous_urls
+            .iter()
+            .map(|url| normalize_route_url(url))
+            .collect(),
+        ca_fingerprint: optional_text_fingerprint(effective_rendezvous_ca),
+    };
+
+    let material = match target.path_kind {
+        TransportPathKind::DirectHttps => PlannedRouteKeyMaterial::DirectHttps {
+            cluster_id: target.cluster_id,
+            target_node_id: target.target_node_id,
+            server_base_url: normalize_route_url(
+                planned_target_direct_http_base_url(target)?.ok_or_else(|| {
+                    anyhow!("direct HTTPS client transport target is missing server_base_url")
+                })?,
+            ),
+            server_ca_fingerprint: optional_text_fingerprint(
+                target
+                    .server_ca_pem
+                    .as_deref()
+                    .or(target.cluster_ca_pem.as_deref()),
+            ),
+            client_identity_fingerprint,
+        },
+        TransportPathKind::DirectQuic => {
+            let candidate = planned_target_direct_quic_candidate(target)?;
+            let hints = candidate.transport_hints.as_ref();
+            PlannedRouteKeyMaterial::DirectQuic {
+                cluster_id: target.cluster_id,
+                target_node_id: target.target_node_id,
+                candidate: DirectQuicRouteKeyMaterial {
+                    kind: candidate_kind_label(candidate.kind).to_string(),
+                    endpoint: normalize_route_url(&candidate.endpoint),
+                    transport_id: hints
+                        .and_then(|hints| hints.transport_id.as_deref())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                    relay_url: hints
+                        .and_then(|hints| hints.relay_url.as_deref())
+                        .map(normalize_route_url),
+                    relay_auth_fingerprint: hints
+                        .and_then(|hints| hints.relay_auth_token.as_deref())
+                        .and_then(nonempty_text_fingerprint),
+                    alpn: hints
+                        .and_then(|hints| hints.alpn.as_deref())
+                        .unwrap_or(transport_sdk::DEFAULT_DIRECT_QUIC_ALPN)
+                        .trim()
+                        .to_string(),
+                    direct_socket_addrs: hints
+                        .map(|hints| normalize_socket_addr_list(&hints.direct_socket_addrs))
+                        .unwrap_or_default(),
+                    observed_socket_addrs: hints
+                        .map(|hints| normalize_socket_addr_list(&hints.observed_socket_addrs))
+                        .unwrap_or_default(),
+                },
+                rendezvous: candidate_uses_rendezvous_relay(candidate, &target.rendezvous_urls)
+                    .then(rendezvous),
+                relay_ca_fingerprint: optional_text_fingerprint(effective_rendezvous_ca),
+                client_identity_fingerprint,
+            }
+        }
+        TransportPathKind::RelayTunnel => PlannedRouteKeyMaterial::RelayTunnel {
+            cluster_id: target.cluster_id,
+            target_node_id: target.target_node_id,
+            rendezvous: rendezvous(),
+            cluster_ca_fingerprint: optional_text_fingerprint(target.cluster_ca_pem.as_deref()),
+            client_identity_fingerprint,
+        },
+    };
+
+    let encoded = serde_json::to_vec(&material).context("failed encoding planned route key")?;
+    Ok(format!(
+        "planned-route-v1:{}",
+        blake3::hash(&encoded).to_hex()
+    ))
+}
+
+pub(crate) fn planned_transport_route_key(
+    target: &PlannedConnectionBootstrapTarget,
+) -> Result<String> {
+    planned_route_key(target, None)
+}
+
+fn client_identity_route_fingerprint(identity: &ClientIdentityMaterial) -> Result<String> {
+    let material = ClientIdentityRouteKeyMaterial {
+        cluster_id: identity.cluster_id,
+        device_id: identity.device_id,
+        private_key_pem: identity.private_key_pem.trim(),
+        public_key_pem: identity.public_key_pem.trim(),
+        credential_pem: identity.credential_pem.as_deref().map(str::trim),
+        rendezvous_client_identity_pem: identity
+            .rendezvous_client_identity_pem
+            .as_deref()
+            .map(str::trim),
+    };
+    let encoded = serde_json::to_vec(&material).context("failed encoding client route identity")?;
+    Ok(blake3::hash(&encoded).to_hex().to_string())
+}
+
+fn optional_text_fingerprint(value: Option<&str>) -> Option<String> {
+    value.and_then(nonempty_text_fingerprint)
+}
+
+fn nonempty_text_fingerprint(value: &str) -> Option<String> {
+    let normalized = value.replace("\r\n", "\n");
+    let normalized = normalized.trim();
+    (!normalized.is_empty()).then(|| blake3::hash(normalized.as_bytes()).to_hex().to_string())
+}
+
+fn normalize_route_url(value: &str) -> String {
+    let value = value.trim();
+    Url::parse(value)
+        .map(|url| url.to_string().trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| value.trim_end_matches('/').to_string())
+}
+
+fn normalize_socket_addr_list(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+const fn candidate_kind_label(kind: CandidateKind) -> &'static str {
+    match kind {
+        CandidateKind::DirectHttps => "direct_https",
+        CandidateKind::DirectQuic => "direct_quic",
+        CandidateKind::ServerReflexive => "server_reflexive",
+        CandidateKind::Relay => "relay",
+    }
+}
+
 pub fn build_http_client_with_identity_from_planned_targets(
     targets: &[PlannedConnectionBootstrapTarget],
     identity: &ClientIdentityMaterial,
 ) -> Result<IronMeshClient> {
+    let clients = collect_signed_planned_target_clients(targets, identity)?;
+    if clients.len() == 1 {
+        return IronMeshClient::combine(clients);
+    }
+
+    let ordered = order_clients_by_startup_probe(clients, true)?;
+    IronMeshClient::combine(ordered)
+}
+
+fn collect_signed_planned_target_clients(
+    targets: &[PlannedConnectionBootstrapTarget],
+    identity: &ClientIdentityMaterial,
+) -> Result<Vec<IronMeshClient>> {
     let mut clients = Vec::new();
     let mut build_errors = Vec::new();
 
@@ -361,41 +588,29 @@ pub fn build_http_client_with_identity_from_planned_targets(
             format_build_error_suffix(&build_errors)
         );
     }
-
-    if clients.len() == 1 {
-        return IronMeshClient::combine(clients);
-    }
-
-    let ordered = order_clients_by_startup_probe(clients, true)?;
-    IronMeshClient::combine(ordered)
+    Ok(clients)
 }
 
 pub fn build_http_client_from_planned_targets(
     targets: &[PlannedConnectionBootstrapTarget],
 ) -> Result<IronMeshClient> {
+    let clients = collect_anonymous_planned_target_clients(targets)?;
+    if clients.len() == 1 {
+        return IronMeshClient::combine(clients);
+    }
+
+    let ordered = order_clients_by_startup_probe(clients, false)?;
+    IronMeshClient::combine(ordered)
+}
+
+fn collect_anonymous_planned_target_clients(
+    targets: &[PlannedConnectionBootstrapTarget],
+) -> Result<Vec<IronMeshClient>> {
     let mut clients = Vec::new();
     let mut build_errors = Vec::new();
 
     for target in targets {
-        let Some(server_base_url) = (match planned_target_direct_http_base_url(target) {
-            Ok(server_base_url) => server_base_url,
-            Err(error) => {
-                build_errors.push(error.to_string());
-                continue;
-            }
-        }) else {
-            continue;
-        };
-
-        match build_http_client_from_pem_with_target_node_id(
-            target
-                .server_ca_pem
-                .as_deref()
-                .or(target.cluster_ca_pem.as_deref()),
-            server_base_url,
-            target.target_node_id,
-            Some(target.cluster_id),
-        ) {
+        match build_client_with_optional_identity_from_planned_target(target, None) {
             Ok(client) => clients.push(client),
             Err(error) => build_errors.push(error.to_string()),
         }
@@ -407,13 +622,7 @@ pub fn build_http_client_from_planned_targets(
             format_build_error_suffix(&build_errors)
         );
     }
-
-    if clients.len() == 1 {
-        return IronMeshClient::combine(clients);
-    }
-
-    let ordered = order_clients_by_startup_probe(clients, false)?;
-    IronMeshClient::combine(ordered)
+    Ok(clients)
 }
 
 pub fn build_client_with_optional_identity_from_planned_target(
@@ -430,7 +639,7 @@ pub fn build_client_with_optional_identity_from_planned_target(
                 );
             }
             if let Some(server_base_url) = planned_target_direct_http_base_url(target)? {
-                return build_http_client_from_pem_with_target_node_id(
+                let client = build_http_client_from_pem_with_target_node_id(
                     target
                         .server_ca_pem
                         .as_deref()
@@ -438,7 +647,9 @@ pub fn build_client_with_optional_identity_from_planned_target(
                     server_base_url,
                     target.target_node_id,
                     Some(target.cluster_id),
-                );
+                )?;
+                client.set_single_transport_route_key(planned_route_key(target, None)?)?;
+                return Ok(client);
             }
 
             bail!("relay-backed client transport requires enrolled client identity material");
@@ -461,6 +672,21 @@ pub fn build_client_with_optional_identity_from_planned_targets(
         Some(identity) => build_http_client_with_identity_from_planned_targets(targets, identity),
         None => build_http_client_from_planned_targets(targets),
     }
+}
+
+/// Constructs the complete desired route set without performing startup probes.
+/// Managed refresh callers reconcile these inert candidates with the live router
+/// first, then let the router claim only routes whose retained health state says
+/// they are due.
+pub(crate) fn build_unprobed_client_with_optional_identity_from_planned_targets(
+    targets: &[PlannedConnectionBootstrapTarget],
+    identity: Option<&ClientIdentityMaterial>,
+) -> Result<IronMeshClient> {
+    let clients = match identity {
+        Some(identity) => collect_signed_planned_target_clients(targets, identity)?,
+        None => collect_anonymous_planned_target_clients(targets)?,
+    };
+    IronMeshClient::combine(clients)
 }
 
 pub fn build_http_client(
@@ -863,6 +1089,320 @@ mod tests {
                 .expect("identity should generate");
         identity.credential_pem = Some("issued-credential".to_string());
         identity
+    }
+
+    fn direct_quic_route_target(
+        cluster_id: ClusterId,
+        target_node_id: NodeId,
+    ) -> PlannedConnectionBootstrapTarget {
+        PlannedConnectionBootstrapTarget {
+            cluster_id,
+            rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_mtls_required: true,
+            relay_mode: RelayMode::Fallback,
+            path_kind: TransportPathKind::DirectQuic,
+            direct_candidate: Some(ConnectionCandidate {
+                kind: CandidateKind::DirectQuic,
+                endpoint: "iroh://peer-key-1".to_string(),
+                rtt_ms: Some(8),
+                transport_hints: Some(ConnectionCandidateTransportHints {
+                    transport_id: Some("peer-key-1".to_string()),
+                    relay_url: Some("https://rendezvous.example".to_string()),
+                    relay_auth_token: Some("relay-token".to_string()),
+                    alpn: Some(DEFAULT_DIRECT_QUIC_ALPN.to_string()),
+                    direct_socket_addrs: vec!["127.0.0.1:7000".to_string()],
+                    observed_socket_addrs: vec!["198.51.100.8:7000".to_string()],
+                }),
+            }),
+            server_base_url: None,
+            target_node_id: Some(target_node_id),
+            server_ca_pem: None,
+            cluster_ca_pem: Some("cluster-ca".to_string()),
+            rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
+            pairing_token: Some("pairing-token".to_string()),
+            device_label: Some("device label".to_string()),
+            device_id: Some("device-id".to_string()),
+        }
+    }
+
+    fn assert_route_key_changes(
+        baseline: &PlannedConnectionBootstrapTarget,
+        changed: PlannedConnectionBootstrapTarget,
+        identity: &ClientIdentityMaterial,
+        field: &str,
+    ) {
+        assert_ne!(
+            planned_route_key(baseline, Some(identity)).expect("baseline key should build"),
+            planned_route_key(&changed, Some(identity)).expect("changed key should build"),
+            "changing {field} must replace the effective route"
+        );
+    }
+
+    #[test]
+    fn planned_direct_quic_route_key_covers_every_effective_transport_input() {
+        let identity = sample_identity();
+        let target_node_id = NodeId::new_v4();
+        let baseline = direct_quic_route_target(identity.cluster_id, target_node_id);
+
+        let mut changed = baseline.clone();
+        changed.cluster_id = Uuid::now_v7();
+        assert_route_key_changes(&baseline, changed, &identity, "cluster_id");
+
+        let mut changed = baseline.clone();
+        changed.target_node_id = Some(NodeId::new_v4());
+        assert_route_key_changes(&baseline, changed, &identity, "target_node_id");
+
+        let mut changed = baseline.clone();
+        changed
+            .rendezvous_urls
+            .push("https://backup.example".to_string());
+        assert_route_key_changes(&baseline, changed, &identity, "rendezvous_urls");
+
+        let mut changed = baseline.clone();
+        changed.rendezvous_ca_pem = Some("renewed-rendezvous-ca".to_string());
+        assert_route_key_changes(&baseline, changed, &identity, "rendezvous_ca_pem");
+
+        for (field, mutate) in [
+            (
+                "candidate endpoint",
+                (|candidate: &mut ConnectionCandidate| {
+                    candidate.endpoint = "iroh://peer-key-2".to_string();
+                }) as fn(&mut ConnectionCandidate),
+            ),
+            ("transport_id", |candidate: &mut ConnectionCandidate| {
+                candidate
+                    .transport_hints
+                    .as_mut()
+                    .expect("hints should exist")
+                    .transport_id = Some("peer-key-2".to_string());
+            }),
+            ("relay_url", |candidate: &mut ConnectionCandidate| {
+                candidate
+                    .transport_hints
+                    .as_mut()
+                    .expect("hints should exist")
+                    .relay_url = Some("https://other-relay.example".to_string());
+            }),
+            ("relay_auth_token", |candidate: &mut ConnectionCandidate| {
+                candidate
+                    .transport_hints
+                    .as_mut()
+                    .expect("hints should exist")
+                    .relay_auth_token = Some("renewed-relay-token".to_string());
+            }),
+            ("alpn", |candidate: &mut ConnectionCandidate| {
+                candidate
+                    .transport_hints
+                    .as_mut()
+                    .expect("hints should exist")
+                    .alpn = Some("ironmesh/test/2".to_string());
+            }),
+            (
+                "direct_socket_addrs",
+                |candidate: &mut ConnectionCandidate| {
+                    candidate
+                        .transport_hints
+                        .as_mut()
+                        .expect("hints should exist")
+                        .direct_socket_addrs = vec!["127.0.0.1:7001".to_string()];
+                },
+            ),
+            (
+                "observed_socket_addrs",
+                |candidate: &mut ConnectionCandidate| {
+                    candidate
+                        .transport_hints
+                        .as_mut()
+                        .expect("hints should exist")
+                        .observed_socket_addrs = vec!["198.51.100.9:7000".to_string()];
+                },
+            ),
+        ] {
+            let mut changed = baseline.clone();
+            mutate(
+                changed
+                    .direct_candidate
+                    .as_mut()
+                    .expect("candidate should exist"),
+            );
+            assert_route_key_changes(&baseline, changed, &identity, field);
+        }
+
+        let mut renewed_identity = identity.clone();
+        renewed_identity.credential_pem = Some("renewed-credential".to_string());
+        assert_ne!(
+            planned_route_key(&baseline, Some(&identity)).expect("old key should build"),
+            planned_route_key(&baseline, Some(&renewed_identity))
+                .expect("renewed key should build")
+        );
+    }
+
+    #[test]
+    fn planned_route_key_ignores_quality_and_enrollment_metadata() {
+        let identity = sample_identity();
+        let baseline = direct_quic_route_target(identity.cluster_id, NodeId::new_v4());
+        let baseline_key = planned_route_key(&baseline, Some(&identity)).expect("key should build");
+        let mut metadata_update = baseline.clone();
+        metadata_update
+            .direct_candidate
+            .as_mut()
+            .expect("candidate should exist")
+            .rtt_ms = Some(999);
+        metadata_update.pairing_token = Some("new-pairing-token".to_string());
+        metadata_update.device_label = Some("renamed device".to_string());
+        metadata_update.device_id = Some("new-bootstrap-device-id".to_string());
+
+        assert_eq!(
+            planned_route_key(&metadata_update, Some(&identity)).expect("key should build"),
+            baseline_key
+        );
+    }
+
+    #[test]
+    fn planned_route_key_treats_socket_addresses_as_canonical_sets() {
+        let identity = sample_identity();
+        let mut baseline = direct_quic_route_target(identity.cluster_id, NodeId::new_v4());
+        let hints = baseline
+            .direct_candidate
+            .as_mut()
+            .and_then(|candidate| candidate.transport_hints.as_mut())
+            .expect("candidate hints should exist");
+        hints.direct_socket_addrs.push("127.0.0.1:7001".to_string());
+        hints
+            .observed_socket_addrs
+            .push("198.51.100.9:7000".to_string());
+
+        let mut reordered = baseline.clone();
+        let hints = reordered
+            .direct_candidate
+            .as_mut()
+            .and_then(|candidate| candidate.transport_hints.as_mut())
+            .expect("candidate hints should exist");
+        hints.direct_socket_addrs = vec![
+            " 127.0.0.1:7001 ".to_string(),
+            "127.0.0.1:7000".to_string(),
+            "127.0.0.1:7001".to_string(),
+            "".to_string(),
+        ];
+        hints.observed_socket_addrs = vec![
+            "198.51.100.9:7000".to_string(),
+            "198.51.100.8:7000".to_string(),
+            " 198.51.100.8:7000 ".to_string(),
+        ];
+
+        assert_eq!(
+            planned_route_key(&baseline, Some(&identity)).expect("baseline key should build"),
+            planned_route_key(&reordered, Some(&identity)).expect("reordered key should build")
+        );
+    }
+
+    #[test]
+    fn planned_http_and_relay_route_keys_cover_their_effective_inputs() {
+        let mut identity = sample_identity();
+        identity.rendezvous_client_identity_pem = Some("rendezvous-identity".to_string());
+        let http = PlannedConnectionBootstrapTarget {
+            cluster_id: identity.cluster_id,
+            rendezvous_urls: vec!["https://unused-rendezvous.example".to_string()],
+            rendezvous_mtls_required: false,
+            relay_mode: RelayMode::Fallback,
+            path_kind: TransportPathKind::DirectHttps,
+            direct_candidate: None,
+            server_base_url: Some("https://node.example/".to_string()),
+            target_node_id: Some(NodeId::new_v4()),
+            server_ca_pem: Some("server-ca".to_string()),
+            cluster_ca_pem: Some("unused-cluster-ca".to_string()),
+            rendezvous_ca_pem: None,
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+        };
+        let http_key = planned_route_key(&http, Some(&identity)).expect("HTTP key should build");
+        let mut equivalent_http = http.clone();
+        equivalent_http.server_base_url = Some("https://node.example".to_string());
+        equivalent_http.rendezvous_urls = vec!["https://changed-but-unused.example".to_string()];
+        equivalent_http.cluster_ca_pem = Some("changed-but-shadowed-ca".to_string());
+        assert_eq!(
+            planned_route_key(&equivalent_http, Some(&identity)).expect("HTTP key should build"),
+            http_key
+        );
+        for (field, changed) in [
+            ("HTTP URL", {
+                let mut changed = http.clone();
+                changed.server_base_url = Some("https://other-node.example".to_string());
+                changed
+            }),
+            ("HTTP node identity", {
+                let mut changed = http.clone();
+                changed.target_node_id = Some(NodeId::new_v4());
+                changed
+            }),
+            ("HTTP trust root", {
+                let mut changed = http.clone();
+                changed.server_ca_pem = Some("renewed-server-ca".to_string());
+                changed
+            }),
+        ] {
+            assert_route_key_changes(&http, changed, &identity, field);
+        }
+
+        let relay = PlannedConnectionBootstrapTarget {
+            path_kind: TransportPathKind::RelayTunnel,
+            server_base_url: None,
+            server_ca_pem: None,
+            rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
+            cluster_ca_pem: Some("cluster-ca".to_string()),
+            relay_mode: RelayMode::Required,
+            target_node_id: Some(NodeId::new_v4()),
+            ..http.clone()
+        };
+        for (field, changed) in [
+            ("relay rendezvous URL", {
+                let mut changed = relay.clone();
+                changed
+                    .rendezvous_urls
+                    .push("https://backup.example".to_string());
+                changed
+            }),
+            ("relay rendezvous trust root", {
+                let mut changed = relay.clone();
+                changed.rendezvous_ca_pem = Some("renewed-rendezvous-ca".to_string());
+                changed
+            }),
+            ("relay inner trust root", {
+                let mut changed = relay.clone();
+                changed.cluster_ca_pem = Some("renewed-cluster-ca".to_string());
+                changed
+            }),
+        ] {
+            assert_route_key_changes(&relay, changed, &identity, field);
+        }
+    }
+
+    #[test]
+    fn unprobed_planned_route_construction_does_not_require_reachable_targets() {
+        let cluster_id = Uuid::now_v7();
+        let targets = [9_u16, 10_u16].map(|port| PlannedConnectionBootstrapTarget {
+            cluster_id,
+            rendezvous_urls: Vec::new(),
+            rendezvous_mtls_required: false,
+            relay_mode: RelayMode::Disabled,
+            path_kind: TransportPathKind::DirectHttps,
+            direct_candidate: None,
+            server_base_url: Some(format!("http://127.0.0.1:{port}")),
+            target_node_id: None,
+            server_ca_pem: None,
+            cluster_ca_pem: None,
+            rendezvous_ca_pem: None,
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+        });
+
+        let client =
+            build_unprobed_client_with_optional_identity_from_planned_targets(&targets, None)
+                .expect("inert route construction must not connect to either target");
+        assert_eq!(client.connection_route_snapshot().endpoints.len(), 2);
     }
 
     #[test]
