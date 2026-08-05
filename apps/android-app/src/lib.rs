@@ -69,6 +69,7 @@ mod tests {
             connection_name: Some("android-foreground".to_string()),
             impact: ClientConnectionDiagnosticImpact::UserFacing,
             diagnostics: ClientConnectionDiagnostics {
+                generated_at_unix_ms: 3_000,
                 endpoints: vec![client_sdk::ClientEndpointDiagnostics {
                     locator: "https://example.test".to_string(),
                     last_success_unix_ms: Some(3_000),

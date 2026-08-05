@@ -111,13 +111,17 @@ struct IronmeshFilesView: View {
                 Text("No route attempts recorded yet.").foregroundStyle(.secondary)
             } else {
                 ForEach(Array(model.orderedConnectionEndpoints.prefix(3))) { endpoint in
+                    let wasRecentlyUsed = endpointWasRecentlyUsed(
+                        endpoint,
+                        snapshotUnixMs: model.connectionDiagnostics?.generatedAtUnixMs
+                    )
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text(endpoint.locator).font(.headline)
                             Spacer()
-                            Text(endpointWasRecentlyUsed(endpoint) ? "Active" : "Standby")
+                            Text(wasRecentlyUsed ? "Active" : "Standby")
                                 .font(.caption)
-                                .foregroundStyle(endpointWasRecentlyUsed(endpoint) ? .green : .secondary)
+                                .foregroundStyle(wasRecentlyUsed ? .green : .secondary)
                         }
                         if let targetNodeId = endpoint.targetNodeId {
                             IronmeshKeyValueRow(label: "Target server node", value: targetNodeId)
@@ -164,12 +168,14 @@ struct IronmeshFilesView: View {
     }
 }
 
-private func endpointWasRecentlyUsed(_ endpoint: IronmeshConnectionEndpointStatus) -> Bool {
-    guard let lastUsedUnixMs = endpoint.lastUsedUnixMs else {
+private func endpointWasRecentlyUsed(
+    _ endpoint: IronmeshConnectionEndpointStatus,
+    snapshotUnixMs: UInt64?
+) -> Bool {
+    guard let lastUsedUnixMs = endpoint.lastUsedUnixMs, let snapshotUnixMs else {
         return false
     }
-    let nowUnixMs = UInt64(Date().timeIntervalSince1970 * 1_000)
-    return lastUsedUnixMs <= nowUnixMs && nowUnixMs - lastUsedUnixMs <= 2_000
+    return lastUsedUnixMs <= snapshotUnixMs && snapshotUnixMs - lastUsedUnixMs <= 2_000
 }
 
 private struct IronmeshSyncProfileCard: View {

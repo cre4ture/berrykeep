@@ -173,6 +173,7 @@ pub struct AppleEndpointDiagnostics {
 pub struct AppleConnectionDiagnosticsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_name: Option<String>,
+    pub generated_at_unix_ms: u64,
     #[serde(default)]
     pub endpoints: Vec<AppleEndpointDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +253,7 @@ impl AppleConnectionDiagnosticsResponse {
     ) -> Self {
         Self {
             connection_name,
+            generated_at_unix_ms: diagnostics.generated_at_unix_ms,
             endpoints: diagnostics
                 .endpoints
                 .into_iter()
@@ -2259,6 +2261,25 @@ mod tests {
         ] {
             assert!(endpoint.get(field).is_some(), "missing JSON field {field}");
         }
+
+        ironmesh_ios_facade_free(handle);
+    }
+
+    #[test]
+    fn connection_diagnostics_ffi_includes_its_snapshot_timestamp() {
+        let addr = spawn_test_server();
+        let handle = create_handle_for_server(addr);
+        let mut json_out = ptr::null_mut();
+        let mut error_out = ptr::null_mut();
+
+        let status =
+            ironmesh_ios_facade_connection_diagnostics_json(handle, &mut json_out, &mut error_out);
+
+        assert_eq!(status, FFI_OK);
+        assert!(error_out.is_null());
+        let snapshot: serde_json::Value = serde_json::from_str(&read_string(json_out))
+            .expect("connection diagnostics response should parse");
+        assert!(snapshot["generated_at_unix_ms"].as_u64().is_some());
 
         ironmesh_ios_facade_free(handle);
     }

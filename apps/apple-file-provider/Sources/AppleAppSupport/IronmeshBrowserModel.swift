@@ -101,6 +101,7 @@ struct IronmeshConnectionEndpointStatus: Codable, Equatable, Identifiable, Senda
 
 struct IronmeshConnectionDiagnosticsSnapshot: Codable, Equatable, Sendable {
     var connectionName: String?
+    var generatedAtUnixMs: UInt64?
     var endpoints: [IronmeshConnectionEndpointStatus]
     var lastSuccessUnixMs: UInt64?
 }
