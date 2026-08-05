@@ -187,6 +187,19 @@ fn background_probe_failures_are_scoped_as_maintenance_attempts() {
     );
 }
 
+#[test]
+fn connection_diagnostics_timestamp_does_not_precede_last_route_use() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    client.transport_router.record_route_used(0, unix_ts_ms());
+
+    let diagnostics = client.connection_diagnostics();
+    let last_used_unix_ms = diagnostics.endpoints[0]
+        .last_used_unix_ms
+        .expect("route use should be recorded");
+
+    assert!(diagnostics.generated_at_unix_ms >= last_used_unix_ms);
+}
+
 #[tokio::test]
 async fn background_probe_refresh_publishes_maintenance_diagnostics() {
     let listener =

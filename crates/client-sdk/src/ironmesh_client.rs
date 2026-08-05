@@ -1331,7 +1331,6 @@ impl ClientEndpointRouter {
     }
 
     fn diagnostics_snapshot(&self) -> ClientConnectionDiagnostics {
-        let generated_at_unix_ms = unix_ts_ms();
         let endpoints = self
             .endpoints_snapshot()
             .iter()
@@ -1368,6 +1367,7 @@ impl ClientEndpointRouter {
             .iter()
             .filter_map(|endpoint| endpoint.last_success_unix_ms)
             .max();
+        let generated_at_unix_ms = unix_ts_ms();
         ClientConnectionDiagnostics {
             generated_at_unix_ms,
             endpoints,
