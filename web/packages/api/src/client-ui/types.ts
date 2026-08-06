@@ -42,7 +42,6 @@ export type ClientConnectionRouteEndpointSnapshot = {
   locator: string;
   bootstrap_rank: number;
   target_node_id?: string | null;
-  active: boolean;
   score: number;
   ewma_latency_ms?: number | null;
   ewma_throughput_bytes_per_sec?: number | null;
@@ -51,6 +50,7 @@ export type ClientConnectionRouteEndpointSnapshot = {
   total_successes: number;
   last_measurement_unix_ms?: number | null;
   last_success_unix_ms?: number | null;
+  last_used_unix_ms?: number | null;
   last_failure_unix_ms?: number | null;
   circuit_open_until_unix_ms?: number | null;
   background_probe_in_flight: boolean;
@@ -87,7 +87,6 @@ export type ClientConnectionAttempt = {
 
 export type ClientConnectionRouteSnapshot = {
   generated_at_unix_ms: number;
-  active_index?: number | null;
   ranked_indices: number[];
   endpoints: ClientConnectionRouteEndpointSnapshot[];
 };

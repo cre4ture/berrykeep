@@ -18,6 +18,7 @@ use tokio::time::timeout;
 use runtime::ScenarioRuntime;
 
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(120);
+const RECENT_ROUTE_USE_MS: u64 = 2_000;
 
 #[ctor::ctor(unsafe)]
 fn userns_ctor() {
@@ -171,11 +172,21 @@ fn candidate_matches(snapshot: &Value, expected: ExpectedRoute) -> bool {
                 }
                 ExpectedRoute::RelayTunnel => {
                     endpoint["path_kind"] == "relay_tunnel"
-                        && endpoint["active"] == true
+                        && endpoint_was_recently_used(snapshot, endpoint)
                         && successes > 0
                 }
             }
         })
+}
+
+fn endpoint_was_recently_used(snapshot: &Value, endpoint: &Value) -> bool {
+    let Some(generated_at_unix_ms) = snapshot["generated_at_unix_ms"].as_u64() else {
+        return false;
+    };
+    let Some(last_used_unix_ms) = endpoint["last_used_unix_ms"].as_u64() else {
+        return false;
+    };
+    generated_at_unix_ms.saturating_sub(last_used_unix_ms) <= RECENT_ROUTE_USE_MS
 }
 
 fn assert_expected_route(snapshot: &Value, expected: ExpectedRoute) -> Result<()> {
@@ -195,8 +206,8 @@ fn assert_expected_route(snapshot: &Value, expected: ExpectedRoute) -> Result<()
             })
             .context("successful Direct QUIC endpoint disappeared")?;
         ensure!(
-            direct["active"] == true,
-            "Direct QUIC route was not active after the CLI request: {direct:#}"
+            endpoint_was_recently_used(snapshot, direct),
+            "Direct QUIC route was not used within {RECENT_ROUTE_USE_MS} ms of the CLI request: {direct:#}"
         );
         ensure!(
             direct["transport_session_pool"]["connect_count"]

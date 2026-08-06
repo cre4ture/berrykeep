@@ -187,6 +187,19 @@ fn background_probe_failures_are_scoped_as_maintenance_attempts() {
     );
 }
 
+#[test]
+fn connection_diagnostics_timestamp_does_not_precede_last_route_use() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    client.transport_router.record_route_used(0, unix_ts_ms());
+
+    let diagnostics = client.connection_diagnostics();
+    let last_used_unix_ms = diagnostics.endpoints[0]
+        .last_used_unix_ms
+        .expect("route use should be recorded");
+
+    assert!(diagnostics.generated_at_unix_ms >= last_used_unix_ms);
+}
+
 #[tokio::test]
 async fn background_probe_refresh_publishes_maintenance_diagnostics() {
     let listener =
@@ -406,7 +419,6 @@ fn completed_probe_does_not_update_replaced_endpoint_with_same_route_key() {
     );
 
     let snapshot = client.connection_route_snapshot();
-    assert_eq!(snapshot.active_index, Some(0));
     let replacement_snapshot = snapshot
         .endpoints
         .into_iter()
@@ -438,8 +450,16 @@ fn route_reconciliation_updates_shared_request_identity() {
 }
 
 #[tokio::test]
-async fn newly_discovered_direct_quic_is_ranked_first_and_probed() {
+async fn newly_discovered_direct_quic_is_ranked_first_and_probed_while_on_probation() {
     let static_client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    static_client
+        .transport_router
+        .endpoint(0)
+        .expect("static endpoint should exist")
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .last_used_unix_ms = Some(unix_ts_ms());
     let dynamic_quic = IronMeshClient::from_direct_quic_candidate_with_target_node_id(
         ConnectionCandidate {
             kind: CandidateKind::DirectQuic,
@@ -467,7 +487,7 @@ async fn newly_discovered_direct_quic_is_ranked_first_and_probed() {
         Some(&direct_quic.index),
         "new Direct QUIC should receive the first exploration attempt"
     );
-    assert!(!direct_quic.active);
+    assert!(direct_quic.last_used_unix_ms.is_none());
 
     static_client.spawn_due_connection_route_refresh();
     let after_probe_scheduled = static_client.connection_route_snapshot();
@@ -584,7 +604,7 @@ fn reset_timing_measurement_clears_attempts_and_uses_session_pool_baseline() {
 }
 
 #[test]
-fn route_score_strongly_prefers_direct_over_relay_and_stabilizes_active_route() {
+fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
     let state = ClientEndpointState {
         ewma_latency_ms: Some(100.0),
         ..ClientEndpointState::default()
@@ -611,12 +631,9 @@ fn route_score_strongly_prefers_direct_over_relay_and_stabilizes_active_route() 
         bootstrap_rank: 0,
     };
 
-    assert_eq!(endpoint_score(0, None, &direct, &state), 100.0);
-    assert_eq!(endpoint_score(0, None, &relay, &state), 600.0);
-    assert_eq!(endpoint_score(0, None, &direct_quic, &state), 0.0);
-    assert_eq!(endpoint_score(0, Some(0), &direct, &state), 50.0);
-    assert_eq!(endpoint_score(0, Some(0), &relay, &state), 550.0);
-    assert_eq!(endpoint_score(0, Some(0), &direct_quic, &state), -50.0);
+    assert_eq!(endpoint_score(&direct, &state), 100.0);
+    assert_eq!(endpoint_score(&relay, &state), 600.0);
+    assert_eq!(endpoint_score(&direct_quic, &state), 0.0);
 }
 
 #[test]
@@ -4251,6 +4268,14 @@ async fn direct_route_stall_falls_back_to_relay_after_warm_session_timeout() {
         assert_eq!(fallback["route"], "relay");
         assert!(client.uses_relay_transport());
         assert_eq!(client.relay_target_node_id(), Some(target_node_id));
+        let snapshot = client.connection_route_snapshot();
+        assert!(
+            snapshot
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.last_used_unix_ms.is_some()),
+            "both the stalled direct attempt and successful relay fallback should be visible as recently used"
+        );
 
         let title_status = client.run_title_latency_probe().await;
         assert_eq!(
@@ -4389,19 +4414,10 @@ fn buffered_request_timeout_applies_to_normal_and_bounds_long_running_paths() {
 }
 
 #[test]
-fn timeout_route_log_reason_explains_why_active_zero_is_not_switched() {
+fn timeout_detection_is_case_insensitive() {
     assert!(is_timeout_error_message("operation TIMED OUT"));
     assert!(is_timeout_error_message("transport timeout"));
     assert!(!is_timeout_error_message("connection reset by peer"));
-
-    assert_eq!(
-        route_not_switched_reason(Some(0), &[2, 1]),
-        "active_index=0_changes_only_after_a_successful_request;higher_ranked_candidates_remain_failover_candidates_until_then"
-    );
-    assert_eq!(
-        route_not_switched_reason(Some(0), &[]),
-        "active_index=0_remains_the_highest_ranked_route"
-    );
 }
 
 #[test]
@@ -4504,52 +4520,55 @@ async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fa
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn buffered_foreground_request_keeps_validated_active_route_first() {
-    let (active_url, active_state, active_server) =
-        spawn_direct_http_route_server(0, "active").await;
+async fn buffered_foreground_request_uses_best_scored_validated_route() {
+    let (slower_url, slower_state, slower_server) =
+        spawn_direct_http_route_server(0, "slower").await;
     let (challenger_url, challenger_state, challenger_server) =
         spawn_direct_http_route_server(0, "challenger").await;
     let client = IronMeshClient::combine(vec![
-        IronMeshClient::from_direct_base_url(active_url),
+        IronMeshClient::from_direct_base_url(slower_url),
         IronMeshClient::from_direct_base_url(challenger_url),
     ])
     .expect("combined direct client should build");
-    let active_endpoint = client
+    let slower_endpoint = client
         .transport_router
         .endpoint(0)
-        .expect("active endpoint should exist");
+        .expect("slower endpoint should exist");
     let challenger_endpoint = client
         .transport_router
         .endpoint(1)
         .expect("challenger endpoint should exist");
+    let previous_use = unix_ts_ms();
     {
-        let mut state = lock_endpoint_state(&active_endpoint.state);
+        let mut state = lock_endpoint_state(&slower_endpoint.state);
         record_endpoint_success_sample(&mut state, 600.0, 0, false);
+        state.last_used_unix_ms = Some(previous_use);
     }
     {
         let mut state = lock_endpoint_state(&challenger_endpoint.state);
         record_endpoint_success_sample(&mut state, 1.0, 0, false);
     }
-    client.transport_router.set_active_index(0);
-
     assert_eq!(client.transport_router.rank_indices()[0], 1);
     assert_eq!(
         client.transport_router.foreground_route_indices(),
-        vec![0, 1]
+        vec![1, 0]
     );
     let response = client
         .get_json_path("/cluster/status")
         .await
-        .expect("foreground request should use the validated active route");
-    assert_eq!(response["route"], "active");
-    assert_eq!(active_state.cluster_status_hits.load(Ordering::SeqCst), 1);
+        .expect("foreground request should use the best-scored route");
+    assert_eq!(response["route"], "challenger");
+    assert_eq!(slower_state.cluster_status_hits.load(Ordering::SeqCst), 0);
     assert_eq!(
         challenger_state.cluster_status_hits.load(Ordering::SeqCst),
-        0
+        1
     );
+    let snapshot = client.connection_route_snapshot();
+    assert_eq!(snapshot.endpoints[0].last_used_unix_ms, Some(previous_use));
+    assert!(snapshot.endpoints[1].last_used_unix_ms.is_some());
 
-    active_server.abort();
-    let _ = active_server.await;
+    slower_server.abort();
+    let _ = slower_server.await;
     challenger_server.abort();
     let _ = challenger_server.await;
 }
@@ -4560,7 +4579,7 @@ fn probation_is_transport_agnostic_and_clears_after_successful_probe() {
     let direct_identity = relay_test_identity(&relay_security, "direct-probation-test");
 
     // Direct routes do not get special treatment: an unvalidated direct route
-    // cannot preempt a validated active relay even though quality scoring puts
+    // cannot preempt a validated relay even though quality scoring puts
     // the direct route first.
     let relay = relay_test_client_for_public_url(
         "http://127.0.0.1:9",
@@ -4588,7 +4607,6 @@ fn probation_is_transport_agnostic_and_clears_after_successful_probe() {
         let mut state = lock_endpoint_state(&relay_endpoint.state);
         record_endpoint_success_sample(&mut state, 120.0, 0, false);
     }
-    relay_active.transport_router.set_active_index(0);
     assert!(!lock_endpoint_state(&direct_endpoint.state).foreground_validated);
     assert_eq!(relay_active.transport_router.rank_indices()[0], 1);
     assert_eq!(
@@ -4599,13 +4617,12 @@ fn probation_is_transport_agnostic_and_clears_after_successful_probe() {
         .transport_router
         .record_background_probe_successes(1, &[20.0]);
     assert!(lock_endpoint_state(&direct_endpoint.state).foreground_validated);
-    assert_eq!(relay_active.transport_router.active_index(), Some(1));
     assert_eq!(
         relay_active.transport_router.foreground_route_indices(),
         vec![1, 0]
     );
 
-    // The same probation rule applies to relay routes. Give the active direct
+    // The same probation rule applies to relay routes. Give the validated direct
     // route an intentionally poor score so the unvalidated relay would win the
     // old score-only foreground policy.
     let relay_identity = relay_test_identity(&relay_security, "relay-probation-test");
@@ -4630,7 +4647,6 @@ fn probation_is_transport_agnostic_and_clears_after_successful_probe() {
         let mut state = lock_endpoint_state(&direct_endpoint.state);
         record_endpoint_success_sample(&mut state, 1_000.0, 0, false);
     }
-    direct_active.transport_router.set_active_index(0);
     assert!(!lock_endpoint_state(&relay_endpoint.state).foreground_validated);
     assert_eq!(direct_active.transport_router.rank_indices()[0], 1);
     assert_eq!(
@@ -4641,7 +4657,6 @@ fn probation_is_transport_agnostic_and_clears_after_successful_probe() {
         .transport_router
         .record_background_probe_successes(1, &[10.0]);
     assert!(lock_endpoint_state(&relay_endpoint.state).foreground_validated);
-    assert_eq!(direct_active.transport_router.active_index(), Some(1));
     assert_eq!(
         direct_active.transport_router.foreground_route_indices(),
         vec![1, 0]
@@ -4772,28 +4787,36 @@ async fn refresh_connection_route_snapshot_times_out_stalled_probe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn due_route_refresh_reprobes_only_stale_inactive_endpoint_with_warm_samples() {
-    let (active_url, active_state, active_server) =
-        spawn_direct_http_route_server(0, "active").await;
+async fn due_route_refresh_reprobes_only_stale_non_preferred_endpoint_with_warm_samples() {
+    let (preferred_url, preferred_state, preferred_server) =
+        spawn_direct_http_route_server(0, "preferred").await;
     let (inactive_url, inactive_state, inactive_server) =
         spawn_direct_http_route_server(0, "inactive").await;
     let client = IronMeshClient::combine(vec![
-        IronMeshClient::from_direct_base_url(active_url),
+        IronMeshClient::from_direct_base_url(preferred_url),
         IronMeshClient::from_direct_base_url(inactive_url),
     ])
     .expect("combined direct client should build");
 
+    let preferred_endpoint = client
+        .transport_router
+        .endpoint(0)
+        .expect("preferred endpoint should exist");
     let inactive_endpoint = client
         .transport_router
         .endpoint(1)
         .expect("inactive endpoint should exist");
+    {
+        let mut state = lock_endpoint_state(&preferred_endpoint.state);
+        record_endpoint_success_sample(&mut state, 1.0, 0, false);
+    }
     {
         let mut state = lock_endpoint_state(&inactive_endpoint.state);
         record_endpoint_success_sample(&mut state, 12.0, 0, false);
     }
 
     client.refresh_due_connection_route_snapshot().await;
-    assert_eq!(active_state.health_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(preferred_state.health_hits.load(Ordering::SeqCst), 0);
     assert_eq!(inactive_state.health_hits.load(Ordering::SeqCst), 0);
 
     {
@@ -4803,7 +4826,7 @@ async fn due_route_refresh_reprobes_only_stale_inactive_endpoint_with_warm_sampl
     }
     let snapshot = client.refresh_due_connection_route_snapshot().await;
 
-    assert_eq!(active_state.health_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(preferred_state.health_hits.load(Ordering::SeqCst), 0);
     assert_eq!(
         inactive_state.health_hits.load(Ordering::SeqCst),
         CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT + CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT
@@ -4813,8 +4836,8 @@ async fn due_route_refresh_reprobes_only_stale_inactive_endpoint_with_warm_sampl
         1 + CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT as u64
     );
 
-    active_server.abort();
-    let _ = active_server.await;
+    preferred_server.abort();
+    let _ = preferred_server.await;
     inactive_server.abort();
     let _ = inactive_server.await;
 }

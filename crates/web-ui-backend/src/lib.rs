@@ -977,10 +977,10 @@ fn format_transport_attempt_diagnostics(
         .into_iter()
         .map(|(endpoint, attempt)| {
             format!(
-                "endpoint_index={} route_kind={:?} active={} outcome={} status_code={:?} total_us={:?} server_us={:?} transport_overhead_us={:?} network_transfer_us={:?} session_setup_us={} relay_pairing_us={} session_reused={} timeout_ms={:?} error={:?}",
+                "endpoint_index={} route_kind={:?} last_used_unix_ms={:?} outcome={} status_code={:?} total_us={:?} server_us={:?} transport_overhead_us={:?} network_transfer_us={:?} session_setup_us={} relay_pairing_us={} session_reused={} timeout_ms={:?} error={:?}",
                 endpoint.index,
                 endpoint.path_kind,
-                endpoint.active,
+                endpoint.last_used_unix_ms,
                 attempt.outcome,
                 attempt.status_code,
                 attempt.total_duration_us,

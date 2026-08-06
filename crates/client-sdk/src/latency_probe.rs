@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::{IronMeshClient, TransportSessionPoolSnapshot};
+use crate::{
+    ClientConnectionRouteEndpointSnapshot, ClientConnectionRouteSnapshot, IronMeshClient,
+    TransportSessionPoolSnapshot,
+};
 
 const LATENCY_PROBE_ROUTE: &str = "/api/v1/diagnostics/latency";
 const LATENCY_PROBE_HEADER_NODE_ID: &str = "x-ironmesh-latency-node-id";
@@ -349,14 +352,33 @@ fn replace_title_latency_status(
 
 fn title_latency_connection_type(client: &IronMeshClient) -> TitleLatencyConnectionType {
     let snapshot = client.connection_route_snapshot();
-    let active = snapshot
-        .active_index
-        .and_then(|index| snapshot.endpoints.get(index))
-        .or_else(|| snapshot.endpoints.iter().find(|endpoint| endpoint.active));
+    let used = most_recently_used_endpoint(&snapshot).or_else(|| {
+        snapshot.ranked_indices.first().and_then(|index| {
+            snapshot
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.index == *index)
+        })
+    });
 
     title_latency_connection_type_for_path(
-        active.map(|endpoint| (endpoint.path_kind, endpoint.hole_punching_mode.as_deref())),
+        used.map(|endpoint| (endpoint.path_kind, endpoint.hole_punching_mode.as_deref())),
     )
+}
+
+fn most_recently_used_endpoint(
+    snapshot: &ClientConnectionRouteSnapshot,
+) -> Option<&ClientConnectionRouteEndpointSnapshot> {
+    snapshot
+        .endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            endpoint
+                .last_used_unix_ms
+                .map(|used_at| (used_at, endpoint))
+        })
+        .max_by_key(|(used_at, endpoint)| (*used_at, endpoint.index))
+        .map(|(_, endpoint)| endpoint)
 }
 
 fn title_latency_connection_type_for_path(
@@ -381,9 +403,10 @@ fn title_latency_connection_type_for_path(
 }
 
 struct TitleLatencyRouteLog {
-    active_index: Option<usize>,
-    active_path_kind: Option<String>,
-    active_locator: Option<String>,
+    preferred_index: Option<usize>,
+    preferred_path_kind: Option<String>,
+    preferred_locator: Option<String>,
+    last_used_index: Option<usize>,
     ranked_indices: Vec<usize>,
 }
 
@@ -391,13 +414,17 @@ impl std::fmt::Display for TitleLatencyRouteLog {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "active_index={} path_kind={} locator={} ranked_indices={:?}",
-            self.active_index
+            "preferred_index={} path_kind={} locator={} last_used_index={} ranked_indices={:?}",
+            self.preferred_index
                 .map(|index| index.to_string())
                 .as_deref()
                 .unwrap_or("<none>"),
-            self.active_path_kind.as_deref().unwrap_or("<none>"),
-            self.active_locator.as_deref().unwrap_or("<none>"),
+            self.preferred_path_kind.as_deref().unwrap_or("<none>"),
+            self.preferred_locator.as_deref().unwrap_or("<none>"),
+            self.last_used_index
+                .map(|index| index.to_string())
+                .as_deref()
+                .unwrap_or("<none>"),
             self.ranked_indices,
         )
     }
@@ -405,16 +432,18 @@ impl std::fmt::Display for TitleLatencyRouteLog {
 
 fn title_latency_route_log(client: &IronMeshClient) -> TitleLatencyRouteLog {
     let snapshot = client.connection_route_snapshot();
-    let active = snapshot.active_index.and_then(|index| {
+    let preferred_index = snapshot.ranked_indices.first().copied();
+    let preferred = preferred_index.and_then(|index| {
         snapshot
             .endpoints
             .iter()
             .find(|endpoint| endpoint.index == index)
     });
     TitleLatencyRouteLog {
-        active_index: snapshot.active_index,
-        active_path_kind: active.map(|endpoint| format!("{:?}", endpoint.path_kind)),
-        active_locator: active.map(|endpoint| endpoint.locator.clone()),
+        preferred_index,
+        preferred_path_kind: preferred.map(|endpoint| format!("{:?}", endpoint.path_kind)),
+        preferred_locator: preferred.map(|endpoint| endpoint.locator.clone()),
+        last_used_index: most_recently_used_endpoint(&snapshot).map(|endpoint| endpoint.index),
         ranked_indices: snapshot.ranked_indices,
     }
 }

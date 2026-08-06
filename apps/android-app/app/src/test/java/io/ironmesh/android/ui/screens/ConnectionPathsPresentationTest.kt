@@ -8,14 +8,14 @@ import org.junit.Test
 
 class ConnectionPathsPresentationTest {
     @Test
-    fun prioritizesLastUsedAndAvailableRoutesAheadOfCoolDownAndFailedRoutes() {
+    fun prioritizesActiveAndAvailableRoutesAheadOfCoolDownAndFailedRoutes() {
         val snapshot = ConnectionRouteSnapshot(
             generatedAtUnixMs = 1_000L,
             rankedIndices = listOf(0, 1, 2, 3),
             endpoints = listOf(
                 endpoint(index = 0, circuitOpenUntilUnixMs = 2_000L),
                 endpoint(index = 1, totalSuccesses = 4L),
-                endpoint(index = 2, active = true, totalSuccesses = 2L),
+                endpoint(index = 2, lastUsedUnixMs = 900L, totalSuccesses = 2L),
                 endpoint(index = 3, totalFailures = 1L, consecutiveFailures = 1),
             ),
         )
@@ -23,7 +23,7 @@ class ConnectionPathsPresentationTest {
         val presentation = connectionPathsPresentation(snapshot, error = null)
 
         assertEquals(listOf(2, 1, 0, 3), presentation.routes.map { it.endpoint.index })
-        assertEquals(ConnectionRouteState.LAST_USED, presentation.routes[0].state)
+        assertEquals(ConnectionRouteState.ACTIVE, presentation.routes[0].state)
         assertEquals(ConnectionRouteState.AVAILABLE, presentation.routes[1].state)
         assertEquals(ConnectionRouteState.COOL_DOWN, presentation.routes[2].state)
         assertEquals(ConnectionRouteState.UNAVAILABLE, presentation.routes[3].state)
@@ -36,14 +36,13 @@ class ConnectionPathsPresentationTest {
             pathKind = "relay_tunnel",
             locator = "node-a@https://relay.example:7443",
             targetNodeId = "node-a",
-            active = true,
+            lastUsedUnixMs = 900L,
             totalSuccesses = 3L,
         )
 
         val presentation = connectionPathsPresentation(
             snapshot = ConnectionRouteSnapshot(
                 generatedAtUnixMs = 1_000L,
-                activeIndex = relay.index,
                 rankedIndices = listOf(relay.index),
                 endpoints = listOf(relay),
             ),
@@ -72,14 +71,13 @@ class ConnectionPathsPresentationTest {
             index = 5,
             pathKind = "direct_quic",
             holePunchingMode = "direct",
-            active = true,
+            lastUsedUnixMs = 900L,
             totalSuccesses = 3L,
         )
 
         val presentation = connectionPathsPresentation(
             snapshot = ConnectionRouteSnapshot(
                 generatedAtUnixMs = 1_000L,
-                activeIndex = directQuic.index,
                 rankedIndices = listOf(directQuic.index),
                 endpoints = listOf(directQuic),
             ),
@@ -96,14 +94,13 @@ class ConnectionPathsPresentationTest {
             index = 6,
             pathKind = "direct_quic",
             holePunchingMode = "relay",
-            active = true,
+            lastUsedUnixMs = 900L,
             totalSuccesses = 3L,
         )
 
         val presentation = connectionPathsPresentation(
             snapshot = ConnectionRouteSnapshot(
                 generatedAtUnixMs = 1_000L,
-                activeIndex = relayedQuic.index,
                 rankedIndices = listOf(relayedQuic.index),
                 endpoints = listOf(relayedQuic),
             ),
@@ -136,11 +133,11 @@ class ConnectionPathsPresentationTest {
     }
 
     @Test
-    fun exposesRankAndScoreFactorsThatExplainAnActiveRelayRoute() {
+    fun exposesRankAndScoreFactorsWithoutCreditingRecentUse() {
         val relay = endpoint(
             index = 1,
             pathKind = "relay_tunnel",
-            active = true,
+            lastUsedUnixMs = 900L,
             score = 481.0,
             ewmaLatencyMs = 80.0,
             ewmaThroughputBytesPerSec = 12_500_000.0,
@@ -154,7 +151,6 @@ class ConnectionPathsPresentationTest {
         val presentation = connectionPathsPresentation(
             snapshot = ConnectionRouteSnapshot(
                 generatedAtUnixMs = 1_000L,
-                activeIndex = relay.index,
                 rankedIndices = listOf(relay.index, direct.index),
                 endpoints = listOf(direct, relay),
             ),
@@ -171,8 +167,47 @@ class ConnectionPathsPresentationTest {
         assertEquals(80.0, activeRoute.scoreBreakdown.latencyPoints, 0.0)
         assertEquals(500.0, activeRoute.scoreBreakdown.relayPenaltyPoints, 0.0)
         assertEquals(50.0, activeRoute.scoreBreakdown.throughputCreditPoints, 0.0)
-        assertEquals(50.0, activeRoute.scoreBreakdown.activeRouteCreditPoints, 0.0)
         assertEquals(2, directRoute.selectionRank)
+    }
+
+    @Test
+    fun reportsEveryRouteUsedWithinTwoSecondsAsActive() {
+        val snapshot = ConnectionRouteSnapshot(
+            generatedAtUnixMs = 10_000L,
+            rankedIndices = listOf(0, 1, 2),
+            endpoints = listOf(
+                endpoint(index = 0, lastUsedUnixMs = 9_900L, totalSuccesses = 1L),
+                endpoint(index = 1, lastUsedUnixMs = 8_000L, totalSuccesses = 1L),
+                endpoint(index = 2, lastUsedUnixMs = 7_999L, totalSuccesses = 1L),
+            ),
+        )
+
+        val presentation = connectionPathsPresentation(snapshot, error = null)
+
+        assertEquals(ConnectionOverviewState.MULTIPLE, presentation.overview.state)
+        assertEquals(2, presentation.overview.activeRouteCount)
+        assertEquals(
+            listOf(ConnectionRouteState.ACTIVE, ConnectionRouteState.ACTIVE, ConnectionRouteState.AVAILABLE),
+            presentation.routes.map { it.state },
+        )
+    }
+
+    @Test
+    fun reportsHealthyRoutesAsAvailableAfterTheActiveWindowExpires() {
+        val presentation = connectionPathsPresentation(
+            snapshot = ConnectionRouteSnapshot(
+                generatedAtUnixMs = 10_000L,
+                rankedIndices = listOf(0),
+                endpoints = listOf(
+                    endpoint(index = 0, lastUsedUnixMs = 7_999L, totalSuccesses = 1L),
+                ),
+            ),
+            error = null,
+        )
+
+        assertEquals(ConnectionOverviewState.AVAILABLE, presentation.overview.state)
+        assertEquals(0, presentation.overview.activeRouteCount)
+        assertEquals(ConnectionRouteState.AVAILABLE, presentation.routes.single().state)
     }
 
     @Test
@@ -189,7 +224,7 @@ class ConnectionPathsPresentationTest {
         holePunchingMode: String? = null,
         locator: String = "https://node.example",
         targetNodeId: String? = null,
-        active: Boolean = false,
+        lastUsedUnixMs: Long? = null,
         score: Double = 0.0,
         ewmaLatencyMs: Double? = null,
         ewmaThroughputBytesPerSec: Double? = null,
@@ -205,7 +240,7 @@ class ConnectionPathsPresentationTest {
             locator = locator,
             bootstrapRank = index,
             targetNodeId = targetNodeId,
-            active = active,
+            lastUsedUnixMs = lastUsedUnixMs,
             score = score,
             ewmaLatencyMs = ewmaLatencyMs,
             ewmaThroughputBytesPerSec = ewmaThroughputBytesPerSec,

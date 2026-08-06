@@ -152,7 +152,8 @@ pub struct AppleEndpointDiagnostics {
     pub last_successful_iroh_relay_url: Option<String>,
     pub locator: String,
     pub request_base_url: String,
-    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_unix_ms: Option<u64>,
     pub consecutive_failures: u32,
     pub total_failures: u64,
     pub total_successes: u64,
@@ -172,6 +173,7 @@ pub struct AppleEndpointDiagnostics {
 pub struct AppleConnectionDiagnosticsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_name: Option<String>,
+    pub generated_at_unix_ms: u64,
     #[serde(default)]
     pub endpoints: Vec<AppleEndpointDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,7 +223,7 @@ impl AppleEndpointDiagnostics {
             last_successful_iroh_relay_url: value.last_successful_iroh_relay_url,
             locator: endpoint_locator.clone(),
             request_base_url: value.request_base_url,
-            active: value.active,
+            last_used_unix_ms: value.last_used_unix_ms,
             consecutive_failures: value.consecutive_failures,
             total_failures: value.total_failures,
             total_successes: value.total_successes,
@@ -251,6 +253,7 @@ impl AppleConnectionDiagnosticsResponse {
     ) -> Self {
         Self {
             connection_name,
+            generated_at_unix_ms: diagnostics.generated_at_unix_ms,
             endpoints: diagnostics
                 .endpoints
                 .into_iter()
@@ -2234,12 +2237,12 @@ mod tests {
         let snapshot: serde_json::Value = serde_json::from_str(&read_string(json_out))
             .expect("route snapshot response should parse");
         assert!(snapshot["generated_at_unix_ms"].as_u64().is_some());
-        assert_eq!(snapshot["active_index"], 0);
+        assert!(snapshot.get("active_index").is_none());
         assert_eq!(snapshot["ranked_indices"], serde_json::json!([0]));
 
         let endpoint = &snapshot["endpoints"][0];
         assert_eq!(endpoint["path_kind"], "direct_https");
-        assert_eq!(endpoint["active"], true);
+        assert!(endpoint.get("active").is_none());
         for field in [
             "score",
             "ewma_latency_ms",
@@ -2249,6 +2252,7 @@ mod tests {
             "total_successes",
             "last_measurement_unix_ms",
             "last_success_unix_ms",
+            "last_used_unix_ms",
             "last_failure_unix_ms",
             "circuit_open_until_unix_ms",
             "background_probe_in_flight",
@@ -2257,6 +2261,25 @@ mod tests {
         ] {
             assert!(endpoint.get(field).is_some(), "missing JSON field {field}");
         }
+
+        ironmesh_ios_facade_free(handle);
+    }
+
+    #[test]
+    fn connection_diagnostics_ffi_includes_its_snapshot_timestamp() {
+        let addr = spawn_test_server();
+        let handle = create_handle_for_server(addr);
+        let mut json_out = ptr::null_mut();
+        let mut error_out = ptr::null_mut();
+
+        let status =
+            ironmesh_ios_facade_connection_diagnostics_json(handle, &mut json_out, &mut error_out);
+
+        assert_eq!(status, FFI_OK);
+        assert!(error_out.is_null());
+        let snapshot: serde_json::Value = serde_json::from_str(&read_string(json_out))
+            .expect("connection diagnostics response should parse");
+        assert!(snapshot["generated_at_unix_ms"].as_u64().is_some());
 
         ironmesh_ios_facade_free(handle);
     }

@@ -5,8 +5,6 @@ import com.squareup.moshi.Json
 data class ConnectionRouteSnapshot(
     @Json(name = "generated_at_unix_ms")
     val generatedAtUnixMs: Long,
-    @Json(name = "active_index")
-    val activeIndex: Int? = null,
     @Json(name = "ranked_indices")
     val rankedIndices: List<Int> = emptyList(),
     val endpoints: List<ConnectionRouteEndpointSnapshot> = emptyList(),
@@ -27,7 +25,6 @@ data class ConnectionRouteEndpointSnapshot(
     val irohRelayUrls: List<String> = emptyList(),
     @Json(name = "last_successful_iroh_relay_url")
     val lastSuccessfulIrohRelayUrl: String? = null,
-    val active: Boolean,
     val score: Double,
     @Json(name = "ewma_latency_ms")
     val ewmaLatencyMs: Double? = null,
@@ -43,6 +40,8 @@ data class ConnectionRouteEndpointSnapshot(
     val lastMeasurementUnixMs: Long? = null,
     @Json(name = "last_success_unix_ms")
     val lastSuccessUnixMs: Long? = null,
+    @Json(name = "last_used_unix_ms")
+    val lastUsedUnixMs: Long? = null,
     @Json(name = "last_failure_unix_ms")
     val lastFailureUnixMs: Long? = null,
     @Json(name = "circuit_open_until_unix_ms")

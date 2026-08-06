@@ -666,6 +666,10 @@ struct IronmeshConnectionPathsView: View {
             if model.connectionRouteSnapshot == nil && !model.isRefreshingConnectionRoutes {
                 model.refreshConnectionPaths()
             }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                await model.refreshCachedConnectionPaths()
+            }
         }
     }
 }
@@ -710,10 +714,10 @@ private struct IronmeshConnectionOverviewRow: View {
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
                     IronmeshKeyValueRow(
-                        label: "Selected path",
-                        value: snapshot.activeEndpoint?.connectionDisplayName ?? "None"
+                        label: "Preferred path",
+                        value: snapshot.preferredEndpoint?.connectionDisplayName ?? "None"
                     )
-                    if let explanation = snapshot.activeEndpoint?.connectionExplanation {
+                    if let explanation = snapshot.displayEndpoint?.connectionExplanation {
                         Text(explanation)
                             .font(.footnote)
                             .foregroundStyle(.secondary)
@@ -724,7 +728,7 @@ private struct IronmeshConnectionOverviewRow: View {
                         label: "Evaluated",
                         value: unixMillisecondsTimestamp(snapshot.generatedAtUnixMs)
                     )
-                    Text("Routes are evaluated only when this view opens or you explicitly refresh it.")
+                    Text("Recent activity updates automatically; re-evaluate to probe every route now.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -736,8 +740,11 @@ private struct IronmeshConnectionOverviewRow: View {
     }
 
     private var title: String {
-        guard let endpoint = snapshot.activeEndpoint else {
-            return "No active route"
+        if snapshot.recentlyUsedEndpoints.count > 1 {
+            return "Using multiple routes"
+        }
+        guard let endpoint = snapshot.recentlyUsedEndpoints.first else {
+            return snapshot.preferredEndpoint == nil ? "No routes available" : "Routes available"
         }
         if endpoint.usesRelayPath {
             return "Connected through relay"
@@ -749,8 +756,14 @@ private struct IronmeshConnectionOverviewRow: View {
     }
 
     private var summary: String {
-        guard let endpoint = snapshot.activeEndpoint else {
-            return "No route is currently selected"
+        if snapshot.recentlyUsedEndpoints.count > 1 {
+            return "\(snapshot.recentlyUsedEndpoints.count) routes active"
+        }
+        guard let endpoint = snapshot.recentlyUsedEndpoints.first else {
+            guard let preferred = snapshot.preferredEndpoint else {
+                return "No route is currently available"
+            }
+            return "Preferred: \(preferred.compactConnectionDisplayName)"
         }
         var values = [endpoint.compactConnectionDisplayName]
         if let latency = endpoint.ewmaLatencyMs {
@@ -769,6 +782,10 @@ private struct IronmeshConnectionPathRow: View {
 
     private var coolingDown: Bool {
         endpoint.isCoolingDown(atUnixMs: currentUnixMilliseconds)
+    }
+
+    private var recentlyUsed: Bool {
+        endpoint.wasRecentlyUsed(atUnixMs: snapshotTimestamp)
     }
 
     var body: some View {
@@ -852,6 +869,10 @@ private struct IronmeshConnectionPathRow: View {
                             value: unixMillisecondsTimestamp(endpoint.lastSuccessUnixMs)
                         )
                         IronmeshKeyValueRow(
+                            label: "Last active use",
+                            value: unixMillisecondsTimestamp(endpoint.lastUsedUnixMs)
+                        )
+                        IronmeshKeyValueRow(
                             label: "Last failure",
                             value: unixMillisecondsTimestamp(endpoint.lastFailureUnixMs)
                         )
@@ -875,7 +896,7 @@ private struct IronmeshConnectionPathRow: View {
             }
         }
         .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
-        .listRowBackground(endpoint.active ? Color.accentColor.opacity(0.15) : Color.clear)
+        .listRowBackground(recentlyUsed ? Color.accentColor.opacity(0.15) : Color.clear)
         .accessibilityHint("Snapshot \(unixMillisecondsTimestamp(snapshotTimestamp))")
     }
 
@@ -889,7 +910,7 @@ private struct IronmeshConnectionPathRow: View {
     }
 
     private var routeState: (title: String, color: Color) {
-        if endpoint.active {
+        if recentlyUsed {
             return ("Active", .green)
         }
         if endpoint.backgroundProbeInFlight {

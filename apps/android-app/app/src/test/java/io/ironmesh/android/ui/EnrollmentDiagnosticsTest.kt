@@ -120,7 +120,6 @@ class EnrollmentDiagnosticsTest {
                     pathKind = "direct",
                     locator = "https://node.example",
                     bootstrapRank = 0,
-                    active = false,
                     score = 1.0,
                     consecutiveFailures = 0,
                     totalFailures = 0L,
