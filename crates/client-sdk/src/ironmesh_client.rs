@@ -1890,6 +1890,21 @@ fn request_auth_headers_for_auth(
     Ok(headers)
 }
 
+/// Builds the headers for one transport attempt. Retries must call this again so a
+/// server that consumed an earlier request cannot reject the fallback as a nonce replay.
+/// Caller-provided headers remain stable, including the operation ID for mutations.
+fn request_headers_for_attempt(
+    auth: &ClientRequestAuth,
+    method: &Method,
+    url: &Url,
+    connection_name: Option<&str>,
+    request_headers: &[RelayHttpHeader],
+) -> Result<Vec<RelayHttpHeader>> {
+    let mut attempt_headers = request_auth_headers_for_auth(auth, method, url, connection_name)?;
+    attempt_headers.extend_from_slice(request_headers);
+    Ok(attempt_headers)
+}
+
 fn method_uses_operation_id(method: &Method) -> bool {
     matches!(
         method,
@@ -3596,9 +3611,6 @@ impl IronMeshClient {
         self.maybe_spawn_background_quality_refresh();
 
         let auth = self.auth_snapshot();
-        let mut auth_headers =
-            request_auth_headers_for_auth(&auth, &method, &url, self.connection_name.as_deref())?;
-        auth_headers.append(&mut headers);
 
         let mut last_error = None;
         for &index in route_indices {
@@ -3621,6 +3633,13 @@ impl IronMeshClient {
                     continue;
                 }
             };
+            let attempt_headers = request_headers_for_attempt(
+                &auth,
+                &method,
+                &url,
+                self.connection_name.as_deref(),
+                &headers,
+            )?;
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
@@ -3631,7 +3650,7 @@ impl IronMeshClient {
                 TransportRequestOptions::new(self.connection_name.as_deref(), request_timeout),
                 &method,
                 &endpoint_url,
-                &auth_headers,
+                &attempt_headers,
                 body.as_deref().unwrap_or_default(),
             )
             .await
@@ -3735,13 +3754,6 @@ impl IronMeshClient {
 
         self.maybe_spawn_background_quality_refresh();
 
-        let mut auth_headers = request_auth_headers_for_auth(
-            &auth,
-            &Method::PUT,
-            &url,
-            self.connection_name.as_deref(),
-        )?;
-        auth_headers.append(&mut operation_headers);
         let mut last_error = None;
         for &route_index in route_indices {
             let Some(endpoint) = self.transport_router.endpoint(route_index) else {
@@ -3761,6 +3773,13 @@ impl IronMeshClient {
                     continue;
                 }
             };
+            let attempt_headers = request_headers_for_attempt(
+                &auth,
+                &Method::PUT,
+                &url,
+                self.connection_name.as_deref(),
+                &operation_headers,
+            )?;
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
@@ -3771,7 +3790,7 @@ impl IronMeshClient {
                 TransportRequestOptions::new(self.connection_name.as_deref(), request_timeout),
                 &Method::PUT,
                 &endpoint_url,
-                &auth_headers,
+                &attempt_headers,
                 &payload,
             )
             .await
@@ -4476,14 +4495,11 @@ impl IronMeshClient {
 
         let url = self.relative_url(path)?;
         let response_timeout = buffered_request_timeout(&url);
-        let mut headers = headers
+        let headers = headers
             .into_iter()
             .map(|(name, value)| RelayHttpHeader { name, value })
             .collect::<Vec<_>>();
         let auth = self.auth_snapshot();
-        let mut auth_headers =
-            request_auth_headers_for_auth(&auth, &method, &url, self.connection_name.as_deref())?;
-        auth_headers.append(&mut headers);
         let mut last_error = None;
 
         for index in self.transport_router.foreground_route_indices() {
@@ -4504,6 +4520,13 @@ impl IronMeshClient {
                     continue;
                 }
             };
+            let attempt_headers = request_headers_for_attempt(
+                &auth,
+                &method,
+                &url,
+                self.connection_name.as_deref(),
+                &headers,
+            )?;
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
@@ -4515,7 +4538,7 @@ impl IronMeshClient {
                 response_timeout,
                 &method,
                 &endpoint_url,
-                &auth_headers,
+                &attempt_headers,
             )
             .await
             {
@@ -4588,14 +4611,11 @@ impl IronMeshClient {
 
         let url = self.relative_url(path)?;
         let response_timeout = buffered_request_timeout(&url);
-        let mut headers = headers
+        let headers = headers
             .into_iter()
             .map(|(name, value)| RelayHttpHeader { name, value })
             .collect::<Vec<_>>();
         let auth = self.auth_snapshot();
-        let mut auth_headers =
-            request_auth_headers_for_auth(&auth, &method, &url, self.connection_name.as_deref())?;
-        auth_headers.append(&mut headers);
         let mut last_error = None;
         let mut body_stream = Some(Box::pin(body_stream) as RequestBodyStream);
 
@@ -4617,6 +4637,13 @@ impl IronMeshClient {
                     continue;
                 }
             };
+            let attempt_headers = request_headers_for_attempt(
+                &auth,
+                &method,
+                &url,
+                self.connection_name.as_deref(),
+                &headers,
+            )?;
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
@@ -4630,7 +4657,7 @@ impl IronMeshClient {
                 TransportRequestOptions::new(self.connection_name.as_deref(), response_timeout),
                 &method,
                 &endpoint_url,
-                &auth_headers,
+                &attempt_headers,
                 request_body_stream,
             )
             .await
@@ -5030,13 +5057,6 @@ impl IronMeshClient {
             headers.push(simple_header(IF_RANGE, if_range)?);
         }
         let auth = self.auth_snapshot();
-        let mut auth_headers = request_auth_headers_for_auth(
-            &auth,
-            &Method::GET,
-            &url,
-            self.connection_name.as_deref(),
-        )?;
-        auth_headers.append(&mut headers);
 
         let mut last_error = None;
         let mut response = None;
@@ -5058,6 +5078,13 @@ impl IronMeshClient {
                     continue;
                 }
             };
+            let attempt_headers = request_headers_for_attempt(
+                &auth,
+                &Method::GET,
+                &url,
+                self.connection_name.as_deref(),
+                &headers,
+            )?;
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
@@ -5067,7 +5094,7 @@ impl IronMeshClient {
                 &auth,
                 self.connection_name.as_deref(),
                 &endpoint_url,
-                &auth_headers,
+                &attempt_headers,
                 writer,
             )
             .await

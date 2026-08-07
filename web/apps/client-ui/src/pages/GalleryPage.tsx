@@ -37,7 +37,9 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
     structuralSharing: retainEquivalentMapConfiguration
   });
   const mapConfiguration = mapConfigurationQuery.data ?? null;
-  const mapConfigurationError = mapConfigurationErrorMessage(mapConfigurationQuery.error);
+  const mapConfigurationError = mapConfigurationQuery.isError
+    ? mapConfigurationErrorMessage(mapConfigurationQuery.error)
+    : null;
   const basemaps = useMemo(
     () => galleryBasemapsFromConfiguration(mapConfiguration?.configuration.variants ?? []),
     [mapConfiguration]

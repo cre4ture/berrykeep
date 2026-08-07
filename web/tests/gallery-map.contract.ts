@@ -97,6 +97,9 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await target.openGallery(page);
     await page.getByRole("button", { name: "Map" }).click();
 
+    await expect(page.getByText("Map styles could not be refreshed")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Retry map styles" })).toHaveCount(0);
+
     const mapDisplay = page.getByRole("textbox", { name: "Map display", exact: true });
     await expect(mapDisplay).toHaveValue("Natural Earth Globe");
     await mapDisplay.click();
