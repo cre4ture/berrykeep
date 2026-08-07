@@ -4268,6 +4268,30 @@ async fn direct_route_stall_falls_back_to_relay_after_warm_session_timeout() {
         assert_eq!(fallback["route"], "relay");
         assert!(client.uses_relay_transport());
         assert_eq!(client.relay_target_node_id(), Some(target_node_id));
+        let direct_request = direct_state
+            .captured_stalled_request
+            .lock()
+            .await
+            .clone()
+            .expect("stalled direct request should be captured after reaching the server");
+        let relay_request = relay_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("relay fallback request should be captured");
+        let direct_nonce = relay_header_value(
+            &direct_request.headers,
+            transport_sdk::HEADER_AUTH_NONCE,
+        )
+        .expect("direct attempt should carry an auth nonce");
+        let relay_nonce =
+            relay_header_value(&relay_request.headers, transport_sdk::HEADER_AUTH_NONCE)
+                .expect("relay attempt should carry an auth nonce");
+        assert_ne!(
+            direct_nonce, relay_nonce,
+            "fallback must not replay the nonce consumed by the timed-out direct attempt"
+        );
         let snapshot = client.connection_route_snapshot();
         assert!(
             snapshot
@@ -4436,6 +4460,51 @@ fn ensure_operation_id_header_reuses_existing_value_for_mutating_methods() {
     assert_eq!(first_operation_id, second_operation_id);
 }
 
+#[test]
+fn request_headers_for_attempt_refreshes_auth_nonce_and_preserves_operation_id() {
+    let mut identity = ClientIdentityMaterial::generate(
+        uuid::Uuid::now_v7(),
+        None,
+        Some("per-attempt-auth-test-device".to_string()),
+    )
+    .expect("identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+    let auth = ClientRequestAuth::SignedIdentity(identity);
+    let url =
+        Url::parse("https://node.example/api/v1/maps/config").expect("request URL should parse");
+    let mut request_headers = Vec::new();
+    ensure_operation_id_header(&Method::POST, &mut request_headers);
+
+    let first = request_headers_for_attempt(
+        &auth,
+        &Method::POST,
+        &url,
+        Some("gallery-map"),
+        &request_headers,
+    )
+    .expect("first attempt headers should build");
+    let second = request_headers_for_attempt(
+        &auth,
+        &Method::POST,
+        &url,
+        Some("gallery-map"),
+        &request_headers,
+    )
+    .expect("second attempt headers should build");
+
+    let first_nonce = relay_header_value(&first, transport_sdk::HEADER_AUTH_NONCE)
+        .expect("first attempt should carry an auth nonce");
+    let second_nonce = relay_header_value(&second, transport_sdk::HEADER_AUTH_NONCE)
+        .expect("second attempt should carry an auth nonce");
+    let first_operation_id = relay_header_value(&first, transport_sdk::HEADER_OPERATION_ID)
+        .expect("first attempt should carry an operation id");
+    let second_operation_id = relay_header_value(&second, transport_sdk::HEADER_OPERATION_ID)
+        .expect("second attempt should carry an operation id");
+
+    assert_ne!(first_nonce, second_nonce);
+    assert_eq!(first_operation_id, second_operation_id);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fallback() {
     let (direct_state, direct_server) =
@@ -4491,9 +4560,16 @@ async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fa
             let direct_operation_id =
                 relay_header_value(&direct_request.headers, transport_sdk::HEADER_OPERATION_ID)
                     .expect("direct request should carry an operation id");
+            let direct_nonce =
+                relay_header_value(&direct_request.headers, transport_sdk::HEADER_AUTH_NONCE)
+                    .expect("direct request should carry an auth nonce");
+            let relay_nonce =
+                relay_header_value(&relay_request.headers, transport_sdk::HEADER_AUTH_NONCE)
+                    .expect("relay request should carry an auth nonce");
             assert_eq!(direct_request.method, "POST");
             assert_eq!(direct_request.path_and_query, "/api/v1/cluster/status");
             assert_eq!(direct_operation_id, relay_operation_id);
+            assert_ne!(direct_nonce, relay_nonce);
         }
         assert!(
             matches!(
