@@ -13,6 +13,31 @@ import org.junit.Test
 
 class AppConnectionPresentationTest {
     @Test
+    fun newConnectionSuccessUsesCurrentOsTimeInsteadOfPreviousUiTime() {
+        val previousUiTimeUnixMs = 1_750_000_000_000L
+        val successUnixMs = previousUiTimeUnixMs + 1_000L
+        val currentOsTimeUnixMs = successUnixMs + 1L
+        val status = AppConnectionStatus(
+            state = APP_CONNECTION_STATE_CONNECTED,
+            lastSuccessfulConnectionUnixMs = successUnixMs,
+        )
+
+        assertEquals(
+            "Connection status is stale",
+            appConnectionHeadline(status, previousUiTimeUnixMs),
+        )
+        assertTrue(shouldShowRetryConnectionAction(status, previousUiTimeUnixMs))
+
+        val nowUnixMs = currentConnectionHealthNow(previousUiTimeUnixMs) {
+            currentOsTimeUnixMs
+        }
+
+        assertEquals(currentOsTimeUnixMs, nowUnixMs)
+        assertEquals("Connection is healthy", appConnectionHeadline(status, nowUnixMs))
+        assertFalse(shouldShowRetryConnectionAction(status, nowUnixMs))
+    }
+
+    @Test
     fun appRequestFailureIsNotPresentedAsIdle() {
         val status = AppConnectionStatus(
             state = APP_CONNECTION_STATE_ERROR,

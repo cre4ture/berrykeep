@@ -76,12 +76,15 @@ fun appConnectionHeadline(
 
 @Composable
 fun rememberConnectionHealthNow(connectionStatus: AppConnectionStatus): Long {
-    var nowUnixMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var expiryRefreshFloorUnixMs by remember { mutableLongStateOf(0L) }
+    // Read the wall clock during composition so a newly published success is never compared with
+    // the previous composition's time. The retained floor triggers the expiry recomposition and
+    // keeps health evaluation monotonic if the wall clock moves backwards.
+    val nowUnixMs = currentConnectionHealthNow(expiryRefreshFloorUnixMs)
     LaunchedEffect(
         connectionStatus.state,
         connectionStatus.lastSuccessfulConnectionUnixMs,
     ) {
-        nowUnixMs = System.currentTimeMillis()
         if (!connectionStatus.isConnected(nowUnixMs)) {
             return@LaunchedEffect
         }
@@ -89,10 +92,15 @@ fun rememberConnectionHealthNow(connectionStatus: AppConnectionStatus): Long {
         val expiresAtUnixMs = requireNotNull(connectionStatus.lastSuccessfulConnectionUnixMs) +
             APP_CONNECTION_HEALTH_MAX_AGE_MS
         delay((expiresAtUnixMs - nowUnixMs + 1L).coerceAtLeast(0L))
-        nowUnixMs = System.currentTimeMillis()
+        expiryRefreshFloorUnixMs = System.currentTimeMillis()
     }
     return nowUnixMs
 }
+
+internal fun currentConnectionHealthNow(
+    refreshFloorUnixMs: Long,
+    currentTimeMillis: () -> Long = System::currentTimeMillis,
+): Long = maxOf(refreshFloorUnixMs, currentTimeMillis())
 
 fun appConnectionStatusBadge(
     connectionStatus: AppConnectionStatus,
