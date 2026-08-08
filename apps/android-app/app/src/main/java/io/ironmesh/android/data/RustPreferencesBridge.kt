@@ -61,10 +61,9 @@ object RustPreferencesBridge {
         val context = appContext ?: error("RustPreferencesBridge is not initialized")
         val update = diagnosticsUpdateAdapter.fromJson(diagnosticsJson) ?: return
         val current = IronmeshPreferences.getAppConnectionStatus(context)
-        IronmeshPreferences.setAppConnectionStatus(
-            context,
-            mergeAppConnectionDiagnostics(current, update),
-        )
+        val next = mergeAppConnectionDiagnostics(current, update)
+        IronmeshPreferences.setAppConnectionStatus(context, next)
+        logPersistedAppConnectionStatusTransition(current, next, update)
     }
 
     internal fun mergeAppConnectionDiagnostics(
@@ -81,9 +80,6 @@ object RustPreferencesBridge {
         val mergedFailures = retainRecentFailuresByImpact(
             current.failedAttempts + scopedUpdateFailures,
         )
-        val statusRelevantFailures = mergedFailures.filter { attempt ->
-            attempt.affectsAppConnectionStatus()
-        }
 
         val effectiveLastSuccessUnixMs = when {
             !updateAffectsAppConnectionStatus -> current.lastSuccessfulConnectionUnixMs
@@ -122,9 +118,7 @@ object RustPreferencesBridge {
             else -> current.lastSuccessfulFunctionalRequestUrl
         }
 
-        val latestFailure = statusRelevantFailures.maxByOrNull { attempt ->
-            attempt.finishedUnixMs ?: attempt.startedUnixMs
-        }
+        val latestFailure = latestStatusRelevantFailure(mergedFailures)
         val latestFailureUnixMs = latestFailure?.finishedUnixMs ?: latestFailure?.startedUnixMs
         val latestSuccessUnixMs = effectiveLastSuccessUnixMs
         val latestEventUnixMs = listOfNotNull(latestSuccessUnixMs, latestFailureUnixMs).maxOrNull()
