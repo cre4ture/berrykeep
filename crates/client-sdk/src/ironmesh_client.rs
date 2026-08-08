@@ -4479,12 +4479,8 @@ impl IronMeshClient {
         let mut result = serde_json::from_slice::<StoreIndexResponse>(&response.body)
             .context("failed to parse /store/index response");
 
-        if let Ok(ref mut response) = result
-            && options.synthesize_missing_folder_markers
-        {
-            ensure_missing_folder_markers(&mut response.entries);
-            response.entry_count = response.entries.len();
-            response.total_entry_count = response.total_entry_count.max(response.entry_count);
+        if let Ok(ref mut response) = result {
+            synthesize_missing_folder_markers_for_page(response, &options);
         }
 
         result
@@ -7722,7 +7718,26 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>) {
         }
     }
 
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let (mut folders, files): (Vec<_>, Vec<_>) = std::mem::take(entries)
+        .into_iter()
+        .partition(|entry| entry.entry_type == "prefix" || entry.path.ends_with('/'));
+    folders.sort_by(|left, right| left.path.cmp(&right.path));
+    folders.extend(files);
+    *entries = folders;
+}
+
+fn synthesize_missing_folder_markers_for_page(
+    response: &mut StoreIndexResponse,
+    options: &StoreIndexRequestOptions,
+) {
+    let is_first_page = options.cursor.is_none() && options.offset.unwrap_or(0) == 0;
+    if !options.synthesize_missing_folder_markers || !is_first_page {
+        return;
+    }
+
+    ensure_missing_folder_markers(&mut response.entries);
+    response.entry_count = response.entries.len();
+    response.total_entry_count = response.total_entry_count.max(response.entry_count);
 }
 
 fn append_optional_query(url: &mut Url, key: &str, value: Option<&str>) {

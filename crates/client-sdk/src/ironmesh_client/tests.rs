@@ -771,6 +771,109 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
 }
 
 #[test]
+fn folder_marker_synthesis_preserves_server_file_order_on_the_first_page() {
+    let mut response = StoreIndexResponse {
+        prefix: String::new(),
+        depth: 64,
+        entry_count: 3,
+        total_entry_count: 64,
+        offset: 0,
+        limit: Some(32),
+        has_more: true,
+        next_cursor: None,
+        sync_token: None,
+        media_summary: StoreIndexMediaSummary::default(),
+        entries: vec![
+            store_index_test_entry("photos/2026/newest.jpg"),
+            store_index_test_entry("archive/2025/middle.jpg"),
+            store_index_test_entry("photos/2024/oldest.jpg"),
+        ],
+    };
+    let options = StoreIndexRequestOptions {
+        offset: Some(0),
+        limit: Some(32),
+        sort: Some(StoreIndexSortOrder::CapturedDesc),
+        media_filter: Some(StoreIndexMediaFilter::Image),
+        ..StoreIndexRequestOptions::default()
+    };
+
+    synthesize_missing_folder_markers_for_page(&mut response, &options);
+
+    assert_eq!(
+        response
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "archive/",
+            "archive/2025/",
+            "photos/",
+            "photos/2024/",
+            "photos/2026/",
+            "photos/2026/newest.jpg",
+            "archive/2025/middle.jpg",
+            "photos/2024/oldest.jpg",
+        ]
+    );
+    assert_eq!(response.entry_count, 8);
+    assert_eq!(response.total_entry_count, 64);
+}
+
+#[test]
+fn folder_marker_synthesis_leaves_later_pages_unchanged() {
+    let mut response = StoreIndexResponse {
+        prefix: String::new(),
+        depth: 64,
+        entry_count: 2,
+        total_entry_count: 64,
+        offset: 32,
+        limit: Some(32),
+        has_more: false,
+        next_cursor: None,
+        sync_token: None,
+        media_summary: StoreIndexMediaSummary::default(),
+        entries: vec![
+            store_index_test_entry("photos/2024/newer.jpg"),
+            store_index_test_entry("archive/2023/older.jpg"),
+        ],
+    };
+    let options = StoreIndexRequestOptions {
+        offset: Some(32),
+        limit: Some(32),
+        sort: Some(StoreIndexSortOrder::CapturedDesc),
+        media_filter: Some(StoreIndexMediaFilter::Image),
+        ..StoreIndexRequestOptions::default()
+    };
+
+    synthesize_missing_folder_markers_for_page(&mut response, &options);
+
+    assert_eq!(
+        response
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["photos/2024/newer.jpg", "archive/2023/older.jpg"]
+    );
+    assert_eq!(response.entry_count, 2);
+    assert_eq!(response.total_entry_count, 64);
+}
+
+fn store_index_test_entry(path: &str) -> StoreIndexEntry {
+    StoreIndexEntry {
+        path: path.to_string(),
+        entry_type: "key".to_string(),
+        version: None,
+        content_hash: None,
+        size_bytes: None,
+        modified_at_unix: None,
+        content_fingerprint: None,
+        media: None,
+    }
+}
+
+#[test]
 fn place_downloaded_file_creates_missing_target_directory() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
