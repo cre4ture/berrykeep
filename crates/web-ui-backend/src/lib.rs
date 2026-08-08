@@ -2108,7 +2108,7 @@ async fn web_health(State(state): State<WebState>, headers: HeaderMap) -> impl I
 }
 
 async fn web_snapshots(State(state): State<WebState>) -> impl IntoResponse {
-    match fetch_server_json(&state, "/snapshots").await {
+    match current_sdk(&state).await.list_snapshots().await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => logged_error_response(
             &state,
