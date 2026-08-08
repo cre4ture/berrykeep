@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        Path as AxumPath, State,
+        Path as AxumPath, RawQuery, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{Response, header},
@@ -1022,6 +1022,160 @@ async fn spawn_direct_http_route_server(
         name,
     )
     .await
+}
+
+#[derive(Clone)]
+struct SnapshotHttpRouteState {
+    hits: Arc<AtomicUsize>,
+    snapshot_list_hits: Arc<AtomicUsize>,
+    restore_hits: Arc<AtomicUsize>,
+    object_hits: Arc<AtomicUsize>,
+    status: StatusCode,
+    response_body: Vec<u8>,
+    snapshot_list_body: Vec<u8>,
+    last_index_query: Arc<Mutex<Option<String>>>,
+    last_restore_request: Arc<Mutex<Option<serde_json::Value>>>,
+    last_object_query: Arc<Mutex<Option<String>>>,
+}
+
+async fn spawn_snapshot_http_route_server(
+    status: StatusCode,
+    response_body: Vec<u8>,
+    snapshot_list_body: Vec<u8>,
+) -> (String, SnapshotHttpRouteState, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let state = SnapshotHttpRouteState {
+        hits: Arc::new(AtomicUsize::new(0)),
+        snapshot_list_hits: Arc::new(AtomicUsize::new(0)),
+        restore_hits: Arc::new(AtomicUsize::new(0)),
+        object_hits: Arc::new(AtomicUsize::new(0)),
+        status,
+        response_body,
+        snapshot_list_body,
+        last_index_query: Arc::new(Mutex::new(None)),
+        last_restore_request: Arc::new(Mutex::new(None)),
+        last_object_query: Arc::new(Mutex::new(None)),
+    };
+    let router =
+        Router::new()
+            .route(
+                "/api/v1/store/index",
+                get(
+                    |State(state): State<SnapshotHttpRouteState>,
+                     RawQuery(query): RawQuery| async move {
+                        state.hits.fetch_add(1, Ordering::SeqCst);
+                        *state.last_index_query.lock().await = query;
+                        (
+                            state.status,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            state.response_body,
+                        )
+                            .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/snapshots",
+                get(
+                    |State(state): State<SnapshotHttpRouteState>| async move {
+                        state.snapshot_list_hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            state.snapshot_list_body,
+                        )
+                            .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/store/restore",
+                post(
+                    |State(state): State<SnapshotHttpRouteState>,
+                     Json(request): Json<serde_json::Value>| async move {
+                        state.restore_hits.fetch_add(1, Ordering::SeqCst);
+                        *state.last_restore_request.lock().await = Some(request.clone());
+                        Json(SnapshotRestoreResponse {
+                            snapshot_id: request["snapshot"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                            source_path: request["from_path"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                            target_path: request["to_path"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                            recursive: request["recursive"].as_bool().unwrap_or(false),
+                            restored_count: 1,
+                        })
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/store/photo.jpg",
+                get(
+                    |State(state): State<SnapshotHttpRouteState>,
+                     RawQuery(query): RawQuery| async move {
+                        state.object_hits.fetch_add(1, Ordering::SeqCst);
+                        *state.last_object_query.lock().await = query;
+                        (
+                            state.status,
+                            [(header::CONTENT_TYPE, "application/octet-stream")],
+                            b"snapshot-object".to_vec(),
+                        )
+                    },
+                ),
+            )
+            .route("/api/v1/health", get(|| async { StatusCode::OK }))
+            .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("snapshot index test server should run");
+    });
+    (format!("http://{addr}"), state, server)
+}
+
+fn snapshot_index_response_body(path: &str) -> Vec<u8> {
+    serde_json::to_vec(&StoreIndexResponse {
+        prefix: String::new(),
+        depth: 1,
+        entry_count: 1,
+        total_entry_count: 1,
+        offset: 0,
+        limit: None,
+        has_more: false,
+        next_cursor: None,
+        sync_token: None,
+        media_summary: StoreIndexMediaSummary::default(),
+        entries: vec![StoreIndexEntry {
+            path: path.to_string(),
+            entry_type: "key".to_string(),
+            version: Some("v1".to_string()),
+            content_hash: Some("hash-1".to_string()),
+            size_bytes: Some(42),
+            modified_at_unix: None,
+            content_fingerprint: None,
+            media: None,
+        }],
+    })
+    .expect("store index response should serialize")
+}
+
+fn direct_http_test_client_for_node(base_url: String, node_id: NodeId) -> IronMeshClient {
+    IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+        base_url,
+        HttpClient::new(),
+        Some(node_id),
+        None,
+        None,
+    )
 }
 
 #[derive(Clone, Default)]
@@ -4117,6 +4271,251 @@ async fn combined_direct_transports_fail_over_to_second_endpoint() {
 
     server.abort();
     let _ = server.await;
+}
+
+#[test]
+fn client_snapshot_selector_round_trips_and_accepts_legacy_ids() {
+    let owner_node_id = NodeId::new_v4();
+    let qualified = client_snapshot_selector(owner_node_id, "snap:with:colons");
+    let parsed = parse_client_snapshot_selector(&qualified).expect("selector should parse");
+
+    assert_eq!(parsed.owner_node_id, Some(owner_node_id));
+    assert_eq!(parsed.snapshot_id, "snap:with:colons");
+
+    let legacy = parse_client_snapshot_selector("legacy-snapshot").expect("legacy ID should parse");
+    assert_eq!(legacy.owner_node_id, None);
+    assert_eq!(legacy.snapshot_id, "legacy-snapshot");
+
+    assert!(parse_client_snapshot_selector("snapshot-v1:not-a-node:snapshot").is_err());
+    assert!(parse_client_snapshot_selector(&format!("snapshot-v1:{owner_node_id}:")).is_err());
+}
+
+#[tokio::test]
+async fn snapshot_list_qualifies_ids_with_the_serving_node() {
+    let snapshot_list_body = serde_json::to_vec(&serde_json::json!([{
+        "id": "snapshot-local-7",
+        "created_at_unix": 1234,
+        "object_count": 9
+    }]))
+    .expect("snapshot list should serialize");
+    let (base_url, state, server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("unused.jpg"),
+        snapshot_list_body,
+    )
+    .await;
+    let owner_node_id = NodeId::new_v4();
+    let client = direct_http_test_client_for_node(base_url, owner_node_id);
+
+    let snapshots = client
+        .list_snapshots()
+        .await
+        .expect("snapshot list should load");
+
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].snapshot_id, "snapshot-local-7");
+    assert_eq!(snapshots[0].server_node_id, Some(owner_node_id));
+    assert_eq!(
+        snapshots[0].id,
+        client_snapshot_selector(owner_node_id, "snapshot-local-7")
+    );
+    assert_eq!(state.snapshot_list_hits.load(Ordering::SeqCst), 1);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn qualified_snapshot_store_index_targets_owner_and_strips_qualifier() {
+    let (other_url, other_state, other_server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("wrong-node.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let (owner_url, owner_state, owner_server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("snapshot-owner.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let other_node_id = NodeId::new_v4();
+    let owner_node_id = NodeId::new_v4();
+    let client = IronMeshClient::combine(vec![
+        direct_http_test_client_for_node(other_url, other_node_id),
+        direct_http_test_client_for_node(owner_url, owner_node_id),
+    ])
+    .expect("combined direct client should build");
+    let selector = client_snapshot_selector(owner_node_id, "snapshot-local-7");
+
+    let response = client
+        .store_index(None, 1, Some(&selector))
+        .await
+        .expect("qualified snapshot should reach its owner");
+
+    assert_eq!(response.entries[0].path, "snapshot-owner.jpg");
+    assert_eq!(other_state.hits.load(Ordering::SeqCst), 0);
+    assert_eq!(owner_state.hits.load(Ordering::SeqCst), 1);
+    let query = owner_state
+        .last_index_query
+        .lock()
+        .await
+        .clone()
+        .expect("owner should receive a query");
+    assert!(query.contains("snapshot=snapshot-local-7"));
+    assert!(!query.contains("snapshot-v1"));
+
+    other_server.abort();
+    owner_server.abort();
+}
+
+#[tokio::test]
+async fn qualified_snapshot_stream_targets_owner_and_strips_qualifier() {
+    let (other_url, other_state, other_server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("wrong-node.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let (owner_url, owner_state, owner_server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("snapshot-owner.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let owner_node_id = NodeId::new_v4();
+    let client = IronMeshClient::combine(vec![
+        direct_http_test_client_for_node(other_url, NodeId::new_v4()),
+        direct_http_test_client_for_node(owner_url, owner_node_id),
+    ])
+    .expect("combined direct client should build");
+    let selector = client_snapshot_selector(owner_node_id, "snapshot-local-7");
+    let mut payload = Vec::new();
+
+    let response = client
+        .stream_object_request_to_writer(
+            "photo.jpg",
+            Some(&selector),
+            None,
+            None,
+            None,
+            &mut payload,
+        )
+        .await
+        .expect("qualified snapshot stream should reach its owner");
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(payload, b"snapshot-object");
+    assert_eq!(other_state.object_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(owner_state.object_hits.load(Ordering::SeqCst), 1);
+    let query = owner_state
+        .last_object_query
+        .lock()
+        .await
+        .clone()
+        .expect("owner should receive a query");
+    assert!(query.contains("snapshot=snapshot-local-7"));
+    assert!(!query.contains("snapshot-v1"));
+
+    other_server.abort();
+    owner_server.abort();
+}
+
+#[tokio::test]
+async fn qualified_snapshot_restore_targets_owner_and_strips_qualifier() {
+    let (other_url, other_state, other_server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("wrong-node.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let (owner_url, owner_state, owner_server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("snapshot-owner.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let owner_node_id = NodeId::new_v4();
+    let client = IronMeshClient::combine(vec![
+        direct_http_test_client_for_node(other_url, NodeId::new_v4()),
+        direct_http_test_client_for_node(owner_url, owner_node_id),
+    ])
+    .expect("combined direct client should build");
+    let selector = client_snapshot_selector(owner_node_id, "snapshot-local-7");
+
+    let response = client
+        .restore_path_from_snapshot(&selector, "gallery/source.jpg", "restored.jpg", false, true)
+        .await
+        .expect("qualified snapshot restore should reach its owner");
+
+    assert_eq!(response.snapshot_id, "snapshot-local-7");
+    assert_eq!(other_state.restore_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(owner_state.restore_hits.load(Ordering::SeqCst), 1);
+    let request = owner_state
+        .last_restore_request
+        .lock()
+        .await
+        .clone()
+        .expect("owner should receive restore request");
+    assert_eq!(request["snapshot"], "snapshot-local-7");
+
+    other_server.abort();
+    owner_server.abort();
+}
+
+#[tokio::test]
+async fn qualified_snapshot_with_unavailable_owner_does_not_probe_other_nodes() {
+    let (base_url, state, server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("wrong-node.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let client = direct_http_test_client_for_node(base_url, NodeId::new_v4());
+    let unavailable_owner = NodeId::new_v4();
+    let selector = client_snapshot_selector(unavailable_owner, "snapshot-local-7");
+
+    let error = client
+        .store_index(None, 1, Some(&selector))
+        .await
+        .expect_err("a missing owner route should fail before sending a request");
+
+    assert!(format!("{error:#}").contains("no client transport route"));
+    assert_eq!(state.hits.load(Ordering::SeqCst), 0);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn legacy_snapshot_store_index_keeps_normal_route_selection() {
+    let (first_url, first_state, first_server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("legacy-owner.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let (second_url, second_state, second_server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("unexpected-route.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let client = IronMeshClient::combine(vec![
+        direct_http_test_client_for_node(first_url, NodeId::new_v4()),
+        direct_http_test_client_for_node(second_url, NodeId::new_v4()),
+    ])
+    .expect("combined direct client should build");
+
+    let response = client
+        .store_index(None, 1, Some("legacy-snapshot"))
+        .await
+        .expect("legacy snapshot IDs should remain supported");
+
+    assert_eq!(response.entries[0].path, "legacy-owner.jpg");
+    assert_eq!(first_state.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(second_state.hits.load(Ordering::SeqCst), 0);
+
+    first_server.abort();
+    second_server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

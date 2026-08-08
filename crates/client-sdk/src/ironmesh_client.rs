@@ -95,7 +95,7 @@ pub struct IronMeshClient {
     auth: Arc<RwLock<ClientRequestAuth>>,
     connection_name: Option<String>,
     connection_diagnostic_impact: ClientConnectionDiagnosticImpact,
-    upload_session_affinities: Arc<Mutex<HashMap<String, UploadSessionAffinity>>>,
+    upload_session_affinities: Arc<Mutex<HashMap<String, NodeRouteAffinity>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -246,7 +246,7 @@ enum ClientTransport {
 }
 
 #[derive(Debug, Clone)]
-struct UploadSessionAffinity {
+struct NodeRouteAffinity {
     target_node_id: Option<NodeId>,
     preferred_request_base_url: Option<String>,
 }
@@ -464,7 +464,7 @@ struct BufferedTransportResponse {
 #[derive(Debug)]
 struct RoutedBufferedTransportResponse {
     route_index: usize,
-    route_affinity: UploadSessionAffinity,
+    route_affinity: NodeRouteAffinity,
     response: BufferedTransportResponse,
 }
 
@@ -665,7 +665,7 @@ pub fn set_connection_diagnostics_observer(observer: Option<ConnectionDiagnostic
     *slot = observer;
 }
 
-impl UploadSessionAffinity {
+impl NodeRouteAffinity {
     fn from_endpoint(endpoint: &ClientEndpoint) -> Self {
         Self {
             target_node_id: endpoint.transport.target_node_id(),
@@ -1761,6 +1761,83 @@ fn is_retryable_transport_status(status: StatusCode) -> bool {
     )
 }
 
+const CLIENT_SNAPSHOT_SELECTOR_PREFIX: &str = "snapshot-v1:";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClientSnapshotSelector<'a> {
+    owner_node_id: Option<NodeId>,
+    snapshot_id: &'a str,
+}
+
+fn client_snapshot_selector(owner_node_id: NodeId, snapshot_id: &str) -> String {
+    format!("{CLIENT_SNAPSHOT_SELECTOR_PREFIX}{owner_node_id}:{snapshot_id}")
+}
+
+fn parse_client_snapshot_selector(value: &str) -> Result<ClientSnapshotSelector<'_>> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("snapshot selector must not be empty");
+    }
+    let Some(qualified) = value.strip_prefix(CLIENT_SNAPSHOT_SELECTOR_PREFIX) else {
+        return Ok(ClientSnapshotSelector {
+            owner_node_id: None,
+            snapshot_id: value,
+        });
+    };
+    let (node_id, snapshot_id) = qualified.split_once(':').ok_or_else(|| {
+        anyhow!(
+            "qualified snapshot selector must use {CLIENT_SNAPSHOT_SELECTOR_PREFIX}<node-id>:<snapshot-id>"
+        )
+    })?;
+    let owner_node_id = node_id
+        .parse::<NodeId>()
+        .with_context(|| format!("qualified snapshot selector has invalid node ID {node_id}"))?;
+    let snapshot_id = snapshot_id.trim();
+    if snapshot_id.is_empty() {
+        bail!("qualified snapshot selector must include a snapshot ID");
+    }
+    Ok(ClientSnapshotSelector {
+        owner_node_id: Some(owner_node_id),
+        snapshot_id,
+    })
+}
+
+fn normalize_client_snapshot_selector_in_url(url: &mut Url) -> Result<Option<NodeId>> {
+    let mut pairs = url
+        .query_pairs()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let mut owner_node_id = None;
+    let mut snapshot_parameter_count = 0usize;
+    let mut changed = false;
+    for (name, value) in &mut pairs {
+        if name != "snapshot" {
+            continue;
+        }
+        snapshot_parameter_count += 1;
+        let selector = parse_client_snapshot_selector(value)?;
+        let qualified_snapshot = selector
+            .owner_node_id
+            .map(|node_id| (node_id, selector.snapshot_id.to_string()));
+        if let Some((node_id, snapshot_id)) = qualified_snapshot {
+            owner_node_id = Some(node_id);
+            *value = snapshot_id;
+            changed = true;
+        }
+    }
+    if snapshot_parameter_count > 1 {
+        bail!("request URL must not contain more than one snapshot selector");
+    }
+    if changed {
+        url.set_query(None);
+        let mut query = url.query_pairs_mut();
+        for (name, value) in pairs {
+            query.append_pair(&name, &value);
+        }
+    }
+    Ok(owner_node_id)
+}
+
 fn header_value_for_log(headers: &HeaderMap, name: &str) -> String {
     headers
         .get(name)
@@ -1808,9 +1885,9 @@ fn normalize_connection_name(value: &str) -> Option<String> {
     }
 }
 
-fn lock_upload_session_affinities(
-    affinities: &Mutex<HashMap<String, UploadSessionAffinity>>,
-) -> std::sync::MutexGuard<'_, HashMap<String, UploadSessionAffinity>> {
+fn lock_route_affinities(
+    affinities: &Mutex<HashMap<String, NodeRouteAffinity>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, NodeRouteAffinity>> {
     match affinities.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1819,12 +1896,12 @@ fn lock_upload_session_affinities(
 
 fn upload_session_affinity_from_resumable_state(
     state: &ResumableUploadFileState,
-) -> Option<UploadSessionAffinity> {
+) -> Option<NodeRouteAffinity> {
     if state.target_node_id.is_none() && state.preferred_request_base_url.is_none() {
         return None;
     }
 
-    Some(UploadSessionAffinity {
+    Some(NodeRouteAffinity {
         target_node_id: state.target_node_id,
         preferred_request_base_url: state.preferred_request_base_url.clone(),
     })
@@ -3024,6 +3101,28 @@ pub struct SnapshotRestoreResponse {
     pub restored_count: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ServerSnapshotInfo {
+    id: String,
+    created_at_unix: u64,
+    object_count: usize,
+}
+
+/// A snapshot reference returned to client-facing consumers.
+///
+/// `id` is an opaque selector. When the serving route identifies its target
+/// node, the selector includes that node so later snapshot requests can be
+/// routed back to the owner. `snapshot_id` preserves the server-local ID for
+/// diagnostics and display.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientSnapshotInfo {
+    pub id: String,
+    pub snapshot_id: String,
+    pub server_node_id: Option<NodeId>,
+    pub created_at_unix: u64,
+    pub object_count: usize,
+}
+
 impl IronMeshClient {
     pub fn from_direct_base_url(server_base_url: impl Into<String>) -> Self {
         Self::from_direct_http_client(server_base_url, HttpClient::new())
@@ -3554,13 +3653,13 @@ impl IronMeshClient {
 
     fn route_indices_for_upload_session(&self, upload_id: &str) -> Vec<usize> {
         let affinity = {
-            let affinities = lock_upload_session_affinities(&self.upload_session_affinities);
+            let affinities = lock_route_affinities(&self.upload_session_affinities);
             affinities.get(upload_id).cloned()
         };
         self.route_indices_for_affinity(affinity.as_ref())
     }
 
-    fn route_indices_for_affinity(&self, affinity: Option<&UploadSessionAffinity>) -> Vec<usize> {
+    fn route_indices_for_affinity(&self, affinity: Option<&NodeRouteAffinity>) -> Vec<usize> {
         let ranked = self.transport_router.foreground_route_indices();
         let Some(affinity) = affinity else {
             return ranked;
@@ -3583,18 +3682,37 @@ impl IronMeshClient {
         }
     }
 
-    fn upload_session_affinity(&self, upload_id: &str) -> Option<UploadSessionAffinity> {
-        let affinities = lock_upload_session_affinities(&self.upload_session_affinities);
+    fn route_indices_for_target_node(&self, target_node_id: NodeId) -> Result<Vec<usize>> {
+        let matching = self
+            .transport_router
+            .foreground_route_indices()
+            .into_iter()
+            .filter(|index| {
+                self.transport_router
+                    .endpoint(*index)
+                    .is_some_and(|endpoint| {
+                        endpoint.transport.target_node_id() == Some(target_node_id)
+                    })
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            bail!("no client transport route targets snapshot owner node {target_node_id}");
+        }
+        Ok(matching)
+    }
+
+    fn upload_session_affinity(&self, upload_id: &str) -> Option<NodeRouteAffinity> {
+        let affinities = lock_route_affinities(&self.upload_session_affinities);
         affinities.get(upload_id).cloned()
     }
 
-    fn remember_upload_session_affinity(&self, upload_id: &str, affinity: UploadSessionAffinity) {
-        let mut affinities = lock_upload_session_affinities(&self.upload_session_affinities);
+    fn remember_upload_session_affinity(&self, upload_id: &str, affinity: NodeRouteAffinity) {
+        let mut affinities = lock_route_affinities(&self.upload_session_affinities);
         affinities.insert(upload_id.to_string(), affinity);
     }
 
     fn clear_upload_session_affinity(&self, upload_id: &str) {
-        let mut affinities = lock_upload_session_affinities(&self.upload_session_affinities);
+        let mut affinities = lock_route_affinities(&self.upload_session_affinities);
         affinities.remove(upload_id);
     }
 
@@ -3696,7 +3814,7 @@ impl IronMeshClient {
                     self.publish_connection_diagnostics();
                     return Ok(RoutedBufferedTransportResponse {
                         route_index: index,
-                        route_affinity: UploadSessionAffinity::from_endpoint(&endpoint),
+                        route_affinity: NodeRouteAffinity::from_endpoint(&endpoint),
                         response,
                     });
                 }
@@ -3850,7 +3968,7 @@ impl IronMeshClient {
                     self.publish_connection_diagnostics();
                     return Ok(RoutedBufferedTransportResponse {
                         route_index,
-                        route_affinity: UploadSessionAffinity::from_endpoint(&endpoint),
+                        route_affinity: NodeRouteAffinity::from_endpoint(&endpoint),
                         response: candidate_response,
                     });
                 }
@@ -3901,18 +4019,17 @@ impl IronMeshClient {
     async fn execute_buffered_request_with_route(
         &self,
         method: Method,
-        url: Url,
+        mut url: Url,
         headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
     ) -> Result<RoutedBufferedTransportResponse> {
-        self.execute_buffered_request_on_route_indices(
-            method,
-            url,
-            headers,
-            body,
-            &self.transport_router.foreground_route_indices(),
-        )
-        .await
+        let snapshot_owner_node_id = normalize_client_snapshot_selector_in_url(&mut url)?;
+        let route_indices = match snapshot_owner_node_id {
+            Some(node_id) => self.route_indices_for_target_node(node_id)?,
+            None => self.transport_router.foreground_route_indices(),
+        };
+        self.execute_buffered_request_on_route_indices(method, url, headers, body, &route_indices)
+            .await
     }
 
     fn endpoint_context_for_route(&self, route_index: usize) -> String {
@@ -4086,11 +4203,12 @@ impl IronMeshClient {
         overwrite: bool,
     ) -> Result<SnapshotRestoreResponse> {
         let snapshot = snapshot.into();
+        let snapshot_selector = parse_client_snapshot_selector(&snapshot)?;
         let from_path = from_path.into();
         let to_path = to_path.into();
         let url = self.store_restore_url()?;
         let payload = serde_json::to_vec(&SnapshotRestoreRequest {
-            snapshot: snapshot.clone(),
+            snapshot: snapshot_selector.snapshot_id.to_string(),
             from_path: from_path.clone(),
             to_path: to_path.clone(),
             recursive,
@@ -4098,12 +4216,17 @@ impl IronMeshClient {
         })
         .context("failed to encode snapshot restore request")?;
 
+        let route_indices = match snapshot_selector.owner_node_id {
+            Some(node_id) => self.route_indices_for_target_node(node_id)?,
+            None => self.transport_router.foreground_route_indices(),
+        };
         let response = self
-            .execute_buffered_request(
+            .execute_buffered_request_on_route_indices(
                 Method::POST,
                 url,
                 vec![json_content_type_header()],
                 Some(payload),
+                &route_indices,
             )
             .await
             .with_context(|| {
@@ -4113,9 +4236,11 @@ impl IronMeshClient {
                 )
             })?;
 
-        match response.status {
-            StatusCode::OK => serde_json::from_slice::<SnapshotRestoreResponse>(&response.body)
-                .context("failed to parse snapshot restore response"),
+        match response.response.status {
+            StatusCode::OK => {
+                serde_json::from_slice::<SnapshotRestoreResponse>(&response.response.body)
+                    .context("failed to parse snapshot restore response")
+            }
             StatusCode::NOT_FOUND => {
                 bail!("snapshot restore source path not found in snapshot={snapshot}: {from_path}")
             }
@@ -4172,6 +4297,36 @@ impl IronMeshClient {
             StatusCode::NOT_FOUND => Ok(None),
             status => Err(anyhow!("versions lookup failed for {key}: {status}")),
         }
+    }
+
+    pub async fn list_snapshots(&self) -> Result<Vec<ClientSnapshotInfo>> {
+        let url = self.relative_url("/snapshots")?;
+        let routed = self
+            .execute_buffered_request_with_route(Method::GET, url, Vec::new(), None)
+            .await
+            .context("failed to request /snapshots")?;
+        if !routed.response.status.is_success() {
+            bail!(
+                "/snapshots returned non-success status: {}",
+                routed.response.status
+            );
+        }
+
+        let snapshots = serde_json::from_slice::<Vec<ServerSnapshotInfo>>(&routed.response.body)
+            .context("failed to parse /snapshots response")?;
+        let server_node_id = routed.route_affinity.target_node_id;
+        Ok(snapshots
+            .into_iter()
+            .map(|snapshot| ClientSnapshotInfo {
+                id: server_node_id
+                    .map(|node_id| client_snapshot_selector(node_id, &snapshot.id))
+                    .unwrap_or_else(|| snapshot.id.clone()),
+                snapshot_id: snapshot.id,
+                server_node_id,
+                created_at_unix: snapshot.created_at_unix,
+                object_count: snapshot.object_count,
+            })
+            .collect())
     }
 
     pub async fn restore_version_path(
@@ -4493,7 +4648,12 @@ impl IronMeshClient {
 
         self.maybe_spawn_background_quality_refresh();
 
-        let url = self.relative_url(path)?;
+        let mut url = self.relative_url(path)?;
+        let snapshot_owner_node_id = normalize_client_snapshot_selector_in_url(&mut url)?;
+        let route_indices = match snapshot_owner_node_id {
+            Some(node_id) => self.route_indices_for_target_node(node_id)?,
+            None => self.transport_router.foreground_route_indices(),
+        };
         let response_timeout = buffered_request_timeout(&url);
         let headers = headers
             .into_iter()
@@ -4502,7 +4662,7 @@ impl IronMeshClient {
         let auth = self.auth_snapshot();
         let mut last_error = None;
 
-        for index in self.transport_router.foreground_route_indices() {
+        for index in route_indices {
             let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
@@ -5048,6 +5208,11 @@ impl IronMeshClient {
         let mut url = self.store_key_url(key)?;
         append_optional_query(&mut url, "snapshot", snapshot);
         append_optional_query(&mut url, "version", version);
+        let snapshot_owner_node_id = normalize_client_snapshot_selector_in_url(&mut url)?;
+        let route_indices = match snapshot_owner_node_id {
+            Some(node_id) => self.route_indices_for_target_node(node_id)?,
+            None => self.transport_router.foreground_route_indices(),
+        };
 
         let mut headers = Vec::new();
         if let Some((start, end_inclusive)) = range {
@@ -5060,7 +5225,7 @@ impl IronMeshClient {
 
         let mut last_error = None;
         let mut response = None;
-        for index in self.transport_router.foreground_route_indices() {
+        for index in route_indices {
             let Some(endpoint) = self.transport_router.endpoint(index) else {
                 continue;
             };
