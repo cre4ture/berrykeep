@@ -266,6 +266,10 @@ mod tests {
             update.failed_attempts[0].impact,
             ClientConnectionDiagnosticImpact::BackgroundMaintenance
         );
+        assert_eq!(
+            android_connection_log_failure(&update).map(|attempt| attempt.url.as_str()),
+            Some("iroh://candidate/api/v1/cluster/status")
+        );
         let json = serde_json::to_value(update).expect("diagnostics update should serialize");
         assert_eq!(json["impact"], serde_json::json!("background_maintenance"));
         assert_eq!(
@@ -1085,16 +1089,28 @@ fn android_connection_log_state() -> &'static Mutex<HashMap<String, String>> {
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn android_connection_log_failure(
+    update: &AndroidAppConnectionDiagnosticsUpdate,
+) -> Option<&AndroidAppFailedConnectionAttempt> {
+    if update.impact == ClientConnectionDiagnosticImpact::BackgroundMaintenance {
+        update.failed_attempts.iter().find(|attempt| {
+            attempt.impact == ClientConnectionDiagnosticImpact::BackgroundMaintenance
+        })
+    } else {
+        update
+            .failed_attempts
+            .iter()
+            .find(|attempt| attempt.operation_terminal)
+    }
+}
+
 fn log_android_connection_diagnostics(update: &AndroidAppConnectionDiagnosticsUpdate) {
     let source_label = update
         .source_label
         .as_deref()
         .unwrap_or("android client")
         .to_string();
-    let last_failure = update
-        .failed_attempts
-        .iter()
-        .find(|attempt| attempt.operation_terminal);
+    let last_failure = android_connection_log_failure(update);
     let last_failure_unix_ms =
         last_failure.map(|attempt| attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms));
     let latest_event_is_failure = match (
