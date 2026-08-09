@@ -135,9 +135,14 @@ fn shared_route_diagnostics_retain_each_attempts_impact() {
     let request_url = client
         .relative_url("/api/v1/cluster/status")
         .expect("relative URL should build");
+    let endpoint = client
+        .transport_router
+        .endpoint(0)
+        .expect("direct endpoint should exist");
 
     let _ = maintenance_client.record_request_failure(
         0,
+        &endpoint,
         ClientRequestAttemptContext {
             method: &Method::GET,
             url: &request_url,
@@ -149,6 +154,7 @@ fn shared_route_diagnostics_retain_each_attempts_impact() {
     );
     let _ = foreground_client.record_request_failure(
         0,
+        &endpoint,
         ClientRequestAttemptContext {
             method: &Method::GET,
             url: &request_url,
@@ -169,6 +175,39 @@ fn shared_route_diagnostics_retain_each_attempts_impact() {
         attempts[1].impact,
         ClientConnectionDiagnosticImpact::UserFacing
     );
+}
+
+#[test]
+fn request_result_uses_captured_endpoint_after_route_membership_changes() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let request_url = client
+        .relative_url("/api/v1/cluster/status")
+        .expect("relative URL should build");
+    let endpoint = client
+        .transport_router
+        .endpoint(0)
+        .expect("direct endpoint should exist");
+
+    let _ = client.transport_router.reconcile(Vec::new());
+    let completed_operation = client.record_request_failure(
+        0,
+        &endpoint,
+        ClientRequestAttemptContext {
+            method: &Method::GET,
+            url: &request_url,
+            timeout: None,
+            started_unix_ms: 1_000,
+            session_pool_before: TransportSessionPoolSnapshot::default(),
+        },
+        "route was removed during the request",
+    );
+
+    assert_eq!(
+        completed_operation.endpoint_locator,
+        "http://127.0.0.1:18080"
+    );
+    assert_eq!(completed_operation.attempt.outcome, "failure");
+    assert!(client.connection_diagnostics().endpoints.is_empty());
 }
 
 #[test]
