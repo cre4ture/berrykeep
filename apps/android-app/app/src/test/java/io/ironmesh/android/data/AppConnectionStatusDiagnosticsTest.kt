@@ -15,6 +15,7 @@ class AppConnectionStatusDiagnosticsTest {
         val failure = AppFailedConnectionAttempt(
             sourceLabel = "gallery map",
             impact = APP_CONNECTION_DIAGNOSTIC_IMPACT_USER_FACING,
+            operationTerminal = true,
             endpointLocator = "iroh://candidate",
             pathKind = "direct_quic",
             startedUnixMs = 2_900L,

@@ -12,6 +12,8 @@ object RustPreferencesBridge {
     @Volatile
     private var appContext: Context? = null
 
+    private val appConnectionStatusUpdateLock = Any()
+
     private val diagnosticsUpdateAdapter by lazy {
         Moshi.Builder()
             .add(KotlinJsonAdapterFactory())
@@ -60,10 +62,12 @@ object RustPreferencesBridge {
     fun updateAppConnectionDiagnosticsJson(diagnosticsJson: String) {
         val context = appContext ?: error("RustPreferencesBridge is not initialized")
         val update = diagnosticsUpdateAdapter.fromJson(diagnosticsJson) ?: return
-        val current = IronmeshPreferences.getAppConnectionStatus(context)
-        val next = mergeAppConnectionDiagnostics(current, update)
-        IronmeshPreferences.setAppConnectionStatus(context, next)
-        logPersistedAppConnectionStatusTransition(current, next, update)
+        synchronized(appConnectionStatusUpdateLock) {
+            val current = IronmeshPreferences.getAppConnectionStatus(context)
+            val next = mergeAppConnectionDiagnostics(current, update)
+            IronmeshPreferences.setAppConnectionStatus(context, next)
+            logPersistedAppConnectionStatusTransition(current, next, update)
+        }
     }
 
     internal fun mergeAppConnectionDiagnostics(
@@ -166,7 +170,13 @@ object RustPreferencesBridge {
     private fun retainRecentFailuresByImpact(
         failures: List<AppFailedConnectionAttempt>,
     ): List<AppFailedConnectionAttempt> {
-        val distinctFailures = failures.distinctBy { attempt -> failedAttemptKey(attempt) }
+        val distinctFailures = failures
+            .groupBy { attempt -> failedAttemptKey(attempt) }
+            .values
+            .map { matchingAttempts ->
+                matchingAttempts.firstOrNull { attempt -> attempt.operationTerminal }
+                    ?: matchingAttempts.first()
+            }
         return listOf(
             distinctFailures
                 .asSequence()

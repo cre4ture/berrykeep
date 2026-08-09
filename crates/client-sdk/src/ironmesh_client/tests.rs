@@ -38,6 +38,8 @@ use transport_sdk::{
 
 struct ConnectionDiagnosticsObserverReset;
 
+static CONNECTION_DIAGNOSTICS_OBSERVER_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
 impl Drop for ConnectionDiagnosticsObserverReset {
     fn drop(&mut self) {
         set_connection_diagnostics_observer(None);
@@ -134,7 +136,7 @@ fn shared_route_diagnostics_retain_each_attempts_impact() {
         .relative_url("/api/v1/cluster/status")
         .expect("relative URL should build");
 
-    maintenance_client.record_request_failure(
+    let _ = maintenance_client.record_request_failure(
         0,
         ClientRequestAttemptContext {
             method: &Method::GET,
@@ -145,7 +147,7 @@ fn shared_route_diagnostics_retain_each_attempts_impact() {
         },
         "background candidate timed out",
     );
-    foreground_client.record_request_failure(
+    let _ = foreground_client.record_request_failure(
         0,
         ClientRequestAttemptContext {
             method: &Method::GET,
@@ -202,6 +204,7 @@ fn connection_diagnostics_timestamp_does_not_precede_last_route_use() {
 
 #[tokio::test]
 async fn background_probe_refresh_publishes_maintenance_diagnostics() {
+    let _observer_test_guard = CONNECTION_DIAGNOSTICS_OBSERVER_TEST_LOCK.lock().await;
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("temporary listener should bind");
     let endpoint = format!(
@@ -4325,6 +4328,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
 
 #[tokio::test]
 async fn combined_direct_transports_fail_over_to_second_endpoint() {
+    let _observer_test_guard = CONNECTION_DIAGNOSTICS_OBSERVER_TEST_LOCK.lock().await;
     let (direct_state, server) = spawn_direct_transport_test_server(
         200,
         vec![
@@ -4352,8 +4356,23 @@ async fn combined_direct_transports_fail_over_to_second_endpoint() {
     let failing = IronMeshClient::from_direct_base_url("http://127.0.0.1:9")
         .with_client_identity(identity.clone());
     let healthy = direct_transport_test_client(&direct_state, identity);
+    let connection_name = "terminal-failover-diagnostics-test";
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_events = Arc::clone(&events);
+    set_connection_diagnostics_observer(Some(Arc::new(move |event| {
+        if event.connection_name.as_deref() == Some(connection_name)
+            && event.impact == ClientConnectionDiagnosticImpact::UserFacing
+        {
+            captured_events
+                .lock()
+                .expect("captured events lock should not be poisoned")
+                .push(event);
+        }
+    })));
+    let _observer_reset = ConnectionDiagnosticsObserverReset;
     let client = IronMeshClient::combine(vec![failing, healthy])
-        .expect("combined direct client should build");
+        .expect("combined direct client should build")
+        .with_connection_name(connection_name);
 
     let first = client
         .get_json_path("/cluster/status")
@@ -4371,9 +4390,70 @@ async fn combined_direct_transports_fail_over_to_second_endpoint() {
         Some(direct_state.public_url.as_str())
     );
     assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
+    {
+        let events = events
+            .lock()
+            .expect("captured events lock should not be poisoned");
+        assert_eq!(
+            events.len(),
+            2,
+            "each successful routed request should publish only its terminal outcome"
+        );
+        assert!(events.iter().all(|event| {
+            event
+                .completed_operation
+                .as_ref()
+                .is_some_and(|operation| operation.attempt.outcome == "success")
+        }));
+    }
 
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn failed_routed_operation_publishes_one_terminal_failure() {
+    let _observer_test_guard = CONNECTION_DIAGNOSTICS_OBSERVER_TEST_LOCK.lock().await;
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("temporary listener should bind");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("listener should have addr")
+    );
+    drop(listener);
+
+    let connection_name = "terminal-failure-diagnostics-test";
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_events = Arc::clone(&events);
+    set_connection_diagnostics_observer(Some(Arc::new(move |event| {
+        if event.connection_name.as_deref() == Some(connection_name)
+            && event.impact == ClientConnectionDiagnosticImpact::UserFacing
+        {
+            captured_events
+                .lock()
+                .expect("captured events lock should not be poisoned")
+                .push(event);
+        }
+    })));
+    let _observer_reset = ConnectionDiagnosticsObserverReset;
+    let client =
+        IronMeshClient::from_direct_base_url(endpoint).with_connection_name(connection_name);
+
+    client
+        .get_json_path("/cluster/status")
+        .await
+        .expect_err("unreachable route should fail the operation");
+
+    let events = events
+        .lock()
+        .expect("captured events lock should not be poisoned");
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0]
+            .completed_operation
+            .as_ref()
+            .is_some_and(|operation| operation.attempt.outcome == "failure")
+    );
 }
 
 #[test]

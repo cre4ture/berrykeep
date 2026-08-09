@@ -32,6 +32,7 @@ data class AppConnectionStatus(
 data class AppFailedConnectionAttempt(
     val sourceLabel: String? = null,
     val impact: String = APP_CONNECTION_DIAGNOSTIC_IMPACT_USER_FACING,
+    val operationTerminal: Boolean = false,
     val endpointLocator: String = "",
     val pathKind: String = "",
     val startedUnixMs: Long = 0L,
@@ -57,7 +58,7 @@ internal fun String.affectsAppConnectionStatus(): Boolean {
 }
 
 internal fun AppFailedConnectionAttempt.affectsAppConnectionStatus(): Boolean {
-    return impact.affectsAppConnectionStatus()
+    return operationTerminal && impact.affectsAppConnectionStatus()
 }
 
 fun AppConnectionStatus.isRetryPending(): Boolean {

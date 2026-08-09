@@ -36,6 +36,9 @@ internal fun buildAppConnectionStatusTransitionDiagnostic(
     val statusRelevantUpdateFailures = update.failedAttempts.count { attempt ->
         attempt.affectsAppConnectionStatus()
     }
+    val backgroundUpdateFailures = update.failedAttempts.count { attempt ->
+        attempt.impact == APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE
+    }
 
     return buildString {
         append("event=app_connection_status_transition")
@@ -64,7 +67,15 @@ internal fun buildAppConnectionStatusTransitionDiagnostic(
         )
         appendDiagnosticNumber(
             "update_background_failure_count",
-            (update.failedAttempts.size - statusRelevantUpdateFailures).toLong(),
+            backgroundUpdateFailures.toLong(),
+        )
+        appendDiagnosticNumber(
+            "update_non_terminal_user_facing_failure_count",
+            (
+                update.failedAttempts.size -
+                    statusRelevantUpdateFailures -
+                    backgroundUpdateFailures
+                ).toLong(),
         )
         appendDiagnosticNumber(
             "update_last_success_unix_ms",

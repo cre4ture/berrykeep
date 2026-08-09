@@ -68,6 +68,7 @@ mod tests {
         let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
             connection_name: Some("android-foreground".to_string()),
             impact: ClientConnectionDiagnosticImpact::UserFacing,
+            completed_operation: None,
             diagnostics: ClientConnectionDiagnostics {
                 generated_at_unix_ms: 3_000,
                 endpoints: vec![client_sdk::ClientEndpointDiagnostics {
@@ -139,10 +140,103 @@ mod tests {
     }
 
     #[test]
+    fn connection_diagnostics_only_mark_completed_operation_failure_as_terminal() {
+        let intermediate_attempt = client_sdk::ClientConnectionAttempt {
+            started_unix_ms: 900,
+            finished_unix_ms: Some(1_000),
+            method: "GET".to_string(),
+            url: "iroh://first/api/v1/store/index".to_string(),
+            outcome: "failure".to_string(),
+            error: Some("first route timed out".to_string()),
+            ..client_sdk::ClientConnectionAttempt::default()
+        };
+        let terminal_attempt = client_sdk::ClientConnectionAttempt {
+            started_unix_ms: 1_900,
+            finished_unix_ms: Some(2_000),
+            method: "GET".to_string(),
+            url: "iroh://second/api/v1/store/index".to_string(),
+            outcome: "failure".to_string(),
+            error: Some("fallback route timed out".to_string()),
+            ..client_sdk::ClientConnectionAttempt::default()
+        };
+        let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
+            connection_name: Some("android-foreground".to_string()),
+            impact: ClientConnectionDiagnosticImpact::UserFacing,
+            completed_operation: Some(client_sdk::ClientConnectionOperationResult {
+                endpoint_locator: "iroh://second".to_string(),
+                path_kind: "direct".to_string(),
+                attempt: terminal_attempt.clone(),
+            }),
+            diagnostics: ClientConnectionDiagnostics {
+                endpoints: vec![
+                    client_sdk::ClientEndpointDiagnostics {
+                        locator: "iroh://first".to_string(),
+                        path_kind: "direct".to_string(),
+                        recent_attempts: vec![intermediate_attempt],
+                        ..client_sdk::ClientEndpointDiagnostics::default()
+                    },
+                    client_sdk::ClientEndpointDiagnostics {
+                        locator: "iroh://second".to_string(),
+                        path_kind: "direct".to_string(),
+                        recent_attempts: vec![terminal_attempt],
+                        ..client_sdk::ClientEndpointDiagnostics::default()
+                    },
+                ],
+                ..ClientConnectionDiagnostics::default()
+            },
+        });
+
+        assert_eq!(update.failed_attempts.len(), 2);
+        assert_eq!(
+            update
+                .failed_attempts
+                .iter()
+                .filter(|attempt| attempt.operation_terminal)
+                .count(),
+            1
+        );
+        assert_eq!(
+            update
+                .failed_attempts
+                .iter()
+                .find(|attempt| attempt.operation_terminal)
+                .map(|attempt| attempt.endpoint_locator.as_str()),
+            Some("iroh://second")
+        );
+        let json = serde_json::to_value(update).expect("diagnostics update should serialize");
+        assert_eq!(
+            json["failedAttempts"][0]["operationTerminal"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn connection_diagnostics_retention_never_evicts_terminal_failure() {
+        let terminal_failure = AndroidAppFailedConnectionAttempt {
+            operation_terminal: true,
+            finished_unix_ms: Some(10),
+            ..AndroidAppFailedConnectionAttempt::default()
+        };
+        let mut failures = (100..110)
+            .map(|finished_unix_ms| AndroidAppFailedConnectionAttempt {
+                finished_unix_ms: Some(finished_unix_ms),
+                ..AndroidAppFailedConnectionAttempt::default()
+            })
+            .collect::<Vec<_>>();
+        failures.push(terminal_failure);
+
+        let retained = retain_android_failed_attempts_by_impact(failures);
+
+        assert_eq!(retained.len(), MAX_ANDROID_USER_FACING_FAILED_ATTEMPTS);
+        assert!(retained.iter().any(|attempt| attempt.operation_terminal));
+    }
+
+    #[test]
     fn connection_diagnostics_preserve_background_maintenance_impact() {
         let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
             connection_name: None,
             impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+            completed_operation: None,
             diagnostics: ClientConnectionDiagnostics {
                 endpoints: vec![client_sdk::ClientEndpointDiagnostics {
                     locator: "iroh://candidate".to_string(),
@@ -185,6 +279,7 @@ mod tests {
         let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
             connection_name: None,
             impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+            completed_operation: None,
             diagnostics: ClientConnectionDiagnostics {
                 endpoints: vec![client_sdk::ClientEndpointDiagnostics {
                     locator: "iroh://candidate".to_string(),
@@ -260,6 +355,7 @@ mod tests {
         let update = summarize_android_connection_diagnostics(ClientConnectionDiagnosticsEvent {
             connection_name: None,
             impact: ClientConnectionDiagnosticImpact::BackgroundMaintenance,
+            completed_operation: None,
             diagnostics: ClientConnectionDiagnostics {
                 endpoints: vec![client_sdk::ClientEndpointDiagnostics {
                     locator: "iroh://candidate".to_string(),
@@ -614,6 +710,7 @@ struct AndroidAppConnectionDiagnosticsUpdate {
 struct AndroidAppFailedConnectionAttempt {
     source_label: Option<String>,
     impact: ClientConnectionDiagnosticImpact,
+    operation_terminal: bool,
     endpoint_locator: String,
     path_kind: String,
     started_unix_ms: u64,
@@ -764,6 +861,7 @@ fn summarize_android_connection_diagnostics(
     let ClientConnectionDiagnosticsEvent {
         connection_name,
         impact,
+        completed_operation,
         diagnostics,
     } = event;
     let source_label = connection_name
@@ -825,19 +923,75 @@ fn summarize_android_connection_diagnostics(
                 .recent_attempts
                 .into_iter()
                 .filter(|attempt| attempt.outcome == "failure")
-                .map(|attempt| AndroidAppFailedConnectionAttempt {
-                    source_label: source_label.clone(),
-                    impact: attempt.impact,
-                    endpoint_locator: endpoint.locator.clone(),
-                    path_kind: endpoint.path_kind.clone(),
-                    started_unix_ms: attempt.started_unix_ms,
-                    finished_unix_ms: attempt.finished_unix_ms,
-                    method: attempt.method,
-                    url: attempt.url,
-                    timeout_ms: attempt.timeout_ms,
-                    error: attempt.error.map(|error| summarize_android_error(&error)),
+                .map(|attempt| {
+                    let operation_terminal =
+                        completed_operation.as_ref().is_some_and(|completed| {
+                            completed.endpoint_locator == endpoint.locator
+                                && completed.path_kind == endpoint.path_kind
+                                && completed.attempt == attempt
+                        });
+                    AndroidAppFailedConnectionAttempt {
+                        source_label: source_label.clone(),
+                        impact: attempt.impact,
+                        operation_terminal,
+                        endpoint_locator: endpoint.locator.clone(),
+                        path_kind: endpoint.path_kind.clone(),
+                        started_unix_ms: attempt.started_unix_ms,
+                        finished_unix_ms: attempt.finished_unix_ms,
+                        method: attempt.method,
+                        url: attempt.url,
+                        timeout_ms: attempt.timeout_ms,
+                        error: attempt.error.map(|error| summarize_android_error(&error)),
+                    }
                 }),
         );
+    }
+
+    if let Some(completed) = completed_operation
+        && completed
+            .attempt
+            .impact
+            .affects_user_facing_connection_status()
+    {
+        let finished_unix_ms = completed
+            .attempt
+            .finished_unix_ms
+            .unwrap_or(completed.attempt.started_unix_ms);
+        if completed.attempt.outcome == "success" {
+            if last_successful_connection_unix_ms.is_none_or(|current| finished_unix_ms >= current)
+            {
+                last_successful_connection_unix_ms = Some(finished_unix_ms);
+                last_successful_connection_url = Some(completed.attempt.url.clone());
+            }
+            if !is_android_connectivity_probe_url(&completed.attempt.url)
+                && last_successful_functional_request_unix_ms
+                    .is_none_or(|current| finished_unix_ms >= current)
+            {
+                last_successful_functional_request_unix_ms = Some(finished_unix_ms);
+                last_successful_functional_request_url = Some(completed.attempt.url.clone());
+            }
+        } else if completed.attempt.outcome == "failure"
+            && !failed_attempts
+                .iter()
+                .any(|attempt| attempt.operation_terminal)
+        {
+            failed_attempts.push(AndroidAppFailedConnectionAttempt {
+                source_label: source_label.clone(),
+                impact: completed.attempt.impact,
+                operation_terminal: true,
+                endpoint_locator: completed.endpoint_locator,
+                path_kind: completed.path_kind,
+                started_unix_ms: completed.attempt.started_unix_ms,
+                finished_unix_ms: completed.attempt.finished_unix_ms,
+                method: completed.attempt.method,
+                url: completed.attempt.url,
+                timeout_ms: completed.attempt.timeout_ms,
+                error: completed
+                    .attempt
+                    .error
+                    .map(|error| summarize_android_error(&error)),
+            });
+        }
     }
 
     failed_attempts = retain_android_failed_attempts_by_impact(failed_attempts);
@@ -856,28 +1010,38 @@ fn summarize_android_connection_diagnostics(
 fn retain_android_failed_attempts_by_impact(
     failed_attempts: Vec<AndroidAppFailedConnectionAttempt>,
 ) -> Vec<AndroidAppFailedConnectionAttempt> {
-    let mut user_facing = Vec::new();
+    let mut terminal_user_facing = Vec::new();
+    let mut non_terminal_user_facing = Vec::new();
     let mut background_maintenance = Vec::new();
 
     for attempt in failed_attempts {
         if attempt.impact.affects_user_facing_connection_status() {
-            user_facing.push(attempt);
+            if attempt.operation_terminal {
+                terminal_user_facing.push(attempt);
+            } else {
+                non_terminal_user_facing.push(attempt);
+            }
         } else {
             background_maintenance.push(attempt);
         }
     }
 
     retain_recent_android_failed_attempts(
-        &mut user_facing,
+        &mut terminal_user_facing,
         MAX_ANDROID_USER_FACING_FAILED_ATTEMPTS,
+    );
+    retain_recent_android_failed_attempts(
+        &mut non_terminal_user_facing,
+        MAX_ANDROID_USER_FACING_FAILED_ATTEMPTS.saturating_sub(terminal_user_facing.len()),
     );
     retain_recent_android_failed_attempts(
         &mut background_maintenance,
         MAX_ANDROID_BACKGROUND_FAILED_ATTEMPTS,
     );
-    user_facing.extend(background_maintenance);
-    sort_android_failed_attempts(&mut user_facing);
-    user_facing
+    terminal_user_facing.extend(non_terminal_user_facing);
+    terminal_user_facing.extend(background_maintenance);
+    sort_android_failed_attempts(&mut terminal_user_facing);
+    terminal_user_facing
 }
 
 fn retain_recent_android_failed_attempts(
@@ -927,7 +1091,10 @@ fn log_android_connection_diagnostics(update: &AndroidAppConnectionDiagnosticsUp
         .as_deref()
         .unwrap_or("android client")
         .to_string();
-    let last_failure = update.failed_attempts.first();
+    let last_failure = update
+        .failed_attempts
+        .iter()
+        .find(|attempt| attempt.operation_terminal);
     let last_failure_unix_ms =
         last_failure.map(|attempt| attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms));
     let latest_event_is_failure = match (
