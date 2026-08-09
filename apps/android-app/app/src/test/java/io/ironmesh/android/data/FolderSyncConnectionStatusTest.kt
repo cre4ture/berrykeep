@@ -32,6 +32,31 @@ class AppConnectionStatusTest {
     }
 
     @Test
+    fun legacyPersistedFailureDefaultsToNonTerminalRouteAttempt() {
+        val adapter = Moshi.Builder()
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(AppConnectionStatus::class.java)
+
+        val status = adapter.fromJson(
+            """
+            {
+              "state": "error",
+              "failedAttempts": [
+                {
+                  "finishedUnixMs": 1234,
+                  "method": "GET",
+                  "url": "iroh://candidate/api/v1/store/index"
+                }
+              ]
+            }
+            """.trimIndent(),
+        )
+
+        assertFalse(status?.failedAttempts?.single()?.operationTerminal ?: true)
+    }
+
+    @Test
     fun retryPendingReflectsScheduledRetryState() {
         val pending = AppConnectionStatus(
             state = APP_CONNECTION_STATE_RETRY_SCHEDULED,

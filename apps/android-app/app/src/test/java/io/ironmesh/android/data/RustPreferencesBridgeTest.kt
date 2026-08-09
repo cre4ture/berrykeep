@@ -11,6 +11,7 @@ class RustPreferencesBridgeTest {
         val probeUrl =
             "https://example.test/api/v1/diagnostics/latency?response_bytes=0"
         val failure = AppFailedConnectionAttempt(
+            operationTerminal = true,
             startedUnixMs = 900L,
             finishedUnixMs = 1_000L,
             method = "GET",
@@ -96,6 +97,7 @@ class RustPreferencesBridgeTest {
                 impact = APP_CONNECTION_DIAGNOSTIC_IMPACT_USER_FACING,
                 failedAttempts = listOf(
                     AppFailedConnectionAttempt(
+                        operationTerminal = true,
                         startedUnixMs = 3_900L,
                         finishedUnixMs = 4_000L,
                         method = "GET",
@@ -139,6 +141,7 @@ class RustPreferencesBridgeTest {
             update = AppConnectionDiagnosticsUpdate(
                 failedAttempts = listOf(
                     AppFailedConnectionAttempt(
+                        operationTerminal = true,
                         startedUnixMs = 900L,
                         finishedUnixMs = 1_000L,
                         method = "GET",
@@ -180,5 +183,100 @@ class RustPreferencesBridgeTest {
                 attempt.impact == APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE
             },
         )
+    }
+
+    @Test
+    fun routeFailureBeforeFallbackIsRetainedWithoutChangingConnectionState() {
+        val current = AppConnectionStatus(
+            state = APP_CONNECTION_STATE_CONNECTED,
+            message = "Last app request succeeded",
+            updatedUnixMs = 2_000L,
+            lastSuccessfulConnectionUnixMs = 2_000L,
+        )
+        val intermediateRouteFailure = AppFailedConnectionAttempt(
+            startedUnixMs = 2_900L,
+            finishedUnixMs = 3_000L,
+            method = "GET",
+            url = "iroh://failed-route/api/v1/store/index",
+            error = "route timed out",
+        )
+
+        val updated = RustPreferencesBridge.mergeAppConnectionDiagnostics(
+            current = current,
+            update = AppConnectionDiagnosticsUpdate(
+                failedAttempts = listOf(intermediateRouteFailure),
+            ),
+        )
+
+        assertEquals(APP_CONNECTION_STATE_CONNECTED, updated.state)
+        assertEquals(2_000L, updated.updatedUnixMs)
+        assertEquals(current.message, updated.message)
+        assertEquals(listOf(intermediateRouteFailure), updated.failedAttempts)
+    }
+
+    @Test
+    fun intermediateRouteFailuresAndBackgroundFailuresUseIndependentRetentionBudgets() {
+        val intermediateRouteFailures = (1L..20L).map { index ->
+            AppFailedConnectionAttempt(
+                startedUnixMs = 1_000L + index,
+                method = "GET",
+                url = "iroh://user-facing-$index/api/v1/store/index",
+                error = "route timed out",
+            )
+        }
+        val backgroundFailures = (1L..20L).map { index ->
+            AppFailedConnectionAttempt(
+                impact = APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE,
+                startedUnixMs = 2_000L + index,
+                method = "GET",
+                url = "iroh://background-$index/api/v1/cluster/status",
+                error = "probe timed out",
+            )
+        }
+
+        val updated = RustPreferencesBridge.mergeAppConnectionDiagnostics(
+            current = AppConnectionStatus(),
+            update = AppConnectionDiagnosticsUpdate(
+                failedAttempts = intermediateRouteFailures + backgroundFailures,
+            ),
+        )
+
+        assertEquals(24, updated.failedAttempts.size)
+        assertEquals(
+            12,
+            updated.failedAttempts.count { attempt ->
+                attempt.impact == APP_CONNECTION_DIAGNOSTIC_IMPACT_USER_FACING
+            },
+        )
+        assertEquals(
+            12,
+            updated.failedAttempts.count { attempt ->
+                attempt.impact == APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE
+            },
+        )
+    }
+
+    @Test
+    fun terminalFailureReplacesEarlierNonTerminalCopyOfTheSameAttempt() {
+        val intermediate = AppFailedConnectionAttempt(
+            startedUnixMs = 2_900L,
+            finishedUnixMs = 3_000L,
+            method = "GET",
+            url = "iroh://failed-route/api/v1/store/index",
+            error = "route timed out",
+        )
+        val current = AppConnectionStatus(failedAttempts = listOf(intermediate))
+
+        val updated = RustPreferencesBridge.mergeAppConnectionDiagnostics(
+            current = current,
+            update = AppConnectionDiagnosticsUpdate(
+                failedAttempts = listOf(intermediate.copy(operationTerminal = true)),
+            ),
+        )
+
+        assertEquals(APP_CONNECTION_STATE_ERROR, updated.state)
+        assertEquals(3_000L, updated.updatedUnixMs)
+        assertEquals(1, updated.failedAttempts.size)
+        assertEquals(true, updated.failedAttempts.single().operationTerminal)
     }
 }
