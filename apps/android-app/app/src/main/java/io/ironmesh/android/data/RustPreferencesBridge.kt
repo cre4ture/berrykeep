@@ -177,19 +177,34 @@ object RustPreferencesBridge {
                 matchingAttempts.firstOrNull { attempt -> attempt.operationTerminal }
                     ?: matchingAttempts.first()
             }
+        val terminalUserFacingFailures = distinctFailures
+            .asSequence()
+            .filter { attempt -> attempt.affectsAppConnectionStatus() }
+            .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
+            .take(MAX_USER_FACING_FAILED_CONNECTION_ATTEMPTS)
+            .toList()
+        val nonTerminalUserFacingFailures = distinctFailures
+            .asSequence()
+            .filter { attempt ->
+                !attempt.operationTerminal && attempt.impact.affectsAppConnectionStatus()
+            }
+            .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
+            .take(
+                MAX_USER_FACING_FAILED_CONNECTION_ATTEMPTS -
+                    terminalUserFacingFailures.size,
+            )
+            .toList()
+        val backgroundFailures = distinctFailures
+            .asSequence()
+            .filterNot { attempt -> attempt.impact.affectsAppConnectionStatus() }
+            .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
+            .take(MAX_BACKGROUND_FAILED_CONNECTION_ATTEMPTS)
+            .toList()
+
         return listOf(
-            distinctFailures
-                .asSequence()
-                .filter { attempt -> attempt.affectsAppConnectionStatus() }
-                .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
-                .take(MAX_USER_FACING_FAILED_CONNECTION_ATTEMPTS)
-                .toList(),
-            distinctFailures
-                .asSequence()
-                .filterNot { attempt -> attempt.affectsAppConnectionStatus() }
-                .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
-                .take(MAX_BACKGROUND_FAILED_CONNECTION_ATTEMPTS)
-                .toList(),
+            terminalUserFacingFailures,
+            nonTerminalUserFacingFailures,
+            backgroundFailures,
         ).flatten()
             .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
     }

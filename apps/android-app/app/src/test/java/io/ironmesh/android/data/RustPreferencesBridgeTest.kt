@@ -215,6 +215,48 @@ class RustPreferencesBridgeTest {
     }
 
     @Test
+    fun intermediateRouteFailuresAndBackgroundFailuresUseIndependentRetentionBudgets() {
+        val intermediateRouteFailures = (1L..20L).map { index ->
+            AppFailedConnectionAttempt(
+                startedUnixMs = 1_000L + index,
+                method = "GET",
+                url = "iroh://user-facing-$index/api/v1/store/index",
+                error = "route timed out",
+            )
+        }
+        val backgroundFailures = (1L..20L).map { index ->
+            AppFailedConnectionAttempt(
+                impact = APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE,
+                startedUnixMs = 2_000L + index,
+                method = "GET",
+                url = "iroh://background-$index/api/v1/cluster/status",
+                error = "probe timed out",
+            )
+        }
+
+        val updated = RustPreferencesBridge.mergeAppConnectionDiagnostics(
+            current = AppConnectionStatus(),
+            update = AppConnectionDiagnosticsUpdate(
+                failedAttempts = intermediateRouteFailures + backgroundFailures,
+            ),
+        )
+
+        assertEquals(24, updated.failedAttempts.size)
+        assertEquals(
+            12,
+            updated.failedAttempts.count { attempt ->
+                attempt.impact == APP_CONNECTION_DIAGNOSTIC_IMPACT_USER_FACING
+            },
+        )
+        assertEquals(
+            12,
+            updated.failedAttempts.count { attempt ->
+                attempt.impact == APP_CONNECTION_DIAGNOSTIC_IMPACT_BACKGROUND_MAINTENANCE
+            },
+        )
+    }
+
+    @Test
     fun terminalFailureReplacesEarlierNonTerminalCopyOfTheSameAttempt() {
         val intermediate = AppFailedConnectionAttempt(
             startedUnixMs = 2_900L,
