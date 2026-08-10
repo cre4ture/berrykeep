@@ -17,7 +17,7 @@ import io.ironmesh.android.api.StoreIndexResponse
 import io.ironmesh.android.api.StoreIndexSortOrder
 import io.ironmesh.android.data.ConnectionRouteSnapshot
 import io.ironmesh.android.data.AndroidDiagnosticLog as Log
-import io.ironmesh.android.data.buildAndroidDiagnosticLogExport
+import io.ironmesh.android.data.writeAndroidDiagnosticLogExport
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.EnrollmentAccessVerification
 import io.ironmesh.android.data.EmbeddedWebUiSession
@@ -422,21 +422,23 @@ class MainViewModel(
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
+                    // RustClientBridge currently exposes this count-bounded native log only as one
+                    // JNI String. Keep it as the sole large intermediate until that API can stream.
                     val rustLog = runCatching { repository.getDiagnosticLog() }
                         .getOrElse { error ->
                             "Rust diagnostic log unavailable: ${error.message}\n"
                         }
-                    val logText = buildAndroidDiagnosticLogExport(
-                        generatedAtUnixMs = System.currentTimeMillis(),
-                        metadata = diagnosticMetadata(snapshot),
-                        applicationLog = Log.renderText(),
-                        rustLog = rustLog,
-                    )
                     val resolver = getApplication<Application>().contentResolver
                     val output = resolver.openOutputStream(destination, "wt")
                         ?: error("The selected destination could not be opened")
                     output.bufferedWriter(Charsets.UTF_8).use { writer ->
-                        writer.write(logText)
+                        writeAndroidDiagnosticLogExport(
+                            writer = writer,
+                            generatedAtUnixMs = System.currentTimeMillis(),
+                            metadata = diagnosticMetadata(snapshot),
+                            applicationLogWriter = Log::writeTo,
+                            rustLog = rustLog,
+                        )
                     }
                 }
             }.onSuccess {
