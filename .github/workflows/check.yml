@@ -369,6 +369,11 @@ jobs:
         working-directory: ${{ matrix.target.directory }}
         run: ./gradlew --no-daemon :app:testDebugUnitTest
 
+      - name: Compile Android app macrobenchmark
+        if: ${{ matrix.target.variant == 'debug' && matrix.target.module == 'android-app' }}
+        working-directory: ${{ matrix.target.directory }}
+        run: ./gradlew --no-daemon :macrobenchmark:assembleBenchmark :app:compileBenchmarkKotlin
+
       - name: Build Android server-node debug APK (package validation)
         if: ${{ matrix.target.variant == 'debug' && matrix.target.module == 'android-server-node-app' }}
         working-directory: ${{ matrix.target.directory }}

@@ -19,9 +19,13 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.R
 import io.ironmesh.android.ui.EnrollmentDiagnosticStep
@@ -32,6 +36,7 @@ import io.ironmesh.android.ui.components.PermissionExplainerCard
 import io.ironmesh.android.ui.components.SectionCard
 import io.ironmesh.android.ui.components.TimelineDot
 
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun OnboardingScreen(
     state: MainUiState,
@@ -43,6 +48,8 @@ fun OnboardingScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .semantics { testTagsAsResourceId = true }
+            .testTag(ONBOARDING_SCROLL_TEST_TAG)
             .statusBarsPadding()
             .verticalScroll(rememberScrollState())
             .padding(20.dp),
@@ -122,6 +129,8 @@ fun OnboardingScreen(
         )
     }
 }
+
+internal const val ONBOARDING_SCROLL_TEST_TAG = "onboarding_scroll"
 
 @Composable
 private fun EnrollmentDiagnosticsCard(

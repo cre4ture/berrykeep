@@ -289,6 +289,12 @@ android {
                 "proguard-rules.pro"
             )
         }
+        create("benchmark") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+            isDebuggable = false
+        }
     }
 
     compileOptions {
@@ -320,6 +326,9 @@ android {
             jniLibs.srcDir(layout.buildDirectory.dir("generated/rustJniLibs/debug"))
         }
         getByName("release") {
+            jniLibs.srcDir(layout.buildDirectory.dir("generated/rustJniLibs/release"))
+        }
+        getByName("benchmark") {
             jniLibs.srcDir(layout.buildDirectory.dir("generated/rustJniLibs/release"))
         }
     }
@@ -375,6 +384,11 @@ tasks.matching { it.name == "mergeReleaseJniLibFolders" }
         dependsOn(buildRustRelease)
     }
 
+tasks.matching { it.name == "mergeBenchmarkJniLibFolders" }
+    .configureEach {
+        dependsOn(buildRustRelease)
+    }
+
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.06.00"))
     implementation("androidx.core:core-ktx:1.13.1")
@@ -401,5 +415,6 @@ dependencies {
     androidTestImplementation("androidx.test:runner:1.6.1")
     testImplementation("junit:junit:4.13.2")
 
+    "benchmarkImplementation"("androidx.profileinstaller:profileinstaller:1.3.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

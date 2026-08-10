@@ -35,6 +35,25 @@ Prerequisites for native bridge builds:
 - `cargo-ndk` installed (`cargo install cargo-ndk`)
 - Android NDK available in the Android SDK setup
 
+## UI frame stability benchmark
+
+The `macrobenchmark` module measures `FrameTimingMetric` while repeatedly
+scrolling the onboarding screen for eight one-second polling windows. This
+keeps frames flowing while the foreground status monitors run, so a periodic
+main-thread stall is visible in `frameDurationCpuMs` and `frameOverrunMs`.
+
+Run it on an API 31+ physical device with stable thermal and power conditions:
+
+```bash
+./gradlew :macrobenchmark:connectedBenchmarkAndroidTest
+```
+
+Gradle writes the benchmark JSON and Perfetto traces below
+`macrobenchmark/build/outputs/connected_android_test_additional_output/`.
+The regular CI job compiles the benchmark source, but intentionally does not
+publish emulator timing as a performance signal; emulator measurements share
+host resources and are not representative of phone UI performance.
+
 ## Internal release signing
 
 `assembleRelease` uses a dedicated internal release key when these environment variables are set:
