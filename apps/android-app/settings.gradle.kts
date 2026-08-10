@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "ironmesh-android"
 include(":app")
+include(":macrobenchmark")
