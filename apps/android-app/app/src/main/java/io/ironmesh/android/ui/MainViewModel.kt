@@ -16,28 +16,26 @@ import io.ironmesh.android.BuildConfig
 import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.api.StoreIndexResponse
 import io.ironmesh.android.api.StoreIndexSortOrder
+import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.ConnectionRouteSnapshot
 import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.writeAndroidDiagnosticLogExport
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.EnrollmentAccessVerification
-import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.data.EmbeddedWebUiSessionRegistry
 import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncConfig
-import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
-import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.GlobalFolderSyncStatus
 import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.mergeGlobalFolderSyncStatus
 import io.ironmesh.android.ui.screens.ThumbnailBitmapCache
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
+import io.ironmesh.android.data.RustPreferencesBridge
 import io.ironmesh.android.data.TitleLatencyMonitorSettings
 import io.ironmesh.android.data.TitleLatencyProbeStatus
 import io.ironmesh.android.data.parseAllowedWifiSsidsInput
-import io.ironmesh.android.ui.theme.DEFAULT_IRONMESH_ACCENT_COLOR_HEX
 import io.ironmesh.android.ui.theme.normalizeIronmeshAccentColorHex
 import io.ironmesh.android.work.FolderSyncScheduler
 import io.ironmesh.android.work.FolderSyncNetworkGate
@@ -45,39 +43,14 @@ import io.ironmesh.android.work.FolderSyncExecutionCoordinator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.UUID
-
-enum class GallerySortOption {
-    CREATION_TIME,
-    NAME,
-}
-
-enum class GalleryViewMode {
-    FLATTENED_ALL_IMAGES,
-    CURRENT_DIRECTORY,
-}
-
-enum class MainSection {
-    HOME,
-    CONNECTIVITY,
-    REQUEST_TIMINGS,
-    SYNC,
-    LIBRARY,
-    GALLERY_MAP,
-    SETTINGS,
-}
-
-enum class FolderSyncActivityFilter {
-    ALL,
-    UPLOADS,
-    DOWNLOADS,
-    DELETES,
-}
 
 private const val GALLERY_ROOT_DOCUMENT_ID = "dir:"
 private const val GALLERY_ROOT_PATH = "/"
@@ -92,116 +65,6 @@ private const val TITLE_LATENCY_STATUS_POLL_MS = 1_000L
 private const val ENROLLMENT_VERIFICATION_POLL_MS = 5_000L
 private const val ENROLLMENT_LOG_TAG = "EnrollmentDiagnostics"
 
-data class FolderSyncHistoryState(
-    val expanded: Boolean = false,
-    val records: List<FolderSyncModificationRecord> = emptyList(),
-    val nextBeforeId: Long? = null,
-    val filter: FolderSyncActivityFilter = FolderSyncActivityFilter.ALL,
-    val loading: Boolean = false,
-    val error: String? = null,
-    val lastLoadedElapsedRealtimeMs: Long = 0L,
-)
-
-data class GalleryImageItem(
-    val documentUri: Uri,
-    val displayName: String,
-    val remotePath: String,
-    val mimeType: String,
-    val createdAtUnixMs: Long? = null,
-    val width: Int? = null,
-    val height: Int? = null,
-    val thumbnailStatus: String? = null,
-)
-
-data class GalleryDirectoryItem(
-    val documentId: String,
-    val displayName: String,
-    val pathLabel: String,
-)
-
-data class GalleryBreadcrumbItem(
-    val documentId: String,
-    val label: String,
-    val pathLabel: String,
-)
-
-data class GalleryCollectionState(
-    val totalItemCount: Int,
-    val pageSize: Int,
-    val pageCount: Int,
-)
-
-enum class GalleryPageStatus {
-    LOADING,
-    READY,
-    ERROR,
-}
-
-data class GalleryPageState(
-    val status: GalleryPageStatus,
-    val items: List<GalleryImageItem> = emptyList(),
-    val error: String? = null,
-)
-
-enum class GalleryLoadErrorKind {
-    TIMEOUT,
-    REQUEST_FAILED,
-}
-
-data class GalleryLoadError(
-    val kind: GalleryLoadErrorKind,
-    val technicalDetail: String? = null,
-)
-
-data class MainUiState(
-    val persistedStateLoaded: Boolean = false,
-    val deviceAuthState: DeviceAuthState = DeviceAuthState(),
-    val bootstrapInput: String = "",
-    val deviceLabelInput: String = "",
-    val enrollmentDiagnostics: List<EnrollmentDiagnosticStep> = emptyList(),
-    val key: String = "demo-key",
-    val payload: String = "hello from android",
-    val status: String = "Ready",
-    val objectBody: String = "",
-    val syncProfiles: List<FolderSyncConfig> = emptyList(),
-    val folderSyncStatus: FolderSyncServiceStatus = FolderSyncServiceStatus(),
-    val globalFolderSyncStatus: GlobalFolderSyncStatus = GlobalFolderSyncStatus(),
-    val appConnectionStatus: AppConnectionStatus = AppConnectionStatus(),
-    val titleLatencyMonitorSettings: TitleLatencyMonitorSettings = TitleLatencyMonitorSettings(),
-    val titleLatencyStatus: TitleLatencyProbeStatus = TitleLatencyProbeStatus(),
-    val folderSyncHistory: Map<String, FolderSyncHistoryState> = emptyMap(),
-    val newSyncLabel: String = "",
-    val newSyncPrefix: String = "",
-    val newSyncLocalFolder: String = "",
-    val newSyncLocalFolderTreeUri: String? = null,
-    val newSyncAllowWifi: Boolean = true,
-    val newSyncAllowCellular: Boolean = true,
-    val newSyncAllowOtherConnections: Boolean = true,
-    val newSyncAllowRoaming: Boolean = false,
-    val newSyncAllowedWifiSsids: String = "",
-    val selectedSection: MainSection = MainSection.HOME,
-    val connectionRoutes: ConnectionRouteSnapshot? = null,
-    val connectionRoutesLoading: Boolean = false,
-    val connectionRoutesError: String? = null,
-    val connectionRoutesLastLoadedUnixMs: Long = 0L,
-    val timingMeasurementResetting: Boolean = false,
-    val timingStoreIndexTestRunning: Boolean = false,
-    val timingMeasurementStartedUnixMs: Long? = null,
-    val webUiSession: EmbeddedWebUiSession? = null,
-    val galleryMode: GalleryViewMode = GalleryViewMode.FLATTENED_ALL_IMAGES,
-    val galleryCollection: GalleryCollectionState? = null,
-    val galleryPages: Map<Int, GalleryPageState> = emptyMap(),
-    val galleryDirectories: List<GalleryDirectoryItem> = emptyList(),
-    val galleryBreadcrumbs: List<GalleryBreadcrumbItem> = emptyList(),
-    val galleryCurrentDirectoryDocumentId: String = GALLERY_ROOT_DOCUMENT_ID,
-    val galleryCurrentDirectoryPath: String = GALLERY_ROOT_PATH,
-    val gallerySort: GallerySortOption = GallerySortOption.CREATION_TIME,
-    val themeAccentColorHex: String = DEFAULT_IRONMESH_ACCENT_COLOR_HEX,
-    val galleryLoading: Boolean = false,
-    val galleryError: GalleryLoadError? = null,
-    val loading: Boolean = false,
-)
-
 private data class TimingDiagnosticsCredentials(
     val connectionInput: String,
     val serverCaPem: String?,
@@ -211,8 +74,8 @@ private data class TimingDiagnosticsCredentials(
 private data class PersistedMainUiState(
     val syncProfiles: List<FolderSyncConfig>,
     val deviceAuthResult: Result<DeviceAuthState>,
+    val appConnectionStatus: AppConnectionStatus,
     val galleryViewMode: GalleryViewMode,
-    val connectionStatus: AppConnectionStatus,
     val titleLatencyMonitorSettings: TitleLatencyMonitorSettings,
     val themeAccentColorHex: String,
 )
@@ -228,6 +91,7 @@ class MainViewModel(
     private var galleryRequestVersion = 0
     private var pinnedGalleryItemIndex: Int? = null
     private var folderSyncStatusMonitorJob: Job? = null
+    private var appConnectionStatusMonitorJob: Job? = null
     private var connectionRoutesMonitorJob: Job? = null
     private var titleLatencyConfigurationJob: Job? = null
     private var titleLatencyStatusMonitorJob: Job? = null
@@ -235,6 +99,9 @@ class MainViewModel(
     private val uiObservationGate = UiObservationGate()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val preferenceWriteMutex = Mutex()
+
+    @Volatile
+    private var deviceAuthState = DeviceAuthState()
 
     var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
         private set
@@ -312,6 +179,14 @@ class MainViewModel(
         if (uiObservationGate.leaveForeground() == UiObservationTransition.STOP) {
             stopUiObservationJobs()
         }
+        viewModelScope.launch(Dispatchers.IO) {
+            runAppConnectionStatusFlush(
+                flush = RustPreferencesBridge::flushAppConnectionStatus,
+                onFailure = { error ->
+                    Log.w("MainViewModel", "Connection status background flush failed", error)
+                },
+            )
+        }
         if (uiState.value.webUiSession != null) {
             webUiSessionBackgroundGrace.scheduleStop()
         }
@@ -319,6 +194,7 @@ class MainViewModel(
 
     private fun startUiObservationJobs() {
         notifyManagedClientForegrounded()
+        startAppConnectionStatusMonitor()
         startFolderSyncStatusMonitor()
         if (uiState.value.titleLatencyMonitorSettings.enabled) {
             configureTitleLatencyMonitor()
@@ -337,8 +213,10 @@ class MainViewModel(
                         deviceAuthResult = runCatching {
                             IronmeshPreferences.getDeviceAuthState(getApplication())
                         },
+                        appConnectionStatus = RustPreferencesBridge.appConnectionStatus()
+                            .filterNotNull()
+                            .first(),
                         galleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication()),
-                        connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication()),
                         titleLatencyMonitorSettings =
                             IronmeshPreferences.getTitleLatencyMonitorSettings(getApplication()),
                         themeAccentColorHex = IronmeshPreferences.getThemeAccentColor(getApplication()),
@@ -354,13 +232,14 @@ class MainViewModel(
                 return@launch
             }
             val deviceAuth = persisted.deviceAuthResult.getOrDefault(DeviceAuthState())
+            deviceAuthState = deviceAuth
             val loadedState = uiState.value.copy(
                 persistedStateLoaded = true,
                 syncProfiles = persisted.syncProfiles,
-                deviceAuthState = deviceAuth,
+                deviceIdentity = deviceAuth.toDeviceIdentityUiState(),
                 deviceLabelInput = deviceAuth.label.orEmpty(),
+                appConnectionStatus = persisted.appConnectionStatus,
                 galleryMode = persisted.galleryViewMode,
-                appConnectionStatus = persisted.connectionStatus,
                 titleLatencyMonitorSettings = persisted.titleLatencyMonitorSettings,
                 themeAccentColorHex = persisted.themeAccentColorHex,
                 status = persisted.deviceAuthResult.exceptionOrNull()?.let { error ->
@@ -422,6 +301,7 @@ class MainViewModel(
     private fun stopUiObservationJobs() {
         titleLatencyConfigurationJob?.cancel()
         titleLatencyConfigurationJob = null
+        stopAppConnectionStatusMonitor()
         stopFolderSyncStatusMonitor()
         stopTitleLatencyStatusMonitor()
         stopConnectionRoutesMonitor()
@@ -564,7 +444,7 @@ class MainViewModel(
     }
 
     private fun diagnosticMetadata(state: MainUiState): List<Pair<String, String>> {
-        val deviceAuth = state.deviceAuthState
+        val deviceIdentity = state.deviceIdentity
         val activeRoutes = state.connectionRoutes?.let { routes ->
             routes.endpoints
                 .filter { endpoint ->
@@ -579,9 +459,9 @@ class MainViewModel(
             "App version" to BuildConfig.LONG_VERSION,
             "Platform" to "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
             "Device" to "${Build.MANUFACTURER} ${Build.MODEL}",
-            "Cluster ID" to deviceAuth.clusterId.ifBlank { "unavailable" },
-            "Device ID" to deviceAuth.deviceId.ifBlank { "unavailable" },
-            "Device label" to deviceAuth.label.orEmpty().ifBlank { "unavailable" },
+            "Cluster ID" to deviceIdentity.clusterId.ifBlank { "unavailable" },
+            "Device ID" to deviceIdentity.deviceId.ifBlank { "unavailable" },
+            "Device label" to deviceIdentity.label.orEmpty().ifBlank { "unavailable" },
             "Visible section" to state.selectedSection.name,
             "UI status" to state.status,
             "Connection state" to "${state.appConnectionStatus.state}: ${state.appConnectionStatus.message}",
@@ -1168,8 +1048,8 @@ class MainViewModel(
                 setStatus("Enroll this device before checking the connection")
                 return@launch
             }
-            val (result, connectionStatus) = withContext(Dispatchers.IO) {
-                val connectionResult = runCatching {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
                     repository.notifyNetworkChanged(
                         connectionInput = connectionInput,
                         serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
@@ -1182,10 +1062,8 @@ class MainViewModel(
                         clientIdentityJson = clientIdentityJson,
                     )
                 }
-                connectionResult to IronmeshPreferences.getAppConnectionStatus(getApplication())
             }
             uiState.value = uiState.value.copy(
-                appConnectionStatus = connectionStatus,
                 status = result.fold(
                     onSuccess = { "Connection check succeeded" },
                     onFailure = { error -> "Connection check failed: ${error.message}" },
@@ -1321,7 +1199,7 @@ class MainViewModel(
         }
 
         val label = uiState.value.deviceLabelInput.trim().takeIf { it.isNotBlank() }
-        val existingDeviceId = uiState.value.deviceAuthState.deviceId.takeIf { it.isNotBlank() }
+        val existingDeviceId = deviceAuthState.deviceId.takeIf { it.isNotBlank() }
         uiState.value = uiState.value.copy(
             loading = true,
             status = "Enrolling device...",
@@ -1404,9 +1282,10 @@ class MainViewModel(
             }
 
             stopConnectionRoutesMonitor()
+            deviceAuthState = authState
             uiState.value = uiState.value.copy(
                 loading = false,
-                deviceAuthState = authState,
+                deviceIdentity = authState.toDeviceIdentityUiState(),
                 bootstrapInput = "",
                 deviceLabelInput = authState.label.orEmpty(),
                 enrollmentDiagnostics = uiState.value.enrollmentDiagnostics
@@ -1504,7 +1383,6 @@ class MainViewModel(
                             runtimeStatus = status,
                             previousStatus = stateSnapshot.globalFolderSyncStatus,
                         ),
-                        appConnectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication()),
                     )
                 }
                 val currentState = uiState.value
@@ -1526,13 +1404,38 @@ class MainViewModel(
         folderSyncStatusMonitorJob = null
     }
 
+    private fun startAppConnectionStatusMonitor() {
+        if (
+            !uiObservationGate.observationJobsActive ||
+            appConnectionStatusMonitorJob?.isActive == true
+        ) {
+            return
+        }
+        appConnectionStatusMonitorJob = viewModelScope.launch {
+            RustPreferencesBridge.appConnectionStatus()
+                .filterNotNull()
+                .collect { connectionStatus ->
+                    if (uiState.value.appConnectionStatus != connectionStatus) {
+                        uiState.value = uiState.value.copy(
+                            appConnectionStatus = connectionStatus,
+                        )
+                    }
+                }
+        }
+    }
+
+    private fun stopAppConnectionStatusMonitor() {
+        appConnectionStatusMonitorJob?.cancel()
+        appConnectionStatusMonitorJob = null
+    }
+
     private fun buildGlobalFolderSyncStatus(
         state: MainUiState,
         runtimeStatus: FolderSyncServiceStatus,
         previousStatus: GlobalFolderSyncStatus? = state.globalFolderSyncStatus,
     ): GlobalFolderSyncStatus {
         val enabledProfiles = state.syncProfiles.filter { profile -> profile.enabled }
-        val enrollmentReady = state.deviceAuthState.hasClientIdentity()
+        val enrollmentReady = state.deviceIdentity.isEnrolled
         val blockedProfiles = if (enrollmentReady) {
             runCatching {
                 FolderSyncNetworkGate
@@ -1812,8 +1715,10 @@ class MainViewModel(
         val persisted = withContext(Dispatchers.IO) {
             IronmeshPreferences.getDeviceAuthState(getApplication())
         }
-        if (persisted != uiState.value.deviceAuthState) {
-            uiState.value = uiState.value.copy(deviceAuthState = persisted)
+        deviceAuthState = persisted
+        val identity = persisted.toDeviceIdentityUiState()
+        if (identity != uiState.value.deviceIdentity) {
+            uiState.value = uiState.value.copy(deviceIdentity = identity)
         }
         return persisted
     }
@@ -2216,57 +2121,6 @@ class MainViewModel(
         val normalized = path.trim().trim('/')
         return if (normalized.isBlank()) GALLERY_ROOT_PATH else "$normalized/"
     }
-}
-
-internal fun MainUiState.withGalleryRefreshStarted(): MainUiState {
-    return copy(
-        galleryLoading = true,
-        galleryError = null,
-        galleryCollection = null,
-        galleryPages = emptyMap(),
-        status = "Loading gallery...",
-    )
-}
-
-internal fun MainUiState.withGalleryRefreshFailure(error: Throwable): MainUiState {
-    val galleryError = galleryLoadErrorFrom(error)
-    return copy(
-        galleryLoading = false,
-        galleryError = galleryError,
-        status = galleryLoadFailureStatus(galleryError),
-    )
-}
-
-internal fun galleryLoadErrorFrom(error: Throwable): GalleryLoadError {
-    val causes = generateSequence(error) { current -> current.cause }
-        .take(8)
-        .toList()
-    val technicalDetail = causes
-        .mapNotNull { cause -> cause.message?.trim()?.takeIf(String::isNotEmpty) }
-        .lastOrNull()
-        ?: causes.lastOrNull()?.javaClass?.simpleName?.takeIf(String::isNotEmpty)
-    val timedOut = causes.any { cause ->
-        cause.javaClass.simpleName.contains("timeout", ignoreCase = true) ||
-            cause.message?.let { message ->
-                message.contains("timeout", ignoreCase = true) ||
-                    message.contains("timed out", ignoreCase = true)
-            } == true
-    }
-    return GalleryLoadError(
-        kind = if (timedOut) GalleryLoadErrorKind.TIMEOUT else GalleryLoadErrorKind.REQUEST_FAILED,
-        technicalDetail = technicalDetail,
-    )
-}
-
-private fun galleryLoadFailureStatus(error: GalleryLoadError): String {
-    val summary = when (error.kind) {
-        GalleryLoadErrorKind.TIMEOUT -> "Gallery index request timed out"
-        GalleryLoadErrorKind.REQUEST_FAILED -> "Gallery index request failed"
-    }
-    return error.technicalDetail
-        ?.takeIf { it.isNotBlank() }
-        ?.let { detail -> "$summary: $detail" }
-        ?: summary
 }
 
 private fun MainSection.isConnectionDiagnosticsSection(): Boolean {

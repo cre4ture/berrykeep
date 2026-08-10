@@ -87,8 +87,8 @@ import io.ironmesh.android.ui.GalleryPageState
 import io.ironmesh.android.ui.GalleryPageStatus
 import io.ironmesh.android.ui.GallerySortOption
 import io.ironmesh.android.ui.GalleryViewMode
-import io.ironmesh.android.ui.MainUiState
-import io.ironmesh.android.ui.MainViewModel
+import io.ironmesh.android.ui.LibraryScreenActions
+import io.ironmesh.android.ui.LibraryUiState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
@@ -103,12 +103,12 @@ internal enum class GalleryContentPresentation {
     CONTENT,
 }
 
-internal fun galleryContentPresentation(state: MainUiState): GalleryContentPresentation {
-    val totalItemCount = state.galleryCollection?.totalItemCount ?: 0
+internal fun galleryContentPresentation(state: LibraryUiState): GalleryContentPresentation {
+    val totalItemCount = state.collection?.totalItemCount ?: 0
     return when {
-        state.galleryLoading -> GalleryContentPresentation.LOADING
-        state.galleryError != null -> GalleryContentPresentation.LOAD_ERROR
-        totalItemCount == 0 && state.galleryDirectories.isEmpty() -> GalleryContentPresentation.EMPTY
+        state.loading -> GalleryContentPresentation.LOADING
+        state.error != null -> GalleryContentPresentation.LOAD_ERROR
+        totalItemCount == 0 && state.directories.isEmpty() -> GalleryContentPresentation.EMPTY
         totalItemCount == 0 -> GalleryContentPresentation.EMPTY_CURRENT_DIRECTORY
         else -> GalleryContentPresentation.CONTENT
     }
@@ -117,11 +117,11 @@ internal fun galleryContentPresentation(state: MainUiState): GalleryContentPrese
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun LibraryScreen(
-    state: MainUiState,
-    vm: MainViewModel,
+    state: LibraryUiState,
+    actions: LibraryScreenActions,
 ) {
-    val totalGalleryItems = state.galleryCollection?.totalItemCount ?: 0
-    var fullscreenIndex by remember(state.galleryMode, state.galleryCurrentDirectoryPath, totalGalleryItems) {
+    val totalGalleryItems = state.collection?.totalItemCount ?: 0
+    var fullscreenIndex by remember(state.mode, state.currentDirectoryPath, totalGalleryItems) {
         mutableStateOf<Int?>(null)
     }
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
@@ -145,7 +145,7 @@ fun LibraryScreen(
             (availableWidthPx / clampedColumns).toDp()
         }
         val listState = rememberLazyListState()
-        val pageCount = state.galleryCollection?.pageCount ?: 0
+        val pageCount = state.collection?.pageCount ?: 0
         val showDetails = clampedColumns < 3
 
         LaunchedEffect(listState, pageCount) {
@@ -157,7 +157,7 @@ fun LibraryScreen(
                         ?.toIntOrNull()
                 }.toSet()
             }.collect { visiblePages ->
-                vm.updateVisibleGalleryPages(visiblePages)
+                actions.updateVisiblePages(visiblePages)
             }
         }
 
@@ -185,33 +185,33 @@ fun LibraryScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Button(onClick = vm::refreshGallery) {
+                    Button(onClick = actions.refresh) {
                         Text("Refresh")
                     }
                     FilterChip(
-                        selected = state.galleryMode == GalleryViewMode.FLATTENED_ALL_IMAGES,
-                        onClick = { vm.updateGalleryViewMode(GalleryViewMode.FLATTENED_ALL_IMAGES) },
+                        selected = state.mode == GalleryViewMode.FLATTENED_ALL_IMAGES,
+                        onClick = { actions.updateViewMode(GalleryViewMode.FLATTENED_ALL_IMAGES) },
                         label = { Text("All images") },
                     )
                     FilterChip(
-                        selected = state.galleryMode == GalleryViewMode.CURRENT_DIRECTORY,
-                        onClick = { vm.updateGalleryViewMode(GalleryViewMode.CURRENT_DIRECTORY) },
+                        selected = state.mode == GalleryViewMode.CURRENT_DIRECTORY,
+                        onClick = { actions.updateViewMode(GalleryViewMode.CURRENT_DIRECTORY) },
                         label = { Text("Current folder") },
                     )
                     FilterChip(
-                        selected = state.gallerySort == GallerySortOption.CREATION_TIME,
-                        onClick = { vm.updateGallerySort(GallerySortOption.CREATION_TIME) },
+                        selected = state.sort == GallerySortOption.CREATION_TIME,
+                        onClick = { actions.updateSort(GallerySortOption.CREATION_TIME) },
                         label = { Text("Newest") },
                     )
                     FilterChip(
-                        selected = state.gallerySort == GallerySortOption.NAME,
-                        onClick = { vm.updateGallerySort(GallerySortOption.NAME) },
+                        selected = state.sort == GallerySortOption.NAME,
+                        onClick = { actions.updateSort(GallerySortOption.NAME) },
                         label = { Text("Name") },
                     )
                 }
             }
 
-            if (state.galleryMode == GalleryViewMode.CURRENT_DIRECTORY) {
+            if (state.mode == GalleryViewMode.CURRENT_DIRECTORY) {
                 item(key = "gallery-directory") {
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
@@ -223,43 +223,43 @@ fun LibraryScreen(
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             Text(
-                                text = "Current folder: ${state.galleryCurrentDirectoryPath}",
+                                text = "Current folder: ${state.currentDirectoryPath}",
                                 style = MaterialTheme.typography.titleSmall,
                             )
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                OutlinedButton(onClick = vm::navigateGalleryToRoot) {
+                                OutlinedButton(onClick = actions.navigateToRoot) {
                                     Text("Root")
                                 }
                                 OutlinedButton(
-                                    onClick = vm::navigateGalleryUp,
-                                    enabled = state.galleryBreadcrumbs.isNotEmpty(),
+                                    onClick = actions.navigateUp,
+                                    enabled = state.breadcrumbs.isNotEmpty(),
                                 ) {
                                     Text("Up")
                                 }
                             }
-                            if (state.galleryBreadcrumbs.isNotEmpty()) {
+                            if (state.breadcrumbs.isNotEmpty()) {
                                 FlowRow(
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                                     verticalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
-                                    OutlinedButton(onClick = vm::navigateGalleryToRoot) {
+                                    OutlinedButton(onClick = actions.navigateToRoot) {
                                         Text("/")
                                     }
-                                    state.galleryBreadcrumbs.forEachIndexed { index, breadcrumb ->
-                                        OutlinedButton(onClick = { vm.navigateGalleryToBreadcrumb(index) }) {
+                                    state.breadcrumbs.forEachIndexed { index, breadcrumb ->
+                                        OutlinedButton(onClick = { actions.navigateToBreadcrumb(index) }) {
                                             Text(breadcrumb.label)
                                         }
                                     }
                                 }
                             }
-                            if (state.galleryDirectories.isNotEmpty()) {
+                            if (state.directories.isNotEmpty()) {
                                 Text("Folders", style = MaterialTheme.typography.titleSmall)
                                 FlowRow(
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                                     verticalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
-                                    state.galleryDirectories.forEach { directory ->
-                                        OutlinedButton(onClick = { vm.openGalleryDirectory(directory) }) {
+                                    state.directories.forEach { directory ->
+                                        OutlinedButton(onClick = { actions.openDirectory(directory) }) {
                                             Text(directory.displayName)
                                         }
                                     }
@@ -279,15 +279,15 @@ fun LibraryScreen(
                 GalleryContentPresentation.LOAD_ERROR -> {
                     item(key = "gallery-error") {
                         LibraryLoadErrorCard(
-                            error = requireNotNull(state.galleryError),
-                            onRetry = vm::refreshGallery,
+                            error = requireNotNull(state.error),
+                            onRetry = actions.refresh,
                         )
                     }
                 }
                 GalleryContentPresentation.EMPTY -> {
                     item(key = "gallery-empty") {
                         Text(
-                            if (state.galleryMode == GalleryViewMode.FLATTENED_ALL_IMAGES) {
+                            if (state.mode == GalleryViewMode.FLATTENED_ALL_IMAGES) {
                                 "No images loaded from the gallery index."
                             } else {
                                 "No images or nested folders found in the current directory."
@@ -307,14 +307,14 @@ fun LibraryScreen(
                     ) { pageIndex ->
                         GalleryVirtualPage(
                             pageIndex = pageIndex,
-                            page = state.galleryPages[pageIndex],
-                            collection = state.galleryCollection,
+                            page = state.pages[pageIndex],
+                            collection = state.collection,
                             columns = clampedColumns,
                             gap = gap,
                             cardWidth = cardWidth,
                             showDetails = showDetails,
                             onItemClick = { index -> fullscreenIndex = index },
-                            onRetry = { vm.retryGalleryPage(pageIndex) },
+                            onRetry = { actions.retryPage(pageIndex) },
                         )
                     }
                     item(key = "gallery-hint") {
@@ -333,9 +333,9 @@ fun LibraryScreen(
         GalleryFullscreenViewer(
             itemCount = totalGalleryItems,
             initialIndex = selectedIndex.coerceIn(0, totalGalleryItems - 1),
-            itemAt = vm::galleryItemAt,
-            onRequestIndex = vm::ensureGalleryItemLoaded,
-            onFocusIndex = vm::pinGalleryItem,
+            itemAt = actions.itemAt,
+            onRequestIndex = actions.ensureItemLoaded,
+            onFocusIndex = actions.pinItem,
             onDismiss = { fullscreenIndex = null },
         )
     }
@@ -790,7 +790,7 @@ private fun GalleryFullscreenPage(
  * revisiting a card doesn't re-trigger the SAF thumbnail IPC (and the underlying
  * network round trip) for an image that was already fetched. Entries are keyed by
  * document URI (path-based), which doesn't change when a file's content is updated
- * in place, so callers that reload the gallery listing (e.g. [MainViewModel.refreshGallery])
+ * in place, so callers that reload the gallery listing
  * must call [clear] to avoid showing a stale thumbnail after such an update.
  */
 internal object ThumbnailBitmapCache {

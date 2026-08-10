@@ -15,13 +15,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import io.ironmesh.android.ui.MainUiState
 import io.ironmesh.android.data.EmbeddedWebUiSession
+import io.ironmesh.android.ui.GalleryMapUiState
 import io.ironmesh.android.ui.components.IronmeshEmbeddedWebUi
 
 @Composable
 fun GalleryMapScreen(
-    state: MainUiState,
+    state: GalleryMapUiState,
     onStartGalleryMap: () -> Unit,
 ) {
     val galleryMapSession = galleryMapWebUiSession(state.webUiSession)

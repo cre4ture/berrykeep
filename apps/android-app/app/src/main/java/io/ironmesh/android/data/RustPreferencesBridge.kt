@@ -3,6 +3,10 @@ package io.ironmesh.android.data
 import android.content.Context
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONObject
 
 object RustPreferencesBridge {
@@ -12,7 +16,10 @@ object RustPreferencesBridge {
     @Volatile
     private var appContext: Context? = null
 
-    private val appConnectionStatusUpdateLock = Any()
+    private val initializationLock = Any()
+
+    @Volatile
+    private var connectionStatusStore: AppConnectionStatusStore? = null
 
     private val diagnosticsUpdateAdapter by lazy {
         Moshi.Builder()
@@ -23,7 +30,17 @@ object RustPreferencesBridge {
 
     @JvmStatic
     fun initialize(context: Context) {
-        appContext = context.applicationContext
+        val applicationContext = context.applicationContext
+        appContext = applicationContext
+        if (connectionStatusStore == null) {
+            synchronized(initializationLock) {
+                if (connectionStatusStore == null) {
+                    connectionStatusStore = newConnectionStatusStore(applicationContext).also {
+                        it.load()
+                    }
+                }
+            }
+        }
     }
 
     @JvmStatic
@@ -60,14 +77,15 @@ object RustPreferencesBridge {
 
     @JvmStatic
     fun updateAppConnectionDiagnosticsJson(diagnosticsJson: String) {
-        val context = appContext ?: error("RustPreferencesBridge is not initialized")
-        val update = diagnosticsUpdateAdapter.fromJson(diagnosticsJson) ?: return
-        synchronized(appConnectionStatusUpdateLock) {
-            val current = IronmeshPreferences.getAppConnectionStatus(context)
-            val next = mergeAppConnectionDiagnostics(current, update)
-            IronmeshPreferences.setAppConnectionStatus(context, next)
-            logPersistedAppConnectionStatusTransition(current, next, update)
-        }
+        requireConnectionStatusStore().submitDiagnosticsJson(diagnosticsJson)
+    }
+
+    internal fun appConnectionStatus(): StateFlow<AppConnectionStatus?> =
+        requireConnectionStatusStore().status
+
+    /** Waits until every preceding native update has reached SharedPreferences. */
+    internal suspend fun flushAppConnectionStatus() {
+        requireConnectionStatusStore().flush()
     }
 
     internal fun mergeAppConnectionDiagnostics(
@@ -247,4 +265,30 @@ object RustPreferencesBridge {
             attempt.error.orEmpty(),
         ).joinToString("|")
     }
+
+    private fun newConnectionStatusStore(context: Context): AppConnectionStatusStore =
+        AppConnectionStatusStore(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            persistence = object : AppConnectionStatusPersistence {
+                override suspend fun load(): AppConnectionStatus =
+                    IronmeshPreferences.getAppConnectionStatus(context)
+
+                override suspend fun save(status: AppConnectionStatus) {
+                    IronmeshPreferences.setAppConnectionStatus(context, status)
+                }
+            },
+            decodeUpdate = diagnosticsUpdateAdapter::fromJson,
+            mergeUpdate = ::mergeAppConnectionDiagnostics,
+            onStatusChanged = ::logPersistedAppConnectionStatusTransition,
+            onFailure = { operation, error ->
+                AndroidDiagnosticLog.w(
+                    "AppConnectionStatus",
+                    "event=app_connection_status_store_failure operation=$operation",
+                    error,
+                )
+            },
+        )
+
+    private fun requireConnectionStatusStore(): AppConnectionStatusStore =
+        connectionStatusStore ?: error("RustPreferencesBridge is not initialized")
 }

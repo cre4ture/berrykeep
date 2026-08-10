@@ -1,6 +1,5 @@
 package io.ironmesh.android.ui
 
-import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.ConnectionRouteSnapshot
 import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.GlobalFolderSyncStatus
@@ -10,7 +9,6 @@ import io.ironmesh.android.ui.screens.connectionRouteSnapshotsUiEquivalent
 internal data class FolderSyncPollResult(
     val folderSyncStatus: FolderSyncServiceStatus,
     val globalFolderSyncStatus: GlobalFolderSyncStatus,
-    val appConnectionStatus: AppConnectionStatus,
 )
 
 internal fun canApplyFolderSyncPollResult(
@@ -18,24 +16,21 @@ internal fun canApplyFolderSyncPollResult(
     currentState: MainUiState,
 ): Boolean {
     return currentState.syncProfiles == stateSnapshot.syncProfiles &&
-        currentState.deviceAuthState == stateSnapshot.deviceAuthState &&
-        currentState.globalFolderSyncStatus == stateSnapshot.globalFolderSyncStatus &&
-        currentState.appConnectionStatus == stateSnapshot.appConnectionStatus
+        currentState.deviceIdentity == stateSnapshot.deviceIdentity &&
+        currentState.globalFolderSyncStatus == stateSnapshot.globalFolderSyncStatus
 }
 
 internal fun MainUiState.withFolderSyncPollResult(result: FolderSyncPollResult): MainUiState {
     val stableFolderSyncStatus = result.folderSyncStatus.withStableTimestampFrom(folderSyncStatus)
     if (
         folderSyncStatus == stableFolderSyncStatus &&
-        globalFolderSyncStatus == result.globalFolderSyncStatus &&
-        appConnectionStatus == result.appConnectionStatus
+        globalFolderSyncStatus == result.globalFolderSyncStatus
     ) {
         return this
     }
     return copy(
         folderSyncStatus = stableFolderSyncStatus,
         globalFolderSyncStatus = result.globalFolderSyncStatus,
-        appConnectionStatus = result.appConnectionStatus,
     )
 }
 

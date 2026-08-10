@@ -45,8 +45,8 @@ import io.ironmesh.android.data.GLOBAL_SYNC_STATE_HEALTHY
 import io.ironmesh.android.data.GLOBAL_SYNC_STATE_WAITING
 import io.ironmesh.android.ui.FolderSyncActivityFilter
 import io.ironmesh.android.ui.FolderSyncHistoryState
-import io.ironmesh.android.ui.MainUiState
-import io.ironmesh.android.ui.MainViewModel
+import io.ironmesh.android.ui.SyncScreenActions
+import io.ironmesh.android.ui.SyncUiState
 import io.ironmesh.android.ui.components.EmptyStateCard
 import io.ironmesh.android.ui.components.HeroTone
 import io.ironmesh.android.ui.components.SectionCard
@@ -55,8 +55,8 @@ import io.ironmesh.android.ui.components.StatusHeroCard
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SyncScreen(
-    state: MainUiState,
-    vm: MainViewModel,
+    state: SyncUiState,
+    actions: SyncScreenActions,
     onPickLocalFolder: () -> Unit,
     onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
 ) {
@@ -65,8 +65,8 @@ fun SyncScreen(
     var showCreateSheet by rememberSaveable { mutableStateOf(false) }
     var detailProfileId by rememberSaveable { mutableStateOf<String?>(null) }
     var editingProfileId by rememberSaveable { mutableStateOf<String?>(null) }
-    val detailProfile = state.syncProfiles.firstOrNull { it.id == detailProfileId }
-    val editingProfile = state.syncProfiles.firstOrNull { it.id == editingProfileId }
+    val detailProfile = state.profiles.firstOrNull { it.id == detailProfileId }
+    val editingProfile = state.profiles.firstOrNull { it.id == editingProfileId }
     val heroTone = when (globalSyncStatus.state) {
         GLOBAL_SYNC_STATE_ERROR -> HeroTone.Error
         GLOBAL_SYNC_STATE_WAITING -> HeroTone.Warning
@@ -92,7 +92,7 @@ fun SyncScreen(
                 Button(onClick = { showCreateSheet = true }) {
                     Text(stringResource(R.string.new_profile))
                 }
-                OutlinedButton(onClick = vm::runFolderSyncNow) {
+                OutlinedButton(onClick = actions.runNow) {
                     Text(stringResource(R.string.sync_now))
                 }
             }
@@ -103,7 +103,7 @@ fun SyncScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                SyncBadge("Configured ${state.syncProfiles.size}")
+                SyncBadge("Configured ${state.profiles.size}")
                 SyncBadge("Enabled ${globalSyncStatus.enabledProfileCount}")
                 SyncBadge("Active ${globalSyncStatus.activeProfileCount}")
                 if (globalSyncStatus.syncingProfileCount > 0L) {
@@ -121,7 +121,7 @@ fun SyncScreen(
             }
         }
 
-        if (state.syncProfiles.isEmpty()) {
+        if (state.profiles.isEmpty()) {
             EmptyStateCard(
                 title = stringResource(R.string.sync_empty_title),
                 body = stringResource(R.string.sync_empty_body),
@@ -129,7 +129,7 @@ fun SyncScreen(
                 onAction = { showCreateSheet = true },
             )
         } else {
-            state.syncProfiles.forEach { profile ->
+            state.profiles.forEach { profile ->
                 val profileStatus = profileStatuses[profile.id]
                 SectionCard(
                     title = profile.label,
@@ -186,7 +186,7 @@ fun SyncScreen(
         ModalBottomSheet(onDismissRequest = { showCreateSheet = false }) {
             NewSyncProfileSheet(
                 state = state,
-                vm = vm,
+                actions = actions,
                 onDismiss = { showCreateSheet = false },
                 onPickLocalFolder = onPickLocalFolder,
                 onEnsureWifiNameAccess = onEnsureWifiNameAccess,
@@ -198,8 +198,8 @@ fun SyncScreen(
         ModalBottomSheet(onDismissRequest = { detailProfileId = null }) {
             ProfileDetailSheet(
                 profile = detailProfile,
-                historyState = state.folderSyncHistory[detailProfile.id] ?: FolderSyncHistoryState(),
-                vm = vm,
+                historyState = state.historyByProfileId[detailProfile.id] ?: FolderSyncHistoryState(),
+                actions = actions,
                 onDismiss = { detailProfileId = null },
                 onEditRules = {
                     detailProfileId = null
@@ -213,7 +213,7 @@ fun SyncScreen(
         ModalBottomSheet(onDismissRequest = { editingProfileId = null }) {
             NetworkPolicySheet(
                 profile = editingProfile,
-                vm = vm,
+                actions = actions,
                 onDismiss = { editingProfileId = null },
                 onEnsureWifiNameAccess = onEnsureWifiNameAccess,
             )
@@ -223,8 +223,8 @@ fun SyncScreen(
 
 @Composable
 private fun NewSyncProfileSheet(
-    state: MainUiState,
-    vm: MainViewModel,
+    state: SyncUiState,
+    actions: SyncScreenActions,
     onDismiss: () -> Unit,
     onPickLocalFolder: () -> Unit,
     onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
@@ -241,22 +241,22 @@ private fun NewSyncProfileSheet(
         Text(stringResource(R.string.new_profile), style = MaterialTheme.typography.titleLarge)
         OutlinedTextField(
             modifier = Modifier.fillMaxWidth(),
-            value = state.newSyncLabel,
-            onValueChange = vm::updateNewSyncLabel,
+            value = state.newProfileLabel,
+            onValueChange = actions.updateNewProfileLabel,
             label = { Text(stringResource(R.string.profile_label)) },
             singleLine = true,
         )
         OutlinedTextField(
             modifier = Modifier.fillMaxWidth(),
-            value = state.newSyncPrefix,
-            onValueChange = vm::updateNewSyncPrefix,
+            value = state.newProfilePrefix,
+            onValueChange = actions.updateNewProfilePrefix,
             label = { Text(stringResource(R.string.remote_prefix_optional)) },
             singleLine = true,
         )
         OutlinedTextField(
             modifier = Modifier.fillMaxWidth(),
-            value = state.newSyncLocalFolder,
-            onValueChange = vm::updateNewSyncLocalFolder,
+            value = state.newProfileLocalFolder,
+            onValueChange = actions.updateNewProfileLocalFolder,
             label = { Text(stringResource(R.string.local_folder_path)) },
             singleLine = true,
         )
@@ -265,16 +265,16 @@ private fun NewSyncProfileSheet(
         }
         Text(stringResource(R.string.network_rules), style = MaterialTheme.typography.titleMedium)
         NetworkPolicyEditor(
-            allowWifi = state.newSyncAllowWifi,
-            onAllowWifiChange = vm::updateNewSyncAllowWifi,
-            allowCellular = state.newSyncAllowCellular,
-            onAllowCellularChange = vm::updateNewSyncAllowCellular,
-            allowOtherConnections = state.newSyncAllowOtherConnections,
-            onAllowOtherConnectionsChange = vm::updateNewSyncAllowOtherConnections,
-            allowRoaming = state.newSyncAllowRoaming,
-            onAllowRoamingChange = vm::updateNewSyncAllowRoaming,
-            allowedWifiSsids = state.newSyncAllowedWifiSsids,
-            onAllowedWifiSsidsChange = vm::updateNewSyncAllowedWifiSsids,
+            allowWifi = state.newProfileAllowWifi,
+            onAllowWifiChange = actions.updateNewProfileAllowWifi,
+            allowCellular = state.newProfileAllowCellular,
+            onAllowCellularChange = actions.updateNewProfileAllowCellular,
+            allowOtherConnections = state.newProfileAllowOtherConnections,
+            onAllowOtherConnectionsChange = actions.updateNewProfileAllowOtherConnections,
+            allowRoaming = state.newProfileAllowRoaming,
+            onAllowRoamingChange = actions.updateNewProfileAllowRoaming,
+            allowedWifiSsids = state.newProfileAllowedWifiSsids,
+            onAllowedWifiSsidsChange = actions.updateNewProfileAllowedWifiSsids,
         )
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -285,7 +285,7 @@ private fun NewSyncProfileSheet(
             }
             Button(
                 onClick = {
-                    vm.addFolderSyncProfile()?.let { policy ->
+                    actions.addProfile()?.let { policy ->
                         onEnsureWifiNameAccess(policy)
                         onDismiss()
                     }
@@ -301,13 +301,13 @@ private fun NewSyncProfileSheet(
 private fun ProfileDetailSheet(
     profile: FolderSyncConfig,
     historyState: FolderSyncHistoryState,
-    vm: MainViewModel,
+    actions: SyncScreenActions,
     onDismiss: () -> Unit,
     onEditRules: () -> Unit,
 ) {
     LaunchedEffect(profile.id) {
         if (!historyState.expanded && historyState.records.isEmpty() && !historyState.loading) {
-            vm.toggleFolderSyncHistory(profile.id)
+            actions.toggleHistory(profile.id)
         }
     }
 
@@ -330,7 +330,7 @@ private fun ProfileDetailSheet(
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(
                 onClick = {
-                    vm.setFolderSyncProfileEnabled(profile.id, !profile.enabled)
+                    actions.setProfileEnabled(profile.id, !profile.enabled)
                 },
             ) {
                 Text(if (profile.enabled) "Pause" else "Enable")
@@ -340,7 +340,7 @@ private fun ProfileDetailSheet(
             }
             OutlinedButton(
                 onClick = {
-                    vm.removeFolderSyncProfile(profile.id)
+                    actions.removeProfile(profile.id)
                     onDismiss()
                 },
             ) {
@@ -350,8 +350,8 @@ private fun ProfileDetailSheet(
         Text(stringResource(R.string.recent_activity), style = MaterialTheme.typography.titleMedium)
         HistoryTimeline(
             historyState = historyState,
-            onFilterSelected = { filter -> vm.setFolderSyncHistoryFilter(profile.id, filter) },
-            onLoadMore = { vm.loadMoreFolderSyncHistory(profile.id) },
+            onFilterSelected = { filter -> actions.setHistoryFilter(profile.id, filter) },
+            onLoadMore = { actions.loadMoreHistory(profile.id) },
         )
     }
 }
@@ -359,7 +359,7 @@ private fun ProfileDetailSheet(
 @Composable
 private fun NetworkPolicySheet(
     profile: FolderSyncConfig,
-    vm: MainViewModel,
+    actions: SyncScreenActions,
     onDismiss: () -> Unit,
     onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
 ) {
@@ -412,7 +412,7 @@ private fun NetworkPolicySheet(
                             allowedWifiSsids,
                         ),
                     ).normalized()
-                    if (vm.updateFolderSyncProfileNetworkPolicy(profile.id, updatedPolicy)) {
+                    if (actions.updateProfileNetworkPolicy(profile.id, updatedPolicy)) {
                         onEnsureWifiNameAccess(updatedPolicy)
                         onDismiss()
                     }

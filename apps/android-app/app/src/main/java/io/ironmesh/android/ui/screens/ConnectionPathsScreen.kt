@@ -32,18 +32,18 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.R
-import io.ironmesh.android.ui.MainUiState
+import io.ironmesh.android.ui.ConnectivityUiState
 import io.ironmesh.android.ui.components.HeroTone
 import io.ironmesh.android.ui.components.SectionCard
 import io.ironmesh.android.ui.components.StatusHeroCard
 
 @Composable
 fun ConnectionPathsScreen(
-    state: MainUiState,
+    state: ConnectivityUiState,
     onRefresh: () -> Unit,
 ) {
-    val presentation = remember(state.connectionRoutes, state.connectionRoutesError) {
-        connectionPathsPresentation(state.connectionRoutes, state.connectionRoutesError)
+    val presentation = remember(state.routes, state.error) {
+        connectionPathsPresentation(state.routes, state.error)
     }
     val clipboardManager = LocalClipboardManager.current
     var expandedRouteIndex by rememberSaveable { mutableStateOf<Int?>(null) }
@@ -52,7 +52,7 @@ fun ConnectionPathsScreen(
         ConnectionRoutesList(
             presentation = presentation,
             expandedRouteIndex = expandedRouteIndex,
-            refreshing = state.connectionRoutesLoading,
+            refreshing = state.loading,
             onRefresh = onRefresh,
             onToggleDetails = { routeIndex ->
                 expandedRouteIndex = if (expandedRouteIndex == routeIndex) null else routeIndex
@@ -73,7 +73,7 @@ fun ConnectionPathsScreen(
         ConnectionOverviewCard(
             overview = presentation.overview,
             onRefresh = onRefresh,
-            refreshing = state.connectionRoutesLoading,
+            refreshing = state.loading,
         )
 
         SectionCard(

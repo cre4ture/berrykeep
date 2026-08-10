@@ -71,6 +71,10 @@ In GitHub Actions, store the keystore itself as base64 in `IRONMESH_ANDROID_INTE
 - Rust exports implemented in: `apps/android-app/src/lib.rs`
 - `IronmeshApplication` initializes the process-wide Rust bridges with the
   Android application context before Iroh can construct its system DNS resolver.
+- Native connection diagnostics feed a process-wide Kotlin `StateFlow`; the UI observes that
+  in-memory source directly. Durable connection-status snapshots are conflated on an IO worker and
+  flushed when the app moves to the background, rather than re-reading and rewriting JSON on every
+  UI polling tick.
 - Current Rust-backed operations in repository:
   - `putObject`, `putObjectBytes`
   - `getObject`, `getObjectBytes` (latest-only path; snapshot/version still uses HTTP fallback)

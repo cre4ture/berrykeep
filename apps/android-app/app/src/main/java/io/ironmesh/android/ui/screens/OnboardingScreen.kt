@@ -31,7 +31,7 @@ import io.ironmesh.android.R
 import io.ironmesh.android.ui.EnrollmentDiagnosticStep
 import io.ironmesh.android.ui.EnrollmentDiagnosticStepId
 import io.ironmesh.android.ui.EnrollmentDiagnosticStepStatus
-import io.ironmesh.android.ui.MainUiState
+import io.ironmesh.android.ui.OnboardingUiState
 import io.ironmesh.android.ui.components.PermissionExplainerCard
 import io.ironmesh.android.ui.components.SectionCard
 import io.ironmesh.android.ui.components.TimelineDot
@@ -39,7 +39,7 @@ import io.ironmesh.android.ui.components.TimelineDot
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun OnboardingScreen(
-    state: MainUiState,
+    state: OnboardingUiState,
     onDeviceLabelChange: (String) -> Unit,
     onBootstrapInputChange: (String) -> Unit,
     onScanQr: () -> Unit,
