@@ -320,7 +320,9 @@ class MainViewModel(
     private fun startUiObservationJobs() {
         notifyManagedClientForegrounded()
         startFolderSyncStatusMonitor()
-        startTitleLatencyStatusMonitor()
+        if (uiState.value.titleLatencyMonitorSettings.enabled) {
+            configureTitleLatencyMonitor()
+        }
         if (uiState.value.selectedSection.isConnectionDiagnosticsSection()) {
             startConnectionRoutesMonitor()
         }
@@ -378,12 +380,6 @@ class MainViewModel(
             persistPreference {
                 FolderSyncScheduler.reschedule(getApplication())
             }
-            if (
-                persisted.titleLatencyMonitorSettings.enabled &&
-                deviceAuth.hasClientIdentity()
-            ) {
-                configureTitleLatencyMonitor()
-            }
             markPersistedStateLoaded()
         }
     }
@@ -424,6 +420,8 @@ class MainViewModel(
     }
 
     private fun stopUiObservationJobs() {
+        titleLatencyConfigurationJob?.cancel()
+        titleLatencyConfigurationJob = null
         stopFolderSyncStatusMonitor()
         stopTitleLatencyStatusMonitor()
         stopConnectionRoutesMonitor()
@@ -1934,6 +1932,9 @@ class MainViewModel(
                         settings = settings,
                     )
                 }
+            }
+            if (!isActive) {
+                return@launch
             }
 
             val initialStatus = configured.getOrElse { error ->
