@@ -5,7 +5,9 @@ import io.ironmesh.android.data.ConnectionRouteSnapshot
 import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.GlobalFolderSyncStatus
 import io.ironmesh.android.data.TitleLatencyProbeStatus
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -81,5 +83,29 @@ class UiPollingStateTest {
         )
 
         assertSame(state, result)
+    }
+
+    @Test
+    fun routePollUpdatesLastCheckedWhenDisplayedMinuteChanges() {
+        val state = MainUiState(
+            connectionRoutes = ConnectionRouteSnapshot(
+                generatedAtUnixMs = 59_000L,
+                endpoints = emptyList(),
+            ),
+            connectionRoutesLastLoadedUnixMs = 59_000L,
+        )
+        val nextPoll = ConnectionRouteSnapshot(
+            generatedAtUnixMs = 60_000L,
+            endpoints = emptyList(),
+        )
+
+        val result = state.withConnectionRoutePollResult(
+            result = nextPoll,
+            loadedAtUnixMs = 60_000L,
+        )
+
+        assertNotSame(state, result)
+        assertEquals(nextPoll, result.connectionRoutes)
+        assertEquals(60_000L, result.connectionRoutesLastLoadedUnixMs)
     }
 }

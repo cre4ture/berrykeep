@@ -61,6 +61,8 @@ internal fun MainUiState.withConnectionRoutePollResult(
 ): MainUiState {
     if (
         connectionRouteSnapshotsUiEquivalent(connectionRoutes, result) &&
+        connectionRoutes?.generatedAtUnixMs?.toDisplayedMinute() ==
+        result.generatedAtUnixMs.toDisplayedMinute() &&
         !connectionRoutesLoading &&
         connectionRoutesError == null
     ) {
@@ -73,3 +75,5 @@ internal fun MainUiState.withConnectionRoutePollResult(
         connectionRoutesLastLoadedUnixMs = loadedAtUnixMs,
     )
 }
+
+private fun Long.toDisplayedMinute(): Long = this / 60_000L
