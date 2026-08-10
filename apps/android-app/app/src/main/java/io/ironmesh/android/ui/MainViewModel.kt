@@ -232,8 +232,7 @@ class MainViewModel(
     private var titleLatencyConfigurationJob: Job? = null
     private var titleLatencyStatusMonitorJob: Job? = null
     private var enrollmentVerificationMonitorJob: Job? = null
-    private var uiObservationActive = false
-    private var uiObservationJobsStarted = false
+    private val uiObservationGate = UiObservationGate()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val preferenceWriteMutex = Mutex()
 
@@ -303,37 +302,22 @@ class MainViewModel(
     }
 
     private fun handleProcessStarted() {
-        if (uiObservationActive) {
-            return
-        }
         webUiSessionBackgroundGrace.cancelScheduledStop()
-        startUiObservation()
+        if (uiObservationGate.enterForeground() == UiObservationTransition.START) {
+            startUiObservationJobs()
+        }
     }
 
     private fun handleProcessStopped() {
-        stopUiObservation()
+        if (uiObservationGate.leaveForeground() == UiObservationTransition.STOP) {
+            stopUiObservationJobs()
+        }
         if (uiState.value.webUiSession != null) {
             webUiSessionBackgroundGrace.scheduleStop()
         }
     }
 
-    private fun startUiObservation() {
-        if (uiObservationActive) {
-            return
-        }
-        uiObservationActive = true
-        startUiObservationJobsIfReady()
-    }
-
-    private fun startUiObservationJobsIfReady() {
-        if (
-            !uiObservationActive ||
-            !uiState.value.persistedStateLoaded ||
-            uiObservationJobsStarted
-        ) {
-            return
-        }
-        uiObservationJobsStarted = true
+    private fun startUiObservationJobs() {
         notifyManagedClientForegrounded()
         startFolderSyncStatusMonitor()
         startTitleLatencyStatusMonitor()
@@ -344,18 +328,28 @@ class MainViewModel(
 
     private fun loadPersistedState() {
         viewModelScope.launch {
-            val persisted = withContext(Dispatchers.IO) {
-                PersistedMainUiState(
-                    syncProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication()),
-                    deviceAuthResult = runCatching {
-                        IronmeshPreferences.getDeviceAuthState(getApplication())
-                    },
-                    galleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication()),
-                    connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication()),
-                    titleLatencyMonitorSettings =
-                        IronmeshPreferences.getTitleLatencyMonitorSettings(getApplication()),
-                    themeAccentColorHex = IronmeshPreferences.getThemeAccentColor(getApplication()),
+            val persistedResult = withContext(Dispatchers.IO) {
+                runCatching {
+                    PersistedMainUiState(
+                        syncProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication()),
+                        deviceAuthResult = runCatching {
+                            IronmeshPreferences.getDeviceAuthState(getApplication())
+                        },
+                        galleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication()),
+                        connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication()),
+                        titleLatencyMonitorSettings =
+                            IronmeshPreferences.getTitleLatencyMonitorSettings(getApplication()),
+                        themeAccentColorHex = IronmeshPreferences.getThemeAccentColor(getApplication()),
+                    )
+                }
+            }
+            val persisted = persistedResult.getOrElse { error ->
+                uiState.value = uiState.value.copy(
+                    persistedStateLoaded = true,
+                    status = "App preferences unavailable: ${error.message}",
                 )
+                markPersistedStateLoaded()
+                return@launch
             }
             val deviceAuth = persisted.deviceAuthResult.getOrDefault(DeviceAuthState())
             val loadedState = uiState.value.copy(
@@ -381,7 +375,7 @@ class MainViewModel(
                 )
             }
             uiState.value = initialState
-            withContext(Dispatchers.IO) {
+            persistPreference {
                 FolderSyncScheduler.reschedule(getApplication())
             }
             if (
@@ -390,7 +384,16 @@ class MainViewModel(
             ) {
                 configureTitleLatencyMonitor()
             }
-            startUiObservationJobsIfReady()
+            markPersistedStateLoaded()
+        }
+    }
+
+    private fun markPersistedStateLoaded() {
+        if (
+            uiObservationGate.markPersistedStateLoaded() ==
+            UiObservationTransition.START
+        ) {
+            startUiObservationJobs()
         }
     }
 
@@ -416,8 +419,11 @@ class MainViewModel(
     }
 
     private fun stopUiObservation() {
-        uiObservationActive = false
-        uiObservationJobsStarted = false
+        uiObservationGate.leaveForeground()
+        stopUiObservationJobs()
+    }
+
+    private fun stopUiObservationJobs() {
         stopFolderSyncStatusMonitor()
         stopTitleLatencyStatusMonitor()
         stopConnectionRoutesMonitor()
@@ -1456,7 +1462,10 @@ class MainViewModel(
     }
 
     private fun startFolderSyncStatusMonitor() {
-        if (!uiObservationActive || folderSyncStatusMonitorJob?.isActive == true) {
+        if (
+            !uiObservationGate.observationJobsActive ||
+            folderSyncStatusMonitorJob?.isActive == true
+        ) {
             return
         }
         folderSyncStatusMonitorJob = viewModelScope.launch {
@@ -1865,7 +1874,10 @@ class MainViewModel(
     }
 
     private fun resumeConnectionRoutesMonitorIfNeeded() {
-        if (uiObservationActive && uiState.value.selectedSection.isConnectionDiagnosticsSection()) {
+        if (
+            uiObservationGate.observationJobsActive &&
+            uiState.value.selectedSection.isConnectionDiagnosticsSection()
+        ) {
             startConnectionRoutesMonitor()
         }
     }
@@ -1913,7 +1925,7 @@ class MainViewModel(
 
     private fun startTitleLatencyStatusMonitor() {
         if (
-            !uiObservationActive ||
+            !uiObservationGate.observationJobsActive ||
             !uiState.value.titleLatencyMonitorSettings.enabled ||
             titleLatencyConfigurationJob?.isActive == true ||
             titleLatencyStatusMonitorJob?.isActive == true
@@ -1937,7 +1949,10 @@ class MainViewModel(
     }
 
     private fun startConnectionRoutesMonitor() {
-        if (!uiObservationActive || connectionRoutesMonitorJob?.isActive == true) {
+        if (
+            !uiObservationGate.observationJobsActive ||
+            connectionRoutesMonitorJob?.isActive == true
+        ) {
             return
         }
         connectionRoutesMonitorJob = viewModelScope.launch {
