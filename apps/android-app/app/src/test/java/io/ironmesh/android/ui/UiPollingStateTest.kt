@@ -1,50 +1,26 @@
 package io.ironmesh.android.ui
 
-import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.ConnectionRouteSnapshot
 import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.GlobalFolderSyncStatus
 import io.ironmesh.android.data.TitleLatencyProbeStatus
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class UiPollingStateTest {
-    @Test
-    fun staleFolderSyncPollCannotOverwriteNewerConnectionStatus() {
-        val snapshot = MainUiState(
-            appConnectionStatus = AppConnectionStatus(
-                state = "connecting",
-                updatedUnixMs = 1_000L,
-            ),
-        )
-        val current = snapshot.copy(
-            appConnectionStatus = AppConnectionStatus(
-                state = "connected",
-                updatedUnixMs = 2_000L,
-            ),
-        )
-
-        assertFalse(canApplyFolderSyncPollResult(snapshot, current))
-        assertTrue(canApplyFolderSyncPollResult(snapshot, snapshot.copy(status = "Unrelated UI change")))
-    }
-
     @Test
     fun folderSyncPollTimestampAloneDoesNotCreateNewUiState() {
         val state = MainUiState(
             folderSyncStatus = FolderSyncServiceStatus(updatedUnixMs = 1_000L),
             globalFolderSyncStatus = GlobalFolderSyncStatus(updatedUnixMs = 1_000L),
-            appConnectionStatus = AppConnectionStatus(updatedUnixMs = 1_000L),
         )
 
         val result = state.withFolderSyncPollResult(
             FolderSyncPollResult(
                 folderSyncStatus = state.folderSyncStatus.copy(updatedUnixMs = 2_000L),
                 globalFolderSyncStatus = state.globalFolderSyncStatus,
-                appConnectionStatus = state.appConnectionStatus,
             ),
         )
 

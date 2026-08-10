@@ -34,6 +34,7 @@ import io.ironmesh.android.data.mergeGlobalFolderSyncStatus
 import io.ironmesh.android.ui.screens.ThumbnailBitmapCache
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
+import io.ironmesh.android.data.RustPreferencesBridge
 import io.ironmesh.android.data.TitleLatencyMonitorSettings
 import io.ironmesh.android.data.TitleLatencyProbeStatus
 import io.ironmesh.android.data.parseAllowedWifiSsidsInput
@@ -45,6 +46,7 @@ import io.ironmesh.android.work.FolderSyncExecutionCoordinator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -212,7 +214,6 @@ private data class PersistedMainUiState(
     val syncProfiles: List<FolderSyncConfig>,
     val deviceAuthResult: Result<DeviceAuthState>,
     val galleryViewMode: GalleryViewMode,
-    val connectionStatus: AppConnectionStatus,
     val titleLatencyMonitorSettings: TitleLatencyMonitorSettings,
     val themeAccentColorHex: String,
 )
@@ -228,6 +229,7 @@ class MainViewModel(
     private var galleryRequestVersion = 0
     private var pinnedGalleryItemIndex: Int? = null
     private var folderSyncStatusMonitorJob: Job? = null
+    private var appConnectionStatusMonitorJob: Job? = null
     private var connectionRoutesMonitorJob: Job? = null
     private var titleLatencyConfigurationJob: Job? = null
     private var titleLatencyStatusMonitorJob: Job? = null
@@ -312,6 +314,7 @@ class MainViewModel(
         if (uiObservationGate.leaveForeground() == UiObservationTransition.STOP) {
             stopUiObservationJobs()
         }
+        RustPreferencesBridge.flushAppConnectionStatus()
         if (uiState.value.webUiSession != null) {
             webUiSessionBackgroundGrace.scheduleStop()
         }
@@ -319,6 +322,7 @@ class MainViewModel(
 
     private fun startUiObservationJobs() {
         notifyManagedClientForegrounded()
+        startAppConnectionStatusMonitor()
         startFolderSyncStatusMonitor()
         if (uiState.value.titleLatencyMonitorSettings.enabled) {
             configureTitleLatencyMonitor()
@@ -338,7 +342,6 @@ class MainViewModel(
                             IronmeshPreferences.getDeviceAuthState(getApplication())
                         },
                         galleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication()),
-                        connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication()),
                         titleLatencyMonitorSettings =
                             IronmeshPreferences.getTitleLatencyMonitorSettings(getApplication()),
                         themeAccentColorHex = IronmeshPreferences.getThemeAccentColor(getApplication()),
@@ -360,7 +363,6 @@ class MainViewModel(
                 deviceAuthState = deviceAuth,
                 deviceLabelInput = deviceAuth.label.orEmpty(),
                 galleryMode = persisted.galleryViewMode,
-                appConnectionStatus = persisted.connectionStatus,
                 titleLatencyMonitorSettings = persisted.titleLatencyMonitorSettings,
                 themeAccentColorHex = persisted.themeAccentColorHex,
                 status = persisted.deviceAuthResult.exceptionOrNull()?.let { error ->
@@ -422,6 +424,7 @@ class MainViewModel(
     private fun stopUiObservationJobs() {
         titleLatencyConfigurationJob?.cancel()
         titleLatencyConfigurationJob = null
+        stopAppConnectionStatusMonitor()
         stopFolderSyncStatusMonitor()
         stopTitleLatencyStatusMonitor()
         stopConnectionRoutesMonitor()
@@ -1168,8 +1171,8 @@ class MainViewModel(
                 setStatus("Enroll this device before checking the connection")
                 return@launch
             }
-            val (result, connectionStatus) = withContext(Dispatchers.IO) {
-                val connectionResult = runCatching {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
                     repository.notifyNetworkChanged(
                         connectionInput = connectionInput,
                         serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
@@ -1182,10 +1185,8 @@ class MainViewModel(
                         clientIdentityJson = clientIdentityJson,
                     )
                 }
-                connectionResult to IronmeshPreferences.getAppConnectionStatus(getApplication())
             }
             uiState.value = uiState.value.copy(
-                appConnectionStatus = connectionStatus,
                 status = result.fold(
                     onSuccess = { "Connection check succeeded" },
                     onFailure = { error -> "Connection check failed: ${error.message}" },
@@ -1504,7 +1505,6 @@ class MainViewModel(
                             runtimeStatus = status,
                             previousStatus = stateSnapshot.globalFolderSyncStatus,
                         ),
-                        appConnectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication()),
                     )
                 }
                 val currentState = uiState.value
@@ -1524,6 +1524,31 @@ class MainViewModel(
     private fun stopFolderSyncStatusMonitor() {
         folderSyncStatusMonitorJob?.cancel()
         folderSyncStatusMonitorJob = null
+    }
+
+    private fun startAppConnectionStatusMonitor() {
+        if (
+            !uiObservationGate.observationJobsActive ||
+            appConnectionStatusMonitorJob?.isActive == true
+        ) {
+            return
+        }
+        appConnectionStatusMonitorJob = viewModelScope.launch {
+            RustPreferencesBridge.appConnectionStatus()
+                .filterNotNull()
+                .collect { connectionStatus ->
+                    if (uiState.value.appConnectionStatus != connectionStatus) {
+                        uiState.value = uiState.value.copy(
+                            appConnectionStatus = connectionStatus,
+                        )
+                    }
+                }
+        }
+    }
+
+    private fun stopAppConnectionStatusMonitor() {
+        appConnectionStatusMonitorJob?.cancel()
+        appConnectionStatusMonitorJob = null
     }
 
     private fun buildGlobalFolderSyncStatus(
