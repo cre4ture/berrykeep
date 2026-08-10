@@ -7,7 +7,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 
 object RustPreferencesBridge {
@@ -84,14 +83,9 @@ object RustPreferencesBridge {
     internal fun appConnectionStatus(): StateFlow<AppConnectionStatus?> =
         requireConnectionStatusStore().status
 
-    /**
-     * Waits until every preceding native update has reached SharedPreferences. This is only called
-     * after the process UI has stopped, so the foreground interaction path remains non-blocking.
-     */
-    internal fun flushAppConnectionStatus() {
-        runBlocking {
-            requireConnectionStatusStore().flush()
-        }
+    /** Waits until every preceding native update has reached SharedPreferences. */
+    internal suspend fun flushAppConnectionStatus() {
+        requireConnectionStatusStore().flush()
     }
 
     internal fun mergeAppConnectionDiagnostics(
