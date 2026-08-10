@@ -1,11 +1,15 @@
 package io.ironmesh.android.data
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -111,6 +115,30 @@ class AppConnectionStatusStoreTest {
         assertEquals(listOf(400L), persistence.saved.map { it.updatedUnixMs })
     }
 
+    @Test
+    fun flushDoesNotReturnBeforeThePersistenceWriteCompletes() = runTest {
+        val saveGate = CompletableDeferred<Unit>()
+        val persistence = FakePersistence(
+            loaded = AppConnectionStatus(),
+            saveGate = saveGate,
+        )
+        val store = newStore(persistence)
+        store.load()
+        runCurrent()
+        store.submitDiagnosticsJson("500")
+        runCurrent()
+
+        val flush = backgroundScope.async { store.flush() }
+        runCurrent()
+        assertFalse(flush.isCompleted)
+
+        saveGate.complete(Unit)
+        runCurrent()
+
+        assertTrue(flush.isCompleted)
+        assertEquals(listOf(500L), persistence.saved.map { it.updatedUnixMs })
+    }
+
     private fun kotlinx.coroutines.test.TestScope.newStore(
         persistence: FakePersistence,
         onTransition: (
@@ -141,12 +169,14 @@ class AppConnectionStatusStoreTest {
 
     private class FakePersistence(
         private val loaded: AppConnectionStatus,
+        private val saveGate: CompletableDeferred<Unit>? = null,
     ) : AppConnectionStatusPersistence {
         val saved = mutableListOf<AppConnectionStatus>()
 
         override suspend fun load(): AppConnectionStatus = loaded
 
         override suspend fun save(status: AppConnectionStatus) {
+            saveGate?.await()
             saved += status
         }
     }

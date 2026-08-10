@@ -1,5 +1,6 @@
 package io.ironmesh.android.data
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -43,7 +44,7 @@ internal class AppConnectionStatusStore(
     private sealed interface Command {
         data object Load : Command
 
-        data object Flush : Command
+        data class Flush(val completed: CompletableDeferred<Unit>) : Command
 
         data class ApplyDiagnostics(val json: String) : Command
     }
@@ -78,10 +79,10 @@ internal class AppConnectionStatusStore(
         }
     }
 
-    fun flush() {
-        check(commands.trySend(Command.Flush).isSuccess) {
-            "App connection status store is unavailable"
-        }
+    suspend fun flush() {
+        val completed = CompletableDeferred<Unit>()
+        commands.send(Command.Flush(completed))
+        completed.await()
     }
 
     private suspend fun processCommands() {
@@ -99,14 +100,18 @@ internal class AppConnectionStatusStore(
 
             when (command) {
                 Command.Load -> Unit
-                Command.Flush -> {
-                    persistSnapshot(
-                        snapshot = PersistenceSnapshot(
-                            sequence = currentSequence,
-                            status = requireNotNull(current),
-                        ),
-                        operation = "flush",
-                    )
+                is Command.Flush -> {
+                    try {
+                        persistSnapshot(
+                            snapshot = PersistenceSnapshot(
+                                sequence = currentSequence,
+                                status = requireNotNull(current),
+                            ),
+                            operation = "flush",
+                        )
+                    } finally {
+                        command.completed.complete(Unit)
+                    }
                 }
                 is Command.ApplyDiagnostics -> {
                     val update = runCatching { decodeUpdate(command.json) }
