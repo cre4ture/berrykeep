@@ -180,10 +180,12 @@ class MainViewModel(
             stopUiObservationJobs()
         }
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { RustPreferencesBridge.flushAppConnectionStatus() }
-                .onFailure { error ->
+            runAppConnectionStatusFlush(
+                flush = RustPreferencesBridge::flushAppConnectionStatus,
+                onFailure = { error ->
                     Log.w("MainViewModel", "Connection status background flush failed", error)
-                }
+                },
+            )
         }
         if (uiState.value.webUiSession != null) {
             webUiSessionBackgroundGrace.scheduleStop()
