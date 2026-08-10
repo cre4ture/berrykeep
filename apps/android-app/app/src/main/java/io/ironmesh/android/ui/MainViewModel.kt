@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
@@ -96,7 +97,7 @@ data class FolderSyncHistoryState(
     val filter: FolderSyncActivityFilter = FolderSyncActivityFilter.ALL,
     val loading: Boolean = false,
     val error: String? = null,
-    val lastLoadedUnixMs: Long = 0L,
+    val lastLoadedElapsedRealtimeMs: Long = 0L,
 )
 
 data class GalleryImageItem(
@@ -214,9 +215,12 @@ class MainViewModel(
     private val repository = IronmeshRepository()
     private var galleryRequestVersion = 0
     private var pinnedGalleryItemIndex: Int? = null
+    private var folderSyncStatusMonitorJob: Job? = null
     private var connectionRoutesMonitorJob: Job? = null
+    private var titleLatencyConfigurationJob: Job? = null
     private var titleLatencyStatusMonitorJob: Job? = null
     private var enrollmentVerificationMonitorJob: Job? = null
+    private var uiObservationActive = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
     var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
@@ -233,15 +237,8 @@ class MainViewModel(
     private var processLifecycleObserverRegistered = false
     private val processLifecycleObserver = LifecycleEventObserver { _, event ->
         when (event) {
-            Lifecycle.Event.ON_START -> {
-                webUiSessionBackgroundGrace.cancelScheduledStop()
-                notifyManagedClientForegrounded()
-            }
-            Lifecycle.Event.ON_STOP -> {
-                if (uiState.value.webUiSession != null) {
-                    webUiSessionBackgroundGrace.scheduleStop()
-                }
-            }
+            Lifecycle.Event.ON_START -> handleProcessStarted()
+            Lifecycle.Event.ON_STOP -> handleProcessStopped()
 
             else -> Unit
         }
@@ -274,10 +271,10 @@ class MainViewModel(
             globalFolderSyncStatus = buildGlobalFolderSyncStatus(
                 state = initialState,
                 runtimeStatus = initialState.folderSyncStatus,
+                previousStatus = null,
             ),
         )
         FolderSyncScheduler.reschedule(getApplication())
-        observeFolderSyncStatus()
         registerProcessLifecycleObserver()
         if (persistedTitleLatencyMonitorSettings.enabled && persistedDeviceAuth.hasClientIdentity()) {
             configureTitleLatencyMonitor()
@@ -289,8 +286,10 @@ class MainViewModel(
         unregisterProcessLifecycleObserver()
         webUiSessionBackgroundGrace.cancelScheduledStop()
         EmbeddedWebUiSessionRegistry.clear()
+        stopUiObservation()
         stopEnrollmentVerificationMonitor()
-        stopTitleLatencyStatusMonitor()
+        titleLatencyConfigurationJob?.cancel()
+        titleLatencyConfigurationJob = null
         repository.stopWebUi()
         super.onCleared()
     }
@@ -319,6 +318,41 @@ class MainViewModel(
         } else {
             mainHandler.post(action)
         }
+    }
+
+    private fun handleProcessStarted() {
+        if (uiObservationActive) {
+            return
+        }
+        webUiSessionBackgroundGrace.cancelScheduledStop()
+        notifyManagedClientForegrounded()
+        startUiObservation()
+    }
+
+    private fun handleProcessStopped() {
+        stopUiObservation()
+        if (uiState.value.webUiSession != null) {
+            webUiSessionBackgroundGrace.scheduleStop()
+        }
+    }
+
+    private fun startUiObservation() {
+        if (uiObservationActive) {
+            return
+        }
+        uiObservationActive = true
+        startFolderSyncStatusMonitor()
+        startTitleLatencyStatusMonitor()
+        if (uiState.value.selectedSection.isConnectionDiagnosticsSection()) {
+            startConnectionRoutesMonitor()
+        }
+    }
+
+    private fun stopUiObservation() {
+        uiObservationActive = false
+        stopFolderSyncStatusMonitor()
+        stopTitleLatencyStatusMonitor()
+        stopConnectionRoutesMonitor()
     }
 
     private fun notifyManagedClientForegrounded() {
@@ -1049,8 +1083,8 @@ class MainViewModel(
         }
         setStatus("Checking app connection")
         viewModelScope.launch {
-            val result = runCatching {
-                withContext(Dispatchers.IO) {
+            val (result, connectionStatus) = withContext(Dispatchers.IO) {
+                val connectionResult = runCatching {
                     repository.notifyNetworkChanged(
                         connectionInput = connectionInput,
                         serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
@@ -1063,8 +1097,8 @@ class MainViewModel(
                         clientIdentityJson = clientIdentityJson,
                     )
                 }
+                connectionResult to IronmeshPreferences.getAppConnectionStatus(getApplication())
             }
-            val connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
             uiState.value = uiState.value.copy(
                 appConnectionStatus = connectionStatus,
                 status = result.fold(
@@ -1352,26 +1386,35 @@ class MainViewModel(
         }
     }
 
-    private fun observeFolderSyncStatus() {
-        viewModelScope.launch {
+    private fun startFolderSyncStatusMonitor() {
+        if (!uiObservationActive || folderSyncStatusMonitorJob?.isActive == true) {
+            return
+        }
+        folderSyncStatusMonitorJob = viewModelScope.launch {
             var historyRefreshTick = 0
             while (isActive) {
-                val status = withContext(Dispatchers.IO) {
-                    runCatching { repository.getContinuousFolderSyncStatus() }
+                val stateSnapshot = uiState.value
+                val result = withContext(Dispatchers.IO) {
+                    val status = runCatching { repository.getContinuousFolderSyncStatus() }
                         .getOrDefault(FolderSyncServiceStatus())
-                }
-                val connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
-                val globalStatus = withContext(Dispatchers.IO) {
-                    buildGlobalFolderSyncStatus(
-                        state = uiState.value,
-                        runtimeStatus = status,
+                    FolderSyncPollResult(
+                        folderSyncStatus = status,
+                        globalFolderSyncStatus = buildGlobalFolderSyncStatus(
+                            state = stateSnapshot,
+                            runtimeStatus = status,
+                            previousStatus = stateSnapshot.globalFolderSyncStatus,
+                        ),
+                        appConnectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication()),
                     )
                 }
-                uiState.value = uiState.value.copy(
-                    folderSyncStatus = status,
-                    globalFolderSyncStatus = globalStatus,
-                    appConnectionStatus = connectionStatus,
-                )
+                val currentState = uiState.value
+                if (
+                    currentState.syncProfiles == stateSnapshot.syncProfiles &&
+                    currentState.deviceAuthState == stateSnapshot.deviceAuthState &&
+                    currentState.globalFolderSyncStatus == stateSnapshot.globalFolderSyncStatus
+                ) {
+                    uiState.value = currentState.withFolderSyncPollResult(result)
+                }
                 historyRefreshTick += 1
                 if (historyRefreshTick >= 5) {
                     historyRefreshTick = 0
@@ -1382,9 +1425,15 @@ class MainViewModel(
         }
     }
 
+    private fun stopFolderSyncStatusMonitor() {
+        folderSyncStatusMonitorJob?.cancel()
+        folderSyncStatusMonitorJob = null
+    }
+
     private fun buildGlobalFolderSyncStatus(
         state: MainUiState,
         runtimeStatus: FolderSyncServiceStatus,
+        previousStatus: GlobalFolderSyncStatus? = state.globalFolderSyncStatus,
     ): GlobalFolderSyncStatus {
         val enabledProfiles = state.syncProfiles.filter { profile -> profile.enabled }
         val enrollmentReady = state.deviceAuthState.hasClientIdentity()
@@ -1401,6 +1450,7 @@ class MainViewModel(
         return mergeGlobalFolderSyncStatus(
             configs = state.syncProfiles,
             runtimeStatus = runtimeStatus,
+            previousStatus = previousStatus,
             blockedProfileCount = blockedProfiles.size,
             blockedReason = blockedProfiles.firstOrNull()?.decision?.reason,
             enrollmentReady = enrollmentReady,
@@ -1486,7 +1536,7 @@ class MainViewModel(
                             nextBeforeId = history.nextBeforeId,
                             loading = false,
                             error = null,
-                            lastLoadedUnixMs = System.currentTimeMillis(),
+                            lastLoadedElapsedRealtimeMs = SystemClock.elapsedRealtime(),
                         )
                     }
                 }
@@ -1514,7 +1564,7 @@ class MainViewModel(
     }
 
     private fun isHistoryStale(historyState: FolderSyncHistoryState): Boolean {
-        return System.currentTimeMillis() - historyState.lastLoadedUnixMs >=
+        return SystemClock.elapsedRealtime() - historyState.lastLoadedElapsedRealtimeMs >=
             FOLDER_SYNC_HISTORY_REFRESH_MS
     }
 
@@ -1744,12 +1794,14 @@ class MainViewModel(
     }
 
     private fun resumeConnectionRoutesMonitorIfNeeded() {
-        if (uiState.value.selectedSection.isConnectionDiagnosticsSection()) {
+        if (uiObservationActive && uiState.value.selectedSection.isConnectionDiagnosticsSection()) {
             startConnectionRoutesMonitor()
         }
     }
 
     private fun configureTitleLatencyMonitor() {
+        titleLatencyConfigurationJob?.cancel()
+        titleLatencyConfigurationJob = null
         stopTitleLatencyStatusMonitor()
 
         val settings = uiState.value.titleLatencyMonitorSettings
@@ -1758,13 +1810,11 @@ class MainViewModel(
         val clientIdentityJson = deviceAuth?.toClientIdentityJson()
 
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-            uiState.value = uiState.value.copy(
-                titleLatencyStatus = TitleLatencyProbeStatus(),
-            )
+            uiState.value = uiState.value.withTitleLatencyPollResult(TitleLatencyProbeStatus())
             return
         }
 
-        titleLatencyStatusMonitorJob = viewModelScope.launch {
+        titleLatencyConfigurationJob = viewModelScope.launch {
             val configured = runCatching {
                 withContext(Dispatchers.IO) {
                     repository.configureTitleLatencyMonitor(
@@ -1782,17 +1832,30 @@ class MainViewModel(
                     error = error.message ?: "Failed to configure the title latency monitor",
                 )
             }
-            uiState.value = uiState.value.copy(titleLatencyStatus = initialStatus)
-            if (configured.isFailure || !settings.enabled) {
-                return@launch
+            uiState.value = uiState.value.withTitleLatencyPollResult(initialStatus)
+            titleLatencyConfigurationJob = null
+            if (configured.isSuccess && settings.enabled) {
+                startTitleLatencyStatusMonitor()
             }
+        }
+    }
 
+    private fun startTitleLatencyStatusMonitor() {
+        if (
+            !uiObservationActive ||
+            !uiState.value.titleLatencyMonitorSettings.enabled ||
+            titleLatencyConfigurationJob?.isActive == true ||
+            titleLatencyStatusMonitorJob?.isActive == true
+        ) {
+            return
+        }
+        titleLatencyStatusMonitorJob = viewModelScope.launch {
             while (isActive) {
                 delay(TITLE_LATENCY_STATUS_POLL_MS)
                 val nextStatus = withContext(Dispatchers.IO) {
                     runCatching { repository.getTitleLatencyStatus() }.getOrNull()
                 } ?: continue
-                uiState.value = uiState.value.copy(titleLatencyStatus = nextStatus)
+                uiState.value = uiState.value.withTitleLatencyPollResult(nextStatus)
             }
         }
     }
@@ -1803,7 +1866,7 @@ class MainViewModel(
     }
 
     private fun startConnectionRoutesMonitor() {
-        if (connectionRoutesMonitorJob?.isActive == true) {
+        if (!uiObservationActive || connectionRoutesMonitorJob?.isActive == true) {
             return
         }
         connectionRoutesMonitorJob = viewModelScope.launch {
@@ -1927,11 +1990,9 @@ class MainViewModel(
             }
         }
             .onSuccess { snapshot ->
-                uiState.value = uiState.value.copy(
-                    connectionRoutes = snapshot,
-                    connectionRoutesLoading = false,
-                    connectionRoutesError = null,
-                    connectionRoutesLastLoadedUnixMs = System.currentTimeMillis(),
+                uiState.value = uiState.value.withConnectionRoutePollResult(
+                    result = snapshot,
+                    loadedAtUnixMs = System.currentTimeMillis(),
                 )
             }
             .onFailure { error ->

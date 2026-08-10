@@ -15,6 +15,20 @@ import androidx.activity.result.ActivityResult
 import androidx.core.content.ContextCompat
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 
+data class AndroidSystemAccessState(
+    val hasPhotoAccess: Boolean = false,
+    val hasWifiNamePermissions: Boolean = false,
+    val isLocationEnabled: Boolean = false,
+)
+
+fun readAndroidSystemAccessState(context: Context): AndroidSystemAccessState {
+    return AndroidSystemAccessState(
+        hasPhotoAccess = missingOriginalPhotoAccessPermissions(context).isEmpty(),
+        hasWifiNamePermissions = missingWifiNameAccessPermissions(context).isEmpty(),
+        isLocationEnabled = isDeviceLocationEnabled(context),
+    )
+}
+
 fun launchFolderPicker(
     launcher: ManagedActivityResultLauncher<Intent, ActivityResult>,
     onError: (String) -> Unit,

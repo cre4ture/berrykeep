@@ -46,9 +46,17 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 
 class MainActivity : ComponentActivity() {
+    private var systemAccessState by mutableStateOf(AndroidSystemAccessState())
+
+    override fun onResume() {
+        super.onResume()
+        refreshSystemAccessState()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        refreshSystemAccessState()
 
         setContent {
             val vm: MainViewModel = viewModel()
@@ -82,6 +90,7 @@ class MainActivity : ComponentActivity() {
                         )
                         vm.setStatus("Photo GPS EXIF may be stripped until photo permissions are granted")
                     }
+                    refreshSystemAccessState()
                 }
                 val wifiNamePermissionLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions(),
@@ -97,6 +106,7 @@ class MainActivity : ComponentActivity() {
                             "Allowed Wi-Fi names need Android Wi-Fi/location access before they can be enforced",
                         )
                     }
+                    refreshSystemAccessState()
                 }
                 val folderPickerLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.StartActivityForResult(),
@@ -150,10 +160,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-                val hasPhotoAccess = missingOriginalPhotoAccessPermissions(context).isEmpty()
-                val hasWifiNamePermissions = missingWifiNameAccessPermissions(context).isEmpty()
-                val isLocationEnabled = isDeviceLocationEnabled(context)
-
                 LaunchedEffect(openWebUiWhenReady, state.loading, state.webUiSession) {
                     if (!openWebUiWhenReady || state.loading) {
                         return@LaunchedEffect
@@ -286,9 +292,9 @@ class MainActivity : ComponentActivity() {
 
                                 MainSection.SETTINGS -> SettingsScreen(
                                     state = state,
-                                    hasPhotoAccess = hasPhotoAccess,
-                                    hasWifiNamePermissions = hasWifiNamePermissions,
-                                    isLocationEnabled = isLocationEnabled,
+                                    hasPhotoAccess = systemAccessState.hasPhotoAccess,
+                                    hasWifiNamePermissions = systemAccessState.hasWifiNamePermissions,
+                                    isLocationEnabled = systemAccessState.isLocationEnabled,
                                     onRequestPhotoAccess = {
                                         requestOriginalPhotoAccessIfNeeded(
                                             context,
@@ -329,6 +335,10 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun refreshSystemAccessState() {
+        systemAccessState = readAndroidSystemAccessState(this)
     }
 
     private fun openWebUi(
