@@ -8,6 +8,7 @@ import io.ironmesh.android.ui.GalleryPageState
 import io.ironmesh.android.ui.GalleryPageStatus
 import io.ironmesh.android.ui.MainUiState
 import io.ironmesh.android.ui.galleryLoadErrorFrom
+import io.ironmesh.android.ui.toLibraryUiState
 import io.ironmesh.android.ui.withGalleryRefreshFailure
 import io.ironmesh.android.ui.withGalleryRefreshStarted
 import org.junit.Assert.assertEquals
@@ -41,7 +42,7 @@ class GalleryPresentationTest {
         assertTrue(refreshing.galleryPages.isEmpty())
         assertEquals(
             GalleryContentPresentation.LOADING,
-            galleryContentPresentation(refreshing),
+            galleryContentPresentation(refreshing.toLibraryUiState()),
         )
     }
 
@@ -57,7 +58,7 @@ class GalleryPresentationTest {
         assertEquals("server unavailable", failed.galleryError?.technicalDetail)
         assertEquals(
             GalleryContentPresentation.LOAD_ERROR,
-            galleryContentPresentation(failed),
+            galleryContentPresentation(failed.toLibraryUiState()),
         )
     }
 
@@ -93,7 +94,7 @@ class GalleryPresentationTest {
 
         assertEquals(
             GalleryContentPresentation.EMPTY_CURRENT_DIRECTORY,
-            galleryContentPresentation(state),
+            galleryContentPresentation(state.toLibraryUiState()),
         )
     }
 }

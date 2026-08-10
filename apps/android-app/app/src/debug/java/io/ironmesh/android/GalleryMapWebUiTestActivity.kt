@@ -7,7 +7,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import io.ironmesh.android.data.EmbeddedWebUiSession
-import io.ironmesh.android.ui.MainUiState
+import io.ironmesh.android.ui.GalleryMapUiState
 import io.ironmesh.android.ui.screens.GalleryMapScreen
 import io.ironmesh.android.ui.theme.IronmeshTheme
 
@@ -28,8 +28,10 @@ class GalleryMapWebUiTestActivity : ComponentActivity() {
             IronmeshTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     GalleryMapScreen(
-                        state = MainUiState(
+                        state = GalleryMapUiState(
                             webUiSession = EmbeddedWebUiSession(url, authorization),
+                            loading = false,
+                            status = "Ready",
                         ),
                         onStartGalleryMap = {},
                     )

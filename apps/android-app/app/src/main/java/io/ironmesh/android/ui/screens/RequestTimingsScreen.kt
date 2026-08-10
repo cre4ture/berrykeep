@@ -23,7 +23,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.data.ConnectionRouteAttemptSnapshot
-import io.ironmesh.android.ui.MainUiState
+import io.ironmesh.android.ui.RequestTimingsUiState
 import io.ironmesh.android.ui.components.HeroTone
 import io.ironmesh.android.ui.components.MetricPill
 import io.ironmesh.android.ui.components.SectionCard
@@ -35,15 +35,15 @@ import kotlin.math.abs
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun RequestTimingsScreen(
-    state: MainUiState,
+    state: RequestTimingsUiState,
     onRefresh: () -> Unit,
     onResetMeasurement: () -> Unit,
     onRunStoreIndexTest: () -> Unit,
 ) {
-    val measurement = timingMeasurementPresentation(state.connectionRoutes)
-    val busy = state.connectionRoutesLoading ||
-        state.timingMeasurementResetting ||
-        state.timingStoreIndexTestRunning
+    val measurement = timingMeasurementPresentation(state.routes)
+    val busy = state.loading ||
+        state.measurementResetting ||
+        state.storeIndexTestRunning
     var expandedRequestStartedAt by rememberSaveable { mutableStateOf<Long?>(null) }
 
     Column(
@@ -55,7 +55,7 @@ fun RequestTimingsScreen(
         StatusHeroCard(
             title = timingHeroTitle(state, measurement.requests.size),
             subtitle = timingHeroSubtitle(state, measurement.requests.size),
-            tone = if (state.connectionRoutesError == null) HeroTone.Neutral else HeroTone.Error,
+            tone = if (state.error == null) HeroTone.Neutral else HeroTone.Error,
         ) {
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -65,13 +65,13 @@ fun RequestTimingsScreen(
                     onClick = onResetMeasurement,
                     enabled = !busy,
                 ) {
-                    Text(if (state.timingMeasurementResetting) "Resetting..." else "Reset measurement")
+                    Text(if (state.measurementResetting) "Resetting..." else "Reset measurement")
                 }
                 Button(
                     onClick = onRunStoreIndexTest,
                     enabled = !busy,
                 ) {
-                    Text(if (state.timingStoreIndexTestRunning) "Running test..." else "Run store-index test")
+                    Text(if (state.storeIndexTestRunning) "Running test..." else "Run store-index test")
                 }
             }
         }
@@ -145,7 +145,7 @@ fun RequestTimingsScreen(
         }
 
         TextButton(onClick = onRefresh, enabled = !busy) {
-            Text(if (state.connectionRoutesLoading) "Refreshing..." else "Refresh snapshot")
+            Text(if (state.loading) "Refreshing..." else "Refresh snapshot")
         }
     }
 }
@@ -237,24 +237,24 @@ private fun TimingDetail(label: String, value: String) {
     )
 }
 
-private fun timingHeroTitle(state: MainUiState, requestCount: Int): String {
+private fun timingHeroTitle(state: RequestTimingsUiState, requestCount: Int): String {
     return when {
-        state.connectionRoutesError != null -> "Timing measurement unavailable"
-        state.timingMeasurementResetting -> "Resetting timing measurement"
-        state.timingStoreIndexTestRunning -> "Running store-index test"
-        requestCount == 0 && state.timingMeasurementStartedUnixMs != null -> "Ready to measure"
+        state.error != null -> "Timing measurement unavailable"
+        state.measurementResetting -> "Resetting timing measurement"
+        state.storeIndexTestRunning -> "Running store-index test"
+        requestCount == 0 && state.measurementStartedUnixMs != null -> "Ready to measure"
         requestCount == 0 -> "No current measurements"
         else -> "$requestCount request(s) captured"
     }
 }
 
-private fun timingHeroSubtitle(state: MainUiState, requestCount: Int): String {
+private fun timingHeroSubtitle(state: RequestTimingsUiState, requestCount: Int): String {
     return when {
-        state.connectionRoutesError != null -> state.connectionRoutesError
-        state.timingMeasurementResetting -> "Clearing recorded requests and starting a new measurement window."
-        state.timingStoreIndexTestRunning -> "Making a read-only store-index request through the app's cached Rust client."
-        requestCount == 0 && state.timingMeasurementStartedUnixMs != null ->
-            "Reset complete at ${formatTimestampMs(state.timingMeasurementStartedUnixMs)}. Run the test or perform the action you want to inspect."
+        state.error != null -> state.error
+        state.measurementResetting -> "Clearing recorded requests and starting a new measurement window."
+        state.storeIndexTestRunning -> "Making a read-only store-index request through the app's cached Rust client."
+        requestCount == 0 && state.measurementStartedUnixMs != null ->
+            "Reset complete at ${formatTimestampMs(state.measurementStartedUnixMs)}. Run the test or perform the action you want to inspect."
         requestCount == 0 ->
             "Reset first when you want to isolate the timing of one action, then run that action."
         else -> "These requests and session counters belong to the current measurement window."

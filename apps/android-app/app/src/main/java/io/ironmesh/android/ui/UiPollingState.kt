@@ -16,7 +16,7 @@ internal fun canApplyFolderSyncPollResult(
     currentState: MainUiState,
 ): Boolean {
     return currentState.syncProfiles == stateSnapshot.syncProfiles &&
-        currentState.deviceAuthState == stateSnapshot.deviceAuthState &&
+        currentState.deviceIdentity == stateSnapshot.deviceIdentity &&
         currentState.globalFolderSyncStatus == stateSnapshot.globalFolderSyncStatus
 }
 

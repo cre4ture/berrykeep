@@ -21,8 +21,8 @@ import io.ironmesh.android.R
 import io.ironmesh.android.data.GLOBAL_SYNC_STATE_ERROR
 import io.ironmesh.android.data.GLOBAL_SYNC_STATE_HEALTHY
 import io.ironmesh.android.data.GLOBAL_SYNC_STATE_WAITING
+import io.ironmesh.android.ui.HomeUiState
 import io.ironmesh.android.ui.MainSection
-import io.ironmesh.android.ui.MainUiState
 import io.ironmesh.android.ui.components.EmptyStateCard
 import io.ironmesh.android.ui.components.HeroTone
 import io.ironmesh.android.ui.components.MetricPill
@@ -32,7 +32,7 @@ import io.ironmesh.android.ui.components.StatusHeroCard
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun HomeScreen(
-    state: MainUiState,
+    state: HomeUiState,
     onRunSyncNow: () -> Unit,
     onRetryConnection: () -> Unit,
     onOpenWebConsole: () -> Unit,
@@ -43,7 +43,7 @@ fun HomeScreen(
     val globalSyncStatus = state.globalFolderSyncStatus
     val connectionStatus = state.appConnectionStatus
     val connectionHealthNow = rememberConnectionHealthNow(connectionStatus)
-    val hasProfiles = state.syncProfiles.isNotEmpty()
+    val hasProfiles = state.syncProfileCount > 0
     val connectionTone = when {
         !isAppConnectionHealthy(connectionStatus, connectionHealthNow) -> HeroTone.Warning
         else -> HeroTone.Good
@@ -73,7 +73,7 @@ fun HomeScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 if (
-                    state.deviceAuthState.hasClientIdentity() &&
+                    state.isEnrolled &&
                     shouldShowRetryConnectionAction(connectionStatus, connectionHealthNow)
                 ) {
                     OutlinedButton(onClick = onRetryConnection) {
@@ -111,7 +111,7 @@ fun HomeScreen(
         ) {
             MetricPill(
                 label = stringResource(R.string.metric_profiles),
-                value = state.syncProfiles.size.toString(),
+                value = state.syncProfileCount.toString(),
             )
             MetricPill(
                 label = stringResource(R.string.metric_last_success),
@@ -186,6 +186,6 @@ fun HomeScreen(
     }
 }
 
-private fun totalUploadedCount(state: MainUiState): Long {
+private fun totalUploadedCount(state: HomeUiState): Long {
     return state.folderSyncStatus.profiles.sumOf { it.metrics.uploadedFileCount }
 }
