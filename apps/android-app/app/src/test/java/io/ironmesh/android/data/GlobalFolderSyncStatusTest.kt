@@ -87,6 +87,57 @@ class GlobalFolderSyncStatusTest {
         assertEquals(123L, status.lastSuccessUnixMs)
     }
 
+    @Test
+    fun unchangedSemanticStatusKeepsItsOriginalUpdateTimestamp() {
+        val first = mergeGlobalFolderSyncStatus(
+            configs = listOf(profile()),
+            runtimeStatus = FolderSyncServiceStatus(
+                updatedUnixMs = 500L,
+                activeProfileCount = 1,
+                runningProfileCount = 1,
+            ),
+            nowUnixMs = 1_000L,
+        )
+
+        val unchanged = mergeGlobalFolderSyncStatus(
+            configs = listOf(profile()),
+            runtimeStatus = FolderSyncServiceStatus(
+                updatedUnixMs = 2_000L,
+                activeProfileCount = 1,
+                runningProfileCount = 1,
+            ),
+            previousStatus = first,
+            nowUnixMs = 3_000L,
+        )
+
+        assertEquals(1_000L, first.updatedUnixMs)
+        assertEquals(first, unchanged)
+    }
+
+    @Test
+    fun semanticStatusChangeAdvancesItsUpdateTimestamp() {
+        val first = mergeGlobalFolderSyncStatus(
+            configs = listOf(profile()),
+            runtimeStatus = FolderSyncServiceStatus(activeProfileCount = 1),
+            nowUnixMs = 1_000L,
+        )
+
+        val changed = mergeGlobalFolderSyncStatus(
+            configs = listOf(profile()),
+            runtimeStatus = FolderSyncServiceStatus(
+                updatedUnixMs = 2_000L,
+                activeProfileCount = 1,
+                syncingProfileCount = 1,
+                currentActivity = "Uploading photo.jpg",
+            ),
+            previousStatus = first,
+            nowUnixMs = 3_000L,
+        )
+
+        assertEquals(GLOBAL_SYNC_STATE_SYNCING, changed.state)
+        assertEquals(3_000L, changed.updatedUnixMs)
+    }
+
     private fun profile(
         id: String = "photos",
         enabled: Boolean = true,

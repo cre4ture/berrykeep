@@ -5,7 +5,9 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.ironmesh.android.ui.MainViewModel
 import io.ironmesh.android.ui.enrollmentVerificationSuccessDetail
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
@@ -108,7 +110,7 @@ class RendezvousCertificateRenewalInstrumentationTest {
     }
 
     @Test
-    fun mainViewModel_reloadsPersistedIdentityBeforeBuildingClientRequests() {
+    fun mainViewModel_reloadsPersistedIdentityBeforeBuildingClientRequests() = runBlocking {
         val scenario = JSONObject(RustClientTestBridge.startRendezvousRenewalScenario())
         val bootstrapJson = scenario.getString("connectionBootstrapJson")
         val expiredClientIdentityJson = scenario.getString("expiredClientIdentityJson")
@@ -120,13 +122,18 @@ class RendezvousCertificateRenewalInstrumentationTest {
         )
         IronmeshPreferences.setDeviceAuthState(appContext, expiredState)
         val viewModel = MainViewModel(application)
+        withTimeout(5_000L) {
+            while (!viewModel.uiState.value.persistedStateLoaded) {
+                delay(10L)
+            }
+        }
 
         val renewedState = expiredState.copy(rendezvousClientIdentityPem = expectedRenewedPem)
         IronmeshPreferences.setDeviceAuthState(appContext, renewedState)
 
-        val method = MainViewModel::class.java.getDeclaredMethod("currentClientIdentityJson")
-        method.isAccessible = true
-        val reloadedIdentityJson = method.invoke(viewModel) as String
+        val reloadedIdentityJson = requireNotNull(
+            viewModel.refreshPersistedDeviceAuthState().toClientIdentityJson(),
+        )
         val reloadedPem = JSONObject(reloadedIdentityJson)
             .getString("rendezvous_client_identity_pem")
             .trim()

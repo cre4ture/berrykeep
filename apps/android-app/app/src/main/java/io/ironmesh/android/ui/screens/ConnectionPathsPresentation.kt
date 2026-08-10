@@ -56,6 +56,27 @@ internal data class ConnectionPathsPresentation(
     val routes: List<ConnectionRouteItem>,
 )
 
+internal fun connectionRouteSnapshotsUiEquivalent(
+    previous: ConnectionRouteSnapshot?,
+    next: ConnectionRouteSnapshot,
+): Boolean {
+    if (previous == null) {
+        return false
+    }
+    if (
+        previous.copy(generatedAtUnixMs = 0L) !=
+        next.copy(generatedAtUnixMs = 0L)
+    ) {
+        return false
+    }
+    return connectionPathsPresentation(previous, error = null).withoutObservationTimestamp() ==
+        connectionPathsPresentation(next, error = null).withoutObservationTimestamp()
+}
+
+private fun ConnectionPathsPresentation.withoutObservationTimestamp(): ConnectionPathsPresentation {
+    return copy(overview = overview.copy(checkedAtUnixMs = null))
+}
+
 internal fun connectionPathsPresentation(
     snapshot: ConnectionRouteSnapshot?,
     error: String?,

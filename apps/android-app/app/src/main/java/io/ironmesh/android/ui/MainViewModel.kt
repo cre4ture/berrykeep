@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
@@ -46,6 +47,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
@@ -96,7 +99,7 @@ data class FolderSyncHistoryState(
     val filter: FolderSyncActivityFilter = FolderSyncActivityFilter.ALL,
     val loading: Boolean = false,
     val error: String? = null,
-    val lastLoadedUnixMs: Long = 0L,
+    val lastLoadedElapsedRealtimeMs: Long = 0L,
 )
 
 data class GalleryImageItem(
@@ -151,6 +154,7 @@ data class GalleryLoadError(
 )
 
 data class MainUiState(
+    val persistedStateLoaded: Boolean = false,
     val deviceAuthState: DeviceAuthState = DeviceAuthState(),
     val bootstrapInput: String = "",
     val deviceLabelInput: String = "",
@@ -204,6 +208,15 @@ private data class TimingDiagnosticsCredentials(
     val clientIdentityJson: String,
 )
 
+private data class PersistedMainUiState(
+    val syncProfiles: List<FolderSyncConfig>,
+    val deviceAuthResult: Result<DeviceAuthState>,
+    val galleryViewMode: GalleryViewMode,
+    val connectionStatus: AppConnectionStatus,
+    val titleLatencyMonitorSettings: TitleLatencyMonitorSettings,
+    val themeAccentColorHex: String,
+)
+
 class MainViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
@@ -214,10 +227,14 @@ class MainViewModel(
     private val repository = IronmeshRepository()
     private var galleryRequestVersion = 0
     private var pinnedGalleryItemIndex: Int? = null
+    private var folderSyncStatusMonitorJob: Job? = null
     private var connectionRoutesMonitorJob: Job? = null
+    private var titleLatencyConfigurationJob: Job? = null
     private var titleLatencyStatusMonitorJob: Job? = null
     private var enrollmentVerificationMonitorJob: Job? = null
+    private val uiObservationGate = UiObservationGate()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val preferenceWriteMutex = Mutex()
 
     var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
         private set
@@ -233,55 +250,16 @@ class MainViewModel(
     private var processLifecycleObserverRegistered = false
     private val processLifecycleObserver = LifecycleEventObserver { _, event ->
         when (event) {
-            Lifecycle.Event.ON_START -> {
-                webUiSessionBackgroundGrace.cancelScheduledStop()
-                notifyManagedClientForegrounded()
-            }
-            Lifecycle.Event.ON_STOP -> {
-                if (uiState.value.webUiSession != null) {
-                    webUiSessionBackgroundGrace.scheduleStop()
-                }
-            }
+            Lifecycle.Event.ON_START -> handleProcessStarted()
+            Lifecycle.Event.ON_STOP -> handleProcessStopped()
 
             else -> Unit
         }
     }
 
     init {
-        val persistedProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication())
-        val persistedDeviceAuthResult = runCatching {
-            IronmeshPreferences.getDeviceAuthState(getApplication())
-        }
-        val persistedDeviceAuth = persistedDeviceAuthResult.getOrDefault(DeviceAuthState())
-        val persistedGalleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication())
-        val persistedConnectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
-        val persistedTitleLatencyMonitorSettings =
-            IronmeshPreferences.getTitleLatencyMonitorSettings(getApplication())
-        val persistedThemeAccentColor = IronmeshPreferences.getThemeAccentColor(getApplication())
-        val initialState = uiState.value.copy(
-            syncProfiles = persistedProfiles,
-            deviceAuthState = persistedDeviceAuth,
-            deviceLabelInput = persistedDeviceAuth.label.orEmpty(),
-            galleryMode = persistedGalleryViewMode,
-            appConnectionStatus = persistedConnectionStatus,
-            titleLatencyMonitorSettings = persistedTitleLatencyMonitorSettings,
-            themeAccentColorHex = persistedThemeAccentColor,
-            status = persistedDeviceAuthResult.exceptionOrNull()?.let { error ->
-                "Device identity unavailable: ${error.message}"
-            } ?: uiState.value.status,
-        )
-        uiState.value = initialState.copy(
-            globalFolderSyncStatus = buildGlobalFolderSyncStatus(
-                state = initialState,
-                runtimeStatus = initialState.folderSyncStatus,
-            ),
-        )
-        FolderSyncScheduler.reschedule(getApplication())
-        observeFolderSyncStatus()
         registerProcessLifecycleObserver()
-        if (persistedTitleLatencyMonitorSettings.enabled && persistedDeviceAuth.hasClientIdentity()) {
-            configureTitleLatencyMonitor()
-        }
+        loadPersistedState()
     }
 
     override fun onCleared() {
@@ -289,8 +267,10 @@ class MainViewModel(
         unregisterProcessLifecycleObserver()
         webUiSessionBackgroundGrace.cancelScheduledStop()
         EmbeddedWebUiSessionRegistry.clear()
+        stopUiObservation()
         stopEnrollmentVerificationMonitor()
-        stopTitleLatencyStatusMonitor()
+        titleLatencyConfigurationJob?.cancel()
+        titleLatencyConfigurationJob = null
         repository.stopWebUi()
         super.onCleared()
     }
@@ -321,15 +301,144 @@ class MainViewModel(
         }
     }
 
-    private fun notifyManagedClientForegrounded() {
-        val deviceAuth = uiState.value.deviceAuthState
-        val connectionInput = deviceAuth.connectionBootstrapJson()
-        val clientIdentityJson = deviceAuth.toClientIdentityJson()
-        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-            return
+    private fun handleProcessStarted() {
+        webUiSessionBackgroundGrace.cancelScheduledStop()
+        if (uiObservationGate.enterForeground() == UiObservationTransition.START) {
+            startUiObservationJobs()
         }
+    }
 
+    private fun handleProcessStopped() {
+        if (uiObservationGate.leaveForeground() == UiObservationTransition.STOP) {
+            stopUiObservationJobs()
+        }
+        if (uiState.value.webUiSession != null) {
+            webUiSessionBackgroundGrace.scheduleStop()
+        }
+    }
+
+    private fun startUiObservationJobs() {
+        notifyManagedClientForegrounded()
+        startFolderSyncStatusMonitor()
+        if (uiState.value.titleLatencyMonitorSettings.enabled) {
+            configureTitleLatencyMonitor()
+        }
+        if (uiState.value.selectedSection.isConnectionDiagnosticsSection()) {
+            startConnectionRoutesMonitor()
+        }
+    }
+
+    private fun loadPersistedState() {
         viewModelScope.launch {
+            val persistedResult = withContext(Dispatchers.IO) {
+                runCatching {
+                    PersistedMainUiState(
+                        syncProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication()),
+                        deviceAuthResult = runCatching {
+                            IronmeshPreferences.getDeviceAuthState(getApplication())
+                        },
+                        galleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication()),
+                        connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication()),
+                        titleLatencyMonitorSettings =
+                            IronmeshPreferences.getTitleLatencyMonitorSettings(getApplication()),
+                        themeAccentColorHex = IronmeshPreferences.getThemeAccentColor(getApplication()),
+                    )
+                }
+            }
+            val persisted = persistedResult.getOrElse { error ->
+                uiState.value = uiState.value.copy(
+                    persistedStateLoaded = true,
+                    status = "App preferences unavailable: ${error.message}",
+                )
+                markPersistedStateLoaded()
+                return@launch
+            }
+            val deviceAuth = persisted.deviceAuthResult.getOrDefault(DeviceAuthState())
+            val loadedState = uiState.value.copy(
+                persistedStateLoaded = true,
+                syncProfiles = persisted.syncProfiles,
+                deviceAuthState = deviceAuth,
+                deviceLabelInput = deviceAuth.label.orEmpty(),
+                galleryMode = persisted.galleryViewMode,
+                appConnectionStatus = persisted.connectionStatus,
+                titleLatencyMonitorSettings = persisted.titleLatencyMonitorSettings,
+                themeAccentColorHex = persisted.themeAccentColorHex,
+                status = persisted.deviceAuthResult.exceptionOrNull()?.let { error ->
+                    "Device identity unavailable: ${error.message}"
+                } ?: uiState.value.status,
+            )
+            val initialState = withContext(Dispatchers.IO) {
+                loadedState.copy(
+                    globalFolderSyncStatus = buildGlobalFolderSyncStatus(
+                        state = loadedState,
+                        runtimeStatus = loadedState.folderSyncStatus,
+                        previousStatus = null,
+                    ),
+                )
+            }
+            uiState.value = initialState
+            persistPreference {
+                FolderSyncScheduler.reschedule(getApplication())
+            }
+            markPersistedStateLoaded()
+        }
+    }
+
+    private fun markPersistedStateLoaded() {
+        if (
+            uiObservationGate.markPersistedStateLoaded() ==
+            UiObservationTransition.START
+        ) {
+            startUiObservationJobs()
+        }
+    }
+
+    private fun persistPreference(write: () -> Unit) {
+        viewModelScope.launch {
+            preferenceWriteMutex.withLock {
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        write()
+                    }
+                }.onFailure { error ->
+                    Log.e("MainViewModel", "Failed to persist app preference", error)
+                }
+            }
+        }
+    }
+
+    private fun persistFolderSyncProfiles(profiles: List<FolderSyncConfig>) {
+        persistPreference {
+            IronmeshPreferences.setFolderSyncConfigs(getApplication(), profiles)
+            FolderSyncScheduler.reschedule(getApplication())
+        }
+    }
+
+    private fun stopUiObservation() {
+        uiObservationGate.leaveForeground()
+        stopUiObservationJobs()
+    }
+
+    private fun stopUiObservationJobs() {
+        titleLatencyConfigurationJob?.cancel()
+        titleLatencyConfigurationJob = null
+        stopFolderSyncStatusMonitor()
+        stopTitleLatencyStatusMonitor()
+        stopConnectionRoutesMonitor()
+    }
+
+    private fun notifyManagedClientForegrounded() {
+        viewModelScope.launch {
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    Log.w("MainViewModel", "Foreground identity refresh failed", error)
+                    return@launch
+                }
+            val connectionInput = deviceAuth.connectionBootstrapJson()
+            val clientIdentityJson = deviceAuth.toClientIdentityJson()
+            if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+                return@launch
+            }
             withContext(Dispatchers.IO) {
                 runCatching {
                     repository.notifyForegrounded(
@@ -362,8 +471,10 @@ class MainViewModel(
 
     fun updateThemeAccentColor(value: String) {
         val normalized = normalizeIronmeshAccentColorHex(value) ?: return
-        IronmeshPreferences.setThemeAccentColor(getApplication(), normalized)
         uiState.value = uiState.value.copy(themeAccentColorHex = normalized)
+        persistPreference {
+            IronmeshPreferences.setThemeAccentColor(getApplication(), normalized)
+        }
     }
 
     fun updateTitleLatencyMonitorEnabled(enabled: Boolean) {
@@ -380,31 +491,33 @@ class MainViewModel(
 
     private fun updateTitleLatencyMonitorSettings(settings: TitleLatencyMonitorSettings) {
         val normalized = settings.normalized()
-        IronmeshPreferences.setTitleLatencyMonitorSettings(getApplication(), normalized)
         uiState.value = uiState.value.copy(titleLatencyMonitorSettings = normalized)
+        persistPreference {
+            IronmeshPreferences.setTitleLatencyMonitorSettings(getApplication(), normalized)
+        }
         configureTitleLatencyMonitor()
     }
 
     fun putObject() {
-        execute("Uploading object...") {
+        execute("Uploading object...") { deviceAuth ->
             val statusCode = repository.putObject(
-                currentConnectionInput(),
+                deviceAuth.connectionBootstrapJson(),
                 uiState.value.key,
                 uiState.value.payload,
-                currentServerCaPem(),
-                currentClientIdentityJson(),
+                deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                deviceAuth.toClientIdentityJson(),
             )
             "PUT ok: HTTP $statusCode"
         }
     }
 
     fun getObject() {
-        execute("Downloading object...") {
+        execute("Downloading object...") { deviceAuth ->
             val body = repository.getObject(
-                currentConnectionInput(),
+                deviceAuth.connectionBootstrapJson(),
                 uiState.value.key,
-                serverCaPem = currentServerCaPem(),
-                clientIdentityJson = currentClientIdentityJson(),
+                serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                clientIdentityJson = deviceAuth.toClientIdentityJson(),
             )
             uiState.value = uiState.value.copy(objectBody = body)
             "GET ok: ${body.length} bytes"
@@ -626,8 +739,9 @@ class MainViewModel(
         uiState.value = uiState.value.withGalleryRefreshStarted()
         viewModelScope.launch {
             runCatching {
+                val deviceAuth = refreshPersistedDeviceAuthState()
                 withContext(Dispatchers.IO) {
-                    loadGalleryState(request)
+                    loadGalleryState(request, deviceAuth)
                 }
             }
                 .onSuccess { snapshot ->
@@ -687,7 +801,6 @@ class MainViewModel(
         if (uiState.value.galleryMode == mode) {
             return
         }
-        IronmeshPreferences.setGalleryViewMode(getApplication(), mode)
         uiState.value = uiState.value.copy(
             galleryMode = mode,
             galleryCollection = null,
@@ -697,6 +810,9 @@ class MainViewModel(
             galleryCurrentDirectoryDocumentId = GALLERY_ROOT_DOCUMENT_ID,
             galleryCurrentDirectoryPath = GALLERY_ROOT_PATH,
         )
+        persistPreference {
+            IronmeshPreferences.setGalleryViewMode(getApplication(), mode)
+        }
         refreshGallery()
     }
 
@@ -865,10 +981,12 @@ class MainViewModel(
 
         viewModelScope.launch {
             runCatching {
+                val deviceAuth = refreshPersistedDeviceAuthState()
                 withContext(Dispatchers.IO) {
                     loadGalleryPage(
                         request = request,
                         pageIndex = pageIndex,
+                        deviceAuth = deviceAuth,
                     )
                 }
             }
@@ -951,7 +1069,6 @@ class MainViewModel(
         )
 
         val updated = uiState.value.syncProfiles + profile
-        IronmeshPreferences.setFolderSyncConfigs(getApplication(), updated)
         uiState.value = uiState.value.copy(
             syncProfiles = updated,
             newSyncLabel = "",
@@ -965,8 +1082,7 @@ class MainViewModel(
             newSyncAllowedWifiSsids = "",
             status = "Added sync profile '${profile.label}'",
         )
-
-        FolderSyncScheduler.reschedule(getApplication())
+        persistFolderSyncProfiles(updated)
         return profile.networkPolicy
     }
 
@@ -974,14 +1090,12 @@ class MainViewModel(
         val updated = uiState.value.syncProfiles.map { profile ->
             if (profile.id == profileId) profile.copy(enabled = enabled) else profile
         }
-        IronmeshPreferences.setFolderSyncConfigs(getApplication(), updated)
         uiState.value = uiState.value.copy(syncProfiles = updated)
-        FolderSyncScheduler.reschedule(getApplication())
+        persistFolderSyncProfiles(updated)
     }
 
     fun removeFolderSyncProfile(profileId: String) {
         val updated = uiState.value.syncProfiles.filterNot { it.id == profileId }
-        IronmeshPreferences.setFolderSyncConfigs(getApplication(), updated)
         val updatedHistory = uiState.value.folderSyncHistory.toMutableMap().apply {
             remove(profileId)
         }
@@ -990,7 +1104,7 @@ class MainViewModel(
             folderSyncHistory = updatedHistory,
             status = "Removed sync profile",
         )
-        FolderSyncScheduler.reschedule(getApplication())
+        persistFolderSyncProfiles(updated)
     }
 
     fun updateFolderSyncProfileNetworkPolicy(
@@ -1012,12 +1126,11 @@ class MainViewModel(
                 profile
             }
         }
-        IronmeshPreferences.setFolderSyncConfigs(getApplication(), updated)
         uiState.value = uiState.value.copy(
             syncProfiles = updated,
             status = "Updated network rules for '${targetProfile.label}'",
         )
-        FolderSyncScheduler.reschedule(getApplication())
+        persistFolderSyncProfiles(updated)
         return true
     }
 
@@ -1042,17 +1155,21 @@ class MainViewModel(
     }
 
     fun retryAppConnection() {
-        val deviceAuth = uiState.value.deviceAuthState
-        val connectionInput = deviceAuth.connectionBootstrapJson()
-        val clientIdentityJson = deviceAuth.toClientIdentityJson()
-        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-            setStatus("Enroll this device before checking the connection")
-            return
-        }
         setStatus("Checking app connection")
         viewModelScope.launch {
-            val result = runCatching {
-                withContext(Dispatchers.IO) {
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    setStatus("Device identity unavailable: ${error.message}")
+                    return@launch
+                }
+            val connectionInput = deviceAuth.connectionBootstrapJson()
+            val clientIdentityJson = deviceAuth.toClientIdentityJson()
+            if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+                setStatus("Enroll this device before checking the connection")
+                return@launch
+            }
+            val (result, connectionStatus) = withContext(Dispatchers.IO) {
+                val connectionResult = runCatching {
                     repository.notifyNetworkChanged(
                         connectionInput = connectionInput,
                         serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
@@ -1065,8 +1182,8 @@ class MainViewModel(
                         clientIdentityJson = clientIdentityJson,
                     )
                 }
+                connectionResult to IronmeshPreferences.getAppConnectionStatus(getApplication())
             }
-            val connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
             uiState.value = uiState.value.copy(
                 appConnectionStatus = connectionStatus,
                 status = result.fold(
@@ -1119,30 +1236,31 @@ class MainViewModel(
             uiState.value = uiState.value.copy(status = "Web UI ready.")
             return
         }
-        val deviceAuth = try {
-            currentDeviceAuthState()
-        } catch (error: DeviceIdentityStorageException) {
-            uiState.value = uiState.value.copy(
-                webUiSession = null,
-                status = "Device identity unavailable: ${error.message}",
-            )
-            return
-        }
-        val connectionInput = deviceAuth.connectionBootstrapJson()
-        val clientIdentityJson = deviceAuth.toClientIdentityJson()
-        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-            uiState.value = uiState.value.copy(
-                webUiSession = null,
-                status = "Enroll this device before opening the Web UI.",
-            )
-            return
-        }
         uiState.value = uiState.value.copy(
             loading = true,
             webUiSession = null,
             status = "Starting Web UI...",
         )
         viewModelScope.launch {
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        webUiSession = null,
+                        status = "Device identity unavailable: ${error.message}",
+                    )
+                    return@launch
+                }
+            val connectionInput = deviceAuth.connectionBootstrapJson()
+            val clientIdentityJson = deviceAuth.toClientIdentityJson()
+            if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+                uiState.value = uiState.value.copy(
+                    loading = false,
+                    webUiSession = null,
+                    status = "Enroll this device before opening the Web UI.",
+                )
+                return@launch
+            }
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     repository.startWebUi(
@@ -1278,6 +1396,7 @@ class MainViewModel(
                     EmbeddedWebUiSessionRegistry.clear()
                     repository.stopWebUi()
                     IronmeshPreferences.setDeviceAuthState(getApplication(), authState)
+                    FolderSyncScheduler.reschedule(getApplication())
                 }
             } catch (error: Throwable) {
                 finishEnrollmentWithError(EnrollmentDiagnosticStepId.SAVE_IDENTITY, error)
@@ -1302,7 +1421,6 @@ class MainViewModel(
                 webUiSession = null,
                 status = "Device enrolled: ${authState.deviceId}",
             )
-            FolderSyncScheduler.reschedule(getApplication())
             if (uiState.value.titleLatencyMonitorSettings.enabled) {
                 configureTitleLatencyMonitor()
             }
@@ -1329,10 +1447,21 @@ class MainViewModel(
         )
     }
 
-    private fun execute(loadingMessage: String, action: suspend () -> String) {
+    private fun execute(
+        loadingMessage: String,
+        action: suspend (DeviceAuthState) -> String,
+    ) {
         uiState.value = uiState.value.copy(loading = true, status = loadingMessage)
         viewModelScope.launch {
-            val result = runCatching { action() }
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        status = "Device identity unavailable: ${error.message}",
+                    )
+                    return@launch
+                }
+            val result = runCatching { action(deviceAuth) }
             runCatching { refreshPersistedDeviceAuthState() }
                 .onFailure { error ->
                     uiState.value = uiState.value.copy(
@@ -1354,26 +1483,34 @@ class MainViewModel(
         }
     }
 
-    private fun observeFolderSyncStatus() {
-        viewModelScope.launch {
+    private fun startFolderSyncStatusMonitor() {
+        if (
+            !uiObservationGate.observationJobsActive ||
+            folderSyncStatusMonitorJob?.isActive == true
+        ) {
+            return
+        }
+        folderSyncStatusMonitorJob = viewModelScope.launch {
             var historyRefreshTick = 0
             while (isActive) {
-                val status = withContext(Dispatchers.IO) {
-                    runCatching { repository.getContinuousFolderSyncStatus() }
+                val stateSnapshot = uiState.value
+                val result = withContext(Dispatchers.IO) {
+                    val status = runCatching { repository.getContinuousFolderSyncStatus() }
                         .getOrDefault(FolderSyncServiceStatus())
-                }
-                val connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
-                val globalStatus = withContext(Dispatchers.IO) {
-                    buildGlobalFolderSyncStatus(
-                        state = uiState.value,
-                        runtimeStatus = status,
+                    FolderSyncPollResult(
+                        folderSyncStatus = status,
+                        globalFolderSyncStatus = buildGlobalFolderSyncStatus(
+                            state = stateSnapshot,
+                            runtimeStatus = status,
+                            previousStatus = stateSnapshot.globalFolderSyncStatus,
+                        ),
+                        appConnectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication()),
                     )
                 }
-                uiState.value = uiState.value.copy(
-                    folderSyncStatus = status,
-                    globalFolderSyncStatus = globalStatus,
-                    appConnectionStatus = connectionStatus,
-                )
+                val currentState = uiState.value
+                if (canApplyFolderSyncPollResult(stateSnapshot, currentState)) {
+                    uiState.value = currentState.withFolderSyncPollResult(result)
+                }
                 historyRefreshTick += 1
                 if (historyRefreshTick >= 5) {
                     historyRefreshTick = 0
@@ -1384,9 +1521,15 @@ class MainViewModel(
         }
     }
 
+    private fun stopFolderSyncStatusMonitor() {
+        folderSyncStatusMonitorJob?.cancel()
+        folderSyncStatusMonitorJob = null
+    }
+
     private fun buildGlobalFolderSyncStatus(
         state: MainUiState,
         runtimeStatus: FolderSyncServiceStatus,
+        previousStatus: GlobalFolderSyncStatus? = state.globalFolderSyncStatus,
     ): GlobalFolderSyncStatus {
         val enabledProfiles = state.syncProfiles.filter { profile -> profile.enabled }
         val enrollmentReady = state.deviceAuthState.hasClientIdentity()
@@ -1403,6 +1546,7 @@ class MainViewModel(
         return mergeGlobalFolderSyncStatus(
             configs = state.syncProfiles,
             runtimeStatus = runtimeStatus,
+            previousStatus = previousStatus,
             blockedProfileCount = blockedProfiles.size,
             blockedReason = blockedProfiles.firstOrNull()?.decision?.reason,
             enrollmentReady = enrollmentReady,
@@ -1442,8 +1586,18 @@ class MainViewModel(
         } else {
             existing.records.size.coerceAtLeast(FOLDER_SYNC_HISTORY_PAGE_SIZE)
         }
-        val connectionInput = runCatching { currentConnectionInput() }
-            .getOrElse { error ->
+        updateFolderSyncHistoryState(profileId) { historyState ->
+            historyState.copy(
+                expanded = true,
+                loading = true,
+                error = null,
+            )
+        }
+
+        viewModelScope.launch {
+            val connectionInput = runCatching {
+                refreshPersistedDeviceAuthState().connectionBootstrapJson()
+            }.getOrElse { error ->
                 updateFolderSyncHistoryState(profileId) { historyState ->
                     historyState.copy(
                         expanded = true,
@@ -1454,17 +1608,8 @@ class MainViewModel(
                 uiState.value = uiState.value.copy(
                     status = "Device identity unavailable: ${error.message}",
                 )
-                return
+                return@launch
             }
-        updateFolderSyncHistoryState(profileId) { historyState ->
-            historyState.copy(
-                expanded = true,
-                loading = true,
-                error = null,
-            )
-        }
-
-        viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
                     repository.getFolderSyncModificationHistory(
@@ -1488,7 +1633,7 @@ class MainViewModel(
                             nextBeforeId = history.nextBeforeId,
                             loading = false,
                             error = null,
-                            lastLoadedUnixMs = System.currentTimeMillis(),
+                            lastLoadedElapsedRealtimeMs = SystemClock.elapsedRealtime(),
                         )
                     }
                 }
@@ -1516,7 +1661,7 @@ class MainViewModel(
     }
 
     private fun isHistoryStale(historyState: FolderSyncHistoryState): Boolean {
-        return System.currentTimeMillis() - historyState.lastLoadedUnixMs >=
+        return SystemClock.elapsedRealtime() - historyState.lastLoadedElapsedRealtimeMs >=
             FOLDER_SYNC_HISTORY_REFRESH_MS
     }
 
@@ -1551,23 +1696,31 @@ class MainViewModel(
         )
     }
 
-    private suspend fun loadGalleryState(request: GalleryRequest): GalleryLoadSnapshot {
+    private suspend fun loadGalleryState(
+        request: GalleryRequest,
+        deviceAuth: DeviceAuthState,
+    ): GalleryLoadSnapshot {
         return when (request.mode) {
-            GalleryViewMode.FLATTENED_ALL_IMAGES -> loadFlattenedGalleryState(request)
-            GalleryViewMode.CURRENT_DIRECTORY -> loadCurrentDirectoryGalleryState(request)
+            GalleryViewMode.FLATTENED_ALL_IMAGES ->
+                loadFlattenedGalleryState(request, deviceAuth)
+            GalleryViewMode.CURRENT_DIRECTORY ->
+                loadCurrentDirectoryGalleryState(request, deviceAuth)
         }
     }
 
-    private suspend fun loadFlattenedGalleryState(request: GalleryRequest): GalleryLoadSnapshot {
+    private suspend fun loadFlattenedGalleryState(
+        request: GalleryRequest,
+        deviceAuth: DeviceAuthState,
+    ): GalleryLoadSnapshot {
         val firstPage = repository.storeIndexImagePage(
-            connectionInput = currentConnectionInput(),
+            connectionInput = deviceAuth.connectionBootstrapJson(),
             prefix = null,
             depth = GALLERY_FLATTENED_DEPTH,
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
-            serverCaPem = currentServerCaPem(),
-            clientIdentityJson = currentClientIdentityJson(),
+            serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+            clientIdentityJson = deviceAuth.toClientIdentityJson(),
         )
         val items = firstPage.entries.mapNotNull(::galleryImageItemFromEntry)
         val totalItemCount = firstPage.total_entry_count.coerceAtLeast(items.size)
@@ -1586,24 +1739,30 @@ class MainViewModel(
         )
     }
 
-    private suspend fun loadCurrentDirectoryGalleryState(request: GalleryRequest): GalleryLoadSnapshot {
+    private suspend fun loadCurrentDirectoryGalleryState(
+        request: GalleryRequest,
+        deviceAuth: DeviceAuthState,
+    ): GalleryLoadSnapshot {
+        val connectionInput = deviceAuth.connectionBootstrapJson()
+        val serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() }
+        val clientIdentityJson = deviceAuth.toClientIdentityJson()
         val prefix = galleryPrefixForPath(request.currentDirectoryPath)
         val listing = repository.storeIndexDirectoryListing(
-            connectionInput = currentConnectionInput(),
+            connectionInput = connectionInput,
             prefix = prefix,
             depth = 1,
-            serverCaPem = currentServerCaPem(),
-            clientIdentityJson = currentClientIdentityJson(),
+            serverCaPem = serverCaPem,
+            clientIdentityJson = clientIdentityJson,
         )
         val firstPage = repository.storeIndexImagePage(
-            connectionInput = currentConnectionInput(),
+            connectionInput = connectionInput,
             prefix = prefix,
             depth = 1,
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
-            serverCaPem = currentServerCaPem(),
-            clientIdentityJson = currentClientIdentityJson(),
+            serverCaPem = serverCaPem,
+            clientIdentityJson = clientIdentityJson,
         )
         val directories = listing.entries.mapNotNull(::galleryDirectoryItemFromEntry)
         val items = firstPage.entries.mapNotNull(::galleryImageItemFromEntry)
@@ -1627,11 +1786,12 @@ class MainViewModel(
     private suspend fun loadGalleryPage(
         request: GalleryRequest,
         pageIndex: Int,
+        deviceAuth: DeviceAuthState,
     ): StoreIndexResponse {
         val pageSize = request.pageSize.coerceAtLeast(1)
         val offset = pageIndex.coerceAtLeast(0) * pageSize
         return repository.storeIndexImagePage(
-            connectionInput = currentConnectionInput(),
+            connectionInput = deviceAuth.connectionBootstrapJson(),
             prefix = when (request.mode) {
                 GalleryViewMode.FLATTENED_ALL_IMAGES -> null
                 GalleryViewMode.CURRENT_DIRECTORY -> galleryPrefixForPath(request.currentDirectoryPath)
@@ -1643,33 +1803,19 @@ class MainViewModel(
             offset = offset,
             limit = pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
-            serverCaPem = currentServerCaPem(),
-            clientIdentityJson = currentClientIdentityJson(),
+            serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+            clientIdentityJson = deviceAuth.toClientIdentityJson(),
         )
     }
 
-    private fun refreshPersistedDeviceAuthState(): DeviceAuthState {
-        val persisted = IronmeshPreferences.getDeviceAuthState(getApplication())
+    internal suspend fun refreshPersistedDeviceAuthState(): DeviceAuthState {
+        val persisted = withContext(Dispatchers.IO) {
+            IronmeshPreferences.getDeviceAuthState(getApplication())
+        }
         if (persisted != uiState.value.deviceAuthState) {
             uiState.value = uiState.value.copy(deviceAuthState = persisted)
         }
         return persisted
-    }
-
-    private fun currentDeviceAuthState(): DeviceAuthState {
-        return refreshPersistedDeviceAuthState()
-    }
-
-    private fun currentClientIdentityJson(): String? {
-        return currentDeviceAuthState().toClientIdentityJson()
-    }
-
-    private fun currentConnectionInput(): String {
-        return currentDeviceAuthState().connectionBootstrapJson()
-    }
-
-    private fun currentServerCaPem(): String? {
-        return currentDeviceAuthState().serverCaPem?.takeIf { it.isNotBlank() }
     }
 
     private fun runTimingDiagnosticsOperation(
@@ -1681,7 +1827,19 @@ class MainViewModel(
         stopConnectionRoutesMonitor()
         uiState.value = markInProgress(uiState.value)
         viewModelScope.launch {
-            val credentials = timingDiagnosticsCredentialsOrNull(actionDescription) ?: run {
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    uiState.value = uiState.value.copy(
+                        connectionRoutesError = error.message,
+                        status = "Device identity unavailable: ${error.message}",
+                    )
+                    finishTimingDiagnosticsOperation()
+                    return@launch
+                }
+            val credentials = timingDiagnosticsCredentialsOrNull(
+                actionDescription = actionDescription,
+                deviceAuth = deviceAuth,
+            ) ?: run {
                 finishTimingDiagnosticsOperation()
                 return@launch
             }
@@ -1706,8 +1864,8 @@ class MainViewModel(
 
     private fun timingDiagnosticsCredentialsOrNull(
         actionDescription: String,
+        deviceAuth: DeviceAuthState,
     ): TimingDiagnosticsCredentials? {
-        val deviceAuth = timingDiagnosticsDeviceAuthOrNull() ?: return null
         val connectionInput = deviceAuth.connectionBootstrapJson()
         val clientIdentityJson = deviceAuth.toClientIdentityJson()
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
@@ -1725,18 +1883,6 @@ class MainViewModel(
         )
     }
 
-    private fun timingDiagnosticsDeviceAuthOrNull(): DeviceAuthState? {
-        return try {
-            currentDeviceAuthState()
-        } catch (error: DeviceIdentityStorageException) {
-            uiState.value = uiState.value.copy(
-                connectionRoutesError = error.message,
-                status = "Device identity unavailable: ${error.message}",
-            )
-            null
-        }
-    }
-
     private fun finishTimingDiagnosticsOperation() {
         uiState.value = uiState.value.copy(
             timingMeasurementResetting = false,
@@ -1746,27 +1892,39 @@ class MainViewModel(
     }
 
     private fun resumeConnectionRoutesMonitorIfNeeded() {
-        if (uiState.value.selectedSection.isConnectionDiagnosticsSection()) {
+        if (
+            uiObservationGate.observationJobsActive &&
+            uiState.value.selectedSection.isConnectionDiagnosticsSection()
+        ) {
             startConnectionRoutesMonitor()
         }
     }
 
     private fun configureTitleLatencyMonitor() {
+        titleLatencyConfigurationJob?.cancel()
+        titleLatencyConfigurationJob = null
         stopTitleLatencyStatusMonitor()
 
         val settings = uiState.value.titleLatencyMonitorSettings
-        val deviceAuth = runCatching { currentDeviceAuthState() }.getOrNull()
-        val connectionInput = deviceAuth?.connectionBootstrapJson().orEmpty()
-        val clientIdentityJson = deviceAuth?.toClientIdentityJson()
-
-        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-            uiState.value = uiState.value.copy(
-                titleLatencyStatus = TitleLatencyProbeStatus(),
-            )
-            return
-        }
-
-        titleLatencyStatusMonitorJob = viewModelScope.launch {
+        titleLatencyConfigurationJob = viewModelScope.launch {
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    uiState.value = uiState.value.withTitleLatencyPollResult(
+                        TitleLatencyProbeStatus(
+                            state = "failed",
+                            error = error.message ?: "Device identity is unavailable",
+                        ),
+                    )
+                    titleLatencyConfigurationJob = null
+                    return@launch
+                }
+            val connectionInput = deviceAuth.connectionBootstrapJson()
+            val clientIdentityJson = deviceAuth.toClientIdentityJson()
+            if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+                uiState.value = uiState.value.withTitleLatencyPollResult(TitleLatencyProbeStatus())
+                titleLatencyConfigurationJob = null
+                return@launch
+            }
             val configured = runCatching {
                 withContext(Dispatchers.IO) {
                     repository.configureTitleLatencyMonitor(
@@ -1777,6 +1935,9 @@ class MainViewModel(
                     )
                 }
             }
+            if (!isActive) {
+                return@launch
+            }
 
             val initialStatus = configured.getOrElse { error ->
                 TitleLatencyProbeStatus(
@@ -1784,17 +1945,30 @@ class MainViewModel(
                     error = error.message ?: "Failed to configure the title latency monitor",
                 )
             }
-            uiState.value = uiState.value.copy(titleLatencyStatus = initialStatus)
-            if (configured.isFailure || !settings.enabled) {
-                return@launch
+            uiState.value = uiState.value.withTitleLatencyPollResult(initialStatus)
+            titleLatencyConfigurationJob = null
+            if (configured.isSuccess && settings.enabled) {
+                startTitleLatencyStatusMonitor()
             }
+        }
+    }
 
+    private fun startTitleLatencyStatusMonitor() {
+        if (
+            !uiObservationGate.observationJobsActive ||
+            !uiState.value.titleLatencyMonitorSettings.enabled ||
+            titleLatencyConfigurationJob?.isActive == true ||
+            titleLatencyStatusMonitorJob?.isActive == true
+        ) {
+            return
+        }
+        titleLatencyStatusMonitorJob = viewModelScope.launch {
             while (isActive) {
                 delay(TITLE_LATENCY_STATUS_POLL_MS)
                 val nextStatus = withContext(Dispatchers.IO) {
                     runCatching { repository.getTitleLatencyStatus() }.getOrNull()
                 } ?: continue
-                uiState.value = uiState.value.copy(titleLatencyStatus = nextStatus)
+                uiState.value = uiState.value.withTitleLatencyPollResult(nextStatus)
             }
         }
     }
@@ -1805,7 +1979,10 @@ class MainViewModel(
     }
 
     private fun startConnectionRoutesMonitor() {
-        if (connectionRoutesMonitorJob?.isActive == true) {
+        if (
+            !uiObservationGate.observationJobsActive ||
+            connectionRoutesMonitorJob?.isActive == true
+        ) {
             return
         }
         connectionRoutesMonitorJob = viewModelScope.launch {
@@ -1888,7 +2065,7 @@ class MainViewModel(
         statusOnFailure: Boolean,
     ) {
         val deviceAuth = try {
-            currentDeviceAuthState()
+            refreshPersistedDeviceAuthState()
         } catch (error: DeviceIdentityStorageException) {
             uiState.value = uiState.value.copy(
                 connectionRoutesLoading = false,
@@ -1929,11 +2106,9 @@ class MainViewModel(
             }
         }
             .onSuccess { snapshot ->
-                uiState.value = uiState.value.copy(
-                    connectionRoutes = snapshot,
-                    connectionRoutesLoading = false,
-                    connectionRoutesError = null,
-                    connectionRoutesLastLoadedUnixMs = System.currentTimeMillis(),
+                uiState.value = uiState.value.withConnectionRoutePollResult(
+                    result = snapshot,
+                    loadedAtUnixMs = System.currentTimeMillis(),
                 )
             }
             .onFailure { error ->

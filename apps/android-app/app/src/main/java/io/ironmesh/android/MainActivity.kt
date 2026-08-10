@@ -11,6 +11,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -22,6 +25,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
@@ -46,9 +51,17 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 
 class MainActivity : ComponentActivity() {
+    private var systemAccessState by mutableStateOf(AndroidSystemAccessState())
+
+    override fun onResume() {
+        super.onResume()
+        refreshSystemAccessState()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        refreshSystemAccessState()
 
         setContent {
             val vm: MainViewModel = viewModel()
@@ -82,6 +95,7 @@ class MainActivity : ComponentActivity() {
                         )
                         vm.setStatus("Photo GPS EXIF may be stripped until photo permissions are granted")
                     }
+                    refreshSystemAccessState()
                 }
                 val wifiNamePermissionLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions(),
@@ -97,6 +111,7 @@ class MainActivity : ComponentActivity() {
                             "Allowed Wi-Fi names need Android Wi-Fi/location access before they can be enforced",
                         )
                     }
+                    refreshSystemAccessState()
                 }
                 val folderPickerLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.StartActivityForResult(),
@@ -150,10 +165,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-                val hasPhotoAccess = missingOriginalPhotoAccessPermissions(context).isEmpty()
-                val hasWifiNamePermissions = missingWifiNameAccessPermissions(context).isEmpty()
-                val isLocationEnabled = isDeviceLocationEnabled(context)
-
                 LaunchedEffect(openWebUiWhenReady, state.loading, state.webUiSession) {
                     if (!openWebUiWhenReady || state.loading) {
                         return@LaunchedEffect
@@ -185,7 +196,20 @@ class MainActivity : ComponentActivity() {
                     snackbarHostState.showSnackbar(state.status)
                 }
 
-                if (!state.deviceAuthState.hasClientIdentity()) {
+                if (!state.persistedStateLoaded) {
+                    Scaffold(
+                        snackbarHost = { SnackbarHost(snackbarHostState) },
+                    ) { contentPadding ->
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(contentPadding),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            CircularProgressIndicator()
+                        }
+                    }
+                } else if (!state.deviceAuthState.hasClientIdentity()) {
                     Scaffold(
                         snackbarHost = { SnackbarHost(snackbarHostState) },
                     ) { _ ->
@@ -286,9 +310,9 @@ class MainActivity : ComponentActivity() {
 
                                 MainSection.SETTINGS -> SettingsScreen(
                                     state = state,
-                                    hasPhotoAccess = hasPhotoAccess,
-                                    hasWifiNamePermissions = hasWifiNamePermissions,
-                                    isLocationEnabled = isLocationEnabled,
+                                    hasPhotoAccess = systemAccessState.hasPhotoAccess,
+                                    hasWifiNamePermissions = systemAccessState.hasWifiNamePermissions,
+                                    isLocationEnabled = systemAccessState.isLocationEnabled,
                                     onRequestPhotoAccess = {
                                         requestOriginalPhotoAccessIfNeeded(
                                             context,
@@ -329,6 +353,10 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun refreshSystemAccessState() {
+        systemAccessState = readAndroidSystemAccessState(this)
     }
 
     private fun openWebUi(

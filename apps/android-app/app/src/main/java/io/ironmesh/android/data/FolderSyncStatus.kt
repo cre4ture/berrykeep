@@ -45,6 +45,7 @@ data class GlobalFolderSyncStatus(
 fun mergeGlobalFolderSyncStatus(
     configs: List<FolderSyncConfig>,
     runtimeStatus: FolderSyncServiceStatus,
+    previousStatus: GlobalFolderSyncStatus? = null,
     blockedProfileCount: Int = 0,
     blockedReason: String? = null,
     enrollmentReady: Boolean = true,
@@ -58,7 +59,6 @@ fun mergeGlobalFolderSyncStatus(
         .coerceIn(0, enabledCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
         .toLong()
     val common = GlobalFolderSyncStatus(
-        updatedUnixMs = maxOf(nowUnixMs, runtimeStatus.updatedUnixMs),
         configuredProfileCount = configuredCount,
         enabledProfileCount = enabledCount,
         activeProfileCount = runtimeStatus.activeProfileCount,
@@ -68,7 +68,7 @@ fun mergeGlobalFolderSyncStatus(
         lastSuccessUnixMs = runtimeStatus.lastSuccessUnixMs,
     )
 
-    return when {
+    val merged = when {
         configuredCount == 0L -> common.copy(
             state = GLOBAL_SYNC_STATE_NOT_CONFIGURED,
             message = "No sync profiles are configured",
@@ -132,6 +132,15 @@ fun mergeGlobalFolderSyncStatus(
             message = "Starting ${enabledCount - runtimeStatus.activeProfileCount} sync profile(s)",
         )
     }
+    val statusChanged = previousStatus == null ||
+        merged.copy(updatedUnixMs = 0L) != previousStatus.copy(updatedUnixMs = 0L)
+    return merged.copy(
+        updatedUnixMs = if (statusChanged) {
+            maxOf(nowUnixMs, runtimeStatus.updatedUnixMs)
+        } else {
+            requireNotNull(previousStatus).updatedUnixMs
+        },
+    )
 }
 
 data class FolderSyncProfileStatus(

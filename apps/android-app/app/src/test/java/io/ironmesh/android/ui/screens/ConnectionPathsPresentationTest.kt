@@ -3,6 +3,7 @@ package io.ironmesh.android.ui.screens
 import io.ironmesh.android.data.ConnectionRouteEndpointSnapshot
 import io.ironmesh.android.data.ConnectionRouteSnapshot
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -208,6 +209,30 @@ class ConnectionPathsPresentationTest {
         assertEquals(ConnectionOverviewState.AVAILABLE, presentation.overview.state)
         assertEquals(0, presentation.overview.activeRouteCount)
         assertEquals(ConnectionRouteState.AVAILABLE, presentation.routes.single().state)
+    }
+
+    @Test
+    fun ignoresSnapshotTimeWhileTheVisibleRouteStateIsUnchanged() {
+        val route = endpoint(index = 0, lastUsedUnixMs = 900L, totalSuccesses = 1L)
+        val previous = ConnectionRouteSnapshot(
+            generatedAtUnixMs = 1_000L,
+            endpoints = listOf(route),
+        )
+        val next = previous.copy(generatedAtUnixMs = 1_500L)
+
+        assertTrue(connectionRouteSnapshotsUiEquivalent(previous, next))
+    }
+
+    @Test
+    fun observesSnapshotTimeWhenItChangesTheVisibleRouteState() {
+        val route = endpoint(index = 0, lastUsedUnixMs = 900L, totalSuccesses = 1L)
+        val active = ConnectionRouteSnapshot(
+            generatedAtUnixMs = 1_000L,
+            endpoints = listOf(route),
+        )
+        val expired = active.copy(generatedAtUnixMs = 3_001L)
+
+        assertFalse(connectionRouteSnapshotsUiEquivalent(active, expired))
     }
 
     @Test
