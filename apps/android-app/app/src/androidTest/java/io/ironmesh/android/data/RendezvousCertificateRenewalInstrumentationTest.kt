@@ -139,10 +139,12 @@ class RendezvousCertificateRenewalInstrumentationTest {
             .trim()
 
         assertEquals(expectedRenewedPem, reloadedPem)
-        assertEquals(
-            expectedRenewedPem,
-            viewModel.uiState.value.deviceAuthState.rendezvousClientIdentityPem,
-        )
+        val uiIdentity = viewModel.uiState.value.deviceIdentity
+        assertEquals(renewedState.clusterId, uiIdentity.clusterId)
+        assertEquals(renewedState.deviceId, uiIdentity.deviceId)
+        assertEquals(renewedState.label, uiIdentity.label)
+        assertTrue(uiIdentity.isEnrolled)
+        assertTrue(!viewModel.uiState.value.toString().contains(expectedRenewedPem))
     }
 
     private fun deviceAuthState(

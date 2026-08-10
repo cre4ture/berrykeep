@@ -36,7 +36,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.BuildConfig
 import io.ironmesh.android.R
-import io.ironmesh.android.ui.MainUiState
+import io.ironmesh.android.ui.SettingsUiState
 import io.ironmesh.android.ui.components.PermissionExplainerCard
 import io.ironmesh.android.ui.components.SectionCard
 import io.ironmesh.android.ui.theme.DEFAULT_IRONMESH_ACCENT_COLOR_HEX
@@ -48,7 +48,7 @@ import kotlin.math.roundToInt
 
 @Composable
 fun SettingsScreen(
-    state: MainUiState,
+    state: SettingsUiState,
     hasPhotoAccess: Boolean,
     hasWifiNamePermissions: Boolean,
     isLocationEnabled: Boolean,
@@ -92,10 +92,10 @@ fun SettingsScreen(
     ) {
         SectionCard(
             title = stringResource(R.string.settings_device),
-            supportingText = state.deviceAuthState.deviceId.ifBlank { "This phone is not enrolled yet." },
+            supportingText = state.deviceIdentity.deviceId.ifBlank { "This phone is not enrolled yet." },
         ) {
             Text(
-                text = state.deviceAuthState.label.orEmpty().ifBlank { "No device label set" },
+                text = state.deviceIdentity.label.orEmpty().ifBlank { "No device label set" },
                 style = MaterialTheme.typography.bodyLarge,
             )
         }

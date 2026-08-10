@@ -36,6 +36,8 @@ import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainViewModel
+import io.ironmesh.android.ui.LibraryScreenActions
+import io.ironmesh.android.ui.SyncScreenActions
 import io.ironmesh.android.ui.components.IronmeshAppShell
 import io.ironmesh.android.ui.screens.ConnectionPathsScreen
 import io.ironmesh.android.ui.screens.HomeScreen
@@ -46,6 +48,14 @@ import io.ironmesh.android.ui.screens.RequestTimingsScreen
 import io.ironmesh.android.ui.screens.SettingsScreen
 import io.ironmesh.android.ui.screens.SyncScreen
 import io.ironmesh.android.ui.theme.IronmeshTheme
+import io.ironmesh.android.ui.toConnectivityUiState
+import io.ironmesh.android.ui.toGalleryMapUiState
+import io.ironmesh.android.ui.toHomeUiState
+import io.ironmesh.android.ui.toLibraryUiState
+import io.ironmesh.android.ui.toOnboardingUiState
+import io.ironmesh.android.ui.toRequestTimingsUiState
+import io.ironmesh.android.ui.toSettingsUiState
+import io.ironmesh.android.ui.toSyncUiState
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -66,6 +76,42 @@ class MainActivity : ComponentActivity() {
         setContent {
             val vm: MainViewModel = viewModel()
             val state by vm.uiState
+            val syncActions = remember(vm) {
+                SyncScreenActions(
+                    runNow = vm::runFolderSyncNow,
+                    updateNewProfileLabel = vm::updateNewSyncLabel,
+                    updateNewProfilePrefix = vm::updateNewSyncPrefix,
+                    updateNewProfileLocalFolder = vm::updateNewSyncLocalFolder,
+                    updateNewProfileAllowWifi = vm::updateNewSyncAllowWifi,
+                    updateNewProfileAllowCellular = vm::updateNewSyncAllowCellular,
+                    updateNewProfileAllowOtherConnections = vm::updateNewSyncAllowOtherConnections,
+                    updateNewProfileAllowRoaming = vm::updateNewSyncAllowRoaming,
+                    updateNewProfileAllowedWifiSsids = vm::updateNewSyncAllowedWifiSsids,
+                    addProfile = vm::addFolderSyncProfile,
+                    toggleHistory = vm::toggleFolderSyncHistory,
+                    setProfileEnabled = vm::setFolderSyncProfileEnabled,
+                    removeProfile = vm::removeFolderSyncProfile,
+                    setHistoryFilter = vm::setFolderSyncHistoryFilter,
+                    loadMoreHistory = vm::loadMoreFolderSyncHistory,
+                    updateProfileNetworkPolicy = vm::updateFolderSyncProfileNetworkPolicy,
+                )
+            }
+            val libraryActions = remember(vm) {
+                LibraryScreenActions(
+                    updateVisiblePages = vm::updateVisibleGalleryPages,
+                    refresh = vm::refreshGallery,
+                    updateViewMode = vm::updateGalleryViewMode,
+                    updateSort = vm::updateGallerySort,
+                    navigateToRoot = vm::navigateGalleryToRoot,
+                    navigateUp = vm::navigateGalleryUp,
+                    navigateToBreadcrumb = vm::navigateGalleryToBreadcrumb,
+                    openDirectory = vm::openGalleryDirectory,
+                    retryPage = vm::retryGalleryPage,
+                    itemAt = vm::galleryItemAt,
+                    ensureItemLoaded = vm::ensureGalleryItemLoaded,
+                    pinItem = vm::pinGalleryItem,
+                )
+            }
             IronmeshTheme(accentColorHex = state.themeAccentColorHex) {
                 val context = LocalContext.current
                 val snackbarHostState = remember { SnackbarHostState() }
@@ -155,13 +201,16 @@ class MainActivity : ComponentActivity() {
                         policy = policy,
                     )
                 }
-                val onOpenWebConsole: () -> Unit = {
-                    if (!state.loading) {
-                        state.webUiSession?.let { session ->
-                            openWebUi(session, vm::setStatus)
-                        } ?: run {
-                            openWebUiWhenReady = true
-                            vm.startWebUi()
+                val onOpenWebConsole: () -> Unit = remember(vm) {
+                    {
+                        val currentState = vm.uiState.value
+                        if (!currentState.loading) {
+                            currentState.webUiSession?.let { session ->
+                                openWebUi(session, vm::setStatus)
+                            } ?: run {
+                                openWebUiWhenReady = true
+                                vm.startWebUi()
+                            }
                         }
                     }
                 }
@@ -209,12 +258,12 @@ class MainActivity : ComponentActivity() {
                             CircularProgressIndicator()
                         }
                     }
-                } else if (!state.deviceAuthState.hasClientIdentity()) {
+                } else if (!state.deviceIdentity.isEnrolled) {
                     Scaffold(
                         snackbarHost = { SnackbarHost(snackbarHostState) },
                     ) { _ ->
                         OnboardingScreen(
-                            state = state,
+                            state = state.toOnboardingUiState(),
                             onDeviceLabelChange = vm::updateDeviceLabelInput,
                             onBootstrapInputChange = vm::updateBootstrapInput,
                             onScanQr = onScanQr,
@@ -226,7 +275,7 @@ class MainActivity : ComponentActivity() {
                         selectedSection = state.selectedSection,
                         onSelectSection = vm::selectSection,
                         snackbarHostState = snackbarHostState,
-                        deviceLabel = state.deviceAuthState.label,
+                        deviceLabel = state.deviceIdentity.label,
                         titleLatencyStatus = state.titleLatencyStatus,
                         onOpenConnectionDiagnostics = {
                             vm.selectSection(MainSection.CONNECTIVITY)
@@ -271,7 +320,7 @@ class MainActivity : ComponentActivity() {
                         Box(modifier = contentModifier) {
                             when (state.selectedSection) {
                                 MainSection.HOME -> HomeScreen(
-                                    state = state,
+                                    state = state.toHomeUiState(),
                                     onRunSyncNow = vm::runFolderSyncNow,
                                     onRetryConnection = vm::retryAppConnection,
                                     onOpenWebConsole = onOpenWebConsole,
@@ -280,36 +329,36 @@ class MainActivity : ComponentActivity() {
                                 )
 
                                 MainSection.CONNECTIVITY -> ConnectionPathsScreen(
-                                    state = state,
+                                    state = state.toConnectivityUiState(),
                                     onRefresh = vm::refreshConnectionRoutes,
                                 )
 
                                 MainSection.REQUEST_TIMINGS -> RequestTimingsScreen(
-                                    state = state,
+                                    state = state.toRequestTimingsUiState(),
                                     onRefresh = vm::refreshConnectionRoutes,
                                     onResetMeasurement = vm::resetTimingMeasurement,
                                     onRunStoreIndexTest = vm::runTimingStoreIndexTest,
                                 )
 
                                 MainSection.SYNC -> SyncScreen(
-                                    state = state,
-                                    vm = vm,
+                                    state = state.toSyncUiState(),
+                                    actions = syncActions,
                                     onPickLocalFolder = onPickLocalFolder,
                                     onEnsureWifiNameAccess = onEnsureWifiNameAccess,
                                 )
 
                                 MainSection.LIBRARY -> LibraryScreen(
-                                    state = state,
-                                    vm = vm,
+                                    state = state.toLibraryUiState(),
+                                    actions = libraryActions,
                                 )
 
                                 MainSection.GALLERY_MAP -> GalleryMapScreen(
-                                    state = state,
+                                    state = state.toGalleryMapUiState(),
                                     onStartGalleryMap = vm::startWebUi,
                                 )
 
                                 MainSection.SETTINGS -> SettingsScreen(
-                                    state = state,
+                                    state = state.toSettingsUiState(),
                                     hasPhotoAccess = systemAccessState.hasPhotoAccess,
                                     hasWifiNamePermissions = systemAccessState.hasWifiNamePermissions,
                                     isLocationEnabled = systemAccessState.isLocationEnabled,
