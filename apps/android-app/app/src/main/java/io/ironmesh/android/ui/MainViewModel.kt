@@ -46,6 +46,7 @@ import io.ironmesh.android.work.FolderSyncExecutionCoordinator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -213,6 +214,7 @@ private data class TimingDiagnosticsCredentials(
 private data class PersistedMainUiState(
     val syncProfiles: List<FolderSyncConfig>,
     val deviceAuthResult: Result<DeviceAuthState>,
+    val appConnectionStatus: AppConnectionStatus,
     val galleryViewMode: GalleryViewMode,
     val titleLatencyMonitorSettings: TitleLatencyMonitorSettings,
     val themeAccentColorHex: String,
@@ -346,6 +348,9 @@ class MainViewModel(
                         deviceAuthResult = runCatching {
                             IronmeshPreferences.getDeviceAuthState(getApplication())
                         },
+                        appConnectionStatus = RustPreferencesBridge.appConnectionStatus()
+                            .filterNotNull()
+                            .first(),
                         galleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication()),
                         titleLatencyMonitorSettings =
                             IronmeshPreferences.getTitleLatencyMonitorSettings(getApplication()),
@@ -367,6 +372,7 @@ class MainViewModel(
                 syncProfiles = persisted.syncProfiles,
                 deviceAuthState = deviceAuth,
                 deviceLabelInput = deviceAuth.label.orEmpty(),
+                appConnectionStatus = persisted.appConnectionStatus,
                 galleryMode = persisted.galleryViewMode,
                 titleLatencyMonitorSettings = persisted.titleLatencyMonitorSettings,
                 themeAccentColorHex = persisted.themeAccentColorHex,
