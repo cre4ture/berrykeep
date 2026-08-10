@@ -1486,11 +1486,7 @@ class MainViewModel(
                     )
                 }
                 val currentState = uiState.value
-                if (
-                    currentState.syncProfiles == stateSnapshot.syncProfiles &&
-                    currentState.deviceAuthState == stateSnapshot.deviceAuthState &&
-                    currentState.globalFolderSyncStatus == stateSnapshot.globalFolderSyncStatus
-                ) {
+                if (canApplyFolderSyncPollResult(stateSnapshot, currentState)) {
                     uiState.value = currentState.withFolderSyncPollResult(result)
                 }
                 historyRefreshTick += 1

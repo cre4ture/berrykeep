@@ -13,6 +13,16 @@ internal data class FolderSyncPollResult(
     val appConnectionStatus: AppConnectionStatus,
 )
 
+internal fun canApplyFolderSyncPollResult(
+    stateSnapshot: MainUiState,
+    currentState: MainUiState,
+): Boolean {
+    return currentState.syncProfiles == stateSnapshot.syncProfiles &&
+        currentState.deviceAuthState == stateSnapshot.deviceAuthState &&
+        currentState.globalFolderSyncStatus == stateSnapshot.globalFolderSyncStatus &&
+        currentState.appConnectionStatus == stateSnapshot.appConnectionStatus
+}
+
 internal fun MainUiState.withFolderSyncPollResult(result: FolderSyncPollResult): MainUiState {
     val stableFolderSyncStatus = result.folderSyncStatus.withStableTimestampFrom(folderSyncStatus)
     if (
