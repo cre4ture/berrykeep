@@ -430,14 +430,17 @@ class MainViewModel(
     }
 
     private fun notifyManagedClientForegrounded() {
-        val deviceAuth = uiState.value.deviceAuthState
-        val connectionInput = deviceAuth.connectionBootstrapJson()
-        val clientIdentityJson = deviceAuth.toClientIdentityJson()
-        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-            return
-        }
-
         viewModelScope.launch {
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    Log.w("MainViewModel", "Foreground identity refresh failed", error)
+                    return@launch
+                }
+            val connectionInput = deviceAuth.connectionBootstrapJson()
+            val clientIdentityJson = deviceAuth.toClientIdentityJson()
+            if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+                return@launch
+            }
             withContext(Dispatchers.IO) {
                 runCatching {
                     repository.notifyForegrounded(
@@ -498,25 +501,25 @@ class MainViewModel(
     }
 
     fun putObject() {
-        execute("Uploading object...") {
+        execute("Uploading object...") { deviceAuth ->
             val statusCode = repository.putObject(
-                currentConnectionInput(),
+                deviceAuth.connectionBootstrapJson(),
                 uiState.value.key,
                 uiState.value.payload,
-                currentServerCaPem(),
-                currentClientIdentityJson(),
+                deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                deviceAuth.toClientIdentityJson(),
             )
             "PUT ok: HTTP $statusCode"
         }
     }
 
     fun getObject() {
-        execute("Downloading object...") {
+        execute("Downloading object...") { deviceAuth ->
             val body = repository.getObject(
-                currentConnectionInput(),
+                deviceAuth.connectionBootstrapJson(),
                 uiState.value.key,
-                serverCaPem = currentServerCaPem(),
-                clientIdentityJson = currentClientIdentityJson(),
+                serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                clientIdentityJson = deviceAuth.toClientIdentityJson(),
             )
             uiState.value = uiState.value.copy(objectBody = body)
             "GET ok: ${body.length} bytes"
@@ -736,8 +739,9 @@ class MainViewModel(
         uiState.value = uiState.value.withGalleryRefreshStarted()
         viewModelScope.launch {
             runCatching {
+                val deviceAuth = refreshPersistedDeviceAuthState()
                 withContext(Dispatchers.IO) {
-                    loadGalleryState(request)
+                    loadGalleryState(request, deviceAuth)
                 }
             }
                 .onSuccess { snapshot ->
@@ -977,10 +981,12 @@ class MainViewModel(
 
         viewModelScope.launch {
             runCatching {
+                val deviceAuth = refreshPersistedDeviceAuthState()
                 withContext(Dispatchers.IO) {
                     loadGalleryPage(
                         request = request,
                         pageIndex = pageIndex,
+                        deviceAuth = deviceAuth,
                     )
                 }
             }
@@ -1149,15 +1155,19 @@ class MainViewModel(
     }
 
     fun retryAppConnection() {
-        val deviceAuth = uiState.value.deviceAuthState
-        val connectionInput = deviceAuth.connectionBootstrapJson()
-        val clientIdentityJson = deviceAuth.toClientIdentityJson()
-        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-            setStatus("Enroll this device before checking the connection")
-            return
-        }
         setStatus("Checking app connection")
         viewModelScope.launch {
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    setStatus("Device identity unavailable: ${error.message}")
+                    return@launch
+                }
+            val connectionInput = deviceAuth.connectionBootstrapJson()
+            val clientIdentityJson = deviceAuth.toClientIdentityJson()
+            if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+                setStatus("Enroll this device before checking the connection")
+                return@launch
+            }
             val (result, connectionStatus) = withContext(Dispatchers.IO) {
                 val connectionResult = runCatching {
                     repository.notifyNetworkChanged(
@@ -1226,30 +1236,31 @@ class MainViewModel(
             uiState.value = uiState.value.copy(status = "Web UI ready.")
             return
         }
-        val deviceAuth = try {
-            currentDeviceAuthState()
-        } catch (error: DeviceIdentityStorageException) {
-            uiState.value = uiState.value.copy(
-                webUiSession = null,
-                status = "Device identity unavailable: ${error.message}",
-            )
-            return
-        }
-        val connectionInput = deviceAuth.connectionBootstrapJson()
-        val clientIdentityJson = deviceAuth.toClientIdentityJson()
-        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-            uiState.value = uiState.value.copy(
-                webUiSession = null,
-                status = "Enroll this device before opening the Web UI.",
-            )
-            return
-        }
         uiState.value = uiState.value.copy(
             loading = true,
             webUiSession = null,
             status = "Starting Web UI...",
         )
         viewModelScope.launch {
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        webUiSession = null,
+                        status = "Device identity unavailable: ${error.message}",
+                    )
+                    return@launch
+                }
+            val connectionInput = deviceAuth.connectionBootstrapJson()
+            val clientIdentityJson = deviceAuth.toClientIdentityJson()
+            if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+                uiState.value = uiState.value.copy(
+                    loading = false,
+                    webUiSession = null,
+                    status = "Enroll this device before opening the Web UI.",
+                )
+                return@launch
+            }
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     repository.startWebUi(
@@ -1436,10 +1447,21 @@ class MainViewModel(
         )
     }
 
-    private fun execute(loadingMessage: String, action: suspend () -> String) {
+    private fun execute(
+        loadingMessage: String,
+        action: suspend (DeviceAuthState) -> String,
+    ) {
         uiState.value = uiState.value.copy(loading = true, status = loadingMessage)
         viewModelScope.launch {
-            val result = runCatching { action() }
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        status = "Device identity unavailable: ${error.message}",
+                    )
+                    return@launch
+                }
+            val result = runCatching { action(deviceAuth) }
             runCatching { refreshPersistedDeviceAuthState() }
                 .onFailure { error ->
                     uiState.value = uiState.value.copy(
@@ -1564,8 +1586,18 @@ class MainViewModel(
         } else {
             existing.records.size.coerceAtLeast(FOLDER_SYNC_HISTORY_PAGE_SIZE)
         }
-        val connectionInput = runCatching { currentConnectionInput() }
-            .getOrElse { error ->
+        updateFolderSyncHistoryState(profileId) { historyState ->
+            historyState.copy(
+                expanded = true,
+                loading = true,
+                error = null,
+            )
+        }
+
+        viewModelScope.launch {
+            val connectionInput = runCatching {
+                refreshPersistedDeviceAuthState().connectionBootstrapJson()
+            }.getOrElse { error ->
                 updateFolderSyncHistoryState(profileId) { historyState ->
                     historyState.copy(
                         expanded = true,
@@ -1576,17 +1608,8 @@ class MainViewModel(
                 uiState.value = uiState.value.copy(
                     status = "Device identity unavailable: ${error.message}",
                 )
-                return
+                return@launch
             }
-        updateFolderSyncHistoryState(profileId) { historyState ->
-            historyState.copy(
-                expanded = true,
-                loading = true,
-                error = null,
-            )
-        }
-
-        viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
                     repository.getFolderSyncModificationHistory(
@@ -1673,23 +1696,31 @@ class MainViewModel(
         )
     }
 
-    private suspend fun loadGalleryState(request: GalleryRequest): GalleryLoadSnapshot {
+    private suspend fun loadGalleryState(
+        request: GalleryRequest,
+        deviceAuth: DeviceAuthState,
+    ): GalleryLoadSnapshot {
         return when (request.mode) {
-            GalleryViewMode.FLATTENED_ALL_IMAGES -> loadFlattenedGalleryState(request)
-            GalleryViewMode.CURRENT_DIRECTORY -> loadCurrentDirectoryGalleryState(request)
+            GalleryViewMode.FLATTENED_ALL_IMAGES ->
+                loadFlattenedGalleryState(request, deviceAuth)
+            GalleryViewMode.CURRENT_DIRECTORY ->
+                loadCurrentDirectoryGalleryState(request, deviceAuth)
         }
     }
 
-    private suspend fun loadFlattenedGalleryState(request: GalleryRequest): GalleryLoadSnapshot {
+    private suspend fun loadFlattenedGalleryState(
+        request: GalleryRequest,
+        deviceAuth: DeviceAuthState,
+    ): GalleryLoadSnapshot {
         val firstPage = repository.storeIndexImagePage(
-            connectionInput = currentConnectionInput(),
+            connectionInput = deviceAuth.connectionBootstrapJson(),
             prefix = null,
             depth = GALLERY_FLATTENED_DEPTH,
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
-            serverCaPem = currentServerCaPem(),
-            clientIdentityJson = currentClientIdentityJson(),
+            serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+            clientIdentityJson = deviceAuth.toClientIdentityJson(),
         )
         val items = firstPage.entries.mapNotNull(::galleryImageItemFromEntry)
         val totalItemCount = firstPage.total_entry_count.coerceAtLeast(items.size)
@@ -1708,24 +1739,30 @@ class MainViewModel(
         )
     }
 
-    private suspend fun loadCurrentDirectoryGalleryState(request: GalleryRequest): GalleryLoadSnapshot {
+    private suspend fun loadCurrentDirectoryGalleryState(
+        request: GalleryRequest,
+        deviceAuth: DeviceAuthState,
+    ): GalleryLoadSnapshot {
+        val connectionInput = deviceAuth.connectionBootstrapJson()
+        val serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() }
+        val clientIdentityJson = deviceAuth.toClientIdentityJson()
         val prefix = galleryPrefixForPath(request.currentDirectoryPath)
         val listing = repository.storeIndexDirectoryListing(
-            connectionInput = currentConnectionInput(),
+            connectionInput = connectionInput,
             prefix = prefix,
             depth = 1,
-            serverCaPem = currentServerCaPem(),
-            clientIdentityJson = currentClientIdentityJson(),
+            serverCaPem = serverCaPem,
+            clientIdentityJson = clientIdentityJson,
         )
         val firstPage = repository.storeIndexImagePage(
-            connectionInput = currentConnectionInput(),
+            connectionInput = connectionInput,
             prefix = prefix,
             depth = 1,
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
-            serverCaPem = currentServerCaPem(),
-            clientIdentityJson = currentClientIdentityJson(),
+            serverCaPem = serverCaPem,
+            clientIdentityJson = clientIdentityJson,
         )
         val directories = listing.entries.mapNotNull(::galleryDirectoryItemFromEntry)
         val items = firstPage.entries.mapNotNull(::galleryImageItemFromEntry)
@@ -1749,11 +1786,12 @@ class MainViewModel(
     private suspend fun loadGalleryPage(
         request: GalleryRequest,
         pageIndex: Int,
+        deviceAuth: DeviceAuthState,
     ): StoreIndexResponse {
         val pageSize = request.pageSize.coerceAtLeast(1)
         val offset = pageIndex.coerceAtLeast(0) * pageSize
         return repository.storeIndexImagePage(
-            connectionInput = currentConnectionInput(),
+            connectionInput = deviceAuth.connectionBootstrapJson(),
             prefix = when (request.mode) {
                 GalleryViewMode.FLATTENED_ALL_IMAGES -> null
                 GalleryViewMode.CURRENT_DIRECTORY -> galleryPrefixForPath(request.currentDirectoryPath)
@@ -1765,12 +1803,12 @@ class MainViewModel(
             offset = offset,
             limit = pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
-            serverCaPem = currentServerCaPem(),
-            clientIdentityJson = currentClientIdentityJson(),
+            serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+            clientIdentityJson = deviceAuth.toClientIdentityJson(),
         )
     }
 
-    private suspend fun refreshPersistedDeviceAuthState(): DeviceAuthState {
+    internal suspend fun refreshPersistedDeviceAuthState(): DeviceAuthState {
         val persisted = withContext(Dispatchers.IO) {
             IronmeshPreferences.getDeviceAuthState(getApplication())
         }
@@ -1778,22 +1816,6 @@ class MainViewModel(
             uiState.value = uiState.value.copy(deviceAuthState = persisted)
         }
         return persisted
-    }
-
-    private fun currentDeviceAuthState(): DeviceAuthState {
-        return uiState.value.deviceAuthState
-    }
-
-    private fun currentClientIdentityJson(): String? {
-        return currentDeviceAuthState().toClientIdentityJson()
-    }
-
-    private fun currentConnectionInput(): String {
-        return currentDeviceAuthState().connectionBootstrapJson()
-    }
-
-    private fun currentServerCaPem(): String? {
-        return currentDeviceAuthState().serverCaPem?.takeIf { it.isNotBlank() }
     }
 
     private fun runTimingDiagnosticsOperation(
@@ -1805,7 +1827,19 @@ class MainViewModel(
         stopConnectionRoutesMonitor()
         uiState.value = markInProgress(uiState.value)
         viewModelScope.launch {
-            val credentials = timingDiagnosticsCredentialsOrNull(actionDescription) ?: run {
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    uiState.value = uiState.value.copy(
+                        connectionRoutesError = error.message,
+                        status = "Device identity unavailable: ${error.message}",
+                    )
+                    finishTimingDiagnosticsOperation()
+                    return@launch
+                }
+            val credentials = timingDiagnosticsCredentialsOrNull(
+                actionDescription = actionDescription,
+                deviceAuth = deviceAuth,
+            ) ?: run {
                 finishTimingDiagnosticsOperation()
                 return@launch
             }
@@ -1830,8 +1864,8 @@ class MainViewModel(
 
     private fun timingDiagnosticsCredentialsOrNull(
         actionDescription: String,
+        deviceAuth: DeviceAuthState,
     ): TimingDiagnosticsCredentials? {
-        val deviceAuth = timingDiagnosticsDeviceAuthOrNull() ?: return null
         val connectionInput = deviceAuth.connectionBootstrapJson()
         val clientIdentityJson = deviceAuth.toClientIdentityJson()
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
@@ -1847,18 +1881,6 @@ class MainViewModel(
             serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
             clientIdentityJson = clientIdentityJson,
         )
-    }
-
-    private fun timingDiagnosticsDeviceAuthOrNull(): DeviceAuthState? {
-        return try {
-            currentDeviceAuthState()
-        } catch (error: DeviceIdentityStorageException) {
-            uiState.value = uiState.value.copy(
-                connectionRoutesError = error.message,
-                status = "Device identity unavailable: ${error.message}",
-            )
-            null
-        }
     }
 
     private fun finishTimingDiagnosticsOperation() {
@@ -1884,16 +1906,25 @@ class MainViewModel(
         stopTitleLatencyStatusMonitor()
 
         val settings = uiState.value.titleLatencyMonitorSettings
-        val deviceAuth = runCatching { currentDeviceAuthState() }.getOrNull()
-        val connectionInput = deviceAuth?.connectionBootstrapJson().orEmpty()
-        val clientIdentityJson = deviceAuth?.toClientIdentityJson()
-
-        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-            uiState.value = uiState.value.withTitleLatencyPollResult(TitleLatencyProbeStatus())
-            return
-        }
-
         titleLatencyConfigurationJob = viewModelScope.launch {
+            val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
+                .getOrElse { error ->
+                    uiState.value = uiState.value.withTitleLatencyPollResult(
+                        TitleLatencyProbeStatus(
+                            state = "failed",
+                            error = error.message ?: "Device identity is unavailable",
+                        ),
+                    )
+                    titleLatencyConfigurationJob = null
+                    return@launch
+                }
+            val connectionInput = deviceAuth.connectionBootstrapJson()
+            val clientIdentityJson = deviceAuth.toClientIdentityJson()
+            if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+                uiState.value = uiState.value.withTitleLatencyPollResult(TitleLatencyProbeStatus())
+                titleLatencyConfigurationJob = null
+                return@launch
+            }
             val configured = runCatching {
                 withContext(Dispatchers.IO) {
                     repository.configureTitleLatencyMonitor(
@@ -2031,7 +2062,7 @@ class MainViewModel(
         statusOnFailure: Boolean,
     ) {
         val deviceAuth = try {
-            currentDeviceAuthState()
+            refreshPersistedDeviceAuthState()
         } catch (error: DeviceIdentityStorageException) {
             uiState.value = uiState.value.copy(
                 connectionRoutesLoading = false,
