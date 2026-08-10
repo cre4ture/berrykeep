@@ -147,6 +147,7 @@ fun LibraryScreen(
         val listState = rememberLazyListState()
         val pageCount = state.collection?.pageCount ?: 0
         val showDetails = clampedColumns < 3
+        val contentPresentation = galleryContentPresentation(state)
 
         LaunchedEffect(listState, pageCount) {
             snapshotFlow {
@@ -179,11 +180,13 @@ fun LibraryScreen(
                 ),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            item(key = "gallery-hint") {
-                Text(
-                    text = "Pinch the gallery to change thumbnail density.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
+            if (contentPresentation == GalleryContentPresentation.CONTENT) {
+                item(key = "gallery-hint") {
+                    Text(
+                        text = "Pinch the gallery to change thumbnail density.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
             }
 
             item(key = "gallery-controls") {
@@ -277,7 +280,7 @@ fun LibraryScreen(
                 }
             }
 
-            when (galleryContentPresentation(state)) {
+            when (contentPresentation) {
                 GalleryContentPresentation.LOADING -> {
                     item(key = "gallery-loading") {
                         CircularProgressIndicator()
