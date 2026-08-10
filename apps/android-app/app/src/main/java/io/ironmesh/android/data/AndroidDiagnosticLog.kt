@@ -2,6 +2,7 @@ package io.ironmesh.android.data
 
 import java.io.PrintWriter
 import java.io.StringWriter
+import java.io.Writer
 import java.time.Instant
 import java.time.format.DateTimeFormatter
 import java.util.ArrayDeque
@@ -13,22 +14,70 @@ internal data class AndroidDiagnosticLogEntry(
     val message: String,
 )
 
+private data class RetainedAndroidDiagnosticLogEntry(
+    val renderedText: String,
+    val utf8Bytes: Int,
+)
+
 internal class AndroidDiagnosticLogBuffer(
-    private val maxEntries: Int,
+    maxEntries: Int,
+    maxTotalBytes: Int = DEFAULT_MAX_TOTAL_BYTES,
+    maxEntryBytes: Int = DEFAULT_MAX_ENTRY_BYTES,
 ) {
-    private val entries = ArrayDeque<AndroidDiagnosticLogEntry>()
+    private val maxEntries = maxEntries.coerceAtLeast(1)
+    private val maxTotalBytes = maxTotalBytes.coerceAtLeast(1)
+    private val maxEntryBytes = maxEntryBytes.coerceIn(1, this.maxTotalBytes)
+    private val entries = ArrayDeque<RetainedAndroidDiagnosticLogEntry>()
+    private var retainedUtf8Bytes = 0L
 
     @Synchronized
     fun push(entry: AndroidDiagnosticLogEntry) {
-        entries.addLast(entry)
-        while (entries.size > maxEntries.coerceAtLeast(1)) {
-            entries.removeFirst()
+        val retainedEntry = retainEntry(entry)
+        entries.addLast(retainedEntry)
+        retainedUtf8Bytes += retainedEntry.utf8Bytes
+        while (entries.size > maxEntries || retainedUtf8Bytes > maxTotalBytes) {
+            retainedUtf8Bytes -= entries.removeFirst().utf8Bytes
         }
     }
 
-    @Synchronized
-    fun renderText(): String = entries.joinToString(separator = "\n", postfix = if (entries.isEmpty()) "" else "\n") {
-        "${formatDiagnosticTimestamp(it.timestampUnixMs)} ${it.level}/${it.tag}: ${it.message}"
+    /**
+     * Writes a stable capture-order snapshot without holding the buffer lock during I/O.
+     * The snapshot only copies references to immutable, already-bounded strings.
+     */
+    fun writeTo(writer: Writer): Boolean {
+        val snapshot = synchronized(this) { entries.toList() }
+        snapshot.forEach { entry ->
+            writer.write(entry.renderedText)
+            writer.write("\n")
+        }
+        return snapshot.isNotEmpty()
+    }
+
+    internal fun renderText(): String = StringWriter().also(::writeTo).toString()
+
+    private fun retainEntry(entry: AndroidDiagnosticLogEntry): RetainedAndroidDiagnosticLogEntry {
+        val writer = Utf8TruncatingWriter(maxEntryBytes - NEWLINE_UTF8_BYTES)
+        writer.write(formatDiagnosticTimestamp(entry.timestampUnixMs))
+        writer.write(" ")
+        writer.write(entry.level)
+        writer.write("/")
+        writer.write(entry.tag)
+        writer.write(": ")
+        writer.write(entry.message)
+        val renderedText = writer.result()
+        return RetainedAndroidDiagnosticLogEntry(
+            renderedText = renderedText,
+            utf8Bytes = utf8Length(renderedText) + NEWLINE_UTF8_BYTES,
+        )
+    }
+
+    companion object {
+        // Four MiB retains useful history while giving the app a predictable export-size ceiling.
+        internal const val DEFAULT_MAX_TOTAL_BYTES = 4 * 1024 * 1024
+
+        // A single exception must not consume the entire buffer; 64 KiB still carries long stack traces.
+        internal const val DEFAULT_MAX_ENTRY_BYTES = 64 * 1024
+        private const val NEWLINE_UTF8_BYTES = 1
     }
 }
 
@@ -48,7 +97,7 @@ object AndroidDiagnosticLog {
     fun e(tag: String, message: String, error: Throwable? = null): Int =
         record("ERROR", tag, message, error) { android.util.Log.e(tag, message, error) }
 
-    fun renderText(): String = buffer.renderText()
+    fun writeTo(writer: Writer): Boolean = buffer.writeTo(writer)
 
     private fun record(
         level: String,
@@ -57,54 +106,36 @@ object AndroidDiagnosticLog {
         error: Throwable?,
         androidLog: () -> Int,
     ): Int {
-        val detail = if (error == null) {
-            message
-        } else {
-            "$message\n${error.stackTraceText()}"
-        }
         buffer.push(
             AndroidDiagnosticLogEntry(
                 timestampUnixMs = System.currentTimeMillis(),
                 level = level,
                 tag = tag,
-                message = detail,
+                message = boundedDiagnosticMessage(
+                    message = message,
+                    error = error,
+                    maxBytes = AndroidDiagnosticLogBuffer.DEFAULT_MAX_ENTRY_BYTES,
+                ),
             ),
         )
         return androidLog()
     }
 }
 
-internal fun buildAndroidDiagnosticLogExport(
-    generatedAtUnixMs: Long,
-    metadata: List<Pair<String, String>>,
-    applicationLog: String,
-    rustLog: String,
-): String = buildString {
-    appendLine("BerryKeep mobile diagnostic log")
-    appendLine("Generated: ${formatDiagnosticTimestamp(generatedAtUnixMs)}")
-    appendLine("This file can contain server addresses, device identifiers, paths, and error details.")
-    metadata.forEach { (key, value) ->
-        appendLine("$key: ${value.replace('\n', ' ')}")
+internal fun boundedDiagnosticMessage(
+    message: String,
+    error: Throwable?,
+    maxBytes: Int,
+): String {
+    val writer = Utf8TruncatingWriter(maxBytes.coerceAtLeast(0))
+    writer.write(message)
+    if (error != null) {
+        writer.write("\n")
+        PrintWriter(writer).use { printWriter -> error.printStackTrace(printWriter) }
     }
-    appendLine()
-    appendLine("=== Android application log ===")
-    append(applicationLog.ifBlank { "(no Android application entries retained)\n" })
-    if (!endsWith('\n')) {
-        appendLine()
-    }
-    appendLine()
-    appendLine("=== Rust tracing log ===")
-    append(rustLog.ifBlank { "(no Rust tracing entries retained)\n" })
-    if (!endsWith('\n')) {
-        appendLine()
-    }
+    val result = writer.result()
+    return if (error == null) result else result.trimEnd()
 }
 
-private fun Throwable.stackTraceText(): String {
-    val writer = StringWriter()
-    PrintWriter(writer).use { printWriter -> printStackTrace(printWriter) }
-    return writer.toString().trimEnd()
-}
-
-private fun formatDiagnosticTimestamp(timestampUnixMs: Long): String =
+internal fun formatDiagnosticTimestamp(timestampUnixMs: Long): String =
     DateTimeFormatter.ISO_INSTANT.format(Instant.ofEpochMilli(timestampUnixMs))
