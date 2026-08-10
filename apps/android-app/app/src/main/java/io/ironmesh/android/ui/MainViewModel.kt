@@ -314,7 +314,12 @@ class MainViewModel(
         if (uiObservationGate.leaveForeground() == UiObservationTransition.STOP) {
             stopUiObservationJobs()
         }
-        RustPreferencesBridge.flushAppConnectionStatus()
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { RustPreferencesBridge.flushAppConnectionStatus() }
+                .onFailure { error ->
+                    Log.w("MainViewModel", "Connection status background flush failed", error)
+                }
+        }
         if (uiState.value.webUiSession != null) {
             webUiSessionBackgroundGrace.scheduleStop()
         }
