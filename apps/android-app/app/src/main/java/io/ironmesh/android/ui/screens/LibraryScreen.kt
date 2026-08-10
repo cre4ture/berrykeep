@@ -179,6 +179,13 @@ fun LibraryScreen(
                 ),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            item(key = "gallery-hint") {
+                Text(
+                    text = "Pinch the gallery to change thumbnail density.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
             item(key = "gallery-controls") {
                 FlowRow(
                     modifier = Modifier.fillMaxWidth(),
@@ -315,12 +322,6 @@ fun LibraryScreen(
                             showDetails = showDetails,
                             onItemClick = { index -> fullscreenIndex = index },
                             onRetry = { actions.retryPage(pageIndex) },
-                        )
-                    }
-                    item(key = "gallery-hint") {
-                        Text(
-                            text = "Pinch the gallery to change thumbnail density.",
-                            style = MaterialTheme.typography.bodySmall,
                         )
                     }
                 }
