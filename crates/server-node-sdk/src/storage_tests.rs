@@ -68,6 +68,17 @@ fn sample_png_bytes() -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn sample_heic_bytes() -> Vec<u8> {
+    let hex: String = include_str!("../testdata/test-grid.heic.hex")
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+        .collect()
+}
+
 #[test]
 fn chunk_path_for_hash_rejects_non_blake3_hex_lengths() {
     let chunks_dir = Path::new("chunks");
@@ -4970,6 +4981,48 @@ run_on_all_metadata_backends!(
     ensure_media_cache_generates_thumbnail_and_dimensions_for_png_impl,
     ensure_media_cache_generates_thumbnail_and_dimensions_for_png,
     ensure_media_cache_generates_thumbnail_and_dimensions_for_png_turso
+);
+
+async fn ensure_media_cache_generates_thumbnail_and_dimensions_for_heic_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("media-cache-heic").await;
+
+    let put = store
+        .put_object_versioned(
+            "photos/iphone.heic",
+            Bytes::from(sample_heic_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(metadata.status, MediaCacheStatus::Ready);
+    assert_eq!(metadata.media_type.as_deref(), Some("image"));
+    assert_eq!(metadata.mime_type.as_deref(), Some("image/heic"));
+    assert_eq!((metadata.width, metadata.height), (Some(50), Some(100)));
+    let thumbnail = metadata.thumbnail.as_ref().expect("expected thumbnail");
+    assert_eq!((thumbnail.width, thumbnail.height), (128, 256));
+    let thumbnail_path =
+        store.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile);
+    assert!(fs::try_exists(thumbnail_path).await.unwrap());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_media_cache_generates_thumbnail_and_dimensions_for_heic_impl,
+    ensure_media_cache_generates_thumbnail_and_dimensions_for_heic,
+    ensure_media_cache_generates_thumbnail_and_dimensions_for_heic_turso
 );
 
 async fn ensure_mobile_viewer_thumbnail_profile_can_be_generated_impl(backend: StorageTestBackend) {

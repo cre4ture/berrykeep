@@ -18,7 +18,7 @@ async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
-berry-thumbnailer = { git = "https://github.com/cre4ture/berry-thumbnailer.git", rev = "22561032b1f5e7dd2fc15a29e0d6b61e0e128afb" }
+berry-thumbnailer = { git = "https://github.com/cre4ture/berry-thumbnailer.git", rev = "d30b4d0a8a281ff5fcbd58b06e3f603b47643df0" }
 blake3.workspace = true
 bytes.workspace = true
 common = { path = "../common" }
@@ -30,6 +30,7 @@ futures-util = "0.3"
 hmac = "0.12"
 http-body-util = "0.1"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+imagesize = { version = "0.15", default-features = false, features = ["heif"] }
 md-5 = "0.10"
 mime = "0.3"
 percent-encoding = "2"
