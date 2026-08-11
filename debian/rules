@@ -62,11 +62,11 @@ override_dh_auto_configure:
 		(echo "missing prebuilt client-ui assets; run ./scripts/prepare-ppa-source.sh" >&2; exit 1)
 	test -d $(CURDIR)/debian/cargo-vendor || \
 		(echo "missing vendored Rust dependencies; run ./scripts/prepare-ppa-source.sh" >&2; exit 1)
-	test -f $(CURDIR)/debian/cargo-vendor-config.toml || \
+	test -f $(CURDIR)/debian/cargo-vendor/source-config.toml || \
 		(echo "missing vendored Rust source configuration; run ./scripts/prepare-ppa-source.sh" >&2; exit 1)
 	mkdir -p $(CARGO_HOME)
 	sed 's|^directory = .*|directory = "$(CURDIR)/debian/cargo-vendor"|' \
-		$(CURDIR)/debian/cargo-vendor-config.toml \
+		$(CURDIR)/debian/cargo-vendor/source-config.toml \
 		> $(CARGO_HOME)/config.toml
 	printf '%s\n' \
 		'' \

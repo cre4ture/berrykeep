@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREBUILT_WEB_DIR="${ROOT_DIR}/debian/prebuilt-web"
 VENDORED_DIR="${ROOT_DIR}/debian/cargo-vendor"
-VENDOR_CONFIG_FILE="${ROOT_DIR}/debian/cargo-vendor-config.toml"
+VENDOR_CONFIG_FILE="${VENDORED_DIR}/source-config.toml"
 INCLUDE_BINARIES_FILE="${ROOT_DIR}/debian/source/include-binaries"
 CARGO_REGISTRY_SRC_ROOT="${CARGO_HOME:-${HOME}/.cargo}/registry/src"
 
