@@ -592,7 +592,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "berry-thumbnailer"
 version = "0.1.0"
-source = "git+https://github.com/cre4ture/berry-thumbnailer.git?rev=4ce6bd412da0b113c913d60dae6f1ebcf0c59de6#4ce6bd412da0b113c913d60dae6f1ebcf0c59de6"
+source = "git+https://github.com/cre4ture/berry-thumbnailer.git?rev=22561032b1f5e7dd2fc15a29e0d6b61e0e128afb#22561032b1f5e7dd2fc15a29e0d6b61e0e128afb"
 dependencies = [
  "image",
  "jpeg-decoder",
