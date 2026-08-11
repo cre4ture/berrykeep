@@ -83,6 +83,58 @@ pub struct RequestedRange {
     pub length: u64,
 }
 
+/// Controls opportunistic health maintenance for inactive client routes.
+///
+/// Foreground requests and transport-failure failover remain independent from
+/// this policy. It only bounds synthetic `/health` traffic used to keep backup
+/// route quality measurements fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientRouteMaintenancePolicy {
+    pub background_probe_stale_after: Duration,
+    pub background_probe_min_interval: Duration,
+    pub background_probe_batch_min_interval: Duration,
+    pub max_background_probe_candidates: usize,
+    pub background_probe_warmup_count: usize,
+    pub background_probe_sample_count: usize,
+}
+
+impl ClientRouteMaintenancePolicy {
+    pub const fn mobile_background() -> Self {
+        Self {
+            background_probe_stale_after: Duration::from_secs(15 * 60),
+            background_probe_min_interval: Duration::from_secs(15 * 60),
+            background_probe_batch_min_interval: Duration::from_secs(15 * 60),
+            max_background_probe_candidates: 1,
+            background_probe_warmup_count: 0,
+            background_probe_sample_count: 1,
+        }
+    }
+
+    fn normalized(self) -> Self {
+        Self {
+            background_probe_sample_count: self.background_probe_sample_count.max(1),
+            ..self
+        }
+    }
+}
+
+impl Default for ClientRouteMaintenancePolicy {
+    fn default() -> Self {
+        Self {
+            background_probe_stale_after: Duration::from_millis(
+                CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS,
+            ),
+            background_probe_min_interval: Duration::from_millis(
+                CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS,
+            ),
+            background_probe_batch_min_interval: Duration::ZERO,
+            max_background_probe_candidates: usize::MAX,
+            background_probe_warmup_count: CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT,
+            background_probe_sample_count: CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT,
+        }
+    }
+}
+
 impl std::fmt::Display for RequestedRange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "@{}+{}", self.offset, self.length)
@@ -284,6 +336,13 @@ struct ClientEndpointRouter {
     retired_failure_states: Arc<std::sync::Mutex<HashMap<String, RetiredRouteFailureState>>>,
     transport_failure_refresh_observer: Arc<TransportFailureRefreshObserverSlot>,
     relay_connection_refresh_observer: Arc<RelayConnectionRefreshObserverSlot>,
+    route_maintenance_policy: Arc<RwLock<ClientRouteMaintenancePolicy>>,
+    background_probe_scheduler: Arc<std::sync::Mutex<BackgroundProbeSchedulerState>>,
+}
+
+#[derive(Debug, Default)]
+struct BackgroundProbeSchedulerState {
+    last_batch_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -317,6 +376,23 @@ struct BackgroundProbeCandidate {
     route_key: String,
     endpoint: ClientEndpoint,
     timeout: Duration,
+    sampling: BackgroundProbeSampling,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackgroundProbeSampling {
+    warmup_count: usize,
+    sample_count: usize,
+}
+
+impl From<ClientRouteMaintenancePolicy> for BackgroundProbeSampling {
+    fn from(policy: ClientRouteMaintenancePolicy) -> Self {
+        let policy = policy.normalized();
+        Self {
+            warmup_count: policy.background_probe_warmup_count,
+            sample_count: policy.background_probe_sample_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -709,7 +785,27 @@ impl ClientEndpointRouter {
             retired_failure_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             transport_failure_refresh_observer: Arc::new(RwLock::new(None)),
             relay_connection_refresh_observer: Arc::new(RwLock::new(None)),
+            route_maintenance_policy: Arc::new(
+                RwLock::new(ClientRouteMaintenancePolicy::default()),
+            ),
+            background_probe_scheduler: Arc::new(std::sync::Mutex::new(
+                BackgroundProbeSchedulerState::default(),
+            )),
         }
+    }
+
+    fn set_route_maintenance_policy(&self, policy: ClientRouteMaintenancePolicy) {
+        *self
+            .route_maintenance_policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy.normalized();
+    }
+
+    fn route_maintenance_policy(&self) -> ClientRouteMaintenancePolicy {
+        *self
+            .route_maintenance_policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn runtime_id(&self) -> Uuid {
@@ -845,12 +941,30 @@ impl ClientEndpointRouter {
     }
 
     fn claim_background_probe_candidates(&self) -> Vec<BackgroundProbeCandidate> {
+        let policy = self.route_maintenance_policy();
+        if policy.max_background_probe_candidates == 0 {
+            return Vec::new();
+        }
         let endpoints = self.endpoints_snapshot();
         if endpoints.len() <= 1 {
             return Vec::new();
         }
 
         let now_unix_ms = unix_ts_ms();
+        let mut scheduler = self
+            .background_probe_scheduler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let batch_min_interval_ms =
+            duration_to_u64_ms(policy.background_probe_batch_min_interval).unwrap_or(u64::MAX);
+        if scheduler
+            .last_batch_unix_ms
+            .is_some_and(|last_batch_unix_ms| {
+                now_unix_ms.saturating_sub(last_batch_unix_ms) < batch_min_interval_ms
+            })
+        {
+            return Vec::new();
+        }
         let preferred_index = self.foreground_route_indices().into_iter().next();
         let has_foreground_route_use = endpoints.iter().any(|endpoint| {
             lock_endpoint_state(&endpoint.state)
@@ -859,7 +973,10 @@ impl ClientEndpointRouter {
         });
         let mut claimed = Vec::new();
 
-        for (index, endpoint) in endpoints.iter().enumerate() {
+        for index in self.foreground_route_indices() {
+            let Some(endpoint) = endpoints.get(index) else {
+                continue;
+            };
             let mut state = lock_endpoint_state(&endpoint.state);
             // At cold start, foreground traffic owns the preferred candidate
             // while background work probes its alternatives. Once real traffic
@@ -870,7 +987,7 @@ impl ClientEndpointRouter {
             {
                 continue;
             }
-            if !background_probe_due(&state, now_unix_ms) {
+            if !background_probe_due(&state, now_unix_ms, policy) {
                 continue;
             }
             let timeout = background_probe_timeout(&state);
@@ -881,7 +998,14 @@ impl ClientEndpointRouter {
                 route_key: endpoint.descriptor.route_key.clone(),
                 endpoint: endpoint.clone(),
                 timeout,
+                sampling: policy.into(),
             });
+            if claimed.len() >= policy.max_background_probe_candidates {
+                break;
+            }
+        }
+        if !claimed.is_empty() {
+            scheduler.last_batch_unix_ms = Some(now_unix_ms);
         }
 
         claimed
@@ -1011,6 +1135,7 @@ impl ClientEndpointRouter {
             route_key: endpoint.descriptor.route_key.clone(),
             endpoint,
             timeout: CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
+            sampling: ClientRouteMaintenancePolicy::default().into(),
         })
     }
 
@@ -1736,7 +1861,11 @@ fn estimate_clock_offset(
     (offset, uncertainty)
 }
 
-fn background_probe_due(state: &ClientEndpointState, now_unix_ms: u64) -> bool {
+fn background_probe_due(
+    state: &ClientEndpointState,
+    now_unix_ms: u64,
+    policy: ClientRouteMaintenancePolicy,
+) -> bool {
     if state.background_probe_in_flight {
         return false;
     }
@@ -1750,7 +1879,7 @@ fn background_probe_due(state: &ClientEndpointState, now_unix_ms: u64) -> bool {
         .last_background_probe_unix_ms
         .is_some_and(|last_probe_unix_ms| {
             now_unix_ms.saturating_sub(last_probe_unix_ms)
-                < CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS
+                < duration_to_u64_ms(policy.background_probe_min_interval).unwrap_or(u64::MAX)
         })
     {
         return false;
@@ -1762,7 +1891,7 @@ fn background_probe_due(state: &ClientEndpointState, now_unix_ms: u64) -> bool {
             .last_measurement_unix_ms
             .is_some_and(|last_measurement_unix_ms| {
                 now_unix_ms.saturating_sub(last_measurement_unix_ms)
-                    >= CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS
+                    >= duration_to_u64_ms(policy.background_probe_stale_after).unwrap_or(u64::MAX)
             })
 }
 
@@ -2569,6 +2698,7 @@ async fn probe_endpoint_background_quality(
     auth: &ClientRequestAuth,
     connection_name: Option<&str>,
     timeout: Duration,
+    sampling: BackgroundProbeSampling,
 ) -> Result<Vec<f64>> {
     let base_url = Url::parse(endpoint.transport.request_base_url()).with_context(|| {
         format!(
@@ -2585,9 +2715,8 @@ async fn probe_endpoint_background_quality(
                 endpoint.descriptor.locator
             )
         })?;
-    let mut latency_samples_ms = Vec::with_capacity(CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT);
-    let total_probe_count =
-        CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT + CLIENT_ROUTE_BACKGROUND_PROBE_SAMPLE_COUNT;
+    let mut latency_samples_ms = Vec::with_capacity(sampling.sample_count);
+    let total_probe_count = sampling.warmup_count + sampling.sample_count;
     for probe_index in 0..total_probe_count {
         let headers = request_auth_headers_for_auth(auth, &method, &url, connection_name)?;
         let started_at = std::time::Instant::now();
@@ -2632,7 +2761,7 @@ async fn probe_endpoint_background_quality(
                 endpoint.descriptor.locator
             );
         }
-        if probe_index >= CLIENT_ROUTE_BACKGROUND_PROBE_WARMUP_COUNT {
+        if probe_index >= sampling.warmup_count {
             latency_samples_ms.push(started_at.elapsed().as_secs_f64() * 1000.0);
         }
     }
@@ -3361,6 +3490,11 @@ impl IronMeshClient {
         self
     }
 
+    pub fn with_route_maintenance_policy(self, policy: ClientRouteMaintenancePolicy) -> Self {
+        self.transport_router.set_route_maintenance_policy(policy);
+        self
+    }
+
     /// Sets how emitted connection diagnostics affect user-facing connection
     /// status. This is independent from the optional display/telemetry name.
     pub fn with_connection_diagnostic_impact(
@@ -3406,6 +3540,7 @@ impl IronMeshClient {
                     route_key: endpoint.descriptor.route_key.clone(),
                     endpoint,
                     timeout,
+                    sampling: ClientRouteMaintenancePolicy::default().into(),
                 }
             })
             .collect::<Vec<_>>();
@@ -3422,6 +3557,7 @@ impl IronMeshClient {
                     &auth,
                     connection_name.as_deref(),
                     candidate.timeout,
+                    candidate.sampling,
                 )
                 .await;
                 (candidate, result)
@@ -3471,6 +3607,7 @@ impl IronMeshClient {
                     &auth,
                     connection_name.as_deref(),
                     candidate.timeout,
+                    candidate.sampling,
                 )
                 .await;
                 (candidate, result)
@@ -3665,6 +3802,7 @@ impl IronMeshClient {
                     &auth,
                     connection_name.as_deref(),
                     candidate.timeout,
+                    candidate.sampling,
                 )
                 .await
                 {

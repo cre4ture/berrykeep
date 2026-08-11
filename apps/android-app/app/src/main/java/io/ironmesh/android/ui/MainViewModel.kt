@@ -41,6 +41,7 @@ import io.ironmesh.android.work.FolderSyncScheduler
 import io.ironmesh.android.work.FolderSyncNetworkGate
 import io.ironmesh.android.work.FolderSyncExecutionCoordinator
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -62,6 +63,7 @@ private const val FOLDER_SYNC_HISTORY_PAGE_SIZE = 20
 private const val FOLDER_SYNC_HISTORY_REFRESH_MS = 5_000L
 private const val CONNECTION_ROUTE_SNAPSHOT_POLL_MS = 1_000L
 private const val TITLE_LATENCY_STATUS_POLL_MS = 1_000L
+internal const val TITLE_LATENCY_BACKGROUND_GRACE_PERIOD_MILLIS = 5_000L
 private const val ENROLLMENT_VERIFICATION_POLL_MS = 5_000L
 private const val ENROLLMENT_LOG_TAG = "EnrollmentDiagnostics"
 
@@ -95,10 +97,12 @@ class MainViewModel(
     private var connectionRoutesMonitorJob: Job? = null
     private var titleLatencyConfigurationJob: Job? = null
     private var titleLatencyStatusMonitorJob: Job? = null
+    private var titleLatencyBackgroundStopJob: Job? = null
     private var enrollmentVerificationMonitorJob: Job? = null
     private val uiObservationGate = UiObservationGate()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val preferenceWriteMutex = Mutex()
+    private val titleLatencyNativeControlMutex = Mutex()
 
     @Volatile
     private var deviceAuthState = DeviceAuthState()
@@ -106,10 +110,16 @@ class MainViewModel(
     var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
         private set
 
-    private val webUiSessionBackgroundGrace = WebUiSessionBackgroundGrace(
-        scheduler = HandlerWebUiSessionStopScheduler(mainHandler),
+    private val delayedActionScheduler = HandlerDelayedActionScheduler(mainHandler)
+    private val webUiSessionBackgroundGrace = BackgroundGraceAction(
+        scheduler = delayedActionScheduler,
         gracePeriodMillis = WEB_UI_BACKGROUND_GRACE_PERIOD_MILLIS,
         onGraceExpired = ::stopWebUiAfterBackgroundGrace,
+    )
+    private val titleLatencyBackgroundGrace = BackgroundGraceAction(
+        scheduler = delayedActionScheduler,
+        gracePeriodMillis = TITLE_LATENCY_BACKGROUND_GRACE_PERIOD_MILLIS,
+        onGraceExpired = ::stopTitleLatencyAfterBackgroundGrace,
     )
 
     @Volatile
@@ -132,12 +142,23 @@ class MainViewModel(
     override fun onCleared() {
         processLifecycleObserverActive = false
         unregisterProcessLifecycleObserver()
-        webUiSessionBackgroundGrace.cancelScheduledStop()
+        webUiSessionBackgroundGrace.cancel()
+        titleLatencyBackgroundGrace.cancel()
+        titleLatencyBackgroundStopJob?.cancel()
+        titleLatencyBackgroundStopJob = null
         EmbeddedWebUiSessionRegistry.clear()
         stopUiObservation()
         stopEnrollmentVerificationMonitor()
         titleLatencyConfigurationJob?.cancel()
         titleLatencyConfigurationJob = null
+        Thread(
+            {
+                runCatching(repository::stopTitleLatencyMonitor).onFailure { error ->
+                    Log.w("MainViewModel", "Failed to stop cleared title latency monitor", error)
+                }
+            },
+            "ironmesh-title-latency-stop",
+        ).start()
         repository.stopWebUi()
         super.onCleared()
     }
@@ -169,7 +190,10 @@ class MainViewModel(
     }
 
     private fun handleProcessStarted() {
-        webUiSessionBackgroundGrace.cancelScheduledStop()
+        webUiSessionBackgroundGrace.cancel()
+        titleLatencyBackgroundGrace.cancel()
+        titleLatencyBackgroundStopJob?.cancel()
+        titleLatencyBackgroundStopJob = null
         if (uiObservationGate.enterForeground() == UiObservationTransition.START) {
             startUiObservationJobs()
         }
@@ -188,7 +212,33 @@ class MainViewModel(
             )
         }
         if (uiState.value.webUiSession != null) {
-            webUiSessionBackgroundGrace.scheduleStop()
+            webUiSessionBackgroundGrace.schedule()
+        }
+        if (uiState.value.titleLatencyMonitorSettings.enabled) {
+            titleLatencyBackgroundGrace.schedule()
+        }
+    }
+
+    private fun stopTitleLatencyAfterBackgroundGrace() {
+        if (
+            uiObservationGate.observationJobsActive ||
+            !uiState.value.titleLatencyMonitorSettings.enabled
+        ) {
+            return
+        }
+        titleLatencyBackgroundStopJob?.cancel()
+        titleLatencyBackgroundStopJob = viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    titleLatencyNativeControlMutex.withLock {
+                        repository.stopTitleLatencyMonitor()
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w("MainViewModel", "Failed to stop background title latency monitor", error)
+            }
         }
     }
 
@@ -375,6 +425,9 @@ class MainViewModel(
         persistPreference {
             IronmeshPreferences.setTitleLatencyMonitorSettings(getApplication(), normalized)
         }
+        titleLatencyBackgroundGrace.cancel()
+        titleLatencyBackgroundStopJob?.cancel()
+        titleLatencyBackgroundStopJob = null
         configureTitleLatencyMonitor()
     }
 
@@ -1108,7 +1161,7 @@ class MainViewModel(
     }
 
     fun startWebUi() {
-        webUiSessionBackgroundGrace.cancelScheduledStop()
+        webUiSessionBackgroundGrace.cancel()
         uiState.value.webUiSession?.let { session ->
             EmbeddedWebUiSessionRegistry.activate(session)
             uiState.value = uiState.value.copy(status = "Web UI ready.")
@@ -1832,12 +1885,14 @@ class MainViewModel(
             }
             val configured = runCatching {
                 withContext(Dispatchers.IO) {
-                    repository.configureTitleLatencyMonitor(
-                        connectionInput = connectionInput,
-                        serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
-                        clientIdentityJson = clientIdentityJson,
-                        settings = settings,
-                    )
+                    titleLatencyNativeControlMutex.withLock {
+                        repository.configureTitleLatencyMonitor(
+                            connectionInput = connectionInput,
+                            serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                            clientIdentityJson = clientIdentityJson,
+                            settings = settings,
+                        )
+                    }
                 }
             }
             if (!isActive) {
