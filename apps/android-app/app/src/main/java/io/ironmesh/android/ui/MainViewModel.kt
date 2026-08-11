@@ -48,6 +48,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -155,7 +156,13 @@ class MainViewModel(
         titleLatencyConfigurationJob = null
         Thread(
             {
-                runCatching(repository::stopTitleLatencyMonitor).onFailure { error ->
+                runCatching {
+                    runBlocking {
+                        titleLatencyNativeControlMutex.withLock {
+                            repository.stopTitleLatencyMonitor()
+                        }
+                    }
+                }.onFailure { error ->
                     Log.w("MainViewModel", "Failed to stop cleared title latency monitor", error)
                 }
             },

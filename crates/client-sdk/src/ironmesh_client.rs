@@ -866,10 +866,14 @@ impl ClientEndpointRouter {
     }
 
     fn rank_indices(&self) -> Vec<usize> {
+        let endpoints = self.endpoints_snapshot();
+        Self::rank_indices_for(&endpoints)
+    }
+
+    fn rank_indices_for(endpoints: &[ClientEndpoint]) -> Vec<usize> {
         let now_unix_ms = unix_ts_ms();
         let mut available = Vec::new();
         let mut cooling = Vec::new();
-        let endpoints = self.endpoints_snapshot();
 
         for (index, endpoint) in endpoints.iter().enumerate() {
             let state = lock_endpoint_state(&endpoint.state);
@@ -903,13 +907,17 @@ impl ClientEndpointRouter {
     /// so they remain available only as same-request fallback or bootstrap
     /// paths until a foreground request or background probe validates them.
     fn foreground_route_indices(&self) -> Vec<usize> {
-        let now_unix_ms = unix_ts_ms();
         let endpoints = self.endpoints_snapshot();
+        Self::foreground_route_indices_for(&endpoints)
+    }
+
+    fn foreground_route_indices_for(endpoints: &[ClientEndpoint]) -> Vec<usize> {
+        let now_unix_ms = unix_ts_ms();
         let mut validated_available = Vec::new();
         let mut probation_available = Vec::new();
         let mut cooling = Vec::new();
 
-        for index in self.rank_indices() {
+        for index in Self::rank_indices_for(endpoints) {
             let Some(endpoint) = endpoints.get(index) else {
                 continue;
             };
@@ -965,7 +973,8 @@ impl ClientEndpointRouter {
         {
             return Vec::new();
         }
-        let preferred_index = self.foreground_route_indices().into_iter().next();
+        let foreground_route_indices = Self::foreground_route_indices_for(&endpoints);
+        let preferred_index = foreground_route_indices.first().copied();
         let has_foreground_route_use = endpoints.iter().any(|endpoint| {
             lock_endpoint_state(&endpoint.state)
                 .last_used_unix_ms
@@ -973,7 +982,7 @@ impl ClientEndpointRouter {
         });
         let mut claimed = Vec::new();
 
-        for index in self.foreground_route_indices() {
+        for index in foreground_route_indices {
             let Some(endpoint) = endpoints.get(index) else {
                 continue;
             };
