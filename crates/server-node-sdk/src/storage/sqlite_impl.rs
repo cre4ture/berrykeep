@@ -3958,7 +3958,7 @@ mod tests {
         let content_fingerprint = "fingerprint-1".to_string();
         let invalid_payload = br#"{"broken":true}"#.to_vec();
         let valid_payload = serde_json::to_vec_pretty(&CachedMediaMetadata {
-            schema_version: 5,
+            schema_version: crate::storage::media_cache::MEDIA_CACHE_SCHEMA_VERSION,
             content_fingerprint: content_fingerprint.clone(),
             source_manifest_hash: "manifest-1".to_string(),
             status: MediaCacheStatus::Ready,

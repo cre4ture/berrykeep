@@ -1,14 +1,16 @@
-use std::io::Cursor;
+use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::extract::State;
+use berry_thumbnailer::error::ThumbError as BerryThumbnailError;
+use berry_thumbnailer::{ThumbnailOptions, ThumbnailSize, create_thumbnails_with_options};
 use exif::{In, Reader as ExifReader, Tag, Value};
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageFormat, ImageReader, Limits};
+use image::{DynamicImage, ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 use tokio::fs;
@@ -19,6 +21,7 @@ use tokio::time::{Duration, Instant, timeout};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::manifest_reader::ManifestReader;
 use super::media_tools::{
     FFMPEG_TIMEOUT_SECS, FFPROBE_TIMEOUT_SECS, FfprobeOutput, MediaToolPaths,
     VIDEO_THUMBNAIL_SEEK_FRACTION, VIDEO_THUMBNAIL_SEEK_MAX_SECS, VIDEO_THUMBNAIL_SEEK_MIN_SECS,
@@ -29,7 +32,7 @@ use super::{
     content_fingerprint_from_manifest, hash_hex, unix_ts, write_atomic,
 };
 
-pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 5;
+pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 6;
 pub(super) const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
 const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
 const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
@@ -1380,62 +1383,23 @@ fn build_image_media_cache_blocking(
     include_thumbnail: bool,
     image_limits: &MediaCacheImageLimits,
 ) -> Result<DerivedMediaCacheArtifact> {
-    let payload = read_object_by_manifest_blocking(manifest, storage_pool)?;
-    derive_image_media_cache(
+    let mut reader = ManifestReader::new(manifest, storage_pool)
+        .context("failed to create manifest-backed image reader")?;
+    let derived = derive_image_media_cache_from_reader(
         manifest_hash,
         content_fingerprint,
         manifest.total_size_bytes,
-        &payload,
+        &mut reader,
         include_thumbnail,
         image_limits,
-    )
+    )?;
+    reader
+        .verify_all()
+        .context("failed to verify manifest-backed image input")?;
+    Ok(derived)
 }
 
-fn read_object_by_manifest_blocking(
-    manifest: &ObjectManifest,
-    storage_pool: &StoragePool,
-) -> Result<Vec<u8>> {
-    let mut assembled = Vec::new();
-
-    for chunk in &manifest.chunks {
-        let chunk_path = storage_pool.content_path(StorageContentKind::Chunk, &chunk.hash)?;
-        let payload = std::fs::read(&chunk_path)
-            .with_context(|| format!("failed reading chunk {}", chunk.hash))?;
-
-        if payload.len() != chunk.size_bytes {
-            bail!(
-                "size mismatch for chunk hash={} expected={} actual={}",
-                chunk.hash,
-                chunk.size_bytes,
-                payload.len()
-            );
-        }
-
-        let actual_hash = hash_hex(&payload);
-        if actual_hash != chunk.hash {
-            bail!(
-                "hash mismatch for chunk expected={} actual={}",
-                chunk.hash,
-                actual_hash
-            );
-        }
-
-        assembled.reserve(payload.len());
-        assembled.extend_from_slice(&payload);
-    }
-
-    if assembled.len() != manifest.total_size_bytes {
-        bail!(
-            "assembled payload size mismatch key={} expected={} actual={}",
-            manifest.key,
-            manifest.total_size_bytes,
-            assembled.len()
-        );
-    }
-
-    Ok(assembled)
-}
-
+#[cfg(test)]
 fn derive_image_media_cache(
     manifest_hash: &str,
     content_fingerprint: &str,
@@ -1444,8 +1408,27 @@ fn derive_image_media_cache(
     include_thumbnail: bool,
     image_limits: &MediaCacheImageLimits,
 ) -> Result<DerivedMediaCacheArtifact> {
+    let mut reader = Cursor::new(payload);
+    derive_image_media_cache_from_reader(
+        manifest_hash,
+        content_fingerprint,
+        source_size_bytes,
+        &mut reader,
+        include_thumbnail,
+        image_limits,
+    )
+}
+
+fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
+    manifest_hash: &str,
+    content_fingerprint: &str,
+    source_size_bytes: usize,
+    reader: &mut R,
+    include_thumbnail: bool,
+    image_limits: &MediaCacheImageLimits,
+) -> Result<DerivedMediaCacheArtifact> {
     let generated_at_unix = unix_ts();
-    let format = match image::guess_format(payload) {
+    let format = match guess_image_format(reader) {
         Ok(format) => format,
         Err(_) => {
             return Ok(unsupported_media_cache_artifact(
@@ -1471,8 +1454,8 @@ fn derive_image_media_cache(
         }
     };
 
-    let (width, height) = image_dimensions(payload, format)?;
-    let (orientation, gps, taken_at_unix) = extract_exif_fields(payload);
+    let (width, height) = image_dimensions_from_reader(reader, format)?;
+    let (orientation, gps, taken_at_unix) = extract_exif_fields_from_reader(reader);
     let mut metadata = CachedMediaMetadata {
         status: MediaCacheStatus::Ready,
         media_type: Some("image".to_string()),
@@ -1497,7 +1480,13 @@ fn derive_image_media_cache(
         });
     }
 
-    if let Some(error) = validate_image_decode_limits(width, height, image_limits) {
+    if let Some(error) = validate_image_decode_limits(
+        format,
+        width,
+        height,
+        grid_thumbnail_profile(),
+        image_limits,
+    ) {
         metadata.status = MediaCacheStatus::Unsupported;
         metadata.error = Some(error);
         return Ok(DerivedMediaCacheArtifact {
@@ -1506,8 +1495,24 @@ fn derive_image_media_cache(
         });
     }
 
-    let image = decode_image_with_limits(payload, format, image_limits)?;
-    let rendered_thumbnail = render_thumbnail(image, orientation, grid_thumbnail_profile())?;
+    let rendered_thumbnail = match render_thumbnail_from_reader(
+        reader,
+        format,
+        orientation,
+        grid_thumbnail_profile(),
+        image_limits,
+    ) {
+        Ok(rendered) => rendered,
+        Err(error) if is_thumbnail_limit_error(&error) => {
+            metadata.status = MediaCacheStatus::Unsupported;
+            metadata.error = Some(error.to_string());
+            return Ok(DerivedMediaCacheArtifact {
+                metadata,
+                thumbnail_payload: None,
+            });
+        }
+        Err(error) => return Err(error),
+    };
 
     metadata.thumbnail = Some(CachedThumbnailInfo {
         profile: grid_thumbnail_profile().name.to_string(),
@@ -1546,18 +1551,31 @@ fn image_dimensions(payload: &[u8], format: ImageFormat) -> Result<(u32, u32)> {
         .context("failed to inspect image dimensions")
 }
 
-fn decode_image_with_limits(
-    payload: &[u8],
+fn guess_image_format<R: Read + Seek>(reader: &mut R) -> Result<ImageFormat> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind image input for format detection")?;
+    let mut prefix = Vec::with_capacity(MEDIA_FORMAT_SNIFF_BYTES);
+    reader
+        .take(MEDIA_FORMAT_SNIFF_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .context("failed to read image format prefix")?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind image input after format detection")?;
+    image::guess_format(&prefix).context("unsupported media format")
+}
+
+fn image_dimensions_from_reader<R: BufRead + Seek>(
+    reader: &mut R,
     format: ImageFormat,
-    image_limits: &MediaCacheImageLimits,
-) -> Result<DynamicImage> {
-    let mut reader = ImageReader::with_format(Cursor::new(payload), format);
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(image_limits.max_dimension);
-    limits.max_image_height = Some(image_limits.max_dimension);
-    limits.max_alloc = Some(image_limits.max_decode_bytes);
-    reader.limits(limits);
-    reader.decode().context("failed to decode image payload")
+) -> Result<(u32, u32)> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind image input for dimension inspection")?;
+    ImageReader::with_format(&mut *reader, format)
+        .into_dimensions()
+        .context("failed to inspect image dimensions")
 }
 
 fn estimated_image_build_bytes(
@@ -1589,21 +1607,29 @@ fn estimated_image_build_bytes(
 }
 
 fn validate_image_decode_limits(
+    format: ImageFormat,
     width: u32,
     height: u32,
+    profile: ThumbnailProfileSpec,
     image_limits: &MediaCacheImageLimits,
 ) -> Option<String> {
-    if width > image_limits.max_dimension || height > image_limits.max_dimension {
+    let (decode_width, decode_height) = if format == ImageFormat::Jpeg {
+        jpeg_scaled_dimensions(width, height, profile.max_dimension)
+    } else {
+        (width, height)
+    };
+
+    if decode_width > image_limits.max_dimension || decode_height > image_limits.max_dimension {
         return Some(format!(
-            "image thumbnail generation rejected: dimensions {}x{} exceed limit {}px",
-            width, height, image_limits.max_dimension
+            "image thumbnail generation rejected: decoded dimensions {}x{} exceed limit {}px",
+            decode_width, decode_height, image_limits.max_dimension
         ));
     }
 
-    let pixel_count = u64::from(width).saturating_mul(u64::from(height));
+    let pixel_count = u64::from(decode_width).saturating_mul(u64::from(decode_height));
     if pixel_count > image_limits.max_pixels {
         return Some(format!(
-            "image thumbnail generation rejected: pixel count {} exceeds limit {}",
+            "image thumbnail generation rejected: decoded pixel count {} exceeds limit {}",
             pixel_count, image_limits.max_pixels
         ));
     }
@@ -1619,13 +1645,63 @@ fn validate_image_decode_limits(
     None
 }
 
-fn render_thumbnail(
-    mut image: DynamicImage,
+fn jpeg_scaled_dimensions(width: u32, height: u32, target: u32) -> (u32, u32) {
+    for scale in [1, 2, 4, 8] {
+        let scaled_width = width.saturating_mul(scale).div_ceil(8);
+        let scaled_height = height.saturating_mul(scale).div_ceil(8);
+        if scaled_width >= target || scaled_height >= target || scale == 8 {
+            return (scaled_width, scaled_height);
+        }
+    }
+
+    unreachable!("the full-size JPEG scale always matches")
+}
+
+fn render_thumbnail_from_reader<R: BufRead + Seek>(
+    reader: &mut R,
+    format: ImageFormat,
+    orientation: Option<u16>,
+    profile: ThumbnailProfileSpec,
+    image_limits: &MediaCacheImageLimits,
+) -> Result<RenderedThumbnail> {
+    let mime_type = image_format_mime_type(format)
+        .context("image format is not supported for thumbnail extraction")?
+        .parse::<mime::Mime>()
+        .context("failed to construct image MIME type")?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind image input for thumbnail generation")?;
+    let mut thumbnails = create_thumbnails_with_options(
+        &mut *reader,
+        mime_type,
+        [ThumbnailSize::Custom((
+            profile.max_dimension,
+            profile.max_dimension,
+        ))],
+        ThumbnailOptions::new()
+            .with_max_decoded_bytes(image_limits.max_decode_bytes)
+            .with_max_progressive_jpeg_pixels(image_limits.max_pixels),
+    )
+    .context("failed to generate image thumbnail")?;
+    let image = thumbnails
+        .pop()
+        .context("thumbnail generator returned no image")?
+        .into_image();
+    encode_thumbnail(image, orientation, profile)
+}
+
+fn is_thumbnail_limit_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<BerryThumbnailError>()
+        .is_some_and(|error| matches!(error, BerryThumbnailError::LimitExceeded(_)))
+}
+
+fn encode_thumbnail(
+    mut thumbnail: DynamicImage,
     orientation: Option<u16>,
     profile: ThumbnailProfileSpec,
 ) -> Result<RenderedThumbnail> {
-    apply_exif_orientation(&mut image, orientation);
-    let thumbnail = image.thumbnail(profile.max_dimension, profile.max_dimension);
+    apply_exif_orientation(&mut thumbnail, orientation);
     let mut encoded = Vec::new();
     let mut encoder = JpegEncoder::new_with_quality(&mut encoded, profile.jpeg_quality);
     encoder
@@ -1644,10 +1720,12 @@ fn render_image_thumbnail_payload(
     profile: ThumbnailProfileSpec,
     image_limits: &MediaCacheImageLimits,
 ) -> Result<Option<Vec<u8>>> {
-    let payload = read_object_by_manifest_blocking(manifest, storage_pool)?;
-    let format = image::guess_format(&payload).context("unsupported media format")?;
-    let (width, height) = image_dimensions(&payload, format)?;
-    if let Some(error) = validate_image_decode_limits(width, height, image_limits) {
+    let mut reader = ManifestReader::new(manifest, storage_pool)
+        .context("failed to create manifest-backed image reader")?;
+    let format = guess_image_format(&mut reader)?;
+    let (width, height) = image_dimensions_from_reader(&mut reader, format)?;
+    if let Some(error) = validate_image_decode_limits(format, width, height, profile, image_limits)
+    {
         tracing::debug!(
             profile = profile.name,
             width,
@@ -1655,12 +1733,36 @@ fn render_image_thumbnail_payload(
             error = %error,
             "skipping thumbnail profile generation because image exceeds decode limits"
         );
+        reader
+            .verify_all()
+            .context("failed to verify manifest-backed image input")?;
         return Ok(None);
     }
 
-    let image = decode_image_with_limits(&payload, format, image_limits)?;
-    let (orientation, _, _) = extract_exif_fields(&payload);
-    Ok(Some(render_thumbnail(image, orientation, profile)?.payload))
+    let (orientation, _, _) = extract_exif_fields_from_reader(&mut reader);
+    let rendered =
+        match render_thumbnail_from_reader(&mut reader, format, orientation, profile, image_limits)
+        {
+            Ok(rendered) => rendered,
+            Err(error) if is_thumbnail_limit_error(&error) => {
+                tracing::debug!(
+                    profile = profile.name,
+                    width,
+                    height,
+                    error = %error,
+                    "skipping thumbnail profile generation because decoder limits were exceeded"
+                );
+                reader
+                    .verify_all()
+                    .context("failed to verify manifest-backed image input")?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+    reader
+        .verify_all()
+        .context("failed to verify manifest-backed image input")?;
+    Ok(Some(rendered.payload))
 }
 
 fn apply_exif_orientation(image: &mut DynamicImage, orientation: Option<u16>) {
@@ -1673,9 +1775,13 @@ fn apply_exif_orientation(image: &mut DynamicImage, orientation: Option<u16>) {
     image.apply_orientation(orientation);
 }
 
-fn extract_exif_fields(payload: &[u8]) -> (Option<u16>, Option<MediaGpsCoordinates>, Option<u64>) {
-    let mut cursor = Cursor::new(payload);
-    let exif = match ExifReader::new().read_from_container(&mut cursor) {
+fn extract_exif_fields_from_reader<R: BufRead + Seek>(
+    reader: &mut R,
+) -> (Option<u16>, Option<MediaGpsCoordinates>, Option<u64>) {
+    if reader.seek(SeekFrom::Start(0)).is_err() {
+        return (None, None, None);
+    }
+    let exif = match ExifReader::new().read_from_container(reader) {
         Ok(value) => value,
         Err(_) => return (None, None, None),
     };
@@ -1830,6 +1936,15 @@ mod tests {
         cursor.into_inner()
     }
 
+    fn sample_wide_jpeg_bytes() -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(2048, 512, image::Rgb([40, 90, 180]));
+        let mut payload = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut payload, 85)
+            .encode_image(&image)
+            .unwrap();
+        payload
+    }
+
     #[test]
     fn media_cache_build_config_scales_permits_by_source_size() {
         let config = MediaCacheBuildConfig {
@@ -1896,6 +2011,65 @@ mod tests {
                 .unwrap_or_default()
                 .contains("pixel count")
         );
+    }
+
+    #[test]
+    fn baseline_jpeg_uses_scaled_decode_instead_of_full_source_limits() {
+        let payload = sample_wide_jpeg_bytes();
+        let image_limits = MediaCacheImageLimits {
+            max_dimension: 300,
+            max_pixels: 20_000,
+            max_decode_bytes: 64 * 1024,
+        };
+
+        let derived = derive_image_media_cache(
+            "manifest",
+            "fingerprint",
+            payload.len(),
+            &payload,
+            true,
+            &image_limits,
+        )
+        .unwrap();
+
+        assert_eq!(derived.metadata.status, MediaCacheStatus::Ready);
+        let thumbnail = derived.metadata.thumbnail.unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (256, 64));
+        assert!(derived.thumbnail_payload.is_some());
+    }
+
+    #[test]
+    fn jpeg_limits_apply_to_the_native_scaled_decode() {
+        let profile = grid_thumbnail_profile();
+        assert_eq!(
+            jpeg_scaled_dimensions(13_616, 3_616, profile.max_dimension),
+            (1_702, 452)
+        );
+
+        let image_limits = MediaCacheImageLimits {
+            max_dimension: 12_288,
+            max_pixels: 40_000_000,
+            max_decode_bytes: 256 * 1024 * 1024,
+        };
+        let error = validate_image_decode_limits(
+            ImageFormat::Jpeg,
+            u16::MAX.into(),
+            u16::MAX.into(),
+            profile,
+            &image_limits,
+        )
+        .expect("an oversized scaled JPEG buffer must be rejected locally");
+
+        assert!(error.contains("decoded pixel count"));
+    }
+
+    #[test]
+    fn thumbnail_limit_errors_remain_classifiable_through_context() {
+        let error =
+            anyhow::Error::new(BerryThumbnailError::LimitExceeded("test limit".to_string()))
+                .context("thumbnail generation failed");
+
+        assert!(is_thumbnail_limit_error(&error));
     }
 
     #[test]

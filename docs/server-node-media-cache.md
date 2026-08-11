@@ -45,6 +45,12 @@ This excludes the key/path and is therefore stable across:
 Current implementation:
 
 - image detection for common formats handled by the Rust `image` crate
+- image metadata and thumbnail decoders read directly from a verified
+  manifest-backed stream that retains at most one source chunk
+- baseline JPEG thumbnails use native 1/8, 1/4, or 1/2 decoder scaling before
+  the final thumbnail resample, avoiding a full-resolution pixel buffer
+- BerryKeep applies its configured dimension, pixel, and decoded-byte limits
+  to that native scaled JPEG buffer before invoking the decoder
 - video inspection and thumbnail extraction handled by external `ffprobe` / `ffmpeg`
 - cached dimensions
 - EXIF orientation when available
@@ -63,6 +69,10 @@ Unsupported or undecodable media still get a cache record with status:
 Incomplete records carry a retry timestamp so repeated gallery requests do not keep faning out to peers on every view.
 
 `unsupported` and `failed` remain terminal states for a fully available source.
+
+Media-cache schema changes invalidate older terminal records. In particular,
+images previously marked unsupported only because their full-resolution JPEG
+dimensions exceeded the old decoder limits are retried after this optimization.
 
 This prevents repeated expensive decode attempts on every listing while still allowing incomplete replicas to recover automatically.
 
@@ -184,6 +194,10 @@ For gallery-style UIs:
 
 - one thumbnail profile only: `grid`
 - EXIF extraction is best-effort and format-dependent
+- non-JPEG image codecs may still allocate a full decoded image even though the
+  compressed source itself is streamed
+- progressive JPEGs have a separate source-pixel limit because their decoder
+  may retain full-resolution coefficient buffers despite scaled output
 - `taken_at_unix` is best-effort and may fall back to interpreting EXIF datetimes without an explicit offset as UTC
 - video thumbnails require `ffprobe` and `ffmpeg` to be available on `PATH`
 - remote media artifact import is manifest-pinned so the importing node only accepts metadata and thumbnails for the exact manifest it resolved locally
