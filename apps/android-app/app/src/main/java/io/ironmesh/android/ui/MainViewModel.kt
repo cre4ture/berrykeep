@@ -103,6 +103,7 @@ class MainViewModel(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val preferenceWriteMutex = Mutex()
     private val titleLatencyNativeControlMutex = Mutex()
+    private val titleLatencyNativeControlGate = LatestOperationGate()
 
     @Volatile
     private var deviceAuthState = DeviceAuthState()
@@ -144,6 +145,7 @@ class MainViewModel(
         unregisterProcessLifecycleObserver()
         webUiSessionBackgroundGrace.cancel()
         titleLatencyBackgroundGrace.cancel()
+        titleLatencyNativeControlGate.next()
         titleLatencyBackgroundStopJob?.cancel()
         titleLatencyBackgroundStopJob = null
         EmbeddedWebUiSessionRegistry.clear()
@@ -192,6 +194,7 @@ class MainViewModel(
     private fun handleProcessStarted() {
         webUiSessionBackgroundGrace.cancel()
         titleLatencyBackgroundGrace.cancel()
+        titleLatencyNativeControlGate.next()
         titleLatencyBackgroundStopJob?.cancel()
         titleLatencyBackgroundStopJob = null
         if (uiObservationGate.enterForeground() == UiObservationTransition.START) {
@@ -227,11 +230,14 @@ class MainViewModel(
             return
         }
         titleLatencyBackgroundStopJob?.cancel()
+        val operationGeneration = titleLatencyNativeControlGate.next()
         titleLatencyBackgroundStopJob = viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) {
                     titleLatencyNativeControlMutex.withLock {
-                        repository.stopTitleLatencyMonitor()
+                        if (titleLatencyNativeControlGate.isCurrent(operationGeneration)) {
+                            repository.stopTitleLatencyMonitor()
+                        }
                     }
                 }
             } catch (error: CancellationException) {
@@ -1859,14 +1865,21 @@ class MainViewModel(
     }
 
     private fun configureTitleLatencyMonitor() {
+        val operationGeneration = titleLatencyNativeControlGate.next()
         titleLatencyConfigurationJob?.cancel()
         titleLatencyConfigurationJob = null
         stopTitleLatencyStatusMonitor()
 
         val settings = uiState.value.titleLatencyMonitorSettings
         titleLatencyConfigurationJob = viewModelScope.launch {
+            if (!titleLatencyNativeControlGate.isCurrent(operationGeneration)) {
+                return@launch
+            }
             val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
                 .getOrElse { error ->
+                    if (!titleLatencyNativeControlGate.isCurrent(operationGeneration)) {
+                        return@launch
+                    }
                     uiState.value = uiState.value.withTitleLatencyPollResult(
                         TitleLatencyProbeStatus(
                             state = "failed",
@@ -1878,24 +1891,34 @@ class MainViewModel(
                 }
             val connectionInput = deviceAuth.connectionBootstrapJson()
             val clientIdentityJson = deviceAuth.toClientIdentityJson()
+            if (!titleLatencyNativeControlGate.isCurrent(operationGeneration)) {
+                return@launch
+            }
             if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
                 uiState.value = uiState.value.withTitleLatencyPollResult(TitleLatencyProbeStatus())
                 titleLatencyConfigurationJob = null
                 return@launch
             }
-            val configured = runCatching {
-                withContext(Dispatchers.IO) {
-                    titleLatencyNativeControlMutex.withLock {
-                        repository.configureTitleLatencyMonitor(
-                            connectionInput = connectionInput,
-                            serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
-                            clientIdentityJson = clientIdentityJson,
-                            settings = settings,
-                        )
+            val configured = withContext(Dispatchers.IO) {
+                titleLatencyNativeControlMutex.withLock {
+                    if (!titleLatencyNativeControlGate.isCurrent(operationGeneration)) {
+                        null
+                    } else {
+                        runCatching {
+                            repository.configureTitleLatencyMonitor(
+                                connectionInput = connectionInput,
+                                serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                                clientIdentityJson = clientIdentityJson,
+                                settings = settings,
+                            )
+                        }
                     }
                 }
-            }
-            if (!isActive) {
+            } ?: return@launch
+            if (
+                !isActive ||
+                !titleLatencyNativeControlGate.isCurrent(operationGeneration)
+            ) {
                 return@launch
             }
 
