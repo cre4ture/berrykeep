@@ -9,8 +9,9 @@ Before building a source package, prepare the generated packaging inputs:
 
 That command does two things:
 
-  1. Vendors Rust dependencies into `debian/cargo-vendor/` so Launchpad can
-     build without network access.
+  1. Vendors Rust dependencies into `debian/cargo-vendor/` and preserves
+     Cargo's source replacement configuration, including Git sources, so
+     Launchpad can build without network access.
   2. Builds the `server-admin` and `client-ui` web apps and copies their built
      assets into `debian/prebuilt-web/` so the Rust crates can embed them
      without running `pnpm` on the builder.

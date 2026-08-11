@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREBUILT_WEB_DIR="${ROOT_DIR}/debian/prebuilt-web"
 VENDORED_DIR="${ROOT_DIR}/debian/cargo-vendor"
+VENDOR_CONFIG_FILE="${ROOT_DIR}/debian/cargo-vendor-config.toml"
 INCLUDE_BINARIES_FILE="${ROOT_DIR}/debian/source/include-binaries"
 CARGO_REGISTRY_SRC_ROOT="${CARGO_HOME:-${HOME}/.cargo}/registry/src"
 
@@ -172,7 +173,14 @@ verify_workspace_lockfile
 
 log "vendoring Rust dependencies with ${CARGO_BIN}"
 rm -rf "${VENDORED_DIR}"
-"${CARGO_BIN}" vendor --locked --versioned-dirs "${VENDORED_DIR}" >/dev/null
+vendor_config_tmp="$(mktemp)"
+trap 'rm -f "${vendor_config_tmp}"' EXIT
+(
+  cd "${ROOT_DIR}"
+  "${CARGO_BIN}" vendor --locked --versioned-dirs "debian/cargo-vendor"
+) > "${vendor_config_tmp}"
+mv "${vendor_config_tmp}" "${VENDOR_CONFIG_FILE}"
+trap - EXIT
 repair_vendored_missing_files
 
 log "refreshing debian/source/include-binaries"
