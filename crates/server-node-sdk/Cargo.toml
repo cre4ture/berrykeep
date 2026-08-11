@@ -18,6 +18,7 @@ async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
+berry-thumbnailer = { git = "https://github.com/cre4ture/berry-thumbnailer.git", rev = "4ce6bd412da0b113c913d60dae6f1ebcf0c59de6" }
 blake3.workspace = true
 bytes.workspace = true
 common = { path = "../common" }
@@ -30,6 +31,7 @@ hmac = "0.12"
 http-body-util = "0.1"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 md-5 = "0.10"
+mime = "0.3"
 percent-encoding = "2"
 pbkdf2 = "0.12"
 rand = "0.8"

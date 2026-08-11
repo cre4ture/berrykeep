@@ -40,6 +40,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 pub(super) mod data_scrub;
+pub(super) mod manifest_reader;
 pub(super) mod media_cache;
 pub(super) mod media_tools;
 mod sqlite_impl;

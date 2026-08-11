@@ -590,6 +590,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "berry-thumbnailer"
+version = "0.1.0"
+source = "git+https://github.com/cre4ture/berry-thumbnailer.git?rev=4ce6bd412da0b113c913d60dae6f1ebcf0c59de6#4ce6bd412da0b113c913d60dae6f1ebcf0c59de6"
+dependencies = [
+ "image",
+ "jpeg-decoder",
+ "mime",
+ "rayon",
+ "tempfile",
+]
+
+[[package]]
 name = "bigdecimal"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3241,6 +3253,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jpeg-decoder"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5555,6 +5576,7 @@ dependencies = [
  "axum",
  "axum-server",
  "base64",
+ "berry-thumbnailer",
  "blake3",
  "bytes",
  "client-sdk",
@@ -5568,6 +5590,7 @@ dependencies = [
  "image",
  "kamadak-exif",
  "md-5",
+ "mime",
  "pbkdf2",
  "percent-encoding",
  "rand 0.8.7",

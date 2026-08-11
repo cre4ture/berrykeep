@@ -418,7 +418,7 @@ async fn gallery_media_delta_tracks_unprojected_changes_without_noop_churn() {
         .await
         .unwrap();
     let mut metadata = CachedMediaMetadata {
-        schema_version: 5,
+        schema_version: crate::storage::media_cache::MEDIA_CACHE_SCHEMA_VERSION,
         content_fingerprint: "fingerprint-cat".to_string(),
         source_manifest_hash: "manifest-cat".to_string(),
         status: MediaCacheStatus::Ready,
@@ -508,7 +508,7 @@ async fn gallery_media_delta_tracks_each_shared_content_fingerprint_entry() {
         .expect("gallery fixtures should persist");
 
     let media_metadata = |width| CachedMediaMetadata {
-        schema_version: 5,
+        schema_version: crate::storage::media_cache::MEDIA_CACHE_SCHEMA_VERSION,
         content_fingerprint: "fingerprint-shared".to_string(),
         source_manifest_hash: "manifest-a".to_string(),
         status: MediaCacheStatus::Ready,
