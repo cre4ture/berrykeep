@@ -19,6 +19,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.atomic.AtomicLong
 
 object RustSafBridge {
     private const val TAG = "RustSafBridge"
@@ -97,6 +98,17 @@ object RustSafBridge {
                 treeObservers.remove(treeUriString)
                 observer.close()
             }
+        }
+    }
+
+    /**
+     * Exposes observer delivery to instrumentation tests. Runtime sync uses the
+     * push-based native callback and never polls this counter.
+     */
+    @JvmStatic
+    fun getTreeChangeVersion(treeUriString: String): Long {
+        synchronized(observerLock) {
+            return treeObservers[treeUriString]?.version?.get() ?: 0L
         }
     }
 
@@ -760,6 +772,7 @@ object RustSafBridge {
         private val treeUriString: String,
         private val resolver: ContentResolver,
     ) {
+        val version = AtomicLong(0L)
         private var leaseCount = 1
         private val handler = Handler(Looper.getMainLooper())
         private val observers = linkedMapOf<String, ContentObserver>()
@@ -801,6 +814,7 @@ object RustSafBridge {
         }
 
         private fun recordChange() {
+            version.incrementAndGet()
             invalidateTreeCache(treeUriString)
             runCatching { notifyTreeChanged(treeUriString) }
                 .onFailure { error -> Log.w(TAG, "Failed forwarding SAF tree change", error) }
