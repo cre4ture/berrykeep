@@ -848,13 +848,14 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "berry-thumbnailer"
 version = "0.1.0"
-source = "git+https://github.com/cre4ture/berry-thumbnailer.git?rev=d30b4d0a8a281ff5fcbd58b06e3f603b47643df0#d30b4d0a8a281ff5fcbd58b06e3f603b47643df0"
+source = "git+https://github.com/cre4ture/berry-thumbnailer.git?rev=d3e46c5227f5f8764026f36f5b22f305d134616b#d3e46c5227f5f8764026f36f5b22f305d134616b"
 dependencies = [
  "gamut-heic",
  "heif-oxide",
  "image",
  "imagesize",
  "jpeg-decoder",
+ "kamadak-exif",
  "mime",
  "rayon",
  "tempfile",

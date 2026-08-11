@@ -69,7 +69,7 @@ fn sample_png_bytes() -> Vec<u8> {
 }
 
 fn sample_heic_bytes() -> Vec<u8> {
-    let hex: String = include_str!("../testdata/test-grid.heic.hex")
+    let hex: String = include_str!("../testdata/test-exif-orientation.heic.hex")
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
@@ -5009,7 +5009,8 @@ async fn ensure_media_cache_generates_thumbnail_and_dimensions_for_heic_impl(
     assert_eq!(metadata.status, MediaCacheStatus::Ready);
     assert_eq!(metadata.media_type.as_deref(), Some("image"));
     assert_eq!(metadata.mime_type.as_deref(), Some("image/heic"));
-    assert_eq!((metadata.width, metadata.height), (Some(50), Some(100)));
+    assert_eq!((metadata.width, metadata.height), (Some(100), Some(50)));
+    assert_eq!(metadata.orientation, Some(6));
     let thumbnail = metadata.thumbnail.as_ref().expect("expected thumbnail");
     assert_eq!((thumbnail.width, thumbnail.height), (128, 256));
     let thumbnail_path =

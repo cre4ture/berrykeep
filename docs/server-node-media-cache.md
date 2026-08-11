@@ -52,8 +52,8 @@ Current implementation:
 - BerryKeep applies its configured dimension, pixel, and decoded-byte limits
   to that native scaled JPEG buffer before invoking the decoder
 - HEVC-backed HEIF/HEIC still images are decoded in pure Rust, including
-  iPhone-style image grids, container orientation, 8/10-bit pixels, and
-  Display-P3 conversion
+  iPhone-style image grids, container or EXIF orientation, 8/10-bit pixels,
+  and Display-P3 conversion
 - HEIF decoding validates the container, every referenced tile's SPS
   dimensions, and a conservative compressed-plus-decoded memory estimate
   before pixel reconstruction

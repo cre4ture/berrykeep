@@ -1744,6 +1744,8 @@ fn render_thumbnail_from_reader<R: BufRead + Seek>(
         .pop()
         .context("thumbnail generator returned no image")?
         .into_image();
+    // berry-thumbnailer normalizes HEIF container transforms and falls back
+    // to embedded EXIF orientation, so applying it again would rotate twice.
     let orientation = match format {
         MediaImageFormat::Heif => None,
         MediaImageFormat::Standard(_) => orientation,
@@ -2019,6 +2021,17 @@ mod tests {
             .collect()
     }
 
+    fn sample_exif_oriented_heic_bytes() -> Vec<u8> {
+        let hex: String = include_str!("../../testdata/test-exif-orientation.heic.hex")
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
     fn media_cache_build_config_scales_permits_by_source_size() {
         let config = MediaCacheBuildConfig {
@@ -2108,6 +2121,32 @@ mod tests {
             (Some(50), Some(100))
         );
         assert_eq!(derived.metadata.orientation, None);
+        let thumbnail = derived.metadata.thumbnail.unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (128, 256));
+        assert!(derived.thumbnail_payload.is_some());
+    }
+
+    #[test]
+    fn derive_image_media_cache_supports_exif_oriented_heic_grids() {
+        let payload = sample_exif_oriented_heic_bytes();
+
+        let derived = derive_image_media_cache(
+            "manifest",
+            "fingerprint",
+            payload.len(),
+            &payload,
+            true,
+            &MediaCacheImageLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(derived.metadata.status, MediaCacheStatus::Ready);
+        assert_eq!(derived.metadata.mime_type.as_deref(), Some("image/heic"));
+        assert_eq!(
+            (derived.metadata.width, derived.metadata.height),
+            (Some(100), Some(50))
+        );
+        assert_eq!(derived.metadata.orientation, Some(6));
         let thumbnail = derived.metadata.thumbnail.unwrap();
         assert_eq!((thumbnail.width, thumbnail.height), (128, 256));
         assert!(derived.thumbnail_payload.is_some());
