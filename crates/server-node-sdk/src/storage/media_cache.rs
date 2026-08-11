@@ -1480,7 +1480,13 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
         });
     }
 
-    if let Some(error) = validate_image_decode_limits(format, width, height, image_limits) {
+    if let Some(error) = validate_image_decode_limits(
+        format,
+        width,
+        height,
+        grid_thumbnail_profile(),
+        image_limits,
+    ) {
         metadata.status = MediaCacheStatus::Unsupported;
         metadata.error = Some(error);
         return Ok(DerivedMediaCacheArtifact {
@@ -1604,23 +1610,26 @@ fn validate_image_decode_limits(
     format: ImageFormat,
     width: u32,
     height: u32,
+    profile: ThumbnailProfileSpec,
     image_limits: &MediaCacheImageLimits,
 ) -> Option<String> {
-    if format == ImageFormat::Jpeg {
-        return None;
-    }
+    let (decode_width, decode_height) = if format == ImageFormat::Jpeg {
+        jpeg_scaled_dimensions(width, height, profile.max_dimension)
+    } else {
+        (width, height)
+    };
 
-    if width > image_limits.max_dimension || height > image_limits.max_dimension {
+    if decode_width > image_limits.max_dimension || decode_height > image_limits.max_dimension {
         return Some(format!(
-            "image thumbnail generation rejected: dimensions {}x{} exceed limit {}px",
-            width, height, image_limits.max_dimension
+            "image thumbnail generation rejected: decoded dimensions {}x{} exceed limit {}px",
+            decode_width, decode_height, image_limits.max_dimension
         ));
     }
 
-    let pixel_count = u64::from(width).saturating_mul(u64::from(height));
+    let pixel_count = u64::from(decode_width).saturating_mul(u64::from(decode_height));
     if pixel_count > image_limits.max_pixels {
         return Some(format!(
-            "image thumbnail generation rejected: pixel count {} exceeds limit {}",
+            "image thumbnail generation rejected: decoded pixel count {} exceeds limit {}",
             pixel_count, image_limits.max_pixels
         ));
     }
@@ -1634,6 +1643,18 @@ fn validate_image_decode_limits(
     }
 
     None
+}
+
+fn jpeg_scaled_dimensions(width: u32, height: u32, target: u32) -> (u32, u32) {
+    for scale in [1, 2, 4, 8] {
+        let scaled_width = width.saturating_mul(scale).div_ceil(8);
+        let scaled_height = height.saturating_mul(scale).div_ceil(8);
+        if scaled_width >= target || scaled_height >= target || scale == 8 {
+            return (scaled_width, scaled_height);
+        }
+    }
+
+    unreachable!("the full-size JPEG scale always matches")
 }
 
 fn render_thumbnail_from_reader<R: BufRead + Seek>(
@@ -1703,7 +1724,8 @@ fn render_image_thumbnail_payload(
         .context("failed to create manifest-backed image reader")?;
     let format = guess_image_format(&mut reader)?;
     let (width, height) = image_dimensions_from_reader(&mut reader, format)?;
-    if let Some(error) = validate_image_decode_limits(format, width, height, image_limits) {
+    if let Some(error) = validate_image_decode_limits(format, width, height, profile, image_limits)
+    {
         tracing::debug!(
             profile = profile.name,
             width,
@@ -1995,8 +2017,8 @@ mod tests {
     fn baseline_jpeg_uses_scaled_decode_instead_of_full_source_limits() {
         let payload = sample_wide_jpeg_bytes();
         let image_limits = MediaCacheImageLimits {
-            max_dimension: 100,
-            max_pixels: 10_000,
+            max_dimension: 300,
+            max_pixels: 20_000,
             max_decode_bytes: 64 * 1024,
         };
 
@@ -2014,6 +2036,31 @@ mod tests {
         let thumbnail = derived.metadata.thumbnail.unwrap();
         assert_eq!((thumbnail.width, thumbnail.height), (256, 64));
         assert!(derived.thumbnail_payload.is_some());
+    }
+
+    #[test]
+    fn jpeg_limits_apply_to_the_native_scaled_decode() {
+        let profile = grid_thumbnail_profile();
+        assert_eq!(
+            jpeg_scaled_dimensions(13_616, 3_616, profile.max_dimension),
+            (1_702, 452)
+        );
+
+        let image_limits = MediaCacheImageLimits {
+            max_dimension: 12_288,
+            max_pixels: 40_000_000,
+            max_decode_bytes: 256 * 1024 * 1024,
+        };
+        let error = validate_image_decode_limits(
+            ImageFormat::Jpeg,
+            u16::MAX.into(),
+            u16::MAX.into(),
+            profile,
+            &image_limits,
+        )
+        .expect("an oversized scaled JPEG buffer must be rejected locally");
+
+        assert!(error.contains("decoded pixel count"));
     }
 
     #[test]

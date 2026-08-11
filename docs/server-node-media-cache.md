@@ -49,6 +49,8 @@ Current implementation:
   manifest-backed stream that retains at most one source chunk
 - baseline JPEG thumbnails use native 1/8, 1/4, or 1/2 decoder scaling before
   the final thumbnail resample, avoiding a full-resolution pixel buffer
+- BerryKeep applies its configured dimension, pixel, and decoded-byte limits
+  to that native scaled JPEG buffer before invoking the decoder
 - video inspection and thumbnail extraction handled by external `ffprobe` / `ffmpeg`
 - cached dimensions
 - EXIF orientation when available
