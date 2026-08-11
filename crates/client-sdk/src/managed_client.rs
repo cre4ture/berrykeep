@@ -102,6 +102,9 @@ impl ManagedClientOptions {
     pub fn mobile_background() -> Self {
         Self {
             discovery_ttl: Duration::from_secs(15 * 60),
+            // Preserve the default policy's five-refresh tolerance even though
+            // the low-priority background discovery cadence is much longer.
+            route_retirement_grace: Duration::from_secs(75 * 60),
             route_maintenance_policy: ClientRouteMaintenancePolicy::mobile_background(),
             ..Self::default()
         }
@@ -1174,6 +1177,7 @@ mod tests {
         let options = ManagedClientOptions::mobile_background();
 
         assert_eq!(options.discovery_ttl, Duration::from_secs(15 * 60));
+        assert_eq!(options.route_retirement_grace, options.discovery_ttl * 5);
         assert_eq!(
             options.route_maintenance_policy,
             ClientRouteMaintenancePolicy::mobile_background()
