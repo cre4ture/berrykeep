@@ -6,12 +6,14 @@ use turso::{Value, params_from_iter};
 use uuid::Uuid;
 
 use super::super::{
-    CachedMediaMetadata, CurrentObjectEntry, FileVersionIndex, GalleryDeltaChange,
-    GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope,
-    GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaFilter, GalleryIndexMediaSummary,
-    GalleryIndexPage, GalleryIndexQuery, ManifestSummary, current_media_cache_metadata,
-    gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_media_type_for_path, sqlite_like_prefix_pattern,
+    CachedMediaMetadata, CurrentObjectEntry, FileVersionIndex,
+    GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY, GalleryDeltaChange, GalleryDeltaCursorError,
+    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
+    GalleryIndexEntry, GalleryIndexMediaFilter, GalleryIndexMediaSummary, GalleryIndexPage,
+    GalleryIndexQuery, ManifestSummary, current_media_cache_metadata,
+    effective_gallery_captured_at_unix, gallery_index_media_status,
+    gallery_index_media_type_from_metadata, gallery_media_type_for_path,
+    sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
 };
 use super::{TursoMetadataStore, row_string, row_u64};
 
@@ -178,6 +180,14 @@ impl TursoMetadataStore {
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
         let result = async {
+            let mut marker_rows = connection
+                .query(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    (GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,),
+                )
+                .await?;
+            let capture_fallback_backfill_needed = marker_rows.next().await?.is_none();
+            drop(marker_rows);
             let mut rows = connection
                 .query(
                     "SELECT current_objects.key, current_objects.manifest_hash, current_objects.object_id
@@ -189,8 +199,9 @@ impl TursoMetadataStore {
                         OR (
                             gallery_objects.geotagged != 0
                             AND (gallery_objects.latitude IS NULL OR gallery_objects.longitude IS NULL)
-                        )",
-                    (),
+                        )
+                        OR (?1 != 0 AND gallery_objects.captured_at_unix = 0)",
+                    (i64::from(capture_fallback_backfill_needed),),
                 )
                 .await?;
             let mut entries = Vec::new();
@@ -205,6 +216,15 @@ impl TursoMetadataStore {
             }
             for (key, entry) in entries {
                 upsert_gallery_object(connection, &key, &entry).await?;
+            }
+            if capture_fallback_backfill_needed {
+                connection
+                    .execute(
+                        "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,),
+                    )
+                    .await?;
             }
             Ok(())
         }
@@ -416,7 +436,12 @@ impl TursoMetadataStore {
                 )
                 .await?;
             if changed > 0 {
-                record_gallery_upserts_for_object_id(connection, object_id).await?;
+                let unchanged_projection_keys =
+                    refresh_gallery_objects_for_object_id_and_collect_unchanged_keys(
+                        connection, object_id,
+                    )
+                    .await?;
+                record_gallery_upserts_for_keys(connection, &unchanged_projection_keys).await?;
             }
             Ok(())
         }
@@ -545,11 +570,8 @@ async fn refresh_gallery_objects_for_manifest(
     }
     .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
     .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
+    drop(rows);
     let media_type = gallery_index_media_type_from_metadata(metadata.as_ref());
-    let captured_at_unix = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.taken_at_unix)
-        .unwrap_or(0);
     let media_status = gallery_index_media_status(metadata.as_ref());
     let gps = metadata
         .as_ref()
@@ -560,31 +582,62 @@ async fn refresh_gallery_objects_for_manifest(
                 && gps.longitude.is_finite()
                 && (-180.0..=180.0).contains(&gps.longitude)
         });
-    connection
-        .execute(
-            "UPDATE gallery_objects
-             SET media_type = COALESCE(?1, inferred_media_type),
-                 captured_at_unix = ?2,
-                 media_status = ?3,
-                 geotagged = ?4,
-                 latitude = ?5,
-                 longitude = ?6
-             WHERE manifest_hash = ?7",
-            params_from_iter(vec![
-                optional_text_value(media_type),
-                Value::from(
-                    i64::try_from(captured_at_unix).context("gallery capture time overflow")?,
-                ),
-                optional_text_value(media_status),
-                Value::from(i64::from(gps.is_some())),
-                gps.map(|gps| Value::from(gps.latitude))
-                    .unwrap_or(Value::Null),
-                gps.map(|gps| Value::from(gps.longitude))
-                    .unwrap_or(Value::Null),
-                Value::from(manifest_hash),
-            ]),
+    let mut rows = connection
+        .query(
+            "SELECT gallery_objects.key, version_indexes.index_json
+             FROM gallery_objects
+             LEFT JOIN version_indexes
+               ON version_indexes.object_id = gallery_objects.object_id
+             WHERE gallery_objects.manifest_hash = ?1",
+            (manifest_hash,),
         )
         .await?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().await? {
+        entries.push((
+            row_string(&row, 0, "gallery_objects.key")?,
+            row_opt_blob(&row, 1, "version_indexes.index_json")?,
+        ));
+    }
+    drop(rows);
+
+    for (key, version_index_payload) in entries {
+        let version_created_at_unix =
+            version_created_at_unix_from_payload(version_index_payload.as_deref(), manifest_hash)?;
+        let captured_at_unix = effective_gallery_captured_at_unix(
+            &key,
+            metadata.is_some(),
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.taken_at_unix),
+            version_created_at_unix,
+        );
+        connection
+            .execute(
+                "UPDATE gallery_objects
+                 SET media_type = COALESCE(?1, inferred_media_type),
+                     captured_at_unix = ?2,
+                     media_status = ?3,
+                     geotagged = ?4,
+                     latitude = ?5,
+                     longitude = ?6
+                 WHERE key = ?7",
+                params_from_iter(vec![
+                    optional_text_value(media_type),
+                    Value::from(
+                        i64::try_from(captured_at_unix).context("gallery capture time overflow")?,
+                    ),
+                    optional_text_value(media_status),
+                    Value::from(i64::from(gps.is_some())),
+                    gps.map(|gps| Value::from(gps.latitude))
+                        .unwrap_or(Value::Null),
+                    gps.map(|gps| Value::from(gps.longitude))
+                        .unwrap_or(Value::Null),
+                    Value::from(key),
+                ]),
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -627,6 +680,29 @@ async fn refresh_gallery_objects_for_manifest_and_collect_unchanged_keys(
     let before = gallery_projection_states_for_manifest(connection, manifest_hash).await?;
     refresh_gallery_objects_for_manifest(connection, manifest_hash).await?;
     let after = gallery_projection_states_for_manifest(connection, manifest_hash).await?;
+    Ok(unchanged_gallery_projection_keys(before, after))
+}
+
+async fn refresh_gallery_objects_for_object_id_and_collect_unchanged_keys(
+    connection: &turso::Connection,
+    object_id: &str,
+) -> Result<Vec<String>> {
+    let before = gallery_projection_states_for_object_id(connection, object_id).await?;
+    let mut rows = connection
+        .query(
+            "SELECT DISTINCT manifest_hash FROM gallery_objects WHERE object_id = ?1",
+            (object_id,),
+        )
+        .await?;
+    let mut manifest_hashes = Vec::new();
+    while let Some(row) = rows.next().await? {
+        manifest_hashes.push(row_string(&row, 0, "gallery_objects.manifest_hash")?);
+    }
+    drop(rows);
+    for manifest_hash in manifest_hashes {
+        refresh_gallery_objects_for_manifest(connection, &manifest_hash).await?;
+    }
+    let after = gallery_projection_states_for_object_id(connection, object_id).await?;
     Ok(unchanged_gallery_projection_keys(before, after))
 }
 
@@ -674,13 +750,22 @@ async fn gallery_projection_states_for_manifest(
     .await
 }
 
-async fn record_gallery_upserts_for_object_id(
+async fn gallery_projection_states_for_object_id(
     connection: &turso::Connection,
     object_id: &str,
-) -> Result<()> {
-    record_gallery_upserts_for_query(
+) -> Result<Vec<GalleryProjectionState>> {
+    gallery_projection_states_for_query(
         connection,
-        "SELECT key FROM gallery_objects WHERE object_id = ?1",
+        "SELECT
+             key,
+             media_type,
+             captured_at_unix,
+             media_status,
+             geotagged,
+             latitude,
+             longitude
+         FROM gallery_objects
+         WHERE object_id = ?1",
         object_id,
     )
     .await
@@ -729,19 +814,6 @@ async fn record_gallery_upserts_for_keys(
         record_gallery_change(connection, key, "upsert").await?;
     }
     Ok(())
-}
-
-async fn record_gallery_upserts_for_query(
-    connection: &turso::Connection,
-    sql: &str,
-    parameter: &str,
-) -> Result<()> {
-    let mut rows = connection.query(sql, (parameter,)).await?;
-    let mut keys = Vec::new();
-    while let Some(row) = rows.next().await? {
-        keys.push(row_string(&row, 0, "gallery_objects.key")?);
-    }
-    record_gallery_upserts_for_keys(connection, &keys).await
 }
 
 async fn record_gallery_change(
@@ -1110,20 +1182,8 @@ fn materialize_gallery_index_entry(
     let media_metadata = metadata_payload
         .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
-    let modified_at_unix = version_index_payload
-        .map(|payload| {
-            serde_json::from_slice::<FileVersionIndex>(&payload)
-                .context("invalid version index while reading Turso gallery projection")
-        })
-        .transpose()?
-        .and_then(|index| {
-            index
-                .versions
-                .values()
-                .filter(|record| record.manifest_hash == manifest_hash)
-                .map(|record| record.created_at_unix)
-                .max()
-        });
+    let modified_at_unix =
+        version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
     Ok(GalleryIndexEntry {
         key,
         manifest_hash,
@@ -1462,6 +1522,80 @@ mod tests {
 
         drop(connection);
         drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_backfill_migrates_zero_capture_time_to_version_creation() {
+        let metadata_db_path = turso_test_db_path("gallery-capture-fallback-backfill");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let version_index_payload = serde_json::to_vec(&serde_json::json!({
+            "object_id": "object-pending",
+            "versions": {
+                "version-pending": {
+                    "version_id": "version-pending",
+                    "object_id": "object-pending",
+                    "manifest_hash": "manifest-pending",
+                    "logical_path": "gallery/pending.jpg",
+                    "parent_version_ids": [],
+                    "state": "confirmed",
+                    "created_at_unix": 1_800_000_000u64,
+                    "copied_from_object_id": null,
+                    "copied_from_version_id": null,
+                    "copied_from_path": null
+                }
+            },
+            "head_version_ids": ["version-pending"],
+            "preferred_head_version_id": "version-pending"
+        }))
+        .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO current_objects (key, manifest_hash, object_id)
+                 VALUES ('gallery/pending.jpg', 'manifest-pending', 'object-pending');
+                 INSERT INTO gallery_objects (
+                     key, manifest_hash, object_id, inferred_media_type, media_type,
+                     captured_at_unix, media_status, geotagged, latitude, longitude
+                 ) VALUES (
+                     'gallery/pending.jpg', 'manifest-pending', 'object-pending', 'image', 'image',
+                     0, NULL, 0, NULL, NULL
+                 );
+                 DELETE FROM metadata_meta WHERE key = 'gallery_capture_fallback_v1';",
+            )
+            .await
+            .expect("legacy gallery projection should persist");
+        store
+            .connection
+            .execute(
+                "INSERT INTO version_indexes (object_id, index_json) VALUES (?1, ?2)",
+                ("object-pending", version_index_payload),
+            )
+            .await
+            .expect("version index should persist");
+        drop(store);
+
+        let reopened = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should reopen");
+        let mut rows = reopened
+            .connection
+            .query(
+                "SELECT captured_at_unix FROM gallery_objects WHERE key = 'gallery/pending.jpg'",
+                (),
+            )
+            .await
+            .expect("backfilled gallery capture time should query");
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row_u64(&row, 0, "gallery_objects.captured_at_unix").unwrap(),
+            1_800_000_000
+        );
+        drop(rows);
+
+        drop(reopened);
         let _ = std::fs::remove_file(metadata_db_path);
     }
 

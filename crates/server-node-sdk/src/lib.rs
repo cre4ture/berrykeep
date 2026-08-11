@@ -16707,11 +16707,13 @@ fn matches_store_index_media_filter(
 }
 
 fn store_index_entry_captured_at(entry: &StoreIndexEntry) -> u64 {
-    entry
-        .media
-        .as_ref()
-        .and_then(|media| media.taken_at_unix)
-        .unwrap_or(0)
+    let media = entry.media.as_ref();
+    storage::effective_gallery_captured_at_unix(
+        &entry.path,
+        media.is_some_and(|media| media.status != "pending"),
+        media.and_then(|media| media.taken_at_unix),
+        entry.modified_at_unix,
+    )
 }
 
 fn store_index_entry_type(entry: &StoreIndexEntry) -> &str {

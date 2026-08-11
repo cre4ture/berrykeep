@@ -14207,7 +14207,14 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         .await
         .unwrap();
     let first_payload: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
-    assert_eq!(first_payload["entries"][0]["path"], "gallery/a.png");
+    let first_path = first_payload["entries"][0]["path"]
+        .as_str()
+        .expect("first page should contain a path")
+        .to_string();
+    assert!(matches!(
+        first_path.as_str(),
+        "gallery/a.png" | "gallery/b.png"
+    ));
     assert_eq!(first_payload["total_entry_count"], 2);
     assert_eq!(first_payload["has_more"], true);
 
@@ -14254,7 +14261,11 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         .await
         .unwrap();
     let second_payload: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
-    assert_eq!(second_payload["entries"][0]["path"], "gallery/b.png");
+    let second_path = second_payload["entries"][0]["path"]
+        .as_str()
+        .expect("second page should contain a path");
+    assert_ne!(second_path, first_path);
+    assert!(matches!(second_path, "gallery/a.png" | "gallery/b.png"));
     assert_eq!(second_payload["total_entry_count"], 2);
     assert_eq!(second_payload["has_more"], false);
 
@@ -14525,6 +14536,94 @@ run_on_main_metadata_backends!(
     list_store_index_uses_gallery_projection_for_captured_pagination_turso
 );
 
+async fn list_store_index_uses_filename_capture_fallback_after_extraction_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let pending_png = {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    };
+    let latest_snapshot_id = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        // The future date makes the filename fallback observably outrank the newer upload.
+        let named = locked
+            .put_object_versioned(
+                "gallery/IMG-20991231-WA0001.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let metadata = locked
+            .ensure_media_metadata(&named.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.status, super::MediaCacheStatus::Ready);
+        assert_eq!(metadata.taken_at_unix, None);
+        locked
+            .put_object_versioned(
+                "gallery/new-upload.png",
+                bytes::Bytes::from(pending_png),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+            .snapshot_id
+    };
+
+    for snapshot in [None, Some(latest_snapshot_id)] {
+        let response = axum::response::IntoResponse::into_response(
+            super::list_store_index(
+                axum::extract::State(state.clone()),
+                axum::extract::Query(super::StoreIndexQuery {
+                    prefix: Some("gallery".to_string()),
+                    depth: Some(64),
+                    snapshot,
+                    view: Some(super::StoreIndexView::Tree),
+                    cursor: None,
+                    page_size: None,
+                    offset: Some(0),
+                    limit: Some(2),
+                    sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                    media_filter: Some(super::StoreIndexMediaFilter::Image),
+                    south: None,
+                    west: None,
+                    north: None,
+                    east: None,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let entries = payload["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["path"], "gallery/IMG-20991231-WA0001.png");
+        assert_eq!(entries[0]["media"]["status"], "ready");
+        assert_eq!(
+            entries[0]["media"]["taken_at_unix"],
+            serde_json::Value::Null
+        );
+        assert_eq!(entries[1]["path"], "gallery/new-upload.png");
+        assert_eq!(entries[1]["media"]["status"], "pending");
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_uses_filename_capture_fallback_after_extraction_impl,
+    list_store_index_uses_filename_capture_fallback_after_extraction,
+    list_store_index_uses_filename_capture_fallback_after_extraction_turso
+);
+
 #[tokio::test]
 async fn list_store_index_gallery_projection_matches_generic_pending_media_on_cache_miss() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
@@ -14764,14 +14863,14 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
         signature(&gallery_payload),
         vec![
             (
-                serde_json::json!("gallery/older.png"),
-                serde_json::json!("ready"),
-                serde_json::json!(100),
-            ),
-            (
                 serde_json::json!("gallery/missing.png"),
                 serde_json::json!("pending"),
                 serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!("gallery/older.png"),
+                serde_json::json!("ready"),
+                serde_json::json!(100),
             ),
             (
                 serde_json::json!("gallery/zero.png"),

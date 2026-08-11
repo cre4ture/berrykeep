@@ -50,6 +50,76 @@ fn gallery_delta_scope() -> GalleryDeltaScope {
     }
 }
 
+#[tokio::test]
+async fn gallery_backfill_migrates_zero_capture_time_to_version_creation() {
+    let metadata_db_path = sqlite_test_db_path("gallery-capture-fallback-backfill");
+    let store = SqliteMetadataStore::open(&metadata_db_path)
+        .await
+        .expect("sqlite metadata store should open");
+    let version_index_payload = serde_json::to_vec(&serde_json::json!({
+        "object_id": "object-pending",
+        "versions": {
+            "version-pending": {
+                "version_id": "version-pending",
+                "object_id": "object-pending",
+                "manifest_hash": "manifest-pending",
+                "logical_path": "gallery/pending.jpg",
+                "parent_version_ids": [],
+                "state": "confirmed",
+                "created_at_unix": 1_800_000_000u64,
+                "copied_from_object_id": null,
+                "copied_from_version_id": null,
+                "copied_from_path": null
+            }
+        },
+        "head_version_ids": ["version-pending"],
+        "preferred_head_version_id": "version-pending"
+    }))
+    .unwrap();
+    store
+        .write_tx(move |db| {
+            db.execute_batch(
+                "INSERT INTO current_objects (key, manifest_hash, object_id)
+                 VALUES ('gallery/pending.jpg', 'manifest-pending', 'object-pending');
+                 INSERT INTO gallery_objects (
+                     key, manifest_hash, object_id, inferred_media_type, media_type,
+                     captured_at_unix, media_status, geotagged, latitude, longitude
+                 ) VALUES (
+                     'gallery/pending.jpg', 'manifest-pending', 'object-pending', 'image', 'image',
+                     0, NULL, 0, NULL, NULL
+                 );
+                 DELETE FROM metadata_meta WHERE key = 'gallery_capture_fallback_v1';",
+            )?;
+            db.execute(
+                "INSERT INTO version_indexes (object_id, index_json) VALUES (?1, ?2)",
+                params!["object-pending", version_index_payload],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("legacy gallery projection should persist");
+    drop(store);
+
+    let reopened = SqliteMetadataStore::open(&metadata_db_path)
+        .await
+        .expect("sqlite metadata store should reopen");
+    let captured_at_unix = reopened
+        .read(|db| {
+            db.query_row(
+                "SELECT captured_at_unix FROM gallery_objects WHERE key = 'gallery/pending.jpg'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .expect("backfilled gallery capture time should load");
+    assert_eq!(captured_at_unix, 1_800_000_000);
+
+    drop(reopened);
+    let _ = std::fs::remove_file(metadata_db_path);
+}
+
 #[test]
 fn gallery_revision_and_delta_survive_restart_and_track_removals() {
     let metadata_db_path = sqlite_test_db_path("gallery-delta-restart");
