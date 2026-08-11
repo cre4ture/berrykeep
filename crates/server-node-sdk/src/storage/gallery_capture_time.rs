@@ -5,14 +5,16 @@ use super::FileVersionIndex;
 
 pub(crate) fn effective_gallery_captured_at_unix(
     key: &str,
-    metadata_extracted: bool,
+    metadata_status: Option<&str>,
     taken_at_unix: Option<u64>,
     version_created_at_unix: Option<u64>,
 ) -> u64 {
     if let Some(taken_at_unix) = taken_at_unix {
         return taken_at_unix;
     }
-    if metadata_extracted && let Some(filename_captured_at_unix) = filename_captured_at_unix(key) {
+    if matches!(metadata_status, Some("ready" | "unsupported" | "failed"))
+        && let Some(filename_captured_at_unix) = filename_captured_at_unix(key)
+    {
         return filename_captured_at_unix;
     }
     version_created_at_unix.unwrap_or(0)
@@ -213,14 +215,29 @@ mod tests {
         let filename_time = filename_captured_at_unix("IMG_20240304_050607.jpg").unwrap();
 
         assert_eq!(
-            effective_gallery_captured_at_unix("IMG_20240304_050607.jpg", false, None, Some(200),),
+            effective_gallery_captured_at_unix(
+                "IMG_20240304_050607.jpg",
+                Some("pending"),
+                None,
+                Some(200),
+            ),
             200,
             "pending metadata must use the version creation time"
         );
         assert_eq!(
             effective_gallery_captured_at_unix(
                 "IMG_20240304_050607.jpg",
-                true,
+                Some("incomplete"),
+                None,
+                Some(200),
+            ),
+            200,
+            "incomplete extraction must use the version creation time"
+        );
+        assert_eq!(
+            effective_gallery_captured_at_unix(
+                "IMG_20240304_050607.jpg",
+                Some("ready"),
                 Some(300),
                 Some(200),
             ),
@@ -228,12 +245,17 @@ mod tests {
             "extracted capture time must take precedence"
         );
         assert_eq!(
-            effective_gallery_captured_at_unix("IMG_20240304_050607.jpg", true, None, Some(200),),
+            effective_gallery_captured_at_unix(
+                "IMG_20240304_050607.jpg",
+                Some("ready"),
+                None,
+                Some(200),
+            ),
             filename_time,
             "filename time must replace the creation fallback once extraction completes"
         );
         assert_eq!(
-            effective_gallery_captured_at_unix("holiday.jpg", true, None, Some(200)),
+            effective_gallery_captured_at_unix("holiday.jpg", Some("ready"), None, Some(200)),
             200,
             "unrecognized filenames must retain the version creation fallback"
         );

@@ -14548,6 +14548,14 @@ async fn list_store_index_uses_filename_capture_fallback_after_extraction_impl(
             .unwrap();
         bytes.into_inner()
     };
+    let incomplete_png = {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([78, 34, 56, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    };
     let latest_snapshot_id = {
         let mut locked = lock_store(&state, "tests.state.store").await;
         // The future date makes the filename fallback observably outrank the newer upload.
@@ -14566,9 +14574,28 @@ async fn list_store_index_uses_filename_capture_fallback_after_extraction_impl(
             .unwrap();
         assert_eq!(metadata.status, super::MediaCacheStatus::Ready);
         assert_eq!(metadata.taken_at_unix, None);
+        let incomplete = locked
+            .put_object_versioned(
+                "gallery/z-IMG_20980101_000000.png",
+                bytes::Bytes::from(incomplete_png),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut incomplete_metadata = locked
+            .ensure_media_metadata(&incomplete.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        incomplete_metadata.status = super::MediaCacheStatus::Incomplete;
+        incomplete_metadata.taken_at_unix = None;
+        locked
+            .persist_media_cache_record(&incomplete_metadata)
+            .await
+            .unwrap();
         locked
             .put_object_versioned(
-                "gallery/new-upload.png",
+                "gallery/a-new-upload.png",
                 bytes::Bytes::from(pending_png),
                 PutOptions::default(),
             )
@@ -14589,7 +14616,7 @@ async fn list_store_index_uses_filename_capture_fallback_after_extraction_impl(
                     cursor: None,
                     page_size: None,
                     offset: Some(0),
-                    limit: Some(2),
+                    limit: Some(3),
                     sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                     media_filter: Some(super::StoreIndexMediaFilter::Image),
                     south: None,
@@ -14611,8 +14638,10 @@ async fn list_store_index_uses_filename_capture_fallback_after_extraction_impl(
             entries[0]["media"]["taken_at_unix"],
             serde_json::Value::Null
         );
-        assert_eq!(entries[1]["path"], "gallery/new-upload.png");
+        assert_eq!(entries[1]["path"], "gallery/a-new-upload.png");
         assert_eq!(entries[1]["media"]["status"], "pending");
+        assert_eq!(entries[2]["path"], "gallery/z-IMG_20980101_000000.png");
+        assert_eq!(entries[2]["media"]["status"], "incomplete");
     }
 
     cleanup_test_state(&state).await;

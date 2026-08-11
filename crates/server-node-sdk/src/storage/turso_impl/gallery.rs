@@ -606,7 +606,7 @@ async fn refresh_gallery_objects_for_manifest(
             version_created_at_unix_from_payload(version_index_payload.as_deref(), manifest_hash)?;
         let captured_at_unix = effective_gallery_captured_at_unix(
             &key,
-            metadata.is_some(),
+            media_status,
             metadata
                 .as_ref()
                 .and_then(|metadata| metadata.taken_at_unix),

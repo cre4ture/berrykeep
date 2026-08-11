@@ -16710,7 +16710,7 @@ fn store_index_entry_captured_at(entry: &StoreIndexEntry) -> u64 {
     let media = entry.media.as_ref();
     storage::effective_gallery_captured_at_unix(
         &entry.path,
-        media.is_some_and(|media| media.status != "pending"),
+        media.map(|media| media.status.as_str()),
         media.and_then(|media| media.taken_at_unix),
         entry.modified_at_unix,
     )
