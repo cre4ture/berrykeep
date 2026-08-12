@@ -1,3 +1,4 @@
+mod admission;
 mod auth;
 mod cluster_registry;
 mod global_registration;
@@ -39,13 +40,14 @@ use transport_sdk::{
 };
 
 use crate::auth::{
-    MaybeAuthenticatedPeer, MaybeObservedPeerAddr, MtlsAuthenticatedPeerAcceptor,
-    authenticated_peer_cluster, build_mtls_rustls_config, ensure_authenticated_peer_cluster,
+    MaybeAuthenticatedPeer, MaybeObservedPeerAddr, authenticated_peer_cluster,
+    build_mtls_rustls_config, ensure_authenticated_peer_cluster,
     ensure_authenticated_peer_identity, require_any_authenticated_peer,
 };
 use crate::global_registration::GlobalRegistrationState;
 use crate::iroh_relay::IrohRelayRuntime;
 
+pub use crate::admission::RendezvousAdmissionConfig;
 pub use crate::auth::GlobalClusterClientCertVerifier;
 pub use crate::cluster_registry::{ClusterCaRecord, ClusterCaRegistry, cluster_ca_fingerprint};
 pub use crate::iroh_relay::{IrohRelayQuicServerConfig, IrohRelayServerConfig};
@@ -193,11 +195,20 @@ pub struct RendezvousAppState {
     pub relay_tunnel: RelayTunnelBroker,
     pub mesh_peers: Option<RendezvousControlClient>,
     pub(crate) global_registration: Option<GlobalRegistrationState>,
+    admission: RendezvousAdmissionConfig,
     iroh_relay: Option<IrohRelayRuntime>,
 }
 
 impl RendezvousAppState {
     pub fn new(config: RendezvousServerConfig) -> Result<Self> {
+        Self::new_with_admission(config, RendezvousAdmissionConfig::default())
+    }
+
+    pub fn new_with_admission(
+        config: RendezvousServerConfig,
+        admission: RendezvousAdmissionConfig,
+    ) -> Result<Self> {
+        admission.validate()?;
         let global_registration = config
             .mtls
             .as_ref()
@@ -218,6 +229,7 @@ impl RendezvousAppState {
             presence: PresenceRegistry::new(),
             relay_tunnel: RelayTunnelBroker::new(),
             global_registration,
+            admission,
             iroh_relay,
         })
     }
@@ -275,6 +287,7 @@ pub fn build_router(state: RendezvousAppState) -> Router {
 
 pub async fn serve(state: RendezvousAppState) -> Result<()> {
     let bind_addr = state.config.bind_addr;
+    let admission = state.admission;
     let app = build_router(state.clone());
     spawn_mesh_probe_task(state.mesh_peers.clone());
     let relay_service = state.iroh_relay.as_ref().map(IrohRelayRuntime::service);
@@ -295,23 +308,9 @@ pub async fn serve(state: RendezvousAppState) -> Result<()> {
         None
     };
 
-    let result = if let Some(relay_service) = relay_service.as_ref() {
-        iroh_relay::serve_same_port(bind_addr, app, tls_config, relay_service.clone()).await
-    } else if let Some(tls_config) = tls_config {
-        axum_server::bind(bind_addr)
-            .acceptor(MtlsAuthenticatedPeerAcceptor::new(tls_config))
-            .serve(app.into_make_service())
-            .await
-            .map_err(anyhow::Error::from)
-    } else {
-        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .map_err(anyhow::Error::from)
-    };
+    let result =
+        iroh_relay::serve_listener(bind_addr, app, tls_config, relay_service.clone(), admission)
+            .await;
     if let Some(relay_service) = relay_service {
         relay_service.shutdown().await;
     }

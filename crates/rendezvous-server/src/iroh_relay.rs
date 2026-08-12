@@ -35,6 +35,10 @@ use tower::Service;
 use tracing::warn;
 use transport_sdk::{IrohRelayTicket, PeerIdentity};
 
+use crate::admission::{
+    AcceptErrorBackoff, RendezvousAdmissionConfig, RendezvousAdmissionController,
+    classify_accept_error, should_log_admission_event,
+};
 use crate::auth::{AuthenticatedPeer, WithAuthenticatedPeer, authenticated_peer_from_tls_stream};
 use crate::{RendezvousServerTlsIdentity, auth::build_server_rustls_config};
 
@@ -425,44 +429,116 @@ impl IrohRelayRuntime {
     }
 }
 
-pub(crate) async fn serve_same_port(
+pub(crate) async fn serve_listener(
     bind_addr: SocketAddr,
     app: Router,
     tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
-    relay: RelayService,
+    relay: Option<RelayService>,
+    admission_config: RendezvousAdmissionConfig,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let tls_acceptor = tls_config.map(|config| tokio_rustls::TlsAcceptor::from(config.get_inner()));
+    let admission = RendezvousAdmissionController::new(admission_config)?;
+    let limits = admission.config();
+    tracing::info!(
+        event = "rendezvous_admission_started",
+        max_connections = limits.max_connections,
+        max_tls_handshakes = limits.max_tls_handshakes,
+        tls_enabled = tls_acceptor.is_some(),
+        "rendezvous listener admission protection enabled"
+    );
+    let mut accept_backoff = AcceptErrorBackoff::default();
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let connection_permit = match admission.try_admit_connection() {
+            Ok(permit) => permit,
+            Err(saturation) => {
+                if should_log_admission_event(saturation.events_total) {
+                    tracing::warn!(
+                        event = "rendezvous_connection_limit_saturated",
+                        active_connections = saturation.active,
+                        max_connections = saturation.limit,
+                        saturation_events_total = saturation.events_total,
+                        "rendezvous connection admission saturated; pausing accepts"
+                    );
+                }
+                admission.admit_connection().await
+            }
+        };
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(accepted) => {
+                accept_backoff.reset();
+                accepted
+            }
+            Err(error) => {
+                drop(connection_permit);
+                let error_class = classify_accept_error(&error);
+                let Some(retry_after) = accept_backoff.delay_after(&error) else {
+                    tracing::debug!(
+                        event = "rendezvous_accept_interrupted",
+                        %error,
+                        "rendezvous listener accept interrupted; retrying"
+                    );
+                    continue;
+                };
+                tracing::warn!(
+                    event = "rendezvous_accept_failed",
+                    %error,
+                    ?error_class,
+                    retry_after_ms = retry_after.as_millis(),
+                    "rendezvous listener accept failed; retrying with bounded backoff"
+                );
+                tokio::time::sleep(retry_after).await;
+                continue;
+            }
+        };
         let app = app.clone();
         let relay = relay.clone();
         let tls_acceptor = tls_acceptor.clone();
+        let admission = admission.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             let result =
-                serve_same_port_connection(stream, peer_addr, app, relay, tls_acceptor).await;
+                serve_connection(stream, peer_addr, app, relay, tls_acceptor, admission).await;
             if let Err(error) = result {
-                tracing::debug!(%error, %peer_addr, "same-port rendezvous connection ended");
+                tracing::debug!(%error, %peer_addr, "rendezvous connection ended");
             }
         });
     }
 }
 
-async fn serve_same_port_connection(
+async fn serve_connection(
     stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
     app: Router,
-    relay: RelayService,
+    relay: Option<RelayService>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    admission: RendezvousAdmissionController,
 ) -> Result<()> {
     if let Some(tls_acceptor) = tls_acceptor {
+        let handshake_permit = match admission.try_admit_tls_handshake() {
+            Ok(permit) => permit,
+            Err(rejection) => {
+                if should_log_admission_event(rejection.events_total) {
+                    tracing::warn!(
+                        event = "rendezvous_tls_handshake_rejected",
+                        %peer_addr,
+                        active_tls_handshakes = rejection.active,
+                        max_tls_handshakes = rejection.limit,
+                        rejected_total = rejection.events_total,
+                        "rendezvous TLS handshake rejected by global admission limit"
+                    );
+                }
+                return Ok(());
+            }
+        };
         let tls_stream = tokio::time::timeout(Duration::from_secs(10), tls_acceptor.accept(stream))
             .await
             .context("rendezvous TLS handshake timed out")?
             .context("rendezvous TLS handshake failed")?;
+        drop(handshake_permit);
         let authenticated_peer = authenticated_peer_from_tls_stream(&tls_stream)?;
         let http2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
-        return serve_same_port_stream(
+        return serve_stream(
             MaybeTlsStream::Tls(tls_stream),
             peer_addr,
             authenticated_peer,
@@ -473,7 +549,7 @@ async fn serve_same_port_connection(
         .await;
     }
 
-    serve_same_port_stream(
+    serve_stream(
         MaybeTlsStream::Plain(stream),
         peer_addr,
         None,
@@ -484,30 +560,30 @@ async fn serve_same_port_connection(
     .await
 }
 
-async fn serve_same_port_stream(
+async fn serve_stream(
     stream: MaybeTlsStream,
     peer_addr: SocketAddr,
     authenticated_peer: Option<AuthenticatedPeer>,
     app: Router,
-    relay: RelayService,
+    relay: Option<RelayService>,
     http2: bool,
 ) -> Result<()> {
     let service = SamePortProtocolService::new(
         WithAuthenticatedPeer::new(app, authenticated_peer, Some(peer_addr)),
-        Some(relay),
+        relay,
     );
     let service = TowerToHyperService::new(service);
     if http2 {
         http2::Builder::new(TokioExecutor::new())
             .serve_connection(TokioIo::new(stream), service)
             .await
-            .context("same-port Rendezvous HTTP/2 connection failed")?;
+            .context("Rendezvous HTTP/2 connection failed")?;
     } else {
         http1::Builder::new()
             .serve_connection(TokioIo::new(stream), service)
             .with_upgrades()
             .await
-            .context("same-port Rendezvous HTTP/1.1 connection failed")?;
+            .context("Rendezvous HTTP/1.1 connection failed")?;
     }
     Ok(())
 }

@@ -6,8 +6,8 @@ use clap::Parser;
 use common::{ClusterId, NodeId};
 pub use rendezvous_server::{
     ClusterCaRegistry, GlobalClusterRegistrationConfig, IrohRelayQuicServerConfig,
-    IrohRelayServerConfig, RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerConfig,
-    RendezvousServerTlsIdentity,
+    IrohRelayServerConfig, RendezvousAdmissionConfig, RendezvousClientCa, RendezvousMtlsConfig,
+    RendezvousServerConfig, RendezvousServerTlsIdentity,
 };
 
 use crate::failover::{
@@ -59,6 +59,7 @@ pub struct RendezvousServiceConfig {
     pub iroh_relay: Option<IrohRelayServerConfig>,
     pub peer_rendezvous_urls: Vec<String>,
     pub mtls: Option<RendezvousMtlsConfig>,
+    pub admission: RendezvousAdmissionConfig,
     pub allow_insecure_http: bool,
     pub failover_package: Option<LoadedRendezvousFailoverMetadata>,
 }
@@ -228,6 +229,21 @@ impl RendezvousServiceConfig {
             allow_insecure_http,
             mtls.as_ref().map(|mtls| mtls.server_identity.clone()),
         )?;
+        let admission_defaults = RendezvousAdmissionConfig::default();
+        let max_connections = parse_positive_env_usize(
+            "IRONMESH_RENDEZVOUS_MAX_CONNECTIONS",
+            lookup_env("IRONMESH_RENDEZVOUS_MAX_CONNECTIONS"),
+            admission_defaults.max_connections,
+        )?;
+        let admission = RendezvousAdmissionConfig {
+            max_connections,
+            max_tls_handshakes: parse_positive_env_usize(
+                "IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES",
+                lookup_env("IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES"),
+                admission_defaults.max_tls_handshakes.min(max_connections),
+            )?,
+        };
+        admission.validate()?;
 
         let config = Self {
             bind_addr,
@@ -236,6 +252,7 @@ impl RendezvousServiceConfig {
             iroh_relay,
             peer_rendezvous_urls,
             mtls,
+            admission,
             allow_insecure_http,
             failover_package: failover_package.as_ref().map(|package| {
                 LoadedRendezvousFailoverMetadata {
@@ -637,6 +654,7 @@ mod tests {
             iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
+            admission: RendezvousAdmissionConfig::default(),
             allow_insecure_http: false,
             failover_package: None,
         };
@@ -656,6 +674,7 @@ mod tests {
             iroh_relay: None,
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
+            admission: RendezvousAdmissionConfig::default(),
             allow_insecure_http: true,
             failover_package: None,
         };
@@ -701,6 +720,7 @@ mod tests {
         assert_eq!(relay.ticket_ttl, std::time::Duration::from_secs(7200));
         assert_eq!(relay.client_rx_bytes_per_second, 16 * 1024 * 1024);
         assert_eq!(relay.client_rx_max_burst_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.admission, RendezvousAdmissionConfig::default());
         let quic = relay
             .quic
             .as_ref()
@@ -716,6 +736,66 @@ mod tests {
             .iroh_relay
             .expect("relay should be configured");
         assert_eq!(configured, relay.clone());
+    }
+
+    #[test]
+    fn from_lookup_configures_rendezvous_admission_limits() {
+        let cli = RendezvousServiceCliConfig::default();
+        let env = HashMap::from([
+            (
+                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IRONMESH_IROH_RELAY_ENABLED".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_MAX_CONNECTIONS".to_string(),
+                "120".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES".to_string(),
+                "12".to_string(),
+            ),
+        ]);
+
+        let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
+            .expect("admission config should load");
+        assert_eq!(
+            config.admission,
+            RendezvousAdmissionConfig {
+                max_connections: 120,
+                max_tls_handshakes: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn from_lookup_rejects_more_handshakes_than_connections() {
+        let cli = RendezvousServiceCliConfig::default();
+        let env = HashMap::from([
+            (
+                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IRONMESH_IROH_RELAY_ENABLED".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_MAX_CONNECTIONS".to_string(),
+                "10".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES".to_string(),
+                "11".to_string(),
+            ),
+        ]);
+
+        let error = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
+            .expect_err("invalid admission config should fail");
+        assert!(error.to_string().contains("must not exceed"));
     }
 
     #[test]

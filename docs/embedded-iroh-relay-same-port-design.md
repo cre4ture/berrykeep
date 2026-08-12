@@ -111,6 +111,10 @@ Advanced controls are:
 - `IRONMESH_IROH_RELAY_QUIC_TLS_CERT` and
   `IRONMESH_IROH_RELAY_QUIC_TLS_KEY` — optional dedicated QAD identity for
   deployments that cannot reuse Rendezvous TLS.
+- `IRONMESH_RENDEZVOUS_MAX_CONNECTIONS` — global accepted TCP connection cap
+  across Rendezvous-only, mTLS, and same-port relay modes; defaults to `512`.
+- `IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES` — global concurrent TLS handshake
+  cap; defaults to `64` and must not exceed the connection cap.
 
 There is intentionally no separate relay public URL or static authentication
 token. The QAD endpoint only reports the caller's observed UDP address; relay
@@ -120,6 +124,11 @@ admission remains protected by endpoint-bound tickets on `/relay`.
 
 - Same-port routing does not weaken Rendezvous authorization: protected
   control handlers still require a valid client certificate.
+- Accepted TCP connections and in-progress TLS handshakes have separate
+  admission limits. The listener pauses accepting at the connection cap so the
+  kernel backlog provides backpressure; excess TLS handshakes are closed before
+  protocol processing. Listener descriptor exhaustion is retried with bounded
+  backoff instead of terminating the service.
 - Relay admission is endpoint-bound and time-bounded.
 - Ticket signatures are verified in constant time by HMAC.
 - Ticket contents are authenticated but not encrypted; they contain identifiers

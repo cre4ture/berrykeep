@@ -54,6 +54,10 @@ IRONMESH_IROH_RELAY_TICKET_TTL_SECS=3600
 IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND=16777216
 IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES=33554432
 
+# Global TCP/TLS admission defaults for every Rendezvous listener mode.
+IRONMESH_RENDEZVOUS_MAX_CONNECTIONS=512
+IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES=64
+
 # Optional when the public UDP port differs from the default.
 IRONMESH_IROH_RELAY_QUIC_BIND=0.0.0.0:7842
 IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT=7842
@@ -67,6 +71,12 @@ Ticket lifetime must be between 300 and 86400 seconds. Receive limits are
 applied per Iroh relay connection. The QAD certificate must cover every host
 in the advertised relay origins. Bind and public ports must be non-zero; use
 the public port setting when host-level port forwarding changes the UDP port.
+The TCP connection limit is held for the full served connection, including
+upgraded relay connections. The TLS limit is held only through the handshake
+and must not exceed the connection limit. If the connection limit is set below
+64 without an explicit TLS value, the TLS default is reduced to match it.
+These defaults leave descriptor headroom when the service runs with
+`RLIMIT_NOFILE=1024`.
 
 `IRONMESH_DIRECT_QUIC_RELAY_URLS` and
 `IRONMESH_DIRECT_QUIC_RELAY_AUTH_TOKEN` remain supported on server nodes for an

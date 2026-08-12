@@ -31,6 +31,8 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
         bind_addr = %config.bind_addr,
         public_url = %config.public_url,
         mtls_enabled = config.mtls.is_some(),
+        max_connections = config.admission.max_connections,
+        max_tls_handshakes = config.admission.max_tls_handshakes,
         "rendezvous service listening"
     );
 
@@ -45,7 +47,11 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
         );
     }
 
-    serve_rendezvous(RendezvousAppState::new(config.server_config())?).await
+    serve_rendezvous(RendezvousAppState::new_with_admission(
+        config.server_config(),
+        config.admission,
+    )?)
+    .await
 }
 
 #[cfg(test)]
@@ -112,6 +118,7 @@ mod tests {
                     key_path: rendezvous_key_path,
                 },
             }),
+            admission: config::RendezvousAdmissionConfig::default(),
             allow_insecure_http: false,
             failover_package: None,
         };
@@ -339,6 +346,7 @@ mod tests {
             }),
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
+            admission: config::RendezvousAdmissionConfig::default(),
             allow_insecure_http: true,
             failover_package: None,
         };
@@ -581,6 +589,7 @@ mod tests {
                     key_path: rendezvous_key_path,
                 },
             }),
+            admission: config::RendezvousAdmissionConfig::default(),
             allow_insecure_http: false,
             failover_package: None,
         };
@@ -852,6 +861,7 @@ mod tests {
                     key_pem: rendezvous_key_pem,
                 },
             }),
+            admission: config::RendezvousAdmissionConfig::default(),
             allow_insecure_http: false,
             failover_package: None,
         };
@@ -1131,6 +1141,7 @@ mod tests {
                     key_pem: rendezvous_key_pem,
                 },
             }),
+            admission: config::RendezvousAdmissionConfig::default(),
             allow_insecure_http: false,
             failover_package: None,
         };
