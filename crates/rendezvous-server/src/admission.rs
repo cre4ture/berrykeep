@@ -10,6 +10,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// listener, outbound connections, files, and short-lived accepted sockets.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 512;
 pub const DEFAULT_MAX_TLS_HANDSHAKES: usize = 64;
+pub const DEFAULT_MAX_RELAY_TICKETS_PER_CLIENT: usize = 10;
+pub const DEFAULT_MAX_RELAY_TICKET_ISSUES_PER_MINUTE: usize = 10;
 
 const ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(5);
@@ -18,6 +20,8 @@ const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(5);
 pub struct RendezvousAdmissionConfig {
     pub max_connections: usize,
     pub max_tls_handshakes: usize,
+    pub max_relay_tickets_per_client: usize,
+    pub max_relay_ticket_issues_per_minute: usize,
 }
 
 impl Default for RendezvousAdmissionConfig {
@@ -25,6 +29,8 @@ impl Default for RendezvousAdmissionConfig {
         Self {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_tls_handshakes: DEFAULT_MAX_TLS_HANDSHAKES,
+            max_relay_tickets_per_client: DEFAULT_MAX_RELAY_TICKETS_PER_CLIENT,
+            max_relay_ticket_issues_per_minute: DEFAULT_MAX_RELAY_TICKET_ISSUES_PER_MINUTE,
         }
     }
 }
@@ -41,6 +47,12 @@ impl RendezvousAdmissionConfig {
             bail!(
                 "rendezvous maximum concurrent TLS handshakes must not exceed maximum connections"
             );
+        }
+        if self.max_relay_tickets_per_client == 0 {
+            bail!("rendezvous maximum relay tickets per client must be greater than zero");
+        }
+        if self.max_relay_ticket_issues_per_minute == 0 {
+            bail!("rendezvous relay ticket issue rate must be greater than zero");
         }
         if self.max_connections > Semaphore::MAX_PERMITS {
             bail!("rendezvous maximum connections exceeds the supported semaphore capacity");
@@ -191,6 +203,7 @@ mod tests {
             RendezvousAdmissionConfig {
                 max_connections: 0,
                 max_tls_handshakes: 1,
+                ..RendezvousAdmissionConfig::default()
             }
             .validate()
             .is_err()
@@ -199,6 +212,7 @@ mod tests {
             RendezvousAdmissionConfig {
                 max_connections: 10,
                 max_tls_handshakes: 0,
+                ..RendezvousAdmissionConfig::default()
             }
             .validate()
             .is_err()
@@ -207,6 +221,23 @@ mod tests {
             RendezvousAdmissionConfig {
                 max_connections: 10,
                 max_tls_handshakes: 11,
+                ..RendezvousAdmissionConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RendezvousAdmissionConfig {
+                max_relay_tickets_per_client: 0,
+                ..RendezvousAdmissionConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RendezvousAdmissionConfig {
+                max_relay_ticket_issues_per_minute: 0,
+                ..RendezvousAdmissionConfig::default()
             }
             .validate()
             .is_err()
@@ -218,6 +249,7 @@ mod tests {
         let admission = RendezvousAdmissionController::new(RendezvousAdmissionConfig {
             max_connections: 2,
             max_tls_handshakes: 1,
+            ..RendezvousAdmissionConfig::default()
         })
         .expect("admission config should be valid");
 
@@ -253,6 +285,7 @@ mod tests {
         let admission = RendezvousAdmissionController::new(RendezvousAdmissionConfig {
             max_connections: 1,
             max_tls_handshakes: 1,
+            ..RendezvousAdmissionConfig::default()
         })
         .expect("admission config should be valid");
         let active_connection = admission

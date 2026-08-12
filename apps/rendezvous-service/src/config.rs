@@ -242,6 +242,16 @@ impl RendezvousServiceConfig {
                 lookup_env("IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES"),
                 admission_defaults.max_tls_handshakes.min(max_connections),
             )?,
+            max_relay_tickets_per_client: parse_positive_env_usize(
+                "IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT",
+                lookup_env("IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT"),
+                admission_defaults.max_relay_tickets_per_client,
+            )?,
+            max_relay_ticket_issues_per_minute: parse_positive_env_usize(
+                "IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE",
+                lookup_env("IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE"),
+                admission_defaults.max_relay_ticket_issues_per_minute,
+            )?,
         };
         admission.validate()?;
 
@@ -776,6 +786,14 @@ mod tests {
                 "IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES".to_string(),
                 "12".to_string(),
             ),
+            (
+                "IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT".to_string(),
+                "10".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE".to_string(),
+                "20".to_string(),
+            ),
         ]);
 
         let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
@@ -785,6 +803,8 @@ mod tests {
             RendezvousAdmissionConfig {
                 max_connections: 120,
                 max_tls_handshakes: 12,
+                max_relay_tickets_per_client: 10,
+                max_relay_ticket_issues_per_minute: 20,
             }
         );
     }

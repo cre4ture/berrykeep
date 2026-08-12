@@ -33,6 +33,10 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
         mtls_enabled = config.mtls.is_some(),
         max_connections = config.admission.max_connections,
         max_tls_handshakes = config.admission.max_tls_handshakes,
+        max_relay_tickets_per_client = config.admission.max_relay_tickets_per_client,
+        max_relay_ticket_issues_per_minute = config
+            .admission
+            .max_relay_ticket_issues_per_minute,
         "rendezvous service listening"
     );
 

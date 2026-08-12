@@ -184,25 +184,13 @@ impl TicketAuthority {
         &self,
         public_urls: Vec<String>,
         quic_port: Option<u16>,
-        cluster_id: ClusterId,
-        peer: Option<PeerIdentity>,
-        endpoint_id: &str,
-        lease_id: String,
-        issued_at_unix: u64,
-        expires_at_unix: u64,
+        claims: TicketClaims,
     ) -> Result<IrohRelayTicket> {
-        endpoint_id
+        claims
+            .endpoint_id
             .parse::<iroh::EndpointId>()
             .context("invalid iroh endpoint id for relay ticket")?;
-        let claims = TicketClaims {
-            version: TICKET_VERSION,
-            cluster_id,
-            peer,
-            endpoint_id: endpoint_id.to_string(),
-            lease_id,
-            issued_at_unix,
-            expires_at_unix,
-        };
+        let expires_at_unix = claims.expires_at_unix;
         let payload = serde_json::to_vec(&claims).context("failed encoding iroh relay ticket")?;
         let payload = URL_SAFE_NO_PAD.encode(payload);
         let signature = self.sign(payload.as_bytes());
@@ -279,6 +267,14 @@ struct TicketClientKey {
     peer: Option<PeerIdentity>,
 }
 
+struct TicketLeaseRequest {
+    public_urls: Vec<String>,
+    quic_port: Option<u16>,
+    client: TicketClientKey,
+    endpoint_id: String,
+    now_unix: u64,
+}
+
 impl TicketClientKey {
     fn new(cluster_id: ClusterId, peer: Option<PeerIdentity>) -> Self {
         Self { cluster_id, peer }
@@ -326,14 +322,15 @@ impl TicketLeaseRegistry {
     fn issue_or_reuse(
         &self,
         authority: &TicketAuthority,
-        public_urls: Vec<String>,
-        quic_port: Option<u16>,
-        cluster_id: ClusterId,
-        peer: Option<PeerIdentity>,
-        endpoint_id: &str,
-        now_unix: u64,
+        request: TicketLeaseRequest,
     ) -> std::result::Result<IrohRelayTicket, TicketLeaseBackpressure> {
-        let client = TicketClientKey::new(cluster_id, peer.clone());
+        let TicketLeaseRequest {
+            public_urls,
+            quic_port,
+            client,
+            endpoint_id,
+            now_unix,
+        } = request;
         let mut state = self
             .state
             .lock()
@@ -343,7 +340,7 @@ impl TicketLeaseRegistry {
         if let Some(ticket) = state
             .leases
             .get(&client)
-            .and_then(|leases| leases.get(endpoint_id))
+            .and_then(|leases| leases.get(&endpoint_id))
             .map(|lease| lease.ticket.clone())
         {
             return Ok(ticket);
@@ -399,12 +396,15 @@ impl TicketLeaseRegistry {
             .issue(
                 public_urls,
                 quic_port,
-                cluster_id,
-                peer,
-                endpoint_id,
-                lease_id.clone(),
-                now_unix,
-                expires_at_unix,
+                TicketClaims {
+                    version: TICKET_VERSION,
+                    cluster_id: client.cluster_id,
+                    peer: client.peer.clone(),
+                    endpoint_id: endpoint_id.clone(),
+                    lease_id: lease_id.clone(),
+                    issued_at_unix: now_unix,
+                    expires_at_unix,
+                },
             )
             .map_err(|error| TicketLeaseBackpressure {
                 message: error.to_string(),
@@ -412,7 +412,7 @@ impl TicketLeaseRegistry {
             })?;
         history.push_back(now_unix);
         state.leases.entry(client).or_default().insert(
-            endpoint_id.to_string(),
+            endpoint_id,
             TicketLease {
                 lease_id,
                 expires_at_unix,
@@ -686,12 +686,13 @@ impl IrohRelayRuntime {
     ) -> std::result::Result<IrohRelayTicket, TicketLeaseBackpressure> {
         self.access.leases.issue_or_reuse(
             &self.authority,
-            self.config.public_urls.clone(),
-            self.config.quic.as_ref().map(|quic| quic.public_port),
-            cluster_id,
-            peer,
-            endpoint_id,
-            unix_timestamp(),
+            TicketLeaseRequest {
+                public_urls: self.config.public_urls.clone(),
+                quic_port: self.config.quic.as_ref().map(|quic| quic.public_port),
+                client: TicketClientKey::new(cluster_id, peer),
+                endpoint_id: endpoint_id.to_string(),
+                now_unix: unix_timestamp(),
+            },
         )
     }
 
@@ -962,6 +963,21 @@ mod tests {
         }
     }
 
+    fn ticket_lease_request(
+        cluster_id: ClusterId,
+        peer: Option<PeerIdentity>,
+        endpoint_id: impl Into<String>,
+        now_unix: u64,
+    ) -> TicketLeaseRequest {
+        TicketLeaseRequest {
+            public_urls: vec!["https://relay.example".to_string()],
+            quic_port: None,
+            client: TicketClientKey::new(cluster_id, peer),
+            endpoint_id: endpoint_id.into(),
+            now_unix,
+        }
+    }
+
     #[test]
     fn relay_server_config_requires_origins_and_bounded_ticket_lifetime() {
         let mut config = test_config();
@@ -986,12 +1002,15 @@ mod tests {
             .issue(
                 vec!["https://relay.example".to_string()],
                 Some(7443),
-                ClusterId::now_v7(),
-                None,
-                &endpoint,
-                "lease-a".to_string(),
-                7_200,
-                10_800,
+                TicketClaims {
+                    version: TICKET_VERSION,
+                    cluster_id: ClusterId::now_v7(),
+                    peer: None,
+                    endpoint_id: endpoint.clone(),
+                    lease_id: "lease-a".to_string(),
+                    issued_at_unix: 7_200,
+                    expires_at_unix: 10_800,
+                },
             )
             .expect("ticket should issue");
         assert_eq!(ticket.quic_port, Some(7443));
@@ -1026,23 +1045,13 @@ mod tests {
         let first = registry
             .issue_or_reuse(
                 &authority,
-                vec!["https://relay.example".to_string()],
-                None,
-                cluster_id,
-                None,
-                &endpoint,
-                7_200,
+                ticket_lease_request(cluster_id, None, endpoint.clone(), 7_200),
             )
             .expect("first ticket should issue");
         let second = registry
             .issue_or_reuse(
                 &authority,
-                vec!["https://relay.example".to_string()],
-                None,
-                cluster_id,
-                None,
-                &endpoint,
-                7_250,
+                ticket_lease_request(cluster_id, None, endpoint, 7_250),
             )
             .expect("second ticket should issue");
         assert_eq!(first, second);
@@ -1064,46 +1073,26 @@ mod tests {
         let first = registry
             .issue_or_reuse(
                 &authority,
-                vec!["https://relay.example".to_string()],
-                None,
-                cluster_id,
-                peer.clone(),
-                &endpoints[0],
-                7_200,
+                ticket_lease_request(cluster_id, peer.clone(), endpoints[0].clone(), 7_200),
             )
             .expect("first lease should issue");
         let duplicate = registry
             .issue_or_reuse(
                 &authority,
-                vec!["https://relay.example".to_string()],
-                None,
-                cluster_id,
-                peer.clone(),
-                &endpoints[0],
-                7_201,
+                ticket_lease_request(cluster_id, peer.clone(), endpoints[0].clone(), 7_201),
             )
             .expect("duplicate endpoint should reuse its lease");
         assert_eq!(first, duplicate);
         registry
             .issue_or_reuse(
                 &authority,
-                vec!["https://relay.example".to_string()],
-                None,
-                cluster_id,
-                peer.clone(),
-                &endpoints[1],
-                7_201,
+                ticket_lease_request(cluster_id, peer.clone(), endpoints[1].clone(), 7_201),
             )
             .expect("second lease should issue");
         let error = registry
             .issue_or_reuse(
                 &authority,
-                vec!["https://relay.example".to_string()],
-                None,
-                cluster_id,
-                peer.clone(),
-                &endpoints[2],
-                7_202,
+                ticket_lease_request(cluster_id, peer.clone(), endpoints[2].clone(), 7_202),
             )
             .expect_err("third active lease must be rejected");
         assert!(error.message.contains("lease limit"));
@@ -1112,12 +1101,7 @@ mod tests {
         let error = registry
             .issue_or_reuse(
                 &authority,
-                vec!["https://relay.example".to_string()],
-                None,
-                cluster_id,
-                peer,
-                &endpoints[2],
-                7_203,
+                ticket_lease_request(cluster_id, peer, endpoints[2].clone(), 7_203),
             )
             .expect_err("release must not bypass the rolling issuance rate");
         assert!(error.message.contains("issue rate"));
@@ -1137,12 +1121,12 @@ mod tests {
         let issue = |endpoint_id: &iroh::EndpointId| {
             leases.issue_or_reuse(
                 &authority,
-                vec!["https://relay.example".to_string()],
-                None,
-                cluster_id,
-                peer.clone(),
-                &endpoint_id.to_string(),
-                unix_timestamp(),
+                ticket_lease_request(
+                    cluster_id,
+                    peer.clone(),
+                    endpoint_id.to_string(),
+                    unix_timestamp(),
+                ),
             )
         };
         let first_ticket = issue(&first_endpoint).expect("first ticket should issue");
@@ -1198,12 +1182,12 @@ mod tests {
         let ticket = leases
             .issue_or_reuse(
                 &authority,
-                vec!["https://relay.example".to_string()],
-                None,
-                cluster_id,
-                None,
-                &allowed_endpoint.to_string(),
-                unix_timestamp(),
+                ticket_lease_request(
+                    cluster_id,
+                    None,
+                    allowed_endpoint.to_string(),
+                    unix_timestamp(),
+                ),
             )
             .expect("ticket should issue");
         let access = TicketAccess::new(authority, leases.clone());

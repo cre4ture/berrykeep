@@ -115,6 +115,11 @@ Advanced controls are:
   across Rendezvous-only, mTLS, and same-port relay modes; defaults to `512`.
 - `IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES` — global concurrent TLS handshake
   cap; defaults to `64` and must not exceed the connection cap.
+- `IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT` — combined cap for
+  outstanding multiplex tickets and active source relay WebSockets per client;
+  defaults to `10`.
+- `IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE` — rolling issuance
+  cap for multiplex relay tickets per client; defaults to `10`.
 
 There is intentionally no separate relay public URL or static authentication
 token. The QAD endpoint only reports the caller's observed UDP address; relay

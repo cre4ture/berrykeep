@@ -65,9 +65,11 @@ IRONMESH_IROH_RELAY_TICKET_TTL_SECS=3600
 IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND=16777216
 IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES=33554432
 
-# Global TCP/TLS admission defaults for every Rendezvous listener mode.
+# Global admission defaults for every Rendezvous listener mode.
 IRONMESH_RENDEZVOUS_MAX_CONNECTIONS=512
 IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES=64
+IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT=10
+IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE=10
 
 # Defaults: 10 outstanding leases/tickets, 10 ticket issues per minute,
 # and 10 simultaneously connected Iroh relay endpoints per client.
@@ -85,11 +87,11 @@ IRONMESH_IROH_RELAY_QUIC_TLS_KEY=/etc/ironmesh/qad.key
 ```
 
 Ticket lifetime must be between 300 and 86400 seconds. Receive limits are
-applied per Iroh relay connection. The ticket lease and rolling issue settings
-also protect WebSocket relay-tunnel ticket issuance on the same Rendezvous
-service; active-connection counting applies specifically to Iroh relay
-connections because WebSocket connections are protected independently at the
-listener. The QAD certificate must cover every host
+applied per Iroh relay connection. The Rendezvous relay-ticket allocation cap
+counts outstanding tickets and active source WebSockets together, so consuming
+a ticket transfers rather than frees its per-client slot. The separate Iroh
+settings govern endpoint-bound leases and active Iroh relay connections. The
+QAD certificate must cover every host
 in the advertised relay origins. Bind and public ports must be non-zero; use
 the public port setting when host-level port forwarding changes the UDP port.
 The TCP connection limit is held for the full served connection, including
