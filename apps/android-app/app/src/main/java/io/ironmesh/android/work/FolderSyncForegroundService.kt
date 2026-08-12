@@ -19,6 +19,7 @@ import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -43,6 +44,7 @@ class FolderSyncForegroundService : Service() {
     private var retryJob: Job? = null
     private var syncRetryAttemptCount = 0L
     private var networkCallbackRegistered = false
+    private lateinit var networkChangeNotifier: ConflatedNetworkChangeNotifier
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             notifyManagedClientNetworkChanged("network available")
@@ -64,6 +66,13 @@ class FolderSyncForegroundService : Service() {
         super.onCreate()
         FolderSyncExecutionCoordinator.markContinuousServiceActive()
         ensureNotificationChannel()
+        networkChangeNotifier = ConflatedNetworkChangeNotifier(
+            scope = scope,
+            onNetworkChange = ::processManagedClientNetworkChange,
+            onFailure = { reason, error ->
+                Log.w(TAG, "network change processing failed ($reason): ${error.message}")
+            },
+        )
         startForeground(
             NOTIFICATION_ID,
             buildNotification("Starting continuous sync", "Preparing folder sync runtime"),
@@ -92,6 +101,9 @@ class FolderSyncForegroundService : Service() {
     override fun onDestroy() {
         statusJob?.cancel()
         retryJob?.cancel()
+        if (::networkChangeNotifier.isInitialized) {
+            networkChangeNotifier.close()
+        }
         unregisterNetworkCallback()
         repository.stopAllContinuousFolderSync()
         FolderSyncExecutionCoordinator.releaseContinuousService()
@@ -415,7 +427,13 @@ class FolderSyncForegroundService : Service() {
     }
 
     private fun notifyManagedClientNetworkChanged(reason: String) {
-        scope.launch {
+        if (::networkChangeNotifier.isInitialized) {
+            networkChangeNotifier.submit(reason)
+        }
+    }
+
+    private suspend fun processManagedClientNetworkChange(reason: String) {
+        try {
             withContext(Dispatchers.IO) {
                 val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
                 val connectionInput = deviceAuth.connectionBootstrapJson()
@@ -428,8 +446,12 @@ class FolderSyncForegroundService : Service() {
                     )
                 }
             }
-            requestReconcile(reason)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.w(TAG, "managed client network hint failed ($reason): ${error.message}")
         }
+        requestReconcile(reason)
     }
 
     private fun registerNetworkCallback() {

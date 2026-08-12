@@ -319,6 +319,7 @@ fn run_agent(args: &Args) -> Result<()> {
         client_identity_json: client_identity_json.clone(),
         persist_client_identity: None,
         managed_client_options: client_sdk::ManagedClientOptions::default(),
+        shared_client: None,
         prefix: args.prefix.clone(),
         depth: args.depth,
         remote_refresh_interval_ms: args.remote_refresh_interval_ms,

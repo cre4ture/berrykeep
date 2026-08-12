@@ -35,6 +35,56 @@ use crate::{
 
 pub type FolderAgentClientIdentityPersistence = fn(&ClientIdentityMaterial) -> Result<()>;
 
+/// A preconfigured client owned by the embedding process.
+///
+/// Embedders such as the Android app use this handle to give every folder-sync
+/// runtime the same transport router and managed route controller as the rest
+/// of the process. Cloning the handle does not construct or probe another
+/// client; `IronMeshClient` and `ManagedIronMeshClient` both retain their
+/// existing Arc-backed shared state.
+#[derive(Clone)]
+pub struct FolderAgentSharedClient {
+    client: IronMeshClient,
+    managed_client: Option<ManagedIronMeshClient>,
+}
+
+impl std::fmt::Debug for FolderAgentSharedClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FolderAgentSharedClient")
+            .field(
+                "connection_runtime_id",
+                &self.client.connection_runtime_id(),
+            )
+            .field("managed", &self.managed_client.is_some())
+            .finish()
+    }
+}
+
+impl FolderAgentSharedClient {
+    pub fn from_client(client: IronMeshClient) -> Self {
+        Self {
+            client,
+            managed_client: None,
+        }
+    }
+
+    pub fn from_managed_client(managed_client: ManagedIronMeshClient) -> Self {
+        Self {
+            client: managed_client.client(),
+            managed_client: Some(managed_client),
+        }
+    }
+
+    fn client(&self) -> IronMeshClient {
+        self.client.clone()
+    }
+
+    fn managed_client(&self) -> Option<ManagedIronMeshClient> {
+        self.managed_client.clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FolderAgentRuntimeOptions {
     pub root_dir: PathBuf,
@@ -47,6 +97,9 @@ pub struct FolderAgentRuntimeOptions {
     pub client_identity_json: Option<String>,
     pub persist_client_identity: Option<FolderAgentClientIdentityPersistence>,
     pub managed_client_options: ManagedClientOptions,
+    /// Reuses a client owned by the embedding process instead of constructing
+    /// another client from the connection fields above.
+    pub shared_client: Option<FolderAgentSharedClient>,
     pub prefix: Option<String>,
     pub depth: usize,
     pub remote_refresh_interval_ms: u64,
@@ -1634,6 +1687,18 @@ struct ConfiguredFolderAgentClient {
 }
 
 fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<ConfiguredFolderAgentClient> {
+    if let Some(shared_client) = options.shared_client.as_ref() {
+        let client = shared_client.client();
+        let client = match options.connection_name.as_deref() {
+            Some(connection_name) => client.with_connection_name(connection_name),
+            None => client,
+        };
+        return Ok(ConfiguredFolderAgentClient {
+            client,
+            managed_client: shared_client.managed_client(),
+        });
+    }
+
     let server_ca_pem = normalized_optional_string(options.server_ca_pem.as_deref());
     let client_bootstrap_json =
         normalized_optional_string(options.client_bootstrap_json.as_deref());
@@ -3389,6 +3454,7 @@ mod tests {
             client_identity_json: None,
             persist_client_identity: None,
             managed_client_options: ManagedClientOptions::default(),
+            shared_client: None,
             prefix: None,
             depth: 0,
             remote_refresh_interval_ms: 1000,
@@ -3399,6 +3465,23 @@ mod tests {
             run_once: true,
             ui_bind: None,
         }
+    }
+
+    #[test]
+    fn configured_client_prefers_the_injected_shared_runtime() {
+        let shared = client_sdk::build_http_client_from_pem(None, "http://127.0.0.1:18080")
+            .expect("test client should build");
+        let shared_runtime_id = shared.connection_runtime_id();
+        let mut options = test_runtime_options();
+        options.connection_name = Some("shared-folder-sync".to_string());
+        options.client_bootstrap_json = Some("invalid bootstrap must not be parsed".to_string());
+        options.shared_client = Some(FolderAgentSharedClient::from_client(shared));
+
+        let configured = configured_client(&options)
+            .expect("the injected shared client should bypass client construction");
+
+        assert_eq!(configured.client.connection_runtime_id(), shared_runtime_id);
+        assert!(configured.managed_client.is_none());
     }
 
     #[test]
