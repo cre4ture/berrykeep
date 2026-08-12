@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use common::{ClusterId, NodeId};
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::stream::{self, StreamExt};
 use reqwest::Certificate;
 use reqwest::Client;
 use reqwest::ClientBuilder;
@@ -32,6 +32,7 @@ const STARTUP_PROBE_SAMPLE_COUNT: usize = 3;
 const STARTUP_PROBE_FAILURE_PENALTY_MS: f64 = 500.0;
 const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_PROBE_SUCCESS_GRACE: Duration = Duration::from_millis(250);
+const MAX_CONCURRENT_STARTUP_ROUTE_PROBES: usize = 4;
 
 type StartupProbeResult = (usize, Result<f64>);
 type StartupProbeWorkerResult = (Vec<IronMeshClient>, Vec<StartupProbeResult>);
@@ -790,17 +791,16 @@ fn order_clients_by_startup_probe(
             let runtime = blocking_runtime()?;
 
             Ok(runtime.block_on(async move {
-                let mut probes = FuturesUnordered::new();
-                for (index, client) in clients.iter().cloned().enumerate() {
-                    probes.push(async move {
+                let mut probes = stream::iter(clients.clone().into_iter().enumerate())
+                    .map(|(index, client)| async move {
                         let probe = if signed_probe {
                             probe_signed_client_startup_quality(&client).await
                         } else {
                             probe_direct_client_startup_quality(&client).await
                         };
                         (index, probe)
-                    });
-                }
+                    })
+                    .buffer_unordered(MAX_CONCURRENT_STARTUP_ROUTE_PROBES);
 
                 let mut results = Vec::new();
                 let mut success_grace_deadline = None;

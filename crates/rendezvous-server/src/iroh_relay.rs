@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -42,8 +42,8 @@ use crate::admission::{
 use crate::auth::{AuthenticatedPeer, WithAuthenticatedPeer, authenticated_peer_from_tls_stream};
 use crate::{RendezvousServerTlsIdentity, auth::build_server_rustls_config};
 
-const TICKET_FORMAT: &str = "imrt1";
-const TICKET_VERSION: u8 = 1;
+const TICKET_FORMAT: &str = "imrt2";
+const TICKET_VERSION: u8 = 2;
 const TICKET_CLOCK_SKEW_SECS: u64 = 60;
 const KEY_CACHE_CAPACITY: usize = 1024;
 
@@ -55,6 +55,9 @@ pub struct IrohRelayServerConfig {
     pub ticket_ttl: Duration,
     pub client_rx_bytes_per_second: u32,
     pub client_rx_max_burst_bytes: u32,
+    pub max_ticket_leases_per_client: u32,
+    pub max_active_connections_per_client: u32,
+    pub max_ticket_issues_per_minute: u32,
     pub quic: Option<IrohRelayQuicServerConfig>,
 }
 
@@ -110,6 +113,15 @@ impl IrohRelayServerConfig {
         if self.client_rx_max_burst_bytes == 0 {
             bail!("embedded iroh relay receive burst must be greater than zero");
         }
+        if self.max_ticket_leases_per_client == 0 {
+            bail!("embedded iroh relay ticket lease limit must be greater than zero");
+        }
+        if self.max_active_connections_per_client == 0 {
+            bail!("embedded iroh relay active connection limit must be greater than zero");
+        }
+        if self.max_ticket_issues_per_minute == 0 {
+            bail!("embedded iroh relay ticket issue rate must be greater than zero");
+        }
         if let Some(quic) = self.quic.as_ref() {
             if quic.bind_addr.port() == 0 {
                 bail!("embedded iroh relay QUIC bind port must be greater than zero");
@@ -129,6 +141,7 @@ struct TicketClaims {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     peer: Option<PeerIdentity>,
     endpoint_id: String,
+    lease_id: String,
     issued_at_unix: u64,
     expires_at_unix: u64,
 }
@@ -174,19 +187,19 @@ impl TicketAuthority {
         cluster_id: ClusterId,
         peer: Option<PeerIdentity>,
         endpoint_id: &str,
-        now_unix: u64,
+        lease_id: String,
+        issued_at_unix: u64,
+        expires_at_unix: u64,
     ) -> Result<IrohRelayTicket> {
         endpoint_id
             .parse::<iroh::EndpointId>()
             .context("invalid iroh endpoint id for relay ticket")?;
-        let rotation_secs = (self.ttl_secs / 4).max(60);
-        let issued_at_unix = now_unix - (now_unix % rotation_secs);
-        let expires_at_unix = issued_at_unix.saturating_add(self.ttl_secs);
         let claims = TicketClaims {
             version: TICKET_VERSION,
             cluster_id,
             peer,
             endpoint_id: endpoint_id.to_string(),
+            lease_id,
             issued_at_unix,
             expires_at_unix,
         };
@@ -260,9 +273,246 @@ impl TicketAuthority {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TicketClientKey {
+    cluster_id: ClusterId,
+    peer: Option<PeerIdentity>,
+}
+
+impl TicketClientKey {
+    fn new(cluster_id: ClusterId, peer: Option<PeerIdentity>) -> Self {
+        Self { cluster_id, peer }
+    }
+}
+
+#[derive(Clone)]
+struct TicketLease {
+    lease_id: String,
+    expires_at_unix: u64,
+    ticket: IrohRelayTicket,
+}
+
+#[derive(Default)]
+struct TicketLeaseState {
+    leases: HashMap<TicketClientKey, HashMap<String, TicketLease>>,
+    issue_history: HashMap<TicketClientKey, VecDeque<u64>>,
+    active_connections: HashMap<ConnectionId, TicketClientKey>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TicketLeaseBackpressure {
+    pub(crate) message: String,
+    pub(crate) retry_after_secs: u64,
+}
+
+#[derive(Clone)]
+struct TicketLeaseRegistry {
+    state: Arc<Mutex<TicketLeaseState>>,
+    max_leases_per_client: usize,
+    max_active_connections_per_client: usize,
+    max_issues_per_minute: usize,
+}
+
+impl TicketLeaseRegistry {
+    fn new(config: &IrohRelayServerConfig) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TicketLeaseState::default())),
+            max_leases_per_client: config.max_ticket_leases_per_client as usize,
+            max_active_connections_per_client: config.max_active_connections_per_client as usize,
+            max_issues_per_minute: config.max_ticket_issues_per_minute as usize,
+        }
+    }
+
+    fn issue_or_reuse(
+        &self,
+        authority: &TicketAuthority,
+        public_urls: Vec<String>,
+        quic_port: Option<u16>,
+        cluster_id: ClusterId,
+        peer: Option<PeerIdentity>,
+        endpoint_id: &str,
+        now_unix: u64,
+    ) -> std::result::Result<IrohRelayTicket, TicketLeaseBackpressure> {
+        let client = TicketClientKey::new(cluster_id, peer.clone());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_expired(&mut state, now_unix);
+
+        if let Some(ticket) = state
+            .leases
+            .get(&client)
+            .and_then(|leases| leases.get(endpoint_id))
+            .map(|lease| lease.ticket.clone())
+        {
+            return Ok(ticket);
+        }
+
+        let active_leases = state.leases.get(&client).map_or(0, HashMap::len);
+        if active_leases >= self.max_leases_per_client {
+            let retry_after_secs = state
+                .leases
+                .get(&client)
+                .and_then(|leases| leases.values().map(|lease| lease.expires_at_unix).min())
+                .unwrap_or(now_unix.saturating_add(1))
+                .saturating_sub(now_unix)
+                .max(1);
+            return Err(TicketLeaseBackpressure {
+                message: format!(
+                    "iroh relay ticket lease limit reached ({}/{})",
+                    active_leases, self.max_leases_per_client
+                ),
+                retry_after_secs,
+            });
+        }
+
+        let history = state.issue_history.entry(client.clone()).or_default();
+        while history
+            .front()
+            .is_some_and(|issued| issued.saturating_add(60) <= now_unix)
+        {
+            history.pop_front();
+        }
+        if history.len() >= self.max_issues_per_minute {
+            let retry_after_secs = history
+                .front()
+                .copied()
+                .unwrap_or(now_unix)
+                .saturating_add(60)
+                .saturating_sub(now_unix)
+                .max(1);
+            return Err(TicketLeaseBackpressure {
+                message: format!(
+                    "iroh relay ticket issue rate exceeded ({} per minute)",
+                    self.max_issues_per_minute
+                ),
+                retry_after_secs,
+            });
+        }
+
+        let mut lease_bytes = [0_u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut lease_bytes);
+        let lease_id = URL_SAFE_NO_PAD.encode(lease_bytes);
+        let expires_at_unix = now_unix.saturating_add(authority.ttl_secs);
+        let ticket = authority
+            .issue(
+                public_urls,
+                quic_port,
+                cluster_id,
+                peer,
+                endpoint_id,
+                lease_id.clone(),
+                now_unix,
+                expires_at_unix,
+            )
+            .map_err(|error| TicketLeaseBackpressure {
+                message: error.to_string(),
+                retry_after_secs: 0,
+            })?;
+        history.push_back(now_unix);
+        state.leases.entry(client).or_default().insert(
+            endpoint_id.to_string(),
+            TicketLease {
+                lease_id,
+                expires_at_unix,
+                ticket: ticket.clone(),
+            },
+        );
+        Ok(ticket)
+    }
+
+    fn authorize_connection(
+        &self,
+        claims: &TicketClaims,
+        connection_id: ConnectionId,
+        now_unix: u64,
+    ) -> Result<()> {
+        let client = TicketClientKey::new(claims.cluster_id, claims.peer.clone());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_expired(&mut state, now_unix);
+        let lease_is_active = state
+            .leases
+            .get(&client)
+            .and_then(|leases| leases.get(&claims.endpoint_id))
+            .is_some_and(|lease| {
+                lease.lease_id == claims.lease_id && lease.expires_at_unix > now_unix
+            });
+        if !lease_is_active {
+            bail!("iroh relay ticket lease is expired or revoked");
+        }
+        let active_count = state
+            .active_connections
+            .values()
+            .filter(|active_client| *active_client == &client)
+            .count();
+        if active_count >= self.max_active_connections_per_client {
+            bail!(
+                "iroh relay active connection limit reached ({}/{})",
+                active_count,
+                self.max_active_connections_per_client
+            );
+        }
+        state.active_connections.insert(connection_id, client);
+        Ok(())
+    }
+
+    fn disconnect(&self, connection_id: ConnectionId) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_connections
+            .remove(&connection_id);
+    }
+
+    fn release(
+        &self,
+        cluster_id: ClusterId,
+        peer: Option<PeerIdentity>,
+        endpoint_id: &str,
+        now_unix: u64,
+    ) -> bool {
+        let client = TicketClientKey::new(cluster_id, peer);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_expired(&mut state, now_unix);
+        let released = state
+            .leases
+            .get_mut(&client)
+            .and_then(|leases| leases.remove(endpoint_id))
+            .is_some();
+        if state.leases.get(&client).is_some_and(HashMap::is_empty) {
+            state.leases.remove(&client);
+        }
+        released
+    }
+
+    fn prune_expired(state: &mut TicketLeaseState, now_unix: u64) {
+        state.leases.retain(|_, leases| {
+            leases.retain(|_, lease| lease.expires_at_unix > now_unix);
+            !leases.is_empty()
+        });
+        state.issue_history.retain(|_, history| {
+            while history
+                .front()
+                .is_some_and(|issued| issued.saturating_add(60) <= now_unix)
+            {
+                history.pop_front();
+            }
+            !history.is_empty()
+        });
+    }
+}
+
 #[derive(Clone)]
 struct TicketAccess {
     authority: TicketAuthority,
+    leases: TicketLeaseRegistry,
     clients: Arc<OnceLock<Clients>>,
     expiry_tasks: Arc<Mutex<HashMap<ConnectionId, tokio::task::AbortHandle>>>,
 }
@@ -277,9 +527,10 @@ impl std::fmt::Debug for TicketAccess {
 }
 
 impl TicketAccess {
-    fn new(authority: TicketAuthority) -> Self {
+    fn new(authority: TicketAuthority, leases: TicketLeaseRegistry) -> Self {
         Self {
             authority,
+            leases,
             clients: Arc::new(OnceLock::new()),
             expiry_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -323,8 +574,19 @@ impl AccessControl for TicketAccess {
             .verify(&token, &request.endpoint_id().to_string(), unix_timestamp())
         {
             Ok(claims) => {
-                self.schedule_expiry(request, claims.expires_at_unix);
-                Access::Allow
+                match self.leases.authorize_connection(
+                    &claims,
+                    request.connection_id(),
+                    unix_timestamp(),
+                ) {
+                    Ok(()) => {
+                        self.schedule_expiry(request, claims.expires_at_unix);
+                        Access::Allow
+                    }
+                    Err(error) => Access::Deny {
+                        reason: Some(error.to_string()),
+                    },
+                }
             }
             Err(error) => Access::Deny {
                 reason: Some(error.to_string()),
@@ -333,6 +595,7 @@ impl AccessControl for TicketAccess {
     }
 
     fn on_disconnect(&self, _endpoint_id: iroh::EndpointId, connection_id: ConnectionId) {
+        self.leases.disconnect(connection_id);
         if let Some(task) = self
             .expiry_tasks
             .lock()
@@ -348,6 +611,7 @@ impl AccessControl for TicketAccess {
 pub(crate) struct IrohRelayRuntime {
     config: IrohRelayServerConfig,
     authority: TicketAuthority,
+    access: Arc<TicketAccess>,
     service: RelayService,
 }
 
@@ -365,7 +629,8 @@ impl IrohRelayRuntime {
     pub(crate) fn new(config: IrohRelayServerConfig) -> Result<Self> {
         config.validate()?;
         let authority = TicketAuthority::generate(config.ticket_ttl);
-        let access = Arc::new(TicketAccess::new(authority.clone()));
+        let leases = TicketLeaseRegistry::new(&config);
+        let access = Arc::new(TicketAccess::new(authority.clone(), leases));
         let bytes_per_second = NonZeroU32::new(config.client_rx_bytes_per_second)
             .expect("validated iroh relay receive rate should be non-zero");
         let max_burst_bytes = NonZeroU32::new(config.client_rx_max_burst_bytes)
@@ -384,6 +649,7 @@ impl IrohRelayRuntime {
         Ok(Self {
             config,
             authority,
+            access,
             service,
         })
     }
@@ -417,8 +683,9 @@ impl IrohRelayRuntime {
         cluster_id: ClusterId,
         peer: Option<PeerIdentity>,
         endpoint_id: &str,
-    ) -> Result<IrohRelayTicket> {
-        self.authority.issue(
+    ) -> std::result::Result<IrohRelayTicket, TicketLeaseBackpressure> {
+        self.access.leases.issue_or_reuse(
+            &self.authority,
             self.config.public_urls.clone(),
             self.config.quic.as_ref().map(|quic| quic.public_port),
             cluster_id,
@@ -426,6 +693,22 @@ impl IrohRelayRuntime {
             endpoint_id,
             unix_timestamp(),
         )
+    }
+
+    pub(crate) fn release_ticket(
+        &self,
+        cluster_id: ClusterId,
+        peer: Option<PeerIdentity>,
+        endpoint_id: &str,
+    ) -> bool {
+        let released = self
+            .access
+            .leases
+            .release(cluster_id, peer, endpoint_id, unix_timestamp());
+        if released && let Ok(endpoint_id) = endpoint_id.parse::<iroh::EndpointId>() {
+            self.service.clients().disconnect(endpoint_id, None);
+        }
+        released
     }
 }
 
@@ -658,6 +941,7 @@ fn unix_timestamp() -> u64 {
 mod tests {
     use super::*;
     use axum::http::{Request as HttpRequest, Version};
+    use common::DeviceId;
     use iroh::SecretKey;
     use iroh_relay::http::ProtocolVersion;
 
@@ -665,21 +949,31 @@ mod tests {
         TicketAuthority::from_key([7_u8; 32], Duration::from_secs(3600))
     }
 
-    #[test]
-    fn relay_server_config_requires_origins_and_bounded_ticket_lifetime() {
-        let mut config = IrohRelayServerConfig {
+    fn test_config() -> IrohRelayServerConfig {
+        IrohRelayServerConfig {
             public_urls: vec!["https://rendezvous.example".to_string()],
             ticket_ttl: Duration::from_secs(3600),
             client_rx_bytes_per_second: 1024,
             client_rx_max_burst_bytes: 2048,
+            max_ticket_leases_per_client: 10,
+            max_active_connections_per_client: 10,
+            max_ticket_issues_per_minute: 10,
             quic: None,
-        };
+        }
+    }
+
+    #[test]
+    fn relay_server_config_requires_origins_and_bounded_ticket_lifetime() {
+        let mut config = test_config();
         config.validate().expect("valid config should pass");
 
         config.public_urls = vec!["https://rendezvous.example/nested".to_string()];
         assert!(config.validate().is_err());
         config.public_urls = vec!["https://rendezvous.example".to_string()];
         config.ticket_ttl = Duration::from_secs(299);
+        assert!(config.validate().is_err());
+        config.ticket_ttl = Duration::from_secs(3600);
+        config.max_ticket_leases_per_client = 0;
         assert!(config.validate().is_err());
     }
 
@@ -695,7 +989,9 @@ mod tests {
                 ClusterId::now_v7(),
                 None,
                 &endpoint,
+                "lease-a".to_string(),
                 7_200,
+                10_800,
             )
             .expect("ticket should issue");
         assert_eq!(ticket.quic_port, Some(7443));
@@ -722,12 +1018,14 @@ mod tests {
     }
 
     #[test]
-    fn tickets_are_stable_within_a_rotation_window() {
+    fn duplicate_endpoint_issuance_reuses_the_same_lease_without_consuming_capacity() {
         let authority = test_authority();
+        let registry = TicketLeaseRegistry::new(&test_config());
         let endpoint = SecretKey::generate().public().to_string();
         let cluster_id = ClusterId::now_v7();
-        let first = authority
-            .issue(
+        let first = registry
+            .issue_or_reuse(
+                &authority,
                 vec!["https://relay.example".to_string()],
                 None,
                 cluster_id,
@@ -736,8 +1034,9 @@ mod tests {
                 7_200,
             )
             .expect("first ticket should issue");
-        let second = authority
-            .issue(
+        let second = registry
+            .issue_or_reuse(
+                &authority,
                 vec!["https://relay.example".to_string()],
                 None,
                 cluster_id,
@@ -749,22 +1048,165 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    #[test]
+    fn ticket_lease_limit_and_issue_rate_apply_only_to_new_endpoints() {
+        let authority = test_authority();
+        let mut config = test_config();
+        config.max_ticket_leases_per_client = 2;
+        config.max_ticket_issues_per_minute = 2;
+        let registry = TicketLeaseRegistry::new(&config);
+        let cluster_id = ClusterId::now_v7();
+        let peer = Some(PeerIdentity::Device(DeviceId::now_v7()));
+        let endpoints = (0..3)
+            .map(|_| SecretKey::generate().public().to_string())
+            .collect::<Vec<_>>();
+
+        let first = registry
+            .issue_or_reuse(
+                &authority,
+                vec!["https://relay.example".to_string()],
+                None,
+                cluster_id,
+                peer.clone(),
+                &endpoints[0],
+                7_200,
+            )
+            .expect("first lease should issue");
+        let duplicate = registry
+            .issue_or_reuse(
+                &authority,
+                vec!["https://relay.example".to_string()],
+                None,
+                cluster_id,
+                peer.clone(),
+                &endpoints[0],
+                7_201,
+            )
+            .expect("duplicate endpoint should reuse its lease");
+        assert_eq!(first, duplicate);
+        registry
+            .issue_or_reuse(
+                &authority,
+                vec!["https://relay.example".to_string()],
+                None,
+                cluster_id,
+                peer.clone(),
+                &endpoints[1],
+                7_201,
+            )
+            .expect("second lease should issue");
+        let error = registry
+            .issue_or_reuse(
+                &authority,
+                vec!["https://relay.example".to_string()],
+                None,
+                cluster_id,
+                peer.clone(),
+                &endpoints[2],
+                7_202,
+            )
+            .expect_err("third active lease must be rejected");
+        assert!(error.message.contains("lease limit"));
+
+        assert!(registry.release(cluster_id, peer.clone(), &endpoints[0], 7_203));
+        let error = registry
+            .issue_or_reuse(
+                &authority,
+                vec!["https://relay.example".to_string()],
+                None,
+                cluster_id,
+                peer,
+                &endpoints[2],
+                7_203,
+            )
+            .expect_err("release must not bypass the rolling issuance rate");
+        assert!(error.message.contains("issue rate"));
+        assert_eq!(error.retry_after_secs, 57);
+    }
+
+    #[tokio::test]
+    async fn release_revokes_token_and_active_connection_limit_is_per_client() {
+        let authority = test_authority();
+        let mut config = test_config();
+        config.max_active_connections_per_client = 1;
+        let leases = TicketLeaseRegistry::new(&config);
+        let cluster_id = ClusterId::now_v7();
+        let peer = Some(PeerIdentity::Device(DeviceId::now_v7()));
+        let first_endpoint = SecretKey::generate().public();
+        let second_endpoint = SecretKey::generate().public();
+        let issue = |endpoint_id: &iroh::EndpointId| {
+            leases.issue_or_reuse(
+                &authority,
+                vec!["https://relay.example".to_string()],
+                None,
+                cluster_id,
+                peer.clone(),
+                &endpoint_id.to_string(),
+                unix_timestamp(),
+            )
+        };
+        let first_ticket = issue(&first_endpoint).expect("first ticket should issue");
+        let second_ticket = issue(&second_endpoint).expect("second ticket should issue");
+        let access = TicketAccess::new(authority, leases.clone());
+        let first_request = client_request(first_endpoint, Some(&first_ticket.auth_token));
+        let first_connection_id = first_request.connection_id();
+        assert_eq!(access.on_connect(&first_request).await, Access::Allow);
+        assert!(matches!(
+            access
+                .on_connect(&client_request(
+                    second_endpoint,
+                    Some(&second_ticket.auth_token)
+                ))
+                .await,
+            Access::Deny { .. }
+        ));
+
+        access.on_disconnect(first_endpoint, first_connection_id);
+        assert_eq!(
+            access
+                .on_connect(&client_request(
+                    second_endpoint,
+                    Some(&second_ticket.auth_token)
+                ))
+                .await,
+            Access::Allow
+        );
+        assert!(leases.release(
+            cluster_id,
+            peer,
+            &second_endpoint.to_string(),
+            unix_timestamp()
+        ));
+        assert!(matches!(
+            access
+                .on_connect(&client_request(
+                    second_endpoint,
+                    Some(&second_ticket.auth_token)
+                ))
+                .await,
+            Access::Deny { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn relay_access_rejects_a_valid_ticket_from_another_endpoint() {
         let authority = test_authority();
+        let leases = TicketLeaseRegistry::new(&test_config());
         let allowed_endpoint = SecretKey::generate().public();
         let other_endpoint = SecretKey::generate().public();
-        let ticket = authority
-            .issue(
+        let cluster_id = ClusterId::now_v7();
+        let ticket = leases
+            .issue_or_reuse(
+                &authority,
                 vec!["https://relay.example".to_string()],
                 None,
-                ClusterId::now_v7(),
+                cluster_id,
                 None,
                 &allowed_endpoint.to_string(),
                 unix_timestamp(),
             )
             .expect("ticket should issue");
-        let access = TicketAccess::new(authority);
+        let access = TicketAccess::new(authority, leases.clone());
 
         assert_eq!(
             access

@@ -49,6 +49,7 @@ enum SessionPoolTarget {
         candidate: ConnectionCandidate,
         target_node_id: Option<NodeId>,
         endpoint: Arc<Mutex<Option<ManagedDirectQuicEndpoint>>>,
+        setup_identity: Arc<Mutex<Option<DirectQuicSetupIdentity>>>,
         rendezvous: Option<RendezvousControlClient>,
         relay_ca_pem: Option<String>,
     },
@@ -67,11 +68,41 @@ struct CachedTransportSession {
 struct ManagedDirectQuicEndpoint {
     endpoint: DirectQuicEndpoint,
     relay_ticket_refresh: Option<tokio::task::AbortHandle>,
+    _relay_ticket_lease: Option<Arc<IrohRelayLeaseHandle>>,
+}
+
+struct DirectQuicSetupIdentity {
+    secret_key: SecretKey,
+    relay_ticket_lease: Option<Arc<IrohRelayLeaseHandle>>,
+}
+
+struct IrohRelayLeaseHandle {
+    rendezvous: RendezvousControlClient,
+    endpoint_id: String,
+}
+
+struct RelayTicketReleaseGuard {
+    rendezvous: RendezvousControlClient,
+    ticket: Option<transport_sdk::RelayTicket>,
+}
+
+impl RelayTicketReleaseGuard {
+    fn new(rendezvous: RendezvousControlClient, ticket: transport_sdk::RelayTicket) -> Self {
+        Self {
+            rendezvous,
+            ticket: Some(ticket),
+        }
+    }
+
+    fn mark_consumed(&mut self) {
+        self.ticket = None;
+    }
 }
 
 #[derive(Clone)]
 struct DirectQuicEndpointLifecycle {
     endpoint_slot: Arc<Mutex<Option<ManagedDirectQuicEndpoint>>>,
+    relay_ticket_lease: Arc<IrohRelayLeaseHandle>,
     cached_session: Arc<Mutex<Option<CachedTransportSession>>>,
     stats: Arc<TransportSessionPoolStats>,
     endpoint_config: DirectQuicEndpointConfig,
@@ -138,6 +169,7 @@ struct DirectQuicConnectContext<'a> {
     candidate: &'a ConnectionCandidate,
     target_node_id: NodeId,
     endpoint: &'a Arc<Mutex<Option<ManagedDirectQuicEndpoint>>>,
+    setup_identity: &'a Arc<Mutex<Option<DirectQuicSetupIdentity>>>,
     cached_session: &'a Arc<Mutex<Option<CachedTransportSession>>>,
     stats: &'a Arc<TransportSessionPoolStats>,
     rendezvous: Option<&'a RendezvousControlClient>,
@@ -190,6 +222,65 @@ impl Drop for ManagedDirectQuicEndpoint {
         if let Some(refresh) = self.relay_ticket_refresh.take() {
             refresh.abort();
         }
+    }
+}
+
+impl Drop for IrohRelayLeaseHandle {
+    fn drop(&mut self) {
+        let rendezvous = self.rendezvous.clone();
+        let endpoint_id = self.endpoint_id.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                %endpoint_id,
+                "cannot release endpoint-bound iroh relay ticket outside a Tokio runtime"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            match rendezvous.release_iroh_relay_ticket(&endpoint_id).await {
+                Ok(released) => tracing::debug!(
+                    %endpoint_id,
+                    released,
+                    "released endpoint-bound iroh relay ticket lease"
+                ),
+                Err(error) => tracing::warn!(
+                    %endpoint_id,
+                    %error,
+                    "failed releasing endpoint-bound iroh relay ticket lease"
+                ),
+            }
+        });
+    }
+}
+
+impl Drop for RelayTicketReleaseGuard {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        let rendezvous = self.rendezvous.clone();
+        let session_id = ticket.session_id.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                %session_id,
+                "cannot release unused relay ticket outside a Tokio runtime"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            match rendezvous.release_relay_ticket(&ticket).await {
+                Ok(released) => tracing::debug!(
+                    %session_id,
+                    released,
+                    "released unused relay tunnel ticket"
+                ),
+                Err(error) => tracing::warn!(
+                    %session_id,
+                    %error,
+                    "failed releasing unused relay tunnel ticket"
+                ),
+            }
+        });
     }
 }
 
@@ -257,6 +348,7 @@ impl TransportSessionPool {
                 candidate,
                 target_node_id,
                 endpoint: Arc::new(Mutex::new(None)),
+                setup_identity: Arc::new(Mutex::new(None)),
                 rendezvous,
                 relay_ca_pem,
             },
@@ -464,6 +556,7 @@ impl TransportSessionPool {
                 candidate,
                 target_node_id,
                 endpoint,
+                setup_identity,
                 rendezvous,
                 relay_ca_pem,
             } => {
@@ -481,6 +574,7 @@ impl TransportSessionPool {
                         candidate,
                         target_node_id,
                         endpoint,
+                        setup_identity,
                         cached_session: &self.cached_session,
                         stats: &self.stats,
                         rendezvous: rendezvous.as_ref(),
@@ -809,8 +903,12 @@ impl TransportSessionPool {
                 return Err(error);
             }
         };
+        let mut ticket_release = RelayTicketReleaseGuard::new(rendezvous.clone(), ticket.clone());
         let relay_tunnel = match rendezvous.connect_relay_tunnel_source(&ticket).await {
-            Ok(tunnel) => tunnel,
+            Ok(tunnel) => {
+                ticket_release.mark_consumed();
+                tunnel
+            }
             Err(error) => {
                 tracing::warn!(
                     target: MOBILE_CONNECTION_LOG_TARGET,
@@ -1157,6 +1255,7 @@ async fn ensure_direct_quic_endpoint(
     let candidate = context.candidate;
     let target_node_id = context.target_node_id;
     let endpoint = context.endpoint;
+    let setup_identity = context.setup_identity;
     let cached_session = context.cached_session;
     let stats = context.stats;
     let rendezvous = context.rendezvous;
@@ -1170,7 +1269,16 @@ async fn ensure_direct_quic_endpoint(
     }
 
     let has_usable_peer_addresses = has_usable_peer_addresses(candidate)?;
-    let secret_key = SecretKey::generate();
+    let secret_key = {
+        let mut identity = setup_identity.lock().await;
+        identity
+            .get_or_insert_with(|| DirectQuicSetupIdentity {
+                secret_key: SecretKey::generate(),
+                relay_ticket_lease: None,
+            })
+            .secret_key
+            .clone()
+    };
     let local_iroh_endpoint_id = secret_key.public().to_string();
     let remote_iroh_endpoint_id = endpoint_id_from_candidate(candidate)?;
     let relay_ticket_collection = match rendezvous {
@@ -1262,6 +1370,28 @@ async fn ensure_direct_quic_endpoint(
     let first_relay_ticket = relay_ticket_collection
         .as_ref()
         .map(|collection| collection.first_ticket().clone());
+    let relay_ticket_lease = if first_relay_ticket.is_some() {
+        let rendezvous = rendezvous
+            .expect("an endpoint-bound relay ticket requires a rendezvous client")
+            .clone();
+        let mut identity = setup_identity.lock().await;
+        let identity = identity
+            .as_mut()
+            .expect("direct QUIC setup identity should exist after ticket issuance");
+        Some(
+            identity
+                .relay_ticket_lease
+                .get_or_insert_with(|| {
+                    Arc::new(IrohRelayLeaseHandle {
+                        rendezvous,
+                        endpoint_id: local_iroh_endpoint_id.clone(),
+                    })
+                })
+                .clone(),
+        )
+    } else {
+        None
+    };
 
     let static_relay_authorized = rendezvous.is_none()
         && candidate
@@ -1380,6 +1510,9 @@ async fn ensure_direct_quic_endpoint(
         (Some(rendezvous), Some(collection), Some(tickets)) => {
             let lifecycle = DirectQuicEndpointLifecycle {
                 endpoint_slot: endpoint.clone(),
+                relay_ticket_lease: relay_ticket_lease
+                    .clone()
+                    .expect("relay ticket refresh requires an active lease handle"),
                 cached_session: cached_session.clone(),
                 stats: stats.clone(),
                 endpoint_config: config,
@@ -1400,6 +1533,7 @@ async fn ensure_direct_quic_endpoint(
     let managed_endpoint = ManagedDirectQuicEndpoint {
         endpoint: bound_endpoint.clone(),
         relay_ticket_refresh,
+        _relay_ticket_lease: relay_ticket_lease,
     };
     let mut guard = endpoint.lock().await;
     if let Some(existing) = guard.as_ref() {
@@ -1659,6 +1793,7 @@ async fn rollover_direct_quic_endpoint(
         endpoint.replace(ManagedDirectQuicEndpoint {
             endpoint: next_endpoint.clone(),
             relay_ticket_refresh: Some(refresh),
+            _relay_ticket_lease: Some(lifecycle.relay_ticket_lease.clone()),
         })
     };
 
@@ -1746,7 +1881,74 @@ fn unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, routing::delete};
     use transport_sdk::candidates::ConnectionCandidateTransportHints;
+
+    #[tokio::test]
+    async fn dropping_unused_relay_ticket_guard_releases_server_capacity() {
+        let releases = Arc::new(AtomicU64::new(0));
+        let releases_for_handler = Arc::clone(&releases);
+        let router = Router::new().route(
+            "/control/relay/ticket/release",
+            delete(
+                move |Json(_request): Json<transport_sdk::RelayTicketReleaseRequest>| {
+                    let releases = Arc::clone(&releases_for_handler);
+                    async move {
+                        releases.fetch_add(1, Ordering::SeqCst);
+                        Json(transport_sdk::RelayTicketReleaseResponse { released: true })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("release listener should bind");
+        let rendezvous_url = format!(
+            "http://{}",
+            listener.local_addr().expect("release listener address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("release server should run");
+        });
+        let cluster_id = uuid::Uuid::now_v7();
+        let rendezvous = RendezvousControlClient::new(
+            transport_sdk::RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![rendezvous_url.clone()],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+        let guard = RelayTicketReleaseGuard::new(
+            rendezvous,
+            transport_sdk::RelayTicket {
+                cluster_id,
+                session_id: "unused-session".to_string(),
+                source: PeerIdentity::Device(uuid::Uuid::now_v7()),
+                target: PeerIdentity::Node(NodeId::new_v4()),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: transport_sdk::RelayTunnelSecurityMode::InnerMtls,
+                relay_urls: vec![rendezvous_url],
+                issued_at_unix: 1,
+                expires_at_unix: 2,
+            },
+        );
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while releases.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the guard should send an explicit release");
+
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test]
     async fn direct_quic_without_ticket_or_peer_addresses_fails_before_connecting() {
@@ -1765,12 +1967,14 @@ mod tests {
             }),
         };
         let endpoint = Arc::new(Mutex::new(None));
+        let setup_identity = Arc::new(Mutex::new(None));
         let cached_session = Arc::new(Mutex::new(None));
         let stats = Arc::new(TransportSessionPoolStats::default());
         let context = DirectQuicConnectContext {
             candidate: &candidate,
             target_node_id: NodeId::new_v4(),
             endpoint: &endpoint,
+            setup_identity: &setup_identity,
             cached_session: &cached_session,
             stats: &stats,
             rendezvous: None,
@@ -1790,6 +1994,24 @@ mod tests {
                 .contains("direct QUIC unavailable: no relay ticket and no usable peer addresses")
         );
         assert!(endpoint.lock().await.is_none());
+        let first_endpoint_id = setup_identity
+            .lock()
+            .await
+            .as_ref()
+            .expect("failed setup should retain its local identity")
+            .secret_key
+            .public();
+        if ensure_direct_quic_endpoint(&context, None).await.is_ok() {
+            panic!("repeated setup should still reject unusable addresses");
+        }
+        let second_endpoint_id = setup_identity
+            .lock()
+            .await
+            .as_ref()
+            .expect("repeated setup should retain its local identity")
+            .secret_key
+            .public();
+        assert_eq!(first_endpoint_id, second_endpoint_id);
     }
 
     #[tokio::test]
@@ -1840,12 +2062,14 @@ mod tests {
             }),
         };
         let endpoint = Arc::new(Mutex::new(None));
+        let setup_identity = Arc::new(Mutex::new(None));
         let cached_session = Arc::new(Mutex::new(None));
         let stats = Arc::new(TransportSessionPoolStats::default());
         let context = DirectQuicConnectContext {
             candidate: &candidate,
             target_node_id: NodeId::new_v4(),
             endpoint: &endpoint,
+            setup_identity: &setup_identity,
             cached_session: &cached_session,
             stats: &stats,
             rendezvous: Some(&rendezvous),

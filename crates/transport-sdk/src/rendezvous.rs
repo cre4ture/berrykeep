@@ -1,17 +1,18 @@
 use anyhow::{Context, Result, anyhow, bail};
 use common::{ClusterId, NodeId};
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use reqwest::{Certificate, Client, Url};
+use reqwest::{Certificate, Client, StatusCode, Url};
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use x509_parser::parse_x509_certificate;
 
 use crate::bootstrap::RelayMode;
@@ -21,11 +22,77 @@ use crate::bootstrap_claim::{
 use crate::candidates::ConnectionCandidate;
 use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 use crate::peer::PeerIdentity;
-use crate::relay::{RelayTicket, RelayTicketRequest};
+use crate::relay::{
+    RelayTicket, RelayTicketReleaseRequest, RelayTicketReleaseResponse, RelayTicketRequest,
+};
 use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSession};
 use crate::relay_wake::{RelayWakeClient, RelayWakeRegistration};
 
 const MAX_RENDEZVOUS_ERROR_RESPONSE_BYTES: usize = 1024;
+const MAX_CONCURRENT_RELAY_TICKET_REQUESTS_PER_ORIGIN: usize = 3;
+const MAX_SERVER_TICKET_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+static RELAY_TICKET_ORIGIN_GATES: OnceLock<Mutex<HashMap<String, Arc<RelayTicketOriginGate>>>> =
+    OnceLock::new();
+
+struct RelayTicketOriginGate {
+    permits: Arc<Semaphore>,
+    backpressure_until: Mutex<Option<Instant>>,
+}
+
+impl RelayTicketOriginGate {
+    fn shared(base_url: &str) -> Arc<Self> {
+        let origin = base_url.trim().trim_end_matches('/').to_string();
+        let gates = RELAY_TICKET_ORIGIN_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut gates = gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(gate) = gates.get(&origin) {
+            return Arc::clone(gate);
+        }
+        let gate = Arc::new(Self {
+            permits: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_RELAY_TICKET_REQUESTS_PER_ORIGIN,
+            )),
+            backpressure_until: Mutex::new(None),
+        });
+        gates.insert(origin, Arc::clone(&gate));
+        gate
+    }
+
+    async fn acquire(self: &Arc<Self>, respect_backpressure: bool) -> OwnedSemaphorePermit {
+        loop {
+            let permit = Arc::clone(&self.permits)
+                .acquire_owned()
+                .await
+                .expect("relay ticket origin semaphore must remain open");
+            if !respect_backpressure {
+                return permit;
+            }
+            let delay = self
+                .backpressure_until
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .and_then(|until| until.checked_duration_since(Instant::now()));
+            let Some(delay) = delay else {
+                return permit;
+            };
+            drop(permit);
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    fn apply_backpressure(&self, retry_after: Duration) {
+        let until = Instant::now() + retry_after.min(MAX_SERVER_TICKET_BACKOFF);
+        let mut current = self
+            .backpressure_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.is_none_or(|current| current < until) {
+            *current = Some(until);
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IrohRelayAdvertisement {
@@ -51,6 +118,27 @@ impl std::fmt::Debug for IrohRelayAdvertisement {
 pub struct IrohRelayTicketRequest {
     pub cluster_id: ClusterId,
     pub endpoint_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IrohRelayTicketReleaseRequest {
+    pub cluster_id: ClusterId,
+    pub endpoint_id: String,
+}
+
+impl IrohRelayTicketReleaseRequest {
+    pub fn validate(&self) -> Result<()> {
+        IrohRelayTicketRequest {
+            cluster_id: self.cluster_id,
+            endpoint_id: self.endpoint_id.clone(),
+        }
+        .validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IrohRelayTicketReleaseResponse {
+    pub released: bool,
 }
 
 impl IrohRelayTicketRequest {
@@ -468,15 +556,59 @@ impl RendezvousControlClient {
                 self.config.cluster_id
             );
         }
-        let ticket: RelayTicket = self.post_json("/control/relay/ticket", request).await?;
-        if ticket.security_mode != request.security_mode {
+        let mut last_error = None;
+        for base_url in &self.config.rendezvous_urls {
+            match self
+                .issue_relay_ticket_from_endpoint(base_url, request)
+                .await
+            {
+                Ok(ticket) => return Ok(ticket),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
+    }
+
+    pub async fn release_relay_ticket(&self, ticket: &RelayTicket) -> Result<bool> {
+        ticket.validate()?;
+        if ticket.cluster_id != self.config.cluster_id {
             bail!(
-                "rendezvous relay ticket security mode {:?} does not match requested mode {:?}",
-                ticket.security_mode,
-                request.security_mode
+                "relay ticket release cluster_id {} does not match rendezvous client cluster_id {}",
+                ticket.cluster_id,
+                self.config.cluster_id
             );
         }
-        Ok(ticket)
+        let request = RelayTicketReleaseRequest {
+            cluster_id: ticket.cluster_id,
+            source: ticket.source.clone(),
+            session_id: ticket.session_id.clone(),
+        };
+        let mut attempts = FuturesUnordered::new();
+        for base_url in &self.config.rendezvous_urls {
+            let client = self.clone();
+            let base_url = base_url.clone();
+            let request = request.clone();
+            attempts.push(async move {
+                client
+                    .release_relay_ticket_from_endpoint(base_url, request)
+                    .await
+            });
+        }
+        let mut released = false;
+        let mut errors = Vec::new();
+        while let Some(result) = attempts.next().await {
+            match result {
+                Ok(response) => released |= response.released,
+                Err(error) => errors.push(error),
+            }
+        }
+        if errors.is_empty() {
+            Ok(released)
+        } else {
+            Err(errors
+                .pop()
+                .expect("non-empty release error collection should contain an error"))
+        }
     }
 
     pub async fn issue_iroh_relay_ticket(&self, endpoint_id: &str) -> Result<IrohRelayTicket> {
@@ -495,7 +627,46 @@ impl RendezvousControlClient {
         Ok(ticket)
     }
 
-    /// Starts requests against every configured Rendezvous endpoint at once.
+    /// Releases this client's endpoint-bound lease at every configured
+    /// Rendezvous service. Missing leases are treated as an idempotent success.
+    pub async fn release_iroh_relay_ticket(&self, endpoint_id: &str) -> Result<bool> {
+        let request = IrohRelayTicketReleaseRequest {
+            cluster_id: self.config.cluster_id,
+            endpoint_id: endpoint_id.trim().to_string(),
+        };
+        request.validate()?;
+        let mut attempts = FuturesUnordered::new();
+        for base_url in &self.config.rendezvous_urls {
+            let client = self.clone();
+            let base_url = base_url.clone();
+            let request = request.clone();
+            attempts.push(async move {
+                client
+                    .release_iroh_relay_ticket_from_endpoint(base_url, request)
+                    .await
+            });
+        }
+
+        let mut released = false;
+        let mut errors = Vec::new();
+        while let Some(result) = attempts.next().await {
+            match result {
+                Ok(response) => released |= response.released,
+                Err(error) => errors.push(error),
+            }
+        }
+        if errors.is_empty() {
+            Ok(released)
+        } else {
+            Err(errors
+                .pop()
+                .expect("non-empty release error collection should contain an error"))
+        }
+    }
+
+    /// Schedules requests against every configured Rendezvous endpoint. A
+    /// process-wide per-origin gate bounds how many ticket handshakes can run
+    /// concurrently, including across independent client instances.
     ///
     /// The returned collection is ready as soon as the first validated ticket
     /// arrives. It deliberately does not wait for slower endpoints, whose
@@ -905,6 +1076,8 @@ impl RendezvousControlClient {
         base_url: String,
         request: IrohRelayTicketRequest,
     ) -> Result<IrohRelayTicket> {
+        let gate = RelayTicketOriginGate::shared(&base_url);
+        let _permit = gate.acquire(true).await;
         let url = control_url(&base_url, "/control/iroh-relay/ticket")?;
         let result = match self.http.post(url.clone()).json(&request).send().await {
             Ok(response) if response.status().is_success() => {
@@ -917,7 +1090,12 @@ impl RendezvousControlClient {
                     )),
                 }
             }
-            Ok(response) => Err(rendezvous_response_error(&url, response).await),
+            Ok(response) => {
+                if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                    gate.apply_backpressure(retry_after_duration(&response));
+                }
+                Err(rendezvous_response_error(&url, response).await)
+            }
             Err(error) => Err(self.decorate_transport_error(format!(
                 "failed contacting rendezvous endpoint {url}: {error}"
             ))),
@@ -930,6 +1108,120 @@ impl RendezvousControlClient {
             }
             Err(message) => {
                 self.record_endpoint_result(&base_url, Err(message.clone()), true);
+                Err(anyhow!(message))
+            }
+        }
+    }
+
+    async fn issue_relay_ticket_from_endpoint(
+        &self,
+        base_url: &str,
+        request: &RelayTicketRequest,
+    ) -> Result<RelayTicket> {
+        let gate = RelayTicketOriginGate::shared(base_url);
+        let _permit = gate.acquire(true).await;
+        let url = control_url(base_url, "/control/relay/ticket")?;
+        let result = match self.http.post(url.clone()).json(request).send().await {
+            Ok(response) if response.status().is_success() => response
+                .json::<RelayTicket>()
+                .await
+                .map_err(|error| {
+                    format!("failed decoding rendezvous response from {url}: {error}")
+                })
+                .and_then(|mut ticket| {
+                    if ticket.security_mode != request.security_mode {
+                        return Err(format!(
+                            "rendezvous relay ticket security mode {:?} does not match requested mode {:?}",
+                            ticket.security_mode, request.security_mode
+                        ));
+                    }
+                    let issuing_origin = base_url.trim().trim_end_matches('/');
+                    ticket.relay_urls.sort_by_key(|url| {
+                        (url.trim().trim_end_matches('/') != issuing_origin) as u8
+                    });
+                    Ok(ticket)
+                }),
+            Ok(response) => {
+                if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                    gate.apply_backpressure(retry_after_duration(&response));
+                }
+                Err(rendezvous_response_error(&url, response).await)
+            }
+            Err(error) => Err(self.decorate_transport_error(format!(
+                "failed contacting rendezvous endpoint {url}: {error}"
+            ))),
+        };
+        match result {
+            Ok(ticket) => {
+                self.record_endpoint_result(base_url, Ok(()), true);
+                Ok(ticket)
+            }
+            Err(message) => {
+                self.record_endpoint_result(base_url, Err(message.clone()), true);
+                Err(anyhow!(message))
+            }
+        }
+    }
+
+    async fn release_iroh_relay_ticket_from_endpoint(
+        &self,
+        base_url: String,
+        request: IrohRelayTicketReleaseRequest,
+    ) -> Result<IrohRelayTicketReleaseResponse> {
+        let gate = RelayTicketOriginGate::shared(&base_url);
+        let _permit = gate.acquire(false).await;
+        let url = control_url(&base_url, "/control/iroh-relay/ticket/release")?;
+        let result = match self.http.delete(url.clone()).json(&request).send().await {
+            Ok(response) if response.status().is_success() => response
+                .json::<IrohRelayTicketReleaseResponse>()
+                .await
+                .map_err(|error| {
+                    format!("failed decoding rendezvous response from {url}: {error}")
+                }),
+            Ok(response) => Err(rendezvous_response_error(&url, response).await),
+            Err(error) => Err(self.decorate_transport_error(format!(
+                "failed contacting rendezvous endpoint {url}: {error}"
+            ))),
+        };
+        match result {
+            Ok(response) => {
+                self.record_endpoint_result(&base_url, Ok(()), false);
+                Ok(response)
+            }
+            Err(message) => {
+                self.record_endpoint_result(&base_url, Err(message.clone()), false);
+                Err(anyhow!(message))
+            }
+        }
+    }
+
+    async fn release_relay_ticket_from_endpoint(
+        &self,
+        base_url: String,
+        request: RelayTicketReleaseRequest,
+    ) -> Result<RelayTicketReleaseResponse> {
+        let gate = RelayTicketOriginGate::shared(&base_url);
+        let _permit = gate.acquire(false).await;
+        let url = control_url(&base_url, "/control/relay/ticket/release")?;
+        let result = match self.http.delete(url.clone()).json(&request).send().await {
+            Ok(response) if response.status().is_success() => response
+                .json::<RelayTicketReleaseResponse>()
+                .await
+                .map_err(|error| {
+                    format!("failed decoding rendezvous response from {url}: {error}")
+                }),
+            Ok(response) => Err(rendezvous_response_error(&url, response).await),
+            Err(error) => Err(self.decorate_transport_error(format!(
+                "failed contacting rendezvous endpoint {url}: {error}"
+            ))),
+        };
+        match result {
+            Ok(response) => {
+                self.record_endpoint_result(&base_url, Ok(()), false);
+                Ok(response)
+            }
+            Err(message) => {
+                self.record_endpoint_result(&base_url, Err(message.clone()), false);
                 Err(anyhow!(message))
             }
         }
@@ -972,6 +1264,16 @@ async fn rendezvous_response_error(url: &Url, response: reqwest::Response) -> St
         message.push_str(&detail);
     }
     message
+}
+
+fn retry_after_duration(response: &reqwest::Response) -> Duration {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(1))
 }
 
 async fn rendezvous_response_error_detail(mut response: reqwest::Response) -> Option<String> {
@@ -1285,6 +1587,7 @@ mod tests {
     use crate::relay::{RelayTunnelSecurityMode, RelayTunnelSessionKind};
     use axum::extract::Query;
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use axum::{
         Json, Router,
         routing::{get, post},
@@ -1557,6 +1860,217 @@ mod tests {
         let _ = slow_server.await;
         fast_server.abort();
         let _ = fast_server.await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_ticket_requests_share_a_process_wide_per_origin_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cluster_id = ClusterId::now_v7();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let active_for_handler = Arc::clone(&active);
+        let maximum_for_handler = Arc::clone(&maximum);
+        let router = Router::new().route(
+            "/control/iroh-relay/ticket",
+            post(move |Json(_request): Json<IrohRelayTicketRequest>| {
+                let active = Arc::clone(&active_for_handler);
+                let maximum = Arc::clone(&maximum_for_handler);
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Json(IrohRelayTicket {
+                        public_urls: vec!["https://relay.example".to_string()],
+                        auth_token: "endpoint-ticket".to_string(),
+                        expires_at_unix: unix_timestamp() + 60,
+                        quic_port: None,
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("rendezvous server should run");
+        });
+        let clients = (0..8)
+            .map(|_| {
+                RendezvousControlClient::new(
+                    RendezvousClientConfig {
+                        cluster_id,
+                        rendezvous_urls: vec![base_url.clone()],
+                        heartbeat_interval_secs: 15,
+                    },
+                    None,
+                    None,
+                )
+                .expect("client should build")
+            })
+            .collect::<Vec<_>>();
+        let mut requests = FuturesUnordered::new();
+        for client in clients {
+            let base_url = base_url.clone();
+            let request = IrohRelayTicketRequest {
+                cluster_id,
+                endpoint_id: iroh::SecretKey::generate().public().to_string(),
+            };
+            requests.push(async move {
+                client
+                    .issue_iroh_relay_ticket_from_endpoint(base_url, request)
+                    .await
+            });
+        }
+        while let Some(result) = requests.next().await {
+            result.expect("ticket request should succeed");
+        }
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            MAX_CONCURRENT_RELAY_TICKET_REQUESTS_PER_ORIGIN
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_ticket_requests_honor_server_retry_after() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cluster_id = ClusterId::now_v7();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_handler = Arc::clone(&request_count);
+        let router = Router::new().route(
+            "/control/iroh-relay/ticket",
+            post(move || {
+                let request_count = Arc::clone(&request_count_for_handler);
+                async move {
+                    if request_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [(reqwest::header::RETRY_AFTER, "1")],
+                            "ticket lease limit reached",
+                        )
+                            .into_response();
+                    }
+                    Json(IrohRelayTicket {
+                        public_urls: vec!["https://relay.example".to_string()],
+                        auth_token: "endpoint-ticket".to_string(),
+                        expires_at_unix: unix_timestamp() + 60,
+                        quic_port: None,
+                    })
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("rendezvous server should run");
+        });
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![base_url.clone()],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("client should build");
+        let request = || IrohRelayTicketRequest {
+            cluster_id,
+            endpoint_id: iroh::SecretKey::generate().public().to_string(),
+        };
+        client
+            .issue_iroh_relay_ticket_from_endpoint(base_url.clone(), request())
+            .await
+            .expect_err("first request should receive backpressure");
+        let started = Instant::now();
+        client
+            .issue_iroh_relay_ticket_from_endpoint(base_url, request())
+            .await
+            .expect("second request should succeed after backpressure delay");
+        assert!(started.elapsed() >= Duration::from_millis(900));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_ticket_release_is_sent_to_every_rendezvous_origin() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cluster_id = ClusterId::now_v7();
+        let endpoint_id = iroh::SecretKey::generate().public().to_string();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let mut servers = Vec::new();
+        let mut rendezvous_urls = Vec::new();
+        for _ in 0..2 {
+            let releases_for_handler = Arc::clone(&releases);
+            let expected_endpoint_id = endpoint_id.clone();
+            let router = Router::new().route(
+                "/control/iroh-relay/ticket/release",
+                axum::routing::delete(move |Json(request): Json<IrohRelayTicketReleaseRequest>| {
+                    let releases = Arc::clone(&releases_for_handler);
+                    let expected_endpoint_id = expected_endpoint_id.clone();
+                    async move {
+                        assert_eq!(request.cluster_id, cluster_id);
+                        assert_eq!(request.endpoint_id, expected_endpoint_id);
+                        releases.fetch_add(1, Ordering::SeqCst);
+                        Json(IrohRelayTicketReleaseResponse { released: true })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener should bind");
+            rendezvous_urls.push(format!(
+                "http://{}",
+                listener.local_addr().expect("listener address")
+            ));
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .await
+                    .expect("rendezvous server should run");
+            }));
+        }
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls,
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("client should build");
+        assert!(
+            client
+                .release_iroh_relay_ticket(&endpoint_id)
+                .await
+                .expect("release should succeed")
+        );
+        assert_eq!(releases.load(Ordering::SeqCst), 2);
+        for server in servers {
+            server.abort();
+            let _ = server.await;
+        }
     }
 
     #[tokio::test]

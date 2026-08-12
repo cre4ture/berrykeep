@@ -75,8 +75,8 @@ pub use multiplex_transport::{
 pub use mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};
 pub use relay::{
-    RelayHttpHeader, RelayTicket, RelayTicketRequest, RelayTunnelSecurityMode,
-    RelayTunnelSessionKind,
+    RelayHttpHeader, RelayTicket, RelayTicketReleaseRequest, RelayTicketReleaseResponse,
+    RelayTicketRequest, RelayTunnelSecurityMode, RelayTunnelSessionKind,
 };
 pub use relay_security::{
     RelayTunnelSourceSecurityConfig, RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity,
@@ -90,7 +90,8 @@ pub use relay_wake::{
 };
 pub use rendezvous::{
     DiscoveryResponse, IrohRelayAdvertisement, IrohRelayTicket, IrohRelayTicketCollection,
-    IrohRelayTicketRequest, PresenceEntry, PresenceListResponse, PresenceRegistration,
+    IrohRelayTicketReleaseRequest, IrohRelayTicketReleaseResponse, IrohRelayTicketRequest,
+    PresenceEntry, PresenceListResponse, PresenceRegistration,
     RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse, RendezvousClientConfig,
     RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
     RendezvousRuntimeState, TransportCapability, is_expected_idle_relay_tunnel_accept_timeout,
