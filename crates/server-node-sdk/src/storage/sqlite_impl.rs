@@ -17,19 +17,20 @@ use crate::cluster::NodeDescriptor;
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GalleryDeltaChange, GalleryDeltaCursorError,
-    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
-    GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery,
-    ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
-    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
-    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
-    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
-    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
+    GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
+    GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
+    GalleryIndexPage, GalleryIndexQuery, ManifestSummary, ManualRepairActionRunRecord,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
+    MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord,
+    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
+    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
     compress_snapshot_json, current_media_cache_metadata, decompress_snapshot_json,
-    gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_media_type_for_path, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
+    effective_gallery_captured_at_unix, gallery_index_media_status,
+    gallery_index_media_type_from_metadata, gallery_media_type_for_path,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
+    version_created_at_unix_from_payload,
 };
 
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
@@ -179,6 +180,14 @@ impl SqliteMetadataStore {
 
     async fn backfill_gallery_objects(&self) -> Result<()> {
         self.write_tx(|db| {
+            let capture_fallback_backfill_needed = db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_none();
             let mut statement = db.prepare(
                 "SELECT current_objects.key, current_objects.manifest_hash, current_objects.object_id
                  FROM current_objects
@@ -189,9 +198,12 @@ impl SqliteMetadataStore {
                     OR (
                         gallery_objects.geotagged != 0
                         AND (gallery_objects.latitude IS NULL OR gallery_objects.longitude IS NULL)
-                    )",
+                    )
+                    OR (?1 != 0 AND gallery_objects.captured_at_unix = 0)",
             )?;
-            let rows = statement.query_map([], |row| {
+            let rows = statement.query_map(
+                params![i64::from(capture_fallback_backfill_needed)],
+                |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     CurrentObjectEntry {
@@ -199,11 +211,19 @@ impl SqliteMetadataStore {
                         object_id: row.get(2)?,
                     },
                 ))
-            })?;
+                },
+            )?;
             let stale = rows.collect::<std::result::Result<Vec<_>, _>>()?;
             drop(statement);
             for (key, entry) in stale {
                 upsert_gallery_object(db, &key, &entry)?;
+            }
+            if capture_fallback_backfill_needed {
+                db.execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY],
+                )?;
             }
             Ok(())
         })
@@ -265,10 +285,6 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
         .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
     let media_type = gallery_index_media_type_from_metadata(metadata.as_ref());
-    let captured_at_unix = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.taken_at_unix)
-        .unwrap_or(0);
     let media_status = gallery_index_media_status(metadata.as_ref());
     let gps = metadata
         .as_ref()
@@ -279,25 +295,51 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 && gps.longitude.is_finite()
                 && (-180.0..=180.0).contains(&gps.longitude)
         });
-    db.execute(
-        "UPDATE gallery_objects
-         SET media_type = COALESCE(?1, inferred_media_type),
-             captured_at_unix = ?2,
-             media_status = ?3,
-             geotagged = ?4,
-             latitude = ?5,
-             longitude = ?6
-         WHERE manifest_hash = ?7",
-        params![
-            media_type,
-            u64_to_i64(captured_at_unix)?,
-            media_status,
-            if gps.is_some() { 1i64 } else { 0i64 },
-            gps.map(|gps| gps.latitude),
-            gps.map(|gps| gps.longitude),
-            manifest_hash,
-        ],
+    let mut statement = db.prepare(
+        "SELECT gallery_objects.key, version_indexes.index_json
+         FROM gallery_objects
+         LEFT JOIN version_indexes
+           ON version_indexes.object_id = gallery_objects.object_id
+         WHERE gallery_objects.manifest_hash = ?1",
     )?;
+    let entries = statement
+        .query_map(params![manifest_hash], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (key, version_index_payload) in entries {
+        let version_created_at_unix =
+            version_created_at_unix_from_payload(version_index_payload.as_deref(), manifest_hash)?;
+        let captured_at_unix = effective_gallery_captured_at_unix(
+            &key,
+            media_status,
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.taken_at_unix),
+            version_created_at_unix,
+        );
+        db.execute(
+            "UPDATE gallery_objects
+             SET media_type = COALESCE(?1, inferred_media_type),
+                 captured_at_unix = ?2,
+                 media_status = ?3,
+                 geotagged = ?4,
+                 latitude = ?5,
+                 longitude = ?6
+             WHERE key = ?7",
+            params![
+                media_type,
+                u64_to_i64(captured_at_unix)?,
+                media_status,
+                if gps.is_some() { 1i64 } else { 0i64 },
+                gps.map(|gps| gps.latitude),
+                gps.map(|gps| gps.longitude),
+                key,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -336,6 +378,24 @@ fn refresh_gallery_objects_for_manifest_and_collect_unchanged_keys(
     let before = gallery_projection_states_for_manifest(db, manifest_hash)?;
     refresh_gallery_objects_for_manifest(db, manifest_hash)?;
     let after = gallery_projection_states_for_manifest(db, manifest_hash)?;
+    Ok(unchanged_gallery_projection_keys(before, after))
+}
+
+fn refresh_gallery_objects_for_object_id_and_collect_unchanged_keys(
+    db: &Connection,
+    object_id: &str,
+) -> Result<Vec<String>> {
+    let before = gallery_projection_states_for_object_id(db, object_id)?;
+    let mut statement =
+        db.prepare("SELECT DISTINCT manifest_hash FROM gallery_objects WHERE object_id = ?1")?;
+    let manifest_hashes = statement
+        .query_map(params![object_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+    for manifest_hash in manifest_hashes {
+        refresh_gallery_objects_for_manifest(db, &manifest_hash)?;
+    }
+    let after = gallery_projection_states_for_object_id(db, object_id)?;
     Ok(unchanged_gallery_projection_keys(before, after))
 }
 
@@ -381,6 +441,26 @@ fn gallery_projection_states_for_manifest(
     )
 }
 
+fn gallery_projection_states_for_object_id(
+    db: &Connection,
+    object_id: &str,
+) -> Result<Vec<GalleryProjectionState>> {
+    gallery_projection_states_for_query(
+        db,
+        "SELECT
+             key,
+             media_type,
+             captured_at_unix,
+             media_status,
+             geotagged,
+             latitude,
+             longitude
+         FROM gallery_objects
+         WHERE object_id = ?1",
+        object_id,
+    )
+}
+
 fn gallery_projection_states_for_query(
     db: &Connection,
     sql: &str,
@@ -415,26 +495,6 @@ fn unchanged_gallery_projection_keys(
         .into_iter()
         .filter_map(|state| (after_by_key.get(&state.key) == Some(&state)).then_some(state.key))
         .collect()
-}
-
-fn record_gallery_upserts_for_query(db: &Connection, sql: &str, parameter: &str) -> Result<()> {
-    let mut statement = db.prepare(sql)?;
-    let keys = statement
-        .query_map(params![parameter], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    drop(statement);
-    for key in keys {
-        record_gallery_change(db, &key, "upsert")?;
-    }
-    Ok(())
-}
-
-fn record_gallery_upserts_for_object_id(db: &Connection, object_id: &str) -> Result<()> {
-    record_gallery_upserts_for_query(
-        db,
-        "SELECT key FROM gallery_objects WHERE object_id = ?1",
-        object_id,
-    )
 }
 
 fn record_gallery_upserts_for_keys(db: &Connection, keys: &[String]) -> Result<()> {
@@ -668,20 +728,8 @@ fn materialize_gallery_index_entry(
     let media_metadata = metadata_payload
         .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
-    let modified_at_unix = version_index_payload
-        .map(|payload| {
-            serde_json::from_slice::<FileVersionIndex>(&payload)
-                .context("invalid version index while reading gallery projection")
-        })
-        .transpose()?
-        .and_then(|index| {
-            index
-                .versions
-                .values()
-                .filter(|record| record.manifest_hash == manifest_hash)
-                .map(|record| record.created_at_unix)
-                .max()
-        });
+    let modified_at_unix =
+        version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
     Ok(GalleryIndexEntry {
         key,
         manifest_hash,
@@ -2695,7 +2743,11 @@ impl MetadataStore for SqliteMetadataStore {
                 params![object_id, payload],
             )?;
             if changed > 0 {
-                record_gallery_upserts_for_object_id(db, &object_id)?;
+                let unchanged_projection_keys =
+                    refresh_gallery_objects_for_object_id_and_collect_unchanged_keys(
+                        db, &object_id,
+                    )?;
+                record_gallery_upserts_for_keys(db, &unchanged_projection_keys)?;
             }
             Ok(())
         })

@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
+pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 
 fn current_objects_cache_capacity() -> usize {
     std::env::var("IRONMESH_CURRENT_OBJECTS_CACHE_CAPACITY")
@@ -40,6 +41,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 pub(super) mod data_scrub;
+mod gallery_capture_time;
 pub(super) mod manifest_reader;
 pub(super) mod media_cache;
 pub(super) mod media_tools;
@@ -63,6 +65,8 @@ pub use media_tools::{HostDependencyReport, HostDependencyStatus};
 pub(crate) use data_scrub::DataScrubber;
 #[cfg(test)]
 pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTestHook};
+pub(crate) use gallery_capture_time::effective_gallery_captured_at_unix;
+pub(super) use gallery_capture_time::version_created_at_unix_from_payload;
 use media_cache::MediaCacheBuildConfig;
 #[cfg(test)]
 pub(crate) use media_cache::mobile_viewer_thumbnail_profile;
