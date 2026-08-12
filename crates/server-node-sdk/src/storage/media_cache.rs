@@ -47,8 +47,6 @@ const DEFAULT_MEDIA_CACHE_IMAGE_MAX_DIMENSION: u32 = 12_288;
 const DEFAULT_MEDIA_CACHE_IMAGE_MAX_PIXELS: u64 = 40_000_000;
 const DEFAULT_MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 const IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL: u64 = 4;
-const HEIF_DECODE_ESTIMATED_BYTES_PER_PIXEL: u64 = 20;
-const HEIF_SOURCE_COPY_MULTIPLIER: u64 = 4;
 pub(super) const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 pub(super) const GRID_THUMBNAIL_PROFILE: &str = "grid";
 pub(super) const MOBILE_VIEWER_THUMBNAIL_MAX_DIMENSION: u32 = 1536;
@@ -1634,28 +1632,28 @@ fn estimated_image_build_bytes(
         return source_size_bytes;
     }
 
-    let bytes_per_pixel = if format == Some(MediaImageFormat::Heif) {
-        HEIF_DECODE_ESTIMATED_BYTES_PER_PIXEL
-    } else {
-        IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL
-    };
+    // Exact HEIF admission depends on embedded-thumbnail and grid metadata that
+    // is not available in the format-sniff prefix. A successful optimized
+    // decode is bounded by max_decode_bytes; the decoder performs the exact
+    // SPS/tile/source/output estimate before allocating pixel buffers.
+    if format == Some(MediaImageFormat::Heif) {
+        return image_limits.max_decode_bytes;
+    }
+
     let decode_bytes = dimensions
         .map(|(width, height)| {
             u64::from(width)
                 .saturating_mul(u64::from(height))
-                .saturating_mul(bytes_per_pixel)
+                .saturating_mul(IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL)
         })
         .unwrap_or_else(|| {
-            image_limits
-                .max_decode_bytes
-                .max(image_limits.max_pixels.saturating_mul(bytes_per_pixel))
+            image_limits.max_decode_bytes.max(
+                image_limits
+                    .max_pixels
+                    .saturating_mul(IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL),
+            )
         });
-
-    if format == Some(MediaImageFormat::Heif) {
-        decode_bytes.saturating_add(source_size_bytes.saturating_mul(HEIF_SOURCE_COPY_MULTIPLIER))
-    } else {
-        decode_bytes.max(source_size_bytes)
-    }
+    decode_bytes.max(source_size_bytes)
 }
 
 fn validate_image_decode_limits(
@@ -1665,6 +1663,14 @@ fn validate_image_decode_limits(
     profile: ThumbnailProfileSpec,
     image_limits: &MediaCacheImageLimits,
 ) -> Option<String> {
+    // HEIF admission is based on the selected embedded thumbnail or the
+    // largest concurrently live grid tile, not the primary canvas. The
+    // thumbnailer validates coded SPS dimensions and its complete peak-memory
+    // estimate immediately before decode.
+    if format == MediaImageFormat::Heif {
+        return None;
+    }
+
     let (decode_width, decode_height) = if format == MediaImageFormat::Standard(ImageFormat::Jpeg) {
         jpeg_scaled_dimensions(width, height, profile.max_dimension)
     } else {
@@ -1686,12 +1692,7 @@ fn validate_image_decode_limits(
         ));
     }
 
-    let bytes_per_pixel = if format == MediaImageFormat::Heif {
-        HEIF_DECODE_ESTIMATED_BYTES_PER_PIXEL
-    } else {
-        IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL
-    };
-    let estimated_decode_bytes = pixel_count.saturating_mul(bytes_per_pixel);
+    let estimated_decode_bytes = pixel_count.saturating_mul(IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL);
     if estimated_decode_bytes > image_limits.max_decode_bytes {
         return Some(format!(
             "image thumbnail generation rejected: estimated decode footprint {} bytes exceeds limit {} bytes",
@@ -2180,7 +2181,21 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("HEIF codestreams")
+                .contains("target-sized HEIF decode")
+        );
+    }
+
+    #[test]
+    fn heif_primary_canvas_does_not_preempt_optimized_decoder_admission() {
+        assert_eq!(
+            validate_image_decode_limits(
+                MediaImageFormat::Heif,
+                60_000,
+                20_000,
+                grid_thumbnail_profile(),
+                &MediaCacheImageLimits::default(),
+            ),
+            None
         );
     }
 
@@ -2260,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn estimated_image_build_bytes_accounts_for_heif_decode_buffers() {
+    fn estimated_image_build_bytes_reserves_the_heif_decoder_budget() {
         let source_size = 3 * 1024 * 1024;
         let dimensions = (4_032, 3_024);
 
@@ -2272,10 +2287,7 @@ mod tests {
                 true,
                 &MediaCacheImageLimits::default(),
             ),
-            u64::from(dimensions.0)
-                .saturating_mul(u64::from(dimensions.1))
-                .saturating_mul(HEIF_DECODE_ESTIMATED_BYTES_PER_PIXEL)
-                .saturating_add((source_size as u64).saturating_mul(HEIF_SOURCE_COPY_MULTIPLIER))
+            MediaCacheImageLimits::default().max_decode_bytes
         );
     }
 }

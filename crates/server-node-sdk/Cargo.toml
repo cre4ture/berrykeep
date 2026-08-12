@@ -18,7 +18,7 @@ async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
-berry-thumbnailer = { git = "https://github.com/cre4ture/berry-thumbnailer.git", rev = "d3e46c5227f5f8764026f36f5b22f305d134616b" }
+berry-thumbnailer = { git = "https://github.com/cre4ture/berry-thumbnailer.git", rev = "79ffd45d4a280e55747164d85d9095e42d8a7281" }
 blake3.workspace = true
 bytes.workspace = true
 common = { path = "../common" }
