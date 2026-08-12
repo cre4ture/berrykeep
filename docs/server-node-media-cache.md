@@ -51,6 +51,12 @@ Current implementation:
   the final thumbnail resample, avoiding a full-resolution pixel buffer
 - BerryKeep applies its configured dimension, pixel, and decoded-byte limits
   to that native scaled JPEG buffer before invoking the decoder
+- HEVC-backed HEIF/HEIC still images are decoded in pure Rust, including
+  iPhone-style image grids, container or EXIF orientation, 8/10-bit pixels,
+  and Display-P3 conversion
+- HEIF decoding validates the container, every referenced tile's SPS
+  dimensions, and a conservative compressed-plus-decoded memory estimate
+  before pixel reconstruction
 - video inspection and thumbnail extraction handled by external `ffprobe` / `ffmpeg`
 - cached dimensions
 - EXIF orientation when available
@@ -72,7 +78,9 @@ Incomplete records carry a retry timestamp so repeated gallery requests do not k
 
 Media-cache schema changes invalidate older terminal records. In particular,
 images previously marked unsupported only because their full-resolution JPEG
-dimensions exceeded the old decoder limits are retried after this optimization.
+dimensions exceeded the old decoder limits are retried after this optimization;
+the HEIF/HEIC support schema update similarly retries older unsupported image
+records.
 
 This prevents repeated expensive decode attempts on every listing while still allowing incomplete replicas to recover automatically.
 
@@ -196,6 +204,9 @@ For gallery-style UIs:
 - EXIF extraction is best-effort and format-dependent
 - non-JPEG image codecs may still allocate a full decoded image even though the
   compressed source itself is streamed
+- the current HEIF backend materializes the complete compressed source and
+  decodes the complete primary image; both allocations are included in its
+  decoded-byte limit and media-build semaphore estimate
 - progressive JPEGs have a separate source-pixel limit because their decoder
   may retain full-resolution coefficient buffers despite scaled output
 - `taken_at_unix` is best-effort and may fall back to interpreting EXIF datetimes without an explicit offset as UTC

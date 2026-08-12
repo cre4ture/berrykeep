@@ -11,6 +11,7 @@ use exif::{In, Reader as ExifReader, Tag, Value};
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageFormat, ImageReader};
+use imagesize::{Compression as HeifCompression, ImageType as SizeImageType};
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 use tokio::fs;
@@ -32,7 +33,7 @@ use super::{
     content_fingerprint_from_manifest, hash_hex, unix_ts, write_atomic,
 };
 
-pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 6;
+pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 7;
 pub(super) const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
 const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
 const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
@@ -54,6 +55,12 @@ pub(super) const MEDIA_FORMAT_SNIFF_BYTES: usize = 64 * 1024;
 pub(super) const SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS: u128 = 20000;
 const GRID_THUMBNAIL_JPEG_QUALITY: u8 = 82;
 const MOBILE_VIEWER_THUMBNAIL_JPEG_QUALITY: u8 = 84;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaImageFormat {
+    Standard(ImageFormat),
+    Heif,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ThumbnailProfileSpec {
@@ -307,7 +314,7 @@ impl MediaCacheWorker {
             MEDIA_FORMAT_SNIFF_BYTES,
         )
         .await?;
-        let format = match image::guess_format(&sniff_bytes) {
+        let format = match image_format_from_prefix(&sniff_bytes) {
             Ok(format) => format,
             Err(_) => return Ok(None),
         };
@@ -320,6 +327,7 @@ impl MediaCacheWorker {
                 .permits_for_estimated_bytes(estimated_image_build_bytes(
                     manifest.total_size_bytes,
                     image_dimensions(&sniff_bytes, format).ok(),
+                    Some(format),
                     true,
                     self.media_cache_build_config.image_limits(),
                 ));
@@ -599,7 +607,7 @@ impl MediaCacheWorker {
                 );
             }
         };
-        let format = image::guess_format(&sniff_bytes).ok();
+        let format = image_format_from_prefix(&sniff_bytes).ok();
 
         if let Some(format) = format {
             if image_format_mime_type(format).is_none() {
@@ -616,6 +624,7 @@ impl MediaCacheWorker {
                 estimated_image_build_bytes(
                     manifest.total_size_bytes,
                     image_dimensions(&sniff_bytes, format).ok(),
+                    Some(format),
                     include_thumbnail,
                     self.media_cache_build_config.image_limits(),
                 ),
@@ -1505,7 +1514,7 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
         Ok(rendered) => rendered,
         Err(error) if is_thumbnail_limit_error(&error) => {
             metadata.status = MediaCacheStatus::Unsupported;
-            metadata.error = Some(error.to_string());
+            metadata.error = Some(format!("{error:#}"));
             return Ok(DerivedMediaCacheArtifact {
                 metadata,
                 thumbnail_payload: None,
@@ -1528,13 +1537,14 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
     })
 }
 
-fn image_format_mime_type(format: ImageFormat) -> Option<&'static str> {
+fn image_format_mime_type(format: MediaImageFormat) -> Option<&'static str> {
     match format {
-        ImageFormat::Bmp => Some("image/bmp"),
-        ImageFormat::Gif => Some("image/gif"),
-        ImageFormat::Jpeg => Some("image/jpeg"),
-        ImageFormat::Png => Some("image/png"),
-        ImageFormat::WebP => Some("image/webp"),
+        MediaImageFormat::Standard(ImageFormat::Bmp) => Some("image/bmp"),
+        MediaImageFormat::Standard(ImageFormat::Gif) => Some("image/gif"),
+        MediaImageFormat::Standard(ImageFormat::Jpeg) => Some("image/jpeg"),
+        MediaImageFormat::Standard(ImageFormat::Png) => Some("image/png"),
+        MediaImageFormat::Standard(ImageFormat::WebP) => Some("image/webp"),
+        MediaImageFormat::Heif => Some("image/heic"),
         _ => None,
     }
 }
@@ -1545,13 +1555,35 @@ pub(crate) fn current_media_cache_metadata(
     metadata.filter(|metadata| metadata.schema_version == MEDIA_CACHE_SCHEMA_VERSION)
 }
 
-fn image_dimensions(payload: &[u8], format: ImageFormat) -> Result<(u32, u32)> {
-    ImageReader::with_format(Cursor::new(payload), format)
-        .into_dimensions()
-        .context("failed to inspect image dimensions")
+fn image_dimensions(payload: &[u8], format: MediaImageFormat) -> Result<(u32, u32)> {
+    match format {
+        MediaImageFormat::Standard(format) => {
+            ImageReader::with_format(Cursor::new(payload), format)
+                .into_dimensions()
+                .context("failed to inspect image dimensions")
+        }
+        MediaImageFormat::Heif => {
+            let dimensions =
+                imagesize::blob_size(payload).context("failed to inspect HEIF image dimensions")?;
+            Ok((
+                u32::try_from(dimensions.width).context("HEIF image width exceeds u32")?,
+                u32::try_from(dimensions.height).context("HEIF image height exceeds u32")?,
+            ))
+        }
+    }
 }
 
-fn guess_image_format<R: Read + Seek>(reader: &mut R) -> Result<ImageFormat> {
+fn image_format_from_prefix(prefix: &[u8]) -> Result<MediaImageFormat> {
+    if let Ok(format) = image::guess_format(prefix) {
+        return Ok(MediaImageFormat::Standard(format));
+    }
+    match imagesize::image_type(prefix) {
+        Ok(SizeImageType::Heif(HeifCompression::Hevc)) => Ok(MediaImageFormat::Heif),
+        _ => bail!("unsupported media format"),
+    }
+}
+
+fn guess_image_format<R: Read + Seek>(reader: &mut R) -> Result<MediaImageFormat> {
     reader
         .seek(SeekFrom::Start(0))
         .context("failed to rewind image input for format detection")?;
@@ -1563,30 +1595,49 @@ fn guess_image_format<R: Read + Seek>(reader: &mut R) -> Result<ImageFormat> {
     reader
         .seek(SeekFrom::Start(0))
         .context("failed to rewind image input after format detection")?;
-    image::guess_format(&prefix).context("unsupported media format")
+    image_format_from_prefix(&prefix)
 }
 
 fn image_dimensions_from_reader<R: BufRead + Seek>(
     reader: &mut R,
-    format: ImageFormat,
+    format: MediaImageFormat,
 ) -> Result<(u32, u32)> {
     reader
         .seek(SeekFrom::Start(0))
         .context("failed to rewind image input for dimension inspection")?;
-    ImageReader::with_format(&mut *reader, format)
-        .into_dimensions()
-        .context("failed to inspect image dimensions")
+    match format {
+        MediaImageFormat::Standard(format) => ImageReader::with_format(&mut *reader, format)
+            .into_dimensions()
+            .context("failed to inspect image dimensions"),
+        MediaImageFormat::Heif => {
+            let dimensions = imagesize::reader_size(&mut *reader)
+                .context("failed to inspect HEIF image dimensions")?;
+            Ok((
+                u32::try_from(dimensions.width).context("HEIF image width exceeds u32")?,
+                u32::try_from(dimensions.height).context("HEIF image height exceeds u32")?,
+            ))
+        }
+    }
 }
 
 fn estimated_image_build_bytes(
     source_size_bytes: usize,
     dimensions: Option<(u32, u32)>,
+    format: Option<MediaImageFormat>,
     include_thumbnail: bool,
     image_limits: &MediaCacheImageLimits,
 ) -> u64 {
     let source_size_bytes = u64::try_from(source_size_bytes).unwrap_or(u64::MAX);
     if !include_thumbnail {
         return source_size_bytes;
+    }
+
+    // Exact HEIF admission depends on embedded-thumbnail and grid metadata that
+    // is not available in the format-sniff prefix. A successful optimized
+    // decode is bounded by max_decode_bytes; the decoder performs the exact
+    // SPS/tile/source/output estimate before allocating pixel buffers.
+    if format == Some(MediaImageFormat::Heif) {
+        return image_limits.max_decode_bytes;
     }
 
     let decode_bytes = dimensions
@@ -1602,18 +1653,25 @@ fn estimated_image_build_bytes(
                     .saturating_mul(IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL),
             )
         });
-
     decode_bytes.max(source_size_bytes)
 }
 
 fn validate_image_decode_limits(
-    format: ImageFormat,
+    format: MediaImageFormat,
     width: u32,
     height: u32,
     profile: ThumbnailProfileSpec,
     image_limits: &MediaCacheImageLimits,
 ) -> Option<String> {
-    let (decode_width, decode_height) = if format == ImageFormat::Jpeg {
+    // HEIF admission is based on the selected embedded thumbnail or the
+    // largest concurrently live grid tile, not the primary canvas. The
+    // thumbnailer validates coded SPS dimensions and its complete peak-memory
+    // estimate immediately before decode.
+    if format == MediaImageFormat::Heif {
+        return None;
+    }
+
+    let (decode_width, decode_height) = if format == MediaImageFormat::Standard(ImageFormat::Jpeg) {
         jpeg_scaled_dimensions(width, height, profile.max_dimension)
     } else {
         (width, height)
@@ -1659,7 +1717,7 @@ fn jpeg_scaled_dimensions(width: u32, height: u32, target: u32) -> (u32, u32) {
 
 fn render_thumbnail_from_reader<R: BufRead + Seek>(
     reader: &mut R,
-    format: ImageFormat,
+    format: MediaImageFormat,
     orientation: Option<u16>,
     profile: ThumbnailProfileSpec,
     image_limits: &MediaCacheImageLimits,
@@ -1687,6 +1745,12 @@ fn render_thumbnail_from_reader<R: BufRead + Seek>(
         .pop()
         .context("thumbnail generator returned no image")?
         .into_image();
+    // berry-thumbnailer normalizes HEIF container transforms and falls back
+    // to embedded EXIF orientation, so applying it again would rotate twice.
+    let orientation = match format {
+        MediaImageFormat::Heif => None,
+        MediaImageFormat::Standard(_) => orientation,
+    };
     encode_thumbnail(image, orientation, profile)
 }
 
@@ -1945,6 +2009,30 @@ mod tests {
         payload
     }
 
+    fn sample_heic_bytes() -> Vec<u8> {
+        // Lossless x265 grid fixture generated from the permissively licensed
+        // heif-oxide test bitstream.
+        let hex: String = include_str!("../../testdata/test-grid.heic.hex")
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn sample_exif_oriented_heic_bytes() -> Vec<u8> {
+        let hex: String = include_str!("../../testdata/test-exif-orientation.heic.hex")
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
     fn media_cache_build_config_scales_permits_by_source_size() {
         let config = MediaCacheBuildConfig {
@@ -2014,6 +2102,104 @@ mod tests {
     }
 
     #[test]
+    fn derive_image_media_cache_supports_oriented_heic_grids() {
+        let payload = sample_heic_bytes();
+
+        let derived = derive_image_media_cache(
+            "manifest",
+            "fingerprint",
+            payload.len(),
+            &payload,
+            true,
+            &MediaCacheImageLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(derived.metadata.status, MediaCacheStatus::Ready);
+        assert_eq!(derived.metadata.mime_type.as_deref(), Some("image/heic"));
+        assert_eq!(
+            (derived.metadata.width, derived.metadata.height),
+            (Some(50), Some(100))
+        );
+        assert_eq!(derived.metadata.orientation, None);
+        let thumbnail = derived.metadata.thumbnail.unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (128, 256));
+        assert!(derived.thumbnail_payload.is_some());
+    }
+
+    #[test]
+    fn derive_image_media_cache_supports_exif_oriented_heic_grids() {
+        let payload = sample_exif_oriented_heic_bytes();
+
+        let derived = derive_image_media_cache(
+            "manifest",
+            "fingerprint",
+            payload.len(),
+            &payload,
+            true,
+            &MediaCacheImageLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(derived.metadata.status, MediaCacheStatus::Ready);
+        assert_eq!(derived.metadata.mime_type.as_deref(), Some("image/heic"));
+        assert_eq!(
+            (derived.metadata.width, derived.metadata.height),
+            (Some(100), Some(50))
+        );
+        assert_eq!(derived.metadata.orientation, Some(6));
+        let thumbnail = derived.metadata.thumbnail.unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (128, 256));
+        assert!(derived.thumbnail_payload.is_some());
+    }
+
+    #[test]
+    fn heic_codestream_limit_is_reported_as_unsupported_media() {
+        let payload = sample_heic_bytes();
+        let image_limits = MediaCacheImageLimits {
+            max_dimension: 12_288,
+            max_pixels: 40_000_000,
+            max_decode_bytes: 150_000,
+        };
+
+        let derived = derive_image_media_cache(
+            "manifest",
+            "fingerprint",
+            payload.len(),
+            &payload,
+            true,
+            &image_limits,
+        )
+        .unwrap();
+
+        assert_eq!(derived.metadata.status, MediaCacheStatus::Unsupported);
+        assert!(derived.metadata.thumbnail.is_none());
+        assert!(derived.thumbnail_payload.is_none());
+        assert!(
+            derived
+                .metadata
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("target-sized HEIF decode")
+        );
+    }
+
+    #[test]
+    fn heif_primary_canvas_does_not_preempt_optimized_decoder_admission() {
+        assert_eq!(
+            validate_image_decode_limits(
+                MediaImageFormat::Heif,
+                60_000,
+                20_000,
+                grid_thumbnail_profile(),
+                &MediaCacheImageLimits::default(),
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn baseline_jpeg_uses_scaled_decode_instead_of_full_source_limits() {
         let payload = sample_wide_jpeg_bytes();
         let image_limits = MediaCacheImageLimits {
@@ -2052,7 +2238,7 @@ mod tests {
             max_decode_bytes: 256 * 1024 * 1024,
         };
         let error = validate_image_decode_limits(
-            ImageFormat::Jpeg,
+            MediaImageFormat::Standard(ImageFormat::Jpeg),
             u16::MAX.into(),
             u16::MAX.into(),
             profile,
@@ -2081,10 +2267,27 @@ mod tests {
         };
 
         assert_eq!(
-            estimated_image_build_bytes(32 * 1024, None, true, &image_limits),
+            estimated_image_build_bytes(32 * 1024, None, None, true, &image_limits),
             image_limits
                 .max_decode_bytes
                 .max(image_limits.max_pixels * IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL)
+        );
+    }
+
+    #[test]
+    fn estimated_image_build_bytes_reserves_the_heif_decoder_budget() {
+        let source_size = 3 * 1024 * 1024;
+        let dimensions = (4_032, 3_024);
+
+        assert_eq!(
+            estimated_image_build_bytes(
+                source_size,
+                Some(dimensions),
+                Some(MediaImageFormat::Heif),
+                true,
+                &MediaCacheImageLimits::default(),
+            ),
+            MediaCacheImageLimits::default().max_decode_bytes
         );
     }
 }
