@@ -147,6 +147,7 @@ pub(crate) fn should_log_admission_event(events_total: u64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcceptErrorClass {
     Interrupted,
+    #[cfg(unix)]
     DescriptorExhaustion,
     Other,
 }
