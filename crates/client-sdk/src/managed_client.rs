@@ -14,8 +14,8 @@ use crate::connection::{
 };
 use crate::{
     ClientConnectionDiagnosticImpact, ClientConnectionRouteEndpointSnapshot,
-    ClientConnectionRouteSnapshot, ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
-    PlannedConnectionBootstrapTarget,
+    ClientConnectionRouteSnapshot, ClientIdentityMaterial, ClientRouteMaintenancePolicy,
+    ConnectionBootstrap, IronMeshClient, PlannedConnectionBootstrapTarget,
 };
 
 const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
@@ -76,6 +76,9 @@ pub struct ManagedClientOptions {
     /// Lets a caller forward an all-route transport failure without duplicating
     /// discovery or fallback policy in a platform wrapper.
     pub refresh_on_transport_failure: bool,
+    /// Synthetic route-health maintenance performed by the shared transport
+    /// router. Real requests and failover are not delayed by this policy.
+    pub route_maintenance_policy: ClientRouteMaintenancePolicy,
     /// Optional durable storage for authenticated cluster-managed Rendezvous
     /// contact-list updates.
     pub connection_bootstrap_persistence: Option<ManagedBootstrapPersistence>,
@@ -88,7 +91,22 @@ impl Default for ManagedClientOptions {
             discovery_ttl: Duration::from_secs(2 * 60),
             route_retirement_grace: Duration::from_secs(10 * 60),
             refresh_on_transport_failure: true,
+            route_maintenance_policy: ClientRouteMaintenancePolicy::default(),
             connection_bootstrap_persistence: None,
+        }
+    }
+}
+
+impl ManagedClientOptions {
+    /// Conservative maintenance cadence for long-running mobile background work.
+    pub fn mobile_background() -> Self {
+        Self {
+            discovery_ttl: Duration::from_secs(15 * 60),
+            // Preserve the default policy's five-refresh tolerance even though
+            // the low-priority background discovery cadence is much longer.
+            route_retirement_grace: Duration::from_secs(75 * 60),
+            route_maintenance_policy: ClientRouteMaintenancePolicy::mobile_background(),
+            ..Self::default()
         }
     }
 }
@@ -260,6 +278,7 @@ impl ConnectionBootstrap {
         }
         let client = self
             .build_client_with_optional_identity(identity.as_ref())?
+            .with_route_maintenance_policy(options.route_maintenance_policy)
             .with_connection_diagnostic_impact(
                 ClientConnectionDiagnosticImpact::BackgroundMaintenance,
             );
@@ -1150,6 +1169,18 @@ mod tests {
         assert_eq!(
             ManagedClientOptions::default().discovery_ttl,
             Duration::from_secs(2 * 60)
+        );
+    }
+
+    #[test]
+    fn mobile_background_options_bound_route_maintenance() {
+        let options = ManagedClientOptions::mobile_background();
+
+        assert_eq!(options.discovery_ttl, Duration::from_secs(15 * 60));
+        assert_eq!(options.route_retirement_grace, options.discovery_ttl * 5);
+        assert_eq!(
+            options.route_maintenance_policy,
+            ClientRouteMaintenancePolicy::mobile_background()
         );
     }
 

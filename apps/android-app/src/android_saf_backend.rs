@@ -6,12 +6,12 @@ use common::content_fingerprint::FingerprintingReader;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 use serde::Deserialize;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use sync_agent_core::{
@@ -48,7 +48,85 @@ static ANDROID_SAF_BRIDGE_STATE: OnceLock<AndroidSafBridgeState> = OnceLock::new
 const SAF_SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(750);
 const SAF_SCAN_PROGRESS_ENTRY_STRIDE: u64 = 256;
 const SAF_SCAN_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(150);
-const SAF_LOCAL_CHANGE_POLL_INTERVAL_FLOOR: Duration = Duration::from_millis(500);
+type AndroidSafChangeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+type AndroidSafChangeCallbacks = HashMap<u64, AndroidSafChangeCallback>;
+
+fn android_saf_change_callbacks() -> &'static Mutex<HashMap<String, AndroidSafChangeCallbacks>> {
+    static CALLBACKS: OnceLock<Mutex<HashMap<String, AndroidSafChangeCallbacks>>> = OnceLock::new();
+    CALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_android_saf_change_subscription_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+struct AndroidSafChangeSubscription {
+    tree_uri: String,
+    id: u64,
+}
+
+impl AndroidSafChangeSubscription {
+    fn new(tree_uri: String, callback: AndroidSafChangeCallback) -> Self {
+        let id = next_android_saf_change_subscription_id();
+        android_saf_change_callbacks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(tree_uri.clone())
+            .or_default()
+            .insert(id, callback);
+        Self { tree_uri, id }
+    }
+}
+
+impl Drop for AndroidSafChangeSubscription {
+    fn drop(&mut self) {
+        let mut callbacks = android_saf_change_callbacks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tree_callbacks) = callbacks.get_mut(&self.tree_uri) {
+            tree_callbacks.remove(&self.id);
+            if tree_callbacks.is_empty() {
+                callbacks.remove(&self.tree_uri);
+            }
+        }
+    }
+}
+
+fn notify_android_saf_tree_changed(tree_uri: &str) {
+    let callbacks = android_saf_change_callbacks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(tree_uri)
+        .map(|callbacks| callbacks.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for callback in callbacks {
+        callback();
+    }
+}
+
+/// Receives an event from the Kotlin `ContentObserver` registered for a SAF tree.
+///
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustSafBridge_notifyTreeChanged(
+    mut env: JNIEnv,
+    _class: JClass,
+    tree_uri: JString,
+) {
+    match env.get_string(&tree_uri) {
+        Ok(tree_uri) => {
+            let tree_uri: String = tree_uri.into();
+            notify_android_saf_tree_changed(&tree_uri);
+        }
+        Err(error) => tracing::warn!(
+            error = %error,
+            "failed decoding SAF tree change notification"
+        ),
+    }
+}
 
 fn bridge_state() -> Result<&'static AndroidSafBridgeState> {
     ANDROID_SAF_BRIDGE_STATE
@@ -168,25 +246,6 @@ fn release_tree_observer(tree_uri: &str) -> Result<()> {
     })
 }
 
-fn tree_change_version(tree_uri: &str) -> Result<u64> {
-    with_bridge_env(|env, class| {
-        let j_tree_uri = env
-            .new_string(tree_uri)
-            .context("failed to allocate tree URI string")?;
-        let version = env
-            .call_static_method(
-                &class,
-                "getTreeChangeVersion",
-                "(Ljava/lang/String;)J",
-                &[JValue::Object(j_tree_uri.as_ref())],
-            )
-            .context("RustSafBridge.getTreeChangeVersion failed")?
-            .j()
-            .context("RustSafBridge.getTreeChangeVersion returned invalid value")?;
-        Ok(version.max(0) as u64)
-    })
-}
-
 fn tree_scan_progress(tree_uri: &str) -> Result<Option<AndroidSafTreeScanProgress>> {
     with_bridge_env(|env, class| {
         let j_tree_uri = env
@@ -262,10 +321,8 @@ impl Drop for AndroidSafObserverGuard {
 struct AndroidSafBackend {
     tree_uri: Option<String>,
     observer_guard: Option<AndroidSafObserverGuard>,
-    last_observed_tree_change_version: u64,
     cached_tree_state: Option<LocalTreeState>,
-    local_change_monitor_stop: Option<Arc<AtomicBool>>,
-    local_change_monitor_thread: Option<thread::JoinHandle<()>>,
+    local_change_subscription: Option<AndroidSafChangeSubscription>,
 }
 
 impl AndroidSafBackend {
@@ -310,17 +367,7 @@ impl AndroidSafBackend {
     }
 
     fn stop_local_change_monitor(&mut self) {
-        if let Some(stop) = self.local_change_monitor_stop.take() {
-            stop.store(true, Ordering::SeqCst);
-        }
-        if let Some(thread) = self.local_change_monitor_thread.take() {
-            let _ = thread.join();
-        }
-    }
-
-    fn local_change_poll_interval(options: &FolderAgentRuntimeOptions) -> Duration {
-        Duration::from_millis(options.local_scan_interval_ms)
-            .max(SAF_LOCAL_CHANGE_POLL_INTERVAL_FLOOR)
+        self.local_change_subscription = None;
     }
 }
 
@@ -339,7 +386,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         if options.run_once {
             "not-watching"
         } else {
-            "saf-observer+polling"
+            "saf-observer+fallback-scan"
         }
     }
 
@@ -372,7 +419,6 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         let tree_uri = optional_tree_uri(options)?.to_string();
         self.observer_guard = Some(AndroidSafObserverGuard::new(&tree_uri)?);
         self.tree_uri = Some(tree_uri);
-        self.last_observed_tree_change_version = 0;
         self.clear_cached_tree_state();
         Ok(())
     }
@@ -516,41 +562,18 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
     ) -> Result<()> {
         self.stop_local_change_monitor();
         if options.run_once {
-            self.last_observed_tree_change_version = 0;
             self.clear_cached_tree_state();
             return Ok(());
         }
 
         let tree_uri = self.tree_uri()?.to_string();
-        let observed_version = tree_change_version(&tree_uri).unwrap_or(0);
-        let poll_interval = Self::local_change_poll_interval(options);
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_for_thread = Arc::clone(&stop);
-        let watcher = thread::Builder::new()
-            .name("ironmesh-saf-change-watch".to_string())
-            .spawn(move || {
-                let mut last_seen = observed_version;
-                while !stop_for_thread.load(Ordering::SeqCst) {
-                    thread::sleep(poll_interval);
-                    if stop_for_thread.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let current_version = tree_change_version(&tree_uri).unwrap_or(last_seen);
-                    if current_version != last_seen {
-                        last_seen = current_version;
-                        on_local_change();
-                    }
-                }
-            })
-            .context("failed to spawn SAF local change monitor")?;
-        self.last_observed_tree_change_version = observed_version;
-        self.local_change_monitor_stop = Some(stop);
-        self.local_change_monitor_thread = Some(watcher);
+        self.local_change_subscription =
+            Some(AndroidSafChangeSubscription::new(tree_uri, on_local_change));
         Ok(())
     }
 
     fn local_watch_hints_available(&self, _options: &FolderAgentRuntimeOptions) -> bool {
-        self.local_change_monitor_thread.is_some()
+        self.local_change_subscription.is_some()
     }
 }
 
@@ -962,6 +985,7 @@ fn download_remote_file_to_saf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn file_entry(size_bytes: u64) -> LocalEntryState {
         LocalEntryState {
@@ -1002,5 +1026,41 @@ mod tests {
         backend.remember_cached_entry_state("notes/todo.txt", &entry);
 
         assert_eq!(backend.cached_entry_state("notes/todo.txt"), Some(entry));
+    }
+
+    #[test]
+    fn saf_change_subscriptions_fan_out_and_unregister() {
+        let tree_uri = "content://ironmesh.test/tree/callbacks".to_string();
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let second_count = Arc::new(AtomicUsize::new(0));
+        let first_subscription = AndroidSafChangeSubscription::new(tree_uri.clone(), {
+            let first_count = Arc::clone(&first_count);
+            Arc::new(move || {
+                first_count.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        let second_subscription = AndroidSafChangeSubscription::new(tree_uri.clone(), {
+            let second_count = Arc::clone(&second_count);
+            Arc::new(move || {
+                second_count.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+
+        notify_android_saf_tree_changed(&tree_uri);
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 1);
+
+        drop(first_subscription);
+        notify_android_saf_tree_changed(&tree_uri);
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 2);
+
+        drop(second_subscription);
+        assert!(
+            !android_saf_change_callbacks()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&tree_uri)
+        );
     }
 }

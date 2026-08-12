@@ -38,6 +38,9 @@ object RustSafBridge {
     }
 
     @JvmStatic
+    private external fun notifyTreeChanged(treeUriString: String)
+
+    @JvmStatic
     fun listTreeSnapshot(treeUriString: String): String {
         val resolver = requireResolver()
         val treeUri = Uri.parse(treeUriString)
@@ -78,8 +81,11 @@ object RustSafBridge {
     fun prepareTreeObserver(treeUriString: String) {
         val resolver = requireResolver()
         synchronized(observerLock) {
-            treeObservers.getOrPut(treeUriString) {
-                TreeObserverState(treeUriString, resolver)
+            val existing = treeObservers[treeUriString]
+            if (existing != null) {
+                existing.retain()
+            } else {
+                treeObservers[treeUriString] = TreeObserverState(treeUriString, resolver)
             }
         }
     }
@@ -87,10 +93,18 @@ object RustSafBridge {
     @JvmStatic
     fun releaseTreeObserver(treeUriString: String) {
         synchronized(observerLock) {
-            treeObservers.remove(treeUriString)?.close()
+            val observer = treeObservers[treeUriString] ?: return
+            if (observer.release()) {
+                treeObservers.remove(treeUriString)
+                observer.close()
+            }
         }
     }
 
+    /**
+     * Exposes observer delivery to instrumentation tests. Runtime sync uses the
+     * push-based native callback and never polls this counter.
+     */
     @JvmStatic
     fun getTreeChangeVersion(treeUriString: String): Long {
         synchronized(observerLock) {
@@ -759,6 +773,7 @@ object RustSafBridge {
         private val resolver: ContentResolver,
     ) {
         val version = AtomicLong(0L)
+        private var leaseCount = 1
         private val handler = Handler(Looper.getMainLooper())
         private val observers = linkedMapOf<String, ContentObserver>()
 
@@ -777,18 +792,32 @@ object RustSafBridge {
                 }
                 val observer = object : ContentObserver(handler) {
                     override fun onChange(selfChange: Boolean) {
-                        version.incrementAndGet()
-                        invalidateTreeCache(treeUriString)
+                        recordChange()
                     }
 
                     override fun onChange(selfChange: Boolean, uri: Uri?) {
-                        version.incrementAndGet()
-                        invalidateTreeCache(treeUriString)
+                        recordChange()
                     }
                 }
                 resolver.registerContentObserver(uri, false, observer)
                 observers[uriString] = observer
             }
+        }
+
+        fun retain() {
+            leaseCount++
+        }
+
+        fun release(): Boolean {
+            leaseCount--
+            return leaseCount == 0
+        }
+
+        private fun recordChange() {
+            version.incrementAndGet()
+            invalidateTreeCache(treeUriString)
+            runCatching { notifyTreeChanged(treeUriString) }
+                .onFailure { error -> Log.w(TAG, "Failed forwarding SAF tree change", error) }
         }
 
         fun close() {

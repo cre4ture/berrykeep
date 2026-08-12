@@ -436,6 +436,25 @@ fn first_background_probe_gets_startup_budget_but_retries_keep_short_budget() {
 }
 
 #[test]
+fn mobile_background_policy_claims_one_candidate_per_batch() {
+    let client = IronMeshClient::combine(vec![
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/"),
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18081/"),
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18082/"),
+    ])
+    .expect("routes should combine")
+    .with_route_maintenance_policy(ClientRouteMaintenancePolicy::mobile_background());
+
+    let first_batch = client.transport_router.claim_background_probe_candidates();
+    let second_batch = client.transport_router.claim_background_probe_candidates();
+
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0].sampling.warmup_count, 0);
+    assert_eq!(first_batch[0].sampling.sample_count, 1);
+    assert!(second_batch.is_empty());
+}
+
+#[test]
 fn completed_probe_does_not_update_replaced_endpoint_with_same_route_key() {
     let static_route = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
     let dynamic_route = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18081/");

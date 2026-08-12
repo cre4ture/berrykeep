@@ -46,10 +46,13 @@ pub struct FolderAgentRuntimeOptions {
     pub server_ca_pem: Option<String>,
     pub client_identity_json: Option<String>,
     pub persist_client_identity: Option<FolderAgentClientIdentityPersistence>,
+    pub managed_client_options: ManagedClientOptions,
     pub prefix: Option<String>,
     pub depth: usize,
     pub remote_refresh_interval_ms: u64,
+    pub remote_notification_wait_timeout_ms: u64,
     pub local_scan_interval_ms: u64,
+    pub local_watch_fallback_scan_interval_ms: u64,
     pub no_watch_local: bool,
     pub run_once: bool,
     pub ui_bind: Option<String>,
@@ -1136,7 +1139,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
 
     let refresh_interval = Duration::from_millis(options.remote_refresh_interval_ms.max(250));
 
-    let refresh_poller = RemoteSnapshotPoller::prefer_server_notifications(refresh_interval);
+    let notification_wait_timeout = remote_notification_wait_timeout(options);
+    let refresh_poller =
+        RemoteSnapshotPoller::server_notifications(notification_wait_timeout, refresh_interval);
     let refresh_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope);
     let latest_metrics = Arc::new(Mutex::new(initial_runtime_metrics.clone()));
     store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
@@ -1646,8 +1651,10 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<ConfiguredFo
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
         }
 
-        let managed_client = bootstrap
-            .build_managed_client_blocking(client_identity, ManagedClientOptions::default())?;
+        let managed_client = bootstrap.build_managed_client_blocking(
+            client_identity,
+            options.managed_client_options.clone(),
+        )?;
         if let Some(identity) = managed_client.latest_identity_update()
             && let Some(persist_client_identity) = options.persist_client_identity
         {
@@ -2571,7 +2578,16 @@ enum LocalScanTrigger {
 
 const LOCAL_SCAN_INTERVAL_FLOOR: Duration = Duration::from_millis(250);
 const WATCH_LOCAL_FALLBACK_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+const REMOTE_NOTIFICATION_WAIT_TIMEOUT_FLOOR: Duration = Duration::from_secs(2);
+const REMOTE_NOTIFICATION_WAIT_TIMEOUT_CEILING: Duration = Duration::from_secs(60);
 const IDLE_STOP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+fn remote_notification_wait_timeout(options: &FolderAgentRuntimeOptions) -> Duration {
+    Duration::from_millis(options.remote_notification_wait_timeout_ms).clamp(
+        REMOTE_NOTIFICATION_WAIT_TIMEOUT_FLOOR,
+        REMOTE_NOTIFICATION_WAIT_TIMEOUT_CEILING,
+    )
+}
 
 fn watch_mode_label(
     options: &FolderAgentRuntimeOptions,
@@ -2595,7 +2611,10 @@ fn steady_state_local_scan_interval(
     let configured =
         Duration::from_millis(options.local_scan_interval_ms).max(LOCAL_SCAN_INTERVAL_FLOOR);
     if watch_hints_available && !options.no_watch_local {
-        configured.max(WATCH_LOCAL_FALLBACK_SCAN_INTERVAL)
+        let watch_fallback_interval =
+            Duration::from_millis(options.local_watch_fallback_scan_interval_ms)
+                .max(WATCH_LOCAL_FALLBACK_SCAN_INTERVAL);
+        configured.max(watch_fallback_interval)
     } else {
         configured
     }
@@ -3369,10 +3388,13 @@ mod tests {
             server_ca_pem: None,
             client_identity_json: None,
             persist_client_identity: None,
+            managed_client_options: ManagedClientOptions::default(),
             prefix: None,
             depth: 0,
             remote_refresh_interval_ms: 1000,
+            remote_notification_wait_timeout_ms: 2_000,
             local_scan_interval_ms: 1000,
+            local_watch_fallback_scan_interval_ms: 60_000,
             no_watch_local: true,
             run_once: true,
             ui_bind: None,
@@ -3402,6 +3424,42 @@ mod tests {
         assert_eq!(
             steady_state_local_scan_interval(&options, true),
             WATCH_LOCAL_FALLBACK_SCAN_INTERVAL
+        );
+    }
+
+    #[test]
+    fn steady_state_local_scan_interval_honors_longer_watch_fallback() {
+        let mut options = test_runtime_options();
+        options.run_once = false;
+        options.no_watch_local = false;
+        options.local_scan_interval_ms = 2_000;
+        options.local_watch_fallback_scan_interval_ms = 30 * 60 * 1_000;
+
+        assert_eq!(
+            steady_state_local_scan_interval(&options, true),
+            Duration::from_secs(30 * 60)
+        );
+    }
+
+    #[test]
+    fn remote_notification_wait_timeout_is_bounded_by_server_contract() {
+        let mut options = test_runtime_options();
+        options.remote_notification_wait_timeout_ms = 55_000;
+        assert_eq!(
+            remote_notification_wait_timeout(&options),
+            Duration::from_secs(55)
+        );
+
+        options.remote_notification_wait_timeout_ms = 1;
+        assert_eq!(
+            remote_notification_wait_timeout(&options),
+            REMOTE_NOTIFICATION_WAIT_TIMEOUT_FLOOR
+        );
+
+        options.remote_notification_wait_timeout_ms = 120_000;
+        assert_eq!(
+            remote_notification_wait_timeout(&options),
+            REMOTE_NOTIFICATION_WAIT_TIMEOUT_CEILING
         );
     }
 

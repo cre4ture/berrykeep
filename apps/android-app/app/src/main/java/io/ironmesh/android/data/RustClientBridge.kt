@@ -125,6 +125,9 @@ object RustClientBridge {
     ): String
 
     @JvmStatic
+    external fun stopTitleLatencyMonitor()
+
+    @JvmStatic
     external fun getTitleLatencyStatus(): String
 
     @JvmStatic

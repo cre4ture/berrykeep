@@ -418,6 +418,10 @@ class IronmeshRepository {
         )
     }
 
+    fun stopTitleLatencyMonitor() {
+        RustClientBridge.stopTitleLatencyMonitor()
+    }
+
     fun getTitleLatencyStatus(): TitleLatencyProbeStatus {
         return decodeJson(
             RustClientBridge.getTitleLatencyStatus(),

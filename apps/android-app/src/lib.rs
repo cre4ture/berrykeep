@@ -575,6 +575,10 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 const ANDROID_CONNECTION_LOG_TARGET: &str = "ironmesh_android_connection";
 const ANDROID_WEBVIEW_LOG_TARGET: &str = "ironmesh_android_webview";
+const ANDROID_FOLDER_SYNC_REMOTE_FALLBACK_INTERVAL_MS: u64 = 60_000;
+const ANDROID_FOLDER_SYNC_REMOTE_NOTIFICATION_WAIT_MS: u64 = 55_000;
+const ANDROID_FOLDER_SYNC_LOCAL_SCAN_INTERVAL_MS: u64 = 2_000;
+const ANDROID_FOLDER_SYNC_LOCAL_WATCH_FALLBACK_INTERVAL_MS: u64 = 30 * 60 * 1_000;
 const MAX_EMBEDDED_WEB_UI_DIAGNOSTIC_LENGTH: usize = 1_024;
 
 /// # Safety
@@ -2201,6 +2205,11 @@ fn android_title_latency_monitor() -> &'static Mutex<TitleLatencyMonitor> {
     MONITOR.get_or_init(|| Mutex::new(TitleLatencyMonitor::disabled()))
 }
 
+fn android_title_latency_configuration_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn configure_android_title_latency_monitor(
     connection_input: String,
     server_ca_pem: Option<String>,
@@ -2208,6 +2217,9 @@ fn configure_android_title_latency_monitor(
     enabled: bool,
     period_seconds: u64,
 ) -> Result<String> {
+    let _configuration_guard = android_title_latency_configuration_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let config = TitleLatencyProbeConfig {
         enabled,
         period_seconds,
@@ -2234,6 +2246,15 @@ fn android_title_latency_status_json() -> Result<String> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .status();
     serde_json::to_string(&status).context("failed to serialize Android title latency status")
+}
+
+fn stop_android_title_latency_monitor() {
+    let _configuration_guard = android_title_latency_configuration_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *android_title_latency_monitor()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = TitleLatencyMonitor::disabled();
 }
 
 fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>> {
@@ -2371,6 +2392,17 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_con
             std::ptr::null_mut()
         }
     }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_stopTitleLatencyMonitor(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    stop_android_title_latency_monitor();
 }
 
 /// # Safety
@@ -3124,10 +3156,14 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
             server_ca_pem,
             client_identity_json,
             persist_client_identity: Some(persist_android_client_identity),
+            managed_client_options: ManagedClientOptions::default(),
             prefix,
             depth: usize::try_from(depth).unwrap_or(1).max(1),
-            remote_refresh_interval_ms: 3_000,
-            local_scan_interval_ms: 2_000,
+            remote_refresh_interval_ms: ANDROID_FOLDER_SYNC_REMOTE_FALLBACK_INTERVAL_MS,
+            remote_notification_wait_timeout_ms: ANDROID_FOLDER_SYNC_REMOTE_NOTIFICATION_WAIT_MS,
+            local_scan_interval_ms: ANDROID_FOLDER_SYNC_LOCAL_SCAN_INTERVAL_MS,
+            local_watch_fallback_scan_interval_ms:
+                ANDROID_FOLDER_SYNC_LOCAL_WATCH_FALLBACK_INTERVAL_MS,
             no_watch_local: true,
             run_once: true,
             ui_bind: None,
@@ -3194,10 +3230,14 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
             server_ca_pem,
             client_identity_json,
             persist_client_identity: Some(persist_android_client_identity),
+            managed_client_options: ManagedClientOptions::mobile_background(),
             prefix,
             depth: usize::try_from(depth).unwrap_or(1).max(1),
-            remote_refresh_interval_ms: 3_000,
-            local_scan_interval_ms: 2_000,
+            remote_refresh_interval_ms: ANDROID_FOLDER_SYNC_REMOTE_FALLBACK_INTERVAL_MS,
+            remote_notification_wait_timeout_ms: ANDROID_FOLDER_SYNC_REMOTE_NOTIFICATION_WAIT_MS,
+            local_scan_interval_ms: ANDROID_FOLDER_SYNC_LOCAL_SCAN_INTERVAL_MS,
+            local_watch_fallback_scan_interval_ms:
+                ANDROID_FOLDER_SYNC_LOCAL_WATCH_FALLBACK_INTERVAL_MS,
             no_watch_local: false,
             run_once: false,
             ui_bind: None,
