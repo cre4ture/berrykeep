@@ -39,7 +39,7 @@ runs:
         targets: aarch64-linux-android,x86_64-linux-android
 
     - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.10
+      uses: ./.github/actions/setup-sccache
 
     - name: Cache cargo registry and build artifacts
       uses: Swatinem/rust-cache@v2

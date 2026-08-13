@@ -92,6 +92,9 @@ Pull request jobs restore the shared Rust caches but do not write them:
 - sccache keeps `SCCACHE_GHA_ENABLED=true` and sets
   `SCCACHE_GHA_RW_MODE=READ_ONLY` for pull requests, so compiler artifacts
   already cached on `main` remain available;
+- sccache installation is best-effort: if its release download is unavailable,
+  the shared setup action clears `RUSTC_WRAPPER` and jobs continue without the
+  compiler cache;
 - every `Swatinem/rust-cache` path, including the shared Android composite
   action, uses `save-if: ${{ github.event_name != 'pull_request' }}`.
 - the Focal ARM64 package build restores its mounted on-disk sccache with

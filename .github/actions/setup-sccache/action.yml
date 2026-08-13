@@ -1,0 +1,18 @@
+name: Setup optional sccache
+description: Install sccache when available and fall back to uncached Rust builds
+
+runs:
+  using: composite
+  steps:
+    - name: Install sccache
+      id: install
+      continue-on-error: true
+      uses: mozilla-actions/sccache-action@v0.0.10
+
+    - name: Fall back to uncached Rust builds
+      if: ${{ steps.install.outcome != 'success' }}
+      shell: bash
+      run: |
+        echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+        echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+        echo "::warning::sccache setup failed; continuing without compiler caching"
