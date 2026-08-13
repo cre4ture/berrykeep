@@ -1698,6 +1698,28 @@ async fn ensure_direct_quic_endpoint(
         relay_ticket_lease,
     };
     let mut guard = endpoint.lock().await;
+    if context.retired.load(Ordering::Acquire) {
+        drop(guard);
+        drop(managed_endpoint);
+        let retired_lease = setup_identity
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|identity| identity.relay_ticket_lease.take());
+        if let Some(lease) = retired_lease
+            && let Err(error) = lease
+                .release_now("route_removed_before_endpoint_install")
+                .await
+        {
+            tracing::warn!(
+                endpoint_id = %lease.endpoint_id(),
+                %error,
+                "failed releasing iroh relay lease rejected at endpoint installation"
+            );
+        }
+        set_configured_iroh_relay_urls(stats, std::iter::empty());
+        bail!("direct QUIC route was retired before endpoint installation");
+    }
     if let Some(existing) = guard.as_ref() {
         return Ok(existing.endpoint.clone());
     }
