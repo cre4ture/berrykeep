@@ -52,6 +52,18 @@ pub struct RelayTicket {
     pub expires_at_unix: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayTicketReleaseRequest {
+    pub cluster_id: ClusterId,
+    pub source: PeerIdentity,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayTicketReleaseResponse {
+    pub released: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +137,18 @@ impl RelayTicket {
         }
         if self.expires_at_unix <= self.issued_at_unix {
             bail!("relay ticket expires_at_unix must be greater than issued_at_unix");
+        }
+        Ok(())
+    }
+}
+
+impl RelayTicketReleaseRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.cluster_id.is_nil() {
+            bail!("relay ticket release must include a non-nil cluster_id");
+        }
+        if self.session_id.trim().is_empty() {
+            bail!("relay ticket release must include a session_id");
         }
         Ok(())
     }

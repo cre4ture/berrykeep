@@ -1,7 +1,4 @@
-use std::future::Future;
-use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -218,60 +215,6 @@ where
                 .insert(MaybeObservedPeerAddr(Some(observed_peer_addr)));
         }
         self.inner.call(req)
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct MtlsAuthenticatedPeerAcceptor {
-    inner: axum_server::tls_rustls::RustlsAcceptor,
-}
-
-impl MtlsAuthenticatedPeerAcceptor {
-    pub(crate) fn new(config: axum_server::tls_rustls::RustlsConfig) -> Self {
-        Self {
-            inner: axum_server::tls_rustls::RustlsAcceptor::new(config),
-        }
-    }
-}
-
-impl<S> axum_server::accept::Accept<tokio::net::TcpStream, S> for MtlsAuthenticatedPeerAcceptor
-where
-    axum_server::tls_rustls::RustlsAcceptor: axum_server::accept::Accept<
-            tokio::net::TcpStream,
-            S,
-            Stream = TlsStream<tokio::net::TcpStream>,
-        >,
-    <axum_server::tls_rustls::RustlsAcceptor as axum_server::accept::Accept<
-        tokio::net::TcpStream,
-        S,
-    >>::Service: Send + 'static,
-    <axum_server::tls_rustls::RustlsAcceptor as axum_server::accept::Accept<
-        tokio::net::TcpStream,
-        S,
-    >>::Future: Send + 'static,
-    S: Send + 'static,
-{
-    type Stream = TlsStream<tokio::net::TcpStream>;
-    type Service = WithAuthenticatedPeer<
-        <axum_server::tls_rustls::RustlsAcceptor as axum_server::accept::Accept<
-            tokio::net::TcpStream,
-            S,
-        >>::Service,
-    >;
-    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
-
-    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
-        let observed_peer_addr = stream.peer_addr().ok();
-        let fut = self.inner.accept(stream, service);
-        Box::pin(async move {
-            let (tls_stream, service) = fut.await?;
-            let authenticated_peer = authenticated_peer_from_tls_stream(&tls_stream)
-                .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
-            Ok((
-                tls_stream,
-                WithAuthenticatedPeer::new(service, authenticated_peer, observed_peer_addr),
-            ))
-        })
     }
 }
 

@@ -1,11 +1,14 @@
+mod admission;
 mod auth;
 mod cluster_registry;
 mod global_registration;
 mod iroh_relay;
 
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -13,25 +16,27 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::http::Uri;
-use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL};
+use axum::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, RETRY_AFTER};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use common::{ClusterId, DeviceId, NodeId};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use transport_sdk::peer::PeerIdentity;
 use transport_sdk::rendezvous::{
-    DiscoveryResponse, IrohRelayAdvertisement, IrohRelayTicket, IrohRelayTicketRequest,
-    PresenceListResponse, PresenceRegistration, RegisterPresenceResponse, RendezvousClientConfig,
+    DiscoveryResponse, IrohRelayAdvertisement, IrohRelayTicket, IrohRelayTicketReleaseRequest,
+    IrohRelayTicketReleaseResponse, IrohRelayTicketRequest, PresenceListResponse,
+    PresenceRegistration, RegisterPresenceResponse, RendezvousClientConfig,
     RendezvousControlClient, RendezvousRuntimeState,
 };
 use transport_sdk::{
     BufferedTransportRequest, CandidateKind, ClientBootstrapClaimRedeemRequest,
     ClientBootstrapClaimRedeemResponse, ConnectionCandidate, MultiplexConfig, MultiplexMode,
-    PresenceRegistry, RelayTicket, RelayTicketRequest, RelayTunnelBroker,
-    RelayTunnelControlMessage, RelayTunnelFrame, RelayTunnelPairingTiming, RelayTunnelSessionKind,
-    RelayWakeControlMessage, RelayWakeRegistration, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
+    PresenceRegistry, RelayTicket, RelayTicketReleaseRequest, RelayTicketReleaseResponse,
+    RelayTicketRequest, RelayTunnelBroker, RelayTunnelControlMessage, RelayTunnelFrame,
+    RelayTunnelPairingTiming, RelayTunnelSessionKind, RelayWakeControlMessage,
+    RelayWakeRegistration, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
     TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
     WakeRegistrationHandle, issue_relay_ticket as issue_runtime_relay_ticket,
     perform_transport_client_handshake, rank_candidates, read_buffered_transport_response,
@@ -39,13 +44,14 @@ use transport_sdk::{
 };
 
 use crate::auth::{
-    MaybeAuthenticatedPeer, MaybeObservedPeerAddr, MtlsAuthenticatedPeerAcceptor,
-    authenticated_peer_cluster, build_mtls_rustls_config, ensure_authenticated_peer_cluster,
+    MaybeAuthenticatedPeer, MaybeObservedPeerAddr, authenticated_peer_cluster,
+    build_mtls_rustls_config, ensure_authenticated_peer_cluster,
     ensure_authenticated_peer_identity, require_any_authenticated_peer,
 };
 use crate::global_registration::GlobalRegistrationState;
 use crate::iroh_relay::IrohRelayRuntime;
 
+pub use crate::admission::RendezvousAdmissionConfig;
 pub use crate::auth::GlobalClusterClientCertVerifier;
 pub use crate::cluster_registry::{ClusterCaRecord, ClusterCaRegistry, cluster_ca_fingerprint};
 pub use crate::iroh_relay::{IrohRelayQuicServerConfig, IrohRelayServerConfig};
@@ -191,13 +197,23 @@ pub struct RendezvousAppState {
     pub config: RendezvousServerConfig,
     pub presence: PresenceRegistry,
     pub relay_tunnel: RelayTunnelBroker,
+    relay_ticket_issues: RelayTicketIssueLimiter,
     pub mesh_peers: Option<RendezvousControlClient>,
     pub(crate) global_registration: Option<GlobalRegistrationState>,
+    admission: RendezvousAdmissionConfig,
     iroh_relay: Option<IrohRelayRuntime>,
 }
 
 impl RendezvousAppState {
     pub fn new(config: RendezvousServerConfig) -> Result<Self> {
+        Self::new_with_admission(config, RendezvousAdmissionConfig::default())
+    }
+
+    pub fn new_with_admission(
+        config: RendezvousServerConfig,
+        admission: RendezvousAdmissionConfig,
+    ) -> Result<Self> {
+        admission.validate()?;
         let global_registration = config
             .mtls
             .as_ref()
@@ -212,14 +228,225 @@ impl RendezvousAppState {
             .clone()
             .map(IrohRelayRuntime::new)
             .transpose()?;
+        let relay_ticket_issues = RelayTicketIssueLimiter::new(
+            admission.max_relay_tickets_per_client,
+            admission.max_relay_ticket_issues_per_minute,
+        );
         Ok(Self {
             mesh_peers: build_mesh_probe_client(&config)?,
             config,
             presence: PresenceRegistry::new(),
             relay_tunnel: RelayTunnelBroker::new(),
+            relay_ticket_issues,
             global_registration,
+            admission,
             iroh_relay,
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RelayTicketClientKey {
+    cluster_id: ClusterId,
+    source: PeerIdentity,
+}
+
+#[derive(Clone)]
+struct OutstandingRelayTicket {
+    ticket: RelayTicket,
+}
+
+#[derive(Default)]
+struct RelayTicketIssueState {
+    outstanding: HashMap<RelayTicketClientKey, Vec<OutstandingRelayTicket>>,
+    issue_history: HashMap<RelayTicketClientKey, VecDeque<u64>>,
+    active_connections: HashMap<RelayTicketClientKey, usize>,
+}
+
+#[derive(Clone)]
+struct RelayTicketIssueLimiter {
+    state: Arc<Mutex<RelayTicketIssueState>>,
+    max_allocations_per_client: usize,
+    max_issues_per_minute: usize,
+}
+
+impl RelayTicketIssueLimiter {
+    fn new(max_allocations_per_client: usize, max_issues_per_minute: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RelayTicketIssueState::default())),
+            max_allocations_per_client,
+            max_issues_per_minute,
+        }
+    }
+
+    fn issue(
+        &self,
+        request: RelayTicketRequest,
+        relay_urls: &[String],
+        now_unix: u64,
+    ) -> std::result::Result<RelayTicket, TicketApiError> {
+        let client = RelayTicketClientKey {
+            cluster_id: request.cluster_id,
+            source: request.source.clone(),
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune(&mut state, now_unix);
+        let outstanding = state.outstanding.get(&client).map_or(0, Vec::len);
+        let active = state.active_connections.get(&client).copied().unwrap_or(0);
+        let allocated = outstanding.saturating_add(active);
+        if allocated >= self.max_allocations_per_client {
+            let retry_after_secs = state
+                .outstanding
+                .get(&client)
+                .and_then(|tickets| {
+                    tickets
+                        .iter()
+                        .map(|entry| entry.ticket.expires_at_unix)
+                        .min()
+                })
+                .unwrap_or(now_unix.saturating_add(1))
+                .saturating_sub(now_unix)
+                .max(1);
+            return Err(TicketApiError::backpressure(
+                format!(
+                    "relay ticket allocation limit reached ({allocated}/{})",
+                    self.max_allocations_per_client,
+                ),
+                retry_after_secs,
+            ));
+        }
+        let history = state.issue_history.entry(client.clone()).or_default();
+        while history
+            .front()
+            .is_some_and(|issued| issued.saturating_add(60) <= now_unix)
+        {
+            history.pop_front();
+        }
+        if history.len() >= self.max_issues_per_minute {
+            let retry_after_secs = history
+                .front()
+                .copied()
+                .unwrap_or(now_unix)
+                .saturating_add(60)
+                .saturating_sub(now_unix)
+                .max(1);
+            return Err(TicketApiError::backpressure(
+                format!(
+                    "relay ticket issue rate exceeded ({} per minute)",
+                    self.max_issues_per_minute
+                ),
+                retry_after_secs,
+            ));
+        }
+        let ticket = issue_runtime_relay_ticket(request.clone(), relay_urls);
+        ticket
+            .validate()
+            .map_err(|error| TicketApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        history.push_back(now_unix);
+        state
+            .outstanding
+            .entry(client)
+            .or_default()
+            .push(OutstandingRelayTicket {
+                ticket: ticket.clone(),
+            });
+        Ok(ticket)
+    }
+
+    fn consume(&self, ticket: &RelayTicket, now_unix: u64) -> Result<ActiveRelayConnection> {
+        let client = RelayTicketClientKey {
+            cluster_id: ticket.cluster_id,
+            source: ticket.source.clone(),
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune(&mut state, now_unix);
+        let Some(tickets) = state.outstanding.get_mut(&client) else {
+            anyhow::bail!("relay tunnel ticket is unknown, expired, or already consumed");
+        };
+        let Some(index) = tickets
+            .iter()
+            .position(|entry| entry.ticket.session_id == ticket.session_id)
+        else {
+            anyhow::bail!("relay tunnel ticket is unknown, expired, or already consumed");
+        };
+        tickets.swap_remove(index);
+        if tickets.is_empty() {
+            state.outstanding.remove(&client);
+        }
+        *state.active_connections.entry(client.clone()).or_default() += 1;
+        Ok(ActiveRelayConnection {
+            registry: self.clone(),
+            client,
+        })
+    }
+
+    fn release(&self, request: &RelayTicketReleaseRequest, now_unix: u64) -> bool {
+        let client = RelayTicketClientKey {
+            cluster_id: request.cluster_id,
+            source: request.source.clone(),
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune(&mut state, now_unix);
+        let Some(tickets) = state.outstanding.get_mut(&client) else {
+            return false;
+        };
+        let initial_len = tickets.len();
+        tickets.retain(|entry| entry.ticket.session_id != request.session_id);
+        let released = tickets.len() != initial_len;
+        if tickets.is_empty() {
+            state.outstanding.remove(&client);
+        }
+        released
+    }
+
+    fn disconnect(&self, client: &RelayTicketClientKey) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(active) = state.active_connections.get_mut(client) else {
+            return;
+        };
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            state.active_connections.remove(client);
+        }
+    }
+
+    fn prune(state: &mut RelayTicketIssueState, now_unix: u64) {
+        state.outstanding.retain(|_, tickets| {
+            tickets.retain(|entry| entry.ticket.expires_at_unix > now_unix);
+            !tickets.is_empty()
+        });
+        state.issue_history.retain(|_, history| {
+            while history
+                .front()
+                .is_some_and(|issued| issued.saturating_add(60) <= now_unix)
+            {
+                history.pop_front();
+            }
+            !history.is_empty()
+        });
+    }
+}
+
+struct ActiveRelayConnection {
+    registry: RelayTicketIssueLimiter,
+    client: RelayTicketClientKey,
+}
+
+impl Drop for ActiveRelayConnection {
+    fn drop(&mut self) {
+        self.registry.disconnect(&self.client);
     }
 }
 
@@ -245,7 +472,15 @@ pub fn build_router(state: RendezvousAppState) -> Router {
         .route("/control/presence", get(list_presence))
         .route("/control/presence/register", post(register_presence))
         .route("/control/iroh-relay/ticket", post(issue_iroh_relay_ticket))
+        .route(
+            "/control/iroh-relay/ticket/release",
+            delete(release_iroh_relay_ticket),
+        )
         .route("/control/relay/ticket", post(issue_relay_ticket))
+        .route(
+            "/control/relay/ticket/release",
+            delete(release_relay_ticket),
+        )
         .route("/bootstrap-claims/redeem", post(redeem_bootstrap_claim))
         .merge(relay_router);
 
@@ -275,6 +510,7 @@ pub fn build_router(state: RendezvousAppState) -> Router {
 
 pub async fn serve(state: RendezvousAppState) -> Result<()> {
     let bind_addr = state.config.bind_addr;
+    let admission = state.admission;
     let app = build_router(state.clone());
     spawn_mesh_probe_task(state.mesh_peers.clone());
     let relay_service = state.iroh_relay.as_ref().map(IrohRelayRuntime::service);
@@ -295,23 +531,9 @@ pub async fn serve(state: RendezvousAppState) -> Result<()> {
         None
     };
 
-    let result = if let Some(relay_service) = relay_service.as_ref() {
-        iroh_relay::serve_same_port(bind_addr, app, tls_config, relay_service.clone()).await
-    } else if let Some(tls_config) = tls_config {
-        axum_server::bind(bind_addr)
-            .acceptor(MtlsAuthenticatedPeerAcceptor::new(tls_config))
-            .serve(app.into_make_service())
-            .await
-            .map_err(anyhow::Error::from)
-    } else {
-        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .map_err(anyhow::Error::from)
-    };
+    let result =
+        iroh_relay::serve_listener(bind_addr, app, tls_config, relay_service.clone(), admission)
+            .await;
     if let Some(relay_service) = relay_service {
         relay_service.shutdown().await;
     }
@@ -432,7 +654,7 @@ async fn issue_iroh_relay_ticket(
     State(state): State<RendezvousAppState>,
     authenticated_peer: MaybeAuthenticatedPeer,
     Json(request): Json<IrohRelayTicketRequest>,
-) -> std::result::Result<Json<IrohRelayTicket>, (StatusCode, String)> {
+) -> std::result::Result<Json<IrohRelayTicket>, TicketApiError> {
     let started = Instant::now();
     let endpoint_id = request.endpoint_id.clone();
     let cluster_id = request.cluster_id;
@@ -451,18 +673,18 @@ async fn issue_iroh_relay_ticket(
     let result = async {
         request
             .validate()
-            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+            .map_err(|error| TicketApiError::new(StatusCode::BAD_REQUEST, error))?;
         require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
-            .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+            .map_err(|error| TicketApiError::new(StatusCode::UNAUTHORIZED, error))?;
         ensure_authenticated_peer_cluster(
             state.config.mtls.is_some(),
             &authenticated_peer,
             request.cluster_id,
             "iroh relay ticket request",
         )
-        .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+        .map_err(|error| TicketApiError::new(StatusCode::UNAUTHORIZED, error))?;
         let runtime = state.iroh_relay.as_ref().ok_or_else(|| {
-            (
+            TicketApiError::message(
                 StatusCode::NOT_FOUND,
                 "embedded iroh relay is disabled".to_string(),
             )
@@ -473,8 +695,16 @@ async fn issue_iroh_relay_ticket(
             .map(|authenticated| authenticated.identity.clone());
         let ticket = runtime
             .issue_ticket(request.cluster_id, peer, &request.endpoint_id)
-            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-        Ok::<_, (StatusCode, String)>(Json(ticket))
+            .map_err(|error| TicketApiError {
+                status: if error.retry_after_secs > 0 {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                message: error.message,
+                retry_after_secs: (error.retry_after_secs > 0).then_some(error.retry_after_secs),
+            })?;
+        Ok::<_, TicketApiError>(Json(ticket))
     }
     .await;
 
@@ -490,18 +720,97 @@ async fn issue_iroh_relay_ticket(
             relay_scope = "endpoint_bound",
             "iroh_relay_ticket_completed"
         ),
-        Err((status, error)) => warn!(
+        Err(error) => warn!(
             event = "iroh_relay_ticket_failed",
             endpoint_id = %endpoint_id,
             cluster_id = %cluster_id,
             requesting_peer = ?requesting_peer,
-            status = status.as_u16(),
+            status = error.status.as_u16(),
             duration_us = started.elapsed().as_micros() as u64,
-            error = %error,
+            error = %error.message,
             "iroh_relay_ticket_failed"
         ),
     }
     result
+}
+
+#[derive(Debug)]
+struct TicketApiError {
+    status: StatusCode,
+    message: String,
+    retry_after_secs: Option<u64>,
+}
+
+impl TicketApiError {
+    fn new(status: StatusCode, error: impl std::fmt::Display) -> Self {
+        Self::message(status, error.to_string())
+    }
+
+    fn message(status: StatusCode, message: String) -> Self {
+        Self {
+            status,
+            message,
+            retry_after_secs: None,
+        }
+    }
+
+    fn backpressure(message: String, retry_after_secs: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message,
+            retry_after_secs: Some(retry_after_secs.max(1)),
+        }
+    }
+}
+
+impl IntoResponse for TicketApiError {
+    fn into_response(self) -> Response {
+        let mut response = (self.status, self.message).into_response();
+        if let Some(retry_after_secs) = self.retry_after_secs
+            && let Ok(value) = retry_after_secs.to_string().parse()
+        {
+            response.headers_mut().insert(RETRY_AFTER, value);
+        }
+        response
+    }
+}
+
+async fn release_iroh_relay_ticket(
+    State(state): State<RendezvousAppState>,
+    authenticated_peer: MaybeAuthenticatedPeer,
+    Json(request): Json<IrohRelayTicketReleaseRequest>,
+) -> std::result::Result<Json<IrohRelayTicketReleaseResponse>, (StatusCode, String)> {
+    request
+        .validate()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
+        .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+    ensure_authenticated_peer_cluster(
+        state.config.mtls.is_some(),
+        &authenticated_peer,
+        request.cluster_id,
+        "iroh relay ticket release",
+    )
+    .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+    let runtime = state.iroh_relay.as_ref().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "embedded iroh relay is disabled".to_string(),
+        )
+    })?;
+    let peer = authenticated_peer
+        .0
+        .as_ref()
+        .map(|authenticated| authenticated.identity.clone());
+    let released = runtime.release_ticket(request.cluster_id, peer, &request.endpoint_id);
+    info!(
+        event = "iroh_relay_ticket_released",
+        endpoint_id = %request.endpoint_id,
+        cluster_id = %request.cluster_id,
+        released,
+        "iroh_relay_ticket_released"
+    );
+    Ok(Json(IrohRelayTicketReleaseResponse { released }))
 }
 
 async fn list_presence(
@@ -777,30 +1086,66 @@ async fn issue_relay_ticket(
     State(state): State<RendezvousAppState>,
     authenticated_peer: MaybeAuthenticatedPeer,
     Json(request): Json<RelayTicketRequest>,
-) -> std::result::Result<Json<RelayTicket>, (StatusCode, String)> {
+) -> std::result::Result<Json<RelayTicket>, TicketApiError> {
     request
         .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+        .map_err(|error| TicketApiError::new(StatusCode::BAD_REQUEST, error))?;
     ensure_authenticated_peer_identity(
         state.config.mtls.is_some(),
         &authenticated_peer,
         &request.source,
         "relay ticket source",
     )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    .map_err(|error| TicketApiError::new(StatusCode::UNAUTHORIZED, error))?;
     ensure_authenticated_peer_cluster(
         state.config.mtls.is_some(),
         &authenticated_peer,
         request.cluster_id,
         "relay ticket",
     )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    .map_err(|error| TicketApiError::new(StatusCode::UNAUTHORIZED, error))?;
 
-    let ticket = issue_runtime_relay_ticket(request, &state.config.relay_public_urls);
-    ticket
-        .validate()
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let mut relay_urls = state.config.relay_public_urls.clone();
+    let issuing_public_url = state.config.public_url.trim().trim_end_matches('/');
+    relay_urls.sort_by_key(|url| (url.trim().trim_end_matches('/') != issuing_public_url) as u8);
+    let ticket = state
+        .relay_ticket_issues
+        .issue(request, &relay_urls, unix_ts())?;
     Ok(Json(ticket))
+}
+
+async fn release_relay_ticket(
+    State(state): State<RendezvousAppState>,
+    authenticated_peer: MaybeAuthenticatedPeer,
+    Json(request): Json<RelayTicketReleaseRequest>,
+) -> std::result::Result<Json<RelayTicketReleaseResponse>, (StatusCode, String)> {
+    request
+        .validate()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    ensure_authenticated_peer_identity(
+        state.config.mtls.is_some(),
+        &authenticated_peer,
+        &request.source,
+        "relay ticket release source",
+    )
+    .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+    ensure_authenticated_peer_cluster(
+        state.config.mtls.is_some(),
+        &authenticated_peer,
+        request.cluster_id,
+        "relay ticket release",
+    )
+    .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))?;
+    let released = state.relay_ticket_issues.release(&request, unix_ts());
+    info!(
+        event = "relay_ticket_released",
+        cluster_id = %request.cluster_id,
+        source = %request.source,
+        session_id = %request.session_id,
+        released,
+        "relay_ticket_released"
+    );
+    Ok(Json(RelayTicketReleaseResponse { released }))
 }
 
 async fn redeem_bootstrap_claim(
@@ -1050,7 +1395,7 @@ async fn run_relay_tunnel_websocket(
     let establish = establish_relay_tunnel_endpoint(state, authenticated_peer, initial);
     tokio::pin!(establish);
 
-    let mut endpoint = loop {
+    let (mut endpoint, _active_source_connection) = loop {
         tokio::select! {
             result = &mut establish => break result,
             message = socket.recv() => {
@@ -1189,6 +1534,13 @@ fn unix_ts_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn duration_as_u64_micros(duration: Duration) -> u64 {
@@ -1337,7 +1689,10 @@ async fn establish_relay_tunnel_endpoint(
     state: &RendezvousAppState,
     authenticated_peer: &MaybeAuthenticatedPeer,
     control: RelayTunnelControlMessage,
-) -> anyhow::Result<transport_sdk::RelayTunnelEndpoint> {
+) -> anyhow::Result<(
+    transport_sdk::RelayTunnelEndpoint,
+    Option<ActiveRelayConnection>,
+)> {
     match control {
         RelayTunnelControlMessage::ConnectSource { ticket } => {
             ensure_authenticated_peer_identity(
@@ -1352,7 +1707,9 @@ async fn establish_relay_tunnel_endpoint(
                 ticket.cluster_id,
                 "relay tunnel source",
             )?;
-            state.relay_tunnel.connect_source(ticket).await
+            let active_connection = state.relay_ticket_issues.consume(&ticket, unix_ts())?;
+            let endpoint = state.relay_tunnel.connect_source(ticket).await?;
+            Ok((endpoint, Some(active_connection)))
         }
         RelayTunnelControlMessage::AcceptTarget { request } => {
             ensure_authenticated_peer_identity(
@@ -1367,7 +1724,8 @@ async fn establish_relay_tunnel_endpoint(
                 request.cluster_id,
                 "relay tunnel target",
             )?;
-            state.relay_tunnel.accept_target(request).await
+            let endpoint = state.relay_tunnel.accept_target(request).await?;
+            Ok((endpoint, None))
         }
         RelayTunnelControlMessage::Paired { .. }
         | RelayTunnelControlMessage::CloseWrite
@@ -1586,7 +1944,11 @@ async fn send_relay_wake_control(
 mod tests {
     use super::*;
     use crate::auth::AuthenticatedPeer;
+    use axum::body::Body;
+    use axum::http::Request;
     use common::NodeId;
+    use iroh::SecretKey;
+    use tower::ServiceExt;
     use transport_sdk::{
         RelayMode, RendezvousClientConfig, RendezvousControlClient, TransportCapability,
     };
@@ -1642,6 +2004,242 @@ mod tests {
             identity,
             cluster_id: Some(cluster_id),
         }))
+    }
+
+    #[tokio::test]
+    async fn iroh_ticket_limit_returns_retry_after_and_release_frees_the_lease() {
+        let cluster_id = ClusterId::now_v7();
+        let first_endpoint = SecretKey::generate().public().to_string();
+        let second_endpoint = SecretKey::generate().public().to_string();
+        let router = build_router(
+            RendezvousAppState::new(RendezvousServerConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                public_url: "http://rendezvous.example".to_string(),
+                relay_public_urls: vec!["http://rendezvous.example".to_string()],
+                iroh_relay: Some(IrohRelayServerConfig {
+                    public_urls: vec!["http://rendezvous.example".to_string()],
+                    ticket_ttl: Duration::from_secs(300),
+                    client_rx_bytes_per_second: 1024,
+                    client_rx_max_burst_bytes: 2048,
+                    max_ticket_leases_per_client: 1,
+                    max_active_connections_per_client: 1,
+                    max_ticket_issues_per_minute: 10,
+                    quic: None,
+                }),
+                peer_rendezvous_urls: Vec::new(),
+                mtls: None,
+            })
+            .expect("rendezvous state should build"),
+        );
+        let ticket_request = |endpoint_id: &str| {
+            Request::post("/control/iroh-relay/ticket")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&IrohRelayTicketRequest {
+                        cluster_id,
+                        endpoint_id: endpoint_id.to_string(),
+                    })
+                    .expect("ticket request should encode"),
+                ))
+                .expect("ticket request should build")
+        };
+        let first = router
+            .clone()
+            .oneshot(ticket_request(&first_endpoint))
+            .await
+            .expect("first request should complete");
+        assert_eq!(first.status(), StatusCode::OK);
+        let limited = router
+            .clone()
+            .oneshot(ticket_request(&second_endpoint))
+            .await
+            .expect("limited request should complete");
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().contains_key(RETRY_AFTER));
+
+        let release = Request::delete("/control/iroh-relay/ticket/release")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&IrohRelayTicketReleaseRequest {
+                    cluster_id,
+                    endpoint_id: first_endpoint,
+                })
+                .expect("release request should encode"),
+            ))
+            .expect("release request should build");
+        let released = router
+            .clone()
+            .oneshot(release)
+            .await
+            .expect("release should complete");
+        assert_eq!(released.status(), StatusCode::OK);
+        let second = router
+            .oneshot(ticket_request(&second_endpoint))
+            .await
+            .expect("second request should complete after release");
+        assert_eq!(second.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn multiplex_ticket_issuance_is_bounded_and_single_use_per_connection() {
+        let cluster_id = ClusterId::now_v7();
+        let source = PeerIdentity::Device(DeviceId::now_v7());
+        let peer = authenticated_peer(source.clone(), cluster_id);
+        let state = mtls_test_state();
+        let request = RelayTicketRequest {
+            cluster_id,
+            source: source.clone(),
+            target: PeerIdentity::Node(NodeId::now_v7()),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: transport_sdk::RelayTunnelSecurityMode::InnerMtls,
+            requested_expires_in_secs: Some(300),
+        };
+        let first = issue_relay_ticket(State(state.clone()), peer.clone(), Json(request.clone()))
+            .await
+            .expect("first ticket should issue")
+            .0;
+        let duplicate =
+            issue_relay_ticket(State(state.clone()), peer.clone(), Json(request.clone()))
+                .await
+                .expect("a parallel connection to the same route should receive its own ticket")
+                .0;
+        assert_ne!(first.session_id, duplicate.session_id);
+
+        for _ in 2..10 {
+            let _ = issue_relay_ticket(
+                State(state.clone()),
+                peer.clone(),
+                Json(RelayTicketRequest {
+                    target: PeerIdentity::Node(NodeId::now_v7()),
+                    ..request.clone()
+                }),
+            )
+            .await
+            .expect("ticket within the per-client limit should issue");
+        }
+        let limited = issue_relay_ticket(
+            State(state.clone()),
+            peer,
+            Json(RelayTicketRequest {
+                target: PeerIdentity::Node(NodeId::now_v7()),
+                ..request
+            }),
+        )
+        .await
+        .expect_err("eleventh outstanding ticket must be rejected");
+        assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.retry_after_secs.is_some());
+
+        state
+            .relay_ticket_issues
+            .consume(&first, unix_ts())
+            .expect("issued ticket should be consumed once");
+        assert!(
+            state
+                .relay_ticket_issues
+                .consume(&first, unix_ts())
+                .is_err(),
+            "a consumed ticket must not be replayable"
+        );
+    }
+
+    #[test]
+    fn multiplex_ticket_release_frees_capacity_but_preserves_rate_history() {
+        let limiter = RelayTicketIssueLimiter::new(1, 2);
+        let cluster_id = ClusterId::now_v7();
+        let source = PeerIdentity::Device(DeviceId::now_v7());
+        let request = RelayTicketRequest {
+            cluster_id,
+            source: source.clone(),
+            target: PeerIdentity::Node(NodeId::now_v7()),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: transport_sdk::RelayTunnelSecurityMode::InnerMtls,
+            requested_expires_in_secs: Some(300),
+        };
+        let first = limiter
+            .issue(
+                request.clone(),
+                &["https://relay.example".to_string()],
+                1_000,
+            )
+            .expect("first ticket should issue");
+        assert!(limiter.release(
+            &RelayTicketReleaseRequest {
+                cluster_id,
+                source: source.clone(),
+                session_id: first.session_id,
+            },
+            1_001,
+        ));
+        let second = limiter
+            .issue(
+                RelayTicketRequest {
+                    target: PeerIdentity::Node(NodeId::now_v7()),
+                    ..request.clone()
+                },
+                &["https://relay.example".to_string()],
+                1_001,
+            )
+            .expect("release should free the outstanding slot");
+        assert!(limiter.release(
+            &RelayTicketReleaseRequest {
+                cluster_id,
+                source,
+                session_id: second.session_id,
+            },
+            1_002,
+        ));
+        let error = limiter
+            .issue(
+                RelayTicketRequest {
+                    target: PeerIdentity::Node(NodeId::now_v7()),
+                    ..request
+                },
+                &["https://relay.example".to_string()],
+                1_002,
+            )
+            .expect_err("release must not reset the rolling issuance rate");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.message.contains("issue rate"));
+    }
+
+    #[test]
+    fn active_multiplex_connection_keeps_its_client_ticket_slot() {
+        let limiter = RelayTicketIssueLimiter::new(1, 10);
+        let cluster_id = ClusterId::now_v7();
+        let source = PeerIdentity::Device(DeviceId::now_v7());
+        let request = RelayTicketRequest {
+            cluster_id,
+            source,
+            target: PeerIdentity::Node(NodeId::now_v7()),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: transport_sdk::RelayTunnelSecurityMode::InnerMtls,
+            requested_expires_in_secs: Some(300),
+        };
+        let first = limiter
+            .issue(
+                request.clone(),
+                &["https://relay.example".to_string()],
+                1_000,
+            )
+            .expect("first ticket should issue");
+        let active_connection = limiter
+            .consume(&first, 1_001)
+            .expect("first ticket should become an active connection");
+
+        let error = limiter
+            .issue(
+                request.clone(),
+                &["https://relay.example".to_string()],
+                1_001,
+            )
+            .expect_err("active connection must keep the only allocation slot");
+        assert!(error.message.contains("allocation limit"));
+
+        drop(active_connection);
+        limiter
+            .issue(request, &["https://relay.example".to_string()], 1_002)
+            .expect("closing the active connection should free its allocation slot");
     }
 
     #[test]
@@ -2225,7 +2823,7 @@ mod tests {
         )
         .await
         .expect_err("cluster A certificate must not issue cluster B relay ticket");
-        assert_eq!(foreign_ticket.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(foreign_ticket.status, StatusCode::UNAUTHORIZED);
 
         let source_ticket = issue_runtime_relay_ticket(
             RelayTicketRequest {
@@ -2473,17 +3071,8 @@ mod tests {
         let source = PeerIdentity::Device(Uuid::now_v7());
         let target = PeerIdentity::Node(Uuid::now_v7());
 
-        let ticket = issue_runtime_relay_ticket(
-            RelayTicketRequest {
-                cluster_id,
-                source: source.clone(),
-                target: target.clone(),
-                session_kind: RelayTunnelSessionKind::MultiplexTransport,
-                security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
-                requested_expires_in_secs: Some(60),
-            },
-            &[format!("http://{bind_addr}")],
-        );
+        let ticket =
+            issue_test_relay_ticket(bind_addr, cluster_id, source.clone(), target.clone()).await;
 
         let ws_url = format!("ws://{bind_addr}/relay/tunnel/ws");
 
@@ -2602,6 +3191,35 @@ mod tests {
         (bind_addr, server_handle)
     }
 
+    async fn issue_test_relay_ticket(
+        bind_addr: std::net::SocketAddr,
+        cluster_id: ClusterId,
+        source: PeerIdentity,
+        target: PeerIdentity,
+    ) -> RelayTicket {
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![format!("http://{bind_addr}")],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("test rendezvous client should build");
+        client
+            .issue_relay_ticket(&RelayTicketRequest {
+                cluster_id,
+                source,
+                target,
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
+                requested_expires_in_secs: Some(60),
+            })
+            .await
+            .expect("test relay ticket should be registered by the server")
+    }
+
     async fn connect_and_register_wake(
         wake_url: &str,
         bind_addr: std::net::SocketAddr,
@@ -2696,17 +3314,7 @@ mod tests {
         let mut wake_ws =
             connect_and_register_wake(&wake_url, bind_addr, cluster_id, target.clone()).await;
 
-        let ticket = issue_runtime_relay_ticket(
-            RelayTicketRequest {
-                cluster_id,
-                source,
-                target,
-                session_kind: RelayTunnelSessionKind::MultiplexTransport,
-                security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
-                requested_expires_in_secs: Some(60),
-            },
-            &[format!("http://{bind_addr}")],
-        );
+        let ticket = issue_test_relay_ticket(bind_addr, cluster_id, source, target).await;
         let tunnel_url = format!("ws://{bind_addr}/relay/tunnel/ws");
         tokio::spawn(async move {
             let tcp = TcpStream::connect(bind_addr)
@@ -2752,17 +3360,7 @@ mod tests {
             connect_and_register_wake(&wake_url, bind_addr, cluster_id, target.clone()).await;
 
         let source = PeerIdentity::Device(Uuid::now_v7());
-        let ticket = issue_runtime_relay_ticket(
-            RelayTicketRequest {
-                cluster_id,
-                source,
-                target,
-                session_kind: RelayTunnelSessionKind::MultiplexTransport,
-                security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
-                requested_expires_in_secs: Some(60),
-            },
-            &[format!("http://{bind_addr}")],
-        );
+        let ticket = issue_test_relay_ticket(bind_addr, cluster_id, source, target).await;
         let tunnel_url = format!("ws://{bind_addr}/relay/tunnel/ws");
         tokio::spawn(async move {
             let tcp = TcpStream::connect(bind_addr)

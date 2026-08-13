@@ -31,6 +31,12 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
         bind_addr = %config.bind_addr,
         public_url = %config.public_url,
         mtls_enabled = config.mtls.is_some(),
+        max_connections = config.admission.max_connections,
+        max_tls_handshakes = config.admission.max_tls_handshakes,
+        max_relay_tickets_per_client = config.admission.max_relay_tickets_per_client,
+        max_relay_ticket_issues_per_minute = config
+            .admission
+            .max_relay_ticket_issues_per_minute,
         "rendezvous service listening"
     );
 
@@ -40,12 +46,19 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
             quic_bind_addr = ?iroh_relay.quic.as_ref().map(|quic| quic.bind_addr),
             quic_public_port = ?iroh_relay.quic.as_ref().map(|quic| quic.public_port),
             client_rx_bytes_per_second = iroh_relay.client_rx_bytes_per_second,
+            max_ticket_leases_per_client = iroh_relay.max_ticket_leases_per_client,
+            max_active_connections_per_client = iroh_relay.max_active_connections_per_client,
+            max_ticket_issues_per_minute = iroh_relay.max_ticket_issues_per_minute,
             ticket_ttl_secs = iroh_relay.ticket_ttl.as_secs(),
             "embedded authenticated iroh relay enabled on rendezvous listener"
         );
     }
 
-    serve_rendezvous(RendezvousAppState::new(config.server_config())?).await
+    serve_rendezvous(RendezvousAppState::new_with_admission(
+        config.server_config(),
+        config.admission,
+    )?)
+    .await
 }
 
 #[cfg(test)]
@@ -100,6 +113,9 @@ mod tests {
                 ticket_ttl: Duration::from_secs(300),
                 client_rx_bytes_per_second: 16 * 1024 * 1024,
                 client_rx_max_burst_bytes: 32 * 1024 * 1024,
+                max_ticket_leases_per_client: 10,
+                max_active_connections_per_client: 10,
+                max_ticket_issues_per_minute: 10,
                 quic: None,
             }),
             peer_rendezvous_urls: Vec::new(),
@@ -112,6 +128,7 @@ mod tests {
                     key_path: rendezvous_key_path,
                 },
             }),
+            admission: config::RendezvousAdmissionConfig::default(),
             allow_insecure_http: false,
             failover_package: None,
         };
@@ -335,10 +352,14 @@ mod tests {
                 ticket_ttl: Duration::from_secs(300),
                 client_rx_bytes_per_second: 16 * 1024 * 1024,
                 client_rx_max_burst_bytes: 32 * 1024 * 1024,
+                max_ticket_leases_per_client: 10,
+                max_active_connections_per_client: 10,
+                max_ticket_issues_per_minute: 10,
                 quic: None,
             }),
             peer_rendezvous_urls: Vec::new(),
             mtls: None,
+            admission: config::RendezvousAdmissionConfig::default(),
             allow_insecure_http: true,
             failover_package: None,
         };
@@ -581,6 +602,7 @@ mod tests {
                     key_path: rendezvous_key_path,
                 },
             }),
+            admission: config::RendezvousAdmissionConfig::default(),
             allow_insecure_http: false,
             failover_package: None,
         };
@@ -852,6 +874,7 @@ mod tests {
                     key_pem: rendezvous_key_pem,
                 },
             }),
+            admission: config::RendezvousAdmissionConfig::default(),
             allow_insecure_http: false,
             failover_package: None,
         };
@@ -1131,6 +1154,7 @@ mod tests {
                     key_pem: rendezvous_key_pem,
                 },
             }),
+            admission: config::RendezvousAdmissionConfig::default(),
             allow_insecure_http: false,
             failover_package: None,
         };
