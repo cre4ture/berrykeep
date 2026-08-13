@@ -42,6 +42,7 @@ use transport_sdk::{
 };
 use uuid::Uuid;
 
+use crate::iroh_lease_budget::IrohRelayLeaseBudget;
 use crate::session_pool::{
     DirectQuicSetupWaiter, TransportSessionPool, TransportSessionPoolSnapshot,
 };
@@ -144,6 +145,7 @@ impl std::fmt::Display for RequestedRange {
 #[derive(Clone)]
 pub struct IronMeshClient {
     transport_router: ClientEndpointRouter,
+    iroh_relay_lease_budget: Arc<RwLock<IrohRelayLeaseBudget>>,
     auth: Arc<RwLock<ClientRequestAuth>>,
     connection_name: Option<String>,
     connection_diagnostic_impact: ClientConnectionDiagnosticImpact,
@@ -560,6 +562,18 @@ struct RoutedBufferedTransportResponse {
 }
 
 impl ClientTransport {
+    fn set_iroh_relay_lease_budget(&self, budget: IrohRelayLeaseBudget) {
+        if let Self::DirectQuic { session_pool, .. } = self {
+            session_pool.set_iroh_relay_lease_budget(budget);
+        }
+    }
+
+    fn retire(&self) {
+        if let Self::DirectQuic { session_pool, .. } = self {
+            session_pool.retire();
+        }
+    }
+
     fn path_kind(&self) -> ClientEndpointPathKind {
         match self {
             Self::DirectHttp { .. } | Self::DirectQuic { .. } => ClientEndpointPathKind::Direct,
@@ -1586,6 +1600,7 @@ impl ClientEndpointRouter {
             if let Some(retired) = RetiredRouteFailureState::capture(&state, now_unix_ms) {
                 retired_failure_states.insert(route_key.clone(), retired);
             }
+            endpoint.transport.retire();
         }
         for route_key in &desired_keys {
             retired_failure_states.remove(route_key);
@@ -1917,6 +1932,10 @@ fn is_retryable_transport_status(status: StatusCode) -> bool {
         status,
         StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
     )
+}
+
+fn should_suppress_route_fanout(error: &anyhow::Error) -> bool {
+    transport_sdk::is_rendezvous_backpressure(error)
 }
 
 const CLIENT_SNAPSHOT_SELECTOR_PREFIX: &str = "snapshot-v1:";
@@ -3326,6 +3345,7 @@ impl IronMeshClient {
                 },
                 0,
             )]),
+            iroh_relay_lease_budget: Arc::new(RwLock::new(IrohRelayLeaseBudget::default())),
             auth: Arc::new(RwLock::new(ClientRequestAuth::None)),
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
@@ -3346,6 +3366,22 @@ impl IronMeshClient {
         rendezvous: Option<RendezvousControlClient>,
         relay_ca_pem: Option<String>,
     ) -> Self {
+        Self::from_direct_quic_candidate_with_rendezvous_and_lease_budget(
+            candidate,
+            target_node_id,
+            rendezvous,
+            relay_ca_pem,
+            IrohRelayLeaseBudget::default(),
+        )
+    }
+
+    pub(crate) fn from_direct_quic_candidate_with_rendezvous_and_lease_budget(
+        candidate: ConnectionCandidate,
+        target_node_id: Option<NodeId>,
+        rendezvous: Option<RendezvousControlClient>,
+        relay_ca_pem: Option<String>,
+        lease_budget: IrohRelayLeaseBudget,
+    ) -> Self {
         let request_base_url = candidate.endpoint.trim().trim_end_matches('/').to_string();
         let route_identity = direct_quic_route_identity(&candidate);
         Self {
@@ -3354,15 +3390,17 @@ impl IronMeshClient {
                     request_base_url,
                     target_node_id,
                     route_identity,
-                    session_pool: TransportSessionPool::new_direct_quic(
+                    session_pool: TransportSessionPool::new_direct_quic_with_lease_budget(
                         candidate,
                         target_node_id,
                         rendezvous,
                         relay_ca_pem,
+                        lease_budget.clone(),
                     ),
                 },
                 0,
             )]),
+            iroh_relay_lease_budget: Arc::new(RwLock::new(lease_budget)),
             auth: Arc::new(RwLock::new(ClientRequestAuth::None)),
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
@@ -3389,6 +3427,7 @@ impl IronMeshClient {
                 }),
                 0,
             )]),
+            iroh_relay_lease_budget: Arc::new(RwLock::new(IrohRelayLeaseBudget::default())),
             auth: Arc::new(RwLock::new(ClientRequestAuth::None)),
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
@@ -3397,6 +3436,13 @@ impl IronMeshClient {
     }
 
     pub(crate) fn combine(clients: Vec<Self>) -> Result<Self> {
+        Self::combine_with_iroh_relay_lease_budget(clients, IrohRelayLeaseBudget::default())
+    }
+
+    pub(crate) fn combine_with_iroh_relay_lease_budget(
+        clients: Vec<Self>,
+        lease_budget: IrohRelayLeaseBudget,
+    ) -> Result<Self> {
         if clients.is_empty() {
             bail!("cannot combine zero client transport endpoints");
         }
@@ -3422,11 +3468,15 @@ impl IronMeshClient {
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("cannot combine an empty client transport router"))?;
+            endpoint
+                .transport
+                .set_iroh_relay_lease_budget(lease_budget.clone());
             endpoints.push(endpoint.with_bootstrap_rank(bootstrap_rank));
         }
 
         Ok(Self {
             transport_router: ClientEndpointRouter::new(endpoints),
+            iroh_relay_lease_budget: Arc::new(RwLock::new(lease_budget)),
             auth: Arc::new(RwLock::new(
                 combined_auth.unwrap_or(ClientRequestAuth::None),
             )),
@@ -3443,6 +3493,7 @@ impl IronMeshClient {
         &self,
         refreshed: &IronMeshClient,
     ) -> (usize, usize, usize) {
+        refreshed.adopt_iroh_relay_lease_budget(self.iroh_relay_lease_budget());
         let membership = self
             .transport_router
             .reconcile(refreshed.transport_router.endpoints_snapshot());
@@ -3451,6 +3502,25 @@ impl IronMeshClient {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = refreshed.auth_snapshot();
         membership
+    }
+
+    fn iroh_relay_lease_budget(&self) -> IrohRelayLeaseBudget {
+        self.iroh_relay_lease_budget
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn adopt_iroh_relay_lease_budget(&self, budget: IrohRelayLeaseBudget) {
+        *self
+            .iroh_relay_lease_budget
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = budget.clone();
+        for endpoint in self.transport_router.endpoints_snapshot() {
+            endpoint
+                .transport
+                .set_iroh_relay_lease_budget(budget.clone());
+        }
     }
 
     pub(crate) fn set_single_transport_route_key(&self, route_key: String) -> Result<()> {
@@ -4007,6 +4077,7 @@ impl IronMeshClient {
                 }
                 Err(error) => {
                     let error = error.context(endpoint_context);
+                    let suppress_route_fanout = should_suppress_route_fanout(&error);
                     last_completed_operation = Some(self.record_request_failure(
                         index,
                         &endpoint,
@@ -4020,6 +4091,14 @@ impl IronMeshClient {
                         &format!("{error:#}"),
                     ));
                     last_error = Some(error);
+                    if suppress_route_fanout {
+                        tracing::info!(
+                            event = "client_route_fanout_suppressed",
+                            reason = "rendezvous_backpressure",
+                            "stopping route failover after Rendezvous ticket backpressure"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -4164,6 +4243,7 @@ impl IronMeshClient {
                     });
                 }
                 Err(error) => {
+                    let suppress_route_fanout = should_suppress_route_fanout(&error);
                     last_completed_operation = Some(self.record_request_failure(
                         route_index,
                         &endpoint,
@@ -4181,6 +4261,14 @@ impl IronMeshClient {
                         &error.to_string(),
                     ));
                     last_error = Some(error);
+                    if suppress_route_fanout {
+                        tracing::info!(
+                            event = "client_route_fanout_suppressed",
+                            reason = "rendezvous_backpressure",
+                            "stopping route failover after Rendezvous ticket backpressure"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -4922,6 +5010,7 @@ impl IronMeshClient {
                     return Ok(response);
                 }
                 Err(error) => {
+                    let suppress_route_fanout = should_suppress_route_fanout(&error);
                     last_completed_operation = Some(self.record_request_failure(
                         index,
                         &endpoint,
@@ -4935,6 +5024,14 @@ impl IronMeshClient {
                         &error.to_string(),
                     ));
                     last_error = Some(error);
+                    if suppress_route_fanout {
+                        tracing::info!(
+                            event = "client_route_fanout_suppressed",
+                            reason = "rendezvous_backpressure",
+                            "stopping route failover after Rendezvous ticket backpressure"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -5485,6 +5582,7 @@ impl IronMeshClient {
                     break;
                 }
                 Err(error) => {
+                    let suppress_route_fanout = should_suppress_route_fanout(&error);
                     last_completed_operation = Some(self.record_request_failure(
                         index,
                         &endpoint,
@@ -5498,6 +5596,14 @@ impl IronMeshClient {
                         &error.to_string(),
                     ));
                     last_error = Some(error);
+                    if suppress_route_fanout {
+                        tracing::info!(
+                            event = "client_route_fanout_suppressed",
+                            reason = "rendezvous_backpressure",
+                            "stopping route failover after Rendezvous ticket backpressure"
+                        );
+                        break;
+                    }
                 }
             }
         }

@@ -20,6 +20,7 @@ use transport_sdk::{
     RendezvousControlClient, TransportPathKind,
 };
 
+use crate::iroh_lease_budget::IrohRelayLeaseBudget;
 use crate::ironmesh_client::blocking_runtime;
 use crate::latency_probe::LatencyProbeConfig;
 use crate::{IronMeshClient, PlannedConnectionBootstrapTarget};
@@ -270,7 +271,11 @@ pub fn build_http_client_with_identity_from_planned_target(
     target: &PlannedConnectionBootstrapTarget,
     identity: &ClientIdentityMaterial,
 ) -> Result<IronMeshClient> {
-    let client = build_http_client_with_identity_from_planned_target_unkeyed(target, identity)?;
+    let client = build_http_client_with_identity_from_planned_target_unkeyed(
+        target,
+        identity,
+        IrohRelayLeaseBudget::default(),
+    )?;
     client.set_single_transport_route_key(planned_route_key(target, Some(identity))?)?;
     Ok(client)
 }
@@ -278,6 +283,7 @@ pub fn build_http_client_with_identity_from_planned_target(
 fn build_http_client_with_identity_from_planned_target_unkeyed(
     target: &PlannedConnectionBootstrapTarget,
     identity: &ClientIdentityMaterial,
+    lease_budget: IrohRelayLeaseBudget,
 ) -> Result<IronMeshClient> {
     match target.path_kind {
         TransportPathKind::DirectHttps => {
@@ -306,16 +312,19 @@ fn build_http_client_with_identity_from_planned_target_unkeyed(
             } else {
                 None
             };
-            return Ok(IronMeshClient::from_direct_quic_candidate_with_rendezvous(
-                candidate.clone(),
-                target.target_node_id,
-                rendezvous,
-                target
-                    .rendezvous_ca_pem
-                    .clone()
-                    .or_else(|| target.cluster_ca_pem.clone()),
-            )
-            .with_client_identity(identity.clone()));
+            return Ok(
+                IronMeshClient::from_direct_quic_candidate_with_rendezvous_and_lease_budget(
+                    candidate.clone(),
+                    target.target_node_id,
+                    rendezvous,
+                    target
+                        .rendezvous_ca_pem
+                        .clone()
+                        .or_else(|| target.cluster_ca_pem.clone()),
+                    lease_budget,
+                )
+                .with_client_identity(identity.clone()),
+            );
         }
         TransportPathKind::RelayTunnel => {}
     }
@@ -557,24 +566,35 @@ pub fn build_http_client_with_identity_from_planned_targets(
     targets: &[PlannedConnectionBootstrapTarget],
     identity: &ClientIdentityMaterial,
 ) -> Result<IronMeshClient> {
-    let clients = collect_signed_planned_target_clients(targets, identity)?;
+    let lease_budget = IrohRelayLeaseBudget::default();
+    let clients = collect_signed_planned_target_clients(targets, identity, lease_budget.clone())?;
     if clients.len() == 1 {
-        return IronMeshClient::combine(clients);
+        return IronMeshClient::combine_with_iroh_relay_lease_budget(clients, lease_budget);
     }
 
     let ordered = order_clients_by_startup_probe(clients, true)?;
-    IronMeshClient::combine(ordered)
+    IronMeshClient::combine_with_iroh_relay_lease_budget(ordered, lease_budget)
 }
 
 fn collect_signed_planned_target_clients(
     targets: &[PlannedConnectionBootstrapTarget],
     identity: &ClientIdentityMaterial,
+    lease_budget: IrohRelayLeaseBudget,
 ) -> Result<Vec<IronMeshClient>> {
     let mut clients = Vec::new();
     let mut build_errors = Vec::new();
 
     for target in targets {
-        match build_http_client_with_identity_from_planned_target(target, identity) {
+        let client = build_http_client_with_identity_from_planned_target_unkeyed(
+            target,
+            identity,
+            lease_budget.clone(),
+        )
+        .and_then(|client| {
+            client.set_single_transport_route_key(planned_route_key(target, Some(identity))?)?;
+            Ok(client)
+        });
+        match client {
             Ok(client) => clients.push(client),
             Err(error) if target.relay_mode != transport_sdk::RelayMode::Required => {
                 build_errors.push(error.to_string());
@@ -683,11 +703,14 @@ pub(crate) fn build_unprobed_client_with_optional_identity_from_planned_targets(
     targets: &[PlannedConnectionBootstrapTarget],
     identity: Option<&ClientIdentityMaterial>,
 ) -> Result<IronMeshClient> {
+    let lease_budget = IrohRelayLeaseBudget::default();
     let clients = match identity {
-        Some(identity) => collect_signed_planned_target_clients(targets, identity)?,
+        Some(identity) => {
+            collect_signed_planned_target_clients(targets, identity, lease_budget.clone())?
+        }
         None => collect_anonymous_planned_target_clients(targets)?,
     };
-    IronMeshClient::combine(clients)
+    IronMeshClient::combine_with_iroh_relay_lease_budget(clients, lease_budget)
 }
 
 pub fn build_http_client(
