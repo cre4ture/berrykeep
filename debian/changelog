@@ -1,3 +1,15 @@
+ironmesh (1.0.46-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Bound per-client rendezvous tickets and global connection and handshake
+    admission to prevent resource storms.
+  * Share one Android client across UI and sync work while improving connection
+    state reporting and background efficiency.
+  * Add streamed and HEIF/HEIC thumbnail support plus gallery capture-time
+    fallbacks.
+  * Roll the workspace release to 1.0.46.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 13 Aug 2026 07:20:34 +0200
+
 ironmesh (1.0.45-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Improve client connection diagnostics and Android diagnostic handling.
