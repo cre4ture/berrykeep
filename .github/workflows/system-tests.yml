@@ -88,7 +88,7 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -149,7 +149,7 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
