@@ -617,13 +617,31 @@ impl RendezvousControlClient {
                 self.config.cluster_id
             );
         }
+        self.issue_relay_ticket_with_http_budget(request, RELAY_TICKET_HTTP_TIMEOUT)
+            .await
+    }
+
+    async fn issue_relay_ticket_with_http_budget(
+        &self,
+        request: &RelayTicketRequest,
+        http_budget: Duration,
+    ) -> Result<RelayTicket> {
         let mut last_error = None;
         let mut backpressure_error = None;
+        let mut remaining_http_budget = http_budget;
         for base_url in &self.config.rendezvous_urls {
-            match self
-                .issue_relay_ticket_from_endpoint(base_url, request)
-                .await
-            {
+            if remaining_http_budget.is_zero() {
+                break;
+            }
+            let (result, http_elapsed) = self
+                .issue_relay_ticket_from_endpoint_with_timeout(
+                    base_url,
+                    request,
+                    remaining_http_budget,
+                )
+                .await;
+            remaining_http_budget = remaining_http_budget.saturating_sub(http_elapsed);
+            match result {
                 Ok(ticket) => return Ok(ticket),
                 Err(error) if is_rendezvous_backpressure(&error) => {
                     backpressure_error = Some(error)
@@ -1130,16 +1148,24 @@ impl RendezvousControlClient {
         }
     }
 
-    async fn issue_relay_ticket_from_endpoint(
+    async fn issue_relay_ticket_from_endpoint_with_timeout(
         &self,
         base_url: &str,
         request: &RelayTicketRequest,
-    ) -> Result<RelayTicket> {
+        http_timeout: Duration,
+    ) -> (Result<RelayTicket>, Duration) {
         let gate = RelayTicketOriginGate::shared(base_url);
-        let _permit = gate.acquire(true).await?;
-        let url = control_url(base_url, "/control/relay/ticket")?;
+        let _permit = match gate.acquire(true).await {
+            Ok(permit) => permit,
+            Err(error) => return (Err(error), Duration::ZERO),
+        };
+        let url = match control_url(base_url, "/control/relay/ticket") {
+            Ok(url) => url,
+            Err(error) => return (Err(error), Duration::ZERO),
+        };
+        let http_started = Instant::now();
         let result: Result<RelayTicket> = match tokio::time::timeout(
-            RELAY_TICKET_HTTP_TIMEOUT,
+            http_timeout,
             Box::pin(async {
                 match self.http.post(url.clone()).json(request).send().await {
                     Ok(response) if response.status().is_success() => response
@@ -1182,19 +1208,16 @@ impl RendezvousControlClient {
             Ok(result) => result,
             Err(_) => Err(anyhow!(
                 "rendezvous ticket request to {url} timed out after {:?}",
-                RELAY_TICKET_HTTP_TIMEOUT
+                http_timeout
             )),
         };
-        match result {
-            Ok(ticket) => {
-                self.record_endpoint_result(base_url, Ok(()), true);
-                Ok(ticket)
-            }
-            Err(error) => {
-                self.record_endpoint_result(base_url, Err(error.to_string()), true);
-                Err(error)
-            }
-        }
+        let http_elapsed = http_started.elapsed().min(http_timeout);
+        self.record_endpoint_result(
+            base_url,
+            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+            true,
+        );
+        (result, http_elapsed)
     }
 
     async fn release_iroh_relay_ticket_from_endpoint(
@@ -2300,6 +2323,161 @@ mod tests {
         assert!(message.contains("HTTP status client error (400 Bad Request)"));
         assert!(message.contains("relay ticket rejection:"));
         assert!(message.contains("[response truncated]"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_multi_origin_failover_shares_one_http_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cluster_id = Uuid::now_v7();
+        let first_router = Router::new().route(
+            "/control/relay/ticket",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                (StatusCode::BAD_GATEWAY, "first rendezvous unavailable")
+            }),
+        );
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("first listener should bind");
+        let first_url = format!(
+            "http://{}",
+            first_listener.local_addr().expect("first listener address")
+        );
+        let first_server = tokio::spawn(async move {
+            axum::serve(first_listener, first_router)
+                .await
+                .expect("first rendezvous server should run");
+        });
+
+        let second_requests = Arc::new(AtomicUsize::new(0));
+        let second_requests_for_handler = Arc::clone(&second_requests);
+        let second_router = Router::new().route(
+            "/control/relay/ticket",
+            post(move || {
+                let second_requests = Arc::clone(&second_requests_for_handler);
+                async move {
+                    second_requests.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    StatusCode::GATEWAY_TIMEOUT
+                }
+            }),
+        );
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("second listener should bind");
+        let second_url = format!(
+            "http://{}",
+            second_listener
+                .local_addr()
+                .expect("second listener address")
+        );
+        let second_server = tokio::spawn(async move {
+            axum::serve(second_listener, second_router)
+                .await
+                .expect("second rendezvous server should run");
+        });
+
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![first_url, second_url],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+        let request = RelayTicketRequest {
+            cluster_id,
+            source: PeerIdentity::Device(Uuid::now_v7()),
+            target: PeerIdentity::Node(NodeId::now_v7()),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: RelayTunnelSecurityMode::InnerMtls,
+            requested_expires_in_secs: Some(60),
+        };
+        let started = Instant::now();
+        let error = client
+            .issue_relay_ticket_with_http_budget(&request, Duration::from_millis(250))
+            .await
+            .expect_err("the shared HTTP budget should expire on the second origin");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() >= Duration::from_millis(225));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(second_requests.load(Ordering::SeqCst), 1);
+
+        first_server.abort();
+        let _ = first_server.await;
+        second_server.abort();
+        let _ = second_server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_admission_wait_does_not_consume_http_budget() {
+        let cluster_id = Uuid::now_v7();
+        let router = Router::new().route(
+            "/control/relay/ticket",
+            post(|| async { (StatusCode::BAD_GATEWAY, "rendezvous unavailable") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("rendezvous server should run");
+        });
+        let gate = RelayTicketOriginGate::shared(&base_url);
+        let mut held_permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_RELAY_TICKET_REQUESTS_PER_ORIGIN {
+            held_permits.push(
+                gate.acquire(false)
+                    .await
+                    .expect("test should acquire every origin permit"),
+            );
+        }
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![base_url],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+        let request = RelayTicketRequest {
+            cluster_id,
+            source: PeerIdentity::Device(Uuid::now_v7()),
+            target: PeerIdentity::Node(NodeId::now_v7()),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: RelayTunnelSecurityMode::InnerMtls,
+            requested_expires_in_secs: Some(60),
+        };
+        let started = Instant::now();
+        let request_task = tokio::spawn(async move {
+            client
+                .issue_relay_ticket_with_http_budget(&request, Duration::from_millis(100))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(175)).await;
+        drop(held_permits);
+        let error = request_task
+            .await
+            .expect("ticket request task should complete")
+            .expect_err("the test rendezvous response should fail");
+
+        assert!(error.to_string().contains("502 Bad Gateway"));
+        assert!(started.elapsed() >= Duration::from_millis(175));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
         server.abort();
         let _ = server.await;
     }
