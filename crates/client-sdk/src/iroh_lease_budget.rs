@@ -308,21 +308,30 @@ fn select_lru_eviction(
     max_per_origin: usize,
     endpoint_id: &str,
 ) -> Result<Option<Arc<IrohRelayLeaseHandle>>> {
-    if !requested_origins.iter().any(|origin| {
-        state
-            .entries
-            .values()
-            .filter(|entry| entry.origins.contains(origin))
-            .count()
-            >= max_per_origin
-    }) {
+    let saturated_origins = requested_origins
+        .iter()
+        .filter(|origin| {
+            state
+                .entries
+                .values()
+                .filter(|entry| entry.origins.contains(*origin))
+                .count()
+                >= max_per_origin
+        })
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if saturated_origins.is_empty() {
         return Ok(None);
     }
     state
         .entries
         .iter()
         .filter(|(candidate_id, entry)| {
-            candidate_id.as_str() != endpoint_id && !entry.origins.is_disjoint(requested_origins)
+            candidate_id.as_str() != endpoint_id
+                && entry
+                    .origins
+                    .iter()
+                    .any(|origin| saturated_origins.contains(origin.as_str()))
         })
         .min_by_key(|(_, entry)| entry.last_access)
         .map(|(_, entry)| Some(entry.lease.clone()))
@@ -398,10 +407,14 @@ mod tests {
     }
 
     fn rendezvous(base_url: String) -> RendezvousControlClient {
+        rendezvous_urls(vec![base_url])
+    }
+
+    fn rendezvous_urls(base_urls: Vec<String>) -> RendezvousControlClient {
         RendezvousControlClient::new(
             RendezvousClientConfig {
                 cluster_id: uuid::Uuid::now_v7(),
-                rendezvous_urls: vec![base_url],
+                rendezvous_urls: base_urls,
                 heartbeat_interval_secs: 15,
             },
             None,
@@ -562,5 +575,61 @@ mod tests {
         second.release_started.store(true, Ordering::Release);
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn lru_eviction_only_targets_origins_that_are_at_capacity() {
+        let (origin_a_url, origin_a_releases, origin_a_server) = release_server().await;
+        let (origin_b_url, origin_b_releases, origin_b_server) = release_server().await;
+        let budget = IrohRelayLeaseBudget::with_limit(2);
+        let b_only_endpoint = iroh::SecretKey::generate().public().to_string();
+        let first_a_endpoint = iroh::SecretKey::generate().public().to_string();
+        let second_a_endpoint = iroh::SecretKey::generate().public().to_string();
+        let combined_endpoint = iroh::SecretKey::generate().public().to_string();
+
+        let b_only = budget
+            .reserve(rendezvous(origin_b_url.clone()), &b_only_endpoint)
+            .await
+            .expect("B-only lease should reserve first");
+        let first_a = budget
+            .reserve(rendezvous(origin_a_url.clone()), &first_a_endpoint)
+            .await
+            .expect("first A lease should reserve");
+        let second_a = budget
+            .reserve(rendezvous(origin_a_url.clone()), &second_a_endpoint)
+            .await
+            .expect("second A lease should fill origin A");
+        let combined = budget
+            .reserve(
+                rendezvous_urls(vec![origin_a_url, origin_b_url]),
+                &combined_endpoint,
+            )
+            .await
+            .expect("combined lease should evict from saturated origin A");
+
+        assert!(b_only.is_active());
+        assert!(!first_a.is_active());
+        assert!(second_a.is_active());
+        assert!(combined.is_active());
+        assert_eq!(
+            *origin_a_releases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![first_a_endpoint]
+        );
+        assert!(
+            origin_b_releases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+
+        for lease in [b_only, first_a, second_a, combined] {
+            lease.release_started.store(true, Ordering::Release);
+        }
+        origin_a_server.abort();
+        let _ = origin_a_server.await;
+        origin_b_server.abort();
+        let _ = origin_b_server.await;
     }
 }
