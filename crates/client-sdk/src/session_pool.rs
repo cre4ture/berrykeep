@@ -5,7 +5,7 @@ use iroh::endpoint::{Connection, PathList};
 use iroh::{SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore, watch};
@@ -20,6 +20,8 @@ use transport_sdk::{
     connect_websocket_with_expected_server_identity, endpoint_id_from_candidate,
     has_usable_peer_addresses, perform_transport_client_handshake, websocket_url,
 };
+
+use crate::iroh_lease_budget::{IrohRelayLeaseBudget, IrohRelayLeaseHandle};
 
 const IROH_RELAY_TICKET_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MOBILE_CONNECTION_LOG_TARGET: &str = "ironmesh_mobile_connection";
@@ -50,6 +52,8 @@ enum SessionPoolTarget {
         target_node_id: Option<NodeId>,
         endpoint: Arc<Mutex<Option<ManagedDirectQuicEndpoint>>>,
         setup_identity: Arc<Mutex<Option<DirectQuicSetupIdentity>>>,
+        lease_budget: Arc<RwLock<IrohRelayLeaseBudget>>,
+        retired: Arc<AtomicBool>,
         rendezvous: Option<RendezvousControlClient>,
         relay_ca_pem: Option<String>,
     },
@@ -68,17 +72,12 @@ struct CachedTransportSession {
 struct ManagedDirectQuicEndpoint {
     endpoint: DirectQuicEndpoint,
     relay_ticket_refresh: Option<tokio::task::AbortHandle>,
-    _relay_ticket_lease: Option<Arc<IrohRelayLeaseHandle>>,
+    relay_ticket_lease: Option<Arc<IrohRelayLeaseHandle>>,
 }
 
 struct DirectQuicSetupIdentity {
     secret_key: SecretKey,
     relay_ticket_lease: Option<Arc<IrohRelayLeaseHandle>>,
-}
-
-struct IrohRelayLeaseHandle {
-    rendezvous: RendezvousControlClient,
-    endpoint_id: String,
 }
 
 struct RelayTicketReleaseGuard {
@@ -112,7 +111,25 @@ struct DirectQuicEndpointLifecycle {
     target_node_id: NodeId,
 }
 
-type SharedSessionSetupResult = std::result::Result<Arc<MultiplexedSession>, Arc<str>>;
+type SharedSessionSetupResult =
+    std::result::Result<Arc<MultiplexedSession>, SharedSessionSetupError>;
+
+#[derive(Clone, Debug)]
+struct SharedSessionSetupError {
+    error: Arc<anyhow::Error>,
+}
+
+impl std::fmt::Display for SharedSessionSetupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for SharedSessionSetupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref().as_ref())
+    }
+}
 
 #[derive(Clone)]
 struct SharedSessionSetup {
@@ -170,6 +187,8 @@ struct DirectQuicConnectContext<'a> {
     target_node_id: NodeId,
     endpoint: &'a Arc<Mutex<Option<ManagedDirectQuicEndpoint>>>,
     setup_identity: &'a Arc<Mutex<Option<DirectQuicSetupIdentity>>>,
+    lease_budget: IrohRelayLeaseBudget,
+    retired: &'a Arc<AtomicBool>,
     cached_session: &'a Arc<Mutex<Option<CachedTransportSession>>>,
     stats: &'a Arc<TransportSessionPoolStats>,
     rendezvous: Option<&'a RendezvousControlClient>,
@@ -222,34 +241,6 @@ impl Drop for ManagedDirectQuicEndpoint {
         if let Some(refresh) = self.relay_ticket_refresh.take() {
             refresh.abort();
         }
-    }
-}
-
-impl Drop for IrohRelayLeaseHandle {
-    fn drop(&mut self) {
-        let rendezvous = self.rendezvous.clone();
-        let endpoint_id = self.endpoint_id.clone();
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(
-                %endpoint_id,
-                "cannot release endpoint-bound iroh relay ticket outside a Tokio runtime"
-            );
-            return;
-        };
-        runtime.spawn(async move {
-            match rendezvous.release_iroh_relay_ticket(&endpoint_id).await {
-                Ok(released) => tracing::debug!(
-                    %endpoint_id,
-                    released,
-                    "released endpoint-bound iroh relay ticket lease"
-                ),
-                Err(error) => tracing::warn!(
-                    %endpoint_id,
-                    %error,
-                    "failed releasing endpoint-bound iroh relay ticket lease"
-                ),
-            }
-        });
     }
 }
 
@@ -337,11 +328,28 @@ impl TransportSessionPool {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new_direct_quic(
         candidate: ConnectionCandidate,
         target_node_id: Option<NodeId>,
         rendezvous: Option<RendezvousControlClient>,
         relay_ca_pem: Option<String>,
+    ) -> Self {
+        Self::new_direct_quic_with_lease_budget(
+            candidate,
+            target_node_id,
+            rendezvous,
+            relay_ca_pem,
+            IrohRelayLeaseBudget::default(),
+        )
+    }
+
+    pub(crate) fn new_direct_quic_with_lease_budget(
+        candidate: ConnectionCandidate,
+        target_node_id: Option<NodeId>,
+        rendezvous: Option<RendezvousControlClient>,
+        relay_ca_pem: Option<String>,
+        lease_budget: IrohRelayLeaseBudget,
     ) -> Self {
         Self {
             target: SessionPoolTarget::DirectQuic {
@@ -349,6 +357,8 @@ impl TransportSessionPool {
                 target_node_id,
                 endpoint: Arc::new(Mutex::new(None)),
                 setup_identity: Arc::new(Mutex::new(None)),
+                lease_budget: Arc::new(RwLock::new(lease_budget)),
+                retired: Arc::new(AtomicBool::new(false)),
                 rendezvous,
                 relay_ca_pem,
             },
@@ -358,6 +368,32 @@ impl TransportSessionPool {
             stats: Arc::new(TransportSessionPoolStats::default()),
             route_index: Arc::new(AtomicU64::new(u64::MAX)),
         }
+    }
+
+    pub(crate) fn set_iroh_relay_lease_budget(&self, budget: IrohRelayLeaseBudget) {
+        let SessionPoolTarget::DirectQuic { lease_budget, .. } = &self.target else {
+            return;
+        };
+        *lease_budget
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = budget;
+    }
+
+    pub(crate) fn retire(&self) {
+        let SessionPoolTarget::DirectQuic { retired, .. } = &self.target else {
+            return;
+        };
+        if retired.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pool = self.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("cannot retire direct QUIC route outside a Tokio runtime");
+            return;
+        };
+        runtime.spawn(async move {
+            pool.release_direct_quic_resources("route_removed").await;
+        });
     }
 
     pub(crate) fn new_relay(
@@ -452,13 +488,87 @@ impl TransportSessionPool {
         }
     }
 
+    async fn release_direct_quic_resources(&self, reason: &'static str) {
+        let SessionPoolTarget::DirectQuic {
+            endpoint,
+            setup_identity,
+            ..
+        } = &self.target
+        else {
+            return;
+        };
+
+        let endpoint_lease = endpoint
+            .lock()
+            .await
+            .take()
+            .and_then(|managed| managed.relay_ticket_lease.clone());
+        let identity_lease = setup_identity
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|identity| identity.relay_ticket_lease.take());
+        self.invalidate().await;
+        set_configured_iroh_relay_urls(&self.stats, std::iter::empty());
+
+        let mut leases = Vec::new();
+        if let Some(lease) = identity_lease {
+            leases.push(lease);
+        }
+        if let Some(lease) = endpoint_lease
+            && !leases.iter().any(|existing| Arc::ptr_eq(existing, &lease))
+        {
+            leases.push(lease);
+        }
+        for lease in leases {
+            if let Err(error) = lease.release_now(reason).await {
+                tracing::warn!(
+                    endpoint_id = %lease.endpoint_id(),
+                    %error,
+                    reason,
+                    "failed explicitly releasing direct QUIC route lease"
+                );
+            }
+        }
+    }
+
+    async fn clear_revoked_direct_quic_resources(&self) {
+        let SessionPoolTarget::DirectQuic {
+            endpoint,
+            setup_identity,
+            ..
+        } = &self.target
+        else {
+            return;
+        };
+        let endpoint_revoked = endpoint
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|managed| managed.relay_ticket_lease.as_ref())
+            .is_some_and(|lease| !lease.is_active());
+        let identity_revoked = setup_identity
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|identity| identity.relay_ticket_lease.as_ref())
+            .is_some_and(|lease| !lease.is_active());
+        if endpoint_revoked || identity_revoked {
+            self.release_direct_quic_resources("budget_evicted").await;
+        }
+    }
+
     pub(crate) async fn ensure_direct_session(
         &self,
         identity: &ClientIdentityMaterial,
         connection_name: Option<&str>,
         setup_waiter: DirectQuicSetupWaiter,
     ) -> Result<Arc<MultiplexedSession>> {
-        if matches!(&self.target, SessionPoolTarget::DirectQuic { .. }) {
+        if let SessionPoolTarget::DirectQuic { retired, .. } = &self.target {
+            if retired.load(Ordering::Acquire) {
+                bail!("direct QUIC route has been retired");
+            }
+            self.clear_revoked_direct_quic_resources().await;
             if let Some(session) = self.cached_session().await {
                 return Ok(session);
             }
@@ -495,6 +605,25 @@ impl TransportSessionPool {
     }
 
     async fn establish_direct_session(
+        &self,
+        identity: &ClientIdentityMaterial,
+        connection_name: Option<&str>,
+        direct_quic_setup_attempt_id: Option<u64>,
+    ) -> Result<Arc<MultiplexedSession>> {
+        let direct_quic = matches!(&self.target, SessionPoolTarget::DirectQuic { .. });
+        let result = Box::pin(self.establish_direct_session_inner(
+            identity,
+            connection_name,
+            direct_quic_setup_attempt_id,
+        ))
+        .await;
+        if direct_quic && result.is_err() {
+            Box::pin(self.release_direct_quic_resources("setup_failed")).await;
+        }
+        result
+    }
+
+    async fn establish_direct_session_inner(
         &self,
         identity: &ClientIdentityMaterial,
         connection_name: Option<&str>,
@@ -557,6 +686,8 @@ impl TransportSessionPool {
                 target_node_id,
                 endpoint,
                 setup_identity,
+                lease_budget,
+                retired,
                 rendezvous,
                 relay_ca_pem,
             } => {
@@ -569,12 +700,18 @@ impl TransportSessionPool {
                 let target_label = candidate.endpoint.clone();
                 let setup_started = Instant::now();
                 cold_quic_setup_started = Some(setup_started);
+                let lease_budget = lease_budget
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 let direct_quic = self
                     .connect_direct_quic_session(DirectQuicConnectContext {
                         candidate,
                         target_node_id,
                         endpoint,
                         setup_identity,
+                        lease_budget,
+                        retired,
                         cached_session: &self.cached_session,
                         stats: &self.stats,
                         rendezvous: rendezvous.as_ref(),
@@ -829,20 +966,18 @@ impl TransportSessionPool {
             timeout_ms = RELAY_TICKET_REQUEST_TIMEOUT.as_millis(),
             "iroh_relay_ticket_started"
         );
-        let ticket = match tokio::time::timeout(
-            RELAY_TICKET_REQUEST_TIMEOUT,
-            rendezvous.issue_relay_ticket(&RelayTicketRequest {
+        let ticket = match rendezvous
+            .issue_relay_ticket(&RelayTicketRequest {
                 cluster_id: rendezvous.config().cluster_id,
                 source: source.clone(),
                 target: PeerIdentity::Node(*target_node_id),
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
                 security_mode: transport_sdk::RelayTunnelSecurityMode::InnerMtls,
                 requested_expires_in_secs: Some(300),
-            }),
-        )
-        .await
+            })
+            .await
         {
-            Ok(Ok(ticket)) => {
+            Ok(ticket) => {
                 tracing::info!(
                     target: MOBILE_CONNECTION_LOG_TARGET,
                     event = "iroh_relay_ticket_completed",
@@ -854,7 +989,7 @@ impl TransportSessionPool {
                 );
                 ticket
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 tracing::warn!(
                     target: MOBILE_CONNECTION_LOG_TARGET,
                     event = "iroh_relay_ticket_failed",
@@ -881,26 +1016,6 @@ impl TransportSessionPool {
                         target_node_id
                     )
                 });
-            }
-            Err(_) => {
-                let error = anyhow!(
-                    "issuing multiplex relay ticket for client target node {} timed out after {:?}",
-                    target_node_id,
-                    RELAY_TICKET_REQUEST_TIMEOUT
-                );
-                tracing::warn!(
-                    target: MOBILE_CONNECTION_LOG_TARGET,
-                    event = "iroh_relay_ticket_failed",
-                    candidate_index = ?self.route_index(),
-                    path_kind = "relay_tunnel",
-                    target_node_id = %target_node_id,
-                    duration_us = duration_as_u64_micros(ticket_started.elapsed()),
-                    timeout_ms = RELAY_TICKET_REQUEST_TIMEOUT.as_millis(),
-                    reason = "timeout",
-                    error = %error,
-                    "iroh_relay_ticket_failed"
-                );
-                return Err(error);
             }
         };
         let mut ticket_release = RelayTicketReleaseGuard::new(rendezvous.clone(), ticket.clone());
@@ -1120,7 +1235,9 @@ impl TransportSessionPool {
                 tokio::spawn(async move {
                     let result = setup(attempt_id)
                         .await
-                        .map_err(|error| Arc::<str>::from(error.to_string()));
+                        .map_err(|error| SharedSessionSetupError {
+                            error: Arc::new(error),
+                        });
                     let _ = sender.send(Some(result));
                     let mut active = coordinator.active.lock().await;
                     if active
@@ -1138,9 +1255,7 @@ impl TransportSessionPool {
         let mut cancellation_guard = self.direct_quic_setup_wait_guard(setup_attempt_id, waiter);
         let result = loop {
             if let Some(result) = receiver.borrow().as_ref() {
-                break result
-                    .clone()
-                    .map_err(|error| anyhow!(error.as_ref().to_string()));
+                break result.clone().map_err(anyhow::Error::new);
             }
             if receiver.changed().await.is_err() {
                 break Err(anyhow!(
@@ -1155,6 +1270,18 @@ impl TransportSessionPool {
     }
 
     async fn cached_session(&self) -> Option<Arc<MultiplexedSession>> {
+        if let SessionPoolTarget::DirectQuic { setup_identity, .. } = &self.target
+            && let Some(lease) = setup_identity
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|identity| identity.relay_ticket_lease.clone())
+        {
+            if !lease.is_active() {
+                return None;
+            }
+            lease.touch();
+        }
         let guard = self.cached_session.lock().await;
         let session = guard.as_ref().map(|cached| Arc::clone(&cached.session));
         if session.is_some() {
@@ -1261,9 +1388,22 @@ async fn ensure_direct_quic_endpoint(
     let rendezvous = context.rendezvous;
     let relay_ca_pem = context.relay_ca_pem;
     let setup_attempt_id = context.setup_attempt_id;
+    if context.retired.load(Ordering::Acquire) {
+        bail!("direct QUIC route was retired before endpoint setup");
+    }
     {
         let guard = endpoint.lock().await;
         if let Some(managed) = guard.as_ref() {
+            if managed
+                .relay_ticket_lease
+                .as_ref()
+                .is_some_and(|lease| !lease.is_active())
+            {
+                bail!("direct QUIC route lease was evicted before endpoint reuse");
+            }
+            if let Some(lease) = managed.relay_ticket_lease.as_ref() {
+                lease.touch();
+            }
             return Ok(managed.endpoint.clone());
         }
     }
@@ -1281,6 +1421,36 @@ async fn ensure_direct_quic_endpoint(
     };
     let local_iroh_endpoint_id = secret_key.public().to_string();
     let remote_iroh_endpoint_id = endpoint_id_from_candidate(candidate)?;
+    let relay_ticket_lease = match rendezvous {
+        Some(rendezvous) => {
+            let existing = setup_identity
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|identity| identity.relay_ticket_lease.clone())
+                .filter(|lease| lease.is_active());
+            match existing {
+                Some(lease) => {
+                    lease.touch();
+                    Some(lease)
+                }
+                None => {
+                    let lease = context
+                        .lease_budget
+                        .reserve(rendezvous.clone(), &local_iroh_endpoint_id)
+                        .await?;
+                    setup_identity
+                        .lock()
+                        .await
+                        .as_mut()
+                        .expect("direct QUIC setup identity should exist before lease reservation")
+                        .relay_ticket_lease = Some(lease.clone());
+                    Some(lease)
+                }
+            }
+        }
+        None => None,
+    };
     let relay_ticket_collection = match rendezvous {
         Some(rendezvous) => {
             let ticket_started = Instant::now();
@@ -1299,13 +1469,11 @@ async fn ensure_direct_quic_endpoint(
                 timeout_ms = RELAY_TICKET_REQUEST_TIMEOUT.as_millis(),
                 "iroh_relay_ticket_started"
             );
-            match tokio::time::timeout(
-                RELAY_TICKET_REQUEST_TIMEOUT,
-                rendezvous.issue_iroh_relay_tickets_progressively(&local_iroh_endpoint_id),
-            )
-            .await
+            match rendezvous
+                .issue_iroh_relay_tickets_progressively(&local_iroh_endpoint_id)
+                .await
             {
-                Ok(Ok(collection)) => {
+                Ok(collection) => {
                     tracing::info!(
                         target: MOBILE_CONNECTION_LOG_TARGET,
                         event = "iroh_relay_ticket_completed",
@@ -1323,7 +1491,7 @@ async fn ensure_direct_quic_endpoint(
                     );
                     Some(collection)
                 }
-                Ok(Err(error)) => {
+                Err(error) => {
                     tracing::warn!(
                         target: MOBILE_CONNECTION_LOG_TARGET,
                         event = "iroh_relay_ticket_failed",
@@ -1340,26 +1508,9 @@ async fn ensure_direct_quic_endpoint(
                         error = %error,
                         "iroh_relay_ticket_failed"
                     );
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        target: MOBILE_CONNECTION_LOG_TARGET,
-                        event = "iroh_relay_ticket_failed",
-                        setup_attempt_id,
-                        candidate_index = ?route_index,
-                        path_kind = "direct_quic",
-                        locator = %candidate.endpoint,
-                        local_iroh_endpoint_id = %local_iroh_endpoint_id,
-                        remote_iroh_endpoint_id = %remote_iroh_endpoint_id,
-                        target_node_id = %target_node_id,
-                        relay_scope = "endpoint_bound",
-                        error_class = "timeout",
-                        duration_us = duration_as_u64_micros(ticket_started.elapsed()),
-                        timeout_ms = RELAY_TICKET_REQUEST_TIMEOUT.as_millis(),
-                        reason = "timeout",
-                        "iroh_relay_ticket_failed"
-                    );
+                    if transport_sdk::is_rendezvous_backpressure(&error) {
+                        return Err(error);
+                    }
                     None
                 }
             }
@@ -1371,27 +1522,38 @@ async fn ensure_direct_quic_endpoint(
         .as_ref()
         .map(|collection| collection.first_ticket().clone());
     let relay_ticket_lease = if first_relay_ticket.is_some() {
-        let rendezvous = rendezvous
-            .expect("an endpoint-bound relay ticket requires a rendezvous client")
-            .clone();
-        let mut identity = setup_identity.lock().await;
-        let identity = identity
-            .as_mut()
-            .expect("direct QUIC setup identity should exist after ticket issuance");
-        Some(
-            identity
-                .relay_ticket_lease
-                .get_or_insert_with(|| {
-                    Arc::new(IrohRelayLeaseHandle {
-                        rendezvous,
-                        endpoint_id: local_iroh_endpoint_id.clone(),
-                    })
-                })
-                .clone(),
-        )
+        relay_ticket_lease
     } else {
+        if let Some(lease) = relay_ticket_lease {
+            setup_identity
+                .lock()
+                .await
+                .as_mut()
+                .expect("direct QUIC setup identity should exist after ticket request")
+                .relay_ticket_lease = None;
+            if let Err(error) = lease.release_now("ticket_unavailable").await {
+                tracing::warn!(
+                    endpoint_id = %lease.endpoint_id(),
+                    %error,
+                    "failed releasing reservation after an unavailable iroh relay ticket"
+                );
+            }
+        }
         None
     };
+
+    if context.retired.load(Ordering::Acquire) {
+        if let Some(lease) = relay_ticket_lease.as_ref()
+            && let Err(error) = lease.release_now("route_removed_during_setup").await
+        {
+            tracing::warn!(
+                endpoint_id = %lease.endpoint_id(),
+                %error,
+                "failed releasing iroh relay lease for a route removed during setup"
+            );
+        }
+        bail!("direct QUIC route was retired during endpoint setup");
+    }
 
     let static_relay_authorized = rendezvous.is_none()
         && candidate
@@ -1533,9 +1695,31 @@ async fn ensure_direct_quic_endpoint(
     let managed_endpoint = ManagedDirectQuicEndpoint {
         endpoint: bound_endpoint.clone(),
         relay_ticket_refresh,
-        _relay_ticket_lease: relay_ticket_lease,
+        relay_ticket_lease,
     };
     let mut guard = endpoint.lock().await;
+    if context.retired.load(Ordering::Acquire) {
+        drop(guard);
+        drop(managed_endpoint);
+        let retired_lease = setup_identity
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|identity| identity.relay_ticket_lease.take());
+        if let Some(lease) = retired_lease
+            && let Err(error) = lease
+                .release_now("route_removed_before_endpoint_install")
+                .await
+        {
+            tracing::warn!(
+                endpoint_id = %lease.endpoint_id(),
+                %error,
+                "failed releasing iroh relay lease rejected at endpoint installation"
+            );
+        }
+        set_configured_iroh_relay_urls(stats, std::iter::empty());
+        bail!("direct QUIC route was retired before endpoint installation");
+    }
     if let Some(existing) = guard.as_ref() {
         return Ok(existing.endpoint.clone());
     }
@@ -1564,6 +1748,10 @@ fn spawn_iroh_relay_ticket_refresh(
         let mut pending_collection = initial_collection;
         let rollover = IrohRelayTicketRollover::from_ticket_set(&relay_tickets, unix_ts());
         loop {
+            if !lifecycle.relay_ticket_lease.is_active() {
+                return;
+            }
+            lifecycle.relay_ticket_lease.touch();
             let refresh_delay = iroh_relay_ticket_rollover_delay(rollover, unix_ts());
             if let Some(collection) = pending_collection.as_mut() {
                 tokio::select! {
@@ -1717,6 +1905,10 @@ fn spawn_iroh_relay_ticket_refresh(
 async fn request_iroh_relay_ticket_collection(
     lifecycle: &DirectQuicEndpointLifecycle,
 ) -> Option<IrohRelayTicketCollection> {
+    if !lifecycle.relay_ticket_lease.is_active() {
+        return None;
+    }
+    lifecycle.relay_ticket_lease.touch();
     match lifecycle
         .rendezvous
         .issue_iroh_relay_tickets_progressively(&lifecycle.local_iroh_endpoint_id)
@@ -1742,6 +1934,10 @@ async fn install_iroh_relay_ticket(
     ticket: &IrohRelayTicket,
     lifecycle: &DirectQuicEndpointLifecycle,
 ) -> Result<()> {
+    if !lifecycle.relay_ticket_lease.is_active() {
+        bail!("endpoint-bound iroh relay lease was evicted before ticket installation");
+    }
+    lifecycle.relay_ticket_lease.touch();
     let mut updated_tickets = relay_tickets.clone();
     updated_tickets.insert(ticket);
     endpoint
@@ -1793,7 +1989,7 @@ async fn rollover_direct_quic_endpoint(
         endpoint.replace(ManagedDirectQuicEndpoint {
             endpoint: next_endpoint.clone(),
             relay_ticket_refresh: Some(refresh),
-            _relay_ticket_lease: Some(lifecycle.relay_ticket_lease.clone()),
+            relay_ticket_lease: Some(lifecycle.relay_ticket_lease.clone()),
         })
     };
 
@@ -1970,11 +2166,14 @@ mod tests {
         let setup_identity = Arc::new(Mutex::new(None));
         let cached_session = Arc::new(Mutex::new(None));
         let stats = Arc::new(TransportSessionPoolStats::default());
+        let retired = Arc::new(AtomicBool::new(false));
         let context = DirectQuicConnectContext {
             candidate: &candidate,
             target_node_id: NodeId::new_v4(),
             endpoint: &endpoint,
             setup_identity: &setup_identity,
+            lease_budget: IrohRelayLeaseBudget::default(),
+            retired: &retired,
             cached_session: &cached_session,
             stats: &stats,
             rendezvous: None,
@@ -2065,11 +2264,14 @@ mod tests {
         let setup_identity = Arc::new(Mutex::new(None));
         let cached_session = Arc::new(Mutex::new(None));
         let stats = Arc::new(TransportSessionPoolStats::default());
+        let retired = Arc::new(AtomicBool::new(false));
         let context = DirectQuicConnectContext {
             candidate: &candidate,
             target_node_id: NodeId::new_v4(),
             endpoint: &endpoint,
             setup_identity: &setup_identity,
+            lease_budget: IrohRelayLeaseBudget::default(),
+            retired: &retired,
             cached_session: &cached_session,
             stats: &stats,
             rendezvous: Some(&rendezvous),

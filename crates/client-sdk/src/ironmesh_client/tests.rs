@@ -4283,6 +4283,111 @@ async fn direct_quic_continues_after_iroh_relay_ticket_timeout() {
 }
 
 #[tokio::test]
+async fn rendezvous_backpressure_stops_direct_quic_route_fanout() {
+    let ticket_requests = Arc::new(AtomicUsize::new(0));
+    let ticket_requests_for_handler = Arc::clone(&ticket_requests);
+    let router = Router::new()
+        .route(
+            "/control/iroh-relay/ticket",
+            post(move || {
+                let ticket_requests = Arc::clone(&ticket_requests_for_handler);
+                async move {
+                    ticket_requests.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(header::RETRY_AFTER, "60")],
+                        "ticket lease limit reached",
+                    )
+                }
+            }),
+        )
+        .route(
+            "/control/iroh-relay/ticket/release",
+            axum::routing::delete(|| async {
+                Json(transport_sdk::IrohRelayTicketReleaseResponse { released: false })
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("rendezvous listener should bind");
+    let rendezvous_url = format!(
+        "http://{}",
+        listener.local_addr().expect("rendezvous listener address")
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("rendezvous server should run");
+    });
+
+    let cluster_id = uuid::Uuid::now_v7();
+    let mut identity = ClientIdentityMaterial::generate(
+        cluster_id,
+        None,
+        Some("rendezvous-backpressure-device".to_string()),
+    )
+    .expect("identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+    let rendezvous = RendezvousControlClient::new(
+        RendezvousClientConfig {
+            cluster_id,
+            rendezvous_urls: vec![rendezvous_url],
+            heartbeat_interval_secs: 15,
+        },
+        None,
+        None,
+    )
+    .expect("rendezvous client should build");
+    let direct_quic_route = |target_node_id| {
+        IronMeshClient::from_direct_quic_candidate_with_rendezvous(
+            ConnectionCandidate {
+                kind: CandidateKind::DirectQuic,
+                endpoint: format!("iroh://{}", SecretKey::generate().public()),
+                rtt_ms: None,
+                transport_hints: None,
+            },
+            Some(target_node_id),
+            Some(rendezvous.clone()),
+            None,
+        )
+        .with_client_identity(identity.clone())
+    };
+    let client = IronMeshClient::combine(vec![
+        direct_quic_route(NodeId::new_v4()),
+        direct_quic_route(NodeId::new_v4()),
+    ])
+    .expect("direct QUIC routes should combine")
+    .with_route_maintenance_policy(ClientRouteMaintenancePolicy {
+        max_background_probe_candidates: 0,
+        ..ClientRouteMaintenancePolicy::default()
+    });
+
+    let error = client
+        .get_json_path("/cluster/status")
+        .await
+        .expect_err("Rendezvous backpressure should reject the request");
+    assert!(
+        transport_sdk::is_rendezvous_backpressure(&error),
+        "unexpected error chain: {error:#}"
+    );
+    assert_eq!(ticket_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        client
+            .connection_diagnostics()
+            .endpoints
+            .into_iter()
+            .flat_map(|endpoint| endpoint.recent_attempts)
+            .filter(|attempt| attempt.impact == ClientConnectionDiagnosticImpact::UserFacing)
+            .count(),
+        1,
+        "the second route must not be attempted after ticket backpressure"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn direct_transport_executes_store_index_request_with_signed_device_identity() {
     let (direct_state, server) = spawn_direct_transport_test_server(
         200,

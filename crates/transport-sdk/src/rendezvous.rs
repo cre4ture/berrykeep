@@ -31,18 +31,65 @@ use crate::relay_wake::{RelayWakeClient, RelayWakeRegistration};
 const MAX_RENDEZVOUS_ERROR_RESPONSE_BYTES: usize = 1024;
 const MAX_CONCURRENT_RELAY_TICKET_REQUESTS_PER_ORIGIN: usize = 3;
 const MAX_SERVER_TICKET_BACKOFF: Duration = Duration::from_secs(5 * 60);
+const RELAY_TICKET_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+pub struct RendezvousBackpressure {
+    origin: String,
+    retry_after: Duration,
+    detail: String,
+}
+
+impl RendezvousBackpressure {
+    fn new(origin: impl Into<String>, retry_after: Duration, detail: impl Into<String>) -> Self {
+        Self {
+            origin: origin.into(),
+            retry_after,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    pub fn retry_after(&self) -> Duration {
+        self.retry_after
+    }
+}
+
+impl std::fmt::Display for RendezvousBackpressure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "rendezvous origin {} is applying ticket backpressure for {:?}: {}",
+            self.origin, self.retry_after, self.detail
+        )
+    }
+}
+
+impl std::error::Error for RendezvousBackpressure {}
+
+pub fn is_rendezvous_backpressure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RendezvousBackpressure>().is_some())
+}
 
 static RELAY_TICKET_ORIGIN_GATES: OnceLock<Mutex<HashMap<String, Arc<RelayTicketOriginGate>>>> =
     OnceLock::new();
 
 struct RelayTicketOriginGate {
+    origin: String,
     permits: Arc<Semaphore>,
     backpressure_until: Mutex<Option<Instant>>,
 }
 
 impl RelayTicketOriginGate {
     fn shared(base_url: &str) -> Arc<Self> {
-        let origin = base_url.trim().trim_end_matches('/').to_string();
+        let origin = Url::parse(base_url.trim())
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| base_url.trim().trim_end_matches('/').to_string());
         let gates = RELAY_TICKET_ORIGIN_GATES.get_or_init(|| Mutex::new(HashMap::new()));
         let mut gates = gates
             .lock()
@@ -51,6 +98,7 @@ impl RelayTicketOriginGate {
             return Arc::clone(gate);
         }
         let gate = Arc::new(Self {
+            origin: origin.clone(),
             permits: Arc::new(Semaphore::new(
                 MAX_CONCURRENT_RELAY_TICKET_REQUESTS_PER_ORIGIN,
             )),
@@ -60,26 +108,39 @@ impl RelayTicketOriginGate {
         gate
     }
 
-    async fn acquire(self: &Arc<Self>, respect_backpressure: bool) -> OwnedSemaphorePermit {
-        loop {
-            let permit = Arc::clone(&self.permits)
-                .acquire_owned()
-                .await
-                .expect("relay ticket origin semaphore must remain open");
-            if !respect_backpressure {
-                return permit;
-            }
-            let delay = self
-                .backpressure_until
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .and_then(|until| until.checked_duration_since(Instant::now()));
-            let Some(delay) = delay else {
-                return permit;
-            };
-            drop(permit);
-            tokio::time::sleep(delay).await;
+    async fn acquire(self: &Arc<Self>, respect_backpressure: bool) -> Result<OwnedSemaphorePermit> {
+        if respect_backpressure && let Some(delay) = self.remaining_backpressure() {
+            return Err(RendezvousBackpressure::new(
+                &self.origin,
+                delay,
+                "Retry-After window is still active",
+            )
+            .into());
         }
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("relay ticket origin semaphore must remain open");
+        if !respect_backpressure {
+            return Ok(permit);
+        }
+        let Some(delay) = self.remaining_backpressure() else {
+            return Ok(permit);
+        };
+        drop(permit);
+        Err(RendezvousBackpressure::new(
+            &self.origin,
+            delay,
+            "Retry-After window became active while waiting for ticket admission",
+        )
+        .into())
+    }
+
+    fn remaining_backpressure(&self) -> Option<Duration> {
+        self.backpressure_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .and_then(|until| until.checked_duration_since(Instant::now()))
     }
 
     fn apply_backpressure(&self, retry_after: Duration) {
@@ -556,17 +617,41 @@ impl RendezvousControlClient {
                 self.config.cluster_id
             );
         }
+        self.issue_relay_ticket_with_http_budget(request, RELAY_TICKET_HTTP_TIMEOUT)
+            .await
+    }
+
+    async fn issue_relay_ticket_with_http_budget(
+        &self,
+        request: &RelayTicketRequest,
+        http_budget: Duration,
+    ) -> Result<RelayTicket> {
         let mut last_error = None;
+        let mut backpressure_error = None;
+        let mut remaining_http_budget = http_budget;
         for base_url in &self.config.rendezvous_urls {
-            match self
-                .issue_relay_ticket_from_endpoint(base_url, request)
-                .await
-            {
+            if remaining_http_budget.is_zero() {
+                break;
+            }
+            let (result, http_elapsed) = self
+                .issue_relay_ticket_from_endpoint_with_timeout(
+                    base_url,
+                    request,
+                    remaining_http_budget,
+                )
+                .await;
+            remaining_http_budget = remaining_http_budget.saturating_sub(http_elapsed);
+            match result {
                 Ok(ticket) => return Ok(ticket),
+                Err(error) if is_rendezvous_backpressure(&error) => {
+                    backpressure_error = Some(error)
+                }
                 Err(error) => last_error = Some(error),
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
+        Err(backpressure_error
+            .or(last_error)
+            .unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
     }
 
     pub async fn release_relay_ticket(&self, ticket: &RelayTicket) -> Result<bool> {
@@ -612,19 +697,10 @@ impl RendezvousControlClient {
     }
 
     pub async fn issue_iroh_relay_ticket(&self, endpoint_id: &str) -> Result<IrohRelayTicket> {
-        let request = IrohRelayTicketRequest {
-            cluster_id: self.config.cluster_id,
-            endpoint_id: endpoint_id.trim().to_string(),
-        };
-        request.validate()?;
-        let ticket: IrohRelayTicket = self
-            .post_json_first_valid(
-                "/control/iroh-relay/ticket",
-                &request,
-                IrohRelayTicket::validate,
-            )
+        let tickets = self
+            .issue_iroh_relay_tickets_progressively(endpoint_id)
             .await?;
-        Ok(ticket)
+        Ok(tickets.first_ticket().clone())
     }
 
     /// Releases this client's endpoint-bound lease at every configured
@@ -707,6 +783,7 @@ impl RendezvousControlClient {
             abort_handle: task.abort_handle(),
         };
         let mut last_error = None;
+        let mut backpressure_error = None;
 
         while let Some(result) = receiver.recv().await {
             match result {
@@ -717,11 +794,16 @@ impl RendezvousControlClient {
                         _collection_task: collection_task,
                     });
                 }
+                Err(error) if is_rendezvous_backpressure(&error) => {
+                    backpressure_error = Some(error)
+                }
                 Err(error) => last_error = Some(error),
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
+        Err(backpressure_error
+            .or(last_error)
+            .unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
     }
 
     pub async fn publish_bootstrap_claim(
@@ -1004,101 +1086,54 @@ impl RendezvousControlClient {
         Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
     }
 
-    async fn post_json_first_valid<Body, T, Validate>(
-        &self,
-        path: &str,
-        body: &Body,
-        validate: Validate,
-    ) -> Result<T>
-    where
-        Body: Serialize + ?Sized,
-        T: DeserializeOwned,
-        Validate: Fn(&T) -> Result<()>,
-    {
-        let mut attempts = FuturesUnordered::new();
-        let mut errors = std::iter::repeat_with(|| None)
-            .take(self.config.rendezvous_urls.len())
-            .collect::<Vec<Option<anyhow::Error>>>();
-
-        for (index, base_url) in self.config.rendezvous_urls.iter().enumerate() {
-            let url = control_url(base_url, path)?;
-            let request = self.http.post(url.clone()).json(body);
-            let base_url = base_url.clone();
-            let client_identity_pem = self.client_identity_pem.as_deref();
-            attempts.push(async move {
-                let result = match request.send().await {
-                    Ok(response) if response.status().is_success() => {
-                        response.json::<T>().await.map_err(|error| {
-                            format!("failed decoding rendezvous response from {url}: {error}")
-                        })
-                    }
-                    Ok(response) => Err(rendezvous_response_error(&url, response).await),
-                    Err(error) => Err(decorate_rendezvous_transport_error(
-                        format!("failed contacting rendezvous endpoint {url}: {error}"),
-                        client_identity_pem,
-                        unix_timestamp(),
-                    )),
-                };
-                (index, base_url, url, result)
-            });
-        }
-
-        while let Some((index, base_url, url, result)) = attempts.next().await {
-            match result {
-                Ok(payload) => match validate(&payload) {
-                    Ok(()) => {
-                        self.record_endpoint_result(&base_url, Ok(()), true);
-                        return Ok(payload);
-                    }
-                    Err(error) => {
-                        let message = format!("invalid rendezvous response from {url}: {error}");
-                        self.record_endpoint_result(&base_url, Err(message.clone()), true);
-                        errors[index] = Some(anyhow!(message));
-                    }
-                },
-                Err(message) => {
-                    self.record_endpoint_result(&base_url, Err(message.clone()), true);
-                    errors[index] = Some(anyhow!(message));
-                }
-            }
-        }
-
-        Err(errors
-            .into_iter()
-            .rev()
-            .flatten()
-            .next()
-            .unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
-    }
-
     async fn issue_iroh_relay_ticket_from_endpoint(
         &self,
         base_url: String,
         request: IrohRelayTicketRequest,
     ) -> Result<IrohRelayTicket> {
         let gate = RelayTicketOriginGate::shared(&base_url);
-        let _permit = gate.acquire(true).await;
+        let _permit = gate.acquire(true).await?;
         let url = control_url(&base_url, "/control/iroh-relay/ticket")?;
-        let result = match self.http.post(url.clone()).json(&request).send().await {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<IrohRelayTicket>().await {
-                    Ok(ticket) => ticket.validate().map(|()| ticket).map_err(|error| {
-                        format!("invalid rendezvous response from {url}: {error}")
-                    }),
-                    Err(error) => Err(format!(
-                        "failed decoding rendezvous response from {url}: {error}"
-                    )),
+        let result: Result<IrohRelayTicket> = match tokio::time::timeout(
+            RELAY_TICKET_HTTP_TIMEOUT,
+            Box::pin(async {
+                match self.http.post(url.clone()).json(&request).send().await {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<IrohRelayTicket>().await {
+                            Ok(ticket) => ticket.validate().map(|()| ticket).map_err(|error| {
+                                anyhow!("invalid rendezvous response from {url}: {error}")
+                            }),
+                            Err(error) => Err(anyhow!(
+                                "failed decoding rendezvous response from {url}: {error}"
+                            )),
+                        }
+                    }
+                    Ok(response) => {
+                        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                            let retry_after = retry_after_duration(&response);
+                            gate.apply_backpressure(retry_after);
+                            let detail = rendezvous_response_error(&url, response).await;
+                            Err(
+                                RendezvousBackpressure::new(base_url.clone(), retry_after, detail)
+                                    .into(),
+                            )
+                        } else {
+                            Err(anyhow!(rendezvous_response_error(&url, response).await))
+                        }
+                    }
+                    Err(error) => Err(anyhow!(self.decorate_transport_error(format!(
+                        "failed contacting rendezvous endpoint {url}: {error}"
+                    )))),
                 }
-            }
-            Ok(response) => {
-                if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                    gate.apply_backpressure(retry_after_duration(&response));
-                }
-                Err(rendezvous_response_error(&url, response).await)
-            }
-            Err(error) => Err(self.decorate_transport_error(format!(
-                "failed contacting rendezvous endpoint {url}: {error}"
-            ))),
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "rendezvous ticket request to {url} timed out after {:?}",
+                RELAY_TICKET_HTTP_TIMEOUT
+            )),
         };
 
         match result {
@@ -1106,61 +1141,83 @@ impl RendezvousControlClient {
                 self.record_endpoint_result(&base_url, Ok(()), true);
                 Ok(ticket)
             }
-            Err(message) => {
-                self.record_endpoint_result(&base_url, Err(message.clone()), true);
-                Err(anyhow!(message))
+            Err(error) => {
+                self.record_endpoint_result(&base_url, Err(error.to_string()), true);
+                Err(error)
             }
         }
     }
 
-    async fn issue_relay_ticket_from_endpoint(
+    async fn issue_relay_ticket_from_endpoint_with_timeout(
         &self,
         base_url: &str,
         request: &RelayTicketRequest,
-    ) -> Result<RelayTicket> {
+        http_timeout: Duration,
+    ) -> (Result<RelayTicket>, Duration) {
         let gate = RelayTicketOriginGate::shared(base_url);
-        let _permit = gate.acquire(true).await;
-        let url = control_url(base_url, "/control/relay/ticket")?;
-        let result = match self.http.post(url.clone()).json(request).send().await {
-            Ok(response) if response.status().is_success() => response
-                .json::<RelayTicket>()
-                .await
-                .map_err(|error| {
-                    format!("failed decoding rendezvous response from {url}: {error}")
-                })
-                .and_then(|mut ticket| {
-                    if ticket.security_mode != request.security_mode {
-                        return Err(format!(
-                            "rendezvous relay ticket security mode {:?} does not match requested mode {:?}",
-                            ticket.security_mode, request.security_mode
-                        ));
-                    }
-                    let issuing_origin = base_url.trim().trim_end_matches('/');
-                    ticket.relay_urls.sort_by_key(|url| {
-                        (url.trim().trim_end_matches('/') != issuing_origin) as u8
-                    });
-                    Ok(ticket)
-                }),
-            Ok(response) => {
-                if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                    gate.apply_backpressure(retry_after_duration(&response));
-                }
-                Err(rendezvous_response_error(&url, response).await)
-            }
-            Err(error) => Err(self.decorate_transport_error(format!(
-                "failed contacting rendezvous endpoint {url}: {error}"
-            ))),
+        let _permit = match gate.acquire(true).await {
+            Ok(permit) => permit,
+            Err(error) => return (Err(error), Duration::ZERO),
         };
-        match result {
-            Ok(ticket) => {
-                self.record_endpoint_result(base_url, Ok(()), true);
-                Ok(ticket)
-            }
-            Err(message) => {
-                self.record_endpoint_result(base_url, Err(message.clone()), true);
-                Err(anyhow!(message))
-            }
-        }
+        let url = match control_url(base_url, "/control/relay/ticket") {
+            Ok(url) => url,
+            Err(error) => return (Err(error), Duration::ZERO),
+        };
+        let http_started = Instant::now();
+        let result: Result<RelayTicket> = match tokio::time::timeout(
+            http_timeout,
+            Box::pin(async {
+                match self.http.post(url.clone()).json(request).send().await {
+                    Ok(response) if response.status().is_success() => response
+                        .json::<RelayTicket>()
+                        .await
+                        .map_err(|error| {
+                            anyhow!("failed decoding rendezvous response from {url}: {error}")
+                        })
+                        .and_then(|mut ticket| {
+                            if ticket.security_mode != request.security_mode {
+                                return Err(anyhow!(
+                                    "rendezvous relay ticket security mode {:?} does not match requested mode {:?}",
+                                    ticket.security_mode, request.security_mode
+                                ));
+                            }
+                            let issuing_origin = base_url.trim().trim_end_matches('/');
+                            ticket.relay_urls.sort_by_key(|url| {
+                                (url.trim().trim_end_matches('/') != issuing_origin) as u8
+                            });
+                            Ok(ticket)
+                        }),
+                    Ok(response) => {
+                        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                            let retry_after = retry_after_duration(&response);
+                            gate.apply_backpressure(retry_after);
+                            let detail = rendezvous_response_error(&url, response).await;
+                            Err(RendezvousBackpressure::new(base_url, retry_after, detail).into())
+                        } else {
+                            Err(anyhow!(rendezvous_response_error(&url, response).await))
+                        }
+                    }
+                    Err(error) => Err(anyhow!(self.decorate_transport_error(format!(
+                        "failed contacting rendezvous endpoint {url}: {error}"
+                    )))),
+                }
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "rendezvous ticket request to {url} timed out after {:?}",
+                http_timeout
+            )),
+        };
+        let http_elapsed = http_started.elapsed().min(http_timeout);
+        self.record_endpoint_result(
+            base_url,
+            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+            true,
+        );
+        (result, http_elapsed)
     }
 
     async fn release_iroh_relay_ticket_from_endpoint(
@@ -1169,19 +1226,32 @@ impl RendezvousControlClient {
         request: IrohRelayTicketReleaseRequest,
     ) -> Result<IrohRelayTicketReleaseResponse> {
         let gate = RelayTicketOriginGate::shared(&base_url);
-        let _permit = gate.acquire(false).await;
+        let _permit = gate.acquire(false).await?;
         let url = control_url(&base_url, "/control/iroh-relay/ticket/release")?;
-        let result = match self.http.delete(url.clone()).json(&request).send().await {
-            Ok(response) if response.status().is_success() => response
-                .json::<IrohRelayTicketReleaseResponse>()
-                .await
-                .map_err(|error| {
-                    format!("failed decoding rendezvous response from {url}: {error}")
-                }),
-            Ok(response) => Err(rendezvous_response_error(&url, response).await),
-            Err(error) => Err(self.decorate_transport_error(format!(
-                "failed contacting rendezvous endpoint {url}: {error}"
-            ))),
+        let result = match tokio::time::timeout(
+            RELAY_TICKET_HTTP_TIMEOUT,
+            Box::pin(async {
+                match self.http.delete(url.clone()).json(&request).send().await {
+                    Ok(response) if response.status().is_success() => response
+                        .json::<IrohRelayTicketReleaseResponse>()
+                        .await
+                        .map_err(|error| {
+                            format!("failed decoding rendezvous response from {url}: {error}")
+                        }),
+                    Ok(response) => Err(rendezvous_response_error(&url, response).await),
+                    Err(error) => Err(self.decorate_transport_error(format!(
+                        "failed contacting rendezvous endpoint {url}: {error}"
+                    ))),
+                }
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "rendezvous ticket release to {url} timed out after {:?}",
+                RELAY_TICKET_HTTP_TIMEOUT
+            )),
         };
         match result {
             Ok(response) => {
@@ -1201,19 +1271,32 @@ impl RendezvousControlClient {
         request: RelayTicketReleaseRequest,
     ) -> Result<RelayTicketReleaseResponse> {
         let gate = RelayTicketOriginGate::shared(&base_url);
-        let _permit = gate.acquire(false).await;
+        let _permit = gate.acquire(false).await?;
         let url = control_url(&base_url, "/control/relay/ticket/release")?;
-        let result = match self.http.delete(url.clone()).json(&request).send().await {
-            Ok(response) if response.status().is_success() => response
-                .json::<RelayTicketReleaseResponse>()
-                .await
-                .map_err(|error| {
-                    format!("failed decoding rendezvous response from {url}: {error}")
-                }),
-            Ok(response) => Err(rendezvous_response_error(&url, response).await),
-            Err(error) => Err(self.decorate_transport_error(format!(
-                "failed contacting rendezvous endpoint {url}: {error}"
-            ))),
+        let result = match tokio::time::timeout(
+            RELAY_TICKET_HTTP_TIMEOUT,
+            Box::pin(async {
+                match self.http.delete(url.clone()).json(&request).send().await {
+                    Ok(response) if response.status().is_success() => response
+                        .json::<RelayTicketReleaseResponse>()
+                        .await
+                        .map_err(|error| {
+                            format!("failed decoding rendezvous response from {url}: {error}")
+                        }),
+                    Ok(response) => Err(rendezvous_response_error(&url, response).await),
+                    Err(error) => Err(self.decorate_transport_error(format!(
+                        "failed contacting rendezvous endpoint {url}: {error}"
+                    ))),
+                }
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "rendezvous ticket release to {url} timed out after {:?}",
+                RELAY_TICKET_HTTP_TIMEOUT
+            )),
         };
         match result {
             Ok(response) => {
@@ -1997,16 +2080,26 @@ mod tests {
             cluster_id,
             endpoint_id: iroh::SecretKey::generate().public().to_string(),
         };
-        client
+        let first_error = client
             .issue_iroh_relay_ticket_from_endpoint(base_url.clone(), request())
             .await
             .expect_err("first request should receive backpressure");
+        assert!(is_rendezvous_backpressure(&first_error));
         let started = Instant::now();
+        let immediate_error = client
+            .issue_iroh_relay_ticket_from_endpoint(base_url.clone(), request())
+            .await
+            .expect_err("backpressure window should fail fast");
+        assert!(is_rendezvous_backpressure(&immediate_error));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
         client
             .issue_iroh_relay_ticket_from_endpoint(base_url, request())
             .await
-            .expect("second request should succeed after backpressure delay");
-        assert!(started.elapsed() >= Duration::from_millis(900));
+            .expect("request should succeed after backpressure expires");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
 
         server.abort();
         let _ = server.await;
@@ -2230,6 +2323,161 @@ mod tests {
         assert!(message.contains("HTTP status client error (400 Bad Request)"));
         assert!(message.contains("relay ticket rejection:"));
         assert!(message.contains("[response truncated]"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_multi_origin_failover_shares_one_http_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cluster_id = Uuid::now_v7();
+        let first_router = Router::new().route(
+            "/control/relay/ticket",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                (StatusCode::BAD_GATEWAY, "first rendezvous unavailable")
+            }),
+        );
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("first listener should bind");
+        let first_url = format!(
+            "http://{}",
+            first_listener.local_addr().expect("first listener address")
+        );
+        let first_server = tokio::spawn(async move {
+            axum::serve(first_listener, first_router)
+                .await
+                .expect("first rendezvous server should run");
+        });
+
+        let second_requests = Arc::new(AtomicUsize::new(0));
+        let second_requests_for_handler = Arc::clone(&second_requests);
+        let second_router = Router::new().route(
+            "/control/relay/ticket",
+            post(move || {
+                let second_requests = Arc::clone(&second_requests_for_handler);
+                async move {
+                    second_requests.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    StatusCode::GATEWAY_TIMEOUT
+                }
+            }),
+        );
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("second listener should bind");
+        let second_url = format!(
+            "http://{}",
+            second_listener
+                .local_addr()
+                .expect("second listener address")
+        );
+        let second_server = tokio::spawn(async move {
+            axum::serve(second_listener, second_router)
+                .await
+                .expect("second rendezvous server should run");
+        });
+
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![first_url, second_url],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+        let request = RelayTicketRequest {
+            cluster_id,
+            source: PeerIdentity::Device(Uuid::now_v7()),
+            target: PeerIdentity::Node(NodeId::now_v7()),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: RelayTunnelSecurityMode::InnerMtls,
+            requested_expires_in_secs: Some(60),
+        };
+        let started = Instant::now();
+        let error = client
+            .issue_relay_ticket_with_http_budget(&request, Duration::from_millis(250))
+            .await
+            .expect_err("the shared HTTP budget should expire on the second origin");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() >= Duration::from_millis(225));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(second_requests.load(Ordering::SeqCst), 1);
+
+        first_server.abort();
+        let _ = first_server.await;
+        second_server.abort();
+        let _ = second_server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_ticket_admission_wait_does_not_consume_http_budget() {
+        let cluster_id = Uuid::now_v7();
+        let router = Router::new().route(
+            "/control/relay/ticket",
+            post(|| async { (StatusCode::BAD_GATEWAY, "rendezvous unavailable") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("rendezvous server should run");
+        });
+        let gate = RelayTicketOriginGate::shared(&base_url);
+        let mut held_permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_RELAY_TICKET_REQUESTS_PER_ORIGIN {
+            held_permits.push(
+                gate.acquire(false)
+                    .await
+                    .expect("test should acquire every origin permit"),
+            );
+        }
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![base_url],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+        let request = RelayTicketRequest {
+            cluster_id,
+            source: PeerIdentity::Device(Uuid::now_v7()),
+            target: PeerIdentity::Node(NodeId::now_v7()),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: RelayTunnelSecurityMode::InnerMtls,
+            requested_expires_in_secs: Some(60),
+        };
+        let started = Instant::now();
+        let request_task = tokio::spawn(async move {
+            client
+                .issue_relay_ticket_with_http_budget(&request, Duration::from_millis(100))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(175)).await;
+        drop(held_permits);
+        let error = request_task
+            .await
+            .expect("ticket request task should complete")
+            .expect_err("the test rendezvous response should fail");
+
+        assert!(error.to_string().contains("502 Bad Gateway"));
+        assert!(started.elapsed() >= Duration::from_millis(175));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
         server.abort();
         let _ = server.await;
     }

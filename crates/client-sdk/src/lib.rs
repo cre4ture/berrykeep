@@ -3,6 +3,7 @@ pub mod client_node;
 pub mod connection;
 pub mod content_addressed_client_cache;
 pub mod device_auth;
+mod iroh_lease_budget;
 pub mod ironmesh_client;
 pub mod latency_probe;
 mod managed_client;
