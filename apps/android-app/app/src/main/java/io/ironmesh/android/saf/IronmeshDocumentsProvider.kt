@@ -238,6 +238,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         }
 
         val entry = resolveFileEntry(target.path)
+        val thumbnailProfile = thumbnailProfileForSizeHint(sizeHint)
 
         try {
             val pipe = ParcelFileDescriptor.createPipe()
@@ -254,11 +255,12 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                     try {
                         runBlocking {
                             thumbnailStreamer.streamTo(
-                                resolveConnectionInput(),
-                                entry,
-                                output,
-                                resolveServerCaPem(),
-                                resolveClientIdentityJson(),
+                                connectionInput = resolveConnectionInput(),
+                                entry = entry,
+                                output = output,
+                                serverCaPem = resolveServerCaPem(),
+                                clientIdentityJson = resolveClientIdentityJson(),
+                                profile = thumbnailProfile,
                             )
                         }
                         output.flush()
@@ -276,6 +278,10 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         } catch (e: IOException) {
             throw FileNotFoundException("failed to open thumbnail: ${e.message}")
         }
+    }
+
+    private fun thumbnailProfileForSizeHint(sizeHint: Point): IronmeshThumbnailProfile {
+        return thumbnailProfileForRequestedSize(sizeHint.x, sizeHint.y)
     }
 
     private fun includeDocumentRow(cursor: MatrixCursor, documentId: String) {

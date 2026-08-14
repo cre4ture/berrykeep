@@ -79,6 +79,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import io.ironmesh.android.DocumentBitmapLoader
 import io.ironmesh.android.R
+import io.ironmesh.android.saf.MOBILE_VIEWER_THUMBNAIL_MAX_DIMENSION_PX
 import io.ironmesh.android.ui.GalleryCollectionState
 import io.ironmesh.android.ui.GalleryImageItem
 import io.ironmesh.android.ui.GalleryLoadError
@@ -94,6 +95,8 @@ import kotlinx.coroutines.withContext
 import kotlin.math.abs
 
 private const val GALLERY_PAGE_KEY_PREFIX = "gallery-page:"
+private const val GALLERY_FULL_RESOLUTION_MAX_DECODE_DIMENSION_PX = 2048
+private const val GALLERY_FULL_RESOLUTION_ZOOM_THRESHOLD = 1.01f
 
 internal enum class GalleryContentPresentation {
     LOADING,
@@ -691,6 +694,16 @@ private sealed interface GalleryFullscreenImageState {
     data object Failed : GalleryFullscreenImageState
 }
 
+private sealed interface GalleryFullResolutionState {
+    data object NotRequested : GalleryFullResolutionState
+
+    data object Loading : GalleryFullResolutionState
+
+    data class Loaded(val bitmap: Bitmap) : GalleryFullResolutionState
+
+    data object Failed : GalleryFullResolutionState
+}
+
 @Composable
 private fun GalleryFullscreenPage(
     item: GalleryImageItem?,
@@ -703,7 +716,9 @@ private fun GalleryFullscreenPage(
     var scale by remember(documentUri) { mutableFloatStateOf(1f) }
     var offsetX by remember(documentUri) { mutableFloatStateOf(0f) }
     var offsetY by remember(documentUri) { mutableFloatStateOf(0f) }
-    val imageState by produceState<GalleryFullscreenImageState>(
+    var fullResolutionRequested by remember(documentUri) { mutableStateOf(false) }
+    var fullResolutionRetryGeneration by remember(documentUri) { mutableIntStateOf(0) }
+    val previewState by produceState<GalleryFullscreenImageState>(
         initialValue = GalleryFullscreenImageState.Loading,
         key1 = documentUri,
     ) {
@@ -714,19 +729,41 @@ private fun GalleryFullscreenPage(
             return@produceState
         }
         value = withContext(Dispatchers.IO) {
-            DocumentBitmapLoader.load(
-                context = context,
+            loadDocumentThumbnail(
                 contentResolver = context.contentResolver,
                 documentUri = resolvedItem.documentUri,
-                maxDimensionPx = 2048,
+                sizePx = MOBILE_VIEWER_THUMBNAIL_MAX_DIMENSION_PX,
             )?.let { bitmap ->
                 GalleryFullscreenImageState.Loaded(bitmap)
             } ?: GalleryFullscreenImageState.Failed
         }
     }
+    val fullResolutionState by produceState<GalleryFullResolutionState>(
+        initialValue = GalleryFullResolutionState.NotRequested,
+        key1 = documentUri,
+        key2 = fullResolutionRequested,
+        key3 = fullResolutionRetryGeneration,
+    ) {
+        val resolvedItem = item
+        if (!fullResolutionRequested || resolvedItem == null) {
+            value = GalleryFullResolutionState.NotRequested
+            return@produceState
+        }
+        value = GalleryFullResolutionState.Loading
+        value = withContext(Dispatchers.IO) {
+            DocumentBitmapLoader.load(
+                context = context,
+                contentResolver = context.contentResolver,
+                documentUri = resolvedItem.documentUri,
+                maxDimensionPx = GALLERY_FULL_RESOLUTION_MAX_DECODE_DIMENSION_PX,
+            )?.let { bitmap ->
+                GalleryFullResolutionState.Loaded(bitmap)
+            } ?: GalleryFullResolutionState.Failed
+        }
+    }
 
     LaunchedEffect(scale) {
-        onZoomStateChanged(scale > 1.01f)
+        onZoomStateChanged(shouldRequestGalleryFullResolution(scale))
     }
 
     BoxWithConstraints(
@@ -737,53 +774,85 @@ private fun GalleryFullscreenPage(
     ) {
         val widthPx = with(density) { maxWidth.toPx() }
         val heightPx = with(density) { maxHeight.toPx() }
-        when (val state = imageState) {
-            is GalleryFullscreenImageState.Loaded -> {
-                val loadedBitmap = state.bitmap
-                val fittedSize = fittedImageSize(
-                    imageWidth = loadedBitmap.width.toFloat(),
-                    imageHeight = loadedBitmap.height.toFloat(),
-                    containerWidth = widthPx,
-                    containerHeight = heightPx,
-                )
-                Image(
-                    bitmap = loadedBitmap.asImageBitmap(),
-                    contentDescription = item?.displayName ?: "Gallery image",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .zoomableImageGesture(
-                            gestureKey = item?.documentUri,
-                            fittedSize = fittedSize,
-                            containerWidth = widthPx,
-                            containerHeight = heightPx,
-                            scale = { scale },
-                            offset = { Offset(offsetX, offsetY) },
-                            onTransform = { newScale, newOffset ->
-                                scale = newScale
-                                offsetX = newOffset.x
-                                offsetY = newOffset.y
-                            },
-                        )
-                        .graphicsLayer {
-                            scaleX = scale
-                            scaleY = scale
-                            translationX = offsetX
-                            translationY = offsetY
+        val displayedBitmap = (fullResolutionState as? GalleryFullResolutionState.Loaded)?.bitmap
+            ?: (previewState as? GalleryFullscreenImageState.Loaded)?.bitmap
+        if (displayedBitmap != null) {
+            val fittedSize = fittedImageSize(
+                imageWidth = displayedBitmap.width.toFloat(),
+                imageHeight = displayedBitmap.height.toFloat(),
+                containerWidth = widthPx,
+                containerHeight = heightPx,
+            )
+            Image(
+                bitmap = displayedBitmap.asImageBitmap(),
+                contentDescription = item?.displayName ?: "Gallery image",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zoomableImageGesture(
+                        gestureKey = item?.documentUri,
+                        fittedSize = fittedSize,
+                        containerWidth = widthPx,
+                        containerHeight = heightPx,
+                        scale = { scale },
+                        offset = { Offset(offsetX, offsetY) },
+                        onFullResolutionRequested = {
+                            fullResolutionRequested = true
                         },
-                )
-            }
+                        onTransform = { newScale, newOffset ->
+                            scale = newScale
+                            offsetX = newOffset.x
+                            offsetY = newOffset.y
+                        },
+                    )
+                    .graphicsLayer {
+                        scaleX = scale
+                        scaleY = scale
+                        translationX = offsetX
+                        translationY = offsetY
+                    },
+            )
+            when (fullResolutionState) {
+                GalleryFullResolutionState.Loading -> {
+                    CircularProgressIndicator(
+                        color = Color.White,
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .navigationBarsPadding()
+                            .padding(24.dp)
+                            .size(28.dp),
+                    )
+                }
 
-            GalleryFullscreenImageState.Loading -> {
-                CircularProgressIndicator(color = Color.White)
-            }
+                GalleryFullResolutionState.Failed -> {
+                    OutlinedButton(
+                        onClick = { fullResolutionRetryGeneration += 1 },
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .navigationBarsPadding()
+                            .padding(bottom = 72.dp),
+                    ) {
+                        Text("Retry full resolution")
+                    }
+                }
 
-            GalleryFullscreenImageState.Failed -> {
-                Text(
-                    text = "Image unavailable",
-                    color = Color.White,
-                    style = MaterialTheme.typography.titleMedium,
-                )
+                else -> Unit
+            }
+        } else {
+            when (previewState) {
+                GalleryFullscreenImageState.Loading -> {
+                    CircularProgressIndicator(color = Color.White)
+                }
+
+                GalleryFullscreenImageState.Failed -> {
+                    Text(
+                        text = "Image unavailable",
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                }
+
+                is GalleryFullscreenImageState.Loaded -> Unit
             }
         }
     }
@@ -933,6 +1002,7 @@ private fun Modifier.zoomableImageGesture(
     containerHeight: Float,
     scale: () -> Float,
     offset: () -> Offset,
+    onFullResolutionRequested: () -> Unit,
     onTransform: (Float, Offset) -> Unit,
 ): Modifier = pointerInput(gestureKey, fittedSize, containerWidth, containerHeight) {
     awaitEachGesture {
@@ -960,6 +1030,10 @@ private fun Modifier.zoomableImageGesture(
                 continue
             }
 
+            if (shouldRequestGalleryFullResolution(nextScale)) {
+                onFullResolutionRequested()
+            }
+
             onTransform(
                 nextScale,
                 boundedImageOffset(
@@ -980,6 +1054,9 @@ private fun Modifier.zoomableImageGesture(
         } while (event.changes.any { it.pressed })
     }
 }
+
+internal fun shouldRequestGalleryFullResolution(scale: Float): Boolean =
+    scale > GALLERY_FULL_RESOLUTION_ZOOM_THRESHOLD
 
 private data class FittedImageSize(
     val width: Float,
