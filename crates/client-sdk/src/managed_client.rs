@@ -458,6 +458,9 @@ impl ManagedIronMeshClient {
     }
 
     pub async fn refresh_routes(&self, reason: RouteRefreshReason) -> RouteRefreshOutcome {
+        // Lifecycle and periodic signals drive route maintenance independently from discovery.
+        // Even a coalesced or failed discovery pass can therefore validate a due static backup.
+        self.client.spawn_due_connection_route_refresh();
         if matches!(reason, RouteRefreshReason::Stale) && !self.discovery_is_stale() {
             return self.last_outcome();
         }
@@ -601,8 +604,6 @@ impl ManagedIronMeshClient {
                         .adopt_discovered_targets(
                             targets,
                             identity.clone(),
-                            telemetry.reason,
-                            "partial",
                         )
                         .await
                     {
@@ -653,7 +654,7 @@ impl ManagedIronMeshClient {
         // the first usable candidate alive through final reconciliation.
         while let Ok(targets) = updates_receiver.try_recv() {
             let membership = match self
-                .adopt_discovered_targets(targets, identity.clone(), telemetry.reason, "partial")
+                .adopt_discovered_targets(targets, identity.clone())
                 .await
             {
                 Ok(membership) => membership,
@@ -679,7 +680,7 @@ impl ManagedIronMeshClient {
         }
 
         let membership = match self
-            .adopt_discovered_targets(refreshed_targets, identity, telemetry.reason, "complete")
+            .adopt_discovered_targets(refreshed_targets, identity)
             .await
         {
             Ok(membership) => membership,
@@ -722,8 +723,6 @@ impl ManagedIronMeshClient {
         &self,
         refreshed_targets: Vec<PlannedConnectionBootstrapTarget>,
         identity: Option<ClientIdentityMaterial>,
-        refresh_reason: RouteRefreshReason,
-        discovery_update: &'static str,
     ) -> Result<(usize, usize, usize)> {
         let desired_targets = self.reconcile_target_set(refreshed_targets);
         let refreshed_client = tokio::task::spawn_blocking(move || {
@@ -741,17 +740,6 @@ impl ManagedIronMeshClient {
             .reconcile_transport_membership(&refreshed_client);
         let routes_after = self.client.connection_route_snapshot();
         log_dynamic_route_membership_changes(&routes_before, &routes_after);
-        let routes_scheduled = self.client.spawn_due_connection_route_refresh();
-        if routes_scheduled > 0 {
-            tracing::info!(
-                event = "dynamic_route_probe_scheduled",
-                refresh_reason = refresh_reason.as_str(),
-                discovery_update,
-                routes_added = membership.0,
-                routes_scheduled,
-                "probing due discovered routes without blocking the active fallback"
-            );
-        }
         Ok(membership)
     }
 

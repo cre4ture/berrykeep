@@ -231,7 +231,13 @@ fn background_probe_failures_are_scoped_as_maintenance_attempts() {
 #[test]
 fn connection_diagnostics_timestamp_does_not_precede_last_route_use() {
     let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
-    client.transport_router.record_route_used(0, unix_ts_ms());
+    let endpoint = client
+        .transport_router
+        .endpoint(0)
+        .expect("the route should exist");
+    client
+        .transport_router
+        .record_route_used(0, &endpoint, unix_ts_ms());
 
     let diagnostics = client.connection_diagnostics();
     let last_used_unix_ms = diagnostics.endpoints[0]
@@ -401,7 +407,7 @@ fn retired_failure_tombstones_are_capped_by_oldest_expiry() {
         };
         let retired = RetiredRouteFailureState::capture(&state, index as u64)
             .expect("failed state should produce a tombstone");
-        retired_failure_states.insert(format!("route-{index}"), retired);
+        retired_failure_states.insert(RouteId::new(format!("route-{index}")), retired);
     }
 
     prune_retired_failure_states(&mut retired_failure_states);
@@ -411,12 +417,12 @@ fn retired_failure_tombstones_are_capped_by_oldest_expiry() {
         CLIENT_ROUTE_RETIRED_FAILURE_STATE_LIMIT
     );
     for index in 0..5 {
-        assert!(!retired_failure_states.contains_key(&format!("route-{index}")));
+        assert!(!retired_failure_states.contains_key(&RouteId::new(format!("route-{index}"))));
     }
-    assert!(retired_failure_states.contains_key(&format!(
+    assert!(retired_failure_states.contains_key(&RouteId::new(format!(
         "route-{}",
         CLIENT_ROUTE_RETIRED_FAILURE_STATE_LIMIT + 4
-    )));
+    ))));
 }
 
 #[test]
@@ -452,6 +458,237 @@ fn mobile_background_policy_claims_one_candidate_per_batch() {
     assert_eq!(first_batch[0].sampling.warmup_count, 0);
     assert_eq!(first_batch[0].sampling.sample_count, 1);
     assert!(second_batch.is_empty());
+}
+
+#[test]
+fn route_state_transitions_keep_validation_circuit_and_probe_orthogonal() {
+    let mut state = ClientEndpointState::default();
+    assert_eq!(state.validation, RouteValidationState::Probation);
+    assert_eq!(state.circuit, RouteCircuitState::Closed);
+    assert_eq!(state.probe, RouteProbeState::Idle);
+
+    assert!(state.begin_probe(123));
+    assert!(
+        !state.begin_probe(124),
+        "a probe claim must be single-flight"
+    );
+    state.record_success(8.0, 0, true);
+    assert_eq!(state.validation, RouteValidationState::Validated);
+    assert_eq!(state.circuit, RouteCircuitState::Closed);
+    assert_eq!(state.probe, RouteProbeState::Idle);
+
+    state.record_failure("transport failed", false);
+    assert_eq!(state.validation, RouteValidationState::Validated);
+    assert!(matches!(state.circuit, RouteCircuitState::OpenUntil(_)));
+    assert_eq!(state.probe, RouteProbeState::Idle);
+}
+
+#[test]
+fn stable_route_plan_survives_registry_reordering() {
+    let route_a = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18100/");
+    let route_b = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18101/");
+    let client =
+        IronMeshClient::combine(vec![route_a(), route_b()]).expect("routes should combine");
+    let planned = client.transport_router.foreground_route_ids();
+    let planned_primary = planned[0].clone();
+
+    let reordered =
+        IronMeshClient::combine(vec![route_b(), route_a()]).expect("routes should reorder");
+    client.reconcile_transport_membership(&reordered);
+
+    let mut executor = RequestExecutor::new(planned);
+    let selected = executor
+        .next_route(|route_id| client.transport_router.route_admission(route_id))
+        .expect("the stable primary should remain selectable");
+    assert_eq!(selected, planned_primary);
+    let (current_index, endpoint) = client
+        .transport_router
+        .endpoint_by_id(&selected)
+        .expect("the stable route should resolve after reconciliation");
+    assert_eq!(current_index, 1);
+    assert!(endpoint.descriptor.locator.contains(":18100"));
+}
+
+#[test]
+fn route_affinity_keeps_exact_route_ahead_of_ranked_same_node_fallbacks() {
+    let target_node_id = NodeId::new_v4();
+    let client = IronMeshClient::combine(vec![
+        IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+            "http://127.0.0.1:18102/".to_string(),
+            HttpClient::new(),
+            Some(target_node_id),
+            None,
+            None,
+        ),
+        IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+            "http://127.0.0.1:18103/".to_string(),
+            HttpClient::new(),
+            Some(target_node_id),
+            None,
+            None,
+        ),
+    ])
+    .expect("routes should combine");
+    let preferred = client
+        .transport_router
+        .endpoint(0)
+        .expect("preferred route should exist");
+    let fallback = client
+        .transport_router
+        .endpoint(1)
+        .expect("fallback route should exist");
+    {
+        let mut preferred_state = lock_endpoint_state(&preferred.state);
+        preferred_state.validation = RouteValidationState::Validated;
+        preferred_state.ewma_latency_ms = Some(500.0);
+    }
+    {
+        let mut fallback_state = lock_endpoint_state(&fallback.state);
+        fallback_state.validation = RouteValidationState::Validated;
+        fallback_state.ewma_latency_ms = Some(1.0);
+    }
+
+    let ranked = client.transport_router.foreground_route_ids();
+    assert_eq!(ranked[0], fallback.descriptor.route_id);
+    let affinity = NodeRouteAffinity::from_endpoint(&preferred);
+    let with_affinity = client.route_ids_for_affinity(Some(&affinity));
+
+    assert_eq!(with_affinity[0], preferred.descriptor.route_id);
+    assert_eq!(with_affinity[1], fallback.descriptor.route_id);
+}
+
+#[test]
+fn preflight_failure_is_recorded_against_captured_route_after_reordering() {
+    let route_a = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18105/");
+    let route_b = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18106/");
+    let client =
+        IronMeshClient::combine(vec![route_a(), route_b()]).expect("routes should combine");
+    let mut execution =
+        ForegroundRequestExecutor::new(&client, client.transport_router.foreground_route_ids());
+    let (_original_index, captured_endpoint) = execution.next().expect("primary should resolve");
+
+    let reordered =
+        IronMeshClient::combine(vec![route_b(), route_a()]).expect("routes should reorder");
+    client.reconcile_transport_membership(&reordered);
+    execution.record_preflight_failure(&captured_endpoint, anyhow!("rewrite failed"));
+
+    let endpoints = client.transport_router.endpoints_snapshot();
+    let route_a_failures = endpoints
+        .iter()
+        .find(|endpoint| endpoint.descriptor.locator.contains(":18105"))
+        .map(|endpoint| lock_endpoint_state(&endpoint.state).total_failures)
+        .expect("route A should remain registered");
+    let route_b_failures = endpoints
+        .iter()
+        .find(|endpoint| endpoint.descriptor.locator.contains(":18106"))
+        .map(|endpoint| lock_endpoint_state(&endpoint.state).total_failures)
+        .expect("route B should remain registered");
+    assert_eq!(route_a_failures, 1);
+    assert_eq!(route_b_failures, 0);
+}
+
+#[test]
+fn route_use_is_recorded_against_captured_route_after_reordering() {
+    let route_a = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18107/");
+    let route_b = || IronMeshClient::from_direct_base_url("http://127.0.0.1:18108/");
+    let client =
+        IronMeshClient::combine(vec![route_a(), route_b()]).expect("routes should combine");
+    let mut execution =
+        ForegroundRequestExecutor::new(&client, client.transport_router.foreground_route_ids());
+    let (original_index, captured_endpoint) = execution.next().expect("primary should resolve");
+
+    let reordered =
+        IronMeshClient::combine(vec![route_b(), route_a()]).expect("routes should reorder");
+    client.reconcile_transport_membership(&reordered);
+    client
+        .transport_router
+        .record_route_used(original_index, &captured_endpoint, unix_ts_ms());
+
+    let endpoints = client.transport_router.endpoints_snapshot();
+    let route_a_last_used = endpoints
+        .iter()
+        .find(|endpoint| endpoint.descriptor.locator.contains(":18107"))
+        .and_then(|endpoint| lock_endpoint_state(&endpoint.state).last_used_unix_ms);
+    let route_b_last_used = endpoints
+        .iter()
+        .find(|endpoint| endpoint.descriptor.locator.contains(":18108"))
+        .and_then(|endpoint| lock_endpoint_state(&endpoint.state).last_used_unix_ms);
+    assert!(route_a_last_used.is_some());
+    assert_eq!(route_b_last_used, None);
+}
+
+#[test]
+fn concurrent_plan_avoids_route_after_another_request_reports_failure() {
+    let client = IronMeshClient::combine(vec![
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18110/"),
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18111/"),
+    ])
+    .expect("routes should combine");
+    let plan = client.transport_router.foreground_route_ids();
+    let primary = plan[0].clone();
+    let backup = plan[1].clone();
+    let mut first_request = RequestExecutor::new(plan.clone());
+    let mut concurrent_request = RequestExecutor::new(plan);
+
+    assert_eq!(
+        first_request.next_route(|route_id| client.transport_router.route_admission(route_id)),
+        Some(primary.clone())
+    );
+    let (primary_index, _) = client
+        .transport_router
+        .endpoint_by_id(&primary)
+        .expect("primary should exist");
+    client
+        .transport_router
+        .record_failure(primary_index, "concurrent timeout");
+
+    assert_eq!(
+        concurrent_request.next_route(|route_id| client.transport_router.route_admission(route_id)),
+        Some(backup),
+        "admission is resolved lazily, so the fresh circuit state must win"
+    );
+}
+
+#[test]
+fn availability_target_stops_warming_additional_probation_routes() {
+    let client = IronMeshClient::combine(vec![
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18120/"),
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18121/"),
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18122/"),
+        IronMeshClient::from_direct_base_url("http://127.0.0.1:18123/"),
+    ])
+    .expect("routes should combine")
+    .with_route_maintenance_policy(ClientRouteMaintenancePolicy {
+        background_probe_batch_min_interval: Duration::ZERO,
+        ..ClientRouteMaintenancePolicy::mobile_background()
+    });
+
+    for _ in 0..2 {
+        let candidates = client.transport_router.claim_background_probe_candidates();
+        assert_eq!(candidates.len(), 1);
+        client
+            .transport_router
+            .record_background_probe_candidate_successes(&candidates[0], &[5.0]);
+    }
+
+    assert!(
+        client
+            .transport_router
+            .claim_background_probe_candidates()
+            .is_empty(),
+        "one primary plus one validated backup satisfies the mobile target"
+    );
+    assert_eq!(
+        client
+            .transport_router
+            .endpoints_snapshot()
+            .iter()
+            .filter(|endpoint| {
+                lock_endpoint_state(&endpoint.state).validation == RouteValidationState::Validated
+            })
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -550,8 +787,23 @@ async fn newly_discovered_direct_quic_is_ranked_first_and_probed_while_on_probat
     );
     assert!(direct_quic.last_used_unix_ms.is_none());
 
-    static_client.spawn_due_connection_route_refresh();
-    let after_probe_scheduled = static_client.connection_route_snapshot();
+    assert!(static_client.spawn_due_connection_route_refresh());
+    let after_probe_scheduled = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = static_client.connection_route_snapshot();
+            if snapshot
+                .endpoints
+                .iter()
+                .find(|route| route.path_kind == TransportPathKind::DirectQuic)
+                .is_some_and(|route| route.last_background_probe_unix_ms.is_some())
+            {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the shared supervisor should claim the due route promptly");
     let direct_quic = after_probe_scheduled
         .endpoints
         .iter()
@@ -671,21 +923,21 @@ fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
         ..ClientEndpointState::default()
     };
     let direct = ClientEndpointDescriptor {
-        route_key: "direct-route".to_string(),
+        route_id: RouteId::new("direct-route"),
         path_kind: ClientEndpointPathKind::Direct,
         transport_path_kind: TransportPathKind::DirectHttps,
         locator: "https://direct.example".to_string(),
         bootstrap_rank: 0,
     };
     let relay = ClientEndpointDescriptor {
-        route_key: "relay-route".to_string(),
+        route_id: RouteId::new("relay-route"),
         path_kind: ClientEndpointPathKind::Relay,
         transport_path_kind: TransportPathKind::RelayTunnel,
         locator: "relay://node@example".to_string(),
         bootstrap_rank: 0,
     };
     let direct_quic = ClientEndpointDescriptor {
-        route_key: "direct-quic-route".to_string(),
+        route_id: RouteId::new("direct-quic-route"),
         path_kind: ClientEndpointPathKind::Direct,
         transport_path_kind: TransportPathKind::DirectQuic,
         locator: "iroh://direct-quic".to_string(),
@@ -5428,7 +5680,10 @@ fn probation_is_transport_agnostic_and_clears_after_successful_probe() {
         let mut state = lock_endpoint_state(&relay_endpoint.state);
         record_endpoint_success_sample(&mut state, 120.0, 0, false);
     }
-    assert!(!lock_endpoint_state(&direct_endpoint.state).foreground_validated);
+    assert_eq!(
+        lock_endpoint_state(&direct_endpoint.state).validation,
+        RouteValidationState::Probation
+    );
     assert_eq!(relay_active.transport_router.rank_indices()[0], 1);
     assert_eq!(
         relay_active.transport_router.foreground_route_indices(),
@@ -5437,7 +5692,10 @@ fn probation_is_transport_agnostic_and_clears_after_successful_probe() {
     relay_active
         .transport_router
         .record_background_probe_successes(1, &[20.0]);
-    assert!(lock_endpoint_state(&direct_endpoint.state).foreground_validated);
+    assert_eq!(
+        lock_endpoint_state(&direct_endpoint.state).validation,
+        RouteValidationState::Validated
+    );
     assert_eq!(
         relay_active.transport_router.foreground_route_indices(),
         vec![1, 0]
@@ -5468,7 +5726,10 @@ fn probation_is_transport_agnostic_and_clears_after_successful_probe() {
         let mut state = lock_endpoint_state(&direct_endpoint.state);
         record_endpoint_success_sample(&mut state, 1_000.0, 0, false);
     }
-    assert!(!lock_endpoint_state(&relay_endpoint.state).foreground_validated);
+    assert_eq!(
+        lock_endpoint_state(&relay_endpoint.state).validation,
+        RouteValidationState::Probation
+    );
     assert_eq!(direct_active.transport_router.rank_indices()[0], 1);
     assert_eq!(
         direct_active.transport_router.foreground_route_indices(),
@@ -5477,7 +5738,10 @@ fn probation_is_transport_agnostic_and_clears_after_successful_probe() {
     direct_active
         .transport_router
         .record_background_probe_successes(1, &[10.0]);
-    assert!(lock_endpoint_state(&relay_endpoint.state).foreground_validated);
+    assert_eq!(
+        lock_endpoint_state(&relay_endpoint.state).validation,
+        RouteValidationState::Validated
+    );
     assert_eq!(
         direct_active.transport_router.foreground_route_indices(),
         vec![1, 0]
