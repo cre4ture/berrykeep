@@ -43,6 +43,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   unit:
@@ -65,13 +66,17 @@ jobs:
 
       - name: Start GitHub-backed Bazel cache
         id: bazel-cache
-        uses: cre4ture/bazel-github-actions-cache-v2@f94e7b52f3390d5b257169931d6c428155e5fa3d # v0.2.2
+        uses: cre4ture/bazel-github-actions-cache-v2@3a768d2b634f82a23405c838a4aa9c4e971fe65b # v0.3.0
         with:
           # Fine-grained publication is intentionally limited to an explicit
-          # maintainer seed because one GitHub cache entry per Bazel object can
-          # make large default-branch builds wait on thousands of uploads.
+          # maintainer seed. The packed backend turns many Bazel objects into
+          # one CARv2 upload plus its manifest commit point.
           write: ${{ github.event_name == 'workflow_dispatch' && inputs.write_cache && 'true' || 'false' }}
-          key-prefix: ironmesh-bazel-v1
+          # A format-specific namespace keeps the previous v0.2 objects as a
+          # rollback path and never mixes them with CARv2 pack entries.
+          key-prefix: ironmesh-bazel-car-v1
+          storage-mode: packs
+          pack-size-mb: "8"
 
       - name: Test native Bazel targets
         shell: bash
