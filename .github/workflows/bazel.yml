@@ -13,6 +13,7 @@ on:
       - 'MODULE.bazel'
       - 'MODULE.bazel.lock'
       - 'crates/**'
+      - '.github/actions/native-unit/**'
       - '.github/workflows/bazel.yml'
   pull_request:
     types:
@@ -28,6 +29,7 @@ on:
       - 'MODULE.bazel'
       - 'MODULE.bazel.lock'
       - 'crates/**'
+      - '.github/actions/native-unit/**'
       - '.github/workflows/bazel.yml'
   workflow_dispatch:
     inputs:
@@ -43,48 +45,45 @@ concurrency:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
   unit:
     name: Bazel unit
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    # Manifest-head discovery calls GitHub's cache REST API. Keep that scope
+    # out of untrusted fork workflows; those use the isolated job below.
+    permissions:
+      contents: read
+      actions: read
     timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.write_cache && 120 || 30 }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Bazel
-        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
+      - name: Run trusted Bazel unit suite
+        uses: ./.github/actions/native-unit
         with:
-          bazelisk-cache: true
-          # Manual runs isolate the fine-grained remote-cache evaluation from
-          # restored action outputs while retaining Bazelisk/repository caches.
           disk-cache: ${{ github.event_name == 'workflow_dispatch' && 'false' || github.workflow }}
-          repository-cache: true
           cache-save: ${{ github.event_name != 'pull_request' }}
-
-      - name: Start GitHub-backed Bazel cache
-        id: bazel-cache
-        uses: cre4ture/bazel-github-actions-cache-v2@3a768d2b634f82a23405c838a4aa9c4e971fe65b # v0.3.0
-        with:
-          # Fine-grained publication is intentionally limited to an explicit
-          # maintainer seed. The packed backend turns many Bazel objects into
-          # one CARv2 upload plus its manifest commit point.
           write: ${{ github.event_name == 'workflow_dispatch' && inputs.write_cache && 'true' || 'false' }}
-          # A format-specific namespace keeps the previous v0.2 objects as a
-          # rollback path and never mixes them with CARv2 pack entries.
-          key-prefix: ironmesh-bazel-car-v1
           storage-mode: packs
-          pack-size-mb: "8"
 
-      - name: Test native Bazel targets
-        shell: bash
-        env:
-          BAZEL_REMOTE_CACHE_URL: ${{ steps.bazel-cache.outputs.url }}
-          BAZEL_REMOTE_CACHE_WRITABLE: ${{ steps.bazel-cache.outputs.writable }}
-        run: |
-          set -euo pipefail
-          bazel test //:unit \
-            "--remote_cache=${BAZEL_REMOTE_CACHE_URL}" \
-            "--remote_upload_local_results=${BAZEL_REMOTE_CACHE_WRITABLE}"
+  unit-fork:
+    name: Bazel unit (fork)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run isolated fork Bazel unit suite
+        uses: ./.github/actions/native-unit
+        with:
+          # No Actions-cache REST access is granted to a fork. Object mode is
+          # a correct, read-only fallback and cannot discover DAG manifests.
+          disk-cache: ${{ github.workflow }}
+          cache-save: 'false'
+          write: 'false'
+          storage-mode: objects

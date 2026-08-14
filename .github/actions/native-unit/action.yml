@@ -1,0 +1,54 @@
+name: Bazel unit suite
+description: Set up Bazel, optionally start the GitHub-backed remote cache, and run native unit targets.
+
+inputs:
+  disk-cache:
+    description: Value forwarded to setup-bazel's disk-cache input.
+    required: true
+  cache-save:
+    description: Value forwarded to setup-bazel's cache-save input.
+    required: true
+  write:
+    description: Whether the remote cache may publish immutable entries.
+    required: true
+  storage-mode:
+    description: "Remote-cache storage mode: objects or packs."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Bazel
+      uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
+      with:
+        bazelisk-cache: true
+        # Manual runs isolate the fine-grained remote-cache evaluation from
+        # restored action outputs while retaining Bazelisk/repository caches.
+        disk-cache: ${{ inputs.disk-cache }}
+        repository-cache: true
+        cache-save: ${{ inputs.cache-save }}
+
+    - name: Start GitHub-backed Bazel cache
+      id: bazel-cache
+      uses: cre4ture/bazel-github-actions-cache-v2@3a768d2b634f82a23405c838a4aa9c4e971fe65b # v0.3.0
+      with:
+        # Fine-grained publication is intentionally limited to an explicit
+        # maintainer seed. The packed backend turns many Bazel objects into
+        # one CARv2 upload plus its manifest commit point.
+        write: ${{ inputs.write }}
+        # A format-specific namespace keeps the previous v0.2 objects as a
+        # rollback path and never mixes them with CARv2 pack entries.
+        key-prefix: ironmesh-bazel-car-v1
+        storage-mode: ${{ inputs.storage-mode }}
+        pack-size-mb: '8'
+
+    - name: Test native Bazel targets
+      shell: bash
+      env:
+        BAZEL_REMOTE_CACHE_URL: ${{ steps.bazel-cache.outputs.url }}
+        BAZEL_REMOTE_CACHE_WRITABLE: ${{ steps.bazel-cache.outputs.writable }}
+      run: |
+        set -euo pipefail
+        bazel test //:unit \
+          "--remote_cache=${BAZEL_REMOTE_CACHE_URL}" \
+          "--remote_upload_local_results=${BAZEL_REMOTE_CACHE_WRITABLE}"

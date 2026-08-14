@@ -94,8 +94,12 @@ cache v2. It therefore needs no external server, repository secret, or manual
 repository setting. The pinned v0.3.0 action uses `storage-mode: packs`: it
 places many CAS values and Action Results in an indexed CARv2 archive and only
 publishes its immutable DAG-CBOR manifest after the archive exists. The
-workflow grants `actions: read` solely so the action can discover manifest keys
-through GitHub's documented REST API; its default `github.token` is sufficient.
+trusted job grants `actions: read` solely so the action can discover manifest
+keys through GitHub's documented REST API; its default `github.token` is
+sufficient. Fork pull requests instead run the same Bazel targets in an
+isolated, read-only object-store fallback with only `contents: read`. This
+deliberately trades their shared PAC/DAG cache hits for least privilege: fork
+code cannot list Actions-cache metadata, workflow runs, or artifacts.
 
 The manifest has all currently visible manifest heads as parents, so parallel
 manual seeds cannot overwrite each other. Readers merge all discovered heads.
