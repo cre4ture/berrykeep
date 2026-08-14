@@ -8,6 +8,7 @@ pub mod ironmesh_client;
 pub mod latency_probe;
 mod managed_client;
 pub mod remote_sync;
+mod route_supervisor;
 mod session_pool;
 
 pub use bootstrap::{
