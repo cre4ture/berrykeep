@@ -3,6 +3,10 @@ import { gzipSync } from "node:zlib";
 import type { GalleryMapConfiguration } from "@ironmesh/api";
 import { expect, test, type Page, type Route } from "@playwright/test";
 import { registerGalleryMapContractTests } from "./gallery-map.contract";
+import {
+  filterMockStoreEntriesToPrefix,
+  projectMockStoreTreeEntries
+} from "./store-index.mock";
 
 const API_V1_PREFIX = "/api/v1";
 
@@ -864,7 +868,7 @@ test("server-admin provisioning can copy and download the issued bootstrap claim
   expect(bundleDownload.suggestedFilename()).toBe("ironmesh-client-bootstrap-cluster-alpha.json");
 });
 
-test("server-admin gallery derives child folders from nested media entries", async ({ page }) => {
+test("server-admin gallery follows depth-one tree navigation", async ({ page }) => {
   await installServerAdminMocks(page, {
     galleryEntries: [
       {
@@ -882,7 +886,7 @@ test("server-admin gallery derives child folders from nested media entries", asy
         }
       },
       {
-        path: "cameras/oppo-uli/front.jpg",
+        path: "cameras/oppo-uli/trips/front.jpg",
         entry_type: "key",
         media: {
           status: "ready",
@@ -908,6 +912,10 @@ test("server-admin gallery derives child folders from nested media entries", asy
 
   await expect(page.getByText("vm1.4/", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("oppo-uli/", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("trips/", { exact: true })).toHaveCount(0);
+  await page.getByText("oppo-uli/", { exact: true }).first().click();
+  await expect(page.getByLabel("Prefix")).toHaveValue("cameras/oppo-uli/");
+  await expect(page.getByText("trips/", { exact: true }).first()).toBeVisible();
 });
 
 test("server-admin map import wizard starts the Natural Earth labels background job", async ({ page }) => {
@@ -3251,9 +3259,18 @@ function buildAdminStoreIndexResponse(
   const prefix = searchParams.get("prefix") ?? "";
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
+  const isTreeNavigationRequest =
+    searchParams.get("view") === "tree" &&
+    !searchParams.has("offset") &&
+    !searchParams.has("limit") &&
+    !searchParams.has("sort") &&
+    !mediaFilter;
+  const scopedEntries = isTreeNavigationRequest
+    ? projectMockStoreTreeEntries(entries, prefix, depth)
+    : filterMockStoreEntriesToPrefix(entries, prefix);
   const filteredEntries = mediaFilter
-    ? entries.filter((entry) => matchesAdminMediaFilter(entry, mediaFilter))
-    : entries;
+    ? scopedEntries.filter((entry) => matchesAdminMediaFilter(entry, mediaFilter))
+    : scopedEntries;
   const totalEntryCount = filteredEntries.length;
   const offset = Math.max(0, Number(searchParams.get("offset") ?? "0") || 0);
   const limitParam = searchParams.get("limit");

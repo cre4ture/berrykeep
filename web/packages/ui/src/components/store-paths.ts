@@ -32,38 +32,3 @@ export function parentStorePrefix(path: string): string {
   }
   return `${normalized.split("/").slice(0, -1).join("/")}/`;
 }
-
-export function directChildStorePrefix(
-  path: string,
-  currentPrefix: string,
-  isPrefix: boolean
-): string | null {
-  const normalizedCurrentPrefix = normalizeStorePrefix(currentPrefix);
-  const normalizedPath = normalizeStorePath(path, isPrefix);
-  if (!normalizedPath) {
-    return null;
-  }
-  if (normalizedCurrentPrefix && !normalizedPath.startsWith(normalizedCurrentPrefix)) {
-    return null;
-  }
-
-  const relativePath = normalizedCurrentPrefix
-    ? normalizedPath.slice(normalizedCurrentPrefix.length)
-    : normalizedPath;
-  const trimmedRelative = relativePath.replace(/\/+$/, "");
-  if (!trimmedRelative) {
-    return null;
-  }
-
-  const firstSeparator = trimmedRelative.indexOf("/");
-  if (firstSeparator === -1) {
-    return isPrefix ? normalizeStorePrefix(normalizedPath) : null;
-  }
-
-  const directChild = trimmedRelative.slice(0, firstSeparator);
-  if (!directChild) {
-    return null;
-  }
-
-  return normalizeStorePrefix(`${normalizedCurrentPrefix}${directChild}`);
-}

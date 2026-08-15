@@ -54,8 +54,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
-private const val GALLERY_ROOT_DOCUMENT_ID = "dir:"
-private const val GALLERY_ROOT_PATH = "/"
 private const val GALLERY_PAGE_SIZE = 32
 private const val GALLERY_PAGE_PRELOAD_RADIUS = 1
 private const val GALLERY_PAGE_KEEP_RADIUS = 2
@@ -1733,7 +1731,10 @@ class MainViewModel(
             serverCaPem = serverCaPem,
             clientIdentityJson = clientIdentityJson,
         )
-        val directories = listing.entries.mapNotNull(::galleryDirectoryItemFromEntry)
+        val directories = galleryDirectoryItemsForParent(
+            entries = listing.entries,
+            parentPath = request.currentDirectoryPath,
+        )
         val items = firstPage.entries.mapNotNull(::galleryImageItemFromEntry)
         val totalItemCount = firstPage.total_entry_count.coerceAtLeast(items.size)
 
@@ -2136,21 +2137,6 @@ class MainViewModel(
         )
     }
 
-    private fun galleryDirectoryItemFromEntry(entry: StoreIndexEntry): GalleryDirectoryItem? {
-        if (entry.entry_type != "prefix") {
-            return null
-        }
-        val normalizedPath = entry.path.trim().trim('/').removeSuffix("/")
-        if (normalizedPath.isBlank()) {
-            return null
-        }
-        return GalleryDirectoryItem(
-            documentId = galleryDirectoryDocumentId(normalizedPath),
-            displayName = normalizedPath.substringAfterLast('/'),
-            pathLabel = normalizeGalleryDirectoryPath(normalizedPath),
-        )
-    }
-
     private fun resolveGalleryStoreSortOrder(sort: GallerySortOption): StoreIndexSortOrder {
         return when (sort) {
             GallerySortOption.CREATION_TIME -> StoreIndexSortOrder.CAPTURED_DESC
@@ -2171,10 +2157,6 @@ class MainViewModel(
     private fun galleryPrefixForPath(path: String): String? {
         val normalized = path.trim().trim('/')
         return normalized.takeIf { it.isNotBlank() }
-    }
-
-    private fun galleryDirectoryDocumentId(path: String): String {
-        return if (path.isBlank()) GALLERY_ROOT_DOCUMENT_ID else "dir:${path.trim('/')}"
     }
 
     private fun galleryFileDocumentId(path: String): String = "file:${path.trim('/')}"
@@ -2202,10 +2184,6 @@ class MainViewModel(
         return requestVersion == galleryRequestVersion
     }
 
-    private fun normalizeGalleryDirectoryPath(path: String): String {
-        val normalized = path.trim().trim('/')
-        return if (normalized.isBlank()) GALLERY_ROOT_PATH else "$normalized/"
-    }
 }
 
 private fun MainSection.isConnectionDiagnosticsSection(): Boolean {
