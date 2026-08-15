@@ -11,6 +11,7 @@ import {
 import {
   IconChevronLeft,
   IconChevronRight,
+  IconDownload,
   IconMapPin,
   IconPhoto,
   IconPlayerPlay,
@@ -31,10 +32,15 @@ export type MediaPreviewRequest = {
   headers?: Record<string, string>;
 };
 
+export type MediaDownloadRequest = {
+  url: string;
+};
+
 export type MediaPreviewRequests = {
   thumbnail?: MediaPreviewRequest | null;
   fullscreen?: MediaPreviewRequest | null;
   original: MediaPreviewRequest;
+  download?: MediaDownloadRequest | null;
 };
 
 export type MediaKind = "image" | "video";
@@ -150,6 +156,7 @@ export function MediaLightboxModal({
   const usesEmbeddedViewport = usesEmbeddedWebUiViewport();
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < itemCount - 1;
+  const selectedItemDownloadUrl = selectedItem ? mediaDownloadUrl(selectedItem) : null;
   const selectedItemPreviewSignature = selectedItem
     ? [
         mediaPreviewRequestSignature(selectedItem.requests.thumbnail),
@@ -330,8 +337,23 @@ export function MediaLightboxModal({
                     </Badge>
                   ) : null}
                 </Group>
-                <Group gap="xs" wrap="nowrap">
+                <Group data-media-actions="true" gap="xs" justify="flex-end">
                   {extraActions}
+                  <Button
+                    data-media-download="true"
+                    variant="default"
+                    size="xs"
+                    leftSection={<IconDownload size={14} />}
+                    disabled={!selectedItemDownloadUrl}
+                    title={
+                      selectedItemDownloadUrl
+                        ? "Download the original media file"
+                        : "A direct original download URL is unavailable"
+                    }
+                    onClick={() => triggerMediaDownload(selectedItem)}
+                  >
+                    Download original
+                  </Button>
                   <Button
                     variant="default"
                     size="xs"
@@ -364,6 +386,42 @@ function usesEmbeddedWebUiViewport(): boolean {
 
   const embeddedClient = new URLSearchParams(window.location.search).get("embedded_client");
   return embeddedClient === "android" || embeddedClient === "ios";
+}
+
+function triggerMediaDownload(item: MediaLightboxItem) {
+  const url = mediaDownloadUrl(item);
+  if (!url) {
+    return;
+  }
+
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = mediaDownloadFileName(item);
+  anchor.hidden = true;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+function mediaDownloadUrl(item: MediaLightboxItem): string | null {
+  const directDownloadUrl = item.requests.download?.url.trim();
+  if (directDownloadUrl) {
+    return directDownloadUrl;
+  }
+
+  if (item.requests.original.headers && Object.keys(item.requests.original.headers).length > 0) {
+    return null;
+  }
+  return item.requests.original.url;
+}
+
+function mediaDownloadFileName(item: MediaLightboxItem): string {
+  const pathSegment = item.description
+    .split(/[\\/]/)
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .at(-1);
+  return pathSegment || item.title.trim() || "download";
 }
 
 export function MediaThumbnailPreview({

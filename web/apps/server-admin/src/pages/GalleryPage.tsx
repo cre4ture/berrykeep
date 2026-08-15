@@ -63,7 +63,8 @@ export function GalleryPage() {
                   url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
                 }
               : null,
-          original
+          original,
+          download: original
         };
       },
       restoreVersion: (key, versionId, targetPath) =>

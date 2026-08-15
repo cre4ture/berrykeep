@@ -454,6 +454,40 @@ test("client-ui keeps the direct iOS gallery map inside the WebView viewport", a
     .toBeGreaterThan(0.9);
 });
 
+for (const embeddedClient of [null, "android", "ios"] as const) {
+  const clientLabel = embeddedClient ?? "browser";
+  test(`client-ui ${clientLabel} media viewer downloads the original`, async ({ page }) => {
+    await installClientUiMocks(page);
+    if (embeddedClient) {
+      await page.setViewportSize({ width: 390, height: 844 });
+    }
+    const query = new URLSearchParams({ page: "gallery" });
+    if (embeddedClient) {
+      query.set("embedded_client", embeddedClient);
+    }
+    await page.goto(`/?${query.toString()}`);
+    await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+    await page.getByText("gallery/cat.png", { exact: true }).click();
+
+    const dialog = page.getByRole("dialog");
+    const mediaActions = dialog.locator('[data-media-actions="true"]');
+    await expect(dialog.getByRole("button", { name: "Start slideshow" })).toBeVisible();
+    await expect(mediaActions).toBeVisible();
+    expect(await mediaActions.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+    const mediaActionsBox = await mediaActions.boundingBox();
+    expect(mediaActionsBox).not.toBeNull();
+    expect((mediaActionsBox?.x ?? -1) + (mediaActionsBox?.width ?? 0)).toBeLessThanOrEqual(
+      page.viewportSize()?.width ?? Number.POSITIVE_INFINITY
+    );
+    const downloadPromise = page.waitForEvent("download");
+    await dialog.getByRole("button", { name: "Download original" }).click();
+
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe("cat.png");
+    await expect(dialog).toBeVisible();
+  });
+}
+
 test("client-ui gallery restores its persistent cache while the upstream is offline", async ({
   page
 }) => {
@@ -707,6 +741,10 @@ test("client-ui gallery lightbox skips unsupported iOS originals and keeps the t
     page.getByText("Browser cannot preview the original format, showing thumbnail")
   ).toBeVisible();
   expect(mockState.requestedPaths()).not.toContain(apiV1("/store/stream-binary"));
+
+  const downloadPromise = page.waitForEvent("download");
+  await galleryDialog.getByRole("button", { name: "Download original" }).click();
+  expect((await downloadPromise).suggestedFilename()).toBe("ios-photo.heic");
 });
 
 test("client-ui gallery lightbox prefers the mobile viewer thumbnail on narrow touch viewports", async ({

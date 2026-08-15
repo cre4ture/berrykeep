@@ -1499,7 +1499,8 @@ function buildExplorerEntryLightboxItem(
     kind,
     requests: {
       thumbnail: thumbnailRequestForExplorerMedia(entry.media),
-      original: { url: originalUrl }
+      original: { url: originalUrl },
+      download: { url: originalUrl }
     },
     status: explorerMediaString(entry.media, "status"),
     mimeType: explorerMediaString(entry.media, "mime_type"),
@@ -1538,7 +1539,8 @@ function buildExplorerVersionLightboxItem(
     kind,
     requests: {
       thumbnail: thumbnailRequestForExplorerMedia(version.media),
-      original: { url: originalUrl }
+      original: { url: originalUrl },
+      download: { url: originalUrl }
     },
     status: explorerMediaString(version.media, "status"),
     mimeType: explorerMediaString(version.media, "mime_type"),
