@@ -1565,12 +1565,19 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
         ) {
-            guard let candidate = navigationAction.request.url,
-                  isSameOrigin(candidate) else {
+            guard let candidate = navigationAction.request.url else {
                 decisionHandler(.cancel)
                 return
             }
-            decisionHandler(navigationAction.shouldPerformDownload ? .download : .allow)
+
+            if navigationAction.shouldPerformDownload {
+                decisionHandler(
+                    isSameOrigin(candidate) || isLocalDownloadURL(candidate) ? .download : .cancel
+                )
+                return
+            }
+
+            decisionHandler(isSameOrigin(candidate) ? .allow : .cancel)
         }
 
         func webView(
@@ -1652,6 +1659,15 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
             candidate.scheme?.caseInsensitiveCompare(origin.scheme ?? "") == .orderedSame &&
                 candidate.host?.caseInsensitiveCompare(origin.host ?? "") == .orderedSame &&
                 effectivePort(candidate) == effectivePort(origin)
+        }
+
+        private func isLocalDownloadURL(_ candidate: URL) -> Bool {
+            switch candidate.scheme?.lowercased() {
+            case "blob", "data":
+                return true
+            default:
+                return false
+            }
         }
 
         private func effectivePort(_ url: URL) -> Int? {
