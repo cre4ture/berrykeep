@@ -21,3 +21,11 @@ Android uses an app-owned `WebView`, and iOS uses a `WKWebView` with a
 non-persistent data store. Both restrict navigation to the active loopback
 origin so authorization material cannot be carried into external browsing
 state.
+
+The shared media viewer exposes an original-file download action. Android
+accepts downloads only from the active loopback origin and forwards the
+WebView session cookie to the system download manager. iOS converts the same
+link into a `WKDownload`, writes it to an isolated temporary location, and
+opens the Files export picker after the transfer completes. Preview thumbnails
+and mobile-optimized fullscreen images are never substituted for the requested
+original.

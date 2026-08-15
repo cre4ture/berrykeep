@@ -61,6 +61,7 @@ private fun WebView.configureEmbeddedWebUi(session: EmbeddedWebUiSession) {
     settings.setSupportMultipleWindows(false)
     webViewClient = EmbeddedWebUiClient(session.url)
     webChromeClient = EmbeddedWebUiChromeClient()
+    setDownloadListener(EmbeddedWebUiDownloadListener(context, session.url))
     loadEmbeddedWebUi(session)
 }
 
@@ -71,12 +72,13 @@ private fun WebView.loadEmbeddedWebUi(session: EmbeddedWebUiSession) {
 private class EmbeddedWebUiClient(
     private val initialUrl: String,
 ) : WebViewClient() {
-    override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean = !isSameOrigin(url)
+    override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
+        !isSameEmbeddedWebUiOrigin(initialUrl, url)
 
     override fun shouldOverrideUrlLoading(
         view: WebView,
         request: WebResourceRequest,
-    ): Boolean = !isSameOrigin(request.url.toString())
+    ): Boolean = !isSameEmbeddedWebUiOrigin(initialUrl, request.url.toString())
 
     override fun onReceivedHttpError(
         view: WebView,
@@ -135,14 +137,6 @@ private class EmbeddedWebUiClient(
                 errorCode = error.primaryError,
             ),
         )
-    }
-
-    private fun isSameOrigin(url: String): Boolean {
-        val origin = Uri.parse(initialUrl)
-        val candidate = Uri.parse(url)
-        return candidate.scheme == origin.scheme &&
-            candidate.host == origin.host &&
-            candidate.port == origin.port
     }
 }
 
