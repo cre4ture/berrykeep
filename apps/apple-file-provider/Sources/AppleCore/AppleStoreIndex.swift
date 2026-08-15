@@ -449,14 +449,16 @@ public enum AppleGalleryThumbnailPath {
             omittingEmptySubsequences: false
         )
         let path = String(queryParts[0])
-        let existingParameters = queryParts.count > 1
-            ? queryParts[1]
+        var existingParameters: [String] = []
+        if queryParts.count > 1 {
+            existingParameters = queryParts[1]
                 .split(separator: "&", omittingEmptySubsequences: true)
                 .map(String.init)
-                .filter { parameter in
-                    parameter.split(separator: "=", maxSplits: 1).first.map(String.init) != "profile"
-                }
-            : []
+            existingParameters.removeAll { parameter in
+                let name = parameter.split(separator: "=", maxSplits: 1).first.map(String.init)
+                return name == "profile"
+            }
+        }
         let parameters = existingParameters + ["profile=\(profile.rawValue)"]
         return "\(path)?\(parameters.joined(separator: "&"))\(fragment)"
     }
