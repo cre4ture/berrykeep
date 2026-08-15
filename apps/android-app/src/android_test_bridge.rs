@@ -30,14 +30,18 @@ use std::{
 };
 use tokio::task::JoinHandle;
 use transport_sdk::{
-    BootstrapTrustRoots, BufferedTransportResponse, DecodedWebSocketMessage, MultiplexConfig,
-    MultiplexMode, MultiplexedSession, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
-    TransportSessionControlMessage, TransportSessionRole, WebSocketByteStream,
-    WebSocketMessageCodec, perform_transport_server_handshake, read_buffered_transport_request,
+    BootstrapTrustRoots, BufferedTransportRequest, BufferedTransportResponse,
+    DecodedWebSocketMessage, MultiplexConfig, MultiplexMode, MultiplexedSession,
+    TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportSessionControlMessage,
+    TransportSessionRole, WebSocketByteStream, WebSocketMessageCodec,
+    perform_transport_server_handshake, read_buffered_transport_request,
     write_buffered_transport_response,
 };
 
 const TEST_CLUSTER_ID: &str = "019d02eb-ab39-7220-911a-c0eafcb38249";
+const TEST_DOCUMENT_PATH: &str = "docs/readme.txt";
+const TEST_DOCUMENT_REQUEST_PATH: &str = "/api/v1/store/docs%2Freadme.txt";
+const TEST_DOCUMENT_SIZE_BYTES: usize = 1024 * 1024 + 17;
 const EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM: &str = concat!(
     "-----BEGIN CERTIFICATE-----\n",
     "MIIB3DCCAYKgAwIBAgITK3r0r5jwkdN+susWXewPKMOgPDAKBggqhkjOPQQDAjBA\n",
@@ -64,6 +68,8 @@ struct AndroidRendezvousRenewalScenario {
     connection_bootstrap_json: String,
     expired_client_identity_json: String,
     renewed_rendezvous_client_identity_pem: String,
+    remote_document_path: String,
+    remote_document_size_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -347,7 +353,7 @@ async fn serve_android_multiplex_socket(
             .map_err(|_| anyhow::anyhow!("captured request path mutex poisoned"))?
             .push(path.clone());
 
-        let (status, headers, body) = android_transport_response(&state, &request.method, &path)?;
+        let (status, headers, body) = android_transport_response(&state, &request)?;
         write_buffered_transport_response(
             &mut stream,
             &BufferedTransportResponse {
@@ -366,9 +372,10 @@ async fn serve_android_multiplex_socket(
 
 fn android_transport_response(
     state: &AndroidRendezvousRenewalState,
-    method: &str,
-    path: &str,
+    request: &BufferedTransportRequest,
 ) -> Result<(u16, Vec<TransportHeader>, Vec<u8>)> {
+    let method = request.method.as_str();
+    let path = request.path.as_str();
     match (method, path) {
         ("POST", "/api/v1/auth/device/renew-rendezvous-identity") => {
             let body = serde_json::to_vec(&serde_json::json!({
@@ -381,6 +388,25 @@ fn android_transport_response(
             let body = serde_json::to_vec(&android_test_store_index_response())
                 .context("failed to serialize android store index response")?;
             Ok((200, json_headers(body.len()), body))
+        }
+        ("HEAD", TEST_DOCUMENT_REQUEST_PATH) => Ok((
+            200,
+            object_headers(TEST_DOCUMENT_SIZE_BYTES, None),
+            Vec::new(),
+        )),
+        ("GET", TEST_DOCUMENT_REQUEST_PATH) => {
+            let contents = test_document_contents();
+            let Some((start, end_inclusive)) = requested_byte_range(&request.headers)? else {
+                return Ok((200, object_headers(contents.len(), None), contents));
+            };
+            let body = contents[start..=end_inclusive].to_vec();
+            let content_range =
+                format!("bytes {start}-{end_inclusive}/{}", TEST_DOCUMENT_SIZE_BYTES,);
+            Ok((
+                206,
+                object_headers(body.len(), Some(content_range.as_str())),
+                body,
+            ))
         }
         ("GET", "/api/v1/health") => Ok((200, Vec::new(), Vec::new())),
         _ => {
@@ -406,6 +432,64 @@ fn json_headers(content_length: usize) -> Vec<TransportHeader> {
     ]
 }
 
+fn object_headers(content_length: usize, content_range: Option<&str>) -> Vec<TransportHeader> {
+    let mut headers = vec![
+        TransportHeader {
+            name: "content-type".to_string(),
+            value: "application/octet-stream".to_string(),
+        },
+        TransportHeader {
+            name: "content-length".to_string(),
+            value: content_length.to_string(),
+        },
+        TransportHeader {
+            name: "accept-ranges".to_string(),
+            value: "bytes".to_string(),
+        },
+        TransportHeader {
+            name: "etag".to_string(),
+            value: "\"android-saf-provider-test\"".to_string(),
+        },
+    ];
+    if let Some(content_range) = content_range {
+        headers.push(TransportHeader {
+            name: "content-range".to_string(),
+            value: content_range.to_string(),
+        });
+    }
+    headers
+}
+
+fn requested_byte_range(headers: &[TransportHeader]) -> Result<Option<(usize, usize)>> {
+    let Some(raw_range) = headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("range"))
+        .map(|header| header.value.as_str())
+    else {
+        return Ok(None);
+    };
+    let (start, end_inclusive) = raw_range
+        .strip_prefix("bytes=")
+        .and_then(|value| value.split_once('-'))
+        .ok_or_else(|| anyhow::anyhow!("invalid Android test byte range {raw_range}"))?;
+    let start = start
+        .parse::<usize>()
+        .with_context(|| format!("invalid Android test byte range start {raw_range}"))?;
+    let end_inclusive = end_inclusive
+        .parse::<usize>()
+        .with_context(|| format!("invalid Android test byte range end {raw_range}"))?;
+    if start > end_inclusive || end_inclusive >= TEST_DOCUMENT_SIZE_BYTES {
+        anyhow::bail!("Android test byte range is out of bounds: {raw_range}");
+    }
+    Ok(Some((start, end_inclusive)))
+}
+
+fn test_document_contents() -> Vec<u8> {
+    (0..TEST_DOCUMENT_SIZE_BYTES)
+        .map(|index| (index % 251) as u8)
+        .collect()
+}
+
 fn scenario_json() -> Result<String> {
     stop_android_rendezvous_renewal_server()?;
     let renewed_pem = renewed_rendezvous_client_identity_pem();
@@ -421,6 +505,8 @@ fn scenario_json() -> Result<String> {
         connection_bootstrap_json: bootstrap_json,
         expired_client_identity_json,
         renewed_rendezvous_client_identity_pem: renewed_pem,
+        remote_document_path: TEST_DOCUMENT_PATH.to_string(),
+        remote_document_size_bytes: TEST_DOCUMENT_SIZE_BYTES,
     };
     *lock_server_state()? = Some(server);
     serde_json::to_string(&scenario)
