@@ -204,12 +204,12 @@ fun SettingsScreen(
 
 @Composable
 private fun ExperimentalNodePrioritiesEditor(
-    state: MainUiState,
+    state: SettingsUiState,
     onReveal: () -> Unit,
     onPriorityOverrideChange: (String, Int?) -> Unit,
 ) {
     var expanded by rememberSaveable { mutableStateOf(false) }
-    val overrides = state.deviceAuthState.nodePriorityOverrides()
+    val overrides = state.nodePriorityOverrides
     val routePriorities = state.connectionRoutes
         ?.endpoints
         .orEmpty()

@@ -137,6 +137,7 @@ data class MainUiState(
     val newSyncAllowedWifiSsids: String = "",
     val selectedSection: MainSection = MainSection.HOME,
     val connectionRoutes: ConnectionRouteSnapshot? = null,
+    val nodePriorityOverrides: Map<String, Int> = emptyMap(),
     val connectionRoutesLoading: Boolean = false,
     val connectionRoutesError: String? = null,
     val connectionRoutesLastLoadedUnixMs: Long = 0L,
