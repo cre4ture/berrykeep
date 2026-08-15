@@ -43,6 +43,17 @@ class EmbeddedWebUiDownloadTest {
     }
 
     @Test
+    fun emptyDispositionFileNameFallsBackToTheDecodedObjectKey() {
+        assertEquals(
+            "summer_photo.heic",
+            embeddedWebUiDownloadFileName(
+                "http://127.0.0.1:41873/api/v1/store/stream-binary?key=photos%2Fsummer_photo.heic",
+                "attachment; filename=\"\"",
+            ),
+        )
+    }
+
+    @Test
     fun downloadFileNameRemovesPathAndUnsafeCharacters() {
         assertEquals(
             "photo_name_.png",

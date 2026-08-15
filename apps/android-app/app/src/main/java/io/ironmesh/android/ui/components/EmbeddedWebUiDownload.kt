@@ -89,7 +89,9 @@ internal fun embeddedWebUiDownloadFileName(url: String, contentDisposition: Stri
     }.getOrNull()
     val pathName = runCatching { URI(url).path.substringAfterLast('/') }.getOrNull()
 
-    return sanitizeEmbeddedWebUiDownloadFileName(dispositionName ?: queryName ?: pathName.orEmpty())
+    return sanitizeEmbeddedWebUiDownloadFileName(
+        dispositionName?.ifBlank { null } ?: queryName ?: pathName.orEmpty(),
+    )
 }
 
 private fun effectivePort(uri: URI): Int =
