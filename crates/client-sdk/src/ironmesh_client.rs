@@ -8135,12 +8135,17 @@ pub fn normalize_server_base_url(input: &str) -> Result<Url> {
     Ok(normalized)
 }
 
-fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>) {
+fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>, scope_prefix: &str) {
     let mut existing = BTreeSet::new();
     for entry in entries.iter() {
         existing.insert(entry.path.clone());
     }
 
+    let scope_segments = scope_prefix
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
     let mut to_add = BTreeSet::new();
     for entry in entries.iter() {
         let path = entry.path.trim_end_matches('/');
@@ -8155,8 +8160,14 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>) {
         if segments.len() < 2 {
             continue;
         }
+        if !scope_segments.is_empty()
+            && (segments.len() <= scope_segments.len()
+                || segments[..scope_segments.len()] != scope_segments)
+        {
+            continue;
+        }
 
-        for index in 1..segments.len() {
+        for index in (scope_segments.len() + 1)..segments.len() {
             let marker = format!("{}/", segments[..index].join("/"));
             if !existing.contains(&marker) {
                 to_add.insert(marker);
@@ -8196,7 +8207,7 @@ fn synthesize_missing_folder_markers_for_page(
         return;
     }
 
-    ensure_missing_folder_markers(&mut response.entries);
+    ensure_missing_folder_markers(&mut response.entries, &response.prefix);
     response.entry_count = response.entries.len();
     response.total_entry_count = response.total_entry_count.max(response.entry_count);
 }

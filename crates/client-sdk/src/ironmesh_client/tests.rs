@@ -1037,7 +1037,7 @@ fn ensure_missing_folder_markers_adds_nested_parents() {
         media: None,
     }];
 
-    ensure_missing_folder_markers(&mut entries);
+    ensure_missing_folder_markers(&mut entries, "");
 
     let paths = entries
         .into_iter()
@@ -1071,7 +1071,7 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
         },
     ];
 
-    ensure_missing_folder_markers(&mut entries);
+    ensure_missing_folder_markers(&mut entries, "");
 
     let paths = entries
         .into_iter()
@@ -1080,6 +1080,34 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
     assert_eq!(
         paths,
         vec!["docs/", "docs/guides/", "docs/guides/readme.md"]
+    );
+}
+
+#[test]
+fn ensure_missing_folder_markers_stays_within_the_requested_prefix() {
+    let mut entries = vec![StoreIndexEntry {
+        path: "devices/Oppo-uli/Fotos/image.jpg".to_string(),
+        entry_type: "key".to_string(),
+        version: None,
+        content_hash: None,
+        size_bytes: Some(7),
+        modified_at_unix: None,
+        content_fingerprint: None,
+        media: None,
+    }];
+
+    ensure_missing_folder_markers(&mut entries, "devices/Oppo-uli/");
+
+    let paths = entries
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![
+            "devices/Oppo-uli/Fotos/",
+            "devices/Oppo-uli/Fotos/image.jpg",
+        ]
     );
 }
 
