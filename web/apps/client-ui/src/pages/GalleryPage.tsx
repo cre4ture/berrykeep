@@ -51,6 +51,9 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
         listStoreEntries(prefix, depth, snapshotId, options),
       getMediaRequests: (entry, snapshotId, versionId) => {
         const thumbnailUrl = entry.media?.thumbnail?.url ?? null;
+        const original = {
+          url: binaryMediaUrl(entry.path, snapshotId, versionId)
+        };
         return {
           thumbnail: thumbnailUrl
             ? {
@@ -63,9 +66,8 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
                   url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
                 }
               : null,
-          original: {
-            url: binaryMediaUrl(entry.path, snapshotId, versionId)
-          }
+          original,
+          download: original
         };
       },
       loadVersions: getVersionGraph,

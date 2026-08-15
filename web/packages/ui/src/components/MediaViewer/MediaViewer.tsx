@@ -32,10 +32,15 @@ export type MediaPreviewRequest = {
   headers?: Record<string, string>;
 };
 
+export type MediaDownloadRequest = {
+  url: string;
+};
+
 export type MediaPreviewRequests = {
   thumbnail?: MediaPreviewRequest | null;
   fullscreen?: MediaPreviewRequest | null;
   original: MediaPreviewRequest;
+  download?: MediaDownloadRequest | null;
 };
 
 export type MediaKind = "image" | "video";
@@ -148,11 +153,10 @@ export function MediaLightboxModal({
   renderDetails
 }: MediaLightboxModalProps) {
   const [isSlideshowMode, setIsSlideshowMode] = useState(false);
-  const [downloadError, setDownloadError] = useState<string | null>(null);
-  const [isDownloading, setIsDownloading] = useState(false);
   const usesEmbeddedViewport = usesEmbeddedWebUiViewport();
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < itemCount - 1;
+  const selectedItemDownloadUrl = selectedItem ? mediaDownloadUrl(selectedItem) : null;
   const selectedItemPreviewSignature = selectedItem
     ? [
         mediaPreviewRequestSignature(selectedItem.requests.thumbnail),
@@ -168,29 +172,8 @@ export function MediaLightboxModal({
   useEffect(() => {
     if (!opened) {
       setIsSlideshowMode(false);
-      setDownloadError(null);
     }
   }, [opened]);
-
-  useEffect(() => {
-    setDownloadError(null);
-  }, [selectedItemPreviewSignature]);
-
-  async function downloadSelectedOriginal() {
-    if (!selectedItem || isDownloading) {
-      return;
-    }
-
-    setDownloadError(null);
-    setIsDownloading(true);
-    try {
-      await triggerMediaDownload(selectedItem);
-    } catch (error) {
-      setDownloadError(error instanceof Error ? error.message : "Failed to download original media");
-    } finally {
-      setIsDownloading(false);
-    }
-  }
 
   useEffect(() => {
     if (!opened || selectedIndex < 0) {
@@ -361,8 +344,13 @@ export function MediaLightboxModal({
                     variant="default"
                     size="xs"
                     leftSection={<IconDownload size={14} />}
-                    loading={isDownloading}
-                    onClick={() => void downloadSelectedOriginal()}
+                    disabled={!selectedItemDownloadUrl}
+                    title={
+                      selectedItemDownloadUrl
+                        ? "Download the original media file"
+                        : "A direct original download URL is unavailable"
+                    }
+                    onClick={() => triggerMediaDownload(selectedItem)}
                   >
                     Download original
                   </Button>
@@ -376,11 +364,6 @@ export function MediaLightboxModal({
                   </Button>
                 </Group>
               </Group>
-              {downloadError ? (
-                <Text size="sm" c="red">
-                  {downloadError}
-                </Text>
-              ) : null}
               <Text size="sm" c="dimmed">
                 {selectedItem.description}
               </Text>
@@ -405,35 +388,31 @@ function usesEmbeddedWebUiViewport(): boolean {
   return embeddedClient === "android" || embeddedClient === "ios";
 }
 
-async function triggerMediaDownload(item: MediaLightboxItem): Promise<void> {
-  const request = item.requests.original;
-  const fileName = mediaDownloadFileName(item);
-  if (!request.headers || Object.keys(request.headers).length === 0) {
-    triggerMediaDownloadFromUrl(request.url, fileName);
+function triggerMediaDownload(item: MediaLightboxItem) {
+  const url = mediaDownloadUrl(item);
+  if (!url) {
     return;
   }
 
-  const response = await fetch(request.url, {
-    credentials: "same-origin",
-    headers: request.headers
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to download original media: HTTP ${response.status}`);
-  }
-
-  const objectUrl = URL.createObjectURL(await response.blob());
-  triggerMediaDownloadFromUrl(objectUrl, fileName);
-  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
-}
-
-function triggerMediaDownloadFromUrl(url: string, fileName: string) {
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = fileName;
+  anchor.download = mediaDownloadFileName(item);
   anchor.hidden = true;
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
+}
+
+function mediaDownloadUrl(item: MediaLightboxItem): string | null {
+  const directDownloadUrl = item.requests.download?.url.trim();
+  if (directDownloadUrl) {
+    return directDownloadUrl;
+  }
+
+  if (item.requests.original.headers && Object.keys(item.requests.original.headers).length > 0) {
+    return null;
+  }
+  return item.requests.original.url;
 }
 
 function mediaDownloadFileName(item: MediaLightboxItem): string {
