@@ -24103,6 +24103,59 @@ fn operator_config_persistence_source(state: &ServerState) -> OperatorConfigPers
     }
 }
 
+fn resolved_node_enrollment_persistence_path(
+    configured_path: Option<&FsPath>,
+) -> Result<Option<PathBuf>> {
+    let Some(configured_path) = configured_path else {
+        return Ok(None);
+    };
+
+    // The enrollment package is an operator-selected artifact and may intentionally live
+    // outside the runtime data directory. Treat its configured parent as that operator-owned
+    // boundary, but resolve both paths before access so a file symlink cannot escape it.
+    let configured_parent = configured_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| FsPath::new("."));
+    let canonical_parent = std::fs::canonicalize(configured_parent).with_context(|| {
+        format!(
+            "failed resolving node enrollment parent {}",
+            configured_parent.display()
+        )
+    })?;
+    let canonical_path = std::fs::canonicalize(configured_path).with_context(|| {
+        format!(
+            "failed resolving node enrollment package {}",
+            configured_path.display()
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_parent) {
+        bail!(
+            "node enrollment package {} must stay within its configured parent {}",
+            canonical_path.display(),
+            canonical_parent.display()
+        );
+    }
+
+    Ok(Some(canonical_path))
+}
+
+fn update_persisted_node_enrollment_if_possible(
+    state: &ServerState,
+    update: impl FnOnce(&mut NodeEnrollmentPackage),
+) -> Result<bool> {
+    let Some(path) =
+        resolved_node_enrollment_persistence_path(state.network.node_enrollment_path.as_deref())?
+    else {
+        return Ok(false);
+    };
+
+    let mut package = NodeEnrollmentPackage::from_path(&path)?;
+    update(&mut package);
+    package.write_to_path(&path)?;
+    Ok(true)
+}
+
 async fn current_local_node_connection_priority(state: &ServerState) -> i16 {
     let cluster = state.cluster.lock().await;
     cluster
@@ -24130,24 +24183,19 @@ fn persist_node_connection_priority_if_possible(
     state: &ServerState,
     priority: i16,
 ) -> Result<bool> {
-    let Some(path) = state.network.node_enrollment_path.as_ref() else {
-        return Ok(false);
-    };
-
-    let mut package = NodeEnrollmentPackage::from_path(path)?;
-    if priority == 0 {
-        package
-            .bootstrap
-            .labels
-            .remove(transport_sdk::NODE_CONNECTION_PRIORITY_LABEL);
-    } else {
-        package.bootstrap.labels.insert(
-            transport_sdk::NODE_CONNECTION_PRIORITY_LABEL.to_string(),
-            priority.to_string(),
-        );
-    }
-    package.write_to_path(path)?;
-    Ok(true)
+    update_persisted_node_enrollment_if_possible(state, |package| {
+        if priority == 0 {
+            package
+                .bootstrap
+                .labels
+                .remove(transport_sdk::NODE_CONNECTION_PRIORITY_LABEL);
+        } else {
+            package.bootstrap.labels.insert(
+                transport_sdk::NODE_CONNECTION_PRIORITY_LABEL.to_string(),
+                priority.to_string(),
+            );
+        }
+    })
 }
 
 async fn apply_local_node_connection_priority(state: &ServerState, priority: i16) -> Result<()> {
@@ -24373,14 +24421,9 @@ fn persist_direct_endpoints_if_possible(
     state: &ServerState,
     direct_endpoints: &[BootstrapEndpoint],
 ) -> Result<bool> {
-    let Some(path) = state.network.node_enrollment_path.as_ref() else {
-        return Ok(false);
-    };
-
-    let mut package = NodeEnrollmentPackage::from_path(path)?;
-    package.bootstrap.direct_endpoints = direct_endpoints.to_vec();
-    package.write_to_path(path)?;
-    Ok(true)
+    update_persisted_node_enrollment_if_possible(state, |package| {
+        package.bootstrap.direct_endpoints = direct_endpoints.to_vec();
+    })
 }
 
 async fn refresh_local_node_reachability(state: &ServerState) -> Result<()> {
@@ -24512,14 +24555,9 @@ fn persist_rendezvous_urls_if_possible(
     state: &ServerState,
     effective_urls: &[String],
 ) -> Result<bool> {
-    let Some(path) = state.network.node_enrollment_path.as_ref() else {
-        return Ok(false);
-    };
-
-    let mut package = NodeEnrollmentPackage::from_path(path)?;
-    package.bootstrap.rendezvous_urls = effective_urls.to_vec();
-    package.write_to_path(path)?;
-    Ok(true)
+    update_persisted_node_enrollment_if_possible(state, |package| {
+        package.bootstrap.rendezvous_urls = effective_urls.to_vec();
+    })
 }
 
 async fn get_direct_endpoints_config(

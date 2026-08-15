@@ -20668,6 +20668,42 @@ fn configured_file_paths_must_stay_within_data_dir() {
     );
 }
 
+#[test]
+fn node_enrollment_persistence_path_is_canonicalized() {
+    let root = fresh_test_dir("node-enrollment-persistence-path");
+    let operator_dir = root.join("operator");
+    std::fs::create_dir_all(&operator_dir).unwrap();
+    let package_path = operator_dir.join("node-enrollment.json");
+    std::fs::write(&package_path, "{}").unwrap();
+
+    let resolved = super::resolved_node_enrollment_persistence_path(Some(&package_path))
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved, std::fs::canonicalize(&package_path).unwrap());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn node_enrollment_persistence_path_rejects_symlink_escape() {
+    let root = fresh_test_dir("node-enrollment-persistence-symlink");
+    let operator_dir = root.join("operator");
+    let outside_dir = root.join("outside");
+    std::fs::create_dir_all(&operator_dir).unwrap();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    let outside_package_path = outside_dir.join("node-enrollment.json");
+    std::fs::write(&outside_package_path, "{}").unwrap();
+    let configured_path = operator_dir.join("node-enrollment.json");
+    std::os::unix::fs::symlink(&outside_package_path, &configured_path).unwrap();
+
+    let error = super::resolved_node_enrollment_persistence_path(Some(&configured_path))
+        .expect_err("a package symlink must not escape its configured parent");
+    assert!(error.to_string().contains("must stay within"));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn fresh_test_dir(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("ironmesh-{name}-{}", Uuid::new_v4()));
     let _ = std::fs::remove_dir_all(&path);
