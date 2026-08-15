@@ -12,6 +12,7 @@ import io.ironmesh.android.ui.toLibraryUiState
 import io.ironmesh.android.ui.withGalleryRefreshFailure
 import io.ironmesh.android.ui.withGalleryRefreshStarted
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -96,5 +97,12 @@ class GalleryPresentationTest {
             GalleryContentPresentation.EMPTY_CURRENT_DIRECTORY,
             galleryContentPresentation(state.toLibraryUiState()),
         )
+    }
+
+    @Test
+    fun fullResolutionIsRequestedOnlyAfterZoomingPastFitScale() {
+        assertFalse(shouldRequestGalleryFullResolution(1f))
+        assertFalse(shouldRequestGalleryFullResolution(1.01f))
+        assertTrue(shouldRequestGalleryFullResolution(1.02f))
     }
 }

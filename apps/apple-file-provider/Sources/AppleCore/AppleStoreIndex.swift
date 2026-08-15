@@ -402,12 +402,23 @@ public enum AppleGalleryCacheIdentity {
     }
 }
 
+public enum AppleGalleryThumbnailProfile: String, Sendable {
+    case grid
+    case mobileViewer = "mobile_viewer"
+}
+
 public enum AppleGalleryThumbnailPath {
-    public static func relativePath(for entry: AppleStoreIndexEntry) -> String {
+    public static func relativePath(
+        for entry: AppleStoreIndexEntry,
+        profile: AppleGalleryThumbnailProfile = .grid
+    ) -> String {
+        let basePath: String
         if let advertised = safeAdvertisedPath(entry.media?.thumbnail?.url) {
-            return advertised
+            basePath = advertised
+        } else {
+            basePath = fallbackRelativePath(forKey: entry.path)
         }
-        return fallbackRelativePath(forKey: entry.path)
+        return applying(profile: profile, to: basePath)
     }
 
     public static func fallbackRelativePath(forKey key: String) -> String {
@@ -415,6 +426,41 @@ public enum AppleGalleryThumbnailPath {
         let unreserved = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
         let encoded = normalized.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
         return "/media/thumbnail?key=\(encoded)"
+    }
+
+    private static func applying(
+        profile: AppleGalleryThumbnailProfile,
+        to relativePath: String
+    ) -> String {
+        guard profile != .grid else {
+            return relativePath
+        }
+
+        let fragmentParts = relativePath.split(
+            separator: "#",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        let pathAndQuery = String(fragmentParts[0])
+        let fragment = fragmentParts.count > 1 ? "#\(fragmentParts[1])" : ""
+        let queryParts = pathAndQuery.split(
+            separator: "?",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        let path = String(queryParts[0])
+        var existingParameters: [String] = []
+        if queryParts.count > 1 {
+            existingParameters = queryParts[1]
+                .split(separator: "&", omittingEmptySubsequences: true)
+                .map(String.init)
+            existingParameters.removeAll { parameter in
+                let name = parameter.split(separator: "=", maxSplits: 1).first.map(String.init)
+                return name == "profile"
+            }
+        }
+        let parameters = existingParameters + ["profile=\(profile.rawValue)"]
+        return "\(path)?\(parameters.joined(separator: "&"))\(fragment)"
     }
 
     private static func safeAdvertisedPath(_ value: String?) -> String? {

@@ -175,6 +175,7 @@ final class IronmeshGalleryModel: ObservableObject {
 
 final class IronmeshGalleryImageRepository: @unchecked Sendable {
     private let thumbnailCache = NSCache<NSString, NSData>()
+    private let viewerPreviewCache = NSCache<NSString, NSData>()
     private let fullImageCache = NSCache<NSString, NSData>()
     private let thumbnailSessions: [IronmeshGalleryRemoteSession]
     private let fullImageSession: IronmeshGalleryRemoteSession
@@ -192,6 +193,8 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
         self.fullImageSession = fullImageSession
         thumbnailCache.countLimit = 160
         thumbnailCache.totalCostLimit = 48 * 1_024 * 1_024
+        viewerPreviewCache.countLimit = 8
+        viewerPreviewCache.totalCostLimit = 48 * 1_024 * 1_024
         fullImageCache.countLimit = 4
         fullImageCache.totalCostLimit = 96 * 1_024 * 1_024
     }
@@ -204,6 +207,7 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
             return
         }
         thumbnailCache.removeAllObjects()
+        viewerPreviewCache.removeAllObjects()
         fullImageCache.removeAllObjects()
     }
 
@@ -211,9 +215,40 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
         for entry: AppleStoreIndexEntry,
         configuration: AppleConnectionConfiguration
     ) async throws -> Data {
-        let cacheKey = AppleGalleryCacheIdentity.thumbnailKey(for: entry)
-        let lookup = try cacheLookup(
+        try await thumbnailData(
+            for: entry,
+            configuration: configuration,
+            profile: .grid,
             cache: thumbnailCache,
+            cacheKey: AppleGalleryCacheIdentity.thumbnailKey(for: entry),
+            priority: .utility
+        )
+    }
+
+    func viewerPreviewData(
+        for entry: AppleStoreIndexEntry,
+        configuration: AppleConnectionConfiguration
+    ) async throws -> Data {
+        try await thumbnailData(
+            for: entry,
+            configuration: configuration,
+            profile: .mobileViewer,
+            cache: viewerPreviewCache,
+            cacheKey: AppleGalleryCacheIdentity.fullImageKey(for: entry),
+            priority: .userInitiated
+        )
+    }
+
+    private func thumbnailData(
+        for entry: AppleStoreIndexEntry,
+        configuration: AppleConnectionConfiguration,
+        profile: AppleGalleryThumbnailProfile,
+        cache: NSCache<NSString, NSData>,
+        cacheKey: String,
+        priority: TaskPriority
+    ) async throws -> Data {
+        let lookup = try cacheLookup(
+            cache: cache,
             key: cacheKey,
             configuration: configuration
         )
@@ -221,9 +256,9 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
             return data
         }
 
-        let relativePath = AppleGalleryThumbnailPath.relativePath(for: entry)
+        let relativePath = AppleGalleryThumbnailPath.relativePath(for: entry, profile: profile)
         let thumbnailSession = thumbnailSession(for: entry.path)
-        let data = try await Task.detached(priority: .utility) {
+        let data = try await Task.detached(priority: priority) {
             try thumbnailSession.fetchRelativeBytes(
                 path: relativePath,
                 configuration: configuration
@@ -232,7 +267,7 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
 
         try storeCacheResult(
             data,
-            cache: thumbnailCache,
+            cache: cache,
             key: cacheKey,
             generation: lookup.generation,
             configuration: configuration

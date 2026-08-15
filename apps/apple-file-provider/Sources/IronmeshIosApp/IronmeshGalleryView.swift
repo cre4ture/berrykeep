@@ -354,52 +354,108 @@ private struct IronmeshGalleryFullImagePage: View {
     let configuration: AppleConnectionConfiguration
     let repository: IronmeshGalleryImageRepository
 
-    @State private var image: UIImage?
-    @State private var errorMessage: String?
-    @State private var retryGeneration = 0
+    @State private var previewImage: UIImage?
+    @State private var fullImage: UIImage?
+    @State private var previewErrorMessage: String?
+    @State private var fullResolutionErrorMessage: String?
+    @State private var previewRetryGeneration = 0
+    @State private var fullResolutionRetryGeneration = 0
+    @State private var fullResolutionRequested = false
+    @State private var isLoadingFullResolution = false
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            if let image {
-                IronmeshZoomableImageView(image: image)
+            if let displayedImage = fullImage ?? previewImage {
+                IronmeshZoomableImageView(
+                    image: displayedImage,
+                    onZoomStarted: requestFullResolution
+                )
                     .ignoresSafeArea(edges: .bottom)
-            } else if let errorMessage {
+                if isLoadingFullResolution {
+                    ProgressView()
+                        .tint(.white)
+                        .padding(20)
+                        .background(.black.opacity(0.6), in: Circle())
+                        .padding(24)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                        .allowsHitTesting(false)
+                } else if fullResolutionErrorMessage != nil {
+                    Button("Retry full resolution") {
+                        fullResolutionErrorMessage = nil
+                        fullResolutionRetryGeneration += 1
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .padding(.bottom, 72)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                }
+            } else if let previewErrorMessage {
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.largeTitle)
-                    Text(errorMessage)
+                    Text(previewErrorMessage)
                         .font(.footnote)
                         .multilineTextAlignment(.center)
                     Button("Retry") {
-                        retryGeneration += 1
+                        previewRetryGeneration += 1
                     }
                     .buttonStyle(.borderedProminent)
                 }
                 .foregroundStyle(.white)
                 .padding(24)
             } else {
-                ProgressView("Loading full image…")
+                ProgressView("Loading preview…")
                     .tint(.white)
                     .foregroundStyle(.white)
             }
         }
-        .task(id: "\(entry.path)-\(retryGeneration)") {
-            image = nil
-            errorMessage = nil
+        .task(id: "\(entry.path)-preview-\(previewRetryGeneration)") {
+            previewImage = nil
+            previewErrorMessage = nil
+            do {
+                let data = try await repository.viewerPreviewData(
+                    for: entry,
+                    configuration: configuration
+                )
+                try Task.checkCancellation()
+                guard let decoded = UIImage(data: data) else {
+                    throw IronmeshGalleryImageError.invalidImageData
+                }
+                previewImage = decoded
+            } catch is CancellationError {
+                return
+            } catch {
+                previewErrorMessage = error.localizedDescription
+            }
+        }
+        .task(id: "\(entry.path)-full-\(fullResolutionRequested)-\(fullResolutionRetryGeneration)") {
+            guard fullResolutionRequested, fullImage == nil else {
+                return
+            }
+            isLoadingFullResolution = true
+            fullResolutionErrorMessage = nil
             do {
                 let data = try await repository.fullImageData(for: entry, configuration: configuration)
                 try Task.checkCancellation()
                 guard let decoded = UIImage(data: data) else {
                     throw IronmeshGalleryImageError.invalidImageData
                 }
-                image = decoded
+                fullImage = decoded
+                isLoadingFullResolution = false
             } catch is CancellationError {
-                return
+                isLoadingFullResolution = false
             } catch {
-                errorMessage = error.localizedDescription
+                isLoadingFullResolution = false
+                fullResolutionErrorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func requestFullResolution() {
+        guard !fullResolutionRequested else {
+            return
+        }
+        fullResolutionRequested = true
     }
 }
 
@@ -413,9 +469,10 @@ private enum IronmeshGalleryImageError: LocalizedError {
 
 private struct IronmeshZoomableImageView: UIViewRepresentable {
     let image: UIImage
+    let onZoomStarted: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(onZoomStarted: onZoomStarted)
     }
 
     func makeUIView(context: Context) -> UIScrollView {
@@ -435,23 +492,35 @@ private struct IronmeshZoomableImageView: UIViewRepresentable {
     }
 
     func updateUIView(_ scrollView: UIScrollView, context: Context) {
-        let imageChanged = context.coordinator.imageView.image !== image
+        let isFirstImage = context.coordinator.imageView.image == nil
+        context.coordinator.onZoomStarted = onZoomStarted
         context.coordinator.imageView.image = image
         context.coordinator.imageView.frame = scrollView.bounds
         scrollView.contentSize = scrollView.bounds.size
-        if imageChanged {
+        if isFirstImage {
             scrollView.setZoomScale(1, animated: false)
         }
     }
 
     final class Coordinator: NSObject, UIScrollViewDelegate {
         let imageView = UIImageView()
+        var onZoomStarted: () -> Void
+        private var didRequestFullResolution = false
+
+        init(onZoomStarted: @escaping () -> Void) {
+            self.onZoomStarted = onZoomStarted
+        }
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {
             imageView
         }
 
         func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            if !didRequestFullResolution,
+               scrollView.zoomScale > scrollView.minimumZoomScale + 0.01 {
+                didRequestFullResolution = true
+                onZoomStarted()
+            }
             let horizontalInset = max(0, (scrollView.bounds.width - scrollView.contentSize.width) / 2)
             let verticalInset = max(0, (scrollView.bounds.height - scrollView.contentSize.height) / 2)
             scrollView.contentInset = UIEdgeInsets(
