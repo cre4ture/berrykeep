@@ -150,7 +150,7 @@ final class IronmeshBrowserModel: ObservableObject {
     @Published var connectionRouteSnapshot: AppleConnectionRouteSnapshot?
     var knownServerNodeIDs: [String] {
         Array(Set(
-            connectionRouteSnapshot?.endpoints.compactMap(\.targetNodeId) ?? []
+            (connectionRouteSnapshot?.endpoints.compactMap(\.targetNodeId) ?? [])
                 + Array(draft.nodePriorityOverrides.keys)
         )).sorted()
     }
