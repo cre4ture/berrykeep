@@ -1369,7 +1369,7 @@ impl ConnectionBootstrap {
         let mut last_error = None;
         let mut candidates = Vec::new();
         let mut relay_capable = false;
-        let mut node_connection_priority = 0;
+        let mut node_connection_priority = None;
         let mut seen_candidates = BTreeSet::new();
         let mut first_usable_endpoint = None;
         let mut success_grace_deadline = None;
@@ -1389,13 +1389,10 @@ impl ConnectionBootstrap {
             match result {
                 Ok((winning_url, response)) => {
                     saw_success = true;
-                    if transport_sdk::validate_node_connection_priority(
+                    node_connection_priority = merge_node_connection_priority_advertisement(
+                        node_connection_priority,
                         response.node_connection_priority,
-                    )
-                    .is_ok()
-                    {
-                        node_connection_priority = response.node_connection_priority;
-                    }
+                    );
                     rendezvous_urls = merge_connected_rendezvous_urls(
                         &rendezvous_urls,
                         &response.rendezvous_peers,
@@ -1442,7 +1439,7 @@ impl ConnectionBootstrap {
                             rendezvous_urls,
                             candidates: transport_sdk::rank_candidates(&candidates),
                             relay_capable,
-                            node_connection_priority,
+                            node_connection_priority: node_connection_priority.unwrap_or_default(),
                         });
                     }
                     if (!candidates.is_empty() || relay_capable) && success_grace_deadline.is_none()
@@ -1482,7 +1479,7 @@ impl ConnectionBootstrap {
             rendezvous_urls,
             candidates: transport_sdk::rank_candidates(&candidates),
             relay_capable,
-            node_connection_priority,
+            node_connection_priority: node_connection_priority.unwrap_or_default(),
         })
     }
 
@@ -1720,6 +1717,21 @@ impl ConnectionBootstrap {
 
         Ok(planned)
     }
+}
+
+fn merge_node_connection_priority_advertisement(
+    current: Option<i16>,
+    advertised: i16,
+) -> Option<i16> {
+    if transport_sdk::validate_node_connection_priority(advertised).is_err() {
+        return current;
+    }
+
+    // Rendezvous replicas can briefly disagree while a node's presence update
+    // propagates. Choosing the lower value is deterministic and conservative:
+    // a hardware downgrade takes effect without a stale higher value winning a
+    // response race, while converged replicas still produce the exact value.
+    Some(current.map_or(advertised, |current| current.min(advertised)))
 }
 
 #[derive(Debug, Clone)]
@@ -2688,6 +2700,22 @@ mod tests {
         assert_eq!(bootstrap.effective_node_connection_priority(node_id, 8), 8);
         bootstrap.node_priority_overrides.insert(node_id, -4);
         assert_eq!(bootstrap.effective_node_connection_priority(node_id, 8), -4);
+    }
+
+    #[test]
+    fn rendezvous_priority_merge_is_order_independent_and_conservative() {
+        let merge = |values: &[i16]| {
+            values.iter().copied().fold(None, |current, advertised| {
+                merge_node_connection_priority_advertisement(current, advertised)
+            })
+        };
+
+        assert_eq!(merge(&[8, -3, 4]), Some(-3));
+        assert_eq!(merge(&[4, -3, 8]), Some(-3));
+        assert_eq!(
+            merge(&[8, transport_sdk::MAX_NODE_CONNECTION_PRIORITY + 1]),
+            Some(8)
+        );
     }
 
     #[test]
