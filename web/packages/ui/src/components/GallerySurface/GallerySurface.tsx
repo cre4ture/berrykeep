@@ -57,7 +57,6 @@ import {
 } from "../MediaViewer/MediaViewer";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
 import {
-  directChildStorePrefix,
   normalizeStorePath,
   normalizeStorePrefix,
   parentStorePrefix,
@@ -3900,8 +3899,17 @@ function buildGalleryNavigationItems(
   }
 
   for (const entry of entries) {
-    const targetPrefix = galleryDirectChildPrefix(entry, currentPrefix);
-    if (!targetPrefix || targetPrefix === currentPrefix) {
+    if (!isGalleryPrefixEntry(entry)) {
+      continue;
+    }
+
+    // The shared depth-one tree response contract contains direct children only.
+    const targetPrefix = normalizeGalleryPrefix(entry.path);
+    if (
+      !targetPrefix ||
+      targetPrefix === currentPrefix ||
+      !targetPrefix.startsWith(currentPrefix)
+    ) {
       continue;
     }
 
@@ -3930,10 +3938,6 @@ function buildGalleryNavigationItems(
 
 function normalizeGalleryPrefix(path: string): string {
   return normalizeStorePrefix(path);
-}
-
-function galleryDirectChildPrefix(entry: GalleryEntry, currentPrefix: string): string | null {
-  return directChildStorePrefix(entry.path, currentPrefix, isGalleryPrefixEntry(entry));
 }
 
 function loadStoredThumbnailsPerRow(): number {

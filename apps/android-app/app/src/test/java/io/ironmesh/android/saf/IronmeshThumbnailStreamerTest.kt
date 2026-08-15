@@ -14,6 +14,21 @@ import java.io.OutputStream
 
 class IronmeshThumbnailStreamerTest {
     @Test
+    fun thumbnailProfileForRequestedSize_keepsGridRequestsSmall() {
+        assertEquals(
+            IronmeshThumbnailProfile.GRID,
+            thumbnailProfileForRequestedSize(widthPx = 384, heightPx = 384),
+        )
+        assertEquals(
+            IronmeshThumbnailProfile.MOBILE_VIEWER,
+            thumbnailProfileForRequestedSize(
+                widthPx = MOBILE_VIEWER_THUMBNAIL_MAX_DIMENSION_PX,
+                heightPx = 800,
+            ),
+        )
+    }
+
+    @Test
     fun streamTo_usesRemoteThumbnailWhenAvailable() = runBlocking {
         val dataSource = FakeThumbnailDataSource(
             thumbnailBytes = "thumb".toByteArray(),
@@ -55,6 +70,52 @@ class IronmeshThumbnailStreamerTest {
             dataSource.lastRelativeUrl,
         )
         assertArrayEquals("thumb".toByteArray(), output.toByteArray())
+    }
+
+    @Test
+    fun streamTo_requestsMobileViewerProfileForFullscreenPreview() = runBlocking {
+        val dataSource = FakeThumbnailDataSource(
+            thumbnailBytes = "preview".toByteArray(),
+        )
+        val streamer = IronmeshThumbnailStreamer(dataSource)
+        val output = ByteArrayOutputStream()
+
+        streamer.streamTo(
+            connectionInput = "{\"bootstrap\":true}",
+            entry = sampleImageEntry(thumbnail = null),
+            output = output,
+            profile = IronmeshThumbnailProfile.MOBILE_VIEWER,
+        )
+
+        assertEquals(
+            "/media/thumbnail?key=gallery%2Fcat.png&profile=mobile_viewer",
+            dataSource.lastRelativeUrl,
+        )
+        assertArrayEquals("preview".toByteArray(), output.toByteArray())
+    }
+
+    @Test
+    fun streamTo_replacesAdvertisedProfileWithoutDroppingVersion() = runBlocking {
+        val dataSource = FakeThumbnailDataSource(
+            thumbnailBytes = "preview".toByteArray(),
+        )
+        val streamer = IronmeshThumbnailStreamer(dataSource)
+
+        streamer.streamTo(
+            connectionInput = "{\"bootstrap\":true}",
+            entry = sampleImageEntry(
+                thumbnail = sampleThumbnail().copy(
+                    url = "/media/thumbnail?key=gallery%2Fcat.png&profile=grid&version=v1",
+                ),
+            ),
+            output = ByteArrayOutputStream(),
+            profile = IronmeshThumbnailProfile.MOBILE_VIEWER,
+        )
+
+        assertEquals(
+            "/media/thumbnail?key=gallery%2Fcat.png&version=v1&profile=mobile_viewer",
+            dataSource.lastRelativeUrl,
+        )
     }
 
     @Test

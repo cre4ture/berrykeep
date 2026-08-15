@@ -2,6 +2,10 @@ import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import { registerGalleryMapContractTests } from "./gallery-map.contract";
+import {
+  filterMockStoreEntriesToPrefix,
+  projectMockStoreTreeEntries
+} from "./store-index.mock";
 
 const API_V1_PREFIX = "/api/v1";
 
@@ -376,10 +380,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.goBack();
   await expect(page.getByRole("button", { name: "Fullscreen map" })).toBeVisible();
   const prefixInput = page.getByLabel("Prefix");
+  await expect(page.getByRole("button", { name: "nested/", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "docs/", exact: true }).click();
   await expect(prefixInput).toHaveValue("docs/");
   await expect(page.getByRole("button", { name: "nested/", exact: true })).toBeVisible();
-  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByText("No geo-tagged media in view")).toBeVisible();
   await page.getByRole("button", { name: "nested/", exact: true }).click();
   await expect(prefixInput).toHaveValue("docs/nested/");
   await page.getByRole("button", { name: "Up one level" }).click();
@@ -390,8 +395,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("2 markers")).toBeVisible();
   await page.getByRole("button", { name: "media/", exact: true }).click();
   await expect(prefixInput).toHaveValue("media/");
-  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
-  await expect(page.getByText("2 markers")).toBeVisible();
+  await expect(page.getByText("No geo-tagged media in view")).toBeVisible();
   await page.getByRole("button", { name: "Up one level" }).click();
   await expect(prefixInput).toHaveValue("");
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
@@ -1935,9 +1939,18 @@ function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URL
   const prefix = searchParams.get("prefix") ?? "";
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
+  const isTreeNavigationRequest =
+    searchParams.get("view") === "tree" &&
+    !searchParams.has("offset") &&
+    !searchParams.has("limit") &&
+    !searchParams.has("sort") &&
+    !mediaFilter;
+  const scopedEntries = isTreeNavigationRequest
+    ? projectMockStoreTreeEntries(entries, prefix, depth)
+    : filterMockStoreEntriesToPrefix(entries, prefix);
   const filteredEntries = mediaFilter
-    ? entries.filter((entry) => matchesMockMediaFilter(entry, mediaFilter))
-    : entries;
+    ? scopedEntries.filter((entry) => matchesMockMediaFilter(entry, mediaFilter))
+    : scopedEntries;
   const sortedEntries = sortMockGalleryEntries(filteredEntries, searchParams.get("sort"));
   const totalEntryCount = sortedEntries.length;
   const offset = Math.max(0, Number(searchParams.get("offset") ?? "0") || 0);

@@ -7,6 +7,25 @@ import java.io.OutputStream
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
+internal const val MOBILE_VIEWER_THUMBNAIL_MAX_DIMENSION_PX = 1536
+
+internal enum class IronmeshThumbnailProfile(
+    val queryValue: String?,
+) {
+    GRID(null),
+    MOBILE_VIEWER("mobile_viewer"),
+}
+
+internal fun thumbnailProfileForRequestedSize(
+    widthPx: Int,
+    heightPx: Int,
+): IronmeshThumbnailProfile =
+    if (maxOf(widthPx, heightPx) >= MOBILE_VIEWER_THUMBNAIL_MAX_DIMENSION_PX) {
+        IronmeshThumbnailProfile.MOBILE_VIEWER
+    } else {
+        IronmeshThumbnailProfile.GRID
+    }
+
 internal interface IronmeshThumbnailStreamDataSource {
     suspend fun streamRelativeUrlTo(
         connectionInput: String,
@@ -46,9 +65,11 @@ internal class IronmeshThumbnailStreamer(
         output: OutputStream,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
+        profile: IronmeshThumbnailProfile = IronmeshThumbnailProfile.GRID,
     ) {
-        val thumbnailUrl = entry.media?.thumbnail?.url?.trim()?.takeIf { it.isNotEmpty() }
+        val baseThumbnailUrl = entry.media?.thumbnail?.url?.trim()?.takeIf { it.isNotEmpty() }
             ?: buildGeneratedThumbnailUrl(entry)
+        val thumbnailUrl = applyProfile(baseThumbnailUrl, profile)
         dataSource.streamRelativeUrlTo(
             connectionInput,
             thumbnailUrl,
@@ -66,6 +87,29 @@ internal class IronmeshThumbnailStreamer(
         val encodedKey = URLEncoder.encode(entry.path, StandardCharsets.UTF_8.toString())
             .replace("+", "%20")
         return "/media/thumbnail?key=$encodedKey"
+    }
+
+    private fun applyProfile(
+        relativeUrl: String,
+        profile: IronmeshThumbnailProfile,
+    ): String {
+        val profileValue = profile.queryValue ?: return relativeUrl
+        val fragmentStart = relativeUrl.indexOf('#')
+        val withoutFragment = if (fragmentStart >= 0) relativeUrl.substring(0, fragmentStart) else relativeUrl
+        val fragment = if (fragmentStart >= 0) relativeUrl.substring(fragmentStart) else ""
+        val queryStart = withoutFragment.indexOf('?')
+        val path = if (queryStart >= 0) withoutFragment.substring(0, queryStart) else withoutFragment
+        val existingParameters = if (queryStart >= 0) {
+            withoutFragment.substring(queryStart + 1)
+                .split('&')
+                .filter { parameter ->
+                    parameter.isNotBlank() && parameter.substringBefore('=') != "profile"
+                }
+        } else {
+            emptyList()
+        }
+        val parameters = existingParameters + "profile=$profileValue"
+        return "$path?${parameters.joinToString("&")}$fragment"
     }
 
     private fun supportsGeneratedThumbnail(entry: StoreIndexEntry): Boolean {

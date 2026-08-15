@@ -294,6 +294,14 @@ final class AppleStoreIndexTests: XCTestCase {
             AppleGalleryThumbnailPath.relativePath(for: external),
             "/media/thumbnail?key=photos%2FCat%20one%2B%3F.jpg"
         )
+        XCTAssertEqual(
+            AppleGalleryThumbnailPath.relativePath(for: advertised, profile: .mobileViewer),
+            "/media/thumbnail?key=photos%2Fcat.jpg&version=v1&profile=mobile_viewer"
+        )
+        XCTAssertEqual(
+            AppleGalleryThumbnailPath.relativePath(for: external, profile: .mobileViewer),
+            "/media/thumbnail?key=photos%2FCat%20one%2B%3F.jpg&profile=mobile_viewer"
+        )
     }
 
     private func decodeResponse(_ json: String) throws -> AppleStoreIndexResponse {

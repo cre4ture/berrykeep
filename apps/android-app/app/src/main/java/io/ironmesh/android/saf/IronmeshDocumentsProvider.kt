@@ -11,6 +11,7 @@ import android.provider.DocumentsProvider
 import android.webkit.MimeTypeMap
 import io.ironmesh.android.R
 import io.ironmesh.android.api.StoreIndexEntry
+import io.ironmesh.android.api.isDirectStoreIndexChildPath
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.DeviceIdentityStorageException
@@ -84,7 +85,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         entries.forEach { entry ->
             if (entry.entry_type == "prefix") {
                 val dirPath = entry.path.trimEnd('/')
-                if (!isDirectChildPath(parent.path, dirPath)) {
+                if (!isDirectStoreIndexChildPath(parent.path, dirPath)) {
                     return@forEach
                 }
                 val documentId = directoryDocumentId(dirPath)
@@ -93,7 +94,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                 }
                 includeDirectory(result, documentId, dirPath.substringAfterLast('/'))
             } else {
-                if (!isDirectChildPath(parent.path, entry.path)) {
+                if (!isDirectStoreIndexChildPath(parent.path, entry.path)) {
                     return@forEach
                 }
                 val documentId = fileDocumentId(entry.path)
@@ -238,6 +239,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         }
 
         val entry = resolveFileEntry(target.path)
+        val thumbnailProfile = thumbnailProfileForSizeHint(sizeHint)
 
         try {
             val pipe = ParcelFileDescriptor.createPipe()
@@ -254,11 +256,12 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                     try {
                         runBlocking {
                             thumbnailStreamer.streamTo(
-                                resolveConnectionInput(),
-                                entry,
-                                output,
-                                resolveServerCaPem(),
-                                resolveClientIdentityJson(),
+                                connectionInput = resolveConnectionInput(),
+                                entry = entry,
+                                output = output,
+                                serverCaPem = resolveServerCaPem(),
+                                clientIdentityJson = resolveClientIdentityJson(),
+                                profile = thumbnailProfile,
                             )
                         }
                         output.flush()
@@ -276,6 +279,10 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         } catch (e: IOException) {
             throw FileNotFoundException("failed to open thumbnail: ${e.message}")
         }
+    }
+
+    private fun thumbnailProfileForSizeHint(sizeHint: Point): IronmeshThumbnailProfile {
+        return thumbnailProfileForRequestedSize(sizeHint.x, sizeHint.y)
     }
 
     private fun includeDocumentRow(cursor: MatrixCursor, documentId: String) {
@@ -449,26 +456,6 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             throw FileNotFoundException("invalid display name")
         }
         return if (parentPath.isBlank()) normalized else "${parentPath.trim('/')}/$normalized"
-    }
-
-    private fun isDirectChildPath(parentPath: String, candidatePath: String): Boolean {
-        val normalizedParent = parentPath.trim('/')
-        val normalizedCandidate = candidatePath.trim('/').removeSuffix("/")
-        if (normalizedCandidate.isBlank()) {
-            return false
-        }
-        if (normalizedParent.isBlank()) {
-            return !normalizedCandidate.contains('/')
-        }
-        if (normalizedCandidate == normalizedParent) {
-            return false
-        }
-        val prefix = "$normalizedParent/"
-        if (!normalizedCandidate.startsWith(prefix)) {
-            return false
-        }
-        val remainder = normalizedCandidate.removePrefix(prefix)
-        return remainder.isNotBlank() && !remainder.contains('/')
     }
 
     private fun mimeForName(name: String): String {
