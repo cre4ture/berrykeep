@@ -864,7 +864,7 @@ test("server-admin provisioning can copy and download the issued bootstrap claim
   expect(bundleDownload.suggestedFilename()).toBe("ironmesh-client-bootstrap-cluster-alpha.json");
 });
 
-test("server-admin gallery derives child folders from nested media entries", async ({ page }) => {
+test("server-admin gallery uses child folders from the depth-one tree response", async ({ page }) => {
   await installServerAdminMocks(page, {
     galleryEntries: [
       {
@@ -880,6 +880,10 @@ test("server-admin gallery derives child folders from nested media entries", asy
           media_type: "image",
           mime_type: "image/jpeg"
         }
+      },
+      {
+        path: "cameras/oppo-uli/",
+        entry_type: "prefix"
       },
       {
         path: "cameras/oppo-uli/front.jpg",
