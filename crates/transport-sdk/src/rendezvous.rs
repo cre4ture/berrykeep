@@ -470,7 +470,9 @@ impl PresenceRegistration {
         for candidate in &self.direct_candidates {
             candidate.validate()?;
         }
-        node_connection_priority_from_labels(&self.labels)?;
+        // Labels are an extensible, best-effort metadata channel. A malformed
+        // reserved priority is treated as neutral by consumers and must not
+        // make the node disappear from Rendezvous entirely.
         Ok(())
     }
 }
@@ -1747,6 +1749,32 @@ mod tests {
             (MAX_NODE_CONNECTION_PRIORITY + 1).to_string(),
         )]);
         assert!(node_connection_priority_from_labels(&out_of_range).is_err());
+    }
+
+    #[test]
+    fn invalid_priority_label_does_not_reject_presence_registration() {
+        let registration = PresenceRegistration {
+            cluster_id: ClusterId::now_v7(),
+            identity: PeerIdentity::Node(NodeId::now_v7()),
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: None,
+            direct_candidates: Vec::new(),
+            labels: HashMap::from([(
+                NODE_CONNECTION_PRIORITY_LABEL.to_string(),
+                "not-a-priority".to_string(),
+            )]),
+            capacity_bytes: None,
+            free_bytes: None,
+            capabilities: Vec::new(),
+            relay_mode: RelayMode::Disabled,
+            connected_at_unix: 1,
+        };
+
+        registration
+            .validate()
+            .expect("malformed optional metadata must not reject node presence");
+        assert!(node_connection_priority_from_labels(&registration.labels).is_err());
     }
 
     fn rendezvous_identity_pem_with_cluster_san(cluster_id: ClusterId) -> String {
