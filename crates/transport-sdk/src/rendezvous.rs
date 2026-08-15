@@ -33,6 +33,32 @@ const MAX_CONCURRENT_RELAY_TICKET_REQUESTS_PER_ORIGIN: usize = 3;
 const MAX_SERVER_TICKET_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const RELAY_TICKET_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Reserved presence label used by server nodes to advertise their relative
+/// suitability for client traffic. Higher values are preferred by clients.
+pub const NODE_CONNECTION_PRIORITY_LABEL: &str = "client_connection_priority";
+pub const MIN_NODE_CONNECTION_PRIORITY: i16 = -20;
+pub const MAX_NODE_CONNECTION_PRIORITY: i16 = 20;
+
+pub fn validate_node_connection_priority(priority: i16) -> Result<()> {
+    if !(MIN_NODE_CONNECTION_PRIORITY..=MAX_NODE_CONNECTION_PRIORITY).contains(&priority) {
+        bail!(
+            "node connection priority must be between {MIN_NODE_CONNECTION_PRIORITY} and {MAX_NODE_CONNECTION_PRIORITY}"
+        );
+    }
+    Ok(())
+}
+
+pub fn node_connection_priority_from_labels(labels: &HashMap<String, String>) -> Result<i16> {
+    let Some(raw_priority) = labels.get(NODE_CONNECTION_PRIORITY_LABEL) else {
+        return Ok(0);
+    };
+    let priority = raw_priority.trim().parse::<i16>().with_context(|| {
+        format!("presence label {NODE_CONNECTION_PRIORITY_LABEL} must contain an integer priority")
+    })?;
+    validate_node_connection_priority(priority)?;
+    Ok(priority)
+}
+
 #[derive(Debug)]
 pub struct RendezvousBackpressure {
     origin: String,
@@ -362,6 +388,10 @@ pub struct DiscoveryResponse {
     pub node_candidates: Option<Vec<ConnectionCandidate>>,
     #[serde(default)]
     pub node_relay_capable: bool,
+    /// Server-advertised preference for the requested node. Older rendezvous
+    /// services omit this field and therefore retain the neutral priority.
+    #[serde(default)]
+    pub node_connection_priority: i16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -440,6 +470,7 @@ impl PresenceRegistration {
         for candidate in &self.direct_candidates {
             candidate.validate()?;
         }
+        node_connection_priority_from_labels(&self.labels)?;
         Ok(())
     }
 }
@@ -1695,6 +1726,29 @@ mod tests {
         "-----END CERTIFICATE-----\n"
     );
 
+    #[test]
+    fn node_connection_priority_labels_default_and_validate_bounds() {
+        assert_eq!(
+            node_connection_priority_from_labels(&HashMap::new()).unwrap(),
+            0
+        );
+
+        let preferred = HashMap::from([(
+            NODE_CONNECTION_PRIORITY_LABEL.to_string(),
+            MAX_NODE_CONNECTION_PRIORITY.to_string(),
+        )]);
+        assert_eq!(
+            node_connection_priority_from_labels(&preferred).unwrap(),
+            MAX_NODE_CONNECTION_PRIORITY
+        );
+
+        let out_of_range = HashMap::from([(
+            NODE_CONNECTION_PRIORITY_LABEL.to_string(),
+            (MAX_NODE_CONNECTION_PRIORITY + 1).to_string(),
+        )]);
+        assert!(node_connection_priority_from_labels(&out_of_range).is_err());
+    }
+
     fn rendezvous_identity_pem_with_cluster_san(cluster_id: ClusterId) -> String {
         let key_pair = KeyPair::generate().expect("test identity key should generate");
         let mut params = CertificateParams::new(Vec::new()).expect("test certificate params");
@@ -2601,6 +2655,7 @@ mod tests {
                             transport_hints: None,
                         }]),
                         node_relay_capable: true,
+                        node_connection_priority: 6,
                     })
                 },
             ),
@@ -2646,6 +2701,7 @@ mod tests {
             }])
         );
         assert!(discovery.node_relay_capable);
+        assert_eq!(discovery.node_connection_priority, 6);
 
         server.abort();
         let _ = server.await;
@@ -2664,6 +2720,7 @@ mod tests {
                         rendezvous_peers: Vec::new(),
                         node_candidates: None,
                         node_relay_capable: false,
+                        node_connection_priority: 0,
                     })
                 },
             ),

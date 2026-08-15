@@ -1093,6 +1093,7 @@ mod tests {
             pairing_token: None,
             device_label: Some("Laptop".to_string()),
             device_id: Some(device_id.to_string()),
+            node_priority_overrides: Default::default(),
         };
 
         let client = bootstrap

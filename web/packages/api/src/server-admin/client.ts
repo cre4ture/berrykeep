@@ -46,6 +46,7 @@ import type {
   MetadataDbLogicalDistributionStatusResponse,
   MetadataDbLogicalDistributionTriggerResponse,
   NodeCertificateStatusResponse,
+  NodeConnectionPriorityView,
   NodeDescriptor,
   NodeEnrollmentPackage,
   NaturalEarthImportJobView,
@@ -1214,6 +1215,25 @@ export async function updateDirectEndpointsConfig(
     method: "PUT",
     adminTokenOverride,
     body: request
+  });
+}
+
+export async function getNodeConnectionPriority(
+  adminTokenOverride?: string
+): Promise<NodeConnectionPriorityView> {
+  return fetchAdminJson<NodeConnectionPriorityView>(apiV1("/auth/node-connection-priority"), {
+    adminTokenOverride
+  });
+}
+
+export async function updateNodeConnectionPriority(
+  priority: number,
+  adminTokenOverride?: string
+): Promise<NodeConnectionPriorityView> {
+  return fetchAdminJson<NodeConnectionPriorityView>(apiV1("/auth/node-connection-priority"), {
+    method: "PUT",
+    adminTokenOverride,
+    body: { priority }
   });
 }
 

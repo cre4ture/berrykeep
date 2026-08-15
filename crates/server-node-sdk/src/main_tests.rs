@@ -20533,6 +20533,50 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
     cleanup_test_state(&state).await;
 }
 
+#[tokio::test]
+async fn local_node_connection_priority_updates_presence_labels() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+
+    assert_eq!(
+        super::current_local_node_connection_priority(&state).await,
+        0
+    );
+    super::apply_local_node_connection_priority(&state, 9)
+        .await
+        .expect("priority update should succeed");
+    assert_eq!(
+        super::current_local_node_connection_priority(&state).await,
+        9
+    );
+
+    let local_descriptor = state
+        .cluster
+        .lock()
+        .await
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == state.node_id)
+        .expect("local descriptor should exist");
+    let registration =
+        super::build_rendezvous_presence_registration(&state, Some(&local_descriptor));
+    assert_eq!(
+        registration
+            .labels
+            .get(transport_sdk::NODE_CONNECTION_PRIORITY_LABEL)
+            .map(String::as_str),
+        Some("9")
+    );
+
+    super::apply_local_node_connection_priority(&state, 0)
+        .await
+        .expect("neutral priority should succeed");
+    assert_eq!(
+        super::current_local_node_connection_priority(&state).await,
+        0
+    );
+    cleanup_test_state(&state).await;
+}
+
 async fn cleanup_test_state(state: &ServerState) {
     super::shutdown_direct_quic_runtime(state).await;
     let root = {

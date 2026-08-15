@@ -581,6 +581,7 @@ mod tests {
             pairing_token: None,
             device_label: None,
             device_id: None,
+            node_priority_overrides: BTreeMap::new(),
         }
     }
 

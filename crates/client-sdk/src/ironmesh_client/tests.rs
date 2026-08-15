@@ -928,6 +928,7 @@ fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
         transport_path_kind: TransportPathKind::DirectHttps,
         locator: "https://direct.example".to_string(),
         bootstrap_rank: 0,
+        node_connection_priority: 0,
     };
     let relay = ClientEndpointDescriptor {
         route_id: RouteId::new("relay-route"),
@@ -935,6 +936,7 @@ fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
         transport_path_kind: TransportPathKind::RelayTunnel,
         locator: "relay://node@example".to_string(),
         bootstrap_rank: 0,
+        node_connection_priority: 0,
     };
     let direct_quic = ClientEndpointDescriptor {
         route_id: RouteId::new("direct-quic-route"),
@@ -942,11 +944,35 @@ fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
         transport_path_kind: TransportPathKind::DirectQuic,
         locator: "iroh://direct-quic".to_string(),
         bootstrap_rank: 0,
+        node_connection_priority: 0,
     };
 
     assert_eq!(endpoint_score(&direct, &state), 100.0);
     assert_eq!(endpoint_score(&relay, &state), 600.0);
     assert_eq!(endpoint_score(&direct_quic, &state), 0.0);
+}
+
+#[test]
+fn route_score_prefers_higher_priority_server_nodes() {
+    let state = ClientEndpointState {
+        ewma_latency_ms: Some(100.0),
+        ..ClientEndpointState::default()
+    };
+    let preferred = ClientEndpointDescriptor {
+        route_id: RouteId::new("preferred-node"),
+        path_kind: ClientEndpointPathKind::Direct,
+        transport_path_kind: TransportPathKind::DirectHttps,
+        locator: "https://preferred.example".to_string(),
+        bootstrap_rank: 0,
+        node_connection_priority: 5,
+    };
+    let neutral = ClientEndpointDescriptor {
+        node_connection_priority: 0,
+        ..preferred.clone()
+    };
+
+    assert!(endpoint_score(&preferred, &state) < endpoint_score(&neutral, &state));
+    assert_eq!(endpoint_score(&preferred, &state), -25.0);
 }
 
 #[test]

@@ -1,15 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   getHardwareHealth,
+  getNodeConnectionPriority,
   type HardwareHealthCollectorStatus,
   type HardwareHealthCurrentResponse,
   type HardwareHealthFinding,
   type HardwareNetworkInterface,
-  type HardwareStorageDevice
+  type HardwareStorageDevice,
+  updateNodeConnectionPriority
 } from "@ironmesh/api";
 import { ironmeshPrimaryColor, JsonBlock, StatCard } from "@ironmesh/ui";
-import { Alert, Badge, Button, Card, Code, Grid, Group, Loader, Stack, Text } from "@mantine/core";
-import { useCallback, type ReactNode } from "react";
+import { Alert, Badge, Button, Card, Code, Grid, Group, Loader, NumberInput, Stack, Text } from "@mantine/core";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 import { TelemetryConfigurationCard } from "../components/TelemetryConfigurationCard";
@@ -28,6 +30,20 @@ export function HardwarePage() {
     queryFn: () => getHardwareHealth(normalizedAdminTokenOverride || undefined),
     enabled: canInspectHardware
   });
+  const priorityQuery = useQuery({
+    queryKey: ["hardware-page", "node-connection-priority", normalizedAdminTokenOverride],
+    queryFn: () => getNodeConnectionPriority(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectHardware
+  });
+  const [priorityDraft, setPriorityDraft] = useState(0);
+  const [prioritySaving, setPrioritySaving] = useState(false);
+  const [priorityError, setPriorityError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (priorityQuery.data) {
+      setPriorityDraft(priorityQuery.data.priority);
+    }
+  }, [priorityQuery.data]);
 
   const response: HardwareHealthCurrentResponse | null =
     canInspectHardware ? hardwareQuery.data ?? null : null;
@@ -37,8 +53,25 @@ export function HardwarePage() {
   const warningFindings = findings.filter((finding) => finding.severity === "warn");
 
   const refresh = useCallback(async () => {
-    await hardwareQuery.refetch();
-  }, [hardwareQuery]);
+    await Promise.all([hardwareQuery.refetch(), priorityQuery.refetch()]);
+  }, [hardwareQuery, priorityQuery]);
+
+  async function savePriority() {
+    setPrioritySaving(true);
+    setPriorityError(null);
+    try {
+      const response = await updateNodeConnectionPriority(
+        priorityDraft,
+        normalizedAdminTokenOverride || undefined
+      );
+      setPriorityDraft(response.priority);
+      await priorityQuery.refetch();
+    } catch (error) {
+      setPriorityError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPrioritySaving(false);
+    }
+  }
 
   return (
     <Stack gap="lg">
@@ -78,6 +111,52 @@ export function HardwarePage() {
           Refresh
         </Button>
       </Group>
+
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="sm">
+          <Group justify="space-between" align="flex-start">
+            <div>
+              <Text fw={700}>Client connection priority</Text>
+              <Text c="dimmed" size="sm" maw={760}>
+                Advertise how strongly clients should prefer this server node. Use higher values for
+                stronger hardware and lower values for constrained hardware. Route health and failover
+                remain active.
+              </Text>
+            </div>
+            <Badge variant="light">
+              {priorityQuery.data?.persisted ? "Persisted" : "Runtime only"}
+            </Badge>
+          </Group>
+          {priorityError || priorityQuery.error ? (
+            <Alert color="red" title="Priority configuration unavailable">
+              {priorityError ?? (priorityQuery.error instanceof Error ? priorityQuery.error.message : String(priorityQuery.error))}
+            </Alert>
+          ) : null}
+          <Group align="flex-end">
+            <NumberInput
+              label="Priority level"
+              description="0 is neutral; higher values are preferred."
+              value={priorityDraft}
+              min={priorityQuery.data?.min_priority ?? -20}
+              max={priorityQuery.data?.max_priority ?? 20}
+              step={1}
+              allowDecimal={false}
+              onChange={(value) => setPriorityDraft(typeof value === "number" ? value : 0)}
+              disabled={!canInspectHardware || priorityQuery.isLoading || prioritySaving}
+            />
+            <Button
+              onClick={() => void savePriority()}
+              loading={prioritySaving}
+              disabled={!priorityQuery.data || priorityDraft === priorityQuery.data.priority}
+            >
+              Save priority
+            </Button>
+          </Group>
+          <Text size="xs" c="dimmed">
+            Valid range {priorityQuery.data?.min_priority ?? -20} to {priorityQuery.data?.max_priority ?? 20}. Clients may apply a local experimental override.
+          </Text>
+        </Stack>
+      </Card>
 
       <Grid>
         <Grid.Col span={{ base: 12, md: 4, xl: 3 }}>

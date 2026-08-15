@@ -148,6 +148,12 @@ final class IronmeshBrowserModel: ObservableObject {
     @Published var filesSelectionSummary: String?
     @Published var connectionDiagnostics: IronmeshConnectionDiagnosticsSnapshot?
     @Published var connectionRouteSnapshot: AppleConnectionRouteSnapshot?
+    var knownServerNodeIDs: [String] {
+        Array(Set(
+            connectionRouteSnapshot?.endpoints.compactMap(\.targetNodeId) ?? []
+                + Array(draft.nodePriorityOverrides.keys)
+        )).sorted()
+    }
     @Published var connectionRoutesErrorMessage: String?
     @Published var isRefreshingConnectionRoutes = false
     @Published var webUIPresentation: IronmeshWebUIPresentation?
@@ -432,6 +438,32 @@ final class IronmeshBrowserModel: ObservableObject {
                 periodSeconds: periodSeconds
             )
         )
+    }
+
+    func nodePriorityOverride(for nodeID: String) -> Int? {
+        draft.nodePriorityOverrides[nodeID]
+    }
+
+    func effectiveNodePriority(for nodeID: String) -> Int {
+        if let override = nodePriorityOverride(for: nodeID) {
+            return override
+        }
+        return connectionRouteSnapshot?.endpoints
+            .first(where: { $0.targetNodeId == nodeID })?
+            .nodeConnectionPriority ?? 0
+    }
+
+    func updateNodePriorityOverride(_ priority: Int?, for nodeID: String) {
+        do {
+            var updatedDraft = draft
+            try updatedDraft.setNodePriorityOverride(priority, for: nodeID)
+            draft = updatedDraft
+            applyConnectionSettings()
+        } catch {
+            lastErrorMessage = error.localizedDescription
+            statusText = error.localizedDescription
+            addAction("Node priority update failed", detail: error.localizedDescription)
+        }
     }
 
     private func updateTitleLatencyMonitorSettings(_ settings: AppleTitleLatencyMonitorSettings) {

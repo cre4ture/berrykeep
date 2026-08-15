@@ -430,6 +430,27 @@ class MainViewModel(
         )
     }
 
+    fun updateNodeConnectionPriorityOverride(nodeId: String, priority: Int?) {
+        val current = uiState.value.deviceAuthState
+        runCatching { current.withNodePriorityOverride(nodeId, priority) }
+            .onSuccess { updated ->
+                IronmeshPreferences.setDeviceAuthState(getApplication(), updated)
+                deviceAuthState = updated
+                uiState.value = uiState.value.copy(
+                    deviceAuthState = updated,
+                    status = if (priority == null) {
+                        "Using the server priority for node $nodeId"
+                    } else {
+                        "Set node $nodeId priority override to $priority"
+                    },
+                )
+                refreshConnectionRoutes()
+            }
+            .onFailure { error ->
+                setStatus("Could not update server node priority: ${error.message}")
+            }
+    }
+
     private fun updateTitleLatencyMonitorSettings(settings: TitleLatencyMonitorSettings) {
         val normalized = settings.normalized()
         uiState.value = uiState.value.copy(titleLatencyMonitorSettings = normalized)

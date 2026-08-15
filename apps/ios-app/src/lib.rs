@@ -2126,6 +2126,7 @@ mod tests {
             pairing_token: Some("correct horse battery staple".to_string()),
             device_label: Some("iphone".to_string()),
             device_id: None,
+            node_priority_overrides: Default::default(),
         }
     }
 
