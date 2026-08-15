@@ -376,10 +376,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.goBack();
   await expect(page.getByRole("button", { name: "Fullscreen map" })).toBeVisible();
   const prefixInput = page.getByLabel("Prefix");
+  await expect(page.getByRole("button", { name: "nested/", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "docs/", exact: true }).click();
   await expect(prefixInput).toHaveValue("docs/");
   await expect(page.getByRole("button", { name: "nested/", exact: true })).toBeVisible();
-  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByText("No geo-tagged media in view")).toBeVisible();
   await page.getByRole("button", { name: "nested/", exact: true }).click();
   await expect(prefixInput).toHaveValue("docs/nested/");
   await page.getByRole("button", { name: "Up one level" }).click();
@@ -390,8 +391,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("2 markers")).toBeVisible();
   await page.getByRole("button", { name: "media/", exact: true }).click();
   await expect(prefixInput).toHaveValue("media/");
-  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
-  await expect(page.getByText("2 markers")).toBeVisible();
+  await expect(page.getByText("No geo-tagged media in view")).toBeVisible();
   await page.getByRole("button", { name: "Up one level" }).click();
   await expect(prefixInput).toHaveValue("");
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
@@ -1935,9 +1935,18 @@ function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URL
   const prefix = searchParams.get("prefix") ?? "";
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
+  const isTreeNavigationRequest =
+    searchParams.get("view") === "tree" &&
+    !searchParams.has("offset") &&
+    !searchParams.has("limit") &&
+    !searchParams.has("sort") &&
+    !mediaFilter;
+  const scopedEntries = isTreeNavigationRequest
+    ? projectMockStoreEntries(entries, prefix, depth)
+    : filterMockStoreEntriesToPrefix(entries, prefix);
   const filteredEntries = mediaFilter
-    ? entries.filter((entry) => matchesMockMediaFilter(entry, mediaFilter))
-    : entries;
+    ? scopedEntries.filter((entry) => matchesMockMediaFilter(entry, mediaFilter))
+    : scopedEntries;
   const sortedEntries = sortMockGalleryEntries(filteredEntries, searchParams.get("sort"));
   const totalEntryCount = sortedEntries.length;
   const offset = Math.max(0, Number(searchParams.get("offset") ?? "0") || 0);
@@ -1959,6 +1968,73 @@ function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URL
     media_summary: summarizeMockGalleryEntries(filteredEntries),
     entries: pagedEntries
   };
+}
+
+function filterMockStoreEntriesToPrefix(
+  entries: MockStoreEntry[],
+  requestedPrefix: string
+): MockStoreEntry[] {
+  const normalizedPrefix = normalizeMockFolderKey(requestedPrefix).replace(/\/+$/, "");
+  if (!normalizedPrefix) {
+    return entries;
+  }
+  const prefixWithSeparator = `${normalizedPrefix}/`;
+  return entries.filter((entry) => {
+    const normalizedPath = entry.path.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+    return normalizedPath !== normalizedPrefix && normalizedPath.startsWith(prefixWithSeparator);
+  });
+}
+
+function projectMockStoreEntries(
+  entries: MockStoreEntry[],
+  requestedPrefix: string,
+  requestedDepth: number
+): MockStoreEntry[] {
+  const normalizedPrefix = normalizeMockFolderKey(requestedPrefix).replace(/\/+$/, "");
+  const depth = Math.max(1, requestedDepth || 1);
+  const projectedEntries = new Map<string, MockStoreEntry>();
+
+  for (const entry of entries) {
+    const normalizedPath =
+      entry.entry_type === "prefix"
+        ? normalizeMockFolderKey(entry.path)
+        : entry.path.trim().replace(/^\/+/, "");
+    const pathWithoutTrailingSlash = normalizedPath.replace(/\/+$/, "");
+    if (!pathWithoutTrailingSlash) {
+      continue;
+    }
+
+    let relativePath = pathWithoutTrailingSlash;
+    if (normalizedPrefix) {
+      if (pathWithoutTrailingSlash === normalizedPrefix) {
+        continue;
+      }
+      const prefixWithSeparator = `${normalizedPrefix}/`;
+      if (!pathWithoutTrailingSlash.startsWith(prefixWithSeparator)) {
+        continue;
+      }
+      relativePath = pathWithoutTrailingSlash.slice(prefixWithSeparator.length);
+    }
+
+    const relativeSegments = relativePath.split("/").filter(Boolean);
+    if (relativeSegments.length === 0) {
+      continue;
+    }
+    if (relativeSegments.length > depth) {
+      const collapsedPath = [normalizedPrefix, ...relativeSegments.slice(0, depth)]
+        .filter(Boolean)
+        .join("/");
+      const prefixPath = `${collapsedPath}/`;
+      if (!projectedEntries.has(prefixPath)) {
+        projectedEntries.set(prefixPath, { path: prefixPath, entry_type: "prefix" });
+      }
+      continue;
+    }
+
+    projectedEntries.set(normalizedPath, { ...entry, path: normalizedPath });
+  }
+
+  return [...projectedEntries.values()];
 }
 
 function buildMockVersionGraphResponse(key: string, preferredHeadVersionId: string | null) {
