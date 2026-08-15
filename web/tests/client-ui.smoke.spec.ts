@@ -2,6 +2,10 @@ import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import { registerGalleryMapContractTests } from "./gallery-map.contract";
+import {
+  filterMockStoreEntriesToPrefix,
+  projectMockStoreTreeEntries
+} from "./store-index.mock";
 
 const API_V1_PREFIX = "/api/v1";
 
@@ -1942,7 +1946,7 @@ function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URL
     !searchParams.has("sort") &&
     !mediaFilter;
   const scopedEntries = isTreeNavigationRequest
-    ? projectMockStoreEntries(entries, prefix, depth)
+    ? projectMockStoreTreeEntries(entries, prefix, depth)
     : filterMockStoreEntriesToPrefix(entries, prefix);
   const filteredEntries = mediaFilter
     ? scopedEntries.filter((entry) => matchesMockMediaFilter(entry, mediaFilter))
@@ -1968,73 +1972,6 @@ function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URL
     media_summary: summarizeMockGalleryEntries(filteredEntries),
     entries: pagedEntries
   };
-}
-
-function filterMockStoreEntriesToPrefix(
-  entries: MockStoreEntry[],
-  requestedPrefix: string
-): MockStoreEntry[] {
-  const normalizedPrefix = normalizeMockFolderKey(requestedPrefix).replace(/\/+$/, "");
-  if (!normalizedPrefix) {
-    return entries;
-  }
-  const prefixWithSeparator = `${normalizedPrefix}/`;
-  return entries.filter((entry) => {
-    const normalizedPath = entry.path.trim().replace(/^\/+/, "").replace(/\/+$/, "");
-    return normalizedPath !== normalizedPrefix && normalizedPath.startsWith(prefixWithSeparator);
-  });
-}
-
-function projectMockStoreEntries(
-  entries: MockStoreEntry[],
-  requestedPrefix: string,
-  requestedDepth: number
-): MockStoreEntry[] {
-  const normalizedPrefix = normalizeMockFolderKey(requestedPrefix).replace(/\/+$/, "");
-  const depth = Math.max(1, requestedDepth || 1);
-  const projectedEntries = new Map<string, MockStoreEntry>();
-
-  for (const entry of entries) {
-    const normalizedPath =
-      entry.entry_type === "prefix"
-        ? normalizeMockFolderKey(entry.path)
-        : entry.path.trim().replace(/^\/+/, "");
-    const pathWithoutTrailingSlash = normalizedPath.replace(/\/+$/, "");
-    if (!pathWithoutTrailingSlash) {
-      continue;
-    }
-
-    let relativePath = pathWithoutTrailingSlash;
-    if (normalizedPrefix) {
-      if (pathWithoutTrailingSlash === normalizedPrefix) {
-        continue;
-      }
-      const prefixWithSeparator = `${normalizedPrefix}/`;
-      if (!pathWithoutTrailingSlash.startsWith(prefixWithSeparator)) {
-        continue;
-      }
-      relativePath = pathWithoutTrailingSlash.slice(prefixWithSeparator.length);
-    }
-
-    const relativeSegments = relativePath.split("/").filter(Boolean);
-    if (relativeSegments.length === 0) {
-      continue;
-    }
-    if (relativeSegments.length > depth) {
-      const collapsedPath = [normalizedPrefix, ...relativeSegments.slice(0, depth)]
-        .filter(Boolean)
-        .join("/");
-      const prefixPath = `${collapsedPath}/`;
-      if (!projectedEntries.has(prefixPath)) {
-        projectedEntries.set(prefixPath, { path: prefixPath, entry_type: "prefix" });
-      }
-      continue;
-    }
-
-    projectedEntries.set(normalizedPath, { ...entry, path: normalizedPath });
-  }
-
-  return [...projectedEntries.values()];
 }
 
 function buildMockVersionGraphResponse(key: string, preferredHeadVersionId: string | null) {
