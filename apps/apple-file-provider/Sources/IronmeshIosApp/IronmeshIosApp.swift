@@ -1539,6 +1539,7 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
 
         let controller = UIViewController()
         controller.view = webView
+        context.coordinator.hostViewController = controller
         return controller
     }
 
@@ -1547,9 +1548,13 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
         _ = context
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKDownloadDelegate, UIDocumentPickerDelegate {
         private let origin: URL
+        private var downloadDestinations: [ObjectIdentifier: URL] = [:]
+        private var completedDownloads: [URL] = []
+        private var activeExportURL: URL?
         weak var webView: WKWebView?
+        weak var hostViewController: UIViewController?
 
         init(origin: URL) {
             self.origin = origin
@@ -1561,13 +1566,146 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
             decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
         ) {
             guard let candidate = navigationAction.request.url,
-                  candidate.scheme == origin.scheme,
-                  candidate.host == origin.host,
-                  candidate.port == origin.port else {
+                  isSameOrigin(candidate) else {
                 decisionHandler(.cancel)
                 return
             }
-            decisionHandler(.allow)
+            decisionHandler(navigationAction.shouldPerformDownload ? .download : .allow)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            navigationAction: WKNavigationAction,
+            didBecome download: WKDownload
+        ) {
+            download.delegate = self
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            navigationResponse: WKNavigationResponse,
+            didBecome download: WKDownload
+        ) {
+            download.delegate = self
+        }
+
+        func download(
+            _ download: WKDownload,
+            decideDestinationUsing response: URLResponse,
+            suggestedFilename: String,
+            completionHandler: @escaping @MainActor @Sendable (URL?) -> Void
+        ) {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ironmesh-web-downloads", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(
+                    at: directory,
+                    withIntermediateDirectories: true
+                )
+                let destination = directory.appendingPathComponent(
+                    sanitizedDownloadFilename(suggestedFilename),
+                    isDirectory: false
+                )
+                downloadDestinations[ObjectIdentifier(download)] = destination
+                completionHandler(destination)
+            } catch {
+                completionHandler(nil)
+            }
+        }
+
+        func downloadDidFinish(_ download: WKDownload) {
+            guard let destination = downloadDestinations.removeValue(
+                forKey: ObjectIdentifier(download)
+            ) else {
+                return
+            }
+            completedDownloads.append(destination)
+            presentNextCompletedDownload()
+        }
+
+        func download(
+            _ download: WKDownload,
+            didFailWithError error: Error,
+            resumeData: Data?
+        ) {
+            guard let destination = downloadDestinations.removeValue(
+                forKey: ObjectIdentifier(download)
+            ) else {
+                return
+            }
+            removeDownloadedTemporaryFile(destination)
+        }
+
+        func documentPicker(
+            _ controller: UIDocumentPickerViewController,
+            didPickDocumentsAt urls: [URL]
+        ) {
+            finishActiveExport()
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            finishActiveExport()
+        }
+
+        private func isSameOrigin(_ candidate: URL) -> Bool {
+            candidate.scheme?.caseInsensitiveCompare(origin.scheme ?? "") == .orderedSame &&
+                candidate.host?.caseInsensitiveCompare(origin.host ?? "") == .orderedSame &&
+                effectivePort(candidate) == effectivePort(origin)
+        }
+
+        private func effectivePort(_ url: URL) -> Int? {
+            if let port = url.port {
+                return port
+            }
+            switch url.scheme?.lowercased() {
+            case "http":
+                return 80
+            case "https":
+                return 443
+            default:
+                return nil
+            }
+        }
+
+        private func sanitizedDownloadFilename(_ candidate: String) -> String {
+            let leafName = (candidate as NSString).lastPathComponent
+            let invalidCharacters = CharacterSet(charactersIn: "<>:\"/\\|?*")
+                .union(.controlCharacters)
+            let sanitized = leafName
+                .components(separatedBy: invalidCharacters)
+                .joined(separator: "_")
+                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ".")))
+            return sanitized.isEmpty ? "download.bin" : sanitized
+        }
+
+        private func presentNextCompletedDownload() {
+            guard activeExportURL == nil,
+                  let hostViewController,
+                  hostViewController.presentedViewController == nil,
+                  !completedDownloads.isEmpty else {
+                return
+            }
+
+            let fileURL = completedDownloads.removeFirst()
+            activeExportURL = fileURL
+            let picker = UIDocumentPickerViewController(forExporting: [fileURL], asCopy: true)
+            picker.delegate = self
+            hostViewController.present(picker, animated: true)
+        }
+
+        private func finishActiveExport() {
+            if let activeExportURL {
+                removeDownloadedTemporaryFile(activeExportURL)
+            }
+            activeExportURL = nil
+            DispatchQueue.main.async { [weak self] in
+                self?.presentNextCompletedDownload()
+            }
+        }
+
+        private func removeDownloadedTemporaryFile(_ fileURL: URL) {
+            try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
         }
     }
 }

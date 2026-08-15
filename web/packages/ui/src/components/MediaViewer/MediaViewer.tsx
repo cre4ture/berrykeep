@@ -11,6 +11,7 @@ import {
 import {
   IconChevronLeft,
   IconChevronRight,
+  IconDownload,
   IconMapPin,
   IconPhoto,
   IconPlayerPlay,
@@ -330,8 +331,17 @@ export function MediaLightboxModal({
                     </Badge>
                   ) : null}
                 </Group>
-                <Group gap="xs" wrap="nowrap">
+                <Group data-media-actions="true" gap="xs" justify="flex-end">
                   {extraActions}
+                  <Button
+                    data-media-download="true"
+                    variant="default"
+                    size="xs"
+                    leftSection={<IconDownload size={14} />}
+                    onClick={() => triggerMediaDownload(selectedItem)}
+                  >
+                    Download original
+                  </Button>
                   <Button
                     variant="default"
                     size="xs"
@@ -364,6 +374,25 @@ function usesEmbeddedWebUiViewport(): boolean {
 
   const embeddedClient = new URLSearchParams(window.location.search).get("embedded_client");
   return embeddedClient === "android" || embeddedClient === "ios";
+}
+
+function triggerMediaDownload(item: MediaLightboxItem) {
+  const anchor = document.createElement("a");
+  anchor.href = item.requests.original.url;
+  anchor.download = mediaDownloadFileName(item);
+  anchor.hidden = true;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+function mediaDownloadFileName(item: MediaLightboxItem): string {
+  const pathSegment = item.description
+    .split(/[\\/]/)
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .at(-1);
+  return pathSegment || item.title.trim() || "download";
 }
 
 export function MediaThumbnailPreview({
