@@ -28,22 +28,22 @@ internal class EmbeddedWebUiDownloadListener(
         }
 
         val fileName = embeddedWebUiDownloadFileName(url, contentDisposition)
-        val request = DownloadManager.Request(Uri.parse(url))
-            .setTitle(fileName)
-            .setDescription("Downloading original media")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-
-        if (mimetype.isNotBlank()) {
-            request.setMimeType(mimetype)
-        }
-        if (userAgent.isNotBlank()) {
-            request.addRequestHeader("User-Agent", userAgent)
-        }
-        CookieManager.getInstance().getCookie(url)?.takeIf(String::isNotBlank)?.let { cookie ->
-            request.addRequestHeader("Cookie", cookie)
-        }
-
         runCatching {
+            val request = DownloadManager.Request(Uri.parse(url))
+                .setTitle(fileName)
+                .setDescription("Downloading original media")
+                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+
+            if (mimetype.isNotBlank()) {
+                request.setMimeType(mimetype)
+            }
+            if (userAgent.isNotBlank()) {
+                request.addRequestHeader("User-Agent", userAgent)
+            }
+            CookieManager.getInstance().getCookie(url)?.takeIf(String::isNotBlank)?.let { cookie ->
+                request.addRequestHeader("Cookie", cookie)
+            }
+
             val downloadManager = requireNotNull(context.getSystemService(DownloadManager::class.java)) {
                 "Android download manager is unavailable"
             }
