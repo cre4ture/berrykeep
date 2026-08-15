@@ -24,6 +24,16 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 
 ## Current state (latest implemented)
 
+### Client route priority
+
+- Server nodes advertise a configurable client connection priority from `-20` through `20`.
+- The node-local admin Hardware page and `IRONMESH_NODE_CONNECTION_PRIORITY` configure the
+  server value; enrollment-based nodes persist it in their enrollment package.
+- Rendezvous discovery carries the advertised value into client route scoring as a soft bias, so
+  latency, failures, circuit breaking, transport preference, and failover remain active.
+- The iOS and Android advanced settings contain an experimental per-node override editor. Overrides
+  are stored in the connection bootstrap and take precedence over the advertised server value.
+
 ### Server + data plane
 
 - Replication planner stabilized with low-churn semantics and tolerance controls.
@@ -72,8 +82,14 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - `crates/adapter-windows-cfapi/src/register.rs`
 - `apps/os-integration/src/main.rs`
 - `apps/android-app/app/src/main/java/io/ironmesh/android/ui/MainViewModel.kt`
+- `apps/android-app/app/src/main/java/io/ironmesh/android/data/DeviceAuthState.kt`
 - `apps/android-app/app/src/main/java/io/ironmesh/android/data/IronmeshPreferences.kt`
 - `apps/android-app/app/src/main/java/io/ironmesh/android/saf/IronmeshDocumentsProvider.kt`
+- `apps/apple-file-provider/Sources/AppleCore/IronmeshConnectionDraft.swift`
+- `crates/client-sdk/src/bootstrap.rs`
+- `crates/client-sdk/src/ironmesh_client.rs`
+- `crates/server-node-sdk/src/lib.rs`
+- `crates/transport-sdk/src/rendezvous.rs`
 - `.github/workflows/check.yml`
 - `.github/workflows/coverage.yml`
 - `docs/cross-platform-filesystem-integration-strategy.md`
@@ -84,6 +100,8 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 ```bash
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p transport-sdk -p rendezvous-server -p client-sdk -p server-node-sdk
+cd web && pnpm typecheck && pnpm build
 cargo test -p sync-core
 cargo test -p adapter-linux-fuse
 cargo check -p adapter-linux-fuse
