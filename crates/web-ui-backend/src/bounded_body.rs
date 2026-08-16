@@ -1,36 +1,60 @@
 use anyhow::Result;
 use axum::body::Body;
 use bytes::Bytes;
+use std::any::Any;
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Notify, Semaphore};
 
 const STREAM_BUFFERED_CHUNKS: usize = 1;
+const MAX_ACTIVE_STREAM_PRODUCERS: usize = 16;
+
+#[derive(Default)]
+struct StreamCancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct StreamCancellation {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<StreamCancellationState>,
 }
 
 impl StreamCancellation {
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.state.cancelled.load(Ordering::Relaxed)
     }
 
     fn guard(&self) -> StreamCancellationGuard {
         StreamCancellationGuard {
-            cancelled: Arc::clone(&self.cancelled),
+            cancellation: self.clone(),
         }
+    }
+
+    fn cancel(&self) {
+        if !self.state.cancelled.swap(true, Ordering::Relaxed) {
+            self.state.notify.notify_waiters();
+        }
+    }
+
+    async fn cancelled(&self) {
+        let notified = self.state.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
     }
 }
 
 struct StreamCancellationGuard {
-    cancelled: Arc<AtomicBool>,
+    cancellation: StreamCancellation,
 }
 
 impl Drop for StreamCancellationGuard {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancellation.cancel();
     }
 }
 
@@ -81,11 +105,66 @@ impl Write for BoundedBodyWriter {
     }
 }
 
+fn stream_producer_slots() -> Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_ACTIVE_STREAM_PRODUCERS))))
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic payload")
+}
+
+fn run_producer<F>(
+    sender: flume::Sender<io::Result<Bytes>>,
+    cancellation: StreamCancellation,
+    expected_length: u64,
+    produce: F,
+) where
+    F: FnOnce(&mut dyn Write, &StreamCancellation) -> Result<()>,
+{
+    let mut writer = BoundedBodyWriter {
+        sender,
+        cancellation: cancellation.clone(),
+        bytes_written: 0,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        produce(&mut writer, &cancellation)
+    }));
+    if cancellation.is_cancelled() {
+        return;
+    }
+
+    match result {
+        Ok(Err(error)) => writer.send_error(io::Error::other(format!("{error:#}"))),
+        Ok(Ok(())) if writer.bytes_written != expected_length => {
+            writer.send_error(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "stream producer wrote {} bytes, expected {expected_length}",
+                    writer.bytes_written
+                ),
+            ));
+        }
+        Ok(Ok(())) => {}
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            tracing::error!(panic = message, "binary stream producer panicked");
+            writer.send_error(io::Error::other(format!(
+                "binary stream producer panicked: {message}"
+            )));
+        }
+    }
+}
+
 /// Adapts a blocking writer producer to an HTTP body with one-chunk backpressure.
 ///
-/// The producer runs on Tokio's blocking pool. Dropping the returned body closes the bounded
-/// channel and marks the cancellation token, so both a blocked writer and cancellation-aware
-/// upstream work stop promptly.
+/// Producers use capped, dedicated threads so slow HTTP consumers cannot exhaust Tokio's shared
+/// blocking pool. Dropping the returned body cancels queued work, closes the bounded channel, and
+/// stops both a blocked writer and cancellation-aware upstream work promptly.
 pub(crate) fn from_blocking_writer<F>(expected_length: u64, produce: F) -> Body
 where
     F: FnOnce(&mut dyn Write, &StreamCancellation) -> Result<()> + Send + 'static,
@@ -94,27 +173,34 @@ where
     let cancellation = StreamCancellation::default();
     let producer_cancellation = cancellation.clone();
 
-    tokio::task::spawn_blocking(move || {
-        let mut writer = BoundedBodyWriter {
-            sender,
-            cancellation: producer_cancellation.clone(),
-            bytes_written: 0,
+    tokio::spawn(async move {
+        let cancellation_waiter = producer_cancellation.clone();
+        let permit = tokio::select! {
+            _ = cancellation_waiter.cancelled() => return,
+            permit = stream_producer_slots().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
         };
-        let result = produce(&mut writer, &producer_cancellation);
         if producer_cancellation.is_cancelled() {
             return;
         }
 
-        if let Err(error) = result {
-            writer.send_error(io::Error::other(format!("{error:#}")));
-        } else if writer.bytes_written != expected_length {
-            writer.send_error(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "stream producer wrote {} bytes, expected {expected_length}",
-                    writer.bytes_written
-                ),
-            ));
+        let thread_cancellation = producer_cancellation.clone();
+        let thread_sender = sender.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("ironmesh-web-binary-stream".to_string())
+            .spawn(move || {
+                let _permit = permit;
+                run_producer(thread_sender, thread_cancellation, expected_length, produce);
+            });
+        if let Err(error) = spawn_result {
+            tracing::error!(error = %error, "failed to start binary stream producer thread");
+            let _ = sender
+                .send_async(Err(io::Error::other(format!(
+                    "failed to start binary stream producer: {error}"
+                ))))
+                .await;
         }
     });
 
@@ -244,6 +330,33 @@ mod tests {
             .expect("body should contain an error frame")
             .expect_err("producer failure should reach the body");
         assert!(error.to_string().contains("upstream failed"));
+    }
+
+    #[tokio::test]
+    async fn reports_producer_panics_after_delivered_bytes() {
+        let mut body = from_blocking_writer(8, move |writer, _| {
+            writer.write_all(b"partial")?;
+            panic!("test producer panic");
+        });
+
+        let first = body
+            .frame()
+            .await
+            .expect("body should contain a frame")
+            .expect("first frame should succeed");
+        assert_eq!(
+            first
+                .data_ref()
+                .expect("frame should contain data")
+                .as_ref(),
+            b"partial"
+        );
+        let error = body
+            .frame()
+            .await
+            .expect("body should contain an error frame")
+            .expect_err("producer panic should reach the body");
+        assert!(error.to_string().contains("test producer panic"));
     }
 
     #[tokio::test]
