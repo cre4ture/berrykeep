@@ -1,7 +1,7 @@
 use super::{LogicalFileByteRange, WebUiConfig, parse_logical_file_range, router};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
+use axum::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::routing::get;
 use bytes::Bytes;
@@ -338,11 +338,14 @@ async fn dropping_binary_response_cancels_the_upstream_body() {
     let body_dropped = Arc::clone(&state.body_dropped);
     let (base_url, web, upstream) = start_binary_test_servers(state).await;
 
-    let mut response = reqwest::get(format!(
-        "{base_url}/api/v1/store/stream-binary?key=video.mp4"
-    ))
-    .await
-    .expect("stream request should start");
+    let mut response = reqwest::Client::new()
+        .get(format!(
+            "{base_url}/api/v1/store/stream-binary?key=video.mp4"
+        ))
+        .header(CONNECTION, "close")
+        .send()
+        .await
+        .expect("stream request should start");
     let first = response
         .chunk()
         .await

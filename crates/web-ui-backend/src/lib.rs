@@ -3,7 +3,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, RANGE, SET_COOKIE,
+    CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, RANGE, RETRY_AFTER, SET_COOKIE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -3256,6 +3256,15 @@ enum BinaryResponsePresentation {
     Inline,
 }
 
+impl BinaryResponsePresentation {
+    fn producer_class(self) -> bounded_body::StreamProducerClass {
+        match self {
+            Self::Attachment => bounded_body::StreamProducerClass::Attachment,
+            Self::Inline => bounded_body::StreamProducerClass::Inline,
+        }
+    }
+}
+
 struct SelectedRangeWriter<'a> {
     output: &'a mut dyn Write,
     selection_start: u64,
@@ -3295,67 +3304,74 @@ impl Write for SelectedRangeWriter<'_> {
     }
 }
 
-fn binary_stream_body(
+async fn binary_stream_body(
     sdk: IronMeshClient,
     query: WebStoreBinaryGetQuery,
     total_size_bytes: u64,
     selected_range: Option<LogicalFileByteRange>,
     upstream_accepts_ranges: bool,
-) -> Body {
+    presentation: BinaryResponsePresentation,
+) -> io::Result<Body> {
     let output_length = selected_range
         .map(|range| range.end_inclusive - range.start + 1)
         .unwrap_or(total_size_bytes);
     if output_length == 0 {
-        return Body::empty();
+        return Ok(Body::empty());
     }
 
-    bounded_body::from_blocking_writer(output_length, move |writer, cancellation| {
-        let (download_range, slice_selection) = match (selected_range, upstream_accepts_ranges) {
-            (Some(range), false) => (
-                RequestedRange {
-                    offset: 0,
-                    length: total_size_bytes,
+    bounded_body::from_blocking_writer(
+        output_length,
+        presentation.producer_class(),
+        move |writer, cancellation| {
+            let (download_range, slice_selection) = match (selected_range, upstream_accepts_ranges)
+            {
+                (Some(range), false) => (
+                    RequestedRange {
+                        offset: 0,
+                        length: total_size_bytes,
+                    },
+                    Some(range),
+                ),
+                (Some(range), true) => (
+                    RequestedRange {
+                        offset: range.start,
+                        length: output_length,
+                    },
+                    None,
+                ),
+                (None, _) => (
+                    RequestedRange {
+                        offset: 0,
+                        length: total_size_bytes,
+                    },
+                    None,
+                ),
+            };
+            let mut selected_writer;
+            let download_writer: &mut dyn Write = if let Some(selection) = slice_selection {
+                selected_writer = SelectedRangeWriter::new(writer, selection);
+                &mut selected_writer
+            } else {
+                writer
+            };
+            let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
+            let should_cancel = || cancellation.is_cancelled();
+            sdk.download_range_to_writer_with_progress_blocking(
+                DownloadRangeRequest {
+                    key: query.key.as_str(),
+                    snapshot: query.snapshot.as_deref(),
+                    version: query.version.as_deref(),
+                    range: download_range,
                 },
-                Some(range),
-            ),
-            (Some(range), true) => (
-                RequestedRange {
-                    offset: range.start,
-                    length: output_length,
-                },
-                None,
-            ),
-            (None, _) => (
-                RequestedRange {
-                    offset: 0,
-                    length: total_size_bytes,
-                },
-                None,
-            ),
-        };
-        let mut selected_writer;
-        let download_writer: &mut dyn Write = if let Some(selection) = slice_selection {
-            selected_writer = SelectedRangeWriter::new(writer, selection);
-            &mut selected_writer
-        } else {
-            writer
-        };
-        let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
-        let should_cancel = || cancellation.is_cancelled();
-        sdk.download_range_to_writer_with_progress_blocking(
-            DownloadRangeRequest {
-                key: query.key.as_str(),
-                snapshot: query.snapshot.as_deref(),
-                version: query.version.as_deref(),
-                range: download_range,
-            },
-            download_writer,
-            &mut on_progress,
-            &should_cancel,
-        )
-        .with_context(|| format!("failed streaming binary object key={}", query.key))?;
-        Ok(())
-    })
+                download_writer,
+                &mut on_progress,
+                &should_cancel,
+            )
+            .with_context(|| format!("failed streaming binary object key={}", query.key))?;
+            Ok(())
+        },
+    )
+    .await
 }
 
 fn binary_content_headers(
@@ -3490,13 +3506,37 @@ async fn web_store_binary_response(
             .into_response();
     }
 
-    let body = binary_stream_body(
+    let body = match binary_stream_body(
         sdk,
         query,
         total_size_bytes,
         selected_range,
         head.accept_ranges,
-    );
+        presentation,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            tracing::warn!(%error, "binary stream capacity unavailable");
+            let mut response = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "binary stream capacity is temporarily exhausted",
+            );
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+        Err(error) => {
+            return logged_error_response(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binary stream producer failed to start",
+                error.to_string(),
+            );
+        }
+    };
 
     (
         selected_range

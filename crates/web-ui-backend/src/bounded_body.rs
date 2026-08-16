@@ -6,15 +6,23 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Notify, Semaphore};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 const STREAM_BUFFERED_CHUNKS: usize = 1;
-const MAX_ACTIVE_STREAM_PRODUCERS: usize = 16;
+const DEFAULT_MAX_INLINE_STREAM_PRODUCERS: usize = 32;
+const DEFAULT_MAX_ATTACHMENT_STREAM_PRODUCERS: usize = 8;
+const DEFAULT_STREAM_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy)]
+pub(crate) enum StreamProducerClass {
+    Inline,
+    Attachment,
+}
 
 #[derive(Default)]
 struct StreamCancellationState {
     cancelled: AtomicBool,
-    notify: Notify,
 }
 
 #[derive(Clone, Default)]
@@ -34,17 +42,7 @@ impl StreamCancellation {
     }
 
     fn cancel(&self) {
-        if !self.state.cancelled.swap(true, Ordering::Relaxed) {
-            self.state.notify.notify_waiters();
-        }
-    }
-
-    async fn cancelled(&self) {
-        let notified = self.state.notify.notified();
-        if self.is_cancelled() {
-            return;
-        }
-        notified.await;
+        self.state.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
@@ -105,9 +103,32 @@ impl Write for BoundedBodyWriter {
     }
 }
 
-fn stream_producer_slots() -> Arc<Semaphore> {
-    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    Arc::clone(SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_ACTIVE_STREAM_PRODUCERS))))
+fn configured_stream_limit(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn stream_producer_slots(class: StreamProducerClass) -> Arc<Semaphore> {
+    static INLINE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    static ATTACHMENT_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+    match class {
+        StreamProducerClass::Inline => Arc::clone(INLINE_SLOTS.get_or_init(|| {
+            Arc::new(Semaphore::new(configured_stream_limit(
+                "IRONMESH_WEB_MAX_INLINE_STREAMS",
+                DEFAULT_MAX_INLINE_STREAM_PRODUCERS,
+            )))
+        })),
+        StreamProducerClass::Attachment => Arc::clone(ATTACHMENT_SLOTS.get_or_init(|| {
+            Arc::new(Semaphore::new(configured_stream_limit(
+                "IRONMESH_WEB_MAX_ATTACHMENT_STREAMS",
+                DEFAULT_MAX_ATTACHMENT_STREAM_PRODUCERS,
+            )))
+        })),
+    }
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> &str {
@@ -162,60 +183,69 @@ fn run_producer<F>(
 
 /// Adapts a blocking writer producer to an HTTP body with one-chunk backpressure.
 ///
-/// Producers use capped, dedicated threads so slow HTTP consumers cannot exhaust Tokio's shared
-/// blocking pool. Dropping the returned body cancels queued work, closes the bounded channel, and
-/// stops both a blocked writer and cancellation-aware upstream work promptly.
-pub(crate) fn from_blocking_writer<F>(expected_length: u64, produce: F) -> Body
+/// Producers use separate capped pools of dedicated threads so attachment downloads cannot starve
+/// inline gallery/video traffic and slow HTTP consumers cannot exhaust Tokio's shared blocking
+/// pool. Admission waits only briefly before returning `WouldBlock`, allowing the handler to send
+/// a 503 response instead of leaving requests queued indefinitely. Dropping the returned body
+/// closes the bounded channel and stops both a blocked writer and cancellation-aware upstream work.
+pub(crate) async fn from_blocking_writer<F>(
+    expected_length: u64,
+    class: StreamProducerClass,
+    produce: F,
+) -> io::Result<Body>
+where
+    F: FnOnce(&mut dyn Write, &StreamCancellation) -> Result<()> + Send + 'static,
+{
+    from_blocking_writer_with_pool(
+        expected_length,
+        stream_producer_slots(class),
+        DEFAULT_STREAM_ADMISSION_TIMEOUT,
+        produce,
+    )
+    .await
+}
+
+async fn from_blocking_writer_with_pool<F>(
+    expected_length: u64,
+    slots: Arc<Semaphore>,
+    admission_timeout: Duration,
+    produce: F,
+) -> io::Result<Body>
 where
     F: FnOnce(&mut dyn Write, &StreamCancellation) -> Result<()> + Send + 'static,
 {
     let (sender, receiver) = flume::bounded(STREAM_BUFFERED_CHUNKS);
     let cancellation = StreamCancellation::default();
     let producer_cancellation = cancellation.clone();
+    let permit = tokio::time::timeout(admission_timeout, slots.acquire_owned())
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "binary stream capacity is temporarily exhausted",
+            )
+        })?
+        .map_err(|_| io::Error::other("binary stream capacity pool was closed"))?;
 
-    tokio::spawn(async move {
-        let cancellation_waiter = producer_cancellation.clone();
-        let permit = tokio::select! {
-            _ = cancellation_waiter.cancelled() => return,
-            permit = stream_producer_slots().acquire_owned() => match permit {
-                Ok(permit) => permit,
-                Err(_) => return,
-            },
-        };
-        if producer_cancellation.is_cancelled() {
-            return;
-        }
-
-        let thread_cancellation = producer_cancellation.clone();
-        let thread_sender = sender.clone();
-        let spawn_result = std::thread::Builder::new()
-            .name("ironmesh-web-binary-stream".to_string())
-            .spawn(move || {
-                let _permit = permit;
-                run_producer(thread_sender, thread_cancellation, expected_length, produce);
-            });
-        if let Err(error) = spawn_result {
-            tracing::error!(error = %error, "failed to start binary stream producer thread");
-            let _ = sender
-                .send_async(Err(io::Error::other(format!(
-                    "failed to start binary stream producer: {error}"
-                ))))
-                .await;
-        }
-    });
+    std::thread::Builder::new()
+        .name("ironmesh-web-binary-stream".to_string())
+        .spawn(move || {
+            let _permit = permit;
+            run_producer(sender, producer_cancellation, expected_length, produce);
+        })?;
 
     let cancellation_guard = cancellation.guard();
-    Body::from_stream(async_stream::stream! {
+    Ok(Body::from_stream(async_stream::stream! {
         let _cancellation_guard = cancellation_guard;
         while let Ok(item) = receiver.recv_async().await {
             yield item;
         }
-    })
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::from_blocking_writer;
+    use super::{StreamProducerClass, from_blocking_writer, from_blocking_writer_with_pool};
     use anyhow::anyhow;
     use http_body_util::BodyExt;
     use std::sync::Arc;
@@ -235,7 +265,7 @@ mod tests {
         let (continue_sender, continue_receiver) = std::sync::mpsc::sync_channel(0);
         let producer_finished = Arc::new(AtomicBool::new(false));
         let producer_finished_in_task = Arc::clone(&producer_finished);
-        let mut body = from_blocking_writer(11, move |writer, _| {
+        let mut body = from_blocking_writer(11, StreamProducerClass::Inline, move |writer, _| {
             writer.write_all(b"hello ")?;
             continue_receiver
                 .recv()
@@ -243,7 +273,9 @@ mod tests {
             writer.write_all(b"world")?;
             producer_finished_in_task.store(true, Ordering::SeqCst);
             Ok(())
-        });
+        })
+        .await
+        .expect("producer should be admitted");
 
         let first = body
             .frame()
@@ -280,12 +312,14 @@ mod tests {
     async fn applies_one_chunk_of_backpressure() {
         let second_write_finished = Arc::new(AtomicBool::new(false));
         let second_write_finished_in_task = Arc::clone(&second_write_finished);
-        let mut body = from_blocking_writer(2, move |writer, _| {
+        let mut body = from_blocking_writer(2, StreamProducerClass::Inline, move |writer, _| {
             writer.write_all(b"a")?;
             writer.write_all(b"b")?;
             second_write_finished_in_task.store(true, Ordering::SeqCst);
             Ok(())
-        });
+        })
+        .await
+        .expect("producer should be admitted");
 
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(!second_write_finished.load(Ordering::SeqCst));
@@ -307,10 +341,12 @@ mod tests {
 
     #[tokio::test]
     async fn reports_producer_failures_after_delivered_bytes() {
-        let mut body = from_blocking_writer(8, move |writer, _| {
+        let mut body = from_blocking_writer(8, StreamProducerClass::Inline, move |writer, _| {
             writer.write_all(b"partial")?;
             Err(anyhow!("upstream failed"))
-        });
+        })
+        .await
+        .expect("producer should be admitted");
 
         let first = body
             .frame()
@@ -334,10 +370,12 @@ mod tests {
 
     #[tokio::test]
     async fn reports_producer_panics_after_delivered_bytes() {
-        let mut body = from_blocking_writer(8, move |writer, _| {
+        let mut body = from_blocking_writer(8, StreamProducerClass::Inline, move |writer, _| {
             writer.write_all(b"partial")?;
             panic!("test producer panic");
-        });
+        })
+        .await
+        .expect("producer should be admitted");
 
         let first = body
             .frame()
@@ -363,17 +401,63 @@ mod tests {
     async fn dropping_the_body_cancels_a_blocked_producer() {
         let producer_stopped = Arc::new(AtomicBool::new(false));
         let producer_stopped_in_task = Arc::clone(&producer_stopped);
-        let body = from_blocking_writer(2, move |writer, cancellation| {
-            writer.write_all(b"a")?;
-            let result = writer.write_all(b"b");
-            assert!(result.is_err());
-            assert!(cancellation.is_cancelled());
-            producer_stopped_in_task.store(true, Ordering::SeqCst);
-            Ok(())
-        });
+        let body = from_blocking_writer(
+            2,
+            StreamProducerClass::Inline,
+            move |writer, cancellation| {
+                writer.write_all(b"a")?;
+                let result = writer.write_all(b"b");
+                assert!(result.is_err());
+                assert!(cancellation.is_cancelled());
+                producer_stopped_in_task.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("producer should be admitted");
 
         tokio::time::sleep(Duration::from_millis(25)).await;
         drop(body);
         wait_until(|| producer_stopped.load(Ordering::SeqCst)).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_excess_producers_after_a_bounded_wait() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let first_body = from_blocking_writer_with_pool(
+            1,
+            Arc::clone(&slots),
+            Duration::from_secs(1),
+            move |writer, _| {
+                release_receiver
+                    .recv()
+                    .map_err(|error| anyhow!("test gate closed: {error}"))?;
+                writer.write_all(b"a")?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("first producer should be admitted");
+
+        let started = Instant::now();
+        let error = from_blocking_writer_with_pool(
+            1,
+            Arc::clone(&slots),
+            Duration::from_millis(25),
+            move |writer, _| {
+                writer.write_all(b"b")?;
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("second producer should be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        release_sender
+            .send(())
+            .expect("first producer gate should still be open");
+        drop(first_body);
     }
 }
