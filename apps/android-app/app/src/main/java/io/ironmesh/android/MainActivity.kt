@@ -391,6 +391,9 @@ class MainActivity : ComponentActivity() {
                                     onTitleLatencyMonitorEnabledChange = vm::updateTitleLatencyMonitorEnabled,
                                     onTitleLatencyMonitorPeriodSecondsChange =
                                         vm::updateTitleLatencyMonitorPeriodSeconds,
+                                    onRevealNodePriorities = vm::refreshConnectionRoutes,
+                                    onNodePriorityOverrideChange =
+                                        vm::updateNodeConnectionPriorityOverride,
                                     onKeyChange = vm::updateKey,
                                     onPayloadChange = vm::updatePayload,
                                     onPutObject = vm::putObject,

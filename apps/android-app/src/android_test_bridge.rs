@@ -116,6 +116,7 @@ fn android_test_connection_bootstrap(public_url: &str) -> Result<ConnectionBoots
         pairing_token: None,
         device_label: None,
         device_id: None,
+        node_priority_overrides: Default::default(),
     })
 }
 

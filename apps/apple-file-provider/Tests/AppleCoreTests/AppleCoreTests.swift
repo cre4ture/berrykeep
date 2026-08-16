@@ -118,6 +118,33 @@ final class AppleCoreTests: XCTestCase {
         XCTAssertEqual(configuration.normalizedConnectionInput, json)
     }
 
+    func testNodePriorityOverrideRoundTripsInsideConnectionBootstrap() throws {
+        let nodeID = "018f1f74-7b65-7c09-9d13-3a6644d0d999"
+        var draft = IronmeshConnectionDraft(
+            bootstrapInput: #"{"version":1,"cluster_id":"018f1f74-7b65-7c09-9d13-3a6644d0d111"}"#
+        )
+
+        try draft.setNodePriorityOverride(7, for: nodeID)
+        XCTAssertEqual(draft.nodePriorityOverrides, [nodeID: 7])
+
+        try draft.setNodePriorityOverride(nil, for: nodeID)
+        XCTAssertTrue(draft.nodePriorityOverrides.isEmpty)
+        XCTAssertFalse(draft.bootstrapInput.contains("node_priority_overrides"))
+    }
+
+    func testNodePriorityOverrideRejectsOutOfRangeValue() {
+        var draft = IronmeshConnectionDraft(bootstrapInput: #"{"version":1}"#)
+
+        XCTAssertThrowsError(
+            try draft.setNodePriorityOverride(
+                appleMaximumNodeConnectionPriority + 1,
+                for: "018f1f74-7b65-7c09-9d13-3a6644d0d999"
+            )
+        ) { error in
+            XCTAssertEqual(error as? AppleNodePriorityOverrideError, .priorityOutOfRange)
+        }
+    }
+
     func testBridgeItemDerivesDisplayNameFromPath() {
         let item = AppleBridgeItem(
             path: "docs/readme.txt",

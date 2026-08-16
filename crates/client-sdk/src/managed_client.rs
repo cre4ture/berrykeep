@@ -1219,6 +1219,7 @@ mod tests {
             pairing_token: None,
             device_label: None,
             device_id: None,
+            node_priority_overrides: BTreeMap::new(),
         };
         let options = ManagedClientOptions {
             initial_discovery_timeout: Duration::ZERO,
@@ -1309,6 +1310,7 @@ mod tests {
                                     transport_hints: None,
                                 }]),
                                 node_relay_capable: false,
+                                node_connection_priority: 0,
                             });
                         }
                         if query.node_id.is_some() {
@@ -1318,6 +1320,7 @@ mod tests {
                             rendezvous_peers: Vec::new(),
                             node_candidates: None,
                             node_relay_capable: false,
+                            node_connection_priority: 0,
                         })
                     }
                 }),
@@ -1364,6 +1367,7 @@ mod tests {
             pairing_token: None,
             device_label: None,
             device_id: None,
+            node_priority_overrides: BTreeMap::new(),
         };
         let managed = bootstrap
             .build_managed_client(
@@ -1431,6 +1435,7 @@ mod tests {
             pairing_token: None,
             device_label: None,
             device_id: None,
+            node_priority_overrides: BTreeMap::new(),
         };
         let mut identity = ClientIdentityMaterial::generate(cluster_id, None, None)
             .expect("test identity should generate");

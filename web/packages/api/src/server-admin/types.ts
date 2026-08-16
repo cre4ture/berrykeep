@@ -1190,6 +1190,14 @@ export type DirectEndpointsConfigView = {
   persisted: boolean;
 };
 
+export type NodeConnectionPriorityView = {
+  priority: number;
+  min_priority: number;
+  max_priority: number;
+  persistence_source: "node_enrollment" | "runtime_only";
+  persisted: boolean;
+};
+
 export type ManagedControlPlanePromotionPackage = {
   signer_backup: Record<string, unknown>;
   rendezvous_failover: Record<string, unknown>;

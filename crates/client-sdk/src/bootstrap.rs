@@ -82,6 +82,11 @@ pub struct ConnectionBootstrap {
     pub device_label: Option<String>,
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Optional client-local overrides keyed by server node ID. This field is
+    /// intentionally part of the persisted client bootstrap so every mobile
+    /// background consumer uses the same route preference.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_priority_overrides: BTreeMap<NodeId, i16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +127,9 @@ pub struct PlannedConnectionBootstrapTarget {
     pub server_base_url: Option<String>,
     #[serde(default)]
     pub target_node_id: Option<NodeId>,
+    /// Effective server-node priority after applying a client-local override.
+    #[serde(default)]
+    pub node_connection_priority: i16,
     #[serde(default)]
     pub server_ca_pem: Option<String>,
     #[serde(default)]
@@ -314,6 +322,8 @@ fn relay_targets_for_node_ids(
                 direct_candidate: None,
                 server_base_url: None,
                 target_node_id: Some(target_node_id),
+                node_connection_priority: bootstrap
+                    .effective_node_connection_priority(target_node_id, 0),
                 server_ca_pem: bootstrap.trust_roots.public_api_ca_pem.clone(),
                 cluster_ca_pem: bootstrap.trust_roots.cluster_ca_pem.clone(),
                 rendezvous_ca_pem: bootstrap.trust_roots.rendezvous_ca_pem.clone(),
@@ -355,7 +365,27 @@ impl ConnectionBootstrap {
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.to_transport_bootstrap()?.validate()
+        self.to_transport_bootstrap()?.validate()?;
+        for (node_id, priority) in &self.node_priority_overrides {
+            if node_id.is_nil() {
+                bail!("node priority override must not use a nil node ID");
+            }
+            transport_sdk::validate_node_connection_priority(*priority).with_context(|| {
+                format!("invalid connection priority override for node {node_id}")
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn effective_node_connection_priority(
+        &self,
+        node_id: NodeId,
+        advertised_priority: i16,
+    ) -> i16 {
+        self.node_priority_overrides
+            .get(&node_id)
+            .copied()
+            .unwrap_or(advertised_priority)
     }
 
     /// Returns the contact set used for Rendezvous discovery and relay routes.
@@ -524,6 +554,10 @@ impl ConnectionBootstrap {
                 direct_candidate: None,
                 server_base_url: Some(endpoint.url),
                 target_node_id: endpoint.node_id,
+                node_connection_priority: endpoint
+                    .node_id
+                    .map(|node_id| self.effective_node_connection_priority(node_id, 0))
+                    .unwrap_or_default(),
                 server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
                 cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
                 rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
@@ -794,6 +828,8 @@ impl ConnectionBootstrap {
                         direct_candidate: None,
                         server_base_url: None,
                         target_node_id: Some(resolved_target_node_id),
+                        node_connection_priority: self
+                            .effective_node_connection_priority(resolved_target_node_id, 0),
                         server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
                         cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
                         rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
@@ -1181,6 +1217,7 @@ impl ConnectionBootstrap {
             )?,
             direct_candidates_by_node: BTreeMap::new(),
             relay_capable_nodes: BTreeSet::new(),
+            advertised_priorities_by_node: BTreeMap::new(),
         };
         let base_rendezvous_urls = discovery.rendezvous_urls.clone();
         let base_rendezvous_url_set = base_rendezvous_urls
@@ -1226,6 +1263,9 @@ impl ConnectionBootstrap {
             if node_discovery.relay_capable {
                 discovery.relay_capable_nodes.insert(node_id);
             }
+            discovery
+                .advertised_priorities_by_node
+                .insert(node_id, node_discovery.node_connection_priority);
             if discovered_candidate_count > 0 {
                 discovery.rendezvous_urls = merge_parallel_rendezvous_url_results(
                     &base_rendezvous_urls,
@@ -1329,6 +1369,7 @@ impl ConnectionBootstrap {
         let mut last_error = None;
         let mut candidates = Vec::new();
         let mut relay_capable = false;
+        let mut node_connection_priority = None;
         let mut seen_candidates = BTreeSet::new();
         let mut first_usable_endpoint = None;
         let mut success_grace_deadline = None;
@@ -1348,6 +1389,10 @@ impl ConnectionBootstrap {
             match result {
                 Ok((winning_url, response)) => {
                     saw_success = true;
+                    node_connection_priority = merge_node_connection_priority_advertisement(
+                        node_connection_priority,
+                        response.node_connection_priority,
+                    );
                     rendezvous_urls = merge_connected_rendezvous_urls(
                         &rendezvous_urls,
                         &response.rendezvous_peers,
@@ -1394,6 +1439,7 @@ impl ConnectionBootstrap {
                             rendezvous_urls,
                             candidates: transport_sdk::rank_candidates(&candidates),
                             relay_capable,
+                            node_connection_priority: node_connection_priority.unwrap_or_default(),
                         });
                     }
                     if (!candidates.is_empty() || relay_capable) && success_grace_deadline.is_none()
@@ -1433,6 +1479,7 @@ impl ConnectionBootstrap {
             rendezvous_urls,
             candidates: transport_sdk::rank_candidates(&candidates),
             relay_capable,
+            node_connection_priority: node_connection_priority.unwrap_or_default(),
         })
     }
 
@@ -1576,6 +1623,13 @@ impl ConnectionBootstrap {
         // exploration candidates. Runtime health, latency, circuit breaking, and
         // the active-route bonus still decide the durable route after first use.
         for (node_id, candidates) in &discovery.direct_candidates_by_node {
+            let advertised_priority = discovery
+                .advertised_priorities_by_node
+                .get(node_id)
+                .copied()
+                .unwrap_or_default();
+            let node_connection_priority =
+                self.effective_node_connection_priority(*node_id, advertised_priority);
             for candidate in candidates {
                 let Some(path_kind) = planned_path_kind_for_candidate(candidate) else {
                     continue;
@@ -1594,6 +1648,7 @@ impl ConnectionBootstrap {
                     direct_candidate: Some(candidate.clone()),
                     server_base_url: planned_target_server_base_url_for_candidate(candidate)?,
                     target_node_id: Some(*node_id),
+                    node_connection_priority,
                     server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
                     cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
                     rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
@@ -1608,16 +1663,38 @@ impl ConnectionBootstrap {
             if let Some(seen_key) = planned_direct_target_seen_key(target)?
                 && seen_direct_targets.insert(seen_key)
             {
-                direct_targets.push(target.clone());
+                let mut target = target.clone();
+                if let Some(node_id) = target.target_node_id {
+                    let advertised_priority = discovery
+                        .advertised_priorities_by_node
+                        .get(&node_id)
+                        .copied()
+                        .unwrap_or_default();
+                    target.node_connection_priority =
+                        self.effective_node_connection_priority(node_id, advertised_priority);
+                }
+                direct_targets.push(target);
             }
         }
 
-        let relay_targets = refreshed_relay_targets(
+        let mut relay_targets = refreshed_relay_targets(
             self,
             &static_direct_targets,
             &discovery.rendezvous_urls,
             &discovery.relay_capable_nodes,
         )?;
+        for target in &mut relay_targets {
+            let Some(node_id) = target.target_node_id else {
+                continue;
+            };
+            let advertised_priority = discovery
+                .advertised_priorities_by_node
+                .get(&node_id)
+                .copied()
+                .unwrap_or_default();
+            target.node_connection_priority =
+                self.effective_node_connection_priority(node_id, advertised_priority);
+        }
 
         let planned = match self.relay_mode {
             RelayMode::Disabled => direct_targets,
@@ -1642,11 +1719,27 @@ impl ConnectionBootstrap {
     }
 }
 
+fn merge_node_connection_priority_advertisement(
+    current: Option<i16>,
+    advertised: i16,
+) -> Option<i16> {
+    if transport_sdk::validate_node_connection_priority(advertised).is_err() {
+        return current;
+    }
+
+    // Rendezvous replicas can briefly disagree while a node's presence update
+    // propagates. Choosing the lower value is deterministic and conservative:
+    // a hardware downgrade takes effect without a stale higher value winning a
+    // response race, while converged replicas still produce the exact value.
+    Some(current.map_or(advertised, |current| current.min(advertised)))
+}
+
 #[derive(Debug, Clone)]
 struct DynamicDiscoveryState {
     rendezvous_urls: Vec<String>,
     direct_candidates_by_node: BTreeMap<NodeId, Vec<ConnectionCandidate>>,
     relay_capable_nodes: BTreeSet<NodeId>,
+    advertised_priorities_by_node: BTreeMap<NodeId, i16>,
 }
 
 #[derive(Debug, Clone)]
@@ -1654,6 +1747,7 @@ struct NodeDynamicDiscoveryState {
     rendezvous_urls: Vec<String>,
     candidates: Vec<ConnectionCandidate>,
     relay_capable: bool,
+    node_connection_priority: i16,
 }
 
 fn merge_connected_rendezvous_urls(
@@ -2111,6 +2205,7 @@ fn connection_bootstrap_from_transport(
         pairing_token: bootstrap.pairing_token.clone(),
         device_label: bootstrap.device_label.clone(),
         device_id: bootstrap.device_id.map(|value| value.to_string()),
+        node_priority_overrides: BTreeMap::new(),
     }
 }
 
@@ -2228,6 +2323,7 @@ mod tests {
             pairing_token: None,
             device_label: None,
             device_id: None,
+            node_priority_overrides: BTreeMap::new(),
         }
     }
 
@@ -2288,6 +2384,7 @@ mod tests {
             pairing_token: Some("pairing".to_string()),
             device_label: Some("desktop".to_string()),
             device_id: Some("019cf235-6922-7902-9221-0df1a3192c62".to_string()),
+            node_priority_overrides: BTreeMap::new(),
         }
     }
 
@@ -2380,6 +2477,7 @@ mod tests {
             pairing_token: None,
             device_label: None,
             device_id: None,
+            node_priority_overrides: BTreeMap::new(),
         }
     }
 
@@ -2590,6 +2688,34 @@ mod tests {
             },
         ];
         bootstrap
+    }
+
+    #[test]
+    fn node_priority_override_wins_over_advertised_priority() {
+        let mut bootstrap = multi_node_bootstrap();
+        let node_id = bootstrap.direct_endpoints[0]
+            .node_id
+            .expect("fixture endpoint should have a node id");
+
+        assert_eq!(bootstrap.effective_node_connection_priority(node_id, 8), 8);
+        bootstrap.node_priority_overrides.insert(node_id, -4);
+        assert_eq!(bootstrap.effective_node_connection_priority(node_id, 8), -4);
+    }
+
+    #[test]
+    fn rendezvous_priority_merge_is_order_independent_and_conservative() {
+        let merge = |values: &[i16]| {
+            values.iter().copied().fold(None, |current, advertised| {
+                merge_node_connection_priority_advertisement(current, advertised)
+            })
+        };
+
+        assert_eq!(merge(&[8, -3, 4]), Some(-3));
+        assert_eq!(merge(&[4, -3, 8]), Some(-3));
+        assert_eq!(
+            merge(&[8, transport_sdk::MAX_NODE_CONNECTION_PRIORITY + 1]),
+            Some(8)
+        );
     }
 
     #[test]
@@ -2847,12 +2973,14 @@ mod tests {
                                 },
                             ]),
                             node_relay_capable: true,
+                            node_connection_priority: 0,
                         }
                     } else {
                         DiscoveryResponse {
                             rendezvous_peers: Vec::new(),
                             node_candidates: None,
                             node_relay_capable: false,
+                            node_connection_priority: 0,
                         }
                     };
 
@@ -2896,12 +3024,14 @@ mod tests {
                             }],
                             node_candidates: None,
                             node_relay_capable: false,
+                            node_connection_priority: 0,
                         }
                     } else {
                         DiscoveryResponse {
                             rendezvous_peers: Vec::new(),
                             node_candidates: None,
                             node_relay_capable: false,
+                            node_connection_priority: 0,
                         }
                     };
 
@@ -3044,12 +3174,14 @@ mod tests {
                                 transport_hints: None,
                             }]),
                             node_relay_capable: false,
+                            node_connection_priority: 0,
                         })
                     } else {
                         Json(DiscoveryResponse {
                             rendezvous_peers: Vec::new(),
                             node_candidates: None,
                             node_relay_capable: false,
+                            node_connection_priority: 0,
                         })
                     }
                 }
@@ -3131,6 +3263,7 @@ mod tests {
                     rendezvous_peers: Vec::new(),
                     node_candidates: None,
                     node_relay_capable: false,
+                    node_connection_priority: 0,
                 })
             }),
         );
@@ -3160,6 +3293,7 @@ mod tests {
                         }]
                     }),
                     node_relay_capable: false,
+                    node_connection_priority: 0,
                 })
             }),
         );

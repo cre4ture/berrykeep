@@ -96,6 +96,7 @@ pub fn resolve_connection_config(
         pairing_token: normalize_optional(pairing_token),
         device_label: normalize_optional(device_label),
         device_id: normalize_optional(device_id),
+        node_priority_overrides: Default::default(),
     };
     Ok(ResolvedConnectionConfig {
         cluster_id: bootstrap.cluster_id,
@@ -248,6 +249,7 @@ mod tests {
             pairing_token: Some("pairing".to_string()),
             device_label: Some("old-label".to_string()),
             device_id: Some(Uuid::now_v7().to_string()),
+            node_priority_overrides: Default::default(),
         };
 
         persist_connection_config(
@@ -308,6 +310,7 @@ mod tests {
             pairing_token: None,
             device_label: Some("relay-device".to_string()),
             device_id: Some(Uuid::now_v7().to_string()),
+            node_priority_overrides: Default::default(),
         };
         bootstrap
             .write_to_path(&bootstrap_path)
@@ -364,6 +367,7 @@ mod tests {
             pairing_token: Some("pairing-token".to_string()),
             device_label: Some("existing-device".to_string()),
             device_id: Some(Uuid::now_v7().to_string()),
+            node_priority_overrides: Default::default(),
         };
         bootstrap
             .write_to_path(&bootstrap_path)
@@ -418,6 +422,7 @@ mod tests {
             pairing_token: None,
             device_label: None,
             device_id: None,
+            node_priority_overrides: Default::default(),
         };
         bootstrap
             .write_to_path(&legacy_bootstrap_path)

@@ -1066,6 +1066,7 @@ private func diagnosticLogFilename(now: Date = Date()) -> String {
 private struct IronmeshSettingsView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
     @State private var showsScanner = false
+    @State private var showsExperimentalNodePriorities = false
 
     var body: some View {
         NavigationStack {
@@ -1175,6 +1176,66 @@ private struct IronmeshSettingsView: View {
                 }
 
                 Section("Advanced") {
+                    DisclosureGroup(
+                        "Experimental server priorities",
+                        isExpanded: $showsExperimentalNodePriorities
+                    ) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Test feature. Manual values override the priority advertised by each server node. Higher values are preferred.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+
+                            if model.knownServerNodeIDs.isEmpty {
+                                Text(model.isRefreshingConnectionRoutes
+                                    ? "Loading known server nodes…"
+                                    : "No server nodes have been discovered yet.")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            ForEach(model.knownServerNodeIDs, id: \.self) { nodeID in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text(nodeID)
+                                        .font(.caption.monospaced())
+                                        .textSelection(.enabled)
+                                    Toggle(
+                                        "Manual override",
+                                        isOn: Binding(
+                                            get: { model.nodePriorityOverride(for: nodeID) != nil },
+                                            set: { enabled in
+                                                model.updateNodePriorityOverride(
+                                                    enabled ? model.effectiveNodePriority(for: nodeID) : nil,
+                                                    for: nodeID
+                                                )
+                                            }
+                                        )
+                                    )
+                                    if let priority = model.nodePriorityOverride(for: nodeID) {
+                                        Stepper(
+                                            "Priority: \(priority)",
+                                            value: Binding(
+                                                get: { model.nodePriorityOverride(for: nodeID) ?? priority },
+                                                set: { model.updateNodePriorityOverride($0, for: nodeID) }
+                                            ),
+                                            in: appleMinimumNodeConnectionPriority...appleMaximumNodeConnectionPriority
+                                        )
+                                    } else {
+                                        Text("Automatic · priority \(model.effectiveNodePriority(for: nodeID))")
+                                            .font(.footnote)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                            }
+                        }
+                        .padding(.top, 8)
+                    }
+                    .onChange(of: showsExperimentalNodePriorities) { expanded in
+                        if expanded {
+                            model.refreshConnectionPaths()
+                        }
+                    }
+
                     TextField("Domain display name", text: draftBinding(\.domainDisplayName))
                     TextField("Domain identifier", text: draftBinding(\.domainIdentifier))
                         .textInputAutocapitalization(.never)

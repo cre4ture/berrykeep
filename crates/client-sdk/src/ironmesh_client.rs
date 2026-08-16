@@ -60,6 +60,9 @@ const CLIENT_ROUTE_UNKNOWN_LATENCY_MS: f64 = 75.0;
 const CLIENT_ROUTE_RELAY_PENALTY_MS: f64 = 500.0;
 const CLIENT_ROUTE_DIRECT_QUIC_BONUS_MS: f64 = 100.0;
 const CLIENT_ROUTE_FAILURE_PENALTY_MS: f64 = 250.0;
+/// A priority level is a soft route-quality preference. Circuit breaking and
+/// repeated failures still take precedence so a preferred node cannot prevent failover.
+const CLIENT_ROUTE_NODE_PRIORITY_BONUS_MS: f64 = 25.0;
 const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
 const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
 const CLIENT_ROUTE_RETIRED_FAILURE_STATE_TTL_MS: u64 = 10 * 60 * 1_000;
@@ -440,6 +443,7 @@ struct ClientEndpointDescriptor {
     transport_path_kind: TransportPathKind,
     locator: String,
     bootstrap_rank: usize,
+    node_connection_priority: i16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -605,6 +609,9 @@ pub struct ClientConnectionRouteEndpointSnapshot {
     pub bootstrap_rank: usize,
     #[serde(default)]
     pub target_node_id: Option<NodeId>,
+    /// Effective server-node priority after applying an optional client override.
+    #[serde(default)]
+    pub node_connection_priority: i16,
     /// Iroh relay URLs currently configured for this Direct QUIC endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_relay_urls: Option<Vec<String>>,
@@ -938,6 +945,7 @@ impl ClientEndpoint {
                 transport_path_kind: transport.transport_path_kind(),
                 locator: transport.endpoint_locator(),
                 bootstrap_rank,
+                node_connection_priority: 0,
             },
             transport,
             state: Arc::new(std::sync::Mutex::new(ClientEndpointState::default())),
@@ -952,6 +960,17 @@ impl ClientEndpoint {
         Self {
             descriptor: ClientEndpointDescriptor {
                 bootstrap_rank,
+                ..self.descriptor.clone()
+            },
+            transport: self.transport.clone(),
+            state: self.state.clone(),
+        }
+    }
+
+    fn with_node_connection_priority(&self, node_connection_priority: i16) -> Self {
+        Self {
+            descriptor: ClientEndpointDescriptor {
+                node_connection_priority,
                 ..self.descriptor.clone()
             },
             transport: self.transport.clone(),
@@ -1498,6 +1517,7 @@ impl ClientEndpointRouter {
                     locator: endpoint.descriptor.locator.clone(),
                     bootstrap_rank: endpoint.descriptor.bootstrap_rank,
                     target_node_id: endpoint.transport.target_node_id(),
+                    node_connection_priority: endpoint.descriptor.node_connection_priority,
                     iroh_relay_urls: endpoint.transport.iroh_relay_urls(),
                     last_successful_iroh_relay_url: endpoint
                         .transport
@@ -1869,7 +1889,13 @@ impl ClientEndpointRouter {
             }
             if let Some(existing) = old_by_key.get(&route_id) {
                 retained = retained.saturating_add(1);
-                next.push(existing.with_bootstrap_rank(endpoint.descriptor.bootstrap_rank));
+                next.push(
+                    existing
+                        .with_bootstrap_rank(endpoint.descriptor.bootstrap_rank)
+                        .with_node_connection_priority(
+                            endpoint.descriptor.node_connection_priority,
+                        ),
+                );
             } else {
                 added = added.saturating_add(1);
                 let endpoint = match retired_failure_states.remove(&route_id) {
@@ -1970,6 +1996,7 @@ fn lock_endpoint_state(
 
 fn endpoint_score(descriptor: &ClientEndpointDescriptor, state: &ClientEndpointState) -> f64 {
     let mut score = descriptor.bootstrap_rank as f64;
+    score -= descriptor.node_connection_priority as f64 * CLIENT_ROUTE_NODE_PRIORITY_BONUS_MS;
     score += state
         .ewma_latency_ms
         .unwrap_or(CLIENT_ROUTE_UNKNOWN_LATENCY_MS);
@@ -3581,6 +3608,20 @@ pub struct ClientSnapshotInfo {
 }
 
 impl IronMeshClient {
+    pub(crate) fn with_node_connection_priority(self, node_connection_priority: i16) -> Self {
+        {
+            let mut endpoints = self
+                .transport_router
+                .endpoints
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for endpoint in endpoints.iter_mut() {
+                *endpoint = endpoint.with_node_connection_priority(node_connection_priority);
+            }
+        }
+        self
+    }
+
     pub fn from_direct_base_url(server_base_url: impl Into<String>) -> Self {
         Self::from_direct_http_client(server_base_url, HttpClient::new())
     }

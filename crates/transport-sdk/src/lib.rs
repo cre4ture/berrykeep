@@ -91,14 +91,15 @@ pub use relay_wake::{
 pub use rendezvous::{
     DiscoveryResponse, IrohRelayAdvertisement, IrohRelayTicket, IrohRelayTicketCollection,
     IrohRelayTicketReleaseRequest, IrohRelayTicketReleaseResponse, IrohRelayTicketRequest,
+    MAX_NODE_CONNECTION_PRIORITY, MIN_NODE_CONNECTION_PRIORITY, NODE_CONNECTION_PRIORITY_LABEL,
     PresenceEntry, PresenceListResponse, PresenceRegistration,
     RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse, RendezvousBackpressure,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
     RendezvousEndpointStatus, RendezvousRuntimeState, TransportCapability,
     is_expected_idle_relay_tunnel_accept_timeout, is_rendezvous_backpressure,
-    rendezvous_client_identity_has_expected_cluster_uri_san,
+    node_connection_priority_from_labels, rendezvous_client_identity_has_expected_cluster_uri_san,
     rendezvous_client_identity_is_expired_at, rendezvous_client_identity_needs_renewal_at,
-    rendezvous_client_identity_not_after_unix,
+    rendezvous_client_identity_not_after_unix, validate_node_connection_priority,
 };
 pub use rendezvous_runtime::{
     BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayTunnelBroker,
