@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
@@ -26,6 +27,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +53,9 @@ pub const EMBEDDED_WEB_UI_SESSION_HEADER: &str = "x-ironmesh-web-ui-session";
 const EMBEDDED_WEB_UI_SESSION_COOKIE: &str = "ironmesh_web_ui_session";
 const EMBEDDED_WEB_UI_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 
+#[cfg(test)]
+mod binary_stream_tests;
+mod bounded_body;
 mod mbtiles;
 
 #[derive(Clone, Default)]
@@ -1708,6 +1713,17 @@ fn build_inline_content_disposition(key: &str) -> String {
     format!("inline; filename=\"{filename}\"")
 }
 
+fn build_attachment_content_disposition(key: &str) -> String {
+    let filename = file_name_from_key(key);
+    let filename = if filename.is_empty() {
+        "object.bin"
+    } else {
+        filename
+    }
+    .replace('"', "_");
+    format!("attachment; filename=\"{filename}\"")
+}
+
 fn validate_split_logical_file_manifest(
     mut manifest: SplitLogicalFileManifest,
 ) -> Result<SplitLogicalFileManifest> {
@@ -3234,69 +3250,144 @@ async fn web_store_put_binary(
     }
 }
 
-async fn web_store_get_binary(
-    State(state): State<WebState>,
-    Query(query): Query<WebStoreBinaryGetQuery>,
-) -> impl IntoResponse {
-    if query.key.trim().is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
-    }
-
-    let payload = match current_client(&state)
-        .await
-        .get_with_selector(
-            &query.key,
-            query.snapshot.as_deref(),
-            query.version.as_deref(),
-        )
-        .await
-    {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return logged_error_response(
-                &state,
-                StatusCode::BAD_GATEWAY,
-                "binary download request failed",
-                err.to_string(),
-            );
-        }
-    };
-
-    let fallback_name = query
-        .key
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("object.bin");
-    let filename = fallback_name.replace('"', "_");
-    let content_disposition = format!("attachment; filename=\"{filename}\"");
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    match HeaderValue::from_str(&content_disposition) {
-        Ok(value) => {
-            headers.insert(CONTENT_DISPOSITION, value);
-        }
-        Err(err) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid content-disposition header: {err}"),
-            );
-        }
-    }
-
-    (StatusCode::OK, headers, payload).into_response()
+#[derive(Clone, Copy)]
+enum BinaryResponsePresentation {
+    Attachment,
+    Inline,
 }
 
-async fn web_store_stream_binary(
-    State(state): State<WebState>,
+struct SelectedRangeWriter<'a> {
+    output: &'a mut dyn Write,
+    selection_start: u64,
+    selection_end_exclusive: u64,
+    source_offset: u64,
+}
+
+impl<'a> SelectedRangeWriter<'a> {
+    fn new(output: &'a mut dyn Write, selection: LogicalFileByteRange) -> Self {
+        Self {
+            output,
+            selection_start: selection.start,
+            selection_end_exclusive: selection.end_inclusive.saturating_add(1),
+            source_offset: 0,
+        }
+    }
+}
+
+impl Write for SelectedRangeWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let buffer_start = self.source_offset;
+        let buffer_end = buffer_start.saturating_add(buffer.len() as u64);
+        self.source_offset = buffer_end;
+
+        let selected_start = buffer_start.max(self.selection_start);
+        let selected_end = buffer_end.min(self.selection_end_exclusive);
+        if selected_start < selected_end {
+            let local_start = (selected_start - buffer_start) as usize;
+            let local_end = (selected_end - buffer_start) as usize;
+            self.output.write_all(&buffer[local_start..local_end])?;
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+fn binary_stream_body(
+    sdk: IronMeshClient,
+    query: WebStoreBinaryGetQuery,
+    total_size_bytes: u64,
+    selected_range: Option<LogicalFileByteRange>,
+    upstream_accepts_ranges: bool,
+) -> Body {
+    let output_length = selected_range
+        .map(|range| range.end_inclusive - range.start + 1)
+        .unwrap_or(total_size_bytes);
+    if output_length == 0 {
+        return Body::empty();
+    }
+
+    bounded_body::from_blocking_writer(output_length, move |writer, cancellation| {
+        let (download_range, slice_selection) = match (selected_range, upstream_accepts_ranges) {
+            (Some(range), false) => (
+                RequestedRange {
+                    offset: 0,
+                    length: total_size_bytes,
+                },
+                Some(range),
+            ),
+            (Some(range), true) => (
+                RequestedRange {
+                    offset: range.start,
+                    length: output_length,
+                },
+                None,
+            ),
+            (None, _) => (
+                RequestedRange {
+                    offset: 0,
+                    length: total_size_bytes,
+                },
+                None,
+            ),
+        };
+        let mut selected_writer;
+        let download_writer: &mut dyn Write = if let Some(selection) = slice_selection {
+            selected_writer = SelectedRangeWriter::new(writer, selection);
+            &mut selected_writer
+        } else {
+            writer
+        };
+        let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
+        let should_cancel = || cancellation.is_cancelled();
+        sdk.download_range_to_writer_with_progress_blocking(
+            DownloadRangeRequest {
+                key: query.key.as_str(),
+                snapshot: query.snapshot.as_deref(),
+                version: query.version.as_deref(),
+                range: download_range,
+            },
+            download_writer,
+            &mut on_progress,
+            &should_cancel,
+        )
+        .with_context(|| format!("failed streaming binary object key={}", query.key))?;
+        Ok(())
+    })
+}
+
+fn binary_content_headers(
+    key: &str,
+    presentation: BinaryResponsePresentation,
+) -> Result<HeaderMap> {
+    let (content_type, content_disposition) = match presentation {
+        BinaryResponsePresentation::Attachment => (
+            "application/octet-stream",
+            build_attachment_content_disposition(key),
+        ),
+        BinaryResponsePresentation::Inline => (
+            inline_binary_content_type_for(key),
+            build_inline_content_disposition(key),
+        ),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type)?);
+    headers.insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition)?,
+    );
+    Ok(headers)
+}
+
+async fn web_store_binary_response(
+    state: WebState,
     method: Method,
     headers: HeaderMap,
-    Query(query): Query<WebStoreBinaryGetQuery>,
-) -> impl IntoResponse {
+    query: WebStoreBinaryGetQuery,
+    presentation: BinaryResponsePresentation,
+) -> Response {
     if query.key.trim().is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
@@ -3347,36 +3438,20 @@ async fn web_store_stream_binary(
         None => None,
     };
 
-    let mut response_headers = HeaderMap::new();
+    let mut response_headers = match binary_content_headers(&query.key, presentation) {
+        Ok(headers) => headers,
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid binary response header: {err}"),
+            );
+        }
+    };
     response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if let Some(etag) = head.etag.as_deref()
         && let Ok(value) = HeaderValue::from_str(etag)
     {
         response_headers.insert(ETAG, value);
-    }
-
-    match HeaderValue::from_str(inline_binary_content_type_for(&query.key)) {
-        Ok(value) => {
-            response_headers.insert(CONTENT_TYPE, value);
-        }
-        Err(err) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid content-type header: {err}"),
-            );
-        }
-    }
-
-    match HeaderValue::from_str(&build_inline_content_disposition(&query.key)) {
-        Ok(value) => {
-            response_headers.insert(CONTENT_DISPOSITION, value);
-        }
-        Err(err) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid content-disposition header: {err}"),
-            );
-        }
     }
 
     let content_length = selected_range
@@ -3410,95 +3485,59 @@ async fn web_store_stream_binary(
                 .map(|_| StatusCode::PARTIAL_CONTENT)
                 .unwrap_or(StatusCode::OK),
             response_headers,
-            Vec::<u8>::new(),
+            Body::empty(),
         )
             .into_response();
     }
 
-    let payload = if let Some(range) = selected_range {
-        let range_length = range
-            .end_inclusive
-            .saturating_sub(range.start)
-            .saturating_add(1);
-        if head.accept_ranges {
-            let request_cancellation = RequestCancellation::new();
-            let _request_cancellation_guard = request_cancellation.guard();
-            match download_object_range_bytes(ObjectRangeDownloadRequest {
-                sdk,
-                selection: ObjectRangeSelection {
-                    key: query.key.clone(),
-                    snapshot: query.snapshot.clone(),
-                    version: query.version.clone(),
-                    start: range.start,
-                    length: range_length,
-                },
-                perf_logging_enabled: false,
-                cancelled: request_cancellation.flag(),
-            })
-            .await
-            {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    return logged_error_response(
-                        &state,
-                        StatusCode::BAD_GATEWAY,
-                        "binary range download failed",
-                        err.to_string(),
-                    );
-                }
-            }
-        } else {
-            let full_payload = match current_client(&state)
-                .await
-                .get_with_selector(
-                    &query.key,
-                    query.snapshot.as_deref(),
-                    query.version.as_deref(),
-                )
-                .await
-            {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    return logged_error_response(
-                        &state,
-                        StatusCode::BAD_GATEWAY,
-                        "binary fallback download failed",
-                        err.to_string(),
-                    );
-                }
-            };
-            full_payload[range.start as usize..=range.end_inclusive as usize].to_vec()
-        }
-    } else {
-        match current_client(&state)
-            .await
-            .get_with_selector(
-                &query.key,
-                query.snapshot.as_deref(),
-                query.version.as_deref(),
-            )
-            .await
-        {
-            Ok(bytes) => bytes.to_vec(),
-            Err(err) => {
-                return logged_error_response(
-                    &state,
-                    StatusCode::BAD_GATEWAY,
-                    "binary stream request failed",
-                    err.to_string(),
-                );
-            }
-        }
-    };
+    let body = binary_stream_body(
+        sdk,
+        query,
+        total_size_bytes,
+        selected_range,
+        head.accept_ranges,
+    );
 
     (
         selected_range
             .map(|_| StatusCode::PARTIAL_CONTENT)
             .unwrap_or(StatusCode::OK),
         response_headers,
-        payload,
+        body,
     )
         .into_response()
+}
+
+async fn web_store_get_binary(
+    State(state): State<WebState>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<WebStoreBinaryGetQuery>,
+) -> Response {
+    web_store_binary_response(
+        state,
+        method,
+        headers,
+        query,
+        BinaryResponsePresentation::Attachment,
+    )
+    .await
+}
+
+async fn web_store_stream_binary(
+    State(state): State<WebState>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<WebStoreBinaryGetQuery>,
+) -> Response {
+    web_store_binary_response(
+        state,
+        method,
+        headers,
+        query,
+        BinaryResponsePresentation::Inline,
+    )
+    .await
 }
 
 async fn web_rendezvous(State(state): State<WebState>, headers: HeaderMap) -> impl IntoResponse {
