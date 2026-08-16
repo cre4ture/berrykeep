@@ -10,6 +10,7 @@ mod managed_client;
 pub mod remote_sync;
 mod route_supervisor;
 mod session_pool;
+mod staged_download_coordination;
 
 pub use bootstrap::{
     BootstrapEnrollmentResult, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
