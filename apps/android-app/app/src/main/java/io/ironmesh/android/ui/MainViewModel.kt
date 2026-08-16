@@ -298,6 +298,7 @@ class MainViewModel(
                 persistedStateLoaded = true,
                 syncProfiles = persisted.syncProfiles,
                 deviceIdentity = deviceAuth.toDeviceIdentityUiState(),
+                nodePriorityOverrides = deviceAuth.nodePriorityOverrides(),
                 deviceLabelInput = deviceAuth.label.orEmpty(),
                 appConnectionStatus = persisted.appConnectionStatus,
                 galleryMode = persisted.galleryViewMode,
@@ -428,6 +429,27 @@ class MainViewModel(
         updateTitleLatencyMonitorSettings(
             uiState.value.titleLatencyMonitorSettings.copy(periodSeconds = periodSeconds),
         )
+    }
+
+    fun updateNodeConnectionPriorityOverride(nodeId: String, priority: Int?) {
+        val current = deviceAuthState
+        runCatching { current.withNodePriorityOverride(nodeId, priority) }
+            .onSuccess { updated ->
+                IronmeshPreferences.setDeviceAuthState(getApplication(), updated)
+                deviceAuthState = updated
+                uiState.value = uiState.value.copy(
+                    nodePriorityOverrides = updated.nodePriorityOverrides(),
+                    status = if (priority == null) {
+                        "Using the server priority for node $nodeId"
+                    } else {
+                        "Set node $nodeId priority override to $priority"
+                    },
+                )
+                refreshConnectionRoutes()
+            }
+            .onFailure { error ->
+                setStatus("Could not update server node priority: ${error.message}")
+            }
     }
 
     private fun updateTitleLatencyMonitorSettings(settings: TitleLatencyMonitorSettings) {
@@ -1350,6 +1372,7 @@ class MainViewModel(
             uiState.value = uiState.value.copy(
                 loading = false,
                 deviceIdentity = authState.toDeviceIdentityUiState(),
+                nodePriorityOverrides = authState.nodePriorityOverrides(),
                 bootstrapInput = "",
                 deviceLabelInput = authState.label.orEmpty(),
                 enrollmentDiagnostics = uiState.value.enrollmentDiagnostics
@@ -1784,8 +1807,15 @@ class MainViewModel(
         }
         deviceAuthState = persisted
         val identity = persisted.toDeviceIdentityUiState()
-        if (identity != uiState.value.deviceIdentity) {
-            uiState.value = uiState.value.copy(deviceIdentity = identity)
+        val nodePriorityOverrides = persisted.nodePriorityOverrides()
+        if (
+            identity != uiState.value.deviceIdentity ||
+            nodePriorityOverrides != uiState.value.nodePriorityOverrides
+        ) {
+            uiState.value = uiState.value.copy(
+                deviceIdentity = identity,
+                nodePriorityOverrides = nodePriorityOverrides,
+            )
         }
         return persisted
     }

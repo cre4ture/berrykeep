@@ -20533,6 +20533,50 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
     cleanup_test_state(&state).await;
 }
 
+#[tokio::test]
+async fn local_node_connection_priority_updates_presence_labels() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+
+    assert_eq!(
+        super::current_local_node_connection_priority(&state).await,
+        0
+    );
+    super::apply_local_node_connection_priority(&state, 9)
+        .await
+        .expect("priority update should succeed");
+    assert_eq!(
+        super::current_local_node_connection_priority(&state).await,
+        9
+    );
+
+    let local_descriptor = state
+        .cluster
+        .lock()
+        .await
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == state.node_id)
+        .expect("local descriptor should exist");
+    let registration =
+        super::build_rendezvous_presence_registration(&state, Some(&local_descriptor));
+    assert_eq!(
+        registration
+            .labels
+            .get(transport_sdk::NODE_CONNECTION_PRIORITY_LABEL)
+            .map(String::as_str),
+        Some("9")
+    );
+
+    super::apply_local_node_connection_priority(&state, 0)
+        .await
+        .expect("neutral priority should succeed");
+    assert_eq!(
+        super::current_local_node_connection_priority(&state).await,
+        0
+    );
+    cleanup_test_state(&state).await;
+}
+
 async fn cleanup_test_state(state: &ServerState) {
     super::shutdown_direct_quic_runtime(state).await;
     let root = {
@@ -20622,6 +20666,42 @@ fn configured_file_paths_must_stay_within_data_dir() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn node_enrollment_persistence_path_is_canonicalized() {
+    let root = fresh_test_dir("node-enrollment-persistence-path");
+    let operator_dir = root.join("operator");
+    std::fs::create_dir_all(&operator_dir).unwrap();
+    let package_path = operator_dir.join("node-enrollment.json");
+    std::fs::write(&package_path, "{}").unwrap();
+
+    let resolved = super::resolved_node_enrollment_persistence_path(Some(&package_path))
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved, std::fs::canonicalize(&package_path).unwrap());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn node_enrollment_persistence_path_rejects_symlink_escape() {
+    let root = fresh_test_dir("node-enrollment-persistence-symlink");
+    let operator_dir = root.join("operator");
+    let outside_dir = root.join("outside");
+    std::fs::create_dir_all(&operator_dir).unwrap();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    let outside_package_path = outside_dir.join("node-enrollment.json");
+    std::fs::write(&outside_package_path, "{}").unwrap();
+    let configured_path = operator_dir.join("node-enrollment.json");
+    std::os::unix::fs::symlink(&outside_package_path, &configured_path).unwrap();
+
+    let error = super::resolved_node_enrollment_persistence_path(Some(&configured_path))
+        .expect_err("a package symlink must not escape its configured parent");
+    assert!(error.to_string().contains("must stay within"));
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn fresh_test_dir(name: &str) -> PathBuf {

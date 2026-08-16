@@ -124,6 +124,9 @@ data class SettingsUiState(
     val deviceIdentity: DeviceIdentityUiState,
     val themeAccentColorHex: String,
     val titleLatencyMonitorSettings: TitleLatencyMonitorSettings,
+    val connectionRoutes: ConnectionRouteSnapshot?,
+    val connectionRoutesLoading: Boolean,
+    val nodePriorityOverrides: Map<String, Int>,
     val key: String,
     val payload: String,
 )
@@ -133,6 +136,9 @@ internal fun MainUiState.toSettingsUiState(): SettingsUiState =
         deviceIdentity = deviceIdentity,
         themeAccentColorHex = themeAccentColorHex,
         titleLatencyMonitorSettings = titleLatencyMonitorSettings,
+        connectionRoutes = connectionRoutes,
+        connectionRoutesLoading = connectionRoutesLoading,
+        nodePriorityOverrides = nodePriorityOverrides,
         key = key,
         payload = payload,
     )

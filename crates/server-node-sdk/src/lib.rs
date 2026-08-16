@@ -5823,6 +5823,8 @@ impl ServerNodeConfig {
 
     pub fn from_bootstrap(bootstrap: TransportNodeBootstrap) -> Result<Self> {
         bootstrap.validate()?;
+        transport_sdk::node_connection_priority_from_labels(&bootstrap.labels)
+            .context("invalid node connection priority in bootstrap labels")?;
 
         ensure_non_traversing_path(FsPath::new(&bootstrap.data_dir), "node data directory")?;
         let data_dir = normalize_non_traversing_path(FsPath::new(&bootstrap.data_dir));
@@ -6166,6 +6168,23 @@ impl ServerNodeConfig {
             "rack".to_string(),
             std::env::var("IRONMESH_RACK").unwrap_or_else(|_| "local-rack".to_string()),
         );
+        if let Some(raw_priority) = std::env::var("IRONMESH_NODE_CONNECTION_PRIORITY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            let priority = raw_priority
+                .parse::<i16>()
+                .context("invalid IRONMESH_NODE_CONNECTION_PRIORITY")?;
+            transport_sdk::validate_node_connection_priority(priority)
+                .context("invalid IRONMESH_NODE_CONNECTION_PRIORITY")?;
+            if priority != 0 {
+                labels.insert(
+                    transport_sdk::NODE_CONNECTION_PRIORITY_LABEL.to_string(),
+                    priority.to_string(),
+                );
+            }
+        }
 
         let default_replication_factor = 3;
         let public_peer_api_enabled = std::env::var("IRONMESH_PUBLIC_PEER_API_ENABLED")
@@ -7675,6 +7694,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route(
             "/auth/direct-endpoints-config",
             get(get_direct_endpoints_config).put(update_direct_endpoints_config),
+        )
+        .route(
+            "/auth/node-connection-priority",
+            get(get_node_connection_priority).put(update_node_connection_priority),
         )
         .route(
             "/auth/rendezvous-config",
@@ -19148,6 +19171,20 @@ struct DirectEndpointsConfigView {
     persisted: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct NodeConnectionPriorityView {
+    priority: i16,
+    min_priority: i16,
+    max_priority: i16,
+    persistence_source: OperatorConfigPersistenceSource,
+    persisted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateNodeConnectionPriorityRequest {
+    priority: i16,
+}
+
 #[derive(Debug, Deserialize)]
 struct UpdateRendezvousConfigRequest {
     editable_urls: Vec<String>,
@@ -24066,6 +24103,254 @@ fn operator_config_persistence_source(state: &ServerState) -> OperatorConfigPers
     }
 }
 
+fn resolved_node_enrollment_persistence_path(
+    configured_path: Option<&FsPath>,
+) -> Result<Option<PathBuf>> {
+    let Some(configured_path) = configured_path else {
+        return Ok(None);
+    };
+
+    // The enrollment package is an operator-selected artifact and may intentionally live
+    // outside the runtime data directory. Treat its configured parent as that operator-owned
+    // boundary, but resolve both paths before access so a file symlink cannot escape it.
+    let configured_parent = configured_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| FsPath::new("."));
+    let canonical_parent = std::fs::canonicalize(configured_parent).with_context(|| {
+        format!(
+            "failed resolving node enrollment parent {}",
+            configured_parent.display()
+        )
+    })?;
+    let canonical_path = std::fs::canonicalize(configured_path).with_context(|| {
+        format!(
+            "failed resolving node enrollment package {}",
+            configured_path.display()
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_parent) {
+        bail!(
+            "node enrollment package {} must stay within its configured parent {}",
+            canonical_path.display(),
+            canonical_parent.display()
+        );
+    }
+
+    Ok(Some(canonical_path))
+}
+
+fn update_persisted_node_enrollment_if_possible(
+    state: &ServerState,
+    update: impl FnOnce(&mut NodeEnrollmentPackage),
+) -> Result<bool> {
+    let Some(path) =
+        resolved_node_enrollment_persistence_path(state.network.node_enrollment_path.as_deref())?
+    else {
+        return Ok(false);
+    };
+
+    let mut package = NodeEnrollmentPackage::from_path(&path)?;
+    update(&mut package);
+    package.write_to_path(&path)?;
+    Ok(true)
+}
+
+async fn current_local_node_connection_priority(state: &ServerState) -> i16 {
+    let cluster = state.cluster.lock().await;
+    cluster
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == state.node_id)
+        .and_then(|node| transport_sdk::node_connection_priority_from_labels(&node.labels).ok())
+        .unwrap_or_default()
+}
+
+async fn build_node_connection_priority_view(
+    state: &ServerState,
+    persisted: bool,
+) -> NodeConnectionPriorityView {
+    NodeConnectionPriorityView {
+        priority: current_local_node_connection_priority(state).await,
+        min_priority: transport_sdk::MIN_NODE_CONNECTION_PRIORITY,
+        max_priority: transport_sdk::MAX_NODE_CONNECTION_PRIORITY,
+        persistence_source: operator_config_persistence_source(state),
+        persisted,
+    }
+}
+
+fn persist_node_connection_priority_if_possible(
+    state: &ServerState,
+    priority: i16,
+) -> Result<bool> {
+    update_persisted_node_enrollment_if_possible(state, |package| {
+        if priority == 0 {
+            package
+                .bootstrap
+                .labels
+                .remove(transport_sdk::NODE_CONNECTION_PRIORITY_LABEL);
+        } else {
+            package.bootstrap.labels.insert(
+                transport_sdk::NODE_CONNECTION_PRIORITY_LABEL.to_string(),
+                priority.to_string(),
+            );
+        }
+    })
+}
+
+async fn apply_local_node_connection_priority(state: &ServerState, priority: i16) -> Result<()> {
+    let changed = {
+        let mut cluster = state.cluster.lock().await;
+        let Some(mut descriptor) = cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == state.node_id)
+        else {
+            bail!("local node descriptor is unavailable");
+        };
+        if priority == 0 {
+            descriptor
+                .labels
+                .remove(transport_sdk::NODE_CONNECTION_PRIORITY_LABEL);
+        } else {
+            descriptor.labels.insert(
+                transport_sdk::NODE_CONNECTION_PRIORITY_LABEL.to_string(),
+                priority.to_string(),
+            );
+        }
+        cluster.register_node(descriptor)
+    };
+    if changed {
+        persist_cluster_nodes_state(state).await?;
+    }
+    Ok(())
+}
+
+async fn get_node_connection_priority(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/node-connection-priority/get";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+    let view =
+        build_node_connection_priority_view(&state, state.network.node_enrollment_path.is_some())
+            .await;
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({ "priority": view.priority }),
+    )
+    .await;
+    (StatusCode::OK, Json(view)).into_response()
+}
+
+async fn update_node_connection_priority(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateNodeConnectionPriorityRequest>,
+) -> impl IntoResponse {
+    let action = "auth/node-connection-priority/update";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "priority": request.priority }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    if let Err(error) = transport_sdk::validate_node_connection_priority(request.priority) {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": error.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+
+    let persisted = match persist_node_connection_priority_if_possible(&state, request.priority) {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": error.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) = apply_local_node_connection_priority(&state, request.priority).await {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": error.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+
+    let view = build_node_connection_priority_view(&state, persisted).await;
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "priority": view.priority,
+            "persistence_source": view.persistence_source,
+            "persisted": view.persisted,
+        }),
+    )
+    .await;
+    (StatusCode::OK, Json(view)).into_response()
+}
+
 fn current_editable_direct_urls(state: &ServerState) -> (Vec<String>, Vec<String>) {
     let direct_endpoints = current_advertised_direct_endpoints(state);
     let primary_public = state.network.primary_public_direct_url.as_deref();
@@ -24136,14 +24421,9 @@ fn persist_direct_endpoints_if_possible(
     state: &ServerState,
     direct_endpoints: &[BootstrapEndpoint],
 ) -> Result<bool> {
-    let Some(path) = state.network.node_enrollment_path.as_ref() else {
-        return Ok(false);
-    };
-
-    let mut package = NodeEnrollmentPackage::from_path(path)?;
-    package.bootstrap.direct_endpoints = direct_endpoints.to_vec();
-    package.write_to_path(path)?;
-    Ok(true)
+    update_persisted_node_enrollment_if_possible(state, |package| {
+        package.bootstrap.direct_endpoints = direct_endpoints.to_vec();
+    })
 }
 
 async fn refresh_local_node_reachability(state: &ServerState) -> Result<()> {
@@ -24275,14 +24555,9 @@ fn persist_rendezvous_urls_if_possible(
     state: &ServerState,
     effective_urls: &[String],
 ) -> Result<bool> {
-    let Some(path) = state.network.node_enrollment_path.as_ref() else {
-        return Ok(false);
-    };
-
-    let mut package = NodeEnrollmentPackage::from_path(path)?;
-    package.bootstrap.rendezvous_urls = effective_urls.to_vec();
-    package.write_to_path(path)?;
-    Ok(true)
+    update_persisted_node_enrollment_if_possible(state, |package| {
+        package.bootstrap.rendezvous_urls = effective_urls.to_vec();
+    })
 }
 
 async fn get_direct_endpoints_config(

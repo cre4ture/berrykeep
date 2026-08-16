@@ -1,5 +1,25 @@
 import Foundation
 
+public let appleMinimumNodeConnectionPriority = -20
+public let appleMaximumNodeConnectionPriority = 20
+
+public enum AppleNodePriorityOverrideError: LocalizedError, Equatable {
+    case invalidBootstrap
+    case invalidNodeID
+    case priorityOutOfRange
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidBootstrap:
+            return "The connection bootstrap is not valid JSON."
+        case .invalidNodeID:
+            return "The server node ID is invalid."
+        case .priorityOutOfRange:
+            return "Server node priority must be between \(appleMinimumNodeConnectionPriority) and \(appleMaximumNodeConnectionPriority)."
+        }
+    }
+}
+
 public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
     public var deviceLabel: String
     public var bootstrapInput: String
@@ -126,6 +146,60 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
 
     public var normalizedConnectionInput: String? {
         connectionConfiguration?.normalizedConnectionInput
+    }
+
+    public var nodePriorityOverrides: [String: Int] {
+        guard let data = effectiveConnectionInput.data(using: .utf8),
+              let bootstrap = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawOverrides = bootstrap["node_priority_overrides"] as? [String: Any]
+        else {
+            return [:]
+        }
+        return rawOverrides.reduce(into: [String: Int]()) { result, entry in
+            guard let priority = entry.value as? Int,
+                  (appleMinimumNodeConnectionPriority...appleMaximumNodeConnectionPriority)
+                    .contains(priority)
+            else {
+                return
+            }
+            result[entry.key] = priority
+        }
+    }
+
+    public mutating func setNodePriorityOverride(_ priority: Int?, for nodeID: String) throws {
+        let normalizedNodeID = nodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard UUID(uuidString: normalizedNodeID) != nil else {
+            throw AppleNodePriorityOverrideError.invalidNodeID
+        }
+        if let priority,
+           !(appleMinimumNodeConnectionPriority...appleMaximumNodeConnectionPriority)
+            .contains(priority) {
+            throw AppleNodePriorityOverrideError.priorityOutOfRange
+        }
+        guard let data = effectiveConnectionInput.data(using: .utf8),
+              var bootstrap = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            throw AppleNodePriorityOverrideError.invalidBootstrap
+        }
+        var overrides = bootstrap["node_priority_overrides"] as? [String: Any] ?? [:]
+        if let priority {
+            overrides[normalizedNodeID] = priority
+        } else {
+            overrides.removeValue(forKey: normalizedNodeID)
+        }
+        if overrides.isEmpty {
+            bootstrap.removeValue(forKey: "node_priority_overrides")
+        } else {
+            bootstrap["node_priority_overrides"] = overrides
+        }
+        let encoded = try JSONSerialization.data(
+            withJSONObject: bootstrap,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        guard let updated = String(data: encoded, encoding: .utf8) else {
+            throw AppleNodePriorityOverrideError.invalidBootstrap
+        }
+        bootstrapInput = updated
     }
 
     public var setupSummary: String {

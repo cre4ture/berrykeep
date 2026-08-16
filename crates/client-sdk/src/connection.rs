@@ -300,7 +300,8 @@ fn build_http_client_with_identity_from_planned_target_unkeyed(
                 identity,
                 target.target_node_id,
                 Some(target.cluster_id),
-            );
+            )
+            .map(|client| client.with_node_connection_priority(target.node_connection_priority));
         }
         TransportPathKind::DirectQuic => {
             let candidate = planned_target_direct_quic_candidate(target)?;
@@ -323,7 +324,8 @@ fn build_http_client_with_identity_from_planned_target_unkeyed(
                         .or_else(|| target.cluster_ca_pem.clone()),
                     lease_budget,
                 )
-                .with_client_identity(identity.clone()),
+                .with_client_identity(identity.clone())
+                .with_node_connection_priority(target.node_connection_priority),
             );
         }
         TransportPathKind::RelayTunnel => {}
@@ -364,7 +366,8 @@ fn build_http_client_with_identity_from_planned_target_unkeyed(
         target_node_id,
         relay_security,
     )
-    .with_client_identity(identity.clone()))
+    .with_client_identity(identity.clone())
+    .with_node_connection_priority(target.node_connection_priority))
 }
 
 fn candidate_uses_rendezvous_relay(
@@ -668,7 +671,8 @@ pub fn build_client_with_optional_identity_from_planned_target(
                     server_base_url,
                     target.target_node_id,
                     Some(target.cluster_id),
-                )?;
+                )?
+                .with_node_connection_priority(target.node_connection_priority);
                 client.set_single_transport_route_key(planned_route_key(target, None)?)?;
                 return Ok(client);
             }
@@ -1145,6 +1149,7 @@ mod tests {
             pairing_token: Some("pairing-token".to_string()),
             device_label: Some("device label".to_string()),
             device_id: Some("device-id".to_string()),
+            node_connection_priority: 0,
         }
     }
 
@@ -1338,6 +1343,7 @@ mod tests {
             pairing_token: None,
             device_label: None,
             device_id: None,
+            node_connection_priority: 0,
         };
         let http_key = planned_route_key(&http, Some(&identity)).expect("HTTP key should build");
         let mut equivalent_http = http.clone();
@@ -1420,6 +1426,7 @@ mod tests {
             pairing_token: None,
             device_label: None,
             device_id: None,
+            node_connection_priority: 0,
         });
 
         let client =
@@ -1576,6 +1583,7 @@ mod tests {
                 pairing_token: None,
                 device_label: None,
                 device_id: None,
+                node_connection_priority: 0,
             },
             &identity,
         )
@@ -1604,6 +1612,7 @@ mod tests {
                 pairing_token: None,
                 device_label: None,
                 device_id: None,
+                node_connection_priority: 0,
             },
             &identity,
         ) {
@@ -1639,6 +1648,7 @@ mod tests {
                 pairing_token: None,
                 device_label: None,
                 device_id: None,
+                node_connection_priority: 0,
             },
             &identity,
         ) {
@@ -1673,6 +1683,7 @@ mod tests {
                 pairing_token: None,
                 device_label: None,
                 device_id: None,
+                node_connection_priority: 0,
             },
             &identity,
         ) {
@@ -1718,6 +1729,7 @@ mod tests {
                 pairing_token: None,
                 device_label: None,
                 device_id: None,
+                node_connection_priority: 0,
             },
             &identity,
         )
@@ -1777,6 +1789,7 @@ mod tests {
                 pairing_token: None,
                 device_label: None,
                 device_id: None,
+                node_connection_priority: 0,
             },
             None,
         ) {
@@ -1812,6 +1825,7 @@ mod tests {
                 pairing_token: None,
                 device_label: None,
                 device_id: None,
+                node_connection_priority: 0,
             }]) {
                 Ok(_) => panic!("direct QUIC target should not be built as HTTP"),
                 Err(error) => error,

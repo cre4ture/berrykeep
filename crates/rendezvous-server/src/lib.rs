@@ -1010,7 +1010,7 @@ fn discovery_response(
         .unwrap_or_else(empty_rendezvous_runtime_state)
         .endpoint_statuses;
 
-    let (mut node_candidates, node_relay_capable) = cluster_id
+    let (mut node_candidates, node_relay_capable, node_connection_priority) = cluster_id
         .zip(node_id)
         .and_then(|(cluster_id, node_id)| {
             state
@@ -1024,9 +1024,16 @@ fn discovery_response(
                 .capabilities
                 .contains(&transport_sdk::TransportCapability::RelayTunnel)
                 || entry.registration.relay_mode != transport_sdk::RelayMode::Disabled;
-            (Some(entry.registration.direct_candidates), relay_capable)
+            let node_connection_priority =
+                transport_sdk::node_connection_priority_from_labels(&entry.registration.labels)
+                    .unwrap_or_default();
+            (
+                Some(entry.registration.direct_candidates),
+                relay_capable,
+                node_connection_priority,
+            )
         })
-        .unwrap_or((None, false));
+        .unwrap_or((None, false, 0));
     if let (Some(candidates), Some(relay)) =
         (node_candidates.as_mut(), iroh_relay_advertisement(state))
     {
@@ -1037,6 +1044,7 @@ fn discovery_response(
         rendezvous_peers,
         node_candidates,
         node_relay_capable,
+        node_connection_priority,
     }
 }
 
@@ -2977,7 +2985,10 @@ mod tests {
                 public_direct_urls: Vec::new(),
                 peer_api_url: Some("https://node.internal:7443".to_string()),
                 direct_candidates: Vec::new(),
-                labels: Default::default(),
+                labels: HashMap::from([(
+                    transport_sdk::NODE_CONNECTION_PRIORITY_LABEL.to_string(),
+                    "8".to_string(),
+                )]),
                 capacity_bytes: None,
                 free_bytes: None,
                 capabilities: vec![TransportCapability::RelayTunnel],
@@ -3020,6 +3031,7 @@ mod tests {
             }])
         );
         assert!(response.node_relay_capable);
+        assert_eq!(response.node_connection_priority, 8);
 
         peer_server.abort();
         let _ = peer_server.await;

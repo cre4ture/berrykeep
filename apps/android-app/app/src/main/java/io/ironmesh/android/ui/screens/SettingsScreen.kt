@@ -28,6 +28,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -36,6 +37,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.BuildConfig
 import io.ironmesh.android.R
+import io.ironmesh.android.data.MAX_NODE_CONNECTION_PRIORITY
+import io.ironmesh.android.data.MIN_NODE_CONNECTION_PRIORITY
 import io.ironmesh.android.ui.SettingsUiState
 import io.ironmesh.android.ui.components.PermissionExplainerCard
 import io.ironmesh.android.ui.components.SectionCard
@@ -62,6 +65,8 @@ fun SettingsScreen(
     onThemeAccentColorChange: (String) -> Unit,
     onTitleLatencyMonitorEnabledChange: (Boolean) -> Unit,
     onTitleLatencyMonitorPeriodSecondsChange: (Long) -> Unit,
+    onRevealNodePriorities: () -> Unit,
+    onNodePriorityOverrideChange: (String, Int?) -> Unit,
     onKeyChange: (String) -> Unit,
     onPayloadChange: (String) -> Unit,
     onPutObject: () -> Unit,
@@ -152,6 +157,11 @@ fun SettingsScreen(
         }
 
         SectionCard(title = stringResource(R.string.settings_advanced)) {
+            ExperimentalNodePrioritiesEditor(
+                state = state,
+                onReveal = onRevealNodePriorities,
+                onPriorityOverrideChange = onNodePriorityOverrideChange,
+            )
             OutlinedButton(onClick = onOpenConnectionDiagnostics) {
                 Text(stringResource(R.string.connection_diagnostics))
             }
@@ -188,6 +198,117 @@ fun SettingsScreen(
             SelectionContainer {
                 Text(BuildConfig.LONG_VERSION)
             }
+        }
+    }
+}
+
+@Composable
+private fun ExperimentalNodePrioritiesEditor(
+    state: SettingsUiState,
+    onReveal: () -> Unit,
+    onPriorityOverrideChange: (String, Int?) -> Unit,
+) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    val overrides = state.nodePriorityOverrides
+    val routePriorities = state.connectionRoutes
+        ?.endpoints
+        .orEmpty()
+        .mapNotNull { endpoint ->
+            endpoint.targetNodeId?.let { nodeId -> nodeId to endpoint.nodeConnectionPriority }
+        }
+        .toMap()
+    val nodeIds = (routePriorities.keys + overrides.keys).sorted()
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        OutlinedButton(
+            onClick = {
+                expanded = !expanded
+                if (expanded) {
+                    onReveal()
+                }
+            },
+        ) {
+            Text(if (expanded) "Hide experimental node priorities" else "Experimental node priorities")
+        }
+
+        if (expanded) {
+            Text(
+                text = "Test feature. Manual values override the priority advertised by each server node. Higher values are preferred.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (nodeIds.isEmpty()) {
+                Text(
+                    text = if (state.connectionRoutesLoading) {
+                        "Loading known server nodes…"
+                    } else {
+                        "No server nodes have been discovered yet."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            nodeIds.forEach { nodeId ->
+                NodePriorityOverrideRow(
+                    nodeId = nodeId,
+                    automaticPriority = routePriorities[nodeId] ?: 0,
+                    overridePriority = overrides[nodeId],
+                    onPriorityOverrideChange = onPriorityOverrideChange,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NodePriorityOverrideRow(
+    nodeId: String,
+    automaticPriority: Int,
+    overridePriority: Int?,
+    onPriorityOverrideChange: (String, Int?) -> Unit,
+) {
+    var pendingPriority by remember(nodeId, overridePriority, automaticPriority) {
+        mutableStateOf((overridePriority ?: automaticPriority).toFloat())
+    }
+    val hasOverride = overridePriority != null
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.small)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(text = nodeId, style = MaterialTheme.typography.labelSmall)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Manual override", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    if (hasOverride) "Priority ${pendingPriority.roundToInt()}" else "Automatic · priority $automaticPriority",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = hasOverride,
+                onCheckedChange = { enabled ->
+                    onPriorityOverrideChange(nodeId, if (enabled) pendingPriority.roundToInt() else null)
+                },
+            )
+        }
+        if (hasOverride) {
+            Slider(
+                value = pendingPriority,
+                onValueChange = { pendingPriority = it.roundToInt().toFloat() },
+                onValueChangeFinished = {
+                    onPriorityOverrideChange(nodeId, pendingPriority.roundToInt())
+                },
+                valueRange = MIN_NODE_CONNECTION_PRIORITY.toFloat()..MAX_NODE_CONNECTION_PRIORITY.toFloat(),
+                steps = MAX_NODE_CONNECTION_PRIORITY - MIN_NODE_CONNECTION_PRIORITY - 1,
+            )
         }
     }
 }
