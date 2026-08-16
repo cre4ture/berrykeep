@@ -89,16 +89,26 @@ cache hit.
 The workflow also uses
 [`cre4ture/bazel-github-actions-cache-v2`](https://github.com/cre4ture/bazel-github-actions-cache-v2)
 at an immutable commit SHA. The action starts an HTTP cache on the runner's
-loopback interface and stores each validated Bazel AC/CAS object in GitHub
-Actions cache v2. It therefore needs no external server, repository secret, or
-manual repository setting. The pinned v0.2.2 action treats the canonical
-SHA-256 zero-byte digest as an implicit CAS object, coalesces duplicate
-immutable AC/CAS uploads within a runner before rate limiting, then validates
-the complete REAPI action-result closure before serving or publishing an
-action-cache entry. If GitHub has independently evicted a referenced CAS
-object, the dangling action result becomes an ordinary cache miss instead of
-reaching Bazel as a lost input; the workflow therefore needs no correctness
-retry.
+loopback interface and stores the validated Bazel objects in GitHub Actions
+cache v2. It therefore needs no external server, repository secret, or manual
+repository setting. The pinned v0.3.0 action uses `storage-mode: packs`: it
+places many CAS values and Action Results in an indexed CARv2 archive and only
+publishes its immutable DAG-CBOR manifest after the archive exists. The
+trusted job grants `actions: read` solely so the action can discover manifest
+keys through GitHub's documented REST API; its default `github.token` is
+sufficient. Fork pull requests instead run the same Bazel targets in an
+isolated, read-only object-store fallback with only `contents: read`. This
+deliberately trades their shared PAC/DAG cache hits for least privilege: fork
+code cannot list Actions-cache metadata, workflow runs, or artifacts.
+
+The manifest has all currently visible manifest heads as parents, so parallel
+manual seeds cannot overwrite each other. Readers merge all discovered heads.
+Different Action Results for one action digest are deliberately a cache miss,
+not an arbitrary winner. The action continues to treat the canonical SHA-256
+zero-byte digest as implicit and validates each complete REAPI output closure
+against the restored packs before serving an Action Result. Independently
+evicted, missing, or corrupt packs therefore become ordinary cache misses
+rather than lost inputs reaching Bazel.
 
 Fine-grained remote-cache publication is deliberately opt-in:
 
@@ -109,20 +119,19 @@ Fine-grained remote-cache publication is deliberately opt-in:
 
 GitHub's cache scope rules make entries written on the default branch readable
 from later pull requests. Different revisions do not replace one shared
-archive: Bazel objects have immutable content/action keys and coexist until
-GitHub's repository quota or eviction policy removes cold entries.
+archive: packages and manifests have immutable content IDs and coexist until
+GitHub's repository quota or eviction policy removes cold entries. The
+format-specific `ironmesh-bazel-car-v1` namespace intentionally leaves the
+former v0.2 object-per-entry cache available as a rollback path.
 
 This adapter is intentionally experimental. GitHub does not promise its runner
-cache-v2 upload/download protocol as a stable public API. The current adapter
-also maps one Bazel object to one GitHub cache entry and rate-limits
-publication below GitHub's cache-creation limit. A cold native build was
-observed creating thousands of entries while Bazel synchronously waited for
-each bounded upload slot; the publication phase outlasted comparable read-only
-runs by tens of minutes and contributed to repository-quota eviction. Raising
-client concurrency cannot bypass that global creation limit and only increases
-the pending upload and temporary-disk pressure. For this reason, routine CI
-uses the coarse-grained `setup-bazel` cache and reads any surviving
-fine-grained entries without publishing new ones.
+cache-v2 upload/download protocol as a stable public API. The packed action
+reduces cache creations from one per object to one CARv2 package plus one
+manifest per bounded batch; an 8 MiB target replaces thousands of upload slots
+with a few hundred immutable entries on a cold seed. It reports pack and
+manifest creation counts separately from normal cache hits. Routine CI remains
+read-only, so the coarse-grained `setup-bazel` cache handles frequent jobs and
+an explicit manual seed controls fine-grained cache growth.
 
 Regular Bazel jobs are bounded to 30 minutes. An explicitly requested manual
 fine-grained seed may run for up to 120 minutes so it cannot occupy an
@@ -147,9 +156,9 @@ successful seed as proof of a useful cache:
    `write_cache`. Confirm that the adapter publishes no objects and useful
    remote hits reduce total runtime.
 4. Keep routine runs read-only unless the separate warm run demonstrates a
-   repeatable gain without quota churn. If the per-object adapter remains the
-   bottleneck, remove it from routine CI or replace its backend with a
-   segmented format before enabling automatic writes.
+   repeatable gain without quota churn. Inspect `pack_uploads`,
+   `manifest_uploads`, `pack_downloads`, and the total transferred bytes before
+   changing pack size or enabling automatic writes.
 
 ## Migration order
 
