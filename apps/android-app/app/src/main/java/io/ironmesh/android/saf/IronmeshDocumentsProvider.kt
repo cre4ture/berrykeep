@@ -4,8 +4,13 @@ import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.graphics.Point
+import android.os.Binder
 import android.os.CancellationSignal
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
+import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
 import android.webkit.MimeTypeMap
@@ -25,6 +30,7 @@ import java.io.FileNotFoundException
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 class IronmeshDocumentsProvider : DocumentsProvider() {
     private val repository = IronmeshRepository()
@@ -153,79 +159,164 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             throw FileNotFoundException("not a file document")
         }
 
+        val requestId = nextSafRequestId.incrementAndGet()
+        val callingUid = Binder.getCallingUid()
+        val callingPackages = context
+            ?.packageManager
+            ?.getPackagesForUid(callingUid)
+            ?.sorted()
+            ?.joinToString(",")
+            ?: "<unknown>"
+        Log.i(
+            TAG,
+            "SAF open requested: request_id=$requestId path=${target.path} mode=$mode " +
+                "caller_uid=$callingUid caller_packages=$callingPackages",
+        )
+
         return if (mode.contains('w')) {
-            val pipe = ParcelFileDescriptor.createPipe()
-            val readSide = pipe[0]
-            val writeSide = pipe[1]
-
-            Thread {
-                val appContext = context
-                val cacheDir = appContext?.cacheDir
-                if (cacheDir == null) {
-                    Log.e(TAG, "Missing application context for SAF upload staging")
-                    readSide.close()
-                    return@Thread
-                }
-
-                val stagedFile = File.createTempFile("ironmesh-upload-", ".bin", cacheDir)
-                try {
-                    ParcelFileDescriptor.AutoCloseInputStream(readSide).use { input ->
-                        stagedFile.outputStream().use { stagedOutput ->
-                            input.copyTo(stagedOutput)
-                            stagedOutput.flush()
-                        }
-                    }
-
-                    FileInputStream(stagedFile).use { stagedInput ->
-                        runBlocking {
-                            repository.streamPutObject(
-                                resolveConnectionInput(),
-                                target.path,
-                                stagedInput,
-                                stagedFile.length(),
-                                resolveServerCaPem(),
-                                resolveClientIdentityJson(),
-                            )
-                        }
-                    }
-                } catch (e: IOException) {
-                    Log.w(TAG, "Client closed upload pipe: ${e.message}")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error staging SAF upload", e)
-                } finally {
-                    stagedFile.delete()
-                }
-            }.start()
-
-            writeSide
+            openWritableDocument(target.path, requestId)
         } else {
-            val pipe = ParcelFileDescriptor.createPipe()
-            val readSide = pipe[0]
-            val writeSide = pipe[1]
+            openReadableDocument(target.path, requestId, signal)
+        }
+    }
 
-            Thread {
-                ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { output ->
-                    try {
-                        runBlocking {
-                            repository.streamObjectTo(
-                                resolveConnectionInput(),
-                                target.path,
-                                output,
-                                serverCaPem = resolveServerCaPem(),
-                                clientIdentityJson = resolveClientIdentityJson(),
-                            )
-                        }
-                        output.flush()
-                    } catch (e: IOException) {
-                        Log.w(TAG, "Client closed pipe while streaming: ${e.message}")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error streaming object", e)
+    private fun openWritableDocument(
+        remotePath: String,
+        requestId: Long,
+    ): ParcelFileDescriptor {
+        val pipe = ParcelFileDescriptor.createPipe()
+        val readSide = pipe[0]
+        val writeSide = pipe[1]
+
+        Thread {
+            val appContext = context
+            val cacheDir = appContext?.cacheDir
+            if (cacheDir == null) {
+                Log.e(TAG, "Missing application context for SAF upload staging")
+                readSide.close()
+                return@Thread
+            }
+
+            val stagedFile = File.createTempFile("ironmesh-upload-", ".bin", cacheDir)
+            try {
+                ParcelFileDescriptor.AutoCloseInputStream(readSide).use { input ->
+                    stagedFile.outputStream().use { stagedOutput ->
+                        input.copyTo(stagedOutput)
+                        stagedOutput.flush()
                     }
                 }
-            }.start()
 
-            readSide
+                FileInputStream(stagedFile).use { stagedInput ->
+                    runBlocking {
+                        repository.streamPutObject(
+                            resolveConnectionInput(),
+                            remotePath,
+                            stagedInput,
+                            stagedFile.length(),
+                            resolveServerCaPem(),
+                            resolveClientIdentityJson(),
+                        )
+                    }
+                }
+            } catch (e: IOException) {
+                Log.w(
+                    TAG,
+                    "Client closed SAF upload pipe: request_id=$requestId path=$remotePath " +
+                        "error=${e.message}",
+                )
+            } catch (e: Exception) {
+                Log.e(
+                    TAG,
+                    "Error staging SAF upload: request_id=$requestId path=$remotePath",
+                    e,
+                )
+            } finally {
+                stagedFile.delete()
+            }
+        }.start()
+
+        return writeSide
+    }
+
+    private fun openReadableDocument(
+        remotePath: String,
+        requestId: Long,
+        signal: CancellationSignal?,
+    ): ParcelFileDescriptor {
+        val startedAtElapsedMs = SystemClock.elapsedRealtime()
+        signal?.throwIfCanceled()
+        val appContext = context
+            ?: throw FileNotFoundException("Ironmesh application context is unavailable")
+        val entry: StoreIndexEntry
+        val connectionInput: String
+        val serverCaPem: String?
+        val clientIdentityJson: String?
+        try {
+            entry = resolveFileEntry(remotePath)
+            connectionInput = resolveConnectionInput()
+            serverCaPem = resolveServerCaPem()
+            clientIdentityJson = resolveClientIdentityJson()
+        } catch (error: Exception) {
+            Log.e(
+                TAG,
+                "SAF open failed while preparing download: request_id=$requestId path=$remotePath",
+                error,
+            )
+            throw FileNotFoundException("failed to prepare document download: ${error.message}")
+                .apply { initCause(error) }
         }
+        val callbackThread = HandlerThread("ironmesh-saf-$requestId").apply { start() }
+        val callback = IronmeshSeekableFileCallback(
+            requestId = requestId,
+            remotePath = remotePath,
+            expectedSizeBytes = entry.size_bytes,
+            cacheDir = appContext.cacheDir,
+            downloadTo = { output ->
+                runBlocking {
+                    repository.streamObjectTo(
+                        connectionInput,
+                        remotePath,
+                        output,
+                        version = entry.version,
+                        serverCaPem = serverCaPem,
+                        clientIdentityJson = clientIdentityJson,
+                    )
+                }
+            },
+            onReleased = callbackThread::quitSafely,
+        )
+
+        val descriptor = try {
+            val storageManager = appContext.getSystemService(StorageManager::class.java)
+                ?: throw IOException("Android StorageManager is unavailable")
+            storageManager.openProxyFileDescriptor(
+                ParcelFileDescriptor.MODE_READ_ONLY,
+                callback,
+                Handler(callbackThread.looper),
+            )
+        } catch (error: Exception) {
+            callback.onRelease()
+            Log.e(
+                TAG,
+                "SAF open failed while creating seekable descriptor: " +
+                    "request_id=$requestId path=$remotePath",
+                error,
+            )
+            throw FileNotFoundException("failed to open seekable document: ${error.message}")
+                .apply { initCause(error) }
+        }
+
+        signal?.setOnCancelListener {
+            callback.requestCancellation()
+            runCatching { descriptor.close() }
+        }
+        Log.i(
+            TAG,
+            "SAF open completed: request_id=$requestId path=$remotePath descriptor=seekable_proxy " +
+                "size_bytes=${entry.size_bytes ?: "<unknown>"} version=${entry.version ?: "<none>"} " +
+                "elapsed_ms=${SystemClock.elapsedRealtime() - startedAtElapsedMs}",
+        )
+        return descriptor
     }
 
     override fun openDocumentThumbnail(
@@ -480,5 +571,6 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         private const val ROOT_ID = "ironmesh-root"
         private const val ROOT_TITLE = "BerryKeep"
         private const val MAX_CONCURRENT_THUMBNAIL_STREAMS = 4
+        private val nextSafRequestId = AtomicLong(0)
     }
 }

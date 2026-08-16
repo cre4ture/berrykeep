@@ -155,7 +155,7 @@ fn android_test_store_index_response() -> StoreIndexResponse {
             entry_type: "key".to_string(),
             version: Some("v1".to_string()),
             content_hash: Some("hash-1".to_string()),
-            size_bytes: Some(42),
+            size_bytes: Some(TEST_DOCUMENT_SIZE_BYTES as u64),
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
@@ -377,7 +377,10 @@ fn android_transport_response(
 ) -> Result<(u16, Vec<TransportHeader>, Vec<u8>)> {
     let method = request.method.as_str();
     let path = request.path.as_str();
-    match (method, path) {
+    let resource_path = path
+        .split_once('?')
+        .map_or(path, |(resource_path, _)| resource_path);
+    match (method, resource_path) {
         ("POST", "/api/v1/auth/device/renew-rendezvous-identity") => {
             let body = serde_json::to_vec(&serde_json::json!({
                 "rendezvous_client_identity_pem": state.renewed_rendezvous_client_identity_pem,
@@ -385,7 +388,7 @@ fn android_transport_response(
             .context("failed to serialize android rendezvous renewal response")?;
             Ok((200, json_headers(body.len()), body))
         }
-        ("GET", "/api/v1/store/index?depth=1") => {
+        ("GET", "/api/v1/store/index") => {
             let body = serde_json::to_vec(&android_test_store_index_response())
                 .context("failed to serialize android store index response")?;
             Ok((200, json_headers(body.len()), body))

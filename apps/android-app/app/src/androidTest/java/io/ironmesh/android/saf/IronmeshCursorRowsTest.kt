@@ -71,10 +71,31 @@ class IronmeshCursorRowsTest {
         )
     }
 
+    @Test
+    fun populateFileRow_reportsRemoteObjectSize() {
+        val cursor = MatrixCursor(
+            arrayOf(DocumentsContract.Document.COLUMN_SIZE),
+        )
+
+        val row = cursor.newRow()
+        IronmeshCursorRows.populateFileRow(
+            cursor = cursor,
+            row = row,
+            documentId = "file:gallery/cat.png",
+            entry = sampleImageEntry(),
+            fallbackMimeType = "image/png",
+            summary = null,
+        )
+
+        assertTrue(cursor.moveToFirst())
+        assertEquals(1_913_769L, cursor.getLong(0))
+    }
+
     private fun sampleImageEntry(thumbnail: StoreIndexThumbnail? = sampleThumbnail()): StoreIndexEntry {
         return StoreIndexEntry(
             path = "gallery/cat.png",
             entry_type = "key",
+            size_bytes = 1_913_769,
             media = StoreIndexMedia(
                 status = "ready",
                 content_fingerprint = "cfp-cat",

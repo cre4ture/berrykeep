@@ -1,7 +1,10 @@
 package io.ironmesh.android.saf
 
 import android.content.Context
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
+import android.system.Os
+import android.system.OsConstants
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.ironmesh.android.data.DeviceAuthState
@@ -12,6 +15,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -55,8 +59,59 @@ class IronmeshDocumentsProviderInstrumentationTest {
             "/api/v1/store/${scenario.remoteDocumentPath.replace("/", "%2F")}"
         assertTrue(
             "expected HEAD and two ranged GET requests for $expectedRequestPath, got $capturedPaths",
-            capturedPaths.count { it == expectedRequestPath } >= 3,
+            capturedPaths.count { it.startsWith(expectedRequestPath) } >= 3,
         )
+    }
+
+    @Test
+    fun openDocument_supportsRandomAccess() {
+        val scenario = configureProviderDownloadScenario()
+        val descriptor = requireNotNull(
+            appContext.contentResolver.openFileDescriptor(scenario.documentUri, "r"),
+        )
+
+        descriptor.use {
+            val tailOffset = scenario.expectedContents.size - RANDOM_ACCESS_READ_SIZE
+            assertEquals(
+                tailOffset.toLong(),
+                Os.lseek(it.fileDescriptor, tailOffset.toLong(), OsConstants.SEEK_SET),
+            )
+            assertArrayEquals(
+                scenario.expectedContents.copyOfRange(
+                    tailOffset,
+                    tailOffset + RANDOM_ACCESS_READ_SIZE,
+                ),
+                readExactly(it, RANDOM_ACCESS_READ_SIZE),
+            )
+
+            assertEquals(0L, Os.lseek(it.fileDescriptor, 0, OsConstants.SEEK_SET))
+            assertArrayEquals(
+                scenario.expectedContents.copyOfRange(0, RANDOM_ACCESS_READ_SIZE),
+                readExactly(it, RANDOM_ACCESS_READ_SIZE),
+            )
+        }
+    }
+
+    @Test
+    fun queryDocument_reportsRemoteObjectSize() {
+        val scenario = configureProviderDownloadScenario()
+        val cursor = requireNotNull(
+            appContext.contentResolver.query(
+                scenario.documentUri,
+                arrayOf(DocumentsContract.Document.COLUMN_SIZE),
+                null,
+                null,
+                null,
+            ),
+        )
+
+        cursor.use {
+            assertTrue(it.moveToFirst())
+            assertEquals(
+                scenario.expectedContents.size.toLong(),
+                it.getLong(it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)),
+            )
+        }
     }
 
     @Test
@@ -122,6 +177,25 @@ class IronmeshDocumentsProviderInstrumentationTest {
         return List(array.length()) { index -> array.getString(index) }
     }
 
+    private fun readExactly(
+        descriptor: ParcelFileDescriptor,
+        byteCount: Int,
+    ): ByteArray {
+        val result = ByteArray(byteCount)
+        var offset = 0
+        while (offset < result.size) {
+            val bytesRead = Os.read(
+                descriptor.fileDescriptor,
+                result,
+                offset,
+                result.size - offset,
+            )
+            assertTrue("unexpected end of document", bytesRead > 0)
+            offset += bytesRead
+        }
+        return result
+    }
+
     private data class ProviderDownloadScenario(
         val documentUri: android.net.Uri,
         val remoteDocumentPath: String,
@@ -131,5 +205,6 @@ class IronmeshDocumentsProviderInstrumentationTest {
     private companion object {
         const val CONCURRENT_OPEN_COUNT = 2
         const val CONCURRENT_OPEN_TIMEOUT_SECONDS = 30L
+        const val RANDOM_ACCESS_READ_SIZE = 64
     }
 }

@@ -65,6 +65,7 @@ internal object IronmeshCursorRows {
         addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_DOCUMENT_ID, documentId)
         addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_DISPLAY_NAME, fileName)
         addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_MIME_TYPE, mime)
+        addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_SIZE, entry.size_bytes)
         addColumnIfPresent(
             cursor,
             row,
