@@ -46,7 +46,9 @@ data class StoreIndexRequestOptions(
 data class StoreIndexEntry(
     val path: String,
     val entry_type: String,
+    val version: String? = null,
     val content_hash: String? = null,
+    val size_bytes: Long? = null,
     val content_fingerprint: String? = null,
     val media: StoreIndexMedia? = null,
 )

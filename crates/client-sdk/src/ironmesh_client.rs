@@ -50,6 +50,7 @@ use crate::route_supervisor::{
 use crate::session_pool::{
     DirectQuicSetupWaiter, TransportSessionPool, TransportSessionPoolSnapshot,
 };
+use crate::staged_download_coordination::coordinate_staged_download;
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
@@ -6467,15 +6468,17 @@ impl IronMeshClient {
             snapshot_owned.as_deref(),
             version_owned.as_deref(),
         );
-        self.download_file_resumable(
-            key,
-            snapshot_owned.as_deref(),
-            version_owned.as_deref(),
-            &target_path,
-            &temp_path,
-            &state_path,
-        )?;
-        stream_staged_download_and_cleanup(&target_path, &temp_path, &state_path, writer, key)
+        coordinate_staged_download(&target_path, || {
+            self.download_file_resumable(
+                key,
+                snapshot_owned.as_deref(),
+                version_owned.as_deref(),
+                &target_path,
+                &temp_path,
+                &state_path,
+            )?;
+            stream_staged_download_and_cleanup(&target_path, &temp_path, &state_path, writer, key)
+        })
     }
 
     pub async fn load_snapshot_from_server(

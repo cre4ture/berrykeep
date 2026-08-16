@@ -6707,7 +6707,7 @@ async fn direct_transport_cancels_streamed_download_promptly() {
 }
 
 #[test]
-fn blocking_range_download_handles_concurrent_overlapping_requests() {
+fn blocking_downloads_handle_concurrent_range_and_staged_requests() {
     fn build_range_response(
         payload: &[u8],
         status: StatusCode,
@@ -6868,6 +6868,53 @@ fn blocking_range_download_handles_concurrent_overlapping_requests() {
         }
     }
 
+    assert_concurrent_staged_downloads(&client, &payload);
+
     let _ = shutdown_tx.send(());
     server_thread.join().expect("server thread should stop");
+}
+
+fn assert_concurrent_staged_downloads(client: &IronMeshClient, payload: &Arc<Vec<u8>>) {
+    let staging_root = std::env::temp_dir().join(format!(
+        "ironmesh-concurrent-staged-download-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&staging_root).expect("staging root should be created");
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+
+    for _ in 0..2 {
+        let client = client.clone();
+        let staging_root = staging_root.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || -> Result<Vec<u8>> {
+            let mut writer = Vec::new();
+            barrier.wait();
+            client.download_to_writer_resumable_staged(
+                "photos/test.jpg",
+                None,
+                None,
+                &mut writer,
+                &staging_root,
+            )?;
+            Ok(writer)
+        }));
+    }
+
+    let results = handles
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .expect("staged download worker should complete")
+        })
+        .collect::<Vec<_>>();
+    fs::remove_dir_all(&staging_root).expect("staging root should be removed");
+
+    for result in results {
+        assert_eq!(
+            result.expect("concurrent staged download should succeed"),
+            payload.as_ref().clone()
+        );
+    }
 }
