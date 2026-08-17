@@ -28,12 +28,13 @@ extension IronmeshFileProviderService {
     ) {
         try connectIfNeeded()
         let profile = try currentProfile()
-        let items = try bridge.list(
+        let remoteItems = try bridge.list(
             path: pathMapper.remotePath(forLocalPath: ""),
             depth: profile.depth
         )
         .map(pathMapper.localItem)
         .filter { !$0.path.isEmpty }
+        let items = remoteItems + (try activeOriginalShareItems())
         cache.record(items: items)
         _ = try changeJournal.reconcile(items)
         let batch = try changeJournal.changes(after: anchor)
@@ -158,15 +159,7 @@ extension IronmeshFileProviderService {
     private func originalShareItem(
         capability: AppleOriginalShareCapability
     ) -> AppleBridgeItem {
-        AppleBridgeItem(
-            path: capability.remotePath,
-            displayName: capability.displayName,
-            identifier: .originalShare(token: capability.token),
-            kind: .file,
-            revisionHint: capability.selectorRevision,
-            mimeType: capability.mimeType,
-            sizeBytes: capability.sizeBytes
-        )
+        capability.bridgeItem
     }
 
     private func contentSelection(

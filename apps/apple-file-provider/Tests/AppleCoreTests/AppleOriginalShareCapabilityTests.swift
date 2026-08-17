@@ -79,6 +79,33 @@ final class AppleOriginalShareCapabilityTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path + "/\(capability.token).json"))
     }
 
+    func testExpiredCapabilityIsReportedAsAWorkingSetDeletion() throws {
+        var now = Date(timeIntervalSince1970: 1_000)
+        let store = AppleOriginalShareCapabilityStore(
+            directoryURL: temporaryDirectory(),
+            clock: { now },
+            tokenFactory: { "123e4567-e89b-12d3-a456-426614174000" }
+        )
+        let capability = try store.create(
+            AppleOriginalShareRequest.decodeWebMessage(
+                webMessage(snapshotID: "snapshot-1", versionID: nil)
+            )
+        )
+        var journal = AppleRemoteChangeJournal()
+        let insertion = journal.reconcile(
+            try store.activeCapabilities().map(\.bridgeItem)
+        )
+        XCTAssertEqual(insertion.updatedIdentifiers, [capability.bridgeItem.identifier.serialized])
+
+        now = capability.expiresAt
+        let expiration = journal.reconcile(
+            try store.activeCapabilities().map(\.bridgeItem)
+        )
+
+        XCTAssertEqual(expiration.deletedIdentifiers, [capability.bridgeItem.identifier.serialized])
+        XCTAssertTrue(expiration.updatedIdentifiers.isEmpty)
+    }
+
     func testCapabilityStoreRejectsPathLikeTokens() throws {
         let store = AppleOriginalShareCapabilityStore(directoryURL: temporaryDirectory())
 

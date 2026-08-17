@@ -106,6 +106,18 @@ public struct AppleOriginalShareCapability: Codable, Equatable, Sendable {
     public var selectorRevision: String {
         snapshotID.map { "snapshot:\($0)" } ?? "version:\(versionID ?? "invalid")"
     }
+
+    public var bridgeItem: AppleBridgeItem {
+        AppleBridgeItem(
+            path: remotePath,
+            displayName: displayName,
+            identifier: .originalShare(token: token),
+            kind: .file,
+            revisionHint: selectorRevision,
+            mimeType: mimeType,
+            sizeBytes: sizeBytes
+        )
+    }
 }
 
 public final class AppleOriginalShareCapabilityStore: @unchecked Sendable {

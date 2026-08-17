@@ -70,7 +70,7 @@ final class IronmeshFileProviderEnumerator: NSObject, NSFileProviderEnumerator, 
                 let changes = try self.service.reconcileRemoteChanges(after: anchorGeneration)
                 let updatedItems = changes.batch.updatedIdentifiers.compactMap {
                     changes.itemsByIdentifier[$0]
-                } + (try self.service.activeOriginalShareItems())
+                }
                 let fileProviderItems = updatedItems.map {
                     IronmeshFileProviderItem(
                         bridgeItem: $0,
