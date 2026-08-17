@@ -454,7 +454,7 @@ test("client-ui keeps the direct iOS gallery map inside the WebView viewport", a
     .toBeGreaterThan(0.9);
 });
 
-for (const embeddedClient of [null, "ios"] as const) {
+for (const embeddedClient of [null] as const) {
   const clientLabel = embeddedClient ?? "browser";
   test(`client-ui ${clientLabel} media viewer downloads the original`, async ({ page }) => {
     await installClientUiMocks(page);
@@ -530,6 +530,53 @@ test("client-ui Android media viewer shares an immutable original through the na
   );
   expect(payloads).toHaveLength(1);
   expect(JSON.parse(payloads[0])).toMatchObject({
+    action: "share-original",
+    key: "gallery/cat.png",
+    versionId: null,
+    snapshotId: "snapshot-001",
+    fileName: "cat.png",
+    mimeType: "image/png",
+    sizeBytes: 3_145_728
+  });
+});
+
+test("client-ui iOS media viewer shares an immutable original through the native bridge", async ({
+  page
+}) => {
+  await page.addInitScript(() => {
+    const messages: Array<Record<string, unknown>> = [];
+    Object.assign(window, {
+      __ironmeshIosShareMessages: messages,
+      webkit: {
+        messageHandlers: {
+          IronmeshIosShare: {
+            postMessage(message: Record<string, unknown>) {
+              messages.push(message);
+              return Promise.resolve({ requestId: message.requestId, status: "opened" });
+            }
+          }
+        }
+      }
+    });
+  });
+  await installClientUiMocks(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/?page=gallery&embedded_client=ios");
+  await page.getByRole("button", { name: "Map" }).click();
+  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("button", { name: "Download original" })).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Share original" }).click();
+  await expect(dialog.getByRole("button", { name: "Share opened" })).toBeVisible();
+
+  const payloads = await page.evaluate(
+    () =>
+      (window as typeof window & { __ironmeshIosShareMessages: Array<Record<string, unknown>> })
+        .__ironmeshIosShareMessages
+  );
+  expect(payloads).toHaveLength(1);
+  expect(payloads[0]).toMatchObject({
     action: "share-original",
     key: "gallery/cat.png",
     versionId: null,

@@ -36,18 +36,24 @@ extension IronmeshFileProviderExtensionHost {
         request: NSFileProviderRequest,
         completionHandler: @escaping (URL?, NSFileProviderItem?, (any Error)?) -> Void
     ) -> Progress {
-        _ = requestedVersion
         _ = request
-        let progress = Progress(totalUnitCount: 1)
+        let progress = Progress(totalUnitCount: -1)
         let completion = UncheckedBox(completionHandler)
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let (fileURL, item) = try self.service.fetchContents(for: itemIdentifier)
-                progress.completedUnitCount = 1
+                let item = try self.service.item(for: itemIdentifier)
+                try self.validate(requestedVersion: requestedVersion, for: item)
+                let temporaryDirectory = try self.temporaryDirectory()
+                let (fileURL, fetchedItem) = try self.service.fetchContents(
+                    for: itemIdentifier,
+                    item: item,
+                    progress: progress,
+                    temporaryDirectory: temporaryDirectory
+                )
                 completion.value(
                     fileURL,
                     IronmeshFileProviderItem(
-                        bridgeItem: item,
+                        bridgeItem: fetchedItem,
                         domainDisplayName: self.service.configuration.domainDisplayName
                     ),
                     nil
@@ -57,6 +63,84 @@ extension IronmeshFileProviderExtensionHost {
             }
         }
         return progress
+    }
+
+    public func fetchPartialContents(
+        for itemIdentifier: NSFileProviderItemIdentifier,
+        version requestedVersion: NSFileProviderItemVersion,
+        request: NSFileProviderRequest,
+        minimalRange: NSRange,
+        aligningTo alignment: Int,
+        options: NSFileProviderFetchContentsOptions,
+        completionHandler: @escaping (
+            URL?,
+            NSFileProviderItem?,
+            NSRange,
+            NSFileProviderMaterializationFlags,
+            (any Error)?
+        ) -> Void
+    ) -> Progress {
+        _ = request
+        _ = options
+        let progress = Progress(totalUnitCount: -1)
+        let completion = UncheckedBox(completionHandler)
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let item = try self.service.item(for: itemIdentifier)
+                try self.validate(requestedVersion: requestedVersion, for: item)
+                let temporaryDirectory = try self.temporaryDirectory()
+                let (fileURL, fetchedItem, fetchedRange) = try self.service.fetchPartialContents(
+                    for: itemIdentifier,
+                    item: item,
+                    minimalRange: minimalRange,
+                    alignment: alignment,
+                    progress: progress,
+                    temporaryDirectory: temporaryDirectory
+                )
+                completion.value(
+                    fileURL,
+                    IronmeshFileProviderItem(
+                        bridgeItem: fetchedItem,
+                        domainDisplayName: self.service.configuration.domainDisplayName
+                    ),
+                    fetchedRange,
+                    [],
+                    nil
+                )
+            } catch {
+                completion.value(
+                    nil,
+                    nil,
+                    NSRange(location: NSNotFound, length: 0),
+                    [],
+                    asNSError(error)
+                )
+            }
+        }
+        return progress
+    }
+
+    private func temporaryDirectory() throws -> URL {
+        guard let manager = NSFileProviderManager(for: domain) else {
+            throw fileProviderError(.providerDomainNotFound)
+        }
+        return try manager.temporaryDirectoryURL()
+    }
+
+    private func validate(
+        requestedVersion: NSFileProviderItemVersion?,
+        for item: AppleBridgeItem
+    ) throws {
+        guard let requestedVersion else {
+            return
+        }
+        let providedVersion = IronmeshFileProviderItem(
+            bridgeItem: item,
+            domainDisplayName: service.configuration.domainDisplayName
+        ).itemVersion
+        guard requestedVersion.contentVersion == providedVersion.contentVersion else {
+            throw fileProviderError(.versionNoLongerAvailable)
+        }
     }
 
     public func enumerator(

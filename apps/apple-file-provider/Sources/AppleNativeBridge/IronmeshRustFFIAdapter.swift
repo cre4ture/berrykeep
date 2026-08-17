@@ -193,6 +193,68 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return data
     }
 
+    func objectSize(
+        handle: AppleRustHandle,
+        key: String,
+        snapshot: String?,
+        version: String?
+    ) throws -> UInt64 {
+        var size: UInt64 = 0
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = withOptionalCString(key) { keyPointer in
+            withOptionalCString(snapshot) { snapshotPointer in
+                withOptionalCString(version) { versionPointer in
+                    ironmesh_ios_facade_object_size(
+                        handle,
+                        keyPointer,
+                        snapshotPointer,
+                        versionPointer,
+                        &size,
+                        &errorPointer
+                    )
+                }
+            }
+        }
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        return size
+    }
+
+    func fetchRangeBytes(
+        handle: AppleRustHandle,
+        key: String,
+        offset: UInt64,
+        length: Int,
+        snapshot: String?,
+        version: String?
+    ) throws -> Data {
+        var bytes = IronmeshIosBytes(data: nil, len: 0, capacity: 0)
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = withOptionalCString(key) { keyPointer in
+            withOptionalCString(snapshot) { snapshotPointer in
+                withOptionalCString(version) { versionPointer in
+                    ironmesh_ios_facade_fetch_range_bytes(
+                        handle,
+                        keyPointer,
+                        offset,
+                        numericCast(max(length, 0)),
+                        snapshotPointer,
+                        versionPointer,
+                        &bytes,
+                        &errorPointer
+                    )
+                }
+            }
+        }
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let dataPointer = bytes.data else {
+            return Data()
+        }
+        let data = Data(bytes: dataPointer, count: Int(bytes.len))
+        ironmesh_ios_bytes_free(bytes)
+        return data
+    }
+
     func fetchRelativeBytes(handle: AppleRustHandle, path: String) throws -> Data {
         var bytes = IronmeshIosBytes(data: nil, len: 0, capacity: 0)
         var errorPointer: UnsafeMutablePointer<CChar>?

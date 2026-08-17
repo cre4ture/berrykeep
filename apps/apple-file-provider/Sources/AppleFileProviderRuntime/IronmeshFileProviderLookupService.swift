@@ -28,6 +28,8 @@ extension IronmeshFileProviderService {
                 throw fileProviderError(.noSuchItem)
             }
             return path
+        case .originalShare:
+            throw fileProviderError(.noSuchItem)
         }
     }
 

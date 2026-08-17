@@ -19,6 +19,10 @@ public struct AppleFileProviderItemIdentifier: Sendable, Codable, Hashable, Equa
         Self(kind: .temporaryFile, payload: normalizedPath(path))
     }
 
+    public static func originalShare(token: String) -> Self {
+        Self(kind: .originalShare, payload: token.lowercased())
+    }
+
     public static func directory(path: String) -> Self {
         let normalized = normalizedPath(path)
         return normalized.isEmpty ? .root : Self(kind: .directory, payload: normalized)
@@ -41,6 +45,14 @@ public struct AppleFileProviderItemIdentifier: Sendable, Codable, Hashable, Equa
                 return nil
             }
             self = .temporaryFile(path: payload)
+            return
+        }
+
+        if let payload = trimmed.stripPrefix("share:original:") {
+            guard !payload.isEmpty else {
+                return nil
+            }
+            self = .originalShare(token: payload)
             return
         }
 
@@ -89,6 +101,8 @@ public struct AppleFileProviderItemIdentifier: Sendable, Codable, Hashable, Equa
             return "dir:path:\(payload)"
         case .temporaryFile:
             return "file:path:\(payload)"
+        case .originalShare:
+            return "share:original:\(payload)"
         }
     }
 
@@ -98,7 +112,7 @@ public struct AppleFileProviderItemIdentifier: Sendable, Codable, Hashable, Equa
             return ""
         case .directory:
             return payload
-        case .file, .temporaryFile:
+        case .file, .temporaryFile, .originalShare:
             return nil
         }
     }
@@ -110,6 +124,10 @@ public struct AppleFileProviderItemIdentifier: Sendable, Codable, Hashable, Equa
     public var temporaryFilePath: String? {
         kind == .temporaryFile ? payload : nil
     }
+
+    public var originalShareToken: String? {
+        kind == .originalShare ? payload : nil
+    }
 }
 
 public enum AppleFileProviderItemIdentifierKind: String, Sendable, Codable, CaseIterable {
@@ -117,6 +135,7 @@ public enum AppleFileProviderItemIdentifierKind: String, Sendable, Codable, Case
     case file
     case directory
     case temporaryFile = "temporary_file"
+    case originalShare = "original_share"
 }
 
 private extension String {

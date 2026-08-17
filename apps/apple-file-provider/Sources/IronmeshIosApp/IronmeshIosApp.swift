@@ -1577,16 +1577,23 @@ struct IronmeshFilesHandoffPicker: UIViewControllerRepresentable {
 }
 
 private struct IronmeshHostedWebView: UIViewControllerRepresentable {
+    private static let originalShareHandlerName = "IronmeshIosShare"
+
     let session: AppleWebUiSession
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(origin: session.url)
+        Coordinator(origin: ironmeshIosEmbeddedWebURL(session.url))
     }
 
     func makeUIViewController(context: Context) -> UIViewController {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+        configuration.userContentController.addScriptMessageHandler(
+            context.coordinator,
+            contentWorld: .page,
+            name: Self.originalShareHandlerName
+        )
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.accessibilityIdentifier = "ironmesh-hosted-web-ui"
@@ -1594,7 +1601,7 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
         webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView
 
-        var request = URLRequest(url: session.url)
+        var request = URLRequest(url: ironmeshIosEmbeddedWebURL(session.url))
         request.setValue(session.authorization, forHTTPHeaderField: "X-IronMesh-Web-Ui-Session")
         webView.load(request)
 
@@ -1609,8 +1616,22 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
         _ = context
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKDownloadDelegate, UIDocumentPickerDelegate {
+    static func dismantleUIViewController(
+        _ uiViewController: UIViewController,
+        coordinator: Coordinator
+    ) {
+        _ = uiViewController
+        coordinator.webView?.configuration.userContentController.removeScriptMessageHandler(
+            forName: originalShareHandlerName,
+            contentWorld: .page
+        )
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, WKNavigationDelegate, WKDownloadDelegate, UIDocumentPickerDelegate, WKScriptMessageHandlerWithReply {
         private let origin: URL
+        private let originalShareCoordinator: IronmeshOriginalShareCoordinator?
+        private let originalShareInitializationError: String?
         private var downloadDestinations: [ObjectIdentifier: URL] = [:]
         private var completedDownloads: [URL] = []
         private var activeExportURL: URL?
@@ -1619,6 +1640,70 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
 
         init(origin: URL) {
             self.origin = origin
+            do {
+                originalShareCoordinator = try IronmeshOriginalShareCoordinator()
+                originalShareInitializationError = nil
+            } catch {
+                originalShareCoordinator = nil
+                originalShareInitializationError = error.localizedDescription
+            }
+        }
+
+        func userContentController(
+            _ userContentController: WKUserContentController,
+            didReceive message: WKScriptMessage,
+            replyHandler: @escaping (Any?, String?) -> Void
+        ) {
+            _ = userContentController
+            let requestID = shareRequestID(from: message.body)
+            guard message.frameInfo.isMainFrame,
+                  let frameURL = message.frameInfo.request.url,
+                  isSameOrigin(frameURL) else {
+                replyHandler(
+                    shareResponse(
+                        requestID: requestID,
+                        status: "error",
+                        message: "The iOS share request came from an untrusted frame."
+                    ),
+                    nil
+                )
+                return
+            }
+            guard let originalShareCoordinator,
+                  let hostViewController else {
+                replyHandler(
+                    shareResponse(
+                        requestID: requestID,
+                        status: "error",
+                        message: originalShareInitializationError
+                            ?? "The iOS share bridge is unavailable."
+                    ),
+                    nil
+                )
+                return
+            }
+
+            Task { @MainActor in
+                do {
+                    let preparedRequestID = try await originalShareCoordinator.presentShare(
+                        messageBody: message.body,
+                        from: hostViewController
+                    )
+                    replyHandler(
+                        shareResponse(requestID: preparedRequestID, status: "opened"),
+                        nil
+                    )
+                } catch {
+                    replyHandler(
+                        shareResponse(
+                            requestID: requestID,
+                            status: "error",
+                            message: error.localizedDescription
+                        ),
+                        nil
+                    )
+                }
+            }
         }
 
         func webView(
@@ -1727,6 +1812,35 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
             default:
                 return nil
             }
+        }
+
+        private func shareRequestID(from body: Any) -> String {
+            if let object = body as? [String: Any],
+               let requestID = object["requestId"] as? String {
+                return requestID
+            }
+            guard let string = body as? String,
+                  let data = string.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let requestID = object["requestId"] as? String else {
+                return ""
+            }
+            return requestID
+        }
+
+        private func shareResponse(
+            requestID: String,
+            status: String,
+            message: String? = nil
+        ) -> [String: String] {
+            var response = [
+                "requestId": requestID,
+                "status": status,
+            ]
+            if let message {
+                response["message"] = message
+            }
+            return response
         }
 
         private func sanitizedDownloadFilename(_ candidate: String) -> String {

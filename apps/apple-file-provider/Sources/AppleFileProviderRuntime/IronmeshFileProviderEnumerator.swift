@@ -22,6 +22,15 @@ final class IronmeshFileProviderEnumerator: NSObject, NSFileProviderEnumerator, 
             let observer = observerBox.value
             do {
                 if self.containerIdentifier == .workingSet {
+                    let shareItems = try self.service.activeOriginalShareItems().map {
+                        IronmeshFileProviderItem(
+                            bridgeItem: $0,
+                            domainDisplayName: self.service.configuration.domainDisplayName
+                        )
+                    }
+                    if !shareItems.isEmpty {
+                        observer.didEnumerate(shareItems)
+                    }
                     observer.finishEnumerating(upTo: nil)
                     return
                 }
@@ -61,14 +70,15 @@ final class IronmeshFileProviderEnumerator: NSObject, NSFileProviderEnumerator, 
                 let changes = try self.service.reconcileRemoteChanges(after: anchorGeneration)
                 let updatedItems = changes.batch.updatedIdentifiers.compactMap {
                     changes.itemsByIdentifier[$0]
-                }.map {
+                } + (try self.service.activeOriginalShareItems())
+                let fileProviderItems = updatedItems.map {
                     IronmeshFileProviderItem(
                         bridgeItem: $0,
                         domainDisplayName: self.service.configuration.domainDisplayName
                     )
                 }
-                if !updatedItems.isEmpty {
-                    observer.didUpdate(updatedItems)
+                if !fileProviderItems.isEmpty {
+                    observer.didUpdate(fileProviderItems)
                 }
                 let deletedIdentifiers = changes.batch.deletedIdentifiers.map {
                     NSFileProviderItemIdentifier(rawValue: $0)

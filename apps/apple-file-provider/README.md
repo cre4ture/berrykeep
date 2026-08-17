@@ -41,6 +41,11 @@ separate Files domain backed by the shared enrolled device connection.
   copy emit best-effort working-set hints; they do not promise immediate remote push delivery.
 - Content is materialized on demand. Offline pinning remains the Files app's system-managed
   **Keep Downloaded** action; iOS has no provider-level per-profile eager-retention API.
+- The embedded Web UI replaces original-media downloads with the iOS share sheet. It passes only
+  an expiring random capability into the default File Provider domain; the capability remains
+  pinned to one snapshot or version. POSIX readers can request aligned partial content, while
+  full materialization streams directly into the File Provider temporary volume in bounded
+  4 MiB chunks instead of constructing a whole-file Swift `Data` value.
 - The iOS app shell can optionally run the Rust-backed title latency monitor while the app is
   executing. Its configurable direct (`D`) or relay (`R`) result is shown in each main navigation bar.
 - The neighboring export button opens the system document exporter and writes retained app actions,

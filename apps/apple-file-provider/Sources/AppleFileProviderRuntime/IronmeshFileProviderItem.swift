@@ -25,7 +25,7 @@ final class IronmeshFileProviderItem: NSObject, NSFileProviderItem {
     }
 
     var parentItemIdentifier: NSFileProviderItemIdentifier {
-        if bridgeItem.identifier.kind == .root {
+        if bridgeItem.identifier.kind == .root || bridgeItem.identifier.kind == .originalShare {
             return .rootContainer
         }
 
@@ -53,6 +53,11 @@ final class IronmeshFileProviderItem: NSObject, NSFileProviderItem {
             return .folder
         }
 
+        if let mimeType = bridgeItem.mimeType,
+           let type = UTType(mimeType: mimeType) {
+            return type
+        }
+
         let pathExtension = URL(fileURLWithPath: bridgeItem.path).pathExtension
         if let type = UTType(filenameExtension: pathExtension), !pathExtension.isEmpty {
             return type
@@ -74,6 +79,8 @@ final class IronmeshFileProviderItem: NSObject, NSFileProviderItem {
                 .allowsRenaming,
                 .allowsReparenting,
             ]
+        case .originalShare:
+            capabilities = [.allowsReading]
         }
         if AppleDeletionCapabilityPolicy.allowsDeletion(for: bridgeItem.identifier.kind) {
             capabilities.insert(.allowsDeleting)
@@ -83,7 +90,7 @@ final class IronmeshFileProviderItem: NSObject, NSFileProviderItem {
     }
 
     var contentPolicy: NSFileProviderContentPolicy {
-        bridgeItem.identifier.kind == .root
+        bridgeItem.identifier.kind == .root || bridgeItem.identifier.kind == .originalShare
             ? .downloadLazilyAndEvictOnRemoteUpdate
             : .inherited
     }
