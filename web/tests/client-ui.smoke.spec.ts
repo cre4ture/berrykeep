@@ -453,7 +453,8 @@ test("client-ui gallery loads map entries in bounded pages", async ({ page }) =>
   });
 
   await installClientUiMocks(page, {
-    storeEntries: createGalleryPaginationMockStoreEntries(520)
+    storeEntries: createGalleryPaginationMockStoreEntries(520),
+    mapConsistencyMismatchOnce: true
   });
   await page.goto("/");
   await page.getByText("Gallery", { exact: true }).click();
@@ -471,6 +472,12 @@ test("client-ui gallery loads map entries in bounded pages", async ({ page }) =>
   await expect
     .poll(() => [...new Set(mapPageOffsets)].sort().join(","))
     .toBe("0,500");
+  await expect
+    .poll(() => mapPageOffsets.filter((offset) => offset === "0").length)
+    .toBe(2);
+  await expect
+    .poll(() => mapPageOffsets.filter((offset) => offset === "500").length)
+    .toBe(2);
 });
 
 test("client-ui keeps the direct iOS gallery map inside the WebView viewport", async ({ page }) => {
@@ -1086,6 +1093,7 @@ test("client-ui mobile drawer reveals and navigates its menu items", async ({ pa
 
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
+  mapConsistencyMismatchOnce?: boolean;
   cacheScope?: string | null;
   mapMetadataStatus?: number;
   mapConfigurationStatus?: number;
@@ -1135,6 +1143,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   let cacheScope = options?.cacheScope === undefined ? "a".repeat(64) : options.cacheScope;
   let galleryOffline = false;
   let galleryStoreListRequestCount = 0;
+  let mapPaginationAttempt = 0;
   let galleryStoreListDelayMs = 0;
   const galleryStoreListDelayByMediaFilter = new Map<string, number>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
@@ -1612,7 +1621,19 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       if (storeListDelay > 0) {
         await new Promise((resolve) => setTimeout(resolve, storeListDelay));
       }
-      return json(route, buildMockStoreListResponse(storeEntries, searchParams));
+      const response = buildMockStoreListResponse(storeEntries, searchParams);
+      const isMapPage =
+        searchParams.get("limit") === "500" && searchParams.has("media_filter");
+      if (isMapPage && searchParams.get("offset") === "0") {
+        mapPaginationAttempt += 1;
+      }
+      if (isMapPage && options?.mapConsistencyMismatchOnce) {
+        response.consistency_token =
+          mapPaginationAttempt === 1 && searchParams.get("offset") !== "0"
+            ? "mock-store-revision-2"
+            : `mock-store-revision-${mapPaginationAttempt}`;
+      }
+      return json(route, response);
     }
 
     if ((pathname === apiV1("/media/thumbnail") || pathname === "/media/thumbnail") && method === "GET") {

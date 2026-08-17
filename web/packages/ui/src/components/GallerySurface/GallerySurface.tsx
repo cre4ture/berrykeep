@@ -196,6 +196,8 @@ export type GalleryLoadEntriesOptions = {
   limit?: number;
   sort?: GallerySortOrder;
   mediaFilter?: GalleryMediaFilter;
+  /** Bypasses application caches when a consistent multi-page read must be retried. */
+  fresh?: boolean;
 };
 
 export type GalleryDataUpdateKind = "snapshots" | "entries";
@@ -883,52 +885,68 @@ export function GallerySurface({
     targetScope: GalleryLoadedScope,
     requestVersion: number
   ): Promise<{ payload: GalleryPayload; pages: Map<number, GalleryPayload> } | null> {
-    const loadPage = (offset: number) =>
+    const loadPage = (offset: number, fresh: boolean) =>
       loadEntries(targetScope.prefix, targetScope.depth, targetScope.snapshotId, {
         view: "tree",
         sort: sortOrder,
         mediaFilter: requestedServerMediaFilter,
         offset,
-        limit: GALLERY_MAP_PAGE_SIZE
+        limit: GALLERY_MAP_PAGE_SIZE,
+        fresh
       });
 
-    const firstPage = await loadPage(0);
-    if (requestVersion !== galleryRequestVersionRef.current) {
-      return null;
-    }
-
-    const totalEntryCount = galleryPayloadTotalEntryCount(firstPage);
-    const pages = new Map<number, GalleryPayload>([[0, firstPage]]);
-    const remainingOffsets = Array.from(
-      { length: Math.max(0, Math.ceil(totalEntryCount / GALLERY_MAP_PAGE_SIZE) - 1) },
-      (_, index) => (index + 1) * GALLERY_MAP_PAGE_SIZE
-    );
-
-    for (
-      let batchStart = 0;
-      batchStart < remainingOffsets.length;
-      batchStart += GALLERY_MAP_PAGE_CONCURRENCY
-    ) {
-      const offsets = remainingOffsets.slice(
-        batchStart,
-        batchStart + GALLERY_MAP_PAGE_CONCURRENCY
-      );
-      const payloads = await Promise.all(offsets.map((offset) => loadPage(offset)));
+    const loadAttempt = async (fresh: boolean) => {
+      const firstPage = await loadPage(0, fresh);
       if (requestVersion !== galleryRequestVersionRef.current) {
         return null;
       }
-      offsets.forEach((offset, index) => {
-        const payload = payloads[index];
-        if (payload) {
-          pages.set(offset, payload);
+
+      const totalEntryCount = galleryPayloadTotalEntryCount(firstPage);
+      const pages = new Map<number, GalleryPayload>([[0, firstPage]]);
+      const remainingOffsets = Array.from(
+        { length: Math.max(0, Math.ceil(totalEntryCount / GALLERY_MAP_PAGE_SIZE) - 1) },
+        (_, index) => (index + 1) * GALLERY_MAP_PAGE_SIZE
+      );
+
+      for (
+        let batchStart = 0;
+        batchStart < remainingOffsets.length;
+        batchStart += GALLERY_MAP_PAGE_CONCURRENCY
+      ) {
+        const offsets = remainingOffsets.slice(
+          batchStart,
+          batchStart + GALLERY_MAP_PAGE_CONCURRENCY
+        );
+        const payloads = await Promise.all(offsets.map((offset) => loadPage(offset, fresh)));
+        if (requestVersion !== galleryRequestVersionRef.current) {
+          return null;
         }
-      });
+        offsets.forEach((offset, index) => {
+          const payload = payloads[index];
+          if (payload) {
+            pages.set(offset, payload);
+          }
+        });
+      }
+
+      return pages;
+    };
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const pages = await loadAttempt(attempt > 0);
+      if (!pages) {
+        return null;
+      }
+      if (attempt === 0 && !galleryPageConsistencyTokensMatch(pages)) {
+        continue;
+      }
+      return {
+        payload: combinePaginatedGalleryPayloads(pages, GALLERY_MAP_PAGE_SIZE),
+        pages
+      };
     }
 
-    return {
-      payload: combinePaginatedGalleryPayloads(pages, GALLERY_MAP_PAGE_SIZE),
-      pages
-    };
+    return null;
   }
 
   async function loadGalleryScope(targetScope: GalleryLoadedScope, syncPrefixInput: boolean) {
@@ -2204,6 +2222,22 @@ function galleryMediaSummariesMatch(
   );
 }
 
+const GALLERY_PAGINATION_CONSISTENCY_ERROR_MESSAGE =
+  "The gallery changed while its map pages were loading. Refresh the gallery to try again.";
+
+function galleryPageConsistencyTokensMatch(
+  pages: ReadonlyMap<number, GalleryPayload>
+): boolean {
+  const firstPage = pages.get(0);
+  if (!firstPage) {
+    return true;
+  }
+  const firstConsistencyToken = galleryPayloadConsistencyToken(firstPage);
+  return Array.from(pages.values()).every(
+    (page) => galleryPayloadConsistencyToken(page) === firstConsistencyToken
+  );
+}
+
 function combinePaginatedGalleryPayloads(
   pages: ReadonlyMap<number, GalleryPayload>,
   pageSize: number
@@ -2250,16 +2284,12 @@ function combinePaginatedGalleryPayloads(
         firstMediaSummary
       )
     ) {
-      throw new Error(
-        "The gallery changed while its map pages were loading. Refresh the gallery to try again."
-      );
+      throw new Error(GALLERY_PAGINATION_CONSISTENCY_ERROR_MESSAGE);
     }
 
     for (const entry of page.entries) {
       if (seenPaths.has(entry.path)) {
-        throw new Error(
-          "The gallery changed while its map pages were loading. Refresh the gallery to try again."
-        );
+        throw new Error(GALLERY_PAGINATION_CONSISTENCY_ERROR_MESSAGE);
       }
       seenPaths.add(entry.path);
       entries.push(entry);
