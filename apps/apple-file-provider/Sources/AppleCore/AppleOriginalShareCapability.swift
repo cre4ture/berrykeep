@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 public struct AppleOriginalShareRequest: Equatable, Sendable {
     public let requestID: String
@@ -106,10 +111,10 @@ public struct AppleOriginalShareCapability: Codable, Equatable, Sendable {
 public final class AppleOriginalShareCapabilityStore: @unchecked Sendable {
     public static let directoryName = "IronmeshOriginalShareCapabilities"
 
+    private static let processLock = NSLock()
     private let directoryURL: URL
     private let clock: () -> Date
     private let tokenFactory: () -> String
-    private let lock = NSLock()
 
     public convenience init(appGroupIdentifier: String) throws {
         #if canImport(Darwin)
@@ -136,96 +141,123 @@ public final class AppleOriginalShareCapabilityStore: @unchecked Sendable {
     }
 
     public func create(_ request: AppleOriginalShareRequest) throws -> AppleOriginalShareCapability {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let now = clock()
-        try ensureDirectoryExists()
-        try pruneLocked(now: now, reserving: 1)
-        let token = tokenFactory().lowercased()
-        guard isValidOriginalShareToken(token) else {
-            throw AppleOriginalShareError.invalidToken
+        try withExclusiveStoreAccess {
+            let now = clock()
+            try pruneLocked(now: now, reserving: 1)
+            let token = tokenFactory().lowercased()
+            guard isValidOriginalShareToken(token) else {
+                throw AppleOriginalShareError.invalidToken
+            }
+            let capability = AppleOriginalShareCapability(
+                token: token,
+                remotePath: request.remotePath,
+                snapshotID: request.snapshotID,
+                versionID: request.versionID,
+                displayName: request.displayName,
+                mimeType: request.mimeType,
+                sizeBytes: request.sizeBytes,
+                createdAt: now,
+                expiresAt: now.addingTimeInterval(AppleOriginalShareLimits.capabilityLifetime)
+            )
+            try persistLocked(capability)
+            return capability
         }
-        let capability = AppleOriginalShareCapability(
-            token: token,
-            remotePath: request.remotePath,
-            snapshotID: request.snapshotID,
-            versionID: request.versionID,
-            displayName: request.displayName,
-            mimeType: request.mimeType,
-            sizeBytes: request.sizeBytes,
-            createdAt: now,
-            expiresAt: now.addingTimeInterval(AppleOriginalShareLimits.capabilityLifetime)
-        )
-        try persistLocked(capability)
-        return capability
     }
 
     public func resolve(token: String) throws -> AppleOriginalShareCapability {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let normalizedToken = token.lowercased()
-        guard isValidOriginalShareToken(normalizedToken) else {
-            throw AppleOriginalShareError.invalidToken
-        }
-        let fileURL = capabilityURL(token: normalizedToken)
-        let capability: AppleOriginalShareCapability
-        do {
-            capability = try JSONDecoder().decode(
-                AppleOriginalShareCapability.self,
-                from: Data(contentsOf: fileURL)
-            )
-        } catch {
-            try? FileManager.default.removeItem(at: fileURL)
-            throw AppleOriginalShareError.capabilityUnavailable
-        }
-        guard capability.token == normalizedToken,
-              isValidStoredCapability(capability) else {
-            try? FileManager.default.removeItem(at: fileURL)
-            throw AppleOriginalShareError.capabilityUnavailable
-        }
-        guard capability.expiresAt > clock() else {
-            try? FileManager.default.removeItem(at: fileURL)
-            throw AppleOriginalShareError.capabilityExpired
-        }
-        return capability
-    }
-
-    public func remove(token: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard isValidOriginalShareToken(token.lowercased()) else {
-            return
-        }
-        try? FileManager.default.removeItem(at: capabilityURL(token: token.lowercased()))
-    }
-
-    public func activeCapabilities() throws -> [AppleOriginalShareCapability] {
-        lock.lock()
-        defer { lock.unlock() }
-        try ensureDirectoryExists()
-        let now = clock()
-        try pruneLocked(now: now, reserving: 0)
-        return try FileManager.default.contentsOfDirectory(
-            at: directoryURL,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )
-        .filter { $0.pathExtension == "json" }
-        .compactMap { fileURL in
-            guard let data = try? Data(contentsOf: fileURL),
-                  let capability = try? JSONDecoder().decode(
+        try withExclusiveStoreAccess {
+            let normalizedToken = token.lowercased()
+            guard isValidOriginalShareToken(normalizedToken) else {
+                throw AppleOriginalShareError.invalidToken
+            }
+            let fileURL = capabilityURL(token: normalizedToken)
+            let capability: AppleOriginalShareCapability
+            do {
+                capability = try JSONDecoder().decode(
                     AppleOriginalShareCapability.self,
-                    from: data
-                  ),
-                  isValidStoredCapability(capability),
-                  capability.expiresAt > now else {
-                return nil
+                    from: Data(contentsOf: fileURL)
+                )
+            } catch {
+                try? FileManager.default.removeItem(at: fileURL)
+                throw AppleOriginalShareError.capabilityUnavailable
+            }
+            guard capability.token == normalizedToken,
+                  isValidStoredCapability(capability) else {
+                try? FileManager.default.removeItem(at: fileURL)
+                throw AppleOriginalShareError.capabilityUnavailable
+            }
+            guard capability.expiresAt > clock() else {
+                try? FileManager.default.removeItem(at: fileURL)
+                throw AppleOriginalShareError.capabilityExpired
             }
             return capability
         }
-        .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    public func remove(token: String) {
+        try? withExclusiveStoreAccess {
+            guard isValidOriginalShareToken(token.lowercased()) else {
+                return
+            }
+            try? FileManager.default.removeItem(at: capabilityURL(token: token.lowercased()))
+        }
+    }
+
+    public func activeCapabilities() throws -> [AppleOriginalShareCapability] {
+        try withExclusiveStoreAccess {
+            let now = clock()
+            try pruneLocked(now: now, reserving: 0)
+            return try FileManager.default.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+            .filter { $0.pathExtension == "json" }
+            .compactMap { fileURL in
+                guard let data = try? Data(contentsOf: fileURL),
+                      let capability = try? JSONDecoder().decode(
+                        AppleOriginalShareCapability.self,
+                        from: data
+                      ),
+                      isValidStoredCapability(capability),
+                      capability.expiresAt > now else {
+                    return nil
+                }
+                return capability
+            }
+            .sorted { $0.createdAt > $1.createdAt }
+        }
+    }
+
+    private func withExclusiveStoreAccess<T>(_ operation: () throws -> T) throws -> T {
+        // Store instances are short-lived. The static lock coordinates them within one process;
+        // flock coordinates the host app and File Provider extension through the app-group file.
+        Self.processLock.lock()
+        defer { Self.processLock.unlock() }
+
+        try ensureDirectoryExists()
+        let lockFileURL = directoryURL.appendingPathComponent(".store.lock", isDirectory: false)
+        _ = FileManager.default.createFile(atPath: lockFileURL.path, contents: Data())
+        let lockFile: FileHandle
+        do {
+            lockFile = try FileHandle(forUpdating: lockFileURL)
+        } catch {
+            throw AppleOriginalShareError.storageUnavailable
+        }
+        defer { try? lockFile.close() }
+
+        #if canImport(Darwin) || canImport(Glibc)
+        while flock(lockFile.fileDescriptor, LOCK_EX) != 0 {
+            guard errno == EINTR else {
+                throw AppleOriginalShareError.storageUnavailable
+            }
+        }
+        defer { _ = flock(lockFile.fileDescriptor, LOCK_UN) }
+        #else
+        throw AppleOriginalShareError.storageUnavailable
+        #endif
+
+        return try operation()
     }
 
     private func ensureDirectoryExists() throws {
