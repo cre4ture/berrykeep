@@ -587,6 +587,91 @@ test("client-ui iOS media viewer shares an immutable original through the native
   });
 });
 
+test("client-ui iOS media viewer ignores stale native share responses", async ({ page }) => {
+  await page.addInitScript(() => {
+    const pending: Array<{
+      key: string;
+      requestId: string;
+      resolve: (response: { requestId: string; status: "opened" | "error" }) => void;
+    }> = [];
+    Object.assign(window, {
+      __ironmeshIosPendingShares: pending,
+      __resolveIronmeshIosShare(index: number, status: "opened" | "error") {
+        const entry = pending[index];
+        entry?.resolve({ requestId: entry.requestId, status });
+      },
+      webkit: {
+        messageHandlers: {
+          IronmeshIosShare: {
+            postMessage(message: Record<string, unknown>) {
+              return new Promise((resolve) => {
+                pending.push({
+                  key: String(message.key ?? ""),
+                  requestId: String(message.requestId ?? ""),
+                  resolve
+                });
+              });
+            }
+          }
+        }
+      }
+    });
+  });
+  await installClientUiMocks(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/?page=gallery&embedded_client=ios");
+  await page.getByRole("button", { name: "Map" }).click();
+  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "Share original" }).click();
+  await expect(dialog.getByRole("button", { name: "Preparing share…" })).toBeVisible();
+  await dialog.getByRole("button", { name: "Next item" }).click();
+  await expect(dialog).toHaveAccessibleName(/dog\.jpg/);
+  await dialog.getByRole("button", { name: "Share original" }).click();
+  await expect(dialog.getByRole("button", { name: "Preparing share…" })).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __ironmeshIosPendingShares: Array<unknown>;
+            }
+          ).__ironmeshIosPendingShares.length
+      )
+    )
+    .toBe(2);
+  expect(
+    await page.evaluate(
+      () =>
+        (
+          window as typeof window & {
+            __ironmeshIosPendingShares: Array<{ key: string }>;
+          }
+        ).__ironmeshIosPendingShares.map((entry) => entry.key)
+    )
+  ).toEqual(["gallery/cat.png", "gallery/dog.jpg"]);
+
+  await page.evaluate(() => {
+    (
+      window as typeof window & {
+        __resolveIronmeshIosShare: (index: number, status: "opened" | "error") => void;
+      }
+    ).__resolveIronmeshIosShare(0, "opened");
+  });
+  await expect(dialog.getByRole("button", { name: "Preparing share…" })).toBeVisible();
+
+  await page.evaluate(() => {
+    (
+      window as typeof window & {
+        __resolveIronmeshIosShare: (index: number, status: "opened" | "error") => void;
+      }
+    ).__resolveIronmeshIosShare(1, "opened");
+  });
+  await expect(dialog.getByRole("button", { name: "Share opened" })).toBeVisible();
+});
+
 test("client-ui gallery restores its persistent cache while the upstream is offline", async ({
   page
 }) => {

@@ -1,6 +1,6 @@
 import { Button } from "@mantine/core";
 import { IconShare } from "@tabler/icons-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export type MediaShareRequest = {
   key: string;
@@ -50,6 +50,11 @@ type ShareStatus =
   | { state: "opened" }
   | { state: "error"; message: string };
 
+type ScopedShareStatus = {
+  requestIdentity: string;
+  value: ShareStatus;
+};
+
 declare global {
   interface Window {
     IronmeshAndroidShare?: AndroidShareBridge;
@@ -64,21 +69,42 @@ declare global {
 const SHARE_RESPONSE_TIMEOUT_MS = 10_000;
 
 export function OriginalShareAction({ client, request }: OriginalShareActionProps) {
-  const [status, setStatus] = useState<ShareStatus>({ state: "idle" });
+  const requestIdentity = JSON.stringify([
+    client,
+    request?.key,
+    request?.snapshotId,
+    request?.versionId
+  ]);
+  const [scopedStatus, setScopedStatus] = useState<ScopedShareStatus>({
+    requestIdentity,
+    value: { state: "idle" }
+  });
+  const activeRequest = useRef<{ requestId: string; requestIdentity: string } | null>(null);
+  if (activeRequest.current?.requestIdentity !== requestIdentity) {
+    activeRequest.current = null;
+  }
+  const status: ShareStatus =
+    scopedStatus.requestIdentity === requestIdentity
+      ? scopedStatus.value
+      : { state: "idle" };
   const bridgeAvailable = hasShareBridge(client);
   const platformName = client === "android" ? "Android" : "iOS";
-
-  useEffect(() => {
-    setStatus({ state: "idle" });
-  }, [request?.key, request?.snapshotId, request?.versionId]);
 
   useEffect(() => {
     if (status.state !== "opened") {
       return;
     }
-    const timeout = window.setTimeout(() => setStatus({ state: "idle" }), 3_000);
+    const timeout = window.setTimeout(
+      () =>
+        setScopedStatus((current) =>
+          current.requestIdentity === requestIdentity
+            ? { requestIdentity, value: { state: "idle" } }
+            : current
+        ),
+      3_000
+    );
     return () => window.clearTimeout(timeout);
-  }, [status.state]);
+  }, [requestIdentity, status.state]);
 
   const unavailableReason = !request
     ? "This media item has no immutable snapshot or version selector"
@@ -99,12 +125,18 @@ export function OriginalShareAction({ client, request }: OriginalShareActionProp
           : "Share original";
 
   async function shareOriginal() {
-    if (!request || !bridgeAvailable || status.state === "pending") {
+    if (
+      !request ||
+      !bridgeAvailable ||
+      status.state === "pending" ||
+      activeRequest.current !== null
+    ) {
       return;
     }
 
     const requestId = createShareRequestId();
-    setStatus({ state: "pending" });
+    activeRequest.current = { requestId, requestIdentity };
+    setScopedStatus({ requestIdentity, value: { state: "pending" } });
     try {
       const responsePromise = sendShareRequest(client, {
         action: "share-original",
@@ -122,18 +154,38 @@ export function OriginalShareAction({ client, request }: OriginalShareActionProp
       if (!parsed || parsed.requestId !== requestId) {
         throw new Error(`${platformName} returned an invalid share response.`);
       }
-      setStatus(
-        parsed.status === "opened"
-          ? { state: "opened" }
-          : {
-              state: "error",
-              message: parsed.message || `${platformName} could not share this file.`
-            }
-      );
+      if (
+        activeRequest.current?.requestId !== requestId ||
+        activeRequest.current.requestIdentity !== requestIdentity
+      ) {
+        return;
+      }
+      activeRequest.current = null;
+      setScopedStatus({
+        requestIdentity,
+        value:
+          parsed.status === "opened"
+            ? { state: "opened" }
+            : {
+                state: "error",
+                message: parsed.message || `${platformName} could not share this file.`
+              }
+      });
     } catch (error) {
-      setStatus({
-        state: "error",
-        message: error instanceof Error ? error.message : `${platformName} could not share this file.`
+      if (
+        activeRequest.current?.requestId !== requestId ||
+        activeRequest.current.requestIdentity !== requestIdentity
+      ) {
+        return;
+      }
+      activeRequest.current = null;
+      setScopedStatus({
+        requestIdentity,
+        value: {
+          state: "error",
+          message:
+            error instanceof Error ? error.message : `${platformName} could not share this file.`
+        }
       });
     }
   }
