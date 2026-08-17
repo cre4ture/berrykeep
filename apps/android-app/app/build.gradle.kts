@@ -397,6 +397,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
     implementation("androidx.activity:activity-compose:1.9.1")
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+    // WEB_MESSAGE_LISTENER has been stable since WebKit 1.3. Keep this aligned with the
+    // app's Kotlin 1.9 toolchain instead of pulling Kotlin 2.x transitively.
+    implementation("androidx.webkit:webkit:1.11.0")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui-tooling-preview")

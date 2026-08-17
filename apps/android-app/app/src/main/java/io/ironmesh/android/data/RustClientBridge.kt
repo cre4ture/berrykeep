@@ -97,6 +97,28 @@ object RustClientBridge {
     )
 
     @JvmStatic
+    external fun getObjectSize(
+        connectionInput: String,
+        key: String,
+        snapshot: String?,
+        version: String?,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    ): Long
+
+    @JvmStatic
+    external fun readObjectRange(
+        connectionInput: String,
+        key: String,
+        offset: Long,
+        length: Int,
+        snapshot: String?,
+        version: String?,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    ): ByteArray
+
+    @JvmStatic
     external fun streamRelativeUrlTo(
         connectionInput: String,
         relativeUrl: String,

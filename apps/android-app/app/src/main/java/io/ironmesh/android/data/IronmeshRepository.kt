@@ -361,6 +361,42 @@ class IronmeshRepository {
         )
     }
 
+    suspend fun getObjectSize(
+        connectionInput: String,
+        key: String,
+        snapshot: String? = null,
+        version: String? = null,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ): Long = RustClientBridge.getObjectSize(
+        normalizedConnectionInput(connectionInput),
+        key,
+        snapshot,
+        version,
+        serverCaPem,
+        normalizedClientIdentityJson(clientIdentityJson),
+    )
+
+    suspend fun readObjectRange(
+        connectionInput: String,
+        key: String,
+        offset: Long,
+        length: Int,
+        snapshot: String? = null,
+        version: String? = null,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ): ByteArray = RustClientBridge.readObjectRange(
+        normalizedConnectionInput(connectionInput),
+        key,
+        offset,
+        length,
+        snapshot,
+        version,
+        serverCaPem,
+        normalizedClientIdentityJson(clientIdentityJson),
+    )
+
     suspend fun streamRelativeUrlTo(
         connectionInput: String,
         relativeUrl: String,

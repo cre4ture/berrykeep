@@ -114,6 +114,23 @@ internal object IronmeshCursorRows {
         )
     }
 
+    fun populateSharedFileRow(
+        cursor: MatrixCursor,
+        row: MatrixCursor.RowBuilder,
+        documentId: String,
+        displayName: String,
+        mimeType: String,
+        sizeBytes: Long?,
+        remotePath: String,
+    ) {
+        addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_DOCUMENT_ID, documentId)
+        addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_DISPLAY_NAME, displayName)
+        addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_MIME_TYPE, mimeType)
+        addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_SIZE, sizeBytes)
+        addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_FLAGS, 0)
+        addColumnIfPresent(cursor, row, IronmeshDocumentColumns.COLUMN_REMOTE_PATH, remotePath)
+    }
+
     private fun addColumnIfPresent(
         cursor: MatrixCursor,
         row: MatrixCursor.RowBuilder,

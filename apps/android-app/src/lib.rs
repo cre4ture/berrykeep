@@ -576,12 +576,13 @@ mod tests {
         )
     }
 }
+use client_sdk::ironmesh_client::DownloadRangeRequest;
 use client_sdk::{
     ClientConnectionDiagnosticImpact, ClientConnectionDiagnostics,
     ClientConnectionDiagnosticsEvent, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
     EnrolledClientConnection, IronMeshClient, ManagedBootstrapPersistence, ManagedClientOptions,
-    ManagedIronMeshClient, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
-    StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig,
+    ManagedIronMeshClient, RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions,
+    StoreIndexSortOrder, StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig,
     enroll_client_connection_blocking, set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
@@ -3131,6 +3132,121 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
 
     if let Err(err) = result {
         throw_java_error(&mut env, format!("rust streamObjectTo failed: {err:#}"));
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getObjectSize(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    key: JString,
+    snapshot: jstring,
+    version: jstring,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+) -> jlong {
+    let result = (|| -> Result<jlong> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let key: String = env.get_string(&key)?.into();
+        let snapshot = optional_jstring(&mut env, snapshot)?;
+        let version = optional_jstring(&mut env, version)?;
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let client = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        client
+            .get_object_size_blocking(key, snapshot.as_deref(), version.as_deref())?
+            .try_into()
+            .context("object size exceeds Android's signed 64-bit file size")
+    })();
+
+    match result {
+        Ok(size) => size,
+        Err(err) => {
+            throw_java_error(&mut env, format!("rust getObjectSize failed: {err:#}"));
+            0
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_readObjectRange(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    key: JString,
+    offset: jlong,
+    length: jint,
+    snapshot: jstring,
+    version: jstring,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+) -> jbyteArray {
+    const MAX_ANDROID_SAF_RANGE_BYTES: usize = 4 * 1024 * 1024;
+
+    let result = (|| -> Result<Vec<u8>> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let key: String = env.get_string(&key)?.into();
+        let offset = u64::try_from(offset).context("range offset must not be negative")?;
+        let length = usize::try_from(length).context("range length must not be negative")?;
+        anyhow::ensure!(
+            length <= MAX_ANDROID_SAF_RANGE_BYTES,
+            "range length exceeds the Android SAF limit"
+        );
+        let snapshot = optional_jstring(&mut env, snapshot)?;
+        let version = optional_jstring(&mut env, version)?;
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let client = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        let mut bytes = Vec::with_capacity(length);
+        let mut on_progress = |_progress| {};
+        let should_cancel = || false;
+        let report = client.download_range_to_writer_with_progress_blocking(
+            DownloadRangeRequest {
+                key: key.as_str(),
+                snapshot: snapshot.as_deref(),
+                version: version.as_deref(),
+                range: RequestedRange {
+                    offset,
+                    length: length as u64,
+                },
+            },
+            &mut bytes,
+            &mut on_progress,
+            &should_cancel,
+        )?;
+        anyhow::ensure!(
+            report.bytes_downloaded == length as u64 && bytes.len() == length,
+            "range response size mismatch: requested={length} reported={} actual={}",
+            report.bytes_downloaded,
+            bytes.len()
+        );
+        Ok(bytes)
+    })();
+
+    match result {
+        Ok(bytes) => match env.byte_array_from_slice(&bytes) {
+            Ok(array) => array.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!("rust readObjectRange failed to create byte[]: {err:#}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(&mut env, format!("rust readObjectRange failed: {err:#}"));
+            std::ptr::null_mut()
+        }
     }
 }
 

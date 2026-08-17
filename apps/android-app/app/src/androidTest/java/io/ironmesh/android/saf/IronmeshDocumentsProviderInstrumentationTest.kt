@@ -11,6 +11,9 @@ import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.RustClientTestBridge
 import io.ironmesh.android.data.RustPreferencesBridge
+import io.ironmesh.android.share.OriginalShareCapabilityStore
+import io.ironmesh.android.share.OriginalShareRequest
+import io.ironmesh.android.share.originalShareDocumentUri
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
@@ -34,12 +37,14 @@ class IronmeshDocumentsProviderInstrumentationTest {
         RustPreferencesBridge.initialize(appContext)
         IronmeshPreferences.clearDeviceAuthState(appContext)
         RustClientTestBridge.stopRendezvousRenewalScenario()
+        OriginalShareCapabilityStore(appContext).clearForTesting()
     }
 
     @After
     fun tearDown() {
         RustClientTestBridge.stopRendezvousRenewalScenario()
         IronmeshPreferences.clearDeviceAuthState(appContext)
+        OriginalShareCapabilityStore(appContext).clearForTesting()
     }
 
     @Test
@@ -90,6 +95,52 @@ class IronmeshDocumentsProviderInstrumentationTest {
                 readExactly(it, RANDOM_ACCESS_READ_SIZE),
             )
         }
+    }
+
+    @Test
+    fun sharedOriginal_usesCapabilityMetadataAndPinnedVersion() {
+        val scenario = configureProviderDownloadScenario()
+        val capability = OriginalShareCapabilityStore(appContext).create(
+            OriginalShareRequest(
+                requestId = "instrumentation-share",
+                remotePath = scenario.remoteDocumentPath,
+                snapshotId = null,
+                versionId = "v1",
+                displayName = "shared-readme.txt",
+                mimeType = "text/plain",
+                sizeBytes = scenario.expectedContents.size.toLong(),
+            ),
+        )
+        val shareUri = originalShareDocumentUri(appContext, capability.token)
+
+        appContext.contentResolver.query(
+            shareUri,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
+            ),
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            assertNotNull(cursor)
+            requireNotNull(cursor)
+            assertTrue(cursor.moveToFirst())
+            assertEquals("shared-readme.txt", cursor.getString(0))
+            assertEquals("text/plain", cursor.getString(1))
+            assertEquals(scenario.expectedContents.size.toLong(), cursor.getLong(2))
+        }
+
+        val contents = requireNotNull(appContext.contentResolver.openInputStream(shareUri)).use {
+            it.readBytes()
+        }
+        assertArrayEquals(scenario.expectedContents, contents)
+        assertTrue(
+            jsonArrayStrings(RustClientTestBridge.getCapturedRequestPaths()).any { path ->
+                path.contains("version=v1")
+            },
+        )
     }
 
     @Test

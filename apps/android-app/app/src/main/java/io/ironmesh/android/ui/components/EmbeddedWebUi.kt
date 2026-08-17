@@ -15,11 +15,17 @@ import android.webkit.WebViewClient
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.webkit.WebMessageCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import io.ironmesh.android.data.EmbeddedWebUiSession
+import io.ironmesh.android.share.OriginalShareCoordinator
+import java.net.URI
 
 private const val EMBEDDED_WEB_UI_SESSION_HEADER = "X-IronMesh-Web-Ui-Session"
 private const val EMBEDDED_WEB_UI_CLIENT_PARAMETER = "embedded_client"
 private const val ANDROID_WEB_UI_CLIENT = "android"
+private const val ANDROID_SHARE_JAVASCRIPT_OBJECT = "IronmeshAndroidShare"
 
 @Composable
 fun IronmeshEmbeddedWebUi(
@@ -62,7 +68,51 @@ private fun WebView.configureEmbeddedWebUi(session: EmbeddedWebUiSession) {
     webViewClient = EmbeddedWebUiClient(session.url)
     webChromeClient = EmbeddedWebUiChromeClient()
     setDownloadListener(EmbeddedWebUiDownloadListener(context, session.url))
+    installAndroidShareBridge(session.url)
     loadEmbeddedWebUi(session)
+}
+
+private fun WebView.installAndroidShareBridge(initialUrl: String) {
+    if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+        EmbeddedWebUiDiagnostics.report(
+            EmbeddedWebUiDiagnostic(
+                level = EmbeddedWebUiDiagnosticLevel.WARN,
+                event = "android_share_bridge_unavailable",
+                pageUrl = initialUrl,
+                detail = "The installed Android WebView does not support origin-scoped web messages",
+            ),
+        )
+        return
+    }
+
+    val allowedOrigin = embeddedWebUiOrigin(initialUrl)
+    val coordinator = OriginalShareCoordinator(context)
+    WebViewCompat.addWebMessageListener(
+        this,
+        ANDROID_SHARE_JAVASCRIPT_OBJECT,
+        setOf(allowedOrigin),
+    ) { _, message, sourceOrigin, isMainFrame, replyProxy ->
+        val response = if (
+            isMainFrame &&
+            isSameEmbeddedWebUiOrigin(initialUrl, sourceOrigin.toString()) &&
+            message.type == WebMessageCompat.TYPE_STRING
+        ) {
+            coordinator.handleWebMessage(message.data.orEmpty())
+        } else {
+            """{"requestId":"","status":"error","message":"Rejected untrusted share request"}"""
+        }
+        replyProxy.postMessage(response)
+    }
+}
+
+private fun embeddedWebUiOrigin(url: String): String {
+    val parsed = URI(url)
+    require(
+        parsed.scheme.equals("http", ignoreCase = true) ||
+            parsed.scheme.equals("https", ignoreCase = true),
+    ) { "Embedded Web UI origin must use HTTP or HTTPS" }
+    require(!parsed.host.isNullOrBlank()) { "Embedded Web UI origin has no host" }
+    return URI(parsed.scheme.lowercase(), null, parsed.host, parsed.port, null, null, null).toString()
 }
 
 private fun WebView.loadEmbeddedWebUi(session: EmbeddedWebUiSession) {
