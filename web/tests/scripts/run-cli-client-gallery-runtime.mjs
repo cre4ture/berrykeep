@@ -142,6 +142,7 @@ function galleryIndexResponse(url) {
     offset,
     limit,
     has_more: offset + entries.length < scopedEntries.length,
+    consistency_token: "gallery-runtime-revision-1",
     media_summary: {
       ready_count: scopedEntries.length,
       pending_count: 0,

@@ -462,6 +462,10 @@ test("client-ui gallery loads map entries in bounded pages", async ({ page }) =>
 
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("523 items", { exact: true })).toBeVisible();
+  await expect(page.getByText("522 photos", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 movie", { exact: true })).toBeVisible();
+  await expect(page.getByText("522 ready", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 pending", { exact: true })).toBeVisible();
   await expect(page.getByText("2 markers", { exact: true })).toBeVisible();
   await expect(page.getByText("521 without GPS", { exact: true })).toBeVisible();
   await expect
@@ -2095,6 +2099,7 @@ function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URL
     offset,
     limit,
     has_more: offset + pagedEntries.length < totalEntryCount,
+    consistency_token: "mock-store-revision-1",
     media_summary: summarizeMockGalleryEntries(filteredEntries),
     entries: pagedEntries
   };

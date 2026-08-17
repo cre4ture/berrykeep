@@ -144,6 +144,7 @@ export type GalleryPayload = {
   limit?: number | null;
   has_more?: boolean;
   sync_token?: string | null;
+  consistency_token?: string | null;
   media_summary?: GalleryMediaSummary | null;
   entries: GalleryEntry[];
   [key: string]: unknown;
@@ -2185,6 +2186,24 @@ function galleryPayloadTotalEntryCount(payload: GalleryPayload | null): number {
   return payload.entry_count ?? payload.entries.length;
 }
 
+function galleryPayloadConsistencyToken(payload: GalleryPayload): string | null {
+  return payload.consistency_token?.trim() || payload.sync_token?.trim() || null;
+}
+
+function galleryMediaSummariesMatch(
+  first: GalleryMediaSummary,
+  second: GalleryMediaSummary
+): boolean {
+  return (
+    first.ready_count === second.ready_count &&
+    first.pending_count === second.pending_count &&
+    first.incomplete_count === second.incomplete_count &&
+    first.image_count === second.image_count &&
+    first.video_count === second.video_count &&
+    first.geotagged_count === second.geotagged_count
+  );
+}
+
 function combinePaginatedGalleryPayloads(
   pages: ReadonlyMap<number, GalleryPayload>,
   pageSize: number
@@ -2203,7 +2222,10 @@ function combinePaginatedGalleryPayloads(
   const pageCount = Math.max(1, Math.ceil(totalEntryCount / safePageSize));
   const entries: GalleryEntry[] = [];
   const seenPaths = new Set<string>();
-  const firstSyncToken = firstPage.sync_token?.trim() || null;
+  const firstConsistencyToken = galleryPayloadConsistencyToken(firstPage);
+  // The API summary covers the complete filtered scope and is repeated on every page.
+  // Validate that contract instead of summing the repeated counts.
+  const firstMediaSummary = normalizeGalleryMediaSummary(firstPage.media_summary);
 
   for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
     const expectedOffset = pageIndex * safePageSize;
@@ -2212,7 +2234,7 @@ function combinePaginatedGalleryPayloads(
       throw new Error("The paginated gallery map response is incomplete.");
     }
 
-    const pageSyncToken = page.sync_token?.trim() || null;
+    const pageConsistencyToken = galleryPayloadConsistencyToken(page);
     const expectedEntryCount = Math.min(safePageSize, totalEntryCount - expectedOffset);
     if (
       page.prefix !== firstPage.prefix ||
@@ -2222,7 +2244,11 @@ function combinePaginatedGalleryPayloads(
       (typeof page.limit === "number" && page.limit !== safePageSize) ||
       page.entries.length !== expectedEntryCount ||
       page.entry_count !== page.entries.length ||
-      pageSyncToken !== firstSyncToken
+      pageConsistencyToken !== firstConsistencyToken ||
+      !galleryMediaSummariesMatch(
+        normalizeGalleryMediaSummary(page.media_summary),
+        firstMediaSummary
+      )
     ) {
       throw new Error(
         "The gallery changed while its map pages were loading. Refresh the gallery to try again."

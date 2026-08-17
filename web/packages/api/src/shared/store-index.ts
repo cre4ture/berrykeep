@@ -56,6 +56,7 @@ export type StoreIndexResponse = {
   has_more: boolean;
   next_cursor?: string | null;
   sync_token?: string | null;
+  consistency_token?: string | null;
   media_summary: StoreIndexMediaSummary;
   entries: StoreIndexEntry[];
 };
