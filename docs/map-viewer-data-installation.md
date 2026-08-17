@@ -141,10 +141,10 @@ parts are stored.
 
 This automatic path has no administrator-provided URL or converter arguments.
 It requires `unzip`, `gdal_rasterize`, `gdalwarp`, `gdal_translate`, and
-`gdaladdo` on the server `PATH`. The Debian package installs `unzip` and
-`gdal-bin`; other deployments must provide the same tools. The existing manual
-import remains appropriate for a custom physical rendering or data from another
-provider.
+`gdaladdo` on the server `PATH`. On Debian-family systems, install
+`ironmesh-server-node-map-tools` to add `unzip` and `gdal-bin`; other
+deployments must provide the same tools. The existing manual import remains
+appropriate for a custom physical rendering or data from another provider.
 
 Expand **Conversion log** on the Natural Earth job to inspect each conversion
 phase, dependency check, and executed converter command. Failed commands show

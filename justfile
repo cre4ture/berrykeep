@@ -60,6 +60,12 @@ test-system-nightly-one name:
 test-quic-network:
     cargo +nightly -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml --test quic_network -- --test-threads=1 --nocapture
 
+static-server-node-x86-64:
+    ./scripts/build-static-server-node.sh \
+        --target x86_64-unknown-linux-musl \
+        --variant-id x86_64-generic \
+        --run-smoke always
+
 ci-stable:
     cargo fmt --all -- --check
     cargo +stable check --locked --workspace
@@ -70,6 +76,7 @@ ci-required:
     just ci-stable
     just coverage
     just ci-web-smoke
+    just static-server-node-x86-64
     just test-system-nightly
     if [[ "$$(uname -s)" == "Linux" ]]; then just test-quic-network; fi
 

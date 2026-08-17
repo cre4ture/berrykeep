@@ -14,10 +14,12 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 
 ## Toolchain + CI policy
 
-- Workspace toolchain pinned in `rust-toolchain.toml`: `nightly-2026-02-21`
+- Workspace toolchain pinned in `rust-toolchain.toml`: `nightly-2026-02-17`
 - CI check lanes include:
   - Rust checks/lints/tests
   - Android debug build + artifact (`android-debug-apk`)
+  - Generic static x86_64 Server Node build + artifact
+    (`static-server-node-linux-amd64`), included in `Required CI`
   - Linux FUSE mount binary build + artifact (`linux-fuse-mount-binary-ubuntu`)
   - Windows CFAPI compile check lane
 - Coverage gate excludes `crates/adapter-linux-fuse/` for current MVP stage.
@@ -39,6 +41,11 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - Replication planner stabilized with low-churn semantics and tolerance controls.
 - Upload idempotency behavior improved (unchanged payload can reuse existing version).
 - Web/CLI browsing and snapshot/version flows expanded.
+- Linux Server Node releases use one verified static musl binary per CPU ABI.
+  The current portable variants are generic x86_64 and AArch64; client, FUSE,
+  and rendezvous packaging remains distribution-specific.
+- `ironmesh-server-node-map-tools` carries the optional GDAL and unzip
+  dependencies, keeping them out of the core Server Node package.
 
 ### Android
 

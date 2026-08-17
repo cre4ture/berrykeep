@@ -61,7 +61,8 @@ For branch `main`, require these stable aggregate status checks:
 - `Required system tests`
 
 The aggregate jobs are the branch-protection contract. `Required CI` covers
-`workspace-check`, `rustfmt`, `clippy`, `unit-tests`, and `ios-build`;
+`workspace-check`, `rustfmt`, `clippy`, `unit-tests`, `ios-build`, and the
+generic static x86_64 Server Node build;
 `Required coverage` covers the coverage lane; and `Required system tests`
 covers every operating-system entry in the system-test matrix plus the
 Linux-only QUIC network-namespace test. The aggregate jobs always report a
@@ -97,6 +98,8 @@ Pull request jobs restore the shared Rust caches but do not write them:
 - the Focal ARM64 package build restores its mounted on-disk sccache with
   `actions/cache/restore`, then runs `actions/cache/save` only for trusted
   non-pull-request events.
+- the checksum-pinned Zig toolchain used for static Server Node builds is
+  restored on pull requests and saved only by trusted non-pull-request events.
 
 GitHub scopes pull request cache writes to the pull request merge ref. Those
 entries are not reusable by `main` or unrelated pull requests, so allowing
@@ -119,6 +122,10 @@ cargo fmt --all -- --check
 cargo +stable check --workspace
 cargo +stable clippy --workspace --all-targets -- -D warnings
 cargo +stable test --workspace
+./scripts/build-static-server-node.sh \
+	--target x86_64-unknown-linux-musl \
+	--variant-id x86_64-generic \
+	--run-smoke always
 cargo +stable llvm-cov \
 	-p client-sdk \
 	-p sync-core \
@@ -143,6 +150,9 @@ cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml \
 Pass or fail rule:
 
 - Each command must exit `0`.
+- The static Server Node command must verify a static x86_64 ELF, execute its
+  `--version` smoke test, and emit an archive plus checksum below
+  `target/static-server-node/`.
 - `coverage` must stay at or above the `--fail-under-lines 68` floor.
 - `unit-tests` already excludes `tests/system-tests` implicitly because the workspace root excludes that crate; nightly system coverage belongs only to the `system-tests` lane.
 - On Linux, `unit-tests` now also covers the packaged config-app handoff regression through `apps/config-app/tests/package_handoff.rs`, because that integration test is part of the normal `cargo test --workspace` run on `ubuntu-latest`.
@@ -153,6 +163,37 @@ just ci-ios
 ```
 
 - On macOS, `just ci-required-macos` reproduces the full required set including the iOS lane.
+
+## Portable Server Node artifacts and packages
+
+The `Static Server Node (x86_64)` job runs on every normal CI invocation and
+is part of `Required CI`. It builds `x86_64-unknown-linux-musl`, rejects an ELF
+interpreter or `DT_NEEDED` entry, executes the binary, and uploads
+`static-server-node-linux-amd64` with checksums and build metadata.
+
+The separate `Focal A64` workflow performs the same checks natively for
+`aarch64-unknown-linux-musl` and uploads `static-server-node-linux-arm64`. Its
+Focal container receives that already verified executable through
+`build-local-debs.sh --prebuilt-server-node`; only the client and rendezvous
+components are compiled in the distribution container.
+
+On pull requests, add the `ci:debian-packages` label to exercise the AMD64
+binary-package handoff too. The `Linux binaries` job builds the non-server
+bundle, and `Debian packages` combines it with the static Server Node. Both
+package workflows produce `ironmesh-server-node`, the optional
+`ironmesh-server-node-map-tools`, `ironmesh-client`, and
+`ironmesh-rendezvous-service`.
+
+For a local static build, install the web workspace dependencies and ELF tools,
+then run:
+
+```bash
+cd web && pnpm install --frozen-lockfile && cd ..
+just static-server-node-x86-64
+```
+
+See [Portable Static Server-Node Package Strategy](portable-server-node-package-strategy.md)
+for the supported CPU ABI matrix and the remaining repository migration work.
 
 ## iOS CI artifacts
 

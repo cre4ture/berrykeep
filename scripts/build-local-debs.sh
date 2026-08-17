@@ -8,6 +8,7 @@ RUN_PREPARE=true
 RUN_LINTIAN=false
 CHECK_BUILD_DEPENDENCIES=true
 PREBUILT_BINARIES_DIR=""
+PREBUILT_SERVER_NODE=""
 DPKG_BUILD_ARGS=()
 
 log() {
@@ -41,6 +42,10 @@ Options:
                 Package the seven release binaries already present in DIR
                 instead of preparing sources and compiling them. This skips
                 the build-dependency check and validates the binary bundle.
+  --prebuilt-server-node FILE
+                Package this executable as ironmesh-server-node while building
+                the remaining binaries from source. This supports reusing the
+                verified static musl server artifact across distribution builds.
   --no-check-build-deps
                 Skip dpkg-checkbuilddeps and pass -d to dpkg-buildpackage.
                 This is for native builders that provide the required Rust
@@ -125,6 +130,14 @@ while (($# > 0)); do
       CHECK_BUILD_DEPENDENCIES=false
       shift 2
       ;;
+    --prebuilt-server-node)
+      [[ $# -ge 2 ]] || {
+        printf '%s\n' '--prebuilt-server-node requires a file' >&2
+        exit 1
+      }
+      PREBUILT_SERVER_NODE="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -141,6 +154,11 @@ while (($# > 0)); do
       ;;
   esac
 done
+
+if [[ -n "${PREBUILT_BINARIES_DIR}" && -n "${PREBUILT_SERVER_NODE}" ]]; then
+  printf '%s\n' '--prebuilt-binaries and --prebuilt-server-node are mutually exclusive' >&2
+  exit 1
+fi
 
 require_command git
 require_command dpkg-buildpackage
@@ -172,6 +190,19 @@ if [[ -n "${PREBUILT_BINARIES_DIR}" ]]; then
   DPKG_BUILD_ARGS=(-d "${DPKG_BUILD_ARGS[@]}")
 else
   "${ROOT_DIR}/scripts/sync-debian-version.sh"
+
+  if [[ -n "${PREBUILT_SERVER_NODE}" ]]; then
+    [[ -x "${PREBUILT_SERVER_NODE}" ]] || {
+      printf 'prebuilt server-node executable not found: %s\n' \
+        "${PREBUILT_SERVER_NODE}" >&2
+      exit 1
+    }
+    PREBUILT_SERVER_NODE="$(cd "$(dirname "${PREBUILT_SERVER_NODE}")" && pwd)/$(basename "${PREBUILT_SERVER_NODE}")"
+    export IRONMESH_PREBUILT_SERVER_NODE_BIN="${PREBUILT_SERVER_NODE}"
+    export IRONMESH_USE_PREBUILT_SERVER_NODE=1
+    log "packaging prebuilt server node from ${PREBUILT_SERVER_NODE}"
+  fi
+
   if [[ "${CHECK_BUILD_DEPENDENCIES}" == true ]]; then
     check_build_dependencies
   else
@@ -193,6 +224,7 @@ BUILDINFO_PATH="${ARTIFACT_DIR}/${SOURCE_NAME}_${VERSION}_${ARCH}.buildinfo"
 PACKAGE_PATHS=(
   "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${ARCH}.deb"
   "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${ARCH}.deb"
+  "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${ARCH}.deb"
   "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${ARCH}.deb"
 )
 

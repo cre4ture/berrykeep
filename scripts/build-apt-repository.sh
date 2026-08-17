@@ -221,6 +221,7 @@ if ((${#DEB_PATHS[@]} == 0)); then
     DEB_PATHS+=(
       "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${architecture}.deb"
       "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb"
+      "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${architecture}.deb"
       "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${architecture}.deb"
     )
   done
