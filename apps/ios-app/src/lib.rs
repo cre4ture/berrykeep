@@ -2028,6 +2028,7 @@ mod tests {
             has_more: false,
             next_cursor: None,
             sync_token: None,
+            consistency_token: None,
             media_summary: Default::default(),
             entries,
         };
