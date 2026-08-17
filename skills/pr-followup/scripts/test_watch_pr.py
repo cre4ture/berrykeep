@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import importlib.util
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -238,7 +240,7 @@ class EventStateTest(unittest.TestCase):
             state_file = Path(temporary_directory) / "watcher.json"
             state_file.write_text("{not json", encoding="utf-8")
 
-            with self.assertRaises(watch_pr.ConfigError):
+            with self.assertRaises(watch_pr.EventStateError):
                 watch_pr.load_event_state(state_file, identity)
 
     def test_default_state_file_is_unique_per_pull_request(self) -> None:
@@ -248,6 +250,23 @@ class EventStateTest(unittest.TestCase):
 
         self.assertNotEqual(current, other)
         self.assertEqual(current.parent, Path("/tmp/state/ironmesh/pr-followup"))
+
+    def test_failed_save_does_not_advance_observed_event_ids(self) -> None:
+        identity = watch_pr.event_state_identity(self.repo, self.number)
+        seen = watch_pr.empty_seen_events()
+        updated_seen = watch_pr.copy_seen_events(seen)
+        events = watch_pr.collect_new_events(
+            pr_with_events(), inline_with_event(), updated_seen
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_file = Path(temporary_directory) / "watcher.json"
+            with patch.object(watch_pr.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(watch_pr.EventStateError):
+                    watch_pr.save_event_state(state_file, identity, updated_seen)
+
+        self.assertEqual(3, len(events))
+        self.assertEqual(watch_pr.empty_seen_events(), seen)
 
     def test_main_reports_events_when_creating_a_new_state(self) -> None:
         pr = pr_with_events() | {
@@ -287,7 +306,8 @@ class EventStateTest(unittest.TestCase):
                 patch.object(watch_pr, "checks", return_value=[]),
                 patch.object(watch_pr, "notify"),
             ):
-                self.assertEqual(watch_pr.EXIT_NEW_ACTIVITY, watch_pr.main())
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(watch_pr.EXIT_NEW_ACTIVITY, watch_pr.main())
 
             seen, exists = watch_pr.load_event_state(
                 state_file,

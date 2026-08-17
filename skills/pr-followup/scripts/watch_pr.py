@@ -108,6 +108,14 @@ class ConfigError(GhError):
     pass
 
 
+class BaseBranchError(ConfigError):
+    pass
+
+
+class EventStateError(ConfigError):
+    pass
+
+
 class WatchTimeout(RuntimeError):
     pass
 
@@ -217,6 +225,10 @@ def empty_seen_events() -> dict[str, set[str]]:
     return {kind: set() for kind in EVENT_STATE_KINDS}
 
 
+def copy_seen_events(seen: dict[str, set[str]]) -> dict[str, set[str]]:
+    return {kind: set(seen[kind]) for kind in EVENT_STATE_KINDS}
+
+
 def load_event_state(
     state_file: Path,
     identity: dict[str, Any],
@@ -226,27 +238,31 @@ def load_event_state(
     except FileNotFoundError:
         return empty_seen_events(), False
     except OSError as exc:
-        raise ConfigError(f"Event-State konnte nicht gelesen werden: {state_file}: {exc}") from exc
+        raise EventStateError(
+            f"Event-State konnte nicht gelesen werden: {state_file}: {exc}"
+        ) from exc
 
     try:
         payload = json.loads(contents)
     except json.JSONDecodeError as exc:
-        raise ConfigError(f"Event-State ist kein gültiges JSON: {state_file}") from exc
+        raise EventStateError(f"Event-State ist kein gültiges JSON: {state_file}") from exc
 
     if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:
-        raise ConfigError(f"Event-State hat ein unbekanntes Format: {state_file}")
+        raise EventStateError(f"Event-State hat ein unbekanntes Format: {state_file}")
     if payload.get("pull_request") != identity:
-        raise ConfigError(f"Event-State gehört nicht zu diesem Pull Request: {state_file}")
+        raise EventStateError(
+            f"Event-State gehört nicht zu diesem Pull Request: {state_file}"
+        )
 
     stored_seen = payload.get("seen")
     if not isinstance(stored_seen, dict):
-        raise ConfigError(f"Event-State enthält keine Event-IDs: {state_file}")
+        raise EventStateError(f"Event-State enthält keine Event-IDs: {state_file}")
 
     seen = empty_seen_events()
     for kind in EVENT_STATE_KINDS:
         values = stored_seen.get(kind)
         if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
-            raise ConfigError(f"Event-State enthält ungültige {kind}: {state_file}")
+            raise EventStateError(f"Event-State enthält ungültige {kind}: {state_file}")
         seen[kind] = set(values)
     return seen, True
 
@@ -278,7 +294,7 @@ def save_event_state(
         os.replace(temporary_name, state_file)
         temporary_name = None
     except OSError as exc:
-        raise ConfigError(
+        raise EventStateError(
             f"Event-State konnte nicht gespeichert werden: {state_file}: {exc}"
         ) from exc
     finally:
@@ -641,7 +657,7 @@ def collect_new_events(
 def ensure_base(pr: dict[str, Any], expected: str) -> None:
     actual = str(pr.get("baseRefName") or "")
     if actual != expected:
-        raise ConfigError(
+        raise BaseBranchError(
             f"PR #{pr['number']} zielt auf '{actual}', nicht auf '{expected}'. "
             "GitHubs Konfliktstatus gilt immer gegenüber dem tatsächlichen PR-Zielbranch."
         )
@@ -873,9 +889,11 @@ def main() -> int:
     state_identity = event_state_identity(repo, number)
     try:
         seen, state_exists = load_event_state(state_file, state_identity)
-        events = collect_new_events(pr, inline, seen)
-        save_event_state(state_file, state_identity, seen)
-    except ConfigError as exc:
+        updated_seen = copy_seen_events(seen)
+        events = collect_new_events(pr, inline, updated_seen)
+        save_event_state(state_file, state_identity, updated_seen)
+        seen = updated_seen
+    except EventStateError as exc:
         print(f"Fehler: {exc}", file=sys.stderr)
         return EXIT_CONFIGURATION
 
@@ -928,8 +946,10 @@ def main() -> int:
             inline = inline_comments(repo, number, deadline)
             current_checks = checks(repo, number, deadline)
             remaining_time(deadline)
-            events = collect_new_events(pr, inline, seen)
-            save_event_state(state_file, state_identity, seen)
+            updated_seen = copy_seen_events(seen)
+            events = collect_new_events(pr, inline, updated_seen)
+            save_event_state(state_file, state_identity, updated_seen)
+            seen = updated_seen
             errors = 0
         except KeyboardInterrupt:
             print("\nÜberwachung beendet.")
@@ -941,9 +961,13 @@ def main() -> int:
                 "kein relevantes Ereignis festgestellt."
             )
             return EXIT_TIMEOUT
-        except ConfigError as exc:
+        except BaseBranchError as exc:
             print(f"\nKonfigurationsfehler: {exc}", file=sys.stderr)
             notify(f"GitHub PR #{number}", "PR-Zielbranch wurde geändert", notify_enabled)
+            return EXIT_CONFIGURATION
+        except EventStateError as exc:
+            print(f"\nEvent-State-Fehler: {exc}", file=sys.stderr)
+            notify(f"GitHub PR #{number}", "Event-State konnte nicht gespeichert werden", notify_enabled)
             return EXIT_CONFIGURATION
         except GhError as exc:
             errors += 1
