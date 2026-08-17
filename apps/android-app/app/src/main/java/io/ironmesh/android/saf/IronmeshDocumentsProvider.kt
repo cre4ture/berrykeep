@@ -23,6 +23,8 @@ import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import io.ironmesh.android.data.RustBridgeInitializer
+import io.ironmesh.android.share.OriginalShareCapability
+import io.ironmesh.android.share.OriginalShareCapabilityStore
 import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.io.FileInputStream
@@ -117,7 +119,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
         val parent = parseDocumentId(parentDocumentId)
         val child = parseDocumentId(documentId)
-        if (parent.kind != DocumentKind.Directory) {
+        if (parent.kind != DocumentKind.Directory || child.kind == DocumentKind.Share) {
             return false
         }
         if (parent.path.isBlank()) {
@@ -155,8 +157,14 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         signal: CancellationSignal?,
     ): ParcelFileDescriptor {
         val target = parseDocumentId(documentId)
-        if (target.kind != DocumentKind.File) {
+        if (target.kind == DocumentKind.Directory) {
             throw FileNotFoundException("not a file document")
+        }
+
+        val readableSelection = if (target.kind == DocumentKind.Share) {
+            resolveSharedSelection(target.path)
+        } else {
+            null
         }
 
         val requestId = nextSafRequestId.incrementAndGet()
@@ -167,16 +175,23 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             ?.sorted()
             ?.joinToString(",")
             ?: "<unknown>"
+        val loggedRemotePath = readableSelection?.remotePath ?: target.path
         Log.i(
             TAG,
-            "SAF open requested: request_id=$requestId path=${target.path} mode=$mode " +
+            "SAF open requested: request_id=$requestId path=$loggedRemotePath mode=$mode " +
                 "caller_uid=$callingUid caller_packages=$callingPackages",
         )
 
-        return if (mode.contains('w')) {
+        return if (mode.contains('w') && target.kind == DocumentKind.Share) {
+            throw FileNotFoundException("shared originals are read-only")
+        } else if (mode.contains('w')) {
             openWritableDocument(target.path, requestId)
         } else {
-            openReadableDocument(target.path, requestId, signal)
+            openReadableDocument(
+                readableSelection ?: resolveCurrentFileSelection(target.path),
+                requestId,
+                signal,
+            )
         }
     }
 
@@ -239,20 +254,19 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     }
 
     private fun openReadableDocument(
-        remotePath: String,
+        selection: ReadableObjectSelection,
         requestId: Long,
         signal: CancellationSignal?,
     ): ParcelFileDescriptor {
+        val remotePath = selection.remotePath
         val startedAtElapsedMs = SystemClock.elapsedRealtime()
         signal?.throwIfCanceled()
         val appContext = context
             ?: throw FileNotFoundException("Ironmesh application context is unavailable")
-        val entry: StoreIndexEntry
         val connectionInput: String
         val serverCaPem: String?
         val clientIdentityJson: String?
         try {
-            entry = resolveFileEntry(remotePath)
             connectionInput = resolveConnectionInput()
             serverCaPem = resolveServerCaPem()
             clientIdentityJson = resolveClientIdentityJson()
@@ -265,19 +279,42 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             throw FileNotFoundException("failed to prepare document download: ${error.message}")
                 .apply { initCause(error) }
         }
+        val objectSizeBytes = selection.sizeBytes ?: try {
+            runBlocking {
+                repository.getObjectSize(
+                    connectionInput = connectionInput,
+                    key = remotePath,
+                    snapshot = selection.snapshotId,
+                    version = selection.versionId,
+                    serverCaPem = serverCaPem,
+                    clientIdentityJson = clientIdentityJson,
+                )
+            }
+        } catch (error: Exception) {
+            Log.e(
+                TAG,
+                "SAF open failed while resolving object size: " +
+                    "request_id=$requestId path=$remotePath",
+                error,
+            )
+            throw FileNotFoundException("failed to resolve document size: ${error.message}").apply {
+                initCause(error)
+            }
+        }
         val callbackThread = HandlerThread("ironmesh-saf-$requestId").apply { start() }
         val callback = IronmeshSeekableFileCallback(
             requestId = requestId,
             remotePath = remotePath,
-            expectedSizeBytes = entry.size_bytes,
-            cacheDir = appContext.cacheDir,
-            downloadTo = { output ->
+            objectSizeBytes = objectSizeBytes,
+            readRange = { offset, length ->
                 runBlocking {
-                    repository.streamObjectTo(
-                        connectionInput,
-                        remotePath,
-                        output,
-                        version = entry.version,
+                    repository.readObjectRange(
+                        connectionInput = connectionInput,
+                        key = remotePath,
+                        offset = offset,
+                        length = length,
+                        snapshot = selection.snapshotId,
+                        version = selection.versionId,
                         serverCaPem = serverCaPem,
                         clientIdentityJson = clientIdentityJson,
                     )
@@ -313,7 +350,8 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         Log.i(
             TAG,
             "SAF open completed: request_id=$requestId path=$remotePath descriptor=seekable_proxy " +
-                "size_bytes=${entry.size_bytes ?: "<unknown>"} version=${entry.version ?: "<none>"} " +
+                "size_bytes=$objectSizeBytes snapshot=${selection.snapshotId ?: "<none>"} " +
+                "version=${selection.versionId ?: "<none>"} " +
                 "elapsed_ms=${SystemClock.elapsedRealtime() - startedAtElapsedMs}",
         )
         return descriptor
@@ -385,6 +423,9 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             ParsedDocument(DocumentKind.File, parsed.path) -> {
                 includeFile(cursor, documentId, resolveFileEntry(parsed.path))
             }
+            ParsedDocument(DocumentKind.Share, parsed.path) -> {
+                includeSharedFile(cursor, documentId, shareCapabilityStore().resolve(parsed.path))
+            }
         }
     }
 
@@ -405,6 +446,48 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             fallbackMimeType = mimeForName(fileName),
             summary = buildSummary(entry),
         )
+    }
+
+    private fun includeSharedFile(
+        cursor: MatrixCursor,
+        documentId: String,
+        capability: OriginalShareCapability,
+    ) {
+        IronmeshCursorRows.populateSharedFileRow(
+            cursor = cursor,
+            row = cursor.newRow(),
+            documentId = documentId,
+            displayName = capability.displayName,
+            mimeType = capability.mimeType,
+            sizeBytes = capability.sizeBytes,
+            remotePath = capability.remotePath,
+        )
+    }
+
+    private fun resolveCurrentFileSelection(path: String): ReadableObjectSelection {
+        val entry = resolveFileEntry(path)
+        return ReadableObjectSelection(
+            remotePath = path,
+            snapshotId = null,
+            versionId = entry.version,
+            sizeBytes = entry.size_bytes,
+        )
+    }
+
+    private fun resolveSharedSelection(token: String): ReadableObjectSelection {
+        val capability = shareCapabilityStore().resolve(token)
+        return ReadableObjectSelection(
+            remotePath = capability.remotePath,
+            snapshotId = capability.snapshotId,
+            versionId = capability.versionId,
+            sizeBytes = capability.sizeBytes,
+        )
+    }
+
+    private fun shareCapabilityStore(): OriginalShareCapabilityStore {
+        val appContext = context
+            ?: throw FileNotFoundException("Ironmesh application context is unavailable")
+        return OriginalShareCapabilityStore(appContext)
     }
 
     private suspend fun loadDirectoryEntries(prefix: String?): List<StoreIndexEntry> {
@@ -537,6 +620,10 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                 DocumentKind.File,
                 documentId.removePrefix("file:").trim('/'),
             )
+            documentId.startsWith("share:") -> ParsedDocument(
+                DocumentKind.Share,
+                documentId.removePrefix("share:"),
+            )
             else -> throw FileNotFoundException("unknown document id: $documentId")
         }
     }
@@ -559,7 +646,15 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     private enum class DocumentKind {
         Directory,
         File,
+        Share,
     }
+
+    private data class ReadableObjectSelection(
+        val remotePath: String,
+        val snapshotId: String?,
+        val versionId: String?,
+        val sizeBytes: Long?,
+    )
 
     private data class ParsedDocument(
         val kind: DocumentKind,

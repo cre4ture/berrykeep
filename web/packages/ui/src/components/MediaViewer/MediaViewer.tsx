@@ -26,6 +26,13 @@ import {
   type ReactNode
 } from "react";
 import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
+import {
+  AndroidOriginalShareAction,
+  usesAndroidEmbeddedClient,
+  type MediaShareRequest
+} from "./AndroidOriginalShareAction";
+
+export type { MediaShareRequest } from "./AndroidOriginalShareAction";
 
 export type MediaPreviewRequest = {
   url: string;
@@ -41,6 +48,7 @@ export type MediaPreviewRequests = {
   fullscreen?: MediaPreviewRequest | null;
   original: MediaPreviewRequest;
   download?: MediaDownloadRequest | null;
+  share?: MediaShareRequest | null;
 };
 
 export type MediaKind = "image" | "video";
@@ -154,6 +162,7 @@ export function MediaLightboxModal({
 }: MediaLightboxModalProps) {
   const [isSlideshowMode, setIsSlideshowMode] = useState(false);
   const usesEmbeddedViewport = usesEmbeddedWebUiViewport();
+  const usesAndroidShare = usesAndroidEmbeddedClient();
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < itemCount - 1;
   const selectedItemDownloadUrl = selectedItem ? mediaDownloadUrl(selectedItem) : null;
@@ -339,21 +348,25 @@ export function MediaLightboxModal({
                 </Group>
                 <Group data-media-actions="true" gap="xs" justify="flex-end">
                   {extraActions}
-                  <Button
-                    data-media-download="true"
-                    variant="default"
-                    size="xs"
-                    leftSection={<IconDownload size={14} />}
-                    disabled={!selectedItemDownloadUrl}
-                    title={
-                      selectedItemDownloadUrl
-                        ? "Download the original media file"
-                        : "A direct original download URL is unavailable"
-                    }
-                    onClick={() => triggerMediaDownload(selectedItem)}
-                  >
-                    Download original
-                  </Button>
+                  {usesAndroidShare ? (
+                    <AndroidOriginalShareAction request={selectedItem.requests.share} />
+                  ) : (
+                    <Button
+                      data-media-download="true"
+                      variant="default"
+                      size="xs"
+                      leftSection={<IconDownload size={14} />}
+                      disabled={!selectedItemDownloadUrl}
+                      title={
+                        selectedItemDownloadUrl
+                          ? "Download the original media file"
+                          : "A direct original download URL is unavailable"
+                      }
+                      onClick={() => triggerMediaDownload(selectedItem)}
+                    >
+                      Download original
+                    </Button>
+                  )}
                   <Button
                     variant="default"
                     size="xs"

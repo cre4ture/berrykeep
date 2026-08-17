@@ -1500,7 +1500,14 @@ function buildExplorerEntryLightboxItem(
     requests: {
       thumbnail: thumbnailRequestForExplorerMedia(entry.media),
       original: { url: originalUrl },
-      download: { url: originalUrl }
+      download: { url: originalUrl },
+      share: immutableExplorerShareRequest(
+        entry.path,
+        snapshotId,
+        snapshotId ? null : entry.version,
+        entry.size_bytes,
+        explorerMediaString(entry.media, "mime_type")
+      )
     },
     status: explorerMediaString(entry.media, "status"),
     mimeType: explorerMediaString(entry.media, "mime_type"),
@@ -1540,13 +1547,42 @@ function buildExplorerVersionLightboxItem(
     requests: {
       thumbnail: thumbnailRequestForExplorerMedia(version.media),
       original: { url: originalUrl },
-      download: { url: originalUrl }
+      download: { url: originalUrl },
+      share: immutableExplorerShareRequest(
+        sourceKey,
+        null,
+        version.version_id,
+        version.size_bytes,
+        explorerMediaString(version.media, "mime_type")
+      )
     },
     status: explorerMediaString(version.media, "status"),
     mimeType: explorerMediaString(version.media, "mime_type"),
     width: explorerMediaNumber(version.media, "width"),
     height: explorerMediaNumber(version.media, "height"),
     takenAtUnix: version.modified_at_unix ?? version.created_at_unix ?? null
+  };
+}
+
+function immutableExplorerShareRequest(
+  key: string,
+  snapshotId: string | null,
+  versionId: string | null | undefined,
+  sizeBytes: number | null | undefined,
+  mimeType: string | null
+) {
+  const snapshot = snapshotId?.trim() || null;
+  const version = snapshot ? null : versionId?.trim() || null;
+  if (!snapshot && !version) {
+    return null;
+  }
+  return {
+    key,
+    snapshotId: snapshot,
+    versionId: version,
+    fileName: storeEntryName(key, false),
+    mimeType,
+    sizeBytes: sizeBytes ?? null
   };
 }
 

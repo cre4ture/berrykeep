@@ -454,7 +454,7 @@ test("client-ui keeps the direct iOS gallery map inside the WebView viewport", a
     .toBeGreaterThan(0.9);
 });
 
-for (const embeddedClient of [null, "android", "ios"] as const) {
+for (const embeddedClient of [null, "ios"] as const) {
   const clientLabel = embeddedClient ?? "browser";
   test(`client-ui ${clientLabel} media viewer downloads the original`, async ({ page }) => {
     await installClientUiMocks(page);
@@ -487,6 +487,58 @@ for (const embeddedClient of [null, "android", "ios"] as const) {
     await expect(dialog).toBeVisible();
   });
 }
+
+test("client-ui Android media viewer shares an immutable original through the native bridge", async ({
+  page
+}) => {
+  await page.addInitScript(() => {
+    const messages: string[] = [];
+    const listeners = new Set<(event: { data: string }) => void>();
+    Object.assign(window, {
+      __ironmeshShareMessages: messages,
+      IronmeshAndroidShare: {
+        postMessage(message: string) {
+          messages.push(message);
+          const request = JSON.parse(message) as { requestId: string };
+          queueMicrotask(() => {
+            const response = JSON.stringify({ requestId: request.requestId, status: "opened" });
+            listeners.forEach((listener) => listener({ data: response }));
+          });
+        },
+        addEventListener(_type: "message", listener: (event: { data: string }) => void) {
+          listeners.add(listener);
+        },
+        removeEventListener(_type: "message", listener: (event: { data: string }) => void) {
+          listeners.delete(listener);
+        }
+      }
+    });
+  });
+  await installClientUiMocks(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/?page=gallery&embedded_client=android");
+  await page.getByRole("button", { name: "Map" }).click();
+  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("button", { name: "Download original" })).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Share original" }).click();
+  await expect(dialog.getByRole("button", { name: "Share opened" })).toBeVisible();
+
+  const payloads = await page.evaluate(
+    () => (window as typeof window & { __ironmeshShareMessages: string[] }).__ironmeshShareMessages
+  );
+  expect(payloads).toHaveLength(1);
+  expect(JSON.parse(payloads[0])).toMatchObject({
+    action: "share-original",
+    key: "gallery/cat.png",
+    versionId: null,
+    snapshotId: "snapshot-001",
+    fileName: "cat.png",
+    mimeType: "image/png",
+    sizeBytes: 3_145_728
+  });
+});
 
 test("client-ui gallery restores its persistent cache while the upstream is offline", async ({
   page
@@ -1760,6 +1812,7 @@ async function json(route: Route, payload: unknown) {
 type MockStoreEntry = {
   path: string;
   entry_type: "prefix" | "key";
+  version?: string;
   size_bytes?: number;
   modified_at_unix?: number;
   media?: Record<string, unknown>;
@@ -1771,6 +1824,7 @@ function createMockStoreEntries(): MockStoreEntry[] {
     {
       path: "docs/readme.txt",
       entry_type: "key",
+      version: "version-readme-001",
       size_bytes: 23,
       modified_at_unix: 1_712_345_600
     },
@@ -1779,6 +1833,7 @@ function createMockStoreEntries(): MockStoreEntry[] {
     {
       path: "gallery/cat.png",
       entry_type: "key",
+      version: "version-cat-001",
       size_bytes: 3_145_728,
       modified_at_unix: 1_712_345_678,
       media: {
@@ -1806,6 +1861,7 @@ function createMockStoreEntries(): MockStoreEntry[] {
     {
       path: "gallery/dog.jpg",
       entry_type: "key",
+      version: "version-dog-001",
       size_bytes: 2_048,
       modified_at_unix: 1_712_300_000,
       media: {
@@ -1830,6 +1886,7 @@ function createMockStoreEntries(): MockStoreEntry[] {
     {
       path: "gallery/clip.mp4",
       entry_type: "key",
+      version: "version-clip-001",
       size_bytes: 48_000_000,
       modified_at_unix: 1_712_250_000,
       media: {

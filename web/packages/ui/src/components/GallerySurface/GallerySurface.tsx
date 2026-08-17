@@ -113,6 +113,7 @@ export type GalleryEntry = {
   path: string;
   entry_type: string;
   version?: string | null;
+  size_bytes?: number | null;
   media?: {
     status?: string | null;
     media_type?: string | null;
@@ -3688,6 +3689,7 @@ function buildGalleryVersionPreviewEntry(version: GalleryVersionEntry, sourceKey
     path: sourceKey,
     entry_type: normalizeGalleryVersionType(version),
     version: version.version_id,
+    size_bytes: version.size_bytes ?? null,
     media: version.media ?? null
   };
 }
