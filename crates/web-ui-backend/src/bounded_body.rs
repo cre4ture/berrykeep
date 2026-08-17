@@ -51,7 +51,7 @@ impl StreamCancellation {
         }
     }
 
-    fn mark_activity(&self) {
+    pub(crate) fn mark_activity(&self) {
         self.state.activity.notify_one();
     }
 
@@ -577,5 +577,41 @@ mod tests {
         wait_until(|| producer_stopped.load(Ordering::SeqCst)).await;
         wait_until(|| slots.available_permits() == 1).await;
         drop(body);
+    }
+
+    #[tokio::test]
+    async fn producer_activity_resets_the_idle_watchdog() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut body = from_blocking_writer_with_pool(
+            1,
+            Arc::clone(&slots),
+            Duration::from_secs(1),
+            Duration::from_millis(80),
+            move |writer, cancellation| {
+                for _ in 0..5 {
+                    std::thread::sleep(Duration::from_millis(30));
+                    assert!(!cancellation.is_cancelled());
+                    cancellation.mark_activity();
+                }
+                writer.write_all(b"a")?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("producer should be admitted");
+
+        let frame = body
+            .frame()
+            .await
+            .expect("body should contain a frame")
+            .expect("producer activity should keep the stream alive");
+        assert_eq!(
+            frame
+                .data_ref()
+                .expect("frame should contain data")
+                .as_ref(),
+            b"a"
+        );
+        wait_until(|| slots.available_permits() == 1).await;
     }
 }

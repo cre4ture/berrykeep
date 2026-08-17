@@ -3267,15 +3267,21 @@ impl BinaryResponsePresentation {
 
 struct SelectedRangeWriter<'a> {
     output: &'a mut dyn Write,
+    cancellation: &'a bounded_body::StreamCancellation,
     selection_start: u64,
     selection_end_exclusive: u64,
     source_offset: u64,
 }
 
 impl<'a> SelectedRangeWriter<'a> {
-    fn new(output: &'a mut dyn Write, selection: LogicalFileByteRange) -> Self {
+    fn new(
+        output: &'a mut dyn Write,
+        cancellation: &'a bounded_body::StreamCancellation,
+        selection: LogicalFileByteRange,
+    ) -> Self {
         Self {
             output,
+            cancellation,
             selection_start: selection.start,
             selection_end_exclusive: selection.end_inclusive.saturating_add(1),
             source_offset: 0,
@@ -3285,6 +3291,7 @@ impl<'a> SelectedRangeWriter<'a> {
 
 impl Write for SelectedRangeWriter<'_> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.cancellation.mark_activity();
         let buffer_start = self.source_offset;
         let buffer_end = buffer_start.saturating_add(buffer.len() as u64);
         self.source_offset = buffer_end;
@@ -3349,7 +3356,7 @@ async fn binary_stream_body(
             };
             let mut selected_writer;
             let download_writer: &mut dyn Write = if let Some(selection) = slice_selection {
-                selected_writer = SelectedRangeWriter::new(writer, selection);
+                selected_writer = SelectedRangeWriter::new(writer, cancellation, selection);
                 &mut selected_writer
             } else {
                 writer
