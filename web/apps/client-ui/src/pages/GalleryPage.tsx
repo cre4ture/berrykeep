@@ -12,7 +12,9 @@ import {
   galleryBasemapsFromConfiguration,
   galleryMapConfigurationQueryPolicy,
   galleryQueryKeys,
+  MOBILE_VIEWER_THUMBNAIL_PROFILE,
   PageHeader,
+  withMediaThumbnailProfile,
   type GalleryDataSource,
   type GalleryEntry,
   type GalleryMediaRequests,
@@ -21,8 +23,6 @@ import {
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { createPersistentGalleryDataSource } from "../gallery-cache/gallery-persistent-data-source";
-
-const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
 
 type GalleryPageProps = {
   initialViewMode?: GallerySurfaceViewMode;
@@ -65,7 +65,7 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
           fullscreen:
             thumbnailUrl && entry.media?.media_type !== "video"
               ? {
-                  url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
+                  url: withMediaThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
                 }
               : null,
           original,
@@ -168,11 +168,4 @@ function binaryMediaUrl(
   versionId?: string | null
 ): string {
   return getBinaryObjectStreamUrl(key, snapshotId, versionId);
-}
-
-function withThumbnailProfile(url: string, profile: string): string {
-  const baseOrigin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
-  const resolved = new URL(url, baseOrigin);
-  resolved.searchParams.set("profile", profile);
-  return `${resolved.pathname}${resolved.search}${resolved.hash}`;
 }

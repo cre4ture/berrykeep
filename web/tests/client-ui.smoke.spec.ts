@@ -155,7 +155,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("row", { name: /gallery\/cat\.png/ }).getByRole("button", { name: "History" }).click();
   await expect(page.getByLabel("Key")).toHaveValue("gallery/cat.png");
   const versionHistoryTable = page.getByRole("table").nth(1);
-  await expect(versionHistoryTable.getByRole("cell", { name: "version-cat-001" })).toBeVisible();
+  await expect(
+    versionHistoryTable.getByRole("cell", { name: "version-cat-001", exact: true })
+  ).toBeVisible();
   await expect(versionHistoryTable.getByRole("row", { name: /version-cat-001/ })).toContainText("3.0 MB");
   await expect(
     versionHistoryTable.getByRole("row", { name: /version-cat-001/ }).getByRole("button", { name: "Restore" })
@@ -179,7 +181,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     .toBe(true);
   await expect(page.getByText('"target_path": "gallery/cat.png"')).toBeVisible();
   await page.keyboard.press("Escape");
-  await page.getByText("Show thumbnails", { exact: true }).click();
+  await expect(page.getByRole("switch", { name: "Show thumbnails" })).toBeChecked();
   await page.getByRole("button", { name: "Version history" }).click();
   await expect(page.getByRole("button", { name: "Thumbnail for gallery/cat.png" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Thumbnail for version version-cat-001" })).toBeVisible();
@@ -269,7 +271,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("button", { name: "Uploads 4/5 · 1 canceled" })).toBeVisible();
   await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
-  await page.getByRole("row", { name: /^docs\/\s+prefix/i }).getByRole("button", { name: "Open" }).click();
+  await page.getByRole("row", { name: /docs\/\s+prefix/i }).getByRole("button", { name: "Open" }).click();
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("row", { name: /scratch\/\s+prefix/i }).getByRole("button", { name: "Delete" }).click();
   await expect(page.getByRole("cell", { name: "scratch/" })).toHaveCount(0);
@@ -280,7 +282,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("button", { name: "Version history" }).click();
   await page.getByLabel("Key").fill("docs/readme.txt");
   await page.getByRole("button", { name: "Load versions" }).click();
-  await expect(page.getByRole("cell", { name: "version-001" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "version-001", exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
   await page.getByText("Gallery", { exact: true }).click();
@@ -973,7 +975,7 @@ test("client-ui gallery lightbox skips unsupported iOS originals and keeps the t
   expect((await downloadPromise).suggestedFilename()).toBe("ios-photo.heic");
 });
 
-test("client-ui gallery lightbox prefers the mobile viewer thumbnail on narrow touch viewports", async ({
+test("client-ui gallery and explorer lightboxes prefer the mobile viewer thumbnail on narrow touch viewports", async ({
   page
 }) => {
   test.setTimeout(45_000);
@@ -1030,6 +1032,15 @@ test("client-ui gallery lightbox prefers the mobile viewer thumbnail on narrow t
       )
     )
     .toBe(true);
+
+  await page.keyboard.press("Escape");
+  await page.goto("/?page=explorer");
+  await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await expect(page.getByRole("switch", { name: "Show thumbnails" })).toBeChecked();
+  await page.getByRole("button", { name: "Thumbnail for gallery/cat.png" }).click();
+  await expect(
+    page.getByRole("dialog").locator('img[src*="profile=mobile_viewer"]').first()
+  ).toBeVisible();
 });
 
 test("client-ui gallery virtual pages do not keep oversized spacer heights after sidebar resizing", async ({

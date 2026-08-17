@@ -719,7 +719,9 @@ test("server-admin explorer loads version history with thumbnails", async ({ pag
 
   await expect(page.getByLabel("Key")).toHaveValue("gallery/cat.png");
   const versionHistoryTable = page.getByRole("table").nth(1);
-  await expect(versionHistoryTable.getByRole("cell", { name: "version-cat-001" })).toBeVisible();
+  await expect(
+    versionHistoryTable.getByRole("cell", { name: "version-cat-001", exact: true })
+  ).toBeVisible();
   await expect(versionHistoryTable.getByRole("row", { name: /version-cat-001/ })).toContainText("3.0 MB");
   await expect(
     versionHistoryTable.getByRole("row", { name: /version-cat-001/ }).getByRole("button", { name: "Restore" })
@@ -750,7 +752,7 @@ test("server-admin explorer loads version history with thumbnails", async ({ pag
     .toBe(true);
 
   await page.keyboard.press("Escape");
-  await page.getByText("Show thumbnails", { exact: true }).click();
+  await expect(page.getByRole("switch", { name: "Show thumbnails" })).toBeChecked();
   await page.getByRole("button", { name: "Version history" }).click();
   await expect(page.getByRole("button", { name: "Thumbnail for gallery/cat.png" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Thumbnail for version version-cat-001" })).toBeVisible();
