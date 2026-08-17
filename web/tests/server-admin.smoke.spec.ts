@@ -1562,6 +1562,30 @@ test("server-admin provisioning does not fall back when a specific rendezvous se
   await expect(page.getByText("Compact claim issuance is temporarily unavailable on this node, so the page fell back to a full bootstrap QR.")).toHaveCount(0);
 });
 
+test("server-admin setup defaults to Turso and submits the selected metadata backend", async ({ page }) => {
+  await installServerAdminMocks(page, { setupMode: true });
+
+  await page.goto("/");
+
+  await expect(page.getByText("live first-run bootstrap UI", { exact: false })).toBeVisible();
+  const backendSelectors = page.getByRole("textbox", { name: "Metadata database backend" });
+  await expect(backendSelectors).toHaveCount(2);
+  await expect(backendSelectors.first()).toHaveValue("Turso (Pure Rust)");
+
+  await backendSelectors.first().click();
+  await page.getByRole("option", { name: "SQLite (rusqlite)" }).click();
+  await page.getByLabel("Initial admin password").fill("setup-password-long-enough");
+  const requestPromise = page.waitForRequest(
+    (request) => request.url().endsWith("/setup/start-cluster") && request.method() === "POST"
+  );
+  await page.getByRole("button", { name: "Start a new cluster" }).click();
+  const request = await requestPromise;
+
+  expect(request.postDataJSON()).toMatchObject({
+    metadata_backend: "sqlite"
+  });
+});
+
 test("server-admin runtime ignores auth-protected setup probes", async ({ page }) => {
   await installServerAdminMocks(page, { setupProbeStatus: 401 });
 
@@ -2794,6 +2818,9 @@ async function installServerAdminMocks(
         bootstrap_tls_fingerprint: "setup-fingerprint",
         cluster_id: null,
         node_id: "node-beta",
+        recovery_reason: null,
+        metadata_backend: "turso",
+        available_metadata_backends: ["sqlite", "turso"],
         pending_join_request: {
           version: 1,
           node_id: "node-beta",
@@ -2823,6 +2850,7 @@ async function installServerAdminMocks(
         cluster_id: "cluster-new",
         node_id: "node-new",
         public_url: "https://node-new.local",
+        metadata_backend: "turso",
         restart_required: false
       });
     }
@@ -2841,6 +2869,7 @@ async function installServerAdminMocks(
         cluster_id: "cluster-alpha",
         node_id: "node-beta",
         public_url: "https://node-beta.local",
+        metadata_backend: "turso",
         restart_required: false
       });
     }

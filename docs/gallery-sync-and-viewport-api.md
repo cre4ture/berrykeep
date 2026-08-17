@@ -102,8 +102,19 @@ library.
 
 ## Metadata backend capability
 
-SQLite is the default server-node metadata backend. The optional `turso-metadata` backend provides
-the same durable gallery projection, viewport index, and revision log. Both maintain changes as
-part of their metadata updates, and preserve the history identifier and revision across a restart.
-Gallery queries, viewport queries, and delta requests therefore have the same API contract on both
-backends.
+Managed first-run setup offers SQLite and the `turso-metadata` backend, with Turso selected by
+default in the distributed server-node builds. The selected backend is node-local and is persisted
+in `managed/setup-state.json`; subsequent managed starts use that value instead of reevaluating
+`IRONMESH_METADATA_BACKEND`.
+
+Setup-state versions that predate the persisted selection are migrated once. The migration imports
+`IRONMESH_METADATA_BACKEND` when it is set and otherwise records SQLite, which was the historical
+default. Recovery keeps the recorded backend because changing between `state/metadata.sqlite` and
+`state/metadata.turso.db` requires an explicit metadata migration rather than a configuration
+toggle. Environment-only, unmanaged server-node startup continues to use
+`IRONMESH_METADATA_BACKEND` on each start.
+
+Both backends provide the same durable gallery projection, viewport index, and revision log. Both
+maintain changes as part of their metadata updates, and preserve the history identifier and revision
+across a restart. Gallery queries, viewport queries, and delta requests therefore have the same API
+contract on both backends.
