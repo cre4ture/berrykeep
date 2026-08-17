@@ -53,7 +53,9 @@ The watcher stops after 20 minutes by default when no actionable event occurs. S
 
 By default, every failed check is actionable. Use repeated shell-glob rules such as `--ignore-check 'Deploy *'` for a known permanently non-actionable check. Use `--ignore-existing-failures` to accept only check runs that are already red at startup. A new run, or the same run becoming pending/green and later red again, remains actionable.
 
-The watcher ignores comments and reviews that already exist when it starts, but immediately reports a non-ignored existing failed check, merge conflict, or closed pull request. It exits on the first event that needs attention or when its upper time limit expires:
+The watcher persists a PR-specific event state outside the worktree. On its first run it reports existing comments and reviews once; on later runs it reports only IDs not already recorded in that state. This prevents feedback created between watcher invocations from being silently treated as the new baseline. Override the location with `--state-file <path>` when needed.
+
+It still immediately reports a non-ignored existing failed check, merge conflict, or closed pull request. It exits on the first event that needs attention or when its upper time limit expires:
 
 - exit `0`: no actionable event occurred before the timeout;
 - exit `1`: inspect and fix a failed CI check, build, or test;

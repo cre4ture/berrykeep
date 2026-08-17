@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
+from pathlib import Path
 from textwrap import shorten
 from typing import Any
 from urllib.parse import urlparse
@@ -28,6 +32,8 @@ EXIT_CONFIGURATION = 64
 EXIT_RUNTIME = 70
 
 DEFAULT_TIMEOUT_SECONDS = 20 * 60
+STATE_VERSION = 1
+EVENT_STATE_KINDS = ("comments", "reviews", "inline")
 
 QUERY = r"""
 query WatchPr($owner: String!, $name: String!, $number: Int!) {
@@ -183,6 +189,104 @@ def repo_from_url(url: str) -> dict[str, str]:
     host = parsed.hostname
     gh_repo = f"{owner}/{name}" if host == "github.com" else f"{host}/{owner}/{name}"
     return {"owner": owner, "name": name, "host": host, "gh_repo": gh_repo}
+
+
+def event_state_identity(repo: dict[str, str], number: int) -> dict[str, Any]:
+    return {
+        "host": repo["host"],
+        "owner": repo["owner"],
+        "name": repo["name"],
+        "number": number,
+    }
+
+
+def default_event_state_file(repo: dict[str, str], number: int) -> Path:
+    configured_state_home = os.environ.get("XDG_STATE_HOME")
+    state_home = (
+        Path(configured_state_home)
+        if configured_state_home
+        else Path.home() / ".local" / "state"
+    )
+    identity = event_state_identity(repo, number)
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    state_key = hashlib.sha256(encoded).hexdigest()
+    return state_home / "ironmesh" / "pr-followup" / f"{state_key}.json"
+
+
+def empty_seen_events() -> dict[str, set[str]]:
+    return {kind: set() for kind in EVENT_STATE_KINDS}
+
+
+def load_event_state(
+    state_file: Path,
+    identity: dict[str, Any],
+) -> tuple[dict[str, set[str]], bool]:
+    try:
+        contents = state_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return empty_seen_events(), False
+    except OSError as exc:
+        raise ConfigError(f"Event-State konnte nicht gelesen werden: {state_file}: {exc}") from exc
+
+    try:
+        payload = json.loads(contents)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"Event-State ist kein gültiges JSON: {state_file}") from exc
+
+    if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:
+        raise ConfigError(f"Event-State hat ein unbekanntes Format: {state_file}")
+    if payload.get("pull_request") != identity:
+        raise ConfigError(f"Event-State gehört nicht zu diesem Pull Request: {state_file}")
+
+    stored_seen = payload.get("seen")
+    if not isinstance(stored_seen, dict):
+        raise ConfigError(f"Event-State enthält keine Event-IDs: {state_file}")
+
+    seen = empty_seen_events()
+    for kind in EVENT_STATE_KINDS:
+        values = stored_seen.get(kind)
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            raise ConfigError(f"Event-State enthält ungültige {kind}: {state_file}")
+        seen[kind] = set(values)
+    return seen, True
+
+
+def save_event_state(
+    state_file: Path,
+    identity: dict[str, Any],
+    seen: dict[str, set[str]],
+) -> None:
+    payload = {
+        "version": STATE_VERSION,
+        "pull_request": identity,
+        "seen": {kind: sorted(seen[kind]) for kind in EVENT_STATE_KINDS},
+    }
+    temporary_name: str | None = None
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=state_file.parent,
+            prefix=f".{state_file.name}.",
+            suffix=".tmp",
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
+            json.dump(payload, temporary_file, sort_keys=True)
+            temporary_file.write("\n")
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, state_file)
+        temporary_name = None
+    except OSError as exc:
+        raise ConfigError(
+            f"Event-State konnte nicht gespeichert werden: {state_file}: {exc}"
+        ) from exc
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
 
 
 def snapshot(
@@ -693,6 +797,15 @@ def parse_args() -> argparse.Namespace:
             "oder erneut fehlschlagender Lauf wird weiterhin gemeldet"
         ),
     )
+    parser.add_argument(
+        "--state-file",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Datei für den persistenten PR-Event-State; standardmäßig unter "
+            "$XDG_STATE_HOME oder ~/.local/state"
+        ),
+    )
     timeout_group = parser.add_mutually_exclusive_group()
     timeout_group.add_argument(
         "--timeout",
@@ -756,11 +869,16 @@ def main() -> int:
         print(f"Fehler: {exc}", file=sys.stderr)
         return EXIT_CONFIGURATION
 
-    seen = {
-        "comments": ids(connection_nodes(pr, "comments")),
-        "reviews": ids(review_items(pr)),
-        "inline": ids(inline),
-    }
+    state_file = args.state_file or default_event_state_file(repo, number)
+    state_identity = event_state_identity(repo, number)
+    try:
+        seen, state_exists = load_event_state(state_file, state_identity)
+        events = collect_new_events(pr, inline, seen)
+        save_event_state(state_file, state_identity, seen)
+    except ConfigError as exc:
+        print(f"Fehler: {exc}", file=sys.stderr)
+        return EXIT_CONFIGURATION
+
     ignore_patterns = tuple(args.ignore_check)
     ignored_existing_failure_ids = (
         failed_check_ids(current_checks) if args.ignore_existing_failures else set()
@@ -773,17 +891,22 @@ def main() -> int:
         f"Timeout: {format_duration(args.timeout_seconds)}\n"
         f"{pr['url']}"
     )
-    print("Vorhandene Kommentare und Reviews gelten als Ausgangsstand.")
+    print(
+        f"Event-State: {state_file} "
+        f"({'geladen' if state_exists else 'neu angelegt'})"
+    )
     if ignore_patterns:
         print("Dauerhafte Check-Ignore-Regeln: " + ", ".join(ignore_patterns))
     if args.ignore_existing_failures:
         print("Beim Start bereits fehlgeschlagene Check-Läufe werden ignoriert.")
 
-    # Vorhandene Fehler oder Konflikte erfordern sofortige Aufmerksamkeit.
+    # Failures, conflicts, and events not yet recorded in the persistent state
+    # require immediate attention. A fresh state intentionally reports the
+    # current events once so activity between watcher invocations is not lost.
     exit_code = react(
         pr,
         current_checks,
-        [],
+        events,
         notify_enabled,
         ignore_patterns=ignore_patterns,
         ignored_existing_failure_ids=ignored_existing_failure_ids,
@@ -806,6 +929,7 @@ def main() -> int:
             current_checks = checks(repo, number, deadline)
             remaining_time(deadline)
             events = collect_new_events(pr, inline, seen)
+            save_event_state(state_file, state_identity, seen)
             errors = 0
         except KeyboardInterrupt:
             print("\nÜberwachung beendet.")
