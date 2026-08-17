@@ -8,11 +8,13 @@ build = "build.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-stream = "0.3"
 axum.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 client-sdk = { path = "../client-sdk" }
 common = { path = "../common" }
+flume = { version = "0.11", default-features = false, features = ["async"] }
 git-version.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
@@ -23,6 +25,9 @@ tokio.workspace = true
 tracing.workspace = true
 mime_guess = "2.0.5"
 uuid.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
 
 [lints]
 workspace = true
