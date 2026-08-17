@@ -889,13 +889,11 @@ def main() -> int:
     state_identity = event_state_identity(repo, number)
     try:
         seen, state_exists = load_event_state(state_file, state_identity)
-        updated_seen = copy_seen_events(seen)
-        events = collect_new_events(pr, inline, updated_seen)
-        save_event_state(state_file, state_identity, updated_seen)
-        seen = updated_seen
     except EventStateError as exc:
         print(f"Fehler: {exc}", file=sys.stderr)
         return EXIT_CONFIGURATION
+    updated_seen = copy_seen_events(seen)
+    events = collect_new_events(pr, inline, updated_seen)
 
     ignore_patterns = tuple(args.ignore_check)
     ignored_existing_failure_ids = (
@@ -930,6 +928,12 @@ def main() -> int:
         ignored_existing_failure_ids=ignored_existing_failure_ids,
         reported_ignored_failures=reported_ignored_failures,
     )
+    try:
+        save_event_state(state_file, state_identity, updated_seen)
+    except EventStateError as exc:
+        print(f"Event-State-Fehler: {exc}", file=sys.stderr)
+        return EXIT_CONFIGURATION
+    seen = updated_seen
     if exit_code is not None:
         return exit_code
 
@@ -948,8 +952,6 @@ def main() -> int:
             remaining_time(deadline)
             updated_seen = copy_seen_events(seen)
             events = collect_new_events(pr, inline, updated_seen)
-            save_event_state(state_file, state_identity, updated_seen)
-            seen = updated_seen
             errors = 0
         except KeyboardInterrupt:
             print("\nÜberwachung beendet.")
@@ -967,7 +969,11 @@ def main() -> int:
             return EXIT_CONFIGURATION
         except EventStateError as exc:
             print(f"\nEvent-State-Fehler: {exc}", file=sys.stderr)
-            notify(f"GitHub PR #{number}", "Event-State konnte nicht gespeichert werden", notify_enabled)
+            notify(
+                f"GitHub PR #{number}",
+                "Event-State konnte nicht gespeichert werden",
+                notify_enabled,
+            )
             return EXIT_CONFIGURATION
         except GhError as exc:
             errors += 1
@@ -983,6 +989,17 @@ def main() -> int:
             ignored_existing_failure_ids=ignored_existing_failure_ids,
             reported_ignored_failures=reported_ignored_failures,
         )
+        try:
+            save_event_state(state_file, state_identity, updated_seen)
+        except EventStateError as exc:
+            print(f"\nEvent-State-Fehler: {exc}", file=sys.stderr)
+            notify(
+                f"GitHub PR #{number}",
+                "Event-State konnte nicht gespeichert werden",
+                notify_enabled,
+            )
+            return EXIT_CONFIGURATION
+        seen = updated_seen
         if exit_code is not None:
             return exit_code
 

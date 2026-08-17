@@ -289,6 +289,17 @@ class EventStateTest(unittest.TestCase):
             interval=5.0,
         )
         identity = {"number": self.number, "url": pr["url"]}
+        original_save_event_state = watch_pr.save_event_state
+        activity_reported = False
+
+        def report_activity(*_args: object, **_kwargs: object) -> int:
+            nonlocal activity_reported
+            activity_reported = True
+            return watch_pr.EXIT_NEW_ACTIVITY
+
+        def save_after_activity(*args: object) -> None:
+            self.assertTrue(activity_reported)
+            original_save_event_state(*args)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             state_file = Path(temporary_directory) / "watcher.json"
@@ -305,6 +316,8 @@ class EventStateTest(unittest.TestCase):
                 ),
                 patch.object(watch_pr, "checks", return_value=[]),
                 patch.object(watch_pr, "notify"),
+                patch.object(watch_pr, "react", side_effect=report_activity),
+                patch.object(watch_pr, "save_event_state", side_effect=save_after_activity),
             ):
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(watch_pr.EXIT_NEW_ACTIVITY, watch_pr.main())
