@@ -86,6 +86,9 @@ const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
 const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
 const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
 const GALLERY_MAP_FULLSCREEN_HISTORY_KEY = "ironmesh.gallery.map_fullscreen";
+const GALLERY_MAX_DEPTH = 64;
+const GALLERY_MAP_PAGE_SIZE = 500;
+const GALLERY_MAP_PAGE_CONCURRENCY = 4;
 const MAX_WORLD_MAP_THUMBNAIL_MARKERS = 120;
 const MIN_WORLD_MAP_CLUSTER_RADIUS_PX = 28;
 const MAX_WORLD_MAP_CLUSTER_RADIUS_PX = 54;
@@ -140,6 +143,7 @@ export type GalleryPayload = {
   offset?: number;
   limit?: number | null;
   has_more?: boolean;
+  sync_token?: string | null;
   media_summary?: GalleryMediaSummary | null;
   entries: GalleryEntry[];
   [key: string]: unknown;
@@ -318,7 +322,7 @@ export function GallerySurface({
     subscribeToUpdates
   } = dataSource;
   const [prefix, setPrefix] = useState("");
-  const [depth, setDepth] = useState(4);
+  const [depth, setDepth] = useState(GALLERY_MAX_DEPTH);
   const [thumbnailsPerRow, setThumbnailsPerRow] = useState(loadStoredThumbnailsPerRow);
   const [showMetadata, setShowMetadata] = useState(loadStoredShowMetadata);
   const { ref: galleryGridRef, width: galleryGridWidth } = useElementSize();
@@ -353,6 +357,7 @@ export function GallerySurface({
   const gridCollectionRef = useRef<GalleryGridCollection | null>(null);
   const gridPagesRef = useRef<Record<number, GalleryGridPageState>>({});
   const gridPageCacheRef = useRef<GalleryGridPageCache>(new Map());
+  const mapPagePayloadsRef = useRef<Map<number, GalleryPayload>>(new Map());
   const galleryRequestVersionRef = useRef(0);
   const activeGalleryRequestRef = useRef({
     viewMode,
@@ -727,6 +732,30 @@ export function GallerySurface({
     if (activeRequest.viewMode === "map") {
       if (update.options.offset === undefined && update.options.limit === undefined) {
         setMapPayload(update.payload);
+        return;
+      }
+
+      const offset = update.options.offset;
+      if (
+        typeof offset !== "number" ||
+        offset < 0 ||
+        update.options.limit !== GALLERY_MAP_PAGE_SIZE ||
+        offset % GALLERY_MAP_PAGE_SIZE !== 0
+      ) {
+        return;
+      }
+
+      mapPagePayloadsRef.current.set(offset, update.payload);
+      try {
+        setMapPayload(
+          combinePaginatedGalleryPayloads(
+            mapPagePayloadsRef.current,
+            GALLERY_MAP_PAGE_SIZE
+          )
+        );
+      } catch {
+        // Keep the last complete map visible until every cached page has been
+        // revalidated to the same gallery revision.
       }
       return;
     }
@@ -849,15 +878,69 @@ export function GallerySurface({
     }
   }
 
+  async function loadPaginatedMapPayload(
+    targetScope: GalleryLoadedScope,
+    requestVersion: number
+  ): Promise<{ payload: GalleryPayload; pages: Map<number, GalleryPayload> } | null> {
+    const loadPage = (offset: number) =>
+      loadEntries(targetScope.prefix, targetScope.depth, targetScope.snapshotId, {
+        view: "tree",
+        sort: sortOrder,
+        mediaFilter: requestedServerMediaFilter,
+        offset,
+        limit: GALLERY_MAP_PAGE_SIZE
+      });
+
+    const firstPage = await loadPage(0);
+    if (requestVersion !== galleryRequestVersionRef.current) {
+      return null;
+    }
+
+    const totalEntryCount = galleryPayloadTotalEntryCount(firstPage);
+    const pages = new Map<number, GalleryPayload>([[0, firstPage]]);
+    const remainingOffsets = Array.from(
+      { length: Math.max(0, Math.ceil(totalEntryCount / GALLERY_MAP_PAGE_SIZE) - 1) },
+      (_, index) => (index + 1) * GALLERY_MAP_PAGE_SIZE
+    );
+
+    for (
+      let batchStart = 0;
+      batchStart < remainingOffsets.length;
+      batchStart += GALLERY_MAP_PAGE_CONCURRENCY
+    ) {
+      const offsets = remainingOffsets.slice(
+        batchStart,
+        batchStart + GALLERY_MAP_PAGE_CONCURRENCY
+      );
+      const payloads = await Promise.all(offsets.map((offset) => loadPage(offset)));
+      if (requestVersion !== galleryRequestVersionRef.current) {
+        return null;
+      }
+      offsets.forEach((offset, index) => {
+        const payload = payloads[index];
+        if (payload) {
+          pages.set(offset, payload);
+        }
+      });
+    }
+
+    return {
+      payload: combinePaginatedGalleryPayloads(pages, GALLERY_MAP_PAGE_SIZE),
+      pages
+    };
+  }
+
   async function loadGalleryScope(targetScope: GalleryLoadedScope, syncPrefixInput: boolean) {
     const requestVersion = galleryRequestVersionRef.current + 1;
     galleryRequestVersionRef.current = requestVersion;
+    loadedScopeRef.current = null;
     setLoading("entries");
     setError(null);
     setSelection(null);
     setVersionPreviewIndex(null);
     setNavigationPayload(null);
     setMapPayload(null);
+    mapPagePayloadsRef.current = new Map();
     setGridCollection(null);
     gridPagesRef.current = {};
     setGridPages({});
@@ -871,21 +954,18 @@ export function GallerySurface({
       });
 
       if (viewMode === "map") {
-        const [navigation, mediaPayload] = await Promise.all([
+        const [navigation, mapResult] = await Promise.all([
           navigationPromise,
-          loadEntries(targetScope.prefix, targetScope.depth, targetScope.snapshotId, {
-            view: "tree",
-            sort: sortOrder,
-            mediaFilter: requestedServerMediaFilter
-          })
+          loadPaginatedMapPayload(targetScope, requestVersion)
         ]);
 
-        if (requestVersion !== galleryRequestVersionRef.current) {
+        if (requestVersion !== galleryRequestVersionRef.current || !mapResult) {
           return;
         }
 
         setNavigationPayload(navigation);
-        setMapPayload(mediaPayload);
+        mapPagePayloadsRef.current = mapResult.pages;
+        setMapPayload(mapResult.payload);
         loadedScopeRef.current = targetScope;
         setLoadedScope(targetScope);
         if (syncPrefixInput) {
@@ -1505,7 +1585,7 @@ export function GallerySurface({
                 <NumberInput
                   label="Depth"
                   min={1}
-                  max={64}
+                  max={GALLERY_MAX_DEPTH}
                   value={depth}
                   onChange={(value) => setDepth(typeof value === "number" && value > 0 ? value : 1)}
                 />
@@ -2103,6 +2183,72 @@ function galleryPayloadTotalEntryCount(payload: GalleryPayload | null): number {
   }
 
   return payload.entry_count ?? payload.entries.length;
+}
+
+function combinePaginatedGalleryPayloads(
+  pages: ReadonlyMap<number, GalleryPayload>,
+  pageSize: number
+): GalleryPayload {
+  const firstPage = pages.get(0);
+  if (!firstPage) {
+    throw new Error("The paginated gallery map response is missing its first page.");
+  }
+
+  const totalEntryCount = galleryPayloadTotalEntryCount(firstPage);
+  if (!Number.isSafeInteger(totalEntryCount) || totalEntryCount < 0) {
+    throw new Error("The paginated gallery map response has an invalid total entry count.");
+  }
+
+  const safePageSize = Math.max(1, Math.floor(pageSize));
+  const pageCount = Math.max(1, Math.ceil(totalEntryCount / safePageSize));
+  const entries: GalleryEntry[] = [];
+  const seenPaths = new Set<string>();
+  const firstSyncToken = firstPage.sync_token?.trim() || null;
+
+  for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+    const expectedOffset = pageIndex * safePageSize;
+    const page = pages.get(expectedOffset);
+    if (!page) {
+      throw new Error("The paginated gallery map response is incomplete.");
+    }
+
+    const pageSyncToken = page.sync_token?.trim() || null;
+    const expectedEntryCount = Math.min(safePageSize, totalEntryCount - expectedOffset);
+    if (
+      page.prefix !== firstPage.prefix ||
+      page.depth !== firstPage.depth ||
+      galleryPayloadTotalEntryCount(page) !== totalEntryCount ||
+      (typeof page.offset === "number" && page.offset !== expectedOffset) ||
+      (typeof page.limit === "number" && page.limit !== safePageSize) ||
+      page.entries.length !== expectedEntryCount ||
+      page.entry_count !== page.entries.length ||
+      pageSyncToken !== firstSyncToken
+    ) {
+      throw new Error(
+        "The gallery changed while its map pages were loading. Refresh the gallery to try again."
+      );
+    }
+
+    for (const entry of page.entries) {
+      if (seenPaths.has(entry.path)) {
+        throw new Error(
+          "The gallery changed while its map pages were loading. Refresh the gallery to try again."
+        );
+      }
+      seenPaths.add(entry.path);
+      entries.push(entry);
+    }
+  }
+
+  return {
+    ...firstPage,
+    entry_count: entries.length,
+    total_entry_count: totalEntryCount,
+    offset: 0,
+    limit: null,
+    has_more: false,
+    entries
+  };
 }
 
 function resolveGalleryVirtualPageSize(columns: number): number {

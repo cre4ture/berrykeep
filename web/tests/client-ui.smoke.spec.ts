@@ -438,6 +438,37 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   expect(requestedPaths).not.toContain("/api/maps/logical-file");
 });
 
+test("client-ui gallery loads map entries in bounded pages", async ({ page }) => {
+  const mapPageOffsets: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (
+      url.pathname !== apiV1("/store/list") ||
+      !url.searchParams.has("media_filter") ||
+      url.searchParams.get("limit") !== "500"
+    ) {
+      return;
+    }
+    mapPageOffsets.push(url.searchParams.get("offset") ?? "");
+  });
+
+  await installClientUiMocks(page, {
+    storeEntries: createGalleryPaginationMockStoreEntries(520)
+  });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByText("523 items", { exact: true })).toBeVisible();
+  await expect(page.getByText("2 markers", { exact: true })).toBeVisible();
+  await expect(page.getByText("521 without GPS", { exact: true })).toBeVisible();
+  await expect
+    .poll(() => [...new Set(mapPageOffsets)].sort().join(","))
+    .toBe("0,500");
+});
+
 test("client-ui keeps the direct iOS gallery map inside the WebView viewport", async ({ page }) => {
   await installClientUiMocks(page);
   await page.goto("/?embedded=gallery_map&embedded_client=ios");
