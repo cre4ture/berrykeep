@@ -124,7 +124,7 @@ extension IronmeshFileProviderExtensionHost {
 
     private func temporaryDirectory() throws -> URL {
         guard let manager = NSFileProviderManager(for: domain) else {
-            throw fileProviderError(.providerDomainNotFound)
+            throw providerDomainUnavailableError()
         }
         return try manager.temporaryDirectoryURL()
     }
@@ -141,7 +141,7 @@ extension IronmeshFileProviderExtensionHost {
             domainDisplayName: service.configuration.domainDisplayName
         ).itemVersion
         guard requestedVersion.contentVersion == providedVersion.contentVersion else {
-            throw fileProviderError(.versionNoLongerAvailable)
+            throw contentVersionUnavailableError()
         }
     }
 

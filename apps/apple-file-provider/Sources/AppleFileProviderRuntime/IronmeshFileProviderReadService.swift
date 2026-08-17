@@ -189,7 +189,7 @@ extension IronmeshFileProviderService {
             )
             if let expectedSize = capability.sizeBytes,
                UInt64(expectedSize) != size {
-                throw fileProviderError(.versionNoLongerAvailable)
+                throw contentVersionUnavailableError()
             }
             return IronmeshContentSelection(
                 item: item,
