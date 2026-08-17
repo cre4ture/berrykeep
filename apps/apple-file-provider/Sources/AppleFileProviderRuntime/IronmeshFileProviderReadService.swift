@@ -216,7 +216,8 @@ extension IronmeshFileProviderService {
     }
 
     private func originalShareCapabilityStore() throws -> AppleOriginalShareCapabilityStore {
-        guard let appGroupIdentifier = configuration.appGroupIdentifier else {
+        guard configuration.syncProfile == nil,
+              let appGroupIdentifier = configuration.appGroupIdentifier else {
             throw fileProviderError(.noSuchItem)
         }
         return try AppleOriginalShareCapabilityStore(appGroupIdentifier: appGroupIdentifier)
