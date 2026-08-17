@@ -61,85 +61,98 @@ const mapConfiguration = {
   }
 };
 
-const galleryIndex = {
-  prefix: "",
-  depth: 4,
-  entry_count: 2,
-  total_entry_count: 2,
-  offset: 0,
-  limit: 24,
-  has_more: false,
-  media_summary: {
-    ready_count: 2,
-    pending_count: 0,
-    incomplete_count: 0,
-    image_count: 2,
-    video_count: 0,
-    geotagged_count: 2
-  },
-  entries: [
-    {
-      path: "gallery/runtime-map-a.png",
-      entry_type: "key",
-      version: "runtime-map-a-001",
-      content_hash: "runtime-map-a-hash",
-      size_bytes: 68,
-      modified_at_unix: 1712345678,
-      media: {
-        status: "ready",
-        content_fingerprint: "runtime-map-a-fingerprint",
-        media_type: "image",
-        mime_type: "image/png",
+const galleryEntries = [
+  {
+    path: "gallery/runtime-map-a.png",
+    entry_type: "key",
+    version: "runtime-map-a-001",
+    content_hash: "runtime-map-a-hash",
+    size_bytes: 68,
+    modified_at_unix: 1712345678,
+    media: {
+      status: "ready",
+      content_fingerprint: "runtime-map-a-fingerprint",
+      media_type: "image",
+      mime_type: "image/png",
+      width: 1,
+      height: 1,
+      taken_at_unix: 1712345678,
+      gps: {
+        latitude: 47.3769,
+        longitude: 8.5417
+      },
+      thumbnail: {
+        url: "/media/thumbnail?key=gallery%2Fruntime-map-a.png",
+        profile: "grid",
         width: 1,
         height: 1,
-        taken_at_unix: 1712345678,
-        gps: {
-          latitude: 47.3769,
-          longitude: 8.5417
-        },
-        thumbnail: {
-          url: "/media/thumbnail?key=gallery%2Fruntime-map-a.png",
-          profile: "grid",
-          width: 1,
-          height: 1,
-          format: "png",
-          size_bytes: 68
-        }
-      }
-    },
-    {
-      path: "gallery/runtime-map-b.png",
-      entry_type: "key",
-      version: "runtime-map-b-001",
-      content_hash: "runtime-map-b-hash",
-      size_bytes: 68,
-      modified_at_unix: 1712345678,
-      media: {
-        status: "ready",
-        content_fingerprint: "runtime-map-b-fingerprint",
-        media_type: "image",
-        mime_type: "image/png",
-        width: 1,
-        height: 1,
-        taken_at_unix: 1712345678,
-        // Identical coordinates intentionally exercise the direct cluster
-        // chooser instead of the basemap's zoom-to-bounds behavior.
-        gps: {
-          latitude: 47.3769,
-          longitude: 8.5417
-        },
-        thumbnail: {
-          url: "/media/thumbnail?key=gallery%2Fruntime-map-b.png",
-          profile: "grid",
-          width: 1,
-          height: 1,
-          format: "png",
-          size_bytes: 68
-        }
+        format: "png",
+        size_bytes: 68
       }
     }
-  ]
-};
+  },
+  {
+    path: "gallery/runtime-map-b.png",
+    entry_type: "key",
+    version: "runtime-map-b-001",
+    content_hash: "runtime-map-b-hash",
+    size_bytes: 68,
+    modified_at_unix: 1712345678,
+    media: {
+      status: "ready",
+      content_fingerprint: "runtime-map-b-fingerprint",
+      media_type: "image",
+      mime_type: "image/png",
+      width: 1,
+      height: 1,
+      taken_at_unix: 1712345678,
+      // Identical coordinates intentionally exercise the direct cluster
+      // chooser instead of the basemap's zoom-to-bounds behavior.
+      gps: {
+        latitude: 47.3769,
+        longitude: 8.5417
+      },
+      thumbnail: {
+        url: "/media/thumbnail?key=gallery%2Fruntime-map-b.png",
+        profile: "grid",
+        width: 1,
+        height: 1,
+        format: "png",
+        size_bytes: 68
+      }
+    }
+  }
+];
+
+function galleryIndexResponse(url) {
+  const prefix = url.searchParams.get("prefix") ?? "";
+  const depth = Math.max(1, Number(url.searchParams.get("depth") ?? "1") || 1);
+  const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
+  const limitParam = url.searchParams.get("limit");
+  const limit = limitParam === null ? null : Math.max(1, Number(limitParam) || 1);
+  const scopedEntries = galleryEntries.filter((entry) => entry.path.startsWith(prefix));
+  const entries =
+    limit === null ? scopedEntries.slice(offset) : scopedEntries.slice(offset, offset + limit);
+
+  return {
+    prefix,
+    depth,
+    entry_count: entries.length,
+    total_entry_count: scopedEntries.length,
+    offset,
+    limit,
+    has_more: offset + entries.length < scopedEntries.length,
+    media_summary: {
+      ready_count: scopedEntries.length,
+      pending_count: 0,
+      incomplete_count: 0,
+      image_count: scopedEntries.length,
+      video_count: 0,
+      geotagged_count: scopedEntries.length
+    },
+    entries
+  };
+}
 
 function json(response, status, body) {
   response.writeHead(status, {
@@ -169,7 +182,7 @@ function upstreamRequest(request, response) {
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/v1/store/index") {
-    json(response, 200, galleryIndex);
+    json(response, 200, galleryIndexResponse(url));
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/v1/media/thumbnail") {
