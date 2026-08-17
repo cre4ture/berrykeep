@@ -1,7 +1,7 @@
 use super::{LogicalFileByteRange, WebUiConfig, parse_logical_file_range, router};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
+use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::routing::get;
 use bytes::Bytes;
@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio::{io::AsyncReadExt, io::AsyncWriteExt};
 
 #[derive(Clone)]
 struct BinaryUpstreamState {
@@ -334,25 +335,38 @@ async fn binary_stream_delivers_the_first_chunk_before_upstream_finishes() {
 async fn dropping_binary_response_cancels_the_upstream_body() {
     let release_second_chunk = Arc::new(Notify::new());
     let mut state = binary_test_state(vec![0x3c; 128 * 1024]);
-    state.release_second_chunk = Some(release_second_chunk);
+    state.release_second_chunk = Some(Arc::clone(&release_second_chunk));
     let body_dropped = Arc::clone(&state.body_dropped);
     let (base_url, web, upstream) = start_binary_test_servers(state).await;
 
-    let mut response = reqwest::Client::new()
-        .get(format!(
-            "{base_url}/api/v1/store/stream-binary?key=video.mp4"
-        ))
-        .header(CONNECTION, "close")
-        .send()
+    let address = base_url
+        .strip_prefix("http://")
+        .expect("test server URL should use HTTP");
+    let mut socket = tokio::net::TcpStream::connect(address)
         .await
-        .expect("stream request should start");
-    let first = response
-        .chunk()
+        .expect("test client should connect");
+    socket
+        .write_all(
+            b"GET /api/v1/store/stream-binary?key=video.mp4 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
         .await
-        .expect("first chunk read should succeed")
-        .expect("first chunk should be present");
-    assert!(!first.is_empty());
-    drop(response);
+        .expect("test request should be written");
+
+    let mut received = Vec::new();
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(2), socket.read_buf(&mut received))
+            .await
+            .expect("response should start")
+            .expect("response bytes should be readable");
+        assert!(read > 0, "response should include body bytes");
+        if let Some(header_end) = received.windows(4).position(|part| part == b"\r\n\r\n")
+            && received.len() > header_end + 4
+        {
+            break;
+        }
+    }
+    drop(socket);
+    release_second_chunk.notify_one();
 
     wait_until(|| body_dropped.load(Ordering::SeqCst)).await;
 

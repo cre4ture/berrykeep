@@ -7,12 +7,14 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 const STREAM_BUFFERED_CHUNKS: usize = 1;
 const DEFAULT_MAX_INLINE_STREAM_PRODUCERS: usize = 32;
 const DEFAULT_MAX_ATTACHMENT_STREAM_PRODUCERS: usize = 8;
 const DEFAULT_STREAM_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
+const DEFAULT_STREAM_WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const TERMINAL_ERROR_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy)]
 pub(crate) enum StreamProducerClass {
@@ -23,6 +25,8 @@ pub(crate) enum StreamProducerClass {
 #[derive(Default)]
 struct StreamCancellationState {
     cancelled: AtomicBool,
+    finished: AtomicBool,
+    activity: Notify,
 }
 
 #[derive(Clone, Default)]
@@ -42,7 +46,33 @@ impl StreamCancellation {
     }
 
     fn cancel(&self) {
-        self.state.cancelled.store(true, Ordering::Relaxed);
+        if !self.state.cancelled.swap(true, Ordering::Relaxed) {
+            self.state.activity.notify_waiters();
+        }
+    }
+
+    fn mark_activity(&self) {
+        self.state.activity.notify_one();
+    }
+
+    fn finish(&self) {
+        self.state.finished.store(true, Ordering::Relaxed);
+        self.state.activity.notify_waiters();
+    }
+
+    async fn cancel_after_idle(&self, idle_timeout: Duration) {
+        loop {
+            let activity = self.state.activity.notified();
+            if self.is_cancelled() || self.state.finished.load(Ordering::Relaxed) {
+                return;
+            }
+            if tokio::time::timeout(idle_timeout, activity).await.is_err() {
+                if !self.state.finished.load(Ordering::Relaxed) {
+                    self.cancel();
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -59,12 +89,15 @@ impl Drop for StreamCancellationGuard {
 struct BoundedBodyWriter {
     sender: flume::Sender<io::Result<Bytes>>,
     cancellation: StreamCancellation,
+    write_idle_timeout: Duration,
     bytes_written: u64,
 }
 
 impl BoundedBodyWriter {
     fn send_error(&self, error: io::Error) {
-        let _ = self.sender.send(Err(error));
+        let _ = self
+            .sender
+            .send_timeout(Err(error), TERMINAL_ERROR_SEND_TIMEOUT);
     }
 }
 
@@ -81,13 +114,18 @@ impl Write for BoundedBodyWriter {
         }
 
         self.sender
-            .send(Ok(Bytes::copy_from_slice(buffer)))
-            .map_err(|_| {
-                io::Error::new(
+            .send_timeout(Ok(Bytes::copy_from_slice(buffer)), self.write_idle_timeout)
+            .map_err(|error| match error {
+                flume::SendTimeoutError::Timeout(_) => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "response body consumer stopped reading",
+                ),
+                flume::SendTimeoutError::Disconnected(_) => io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "response body receiver was dropped",
-                )
+                ),
             })?;
+        self.cancellation.mark_activity();
         self.bytes_written = self.bytes_written.saturating_add(buffer.len() as u64);
         Ok(buffer.len())
     }
@@ -109,6 +147,18 @@ fn configured_stream_limit(name: &str, default: usize) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+fn stream_write_idle_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var("IRONMESH_WEB_STREAM_WRITE_IDLE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_STREAM_WRITE_IDLE_TIMEOUT)
+    })
 }
 
 fn stream_producer_slots(class: StreamProducerClass) -> Arc<Semaphore> {
@@ -143,6 +193,7 @@ fn run_producer<F>(
     sender: flume::Sender<io::Result<Bytes>>,
     cancellation: StreamCancellation,
     expected_length: u64,
+    write_idle_timeout: Duration,
     produce: F,
 ) where
     F: FnOnce(&mut dyn Write, &StreamCancellation) -> Result<()>,
@@ -150,16 +201,23 @@ fn run_producer<F>(
     let mut writer = BoundedBodyWriter {
         sender,
         cancellation: cancellation.clone(),
+        write_idle_timeout,
         bytes_written: 0,
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         produce(&mut writer, &cancellation)
     }));
-    if cancellation.is_cancelled() {
-        return;
-    }
-
     match result {
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            tracing::error!(panic = message, "binary stream producer panicked");
+            if !cancellation.is_cancelled() {
+                writer.send_error(io::Error::other(format!(
+                    "binary stream producer panicked: {message}"
+                )));
+            }
+        }
+        Ok(_) if cancellation.is_cancelled() => {}
         Ok(Err(error)) => writer.send_error(io::Error::other(format!("{error:#}"))),
         Ok(Ok(())) if writer.bytes_written != expected_length => {
             writer.send_error(io::Error::new(
@@ -171,14 +229,8 @@ fn run_producer<F>(
             ));
         }
         Ok(Ok(())) => {}
-        Err(payload) => {
-            let message = panic_message(payload.as_ref());
-            tracing::error!(panic = message, "binary stream producer panicked");
-            writer.send_error(io::Error::other(format!(
-                "binary stream producer panicked: {message}"
-            )));
-        }
     }
+    cancellation.finish();
 }
 
 /// Adapts a blocking writer producer to an HTTP body with one-chunk backpressure.
@@ -186,8 +238,10 @@ fn run_producer<F>(
 /// Producers use separate capped pools of dedicated threads so attachment downloads cannot starve
 /// inline gallery/video traffic and slow HTTP consumers cannot exhaust Tokio's shared blocking
 /// pool. Admission waits only briefly before returning `WouldBlock`, allowing the handler to send
-/// a 503 response instead of leaving requests queued indefinitely. Dropping the returned body
-/// closes the bounded channel and stops both a blocked writer and cancellation-aware upstream work.
+/// a 503 response instead of leaving requests queued indefinitely. A configurable write-idle
+/// timeout prevents a client that stops reading from retaining a producer slot forever. Dropping
+/// the returned body closes the bounded channel and stops both a blocked writer and
+/// cancellation-aware upstream work.
 pub(crate) async fn from_blocking_writer<F>(
     expected_length: u64,
     class: StreamProducerClass,
@@ -200,6 +254,7 @@ where
         expected_length,
         stream_producer_slots(class),
         DEFAULT_STREAM_ADMISSION_TIMEOUT,
+        stream_write_idle_timeout(),
         produce,
     )
     .await
@@ -209,6 +264,7 @@ async fn from_blocking_writer_with_pool<F>(
     expected_length: u64,
     slots: Arc<Semaphore>,
     admission_timeout: Duration,
+    write_idle_timeout: Duration,
     produce: F,
 ) -> io::Result<Body>
 where
@@ -227,11 +283,24 @@ where
         })?
         .map_err(|_| io::Error::other("binary stream capacity pool was closed"))?;
 
+    let watchdog_cancellation = cancellation.clone();
+    tokio::spawn(async move {
+        watchdog_cancellation
+            .cancel_after_idle(write_idle_timeout)
+            .await;
+    });
+
     std::thread::Builder::new()
         .name("ironmesh-web-binary-stream".to_string())
         .spawn(move || {
             let _permit = permit;
-            run_producer(sender, producer_cancellation, expected_length, produce);
+            run_producer(
+                sender,
+                producer_cancellation,
+                expected_length,
+                write_idle_timeout,
+                produce,
+            );
         })?;
 
     let cancellation_guard = cancellation.guard();
@@ -429,6 +498,7 @@ mod tests {
             1,
             Arc::clone(&slots),
             Duration::from_secs(1),
+            Duration::from_secs(1),
             move |writer, _| {
                 release_receiver
                     .recv()
@@ -445,6 +515,7 @@ mod tests {
             1,
             Arc::clone(&slots),
             Duration::from_millis(25),
+            Duration::from_secs(1),
             move |writer, _| {
                 writer.write_all(b"b")?;
                 Ok(())
@@ -459,5 +530,52 @@ mod tests {
             .send(())
             .expect("first producer gate should still be open");
         drop(first_body);
+    }
+
+    #[tokio::test]
+    async fn stalled_consumers_release_their_producer_slot() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let body = from_blocking_writer_with_pool(
+            2,
+            Arc::clone(&slots),
+            Duration::from_secs(1),
+            Duration::from_millis(25),
+            move |writer, _| {
+                writer.write_all(b"a")?;
+                writer.write_all(b"b")?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("producer should be admitted");
+
+        wait_until(|| slots.available_permits() == 1).await;
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn idle_upstream_work_is_cancelled_and_releases_its_slot() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let producer_stopped = Arc::new(AtomicBool::new(false));
+        let producer_stopped_in_task = Arc::clone(&producer_stopped);
+        let body = from_blocking_writer_with_pool(
+            1,
+            Arc::clone(&slots),
+            Duration::from_secs(1),
+            Duration::from_millis(25),
+            move |_writer, cancellation| {
+                while !cancellation.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                producer_stopped_in_task.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("producer should be admitted");
+
+        wait_until(|| producer_stopped.load(Ordering::SeqCst)).await;
+        wait_until(|| slots.available_permits() == 1).await;
+        drop(body);
     }
 }
