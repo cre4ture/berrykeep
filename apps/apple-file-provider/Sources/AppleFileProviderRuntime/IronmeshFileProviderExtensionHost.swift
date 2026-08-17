@@ -3,7 +3,7 @@ import AppleCore
 import Foundation
 import UniformTypeIdentifiers
 
-open class IronmeshFileProviderExtensionHost: NSObject, NSFileProviderReplicatedExtension, NSFileProviderPartialContentFetching, @unchecked Sendable {
+open class IronmeshFileProviderExtensionHost: NSObject, NSFileProviderReplicatedExtension, @unchecked Sendable {
     public let domain: NSFileProviderDomain
     let service: IronmeshFileProviderService
     let workingSetSignals: IronmeshWorkingSetSignalCoordinator
@@ -34,3 +34,7 @@ open class IronmeshFileProviderExtensionHost: NSObject, NSFileProviderReplicated
         workingSetSignals.invalidate()
     }
 }
+
+#if os(macOS)
+extension IronmeshFileProviderExtensionHost: NSFileProviderPartialContentFetching {}
+#endif

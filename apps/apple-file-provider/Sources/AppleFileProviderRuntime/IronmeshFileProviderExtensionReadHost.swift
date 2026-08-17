@@ -65,6 +65,7 @@ extension IronmeshFileProviderExtensionHost {
         return progress
     }
 
+    #if os(macOS)
     public func fetchPartialContents(
         for itemIdentifier: NSFileProviderItemIdentifier,
         version requestedVersion: NSFileProviderItemVersion,
@@ -119,6 +120,7 @@ extension IronmeshFileProviderExtensionHost {
         }
         return progress
     }
+    #endif
 
     private func temporaryDirectory() throws -> URL {
         guard let manager = NSFileProviderManager(for: domain) else {
