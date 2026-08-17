@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Looper
 import android.provider.DocumentsContract
 import org.json.JSONObject
 import java.io.FileNotFoundException
@@ -207,16 +208,18 @@ internal class OriginalShareCoordinator(
     private val context: Context,
     private val capabilityStore: OriginalShareCapabilityStore = OriginalShareCapabilityStore(context),
 ) {
-    fun handleWebMessage(rawMessage: String): String {
+    fun prepareWebMessage(rawMessage: String): OriginalSharePreparation {
         if (rawMessage.length > MAX_WEB_MESSAGE_LENGTH) {
-            return shareResponse("", "error", "Android share request is too large")
+            return OriginalSharePreparation.Failed(
+                shareResponse("", "error", "Android share request is too large"),
+            )
         }
         val requestId = requestIdForErrorResponse(rawMessage)
         return runCatching {
             val request = OriginalShareRequest.fromWebMessage(rawMessage)
             val capability = capabilityStore.create(request)
-            val uri = originalShareDocumentUri(context, capability.token)
             try {
+                val uri = originalShareDocumentUri(context, capability.token)
                 val chooser = Intent.createChooser(
                     buildOriginalShareIntent(context, capability, uri),
                     "Share ${capability.displayName}",
@@ -224,20 +227,61 @@ internal class OriginalShareCoordinator(
                 if (context !is Activity) {
                     chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
-                context.startActivity(chooser)
+                OriginalSharePreparation.Ready(
+                    requestId = request.requestId,
+                    capabilityToken = capability.token,
+                    chooser = chooser,
+                )
             } catch (error: Exception) {
                 capabilityStore.remove(capability.token)
                 throw error
             }
-            shareResponse(request.requestId, "opened")
         }.getOrElse { error ->
-            shareResponse(
-                requestId,
-                "error",
-                error.message?.take(240) ?: "Android could not open the share sheet.",
+            OriginalSharePreparation.Failed(
+                shareResponse(
+                    requestId,
+                    "error",
+                    error.message?.take(240) ?: "Android could not prepare the share request.",
+                ),
             )
         }
     }
+
+    fun launchPreparedShare(preparation: OriginalSharePreparation): String = when (preparation) {
+        is OriginalSharePreparation.Failed -> preparation.response
+        is OriginalSharePreparation.Ready -> {
+            check(Looper.myLooper() == Looper.getMainLooper()) {
+                "The Android share sheet must be launched from the main thread"
+            }
+            runCatching {
+                context.startActivity(preparation.chooser)
+                shareResponse(preparation.requestId, "opened")
+            }.getOrElse { error ->
+                capabilityStore.remove(preparation.capabilityToken)
+                shareResponse(
+                    preparation.requestId,
+                    "error",
+                    error.message?.take(240) ?: "Android could not open the share sheet.",
+                )
+            }
+        }
+    }
+
+    fun discardPreparedShare(preparation: OriginalSharePreparation) {
+        if (preparation is OriginalSharePreparation.Ready) {
+            capabilityStore.remove(preparation.capabilityToken)
+        }
+    }
+}
+
+internal sealed interface OriginalSharePreparation {
+    data class Ready(
+        val requestId: String,
+        val capabilityToken: String,
+        val chooser: Intent,
+    ) : OriginalSharePreparation
+
+    data class Failed(val response: String) : OriginalSharePreparation
 }
 
 internal fun originalShareDocumentId(token: String): String = "share:$token"

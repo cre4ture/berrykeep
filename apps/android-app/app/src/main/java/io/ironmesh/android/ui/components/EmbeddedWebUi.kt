@@ -21,11 +21,15 @@ import androidx.webkit.WebViewFeature
 import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.share.OriginalShareCoordinator
 import java.net.URI
+import java.util.concurrent.Executors
 
 private const val EMBEDDED_WEB_UI_SESSION_HEADER = "X-IronMesh-Web-Ui-Session"
 private const val EMBEDDED_WEB_UI_CLIENT_PARAMETER = "embedded_client"
 private const val ANDROID_WEB_UI_CLIENT = "android"
 private const val ANDROID_SHARE_JAVASCRIPT_OBJECT = "IronmeshAndroidShare"
+private val androidShareExecutor = Executors.newSingleThreadExecutor { runnable ->
+    Thread(runnable, "ironmesh-original-share").apply { isDaemon = true }
+}
 
 @Composable
 fun IronmeshEmbeddedWebUi(
@@ -91,19 +95,31 @@ private fun WebView.installAndroidShareBridge(initialUrl: String) {
         this,
         ANDROID_SHARE_JAVASCRIPT_OBJECT,
         setOf(allowedOrigin),
-    ) { _, message, sourceOrigin, isMainFrame, replyProxy ->
-        val response = if (
+    ) { webView, message, sourceOrigin, isMainFrame, replyProxy ->
+        val trustedMessage =
             isMainFrame &&
-            isSameEmbeddedWebUiOrigin(initialUrl, sourceOrigin.toString()) &&
-            message.type == WebMessageCompat.TYPE_STRING
-        ) {
-            coordinator.handleWebMessage(message.data.orEmpty())
-        } else {
-            """{"requestId":"","status":"error","message":"Rejected untrusted share request"}"""
+                isSameEmbeddedWebUiOrigin(initialUrl, sourceOrigin.toString()) &&
+                message.type == WebMessageCompat.TYPE_STRING
+        if (!trustedMessage) {
+            replyProxy.postMessage(untrustedShareResponse())
+            return@addWebMessageListener
         }
-        replyProxy.postMessage(response)
+
+        val rawMessage = message.data.orEmpty()
+        androidShareExecutor.execute {
+            val preparation = coordinator.prepareWebMessage(rawMessage)
+            val posted = webView.post {
+                replyProxy.postMessage(coordinator.launchPreparedShare(preparation))
+            }
+            if (!posted) {
+                coordinator.discardPreparedShare(preparation)
+            }
+        }
     }
 }
+
+private fun untrustedShareResponse(): String =
+    """{"requestId":"","status":"error","message":"Rejected untrusted share request"}"""
 
 private fun embeddedWebUiOrigin(url: String): String {
     val parsed = URI(url)
