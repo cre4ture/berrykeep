@@ -1652,7 +1652,7 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
         func userContentController(
             _ userContentController: WKUserContentController,
             didReceive message: WKScriptMessage,
-            replyHandler: @escaping (Any?, String?) -> Void
+            replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void
         ) {
             _ = userContentController
             let requestID = shareRequestID(from: message.body)
