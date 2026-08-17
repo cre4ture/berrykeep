@@ -60,7 +60,7 @@ public struct AppleOriginalShareRequest: Equatable, Sendable {
             throw AppleOriginalShareError.invalidRequest("The original file size must not be negative.")
         }
 
-        self.init(
+        return self.init(
             requestID: requestID,
             remotePath: remotePath,
             snapshotID: snapshotID,
