@@ -2019,6 +2019,9 @@ mod tests {
 
     #[test]
     fn explorer_property_values_use_windows_property_types_and_units() {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .expect("COM should initialize for property descriptions");
         let mut identity = PlaceholderFileIdentity::new("photos/camera.jpg");
         identity.remote_modified_at_unix = Some(1_723_456_789);
         identity.remote_media = Some(NamespaceMediaMetadata {
@@ -2091,6 +2094,7 @@ mod tests {
             Some(u32::from_le_bytes(*b"avc1"))
         );
         assert_eq!(fourcc_property_value("h265x"), None);
+        unsafe { CoUninitialize() };
     }
 
     #[test]
