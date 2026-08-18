@@ -7731,6 +7731,7 @@ dependencies = [
  "client-sdk",
  "common",
  "flume",
+ "fs2",
  "git-version",
  "mime_guess",
  "reqwest 0.12.28",
