@@ -3499,6 +3499,62 @@ pub struct StoreIndexViewport {
     pub east: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct GalleryMapClustersRequest {
+    pub prefix: Option<String>,
+    pub depth: usize,
+    pub media_filter: StoreIndexMediaFilter,
+    pub viewport: StoreIndexViewport,
+    pub zoom: u8,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct GalleryMapBounds {
+    pub south: f64,
+    pub west: f64,
+    pub north: f64,
+    pub east: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GalleryMapCluster {
+    pub cluster_id: String,
+    pub count: usize,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub bounds: GalleryMapBounds,
+    #[serde(default)]
+    pub entry: Option<StoreIndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GalleryMapClustersResponse {
+    pub prefix: String,
+    pub depth: usize,
+    pub zoom: u8,
+    pub resolution: u32,
+    pub total_entry_count: usize,
+    pub visible_geotagged_count: usize,
+    #[serde(default)]
+    pub media_summary: StoreIndexMediaSummary,
+    pub query_token: String,
+    #[serde(default)]
+    pub clusters: Vec<GalleryMapCluster>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GalleryMapClusterEntriesResponse {
+    pub cluster_id: String,
+    pub entry_count: usize,
+    pub total_entry_count: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
+    pub query_token: String,
+    #[serde(default)]
+    pub entries: Vec<StoreIndexEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreIndexDeltaResponse {
     pub next_token: String,
@@ -5059,6 +5115,73 @@ impl IronMeshClient {
     ) -> Result<StoreIndexChangeWaitResponse> {
         let runtime = blocking_runtime()?;
         runtime.block_on(self.wait_for_store_index_change(since, timeout_ms))
+    }
+
+    pub async fn gallery_map_clusters(
+        &self,
+        request: GalleryMapClustersRequest,
+    ) -> Result<GalleryMapClustersResponse> {
+        let mut url = self.relative_url("/store/map/clusters")?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(prefix) = request
+                .prefix
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                query.append_pair("prefix", prefix);
+            }
+            query
+                .append_pair("depth", &request.depth.max(1).to_string())
+                .append_pair("media_filter", request.media_filter.as_query_value())
+                .append_pair("south", &request.viewport.south.to_string())
+                .append_pair("west", &request.viewport.west.to_string())
+                .append_pair("north", &request.viewport.north.to_string())
+                .append_pair("east", &request.viewport.east.to_string())
+                .append_pair("zoom", &request.zoom.min(20).to_string());
+        }
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+            .await
+            .context("failed to request /store/map/clusters")?;
+        if !response.status.is_success() {
+            bail!(
+                "/store/map/clusters returned non-success status: {} body={}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            );
+        }
+        serde_json::from_slice(&response.body)
+            .context("failed to parse /store/map/clusters response")
+    }
+
+    pub async fn gallery_map_cluster_entries(
+        &self,
+        query_token: &str,
+        cluster_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<GalleryMapClusterEntriesResponse> {
+        let mut url = self.relative_url("/store/map/cluster-entries")?;
+        url.query_pairs_mut()
+            .append_pair("query_token", query_token)
+            .append_pair("cluster_id", cluster_id)
+            .append_pair("offset", &offset.to_string())
+            .append_pair("limit", &limit.max(1).to_string());
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+            .await
+            .context("failed to request /store/map/cluster-entries")?;
+        if !response.status.is_success() {
+            bail!(
+                "/store/map/cluster-entries returned non-success status: {} body={}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            );
+        }
+        serde_json::from_slice(&response.body)
+            .context("failed to parse /store/map/cluster-entries response")
     }
 
     pub async fn store_index_delta(

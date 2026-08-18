@@ -13,11 +13,11 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use client_sdk::{
     ClientConnectionRouteSnapshot, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    ConnectionBootstrapDiagnosticTargets, IronMeshClient, LatencyProbeComparison,
-    LatencyProbeConfig, LatencyProbeResult, RelayMode, RendezvousClientConfig,
-    RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
-    RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
-    StoreIndexView, StoreIndexViewport, UploadMode,
+    ConnectionBootstrapDiagnosticTargets, GalleryMapClustersRequest, IronMeshClient,
+    LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult, RelayMode,
+    RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
+    RendezvousEndpointStatus, RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions,
+    StoreIndexSortOrder, StoreIndexView, StoreIndexViewport, UploadMode,
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     ironmesh_client::DownloadRangeRequest,
@@ -419,6 +419,11 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/cluster/replication/plan", get(web_replication_plan))
         .route("/store/list", get(web_store_list))
         .route("/store/index/delta", get(web_store_index_delta))
+        .route("/store/map/clusters", get(web_gallery_map_clusters))
+        .route(
+            "/store/map/cluster-entries",
+            get(web_gallery_map_cluster_entries),
+        )
         .route("/store/get", get(web_store_get))
         .route("/store/put", post(web_store_put))
         .route("/store/rename", post(web_store_rename))
@@ -481,6 +486,11 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/cluster/replication/plan", get(web_replication_plan))
         .route("/api/store/list", get(web_store_list))
         .route("/api/store/index/delta", get(web_store_index_delta))
+        .route("/api/store/map/clusters", get(web_gallery_map_clusters))
+        .route(
+            "/api/store/map/cluster-entries",
+            get(web_gallery_map_cluster_entries),
+        )
         .route("/api/store/get", get(web_store_get))
         .route("/api/store/put", post(web_store_put))
         .route("/api/store/rename", post(web_store_rename))
@@ -638,6 +648,26 @@ struct WebStoreListQuery {
 #[derive(Debug, Deserialize)]
 struct WebStoreIndexDeltaQuery {
     token: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebGalleryMapClustersQuery {
+    prefix: Option<String>,
+    depth: Option<usize>,
+    media_filter: Option<String>,
+    south: f64,
+    west: f64,
+    north: f64,
+    east: f64,
+    zoom: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebGalleryMapClusterEntriesQuery {
+    query_token: String,
+    cluster_id: String,
+    offset: Option<usize>,
     limit: Option<usize>,
 }
 
@@ -2896,6 +2926,78 @@ async fn web_store_list(
             StatusCode::BAD_GATEWAY,
             "store list request failed",
             err.to_string(),
+        ),
+    }
+}
+
+async fn web_gallery_map_clusters(
+    State(state): State<WebState>,
+    Query(query): Query<WebGalleryMapClustersQuery>,
+) -> impl IntoResponse {
+    let media_filter = match query.media_filter.as_deref() {
+        None | Some("all") => StoreIndexMediaFilter::All,
+        Some("image") => StoreIndexMediaFilter::Image,
+        Some("video") => StoreIndexMediaFilter::Video,
+        Some(other) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported gallery map media filter: {other}"),
+            );
+        }
+    };
+    let request = GalleryMapClustersRequest {
+        prefix: query.prefix,
+        depth: query.depth.unwrap_or(1).max(1),
+        media_filter,
+        viewport: StoreIndexViewport {
+            south: query.south,
+            west: query.west,
+            north: query.north,
+            east: query.east,
+        },
+        zoom: query.zoom.unwrap_or(1).min(20),
+    };
+    match current_sdk(&state)
+        .await
+        .gallery_map_clusters(request)
+        .await
+    {
+        Ok(value) => (StatusCode::OK, Json(serde_json::json!(value))).into_response(),
+        Err(error) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "gallery map cluster request failed",
+            error.to_string(),
+        ),
+    }
+}
+
+async fn web_gallery_map_cluster_entries(
+    State(state): State<WebState>,
+    Query(query): Query<WebGalleryMapClusterEntriesQuery>,
+) -> impl IntoResponse {
+    if query.query_token.trim().is_empty() || query.cluster_id.trim().is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "query_token and cluster_id are required",
+        );
+    }
+    match current_sdk(&state)
+        .await
+        .gallery_map_cluster_entries(
+            &query.query_token,
+            &query.cluster_id,
+            query.offset.unwrap_or(0),
+            query.limit.unwrap_or(100).max(1),
+        )
+        .await
+    {
+        Ok(value) => (StatusCode::OK, Json(serde_json::json!(value))).into_response(),
+        Err(error) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "gallery map cluster entries request failed",
+            error.to_string(),
         ),
     }
 }

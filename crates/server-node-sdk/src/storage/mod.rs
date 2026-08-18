@@ -1052,6 +1052,51 @@ pub(crate) struct GalleryIndexPage {
     pub(crate) entries: Vec<GalleryIndexEntry>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GalleryMapClusterQuery {
+    pub(crate) prefix: String,
+    pub(crate) depth: usize,
+    pub(crate) media_filter: GalleryIndexMediaFilter,
+    pub(crate) viewport: GalleryViewportBounds,
+    pub(crate) requested_resolution: u32,
+    pub(crate) max_clusters: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GalleryMapCluster {
+    pub(crate) cell_x: u32,
+    pub(crate) cell_y: u32,
+    pub(crate) count: usize,
+    pub(crate) latitude: f64,
+    pub(crate) longitude: f64,
+    pub(crate) bounds: GalleryViewportBounds,
+    pub(crate) entry: Option<GalleryIndexEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GalleryMapClusterPage {
+    pub(crate) history_id: String,
+    pub(crate) revision: u64,
+    pub(crate) total_entry_count: usize,
+    pub(crate) media_summary: GalleryIndexMediaSummary,
+    pub(crate) visible_geotagged_count: usize,
+    pub(crate) resolution: u32,
+    pub(crate) clusters: Vec<GalleryMapCluster>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GalleryMapClusterEntriesQuery {
+    pub(crate) prefix: String,
+    pub(crate) depth: usize,
+    pub(crate) media_filter: GalleryIndexMediaFilter,
+    pub(crate) viewport: GalleryViewportBounds,
+    pub(crate) resolution: u32,
+    pub(crate) cell_x: u32,
+    pub(crate) cell_y: u32,
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GalleryDeltaScope {
     pub(crate) prefix: String,
@@ -1735,6 +1780,27 @@ pub(crate) fn gallery_media_type_for_path(path: &str) -> Option<&'static str> {
     None
 }
 
+const WEB_MERCATOR_MAX_LATITUDE: f64 = 85.051_128_779_806_6;
+
+pub(super) fn gallery_web_mercator_position(latitude: f64, longitude: f64) -> Option<(f64, f64)> {
+    if !latitude.is_finite()
+        || !longitude.is_finite()
+        || !(-90.0..=90.0).contains(&latitude)
+        || !(-180.0..=180.0).contains(&longitude)
+    {
+        return None;
+    }
+
+    let latitude = latitude.clamp(-WEB_MERCATOR_MAX_LATITUDE, WEB_MERCATOR_MAX_LATITUDE);
+    let x = ((longitude + 180.0) / 360.0).clamp(0.0, 1.0 - f64::EPSILON);
+    let latitude_radians = latitude.to_radians();
+    let y = (0.5
+        - ((1.0 + latitude_radians.sin()) / (1.0 - latitude_radians.sin())).ln()
+            / (4.0 * std::f64::consts::PI))
+        .clamp(0.0, 1.0 - f64::EPSILON);
+    Some((x, y))
+}
+
 pub(super) fn gallery_index_media_type_from_metadata(
     metadata: Option<&CachedMediaMetadata>,
 ) -> Option<&str> {
@@ -2289,6 +2355,14 @@ trait MetadataStore: Send + Sync {
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
+    ) -> Result<Option<GalleryIndexPage>>;
+    async fn query_gallery_map_clusters(
+        &self,
+        query: &GalleryMapClusterQuery,
+    ) -> Result<Option<GalleryMapClusterPage>>;
+    async fn query_gallery_map_cluster_entries(
+        &self,
+        query: &GalleryMapClusterEntriesQuery,
     ) -> Result<Option<GalleryIndexPage>>;
     async fn query_gallery_delta(
         &self,
@@ -3539,6 +3613,22 @@ impl PersistentStore {
         query: &GalleryIndexQuery,
     ) -> Result<Option<GalleryIndexPage>> {
         self.metadata_store.query_gallery_index(query).await
+    }
+
+    pub(crate) async fn query_gallery_map_clusters(
+        &self,
+        query: &GalleryMapClusterQuery,
+    ) -> Result<Option<GalleryMapClusterPage>> {
+        self.metadata_store.query_gallery_map_clusters(query).await
+    }
+
+    pub(crate) async fn query_gallery_map_cluster_entries(
+        &self,
+        query: &GalleryMapClusterEntriesQuery,
+    ) -> Result<Option<GalleryIndexPage>> {
+        self.metadata_store
+            .query_gallery_map_cluster_entries(query)
+            .await
     }
 
     pub(crate) async fn query_gallery_delta(
