@@ -492,14 +492,9 @@ fn photo_property_value(name: &str, media: &NamespaceMediaMetadata) -> Result<PR
             .focal_length_mm
             .map(PROPVARIANT::from)
             .unwrap_or_default()),
-        "System.Photo.Flash" => Ok(photo
-            .flash
-            .and_then(|value| u8::try_from(value).ok())
-            .map(PROPVARIANT::from)
-            .unwrap_or_default()),
+        "System.Photo.Flash" => Ok(photo.flash.map(PROPVARIANT::from).unwrap_or_default()),
         "System.Photo.WhiteBalance" => Ok(photo
             .white_balance
-            .map(u32::from)
             .map(PROPVARIANT::from)
             .unwrap_or_default()),
         _ => Ok(PROPVARIANT::default()),
@@ -1910,7 +1905,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use sync_core::{NamespaceGpsCoordinates, NamespaceMediaMetadata, NamespacePhotoMetadata};
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
-    use windows::Win32::System::Variant::VT_FILETIME;
+    use windows::Win32::System::Variant::{VT_FILETIME, VT_UI2};
     use windows::Win32::UI::Shell::{WTS_E_EXTRACTIONPENDING, WTS_E_FAILEDEXTRACTION};
 
     fn test_temp_dir(label: &str) -> PathBuf {
@@ -2018,6 +2013,8 @@ mod tests {
             photo: Some(NamespacePhotoMetadata {
                 iso_speed: Some(200),
                 exposure_time_seconds: Some(0.008),
+                flash: Some(7),
+                white_balance: Some(1),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2031,6 +2028,13 @@ mod tests {
         assert_eq!(u32::try_from(&iso).unwrap(), 200);
         let exposure = explorer_property_value("System.Photo.ExposureTime", &identity).unwrap();
         assert_eq!(f64::try_from(&exposure).unwrap(), 0.008);
+        let flash = explorer_property_value("System.Photo.Flash", &identity).unwrap();
+        assert_eq!(flash.vt(), VT_UI2);
+        assert_eq!(u16::try_from(&flash).unwrap(), 7);
+        let white_balance =
+            explorer_property_value("System.Photo.WhiteBalance", &identity).unwrap();
+        assert_eq!(white_balance.vt(), VT_UI2);
+        assert_eq!(u16::try_from(&white_balance).unwrap(), 1);
         assert_eq!(decimal_degrees_to_dms(-47.5), [47.0, 30.0, 0.0]);
         assert_eq!(
             fourcc_property_value("avc1"),
