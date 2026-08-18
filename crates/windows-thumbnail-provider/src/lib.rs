@@ -1907,6 +1907,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use sync_core::{NamespaceGpsCoordinates, NamespaceMediaMetadata, NamespacePhotoMetadata};
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
     use windows::Win32::System::Variant::VT_FILETIME;
     use windows::Win32::UI::Shell::{WTS_E_EXTRACTIONPENDING, WTS_E_FAILEDEXTRACTION};
 
@@ -1987,10 +1988,14 @@ mod tests {
 
     #[test]
     fn all_declared_explorer_properties_have_registered_canonical_keys() {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .expect("COM should initialize for property-system lookup");
         for name in SUPPORTED_PROPERTY_NAMES {
             property_key_from_name(name)
                 .unwrap_or_else(|error| panic!("{name} should resolve to a PROPERTYKEY: {error}"));
         }
+        unsafe { CoUninitialize() };
     }
 
     #[test]
