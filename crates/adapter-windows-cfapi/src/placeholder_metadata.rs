@@ -360,7 +360,10 @@ fn mutate_placeholder_identity_for_path(
     };
     let original_identity = identity.clone();
     mutator(&mut identity);
-    if identity == original_identity && fs_metadata.is_none() {
+    // The remote modification time is part of the identity. If the identity is
+    // unchanged, the requested filesystem metadata was already applied by the
+    // update that stored it, so avoid reopening every placeholder on refresh.
+    if identity == original_identity {
         return Ok(());
     }
     let encoded = identity.encoded();
