@@ -2056,7 +2056,6 @@ mod tests {
                 focal_length_mm: Some(50.0),
                 flash: Some(7),
                 white_balance: Some(1),
-                ..Default::default()
             }),
             ..Default::default()
         });
