@@ -7316,6 +7316,7 @@ dependencies = [
  "client-sdk",
  "common",
  "flume",
+ "fs2",
  "git-version",
  "http-body-util",
  "mime_guess",
