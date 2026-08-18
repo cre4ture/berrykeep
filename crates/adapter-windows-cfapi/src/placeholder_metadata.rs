@@ -152,7 +152,7 @@ pub fn refresh_remote_placeholder_state(
             .map(ToString::to_string);
         identity.remote_size_bytes = remote_size_bytes;
         identity.remote_modified_at_unix = remote_modified_at_unix;
-        identity.remote_media = remote_media.cloned();
+        identity.set_remote_media(remote_media.cloned());
     })
 }
 
@@ -447,6 +447,7 @@ fn identity_has_remote_baseline(identity: &PlaceholderFileIdentity) -> bool {
         || identity.remote_size_bytes.is_some()
         || identity.remote_modified_at_unix.is_some()
         || identity.remote_media.is_some()
+        || identity.remote_media_absent
         || identity.in_sync_content_fingerprint.is_some()
 }
 

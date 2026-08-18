@@ -1151,7 +1151,7 @@ pub fn apply_action_plan(
             identity.remote_content_fingerprint = remote_content_fingerprint.clone();
             identity.remote_size_bytes = remote_size;
             identity.remote_modified_at_unix = remote_modified_at_unix;
-            identity.remote_media = remote_media;
+            identity.set_remote_media(remote_media);
             identity.promote_remote_to_in_sync_content_baseline();
 
             inputs.push(PlaceholderInput {

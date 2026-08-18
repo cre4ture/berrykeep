@@ -79,6 +79,9 @@ pub struct PlaceholderFileIdentity {
     pub remote_size_bytes: Option<u64>,
     pub remote_modified_at_unix: Option<u64>,
     pub remote_media: Option<NamespaceMediaMetadata>,
+    /// Distinguishes a current non-media entry from a legacy identity or an
+    /// identity whose media payload was omitted because of the CFAPI limit.
+    pub remote_media_absent: bool,
     // Baseline fingerprint for the content version that should be treated as
     // clean/in sync, even when that content is not fully materialized locally.
     pub in_sync_content_fingerprint: Option<String>,
@@ -109,8 +112,17 @@ impl PlaceholderFileIdentity {
         }
     }
 
+    pub fn set_remote_media(&mut self, remote_media: Option<NamespaceMediaMetadata>) {
+        self.remote_media_absent = remote_media.is_none();
+        self.remote_media = remote_media;
+    }
+
+    pub fn has_remote_media_result(&self) -> bool {
+        self.remote_media.is_some() || self.remote_media_absent
+    }
+
     pub fn encoded(&self) -> Vec<u8> {
-        let mut lines = Vec::with_capacity(11);
+        let mut lines = Vec::with_capacity(12);
         lines.push(format!("v={}", Self::SCHEMA_VERSION));
         lines.push(format!("p={}", normalize_path(&self.path)));
         if let Some(remote_version) = self
@@ -147,6 +159,8 @@ impl PlaceholderFileIdentity {
             && let Ok(encoded_media) = serde_json::to_string(remote_media)
         {
             lines.push(format!("md={encoded_media}"));
+        } else if self.remote_media_absent {
+            lines.push("ma=1".to_string());
         }
         if let Some(in_sync_content_fingerprint) = self
             .in_sync_content_fingerprint
@@ -213,6 +227,9 @@ pub fn decode_placeholder_file_identity(file_identity: &[u8]) -> Option<Placehol
             }
             "md" => {
                 identity.remote_media = serde_json::from_str(value).ok();
+            }
+            "ma" => {
+                identity.remote_media_absent = value.trim() == "1";
             }
             "cf" | "if" => {
                 identity.in_sync_content_fingerprint = Some(value.to_string());
@@ -463,13 +480,13 @@ mod tests {
     fn placeholder_identity_drops_oversized_media_metadata() {
         let mut identity = PlaceholderFileIdentity::new("photos/large.jpg");
         identity.remote_modified_at_unix = Some(1_723_456_789);
-        identity.remote_media = Some(NamespaceMediaMetadata {
+        identity.set_remote_media(Some(NamespaceMediaMetadata {
             photo: Some(NamespacePhotoMetadata {
                 lens_model: Some("x".repeat(5_000)),
                 ..Default::default()
             }),
             ..Default::default()
-        });
+        }));
 
         let encoded = identity.encoded();
         let decoded =
@@ -478,6 +495,20 @@ mod tests {
         assert!(encoded.len() <= super::MAX_CFAPI_FILE_IDENTITY_BYTES);
         assert_eq!(decoded.remote_modified_at_unix, Some(1_723_456_789));
         assert!(decoded.remote_media.is_none());
+        assert!(!decoded.has_remote_media_result());
+    }
+
+    #[test]
+    fn placeholder_identity_round_trips_confirmed_absent_media() {
+        let mut identity = PlaceholderFileIdentity::new("docs/readme.txt");
+        identity.set_remote_media(None);
+
+        let encoded = identity.encoded();
+        let decoded = decode_placeholder_file_identity(&encoded).expect("identity should decode");
+
+        assert!(decoded.remote_media.is_none());
+        assert!(decoded.remote_media_absent);
+        assert!(decoded.has_remote_media_result());
     }
 
     #[test]

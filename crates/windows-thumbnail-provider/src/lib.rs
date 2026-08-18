@@ -1416,7 +1416,7 @@ fn load_property_metadata_for_source_path(
 
     if local_identity
         .as_ref()
-        .is_some_and(|identity| identity.remote_media.is_some())
+        .is_some_and(PlaceholderFileIdentity::has_remote_media_result)
     {
         return Ok(local_identity.expect("checked local property metadata"));
     }
@@ -1447,9 +1447,11 @@ fn load_property_metadata_for_source_path(
     identity.remote_content_fingerprint = entry.content_fingerprint;
     identity.remote_size_bytes = entry.size_bytes;
     identity.remote_modified_at_unix = entry.modified_at_unix;
-    identity.remote_media = entry
-        .media
-        .map(client_sdk::ironmesh_client::namespace_media_metadata);
+    identity.set_remote_media(
+        entry
+            .media
+            .map(client_sdk::ironmesh_client::namespace_media_metadata),
+    );
     Ok(identity)
 }
 
