@@ -738,6 +738,77 @@ jobs:
           path: ${{ runner.temp }}/android-gallery-runtime.log
           if-no-files-found: ignore
 
+  static-server-node-build:
+    name: Static Server Node (x86_64)
+    runs-on: ubuntu-24.04
+    needs: workspace-check
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install web workspace dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-02-17
+
+      - name: Install ELF verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils file xz-utils
+
+      - name: Restore Zig toolchain cache
+        id: restore-zig
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ironmesh-build-tools
+          key: static-server-node-zig-0.16.0-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: static-server-node-x86-64
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build and verify static x86_64 Server Node
+        run: |
+          ./scripts/build-static-server-node.sh \
+            --target x86_64-unknown-linux-musl \
+            --variant-id x86_64-generic \
+            --run-smoke always
+
+      - name: Save Zig toolchain cache
+        if: ${{ github.event_name != 'pull_request' && steps.restore-zig.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ironmesh-build-tools
+          key: ${{ steps.restore-zig.outputs.cache-primary-key }}
+
+      - name: Upload static x86_64 Server Node
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-server-node-linux-amd64
+          path: |
+            target/static-server-node/*.tar.gz
+            target/static-server-node/*.tar.gz.sha256
+          if-no-files-found: error
+
   fuse-mount-build:
     name: Linux binaries
     runs-on: ubuntu-24.04
@@ -789,7 +860,6 @@ jobs:
       - name: Build Linux release binary bundle
         run: |
           cargo build --locked --release \
-            -p server-node \
             -p cli-client \
             -p ironmesh-config-app \
             -p ironmesh-background-launcher \
@@ -797,7 +867,6 @@ jobs:
             -p os-integration \
             -p rendezvous-service
           mkdir -p artifacts/linux-debian-binaries
-          install -m0755 target/release/ironmesh-server-node artifacts/linux-debian-binaries/
           install -m0755 target/release/ironmesh-rendezvous-service artifacts/linux-debian-binaries/
           install -m0755 target/release/ironmesh artifacts/linux-debian-binaries/
           install -m0755 target/release/ironmesh-config-app artifacts/linux-debian-binaries/
@@ -826,7 +895,7 @@ jobs:
   debian-package-build:
     name: Debian packages
     runs-on: ubuntu-24.04
-    needs: fuse-mount-build
+    needs: [fuse-mount-build, static-server-node-build]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -837,11 +906,36 @@ jobs:
           name: linux-debian-binaries-ubuntu
           path: ${{ runner.temp }}/linux-debian-binary-archive
 
+      - name: Download static Server Node
+        uses: actions/download-artifact@v4
+        with:
+          name: static-server-node-linux-amd64
+          path: ${{ runner.temp }}/static-server-node-archive
+
       - name: Extract Linux release binary bundle
         run: |
           mkdir -p "${RUNNER_TEMP}/linux-debian-binaries"
           tar -xzf "${RUNNER_TEMP}/linux-debian-binary-archive/linux-debian-binaries.tar.gz" \
             -C "${RUNNER_TEMP}/linux-debian-binaries"
+
+      - name: Add static Server Node to package bundle
+        run: |
+          (
+            cd "${RUNNER_TEMP}/static-server-node-archive"
+            sha256sum -c ./*.tar.gz.sha256
+          )
+          mkdir -p "${RUNNER_TEMP}/static-server-node"
+          tar -xzf "${RUNNER_TEMP}"/static-server-node-archive/*.tar.gz \
+            -C "${RUNNER_TEMP}/static-server-node"
+          static_binary="$(find "${RUNNER_TEMP}/static-server-node" -type f \
+            -name ironmesh-server-node -print -quit)"
+          test -n "$static_binary"
+          (
+            cd "$(dirname "$static_binary")"
+            sha256sum -c SHA256SUMS
+          )
+          install -m0755 "$static_binary" \
+            "${RUNNER_TEMP}/linux-debian-binaries/ironmesh-server-node"
 
       - name: Install Debian packaging tools
         run: |
@@ -1002,6 +1096,7 @@ jobs:
       - clippy
       - unit-tests
       - ios-build
+      - static-server-node-build
     runs-on: ubuntu-latest
     steps:
       - name: Verify required CI results

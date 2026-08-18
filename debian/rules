@@ -9,8 +9,16 @@ export CARGO_NET_OFFLINE := true
 
 ifeq ($(IRONMESH_USE_PREBUILT_BINARIES),1)
 PACKAGE_BIN_DIR := $(IRONMESH_PREBUILT_BIN_DIR)
+SERVER_NODE_BIN := $(PACKAGE_BIN_DIR)/ironmesh-server-node
 else
 PACKAGE_BIN_DIR := $(CARGO_TARGET_DIR)/release
+ifeq ($(IRONMESH_USE_PREBUILT_SERVER_NODE),1)
+SERVER_NODE_BIN := $(IRONMESH_PREBUILT_SERVER_NODE_BIN)
+SERVER_NODE_CARGO_PACKAGE :=
+else
+SERVER_NODE_BIN := $(PACKAGE_BIN_DIR)/ironmesh-server-node
+SERVER_NODE_CARGO_PACKAGE := -p server-node
+endif
 endif
 
 PACKAGE_BINARIES := \
@@ -21,6 +29,15 @@ PACKAGE_BINARIES := \
 	ironmesh-background-launcher \
 	ironmesh-folder-agent \
 	ironmesh-os-integration
+
+CARGO_PACKAGE_ARGS := \
+	$(SERVER_NODE_CARGO_PACKAGE) \
+	-p cli-client \
+	-p ironmesh-config-app \
+	-p ironmesh-background-launcher \
+	-p ironmesh-folder-agent \
+	-p os-integration \
+	-p rendezvous-service
 
 CARGO_BIN := $(firstword $(wildcard /usr/bin/cargo-1.91 /usr/bin/cargo-1.89 /usr/bin/cargo-1.85 /usr/bin/cargo $(HOME)/.cargo/bin/cargo))
 RUSTC_BIN := $(firstword $(wildcard /usr/bin/rustc-1.91 /usr/bin/rustc-1.89 /usr/bin/rustc-1.85 /usr/bin/rustc $(HOME)/.cargo/bin/rustc))
@@ -52,6 +69,10 @@ override_dh_auto_build:
 	:
 else
 override_dh_auto_configure:
+	if [ "$(IRONMESH_USE_PREBUILT_SERVER_NODE)" = "1" ]; then \
+		test -x "$(SERVER_NODE_BIN)" || \
+			(echo "missing prebuilt server-node binary: $(SERVER_NODE_BIN)" >&2; exit 1); \
+	fi
 	test -n "$(CLANG_BIN)" || \
 		(echo "missing clang; install the Debian build dependencies" >&2; exit 1)
 	test -n "$(CLANGXX_BIN)" || \
@@ -80,13 +101,7 @@ override_dh_auto_build:
 		--locked \
 		--offline \
 		--release \
-		-p server-node \
-		-p cli-client \
-		-p ironmesh-config-app \
-		-p ironmesh-background-launcher \
-		-p ironmesh-folder-agent \
-		-p os-integration \
-		-p rendezvous-service
+		$(CARGO_PACKAGE_ARGS)
 endif
 
 override_dh_auto_test:
@@ -95,9 +110,14 @@ override_dh_auto_test:
 	# source package builds cleanly for the requested Ubuntu series.
 	:
 
+override_dh_shlibdeps:
+	dh_shlibdeps
+	grep -q '^shlibs:Depends=' debian/ironmesh-server-node.substvars 2>/dev/null || \
+		printf '%s\n' 'shlibs:Depends=' >> debian/ironmesh-server-node.substvars
+
 override_dh_auto_install:
 	install -d $(CURDIR)/debian/ironmesh-server-node/usr/bin
-	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-server-node \
+	install -m0755 $(SERVER_NODE_BIN) \
 		$(CURDIR)/debian/ironmesh-server-node/usr/bin/ironmesh-server-node
 	install -d $(CURDIR)/debian/ironmesh-server-node/etc/ironmesh
 	install -m0644 debian/ironmesh-server-node.env \

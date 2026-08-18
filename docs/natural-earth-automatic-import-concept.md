@@ -160,8 +160,10 @@ arguments are server-controlled. The feature accepts neither an arbitrary URL
 nor shell fragments. The physical profile needs `unzip`, `gdal_rasterize`,
 `gdalwarp`, `gdal_translate`, and `gdaladdo` on `PATH`; the labels profile also
 needs `ogr2ogr`. Debian installations receive all GDAL commands from `gdal-bin`
-and archive extraction from `unzip`. Dependency checks use `unzip -v`, which is
-supported by Info-ZIP, rather than the unsupported `--version` spelling.
+and archive extraction from `unzip` through the optional
+`ironmesh-server-node-map-tools` package. The core Server Node package does not
+depend on those programs. Dependency checks use `unzip -v`, which is supported
+by Info-ZIP, rather than the unsupported `--version` spelling.
 
 The feature intentionally does not accept uploaded archives, arbitrary
 Shapefiles/GeoPackages, custom styles, PMTiles output, or arbitrary vector

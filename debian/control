@@ -18,13 +18,23 @@ Section: net
 Architecture: any
 Depends:
  ${misc:Depends},
- ${shlibs:Depends},
- gdal-bin,
- unzip
+ ${shlibs:Depends}
 Description: Ironmesh storage server node
  Ironmesh server node for the distributed storage platform workspace.
  This package ships the `ironmesh-server-node` service binary with the embedded
  server-admin web UI.
+
+Package: ironmesh-server-node-map-tools
+Section: net
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ironmesh-server-node (= ${binary:Version}),
+ gdal-bin,
+ unzip
+Description: Optional Natural Earth import tools for Ironmesh server nodes
+ Installs the GDAL command-line tools and unzip utility used by the optional
+ Natural Earth map import workflows in ironmesh-server-node.
 
 Package: ironmesh-client
 Section: utils
