@@ -32,6 +32,12 @@ pub struct RemoteDeleteReconcileReport {
     pub suppressed_startup_paths: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteFileMetadataPolicy {
+    ApplyAndMarkInSync,
+    PreserveLocalConflict,
+}
+
 pub fn record_in_sync_local_file_state(
     sync_root_path: &Path,
     relative_path: &str,
@@ -104,6 +110,57 @@ pub fn refresh_remote_placeholder_state(
     remote_modified_at_unix: Option<u64>,
     remote_media: Option<&sync_core::NamespaceMediaMetadata>,
 ) -> Result<()> {
+    refresh_remote_placeholder_state_with_policy(
+        sync_root_path,
+        relative_path,
+        provider_instance_id,
+        remote_version,
+        remote_content_hash,
+        remote_size_bytes,
+        remote_content_fingerprint,
+        remote_modified_at_unix,
+        remote_media,
+        RemoteFileMetadataPolicy::ApplyAndMarkInSync,
+    )
+}
+
+pub fn refresh_remote_conflict_identity(
+    sync_root_path: &Path,
+    relative_path: &str,
+    provider_instance_id: Uuid,
+    remote_version: Option<&str>,
+    remote_content_hash: Option<&str>,
+    remote_size_bytes: Option<u64>,
+    remote_content_fingerprint: Option<&str>,
+    remote_modified_at_unix: Option<u64>,
+    remote_media: Option<&sync_core::NamespaceMediaMetadata>,
+) -> Result<()> {
+    refresh_remote_placeholder_state_with_policy(
+        sync_root_path,
+        relative_path,
+        provider_instance_id,
+        remote_version,
+        remote_content_hash,
+        remote_size_bytes,
+        remote_content_fingerprint,
+        remote_modified_at_unix,
+        remote_media,
+        RemoteFileMetadataPolicy::PreserveLocalConflict,
+    )
+}
+
+fn refresh_remote_placeholder_state_with_policy(
+    sync_root_path: &Path,
+    relative_path: &str,
+    provider_instance_id: Uuid,
+    remote_version: Option<&str>,
+    remote_content_hash: Option<&str>,
+    remote_size_bytes: Option<u64>,
+    remote_content_fingerprint: Option<&str>,
+    remote_modified_at_unix: Option<u64>,
+    remote_media: Option<&sync_core::NamespaceMediaMetadata>,
+    file_metadata_policy: RemoteFileMetadataPolicy,
+) -> Result<()> {
     let normalized = normalize_path(relative_path);
     if normalized.is_empty() || is_internal_sync_root_relative_path(&normalized) {
         return Ok(());
@@ -125,15 +182,8 @@ pub fn refresh_remote_placeholder_state(
         .and_then(|value| i64::try_from(value).ok())
         .or_else(|| i64::try_from(metadata.len()).ok())
         .unwrap_or_default();
-    let fs_metadata = remote_modified_at_unix
-        .and_then(unix_seconds_to_windows_file_time)
-        .map(|last_write_time| CF_FS_METADATA {
-            BasicInfo: FILE_BASIC_INFO {
-                LastWriteTime: last_write_time,
-                ..Default::default()
-            },
-            FileSize: file_size,
-        });
+    let fs_metadata =
+        remote_file_system_metadata(file_metadata_policy, remote_modified_at_unix, file_size);
 
     mutate_placeholder_identity_for_path(sync_root_path, &normalized, fs_metadata, |identity| {
         identity.path = normalized.clone();
@@ -154,6 +204,25 @@ pub fn refresh_remote_placeholder_state(
         identity.remote_modified_at_unix = remote_modified_at_unix;
         identity.set_remote_media(remote_media.cloned());
     })
+}
+
+fn remote_file_system_metadata(
+    file_metadata_policy: RemoteFileMetadataPolicy,
+    remote_modified_at_unix: Option<u64>,
+    file_size: i64,
+) -> Option<CF_FS_METADATA> {
+    match file_metadata_policy {
+        RemoteFileMetadataPolicy::ApplyAndMarkInSync => remote_modified_at_unix
+            .and_then(unix_seconds_to_windows_file_time)
+            .map(|last_write_time| CF_FS_METADATA {
+                BasicInfo: FILE_BASIC_INFO {
+                    LastWriteTime: last_write_time,
+                    ..Default::default()
+                },
+                FileSize: file_size,
+            }),
+        RemoteFileMetadataPolicy::PreserveLocalConflict => None,
+    }
 }
 
 pub fn reconcile_remote_delete_state(
@@ -461,6 +530,26 @@ fn is_internal_sync_root_relative_path(path: &str) -> bool {
 mod tests {
     use super::*;
     use sync_core::NamespaceEntry;
+
+    #[test]
+    fn conflict_refresh_preserves_local_file_metadata_and_sync_state() {
+        assert!(
+            remote_file_system_metadata(
+                RemoteFileMetadataPolicy::PreserveLocalConflict,
+                Some(1_723_456_789),
+                42,
+            )
+            .is_none()
+        );
+        assert!(
+            remote_file_system_metadata(
+                RemoteFileMetadataPolicy::ApplyAndMarkInSync,
+                Some(1_723_456_789),
+                42,
+            )
+            .is_some()
+        );
+    }
 
     #[test]
     fn reconcile_remote_delete_preserves_local_only_plain_files() {

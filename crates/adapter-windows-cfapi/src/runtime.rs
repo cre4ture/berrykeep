@@ -29,7 +29,9 @@ use crate::hydration_control::{
     clear_active_hydration, clear_hydration_cancel_request, has_hydration_cancel_request,
     mark_active_hydration,
 };
-use crate::placeholder_metadata::refresh_remote_placeholder_state;
+use crate::placeholder_metadata::{
+    refresh_remote_conflict_identity, refresh_remote_placeholder_state,
+};
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use crate::sync_root_identity::{
     SyncRootIdentity, load_registered_sync_root_context, normalize_prefix,
@@ -1273,7 +1275,7 @@ pub fn apply_action_plan(
                     );
                     continue;
                 }
-                if let Err(err) = refresh_remote_placeholder_state(
+                if let Err(err) = refresh_remote_conflict_identity(
                     root_path,
                     path,
                     provider_instance_id,
