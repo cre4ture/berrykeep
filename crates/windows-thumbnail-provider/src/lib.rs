@@ -482,7 +482,11 @@ fn photo_property_value(name: &str, media: &NamespaceMediaMetadata) -> Result<PR
             .as_deref()
             .map(string_property_value)
             .unwrap_or_else(|| Ok(PROPVARIANT::default())),
-        "System.Photo.ISOSpeed" => Ok(photo.iso_speed.map(PROPVARIANT::from).unwrap_or_default()),
+        "System.Photo.ISOSpeed" => Ok(photo
+            .iso_speed
+            .and_then(|value| u16::try_from(value).ok())
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
         "System.Photo.ExposureTime" => Ok(photo
             .exposure_time_seconds
             .map(PROPVARIANT::from)
@@ -1901,12 +1905,30 @@ mod tests {
     use adapter_windows_cfapi::helpers::PlaceholderFileIdentity;
     use anyhow::anyhow;
     use reqwest::StatusCode;
+    use std::ffi::c_void;
     use std::path::{Path, PathBuf};
+    use std::ptr::null_mut;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use sync_core::{NamespaceGpsCoordinates, NamespaceMediaMetadata, NamespacePhotoMetadata};
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
     use windows::Win32::System::Variant::{VT_FILETIME, VT_UI2};
+    use windows::Win32::UI::Shell::PropertiesSystem::{
+        IPropertyDescription, PSGetPropertyDescription,
+    };
     use windows::Win32::UI::Shell::{WTS_E_EXTRACTIONPENDING, WTS_E_FAILEDEXTRACTION};
+    use windows_core::Interface;
+
+    fn canonical_property_type(name: &str) -> u16 {
+        let key = property_key_from_name(name).expect("property key should resolve");
+        let mut description = null_mut::<c_void>();
+        unsafe {
+            PSGetPropertyDescription(&key, &IPropertyDescription::IID, &mut description)
+                .expect("property description should resolve");
+            IPropertyDescription::from_raw(description)
+                .GetPropertyType()
+                .expect("property type should resolve")
+        }
+    }
 
     fn test_temp_dir(label: &str) -> PathBuf {
         let unique_suffix = SystemTime::now()
@@ -2006,13 +2028,24 @@ mod tests {
             height: Some(3_024),
             orientation: Some(6),
             taken_at_unix: Some(1_700_000_000),
+            date_encoded_unix: Some(1_699_999_000),
+            duration_millis: Some(123_456),
+            frame_rate_millihertz: Some(29_970),
+            total_bitrate_bps: Some(8_000_000),
+            codec_fourcc: Some("avc1".to_string()),
             gps: Some(NamespaceGpsCoordinates {
                 latitude: 47.3769,
                 longitude: 8.5417,
             }),
             photo: Some(NamespacePhotoMetadata {
+                camera_manufacturer: Some("Contoso".to_string()),
+                camera_model: Some("Camera One".to_string()),
+                lens_manufacturer: Some("Contoso".to_string()),
+                lens_model: Some("Prime 50".to_string()),
                 iso_speed: Some(200),
                 exposure_time_seconds: Some(0.008),
+                f_number: Some(2.8),
+                focal_length_mm: Some(50.0),
                 flash: Some(7),
                 white_balance: Some(1),
                 ..Default::default()
@@ -2035,6 +2068,23 @@ mod tests {
             explorer_property_value("System.Photo.WhiteBalance", &identity).unwrap();
         assert_eq!(white_balance.vt(), VT_UI2);
         assert_eq!(u16::try_from(&white_balance).unwrap(), 1);
+        for name in SUPPORTED_PROPERTY_NAMES {
+            let mut property_identity = identity.clone();
+            if name.starts_with("System.Video.") {
+                property_identity
+                    .remote_media
+                    .as_mut()
+                    .expect("test media should exist")
+                    .media_type = Some("video".to_string());
+            }
+            let value = explorer_property_value(name, &property_identity)
+                .unwrap_or_else(|error| panic!("{name} should produce a value: {error}"));
+            assert_eq!(
+                value.vt().0 as u16,
+                canonical_property_type(name),
+                "{name} should use its canonical Windows property type"
+            );
+        }
         assert_eq!(decimal_degrees_to_dms(-47.5), [47.0, 30.0, 0.0]);
         assert_eq!(
             fourcc_property_value("avc1"),
