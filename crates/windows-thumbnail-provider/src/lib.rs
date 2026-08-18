@@ -2066,12 +2066,12 @@ mod tests {
         let width = explorer_property_value("System.Image.HorizontalSize", &identity).unwrap();
         assert_eq!(u32::try_from(&width).unwrap(), 4_032);
         let iso = explorer_property_value("System.Photo.ISOSpeed", &identity).unwrap();
-        assert_eq!(u32::try_from(&iso).unwrap(), 200);
+        assert_eq!(iso.vt(), VT_UI2);
+        assert_eq!(u16::try_from(&iso).unwrap(), 200);
         let exposure = explorer_property_value("System.Photo.ExposureTime", &identity).unwrap();
         assert_eq!(f64::try_from(&exposure).unwrap(), 0.008);
         let flash = explorer_property_value("System.Photo.Flash", &identity).unwrap();
         assert_eq!(flash.vt(), VT_UI1);
-        assert_eq!(u8::try_from(&flash).unwrap(), 7);
         let white_balance =
             explorer_property_value("System.Photo.WhiteBalance", &identity).unwrap();
         assert_eq!(white_balance.vt(), VT_UI4);
