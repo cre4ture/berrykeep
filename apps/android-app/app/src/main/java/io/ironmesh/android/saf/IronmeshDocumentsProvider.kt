@@ -91,7 +91,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         val emittedDocumentIds = LinkedHashSet<String>()
 
         entries.forEach { entry ->
-            if (entry.entry_type == "prefix") {
+            if (entry.entry_type == "prefix" || entry.path.endsWith('/')) {
                 val dirPath = entry.path.trimEnd('/')
                 if (!isDirectStoreIndexChildPath(parent.path, dirPath)) {
                     return@forEach
@@ -491,14 +491,13 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     }
 
     private suspend fun loadDirectoryEntries(prefix: String?): List<StoreIndexEntry> {
-        val entries = repository.storeIndex(
+        val entries = repository.storeIndexDirectoryListing(
             connectionInput = resolveConnectionInput(),
             prefix = prefix,
             depth = 1,
-            snapshot = null,
             serverCaPem = resolveServerCaPem(),
             clientIdentityJson = resolveClientIdentityJson(),
-        )
+        ).entries
 
         entries.forEach { entry ->
             if (entry.entry_type == "key") {
