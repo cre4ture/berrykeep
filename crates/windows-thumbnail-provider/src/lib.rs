@@ -360,12 +360,20 @@ fn property_key_from_name(name: &str) -> Result<PROPERTYKEY> {
     Ok(key)
 }
 
-fn canonical_property_name(key: &PROPERTYKEY) -> Option<&'static str> {
-    SUPPORTED_PROPERTY_NAMES.iter().copied().find(|name| {
-        property_key_from_name(name)
-            .map(|candidate| candidate == *key)
-            .unwrap_or(false)
+fn supported_property_keys() -> &'static [(PROPERTYKEY, &'static str)] {
+    static KEYS: OnceLock<Vec<(PROPERTYKEY, &'static str)>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        SUPPORTED_PROPERTY_NAMES
+            .iter()
+            .filter_map(|&name| property_key_from_name(name).ok().map(|key| (key, name)))
+            .collect()
     })
+}
+
+fn canonical_property_name(key: &PROPERTYKEY) -> Option<&'static str> {
+    supported_property_keys()
+        .iter()
+        .find_map(|(candidate, name)| (candidate == key).then_some(*name))
 }
 
 fn string_property_value(value: &str) -> Result<PROPVARIANT> {
@@ -1902,9 +1910,9 @@ mod tests {
         MAX_CACHED_THUMBNAIL_CLIENTS, MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE,
         SUPPORTED_PROPERTY_NAMES, ThumbnailClientBuild, ThumbnailClientCache,
         ThumbnailClientCacheKey, ThumbnailFailureKind, ThumbnailProviderError,
-        decimal_degrees_to_dms, explorer_property_value, fourcc_property_value,
-        media_thumbnail_request_path, modified_at_unix_ms, property_key_from_name,
-        prototype_bgra_pixels, remote_key_for_item, rgba_pixels_to_bgra,
+        canonical_property_name, decimal_degrees_to_dms, explorer_property_value,
+        fourcc_property_value, media_thumbnail_request_path, modified_at_unix_ms,
+        property_key_from_name, prototype_bgra_pixels, remote_key_for_item, rgba_pixels_to_bgra,
         thumbnail_client_cache_key, thumbnail_status_should_retry,
     };
     use adapter_windows_cfapi::helpers::PlaceholderFileIdentity;
@@ -2016,9 +2024,13 @@ mod tests {
             .ok()
             .expect("COM should initialize for property-system lookup");
         for name in SUPPORTED_PROPERTY_NAMES {
-            property_key_from_name(name)
+            let key = property_key_from_name(name)
                 .unwrap_or_else(|error| panic!("{name} should resolve to a PROPERTYKEY: {error}"));
+            assert_eq!(canonical_property_name(&key), Some(*name));
         }
+        let unsupported = property_key_from_name("System.Title")
+            .expect("unsupported canonical property key should resolve");
+        assert_eq!(canonical_property_name(&unsupported), None);
         unsafe { CoUninitialize() };
     }
 
