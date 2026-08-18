@@ -1269,6 +1269,11 @@ export function ExplorerSurface({
               : current
           );
         }}
+        resolveShareVersionId={
+          loadVersions
+            ? async (key) => (await loadVersions(key)).preferred_head_version_id?.trim() || null
+            : undefined
+        }
         extraActions={
           loadVersions && activeMediaHistoryKey ? (
             <Button
@@ -1506,7 +1511,7 @@ function buildExplorerEntryLightboxItem(
       fullscreen: mobileViewerRequestForExplorerMedia(entry.media, kind),
       original: { url: originalUrl },
       download: { url: originalUrl },
-      share: immutableExplorerShareRequest(
+      share: explorerShareRequest(
         entry.path,
         snapshotId,
         snapshotId ? null : entry.version,
@@ -1554,7 +1559,7 @@ function buildExplorerVersionLightboxItem(
       fullscreen: mobileViewerRequestForExplorerMedia(version.media, kind),
       original: { url: originalUrl },
       download: { url: originalUrl },
-      share: immutableExplorerShareRequest(
+      share: explorerShareRequest(
         sourceKey,
         null,
         version.version_id,
@@ -1570,7 +1575,7 @@ function buildExplorerVersionLightboxItem(
   };
 }
 
-function immutableExplorerShareRequest(
+function explorerShareRequest(
   key: string,
   snapshotId: string | null,
   versionId: string | null | undefined,
@@ -1579,9 +1584,6 @@ function immutableExplorerShareRequest(
 ) {
   const snapshot = snapshotId?.trim() || null;
   const version = snapshot ? null : versionId?.trim() || null;
-  if (!snapshot && !version) {
-    return null;
-  }
   return {
     key,
     snapshotId: snapshot,

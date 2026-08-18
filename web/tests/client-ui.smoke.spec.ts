@@ -43,6 +43,38 @@ async function dispatchCtrlWheel(locator: Locator, deltaY: number): Promise<void
   }, deltaY);
 }
 
+async function installAndroidShareBridgeMock(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const messages: string[] = [];
+    const listeners = new Set<(event: { data: string }) => void>();
+    Object.assign(window, {
+      __ironmeshShareMessages: messages,
+      IronmeshAndroidShare: {
+        postMessage(message: string) {
+          messages.push(message);
+          const request = JSON.parse(message) as { requestId: string };
+          queueMicrotask(() => {
+            const response = JSON.stringify({ requestId: request.requestId, status: "opened" });
+            listeners.forEach((listener) => listener({ data: response }));
+          });
+        },
+        addEventListener(_type: "message", listener: (event: { data: string }) => void) {
+          listeners.add(listener);
+        },
+        removeEventListener(_type: "message", listener: (event: { data: string }) => void) {
+          listeners.delete(listener);
+        }
+      }
+    });
+  });
+}
+
+async function androidShareMessages(page: Page): Promise<string[]> {
+  return page.evaluate(
+    () => (window as typeof window & { __ironmeshShareMessages: string[] }).__ironmeshShareMessages
+  );
+}
+
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
   test.setTimeout(45_000);
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
@@ -535,29 +567,7 @@ for (const embeddedClient of [null] as const) {
 test("client-ui Android media viewer shares an immutable original through the native bridge", async ({
   page
 }) => {
-  await page.addInitScript(() => {
-    const messages: string[] = [];
-    const listeners = new Set<(event: { data: string }) => void>();
-    Object.assign(window, {
-      __ironmeshShareMessages: messages,
-      IronmeshAndroidShare: {
-        postMessage(message: string) {
-          messages.push(message);
-          const request = JSON.parse(message) as { requestId: string };
-          queueMicrotask(() => {
-            const response = JSON.stringify({ requestId: request.requestId, status: "opened" });
-            listeners.forEach((listener) => listener({ data: response }));
-          });
-        },
-        addEventListener(_type: "message", listener: (event: { data: string }) => void) {
-          listeners.add(listener);
-        },
-        removeEventListener(_type: "message", listener: (event: { data: string }) => void) {
-          listeners.delete(listener);
-        }
-      }
-    });
-  });
+  await installAndroidShareBridgeMock(page);
   await installClientUiMocks(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/?page=gallery&embedded_client=android");
@@ -569,9 +579,7 @@ test("client-ui Android media viewer shares an immutable original through the na
   await dialog.getByRole("button", { name: "Share original" }).click();
   await expect(dialog.getByRole("button", { name: "Share opened" })).toBeVisible();
 
-  const payloads = await page.evaluate(
-    () => (window as typeof window & { __ironmeshShareMessages: string[] }).__ironmeshShareMessages
-  );
+  const payloads = await androidShareMessages(page);
   expect(payloads).toHaveLength(1);
   expect(JSON.parse(payloads[0])).toMatchObject({
     action: "share-original",
@@ -625,6 +633,40 @@ test("client-ui iOS media viewer shares an immutable original through the native
     key: "gallery/cat.png",
     versionId: null,
     snapshotId: "snapshot-001",
+    fileName: "cat.png",
+    mimeType: "image/png",
+    sizeBytes: 3_145_728
+  });
+});
+
+test("client-ui Android explorer resolves the preferred current version before sharing", async ({
+  page
+}) => {
+  await installAndroidShareBridgeMock(page);
+  const mocks = await installClientUiMocks(page, {
+    storeEntries: createMockStoreEntries().map((entry) =>
+      entry.path === "gallery/cat.png" ? { ...entry, version: undefined } : entry
+    )
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/?page=explorer&embedded_client=android");
+  await page.getByRole("button", { name: "Thumbnail for gallery/cat.png" }).click();
+
+  const dialog = page.getByRole("dialog");
+  const shareButton = dialog.getByRole("button", { name: "Share original" });
+  await expect(shareButton).toBeEnabled();
+  expect(mocks.requestedPaths()).not.toContain(apiV1("/versions"));
+  await shareButton.click();
+  await expect(dialog.getByRole("button", { name: "Share opened" })).toBeVisible();
+  expect(mocks.requestedPaths()).toContain(apiV1("/versions"));
+
+  const payloads = await androidShareMessages(page);
+  expect(payloads).toHaveLength(1);
+  expect(JSON.parse(payloads[0])).toMatchObject({
+    action: "share-original",
+    key: "gallery/cat.png",
+    versionId: "version-cat-001",
+    snapshotId: null,
     fileName: "cat.png",
     mimeType: "image/png",
     sizeBytes: 3_145_728

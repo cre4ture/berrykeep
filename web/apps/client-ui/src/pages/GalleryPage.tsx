@@ -70,7 +70,7 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
               : null,
           original,
           download: original,
-          share: immutableMediaShareRequest(entry, snapshotId, versionId)
+          share: mediaShareRequest(entry, snapshotId, versionId)
         };
       },
       loadVersions: getVersionGraph,
@@ -110,17 +110,13 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
   );
 }
 
-function immutableMediaShareRequest(
+function mediaShareRequest(
   entry: GalleryEntry,
   snapshotId: string | null,
   versionId?: string | null
 ): GalleryMediaRequests["share"] {
   const snapshot = snapshotId?.trim() || null;
   const version = snapshot ? null : versionId?.trim() || entry.version?.trim() || null;
-  if (!snapshot && !version) {
-    return null;
-  }
-
   return {
     key: entry.path,
     snapshotId: snapshot,

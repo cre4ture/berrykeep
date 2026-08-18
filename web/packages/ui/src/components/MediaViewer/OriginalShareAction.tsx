@@ -11,6 +11,8 @@ export type MediaShareRequest = {
   sizeBytes?: number | null;
 };
 
+export type MediaShareVersionResolver = (key: string) => Promise<string | null>;
+
 export type EmbeddedShareClient = "android" | "ios";
 
 type AndroidShareBridgeMessage = {
@@ -42,6 +44,7 @@ type OriginalShareResponse = {
 type OriginalShareActionProps = {
   client: EmbeddedShareClient;
   request: MediaShareRequest | null | undefined;
+  resolveVersionId?: MediaShareVersionResolver;
 };
 
 type ShareStatus =
@@ -68,7 +71,11 @@ declare global {
 
 const SHARE_RESPONSE_TIMEOUT_MS = 10_000;
 
-export function OriginalShareAction({ client, request }: OriginalShareActionProps) {
+export function OriginalShareAction({
+  client,
+  request,
+  resolveVersionId
+}: OriginalShareActionProps) {
   const requestIdentity = JSON.stringify([
     client,
     request?.key,
@@ -106,11 +113,16 @@ export function OriginalShareAction({ client, request }: OriginalShareActionProp
     return () => window.clearTimeout(timeout);
   }, [requestIdentity, status.state]);
 
+  const selectorState = mediaShareSelectorState(request);
   const unavailableReason = !request
-    ? "This media item has no immutable snapshot or version selector"
-    : !bridgeAvailable
-      ? `The ${platformName} share bridge is unavailable in this WebView`
-      : null;
+    ? "This media item has no original-share request"
+    : selectorState === "invalid"
+      ? "This media item has conflicting snapshot and version selectors"
+      : selectorState === "unresolved" && !resolveVersionId
+        ? "This media item has no immutable snapshot or version selector"
+        : !bridgeAvailable
+          ? `The ${platformName} share bridge is unavailable in this WebView`
+          : null;
   const title =
     status.state === "error"
       ? status.message
@@ -138,10 +150,17 @@ export function OriginalShareAction({ client, request }: OriginalShareActionProp
     activeRequest.current = { requestId, requestIdentity };
     setScopedStatus({ requestIdentity, value: { state: "pending" } });
     try {
+      const resolvedRequest = await resolveImmutableShareRequest(request, resolveVersionId);
+      if (
+        activeRequest.current?.requestId !== requestId ||
+        activeRequest.current.requestIdentity !== requestIdentity
+      ) {
+        return;
+      }
       const responsePromise = sendShareRequest(client, {
         action: "share-original",
         requestId,
-        ...request
+        ...resolvedRequest
       });
       const response = await (client === "ios"
         ? withTimeout(
@@ -206,6 +225,50 @@ export function OriginalShareAction({ client, request }: OriginalShareActionProp
       {label}
     </Button>
   );
+}
+
+type MediaShareSelectorState = "resolved" | "unresolved" | "invalid";
+
+function mediaShareSelectorState(
+  request: MediaShareRequest | null | undefined
+): MediaShareSelectorState {
+  if (!request) {
+    return "unresolved";
+  }
+
+  const hasSnapshot = Boolean(request.snapshotId?.trim());
+  const hasVersion = Boolean(request.versionId?.trim());
+  if (hasSnapshot && hasVersion) {
+    return "invalid";
+  }
+  return hasSnapshot || hasVersion ? "resolved" : "unresolved";
+}
+
+async function resolveImmutableShareRequest(
+  request: MediaShareRequest,
+  resolveVersionId: MediaShareVersionResolver | undefined
+): Promise<MediaShareRequest> {
+  const snapshotId = request.snapshotId?.trim() || null;
+  const versionId = request.versionId?.trim() || null;
+  if (snapshotId && versionId) {
+    throw new Error("The original-share request has conflicting snapshot and version selectors.");
+  }
+  if (snapshotId || versionId) {
+    return { ...request, snapshotId, versionId };
+  }
+  if (!resolveVersionId) {
+    throw new Error("No immutable version is available for this media item.");
+  }
+
+  const resolvedVersionId = (await resolveVersionId(request.key))?.trim() || null;
+  if (!resolvedVersionId) {
+    throw new Error("The current media item has no preferred version to share.");
+  }
+  return {
+    ...request,
+    snapshotId: null,
+    versionId: resolvedVersionId
+  };
 }
 
 export function embeddedShareClient(): EmbeddedShareClient | null {
