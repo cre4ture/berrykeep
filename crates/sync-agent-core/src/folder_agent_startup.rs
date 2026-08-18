@@ -899,6 +899,8 @@ mod tests {
                 content_hash: Some("manifest-hash".to_string()),
                 content_fingerprint: Some("shared-fingerprint".to_string()),
                 size_bytes: Some(5),
+                modified_at_unix: None,
+                media: None,
             }],
         };
 

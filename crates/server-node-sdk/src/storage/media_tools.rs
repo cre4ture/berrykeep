@@ -414,10 +414,24 @@ pub(super) struct FfprobeOutput {
 pub(super) struct FfprobeStream {
     pub(super) width: Option<u32>,
     pub(super) height: Option<u32>,
+    pub(super) codec_name: Option<String>,
+    pub(super) codec_tag_string: Option<String>,
+    pub(super) avg_frame_rate: Option<String>,
+    pub(super) bit_rate: Option<String>,
+    #[serde(default)]
+    pub(super) tags: FfprobeTags,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct FfprobeFormat {
     pub(super) format_name: Option<String>,
     pub(super) duration: Option<String>,
+    pub(super) bit_rate: Option<String>,
+    #[serde(default)]
+    pub(super) tags: FfprobeTags,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct FfprobeTags {
+    pub(super) creation_time: Option<String>,
 }

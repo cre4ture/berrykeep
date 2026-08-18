@@ -23,7 +23,7 @@ use crate::close_upload::{
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{
     PlaceholderFileIdentity, decode_path_from_file_identity, normalize_path, path_to_relative,
-    utf16_path, utf16_string,
+    unix_seconds_to_windows_file_time, utf16_path, utf16_string,
 };
 use crate::hydration_control::{
     clear_active_hydration, clear_hydration_cancel_request, has_hydration_cancel_request,
@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+use sync_core::NamespaceMediaMetadata;
 use walkdir::WalkDir;
 use widestring::U16String;
 use wincs::{
@@ -1028,8 +1029,17 @@ pub fn apply_action_plan(
         set
     };
 
-    let mut placeholders: BTreeMap<String, (String, String, Option<u64>, Option<String>)> =
-        BTreeMap::new();
+    let mut placeholders: BTreeMap<
+        String,
+        (
+            String,
+            String,
+            Option<u64>,
+            Option<String>,
+            Option<u64>,
+            Option<NamespaceMediaMetadata>,
+        ),
+    > = BTreeMap::new();
     let mut created_placeholder_paths = BTreeSet::new();
     for action in &plan.actions {
         match action {
@@ -1046,6 +1056,8 @@ pub fn apply_action_plan(
                 remote_content_hash,
                 remote_size,
                 remote_content_fingerprint,
+                remote_modified_at_unix,
+                remote_media,
             }
             | CfapiAction::HydrateOnDemand {
                 path,
@@ -1053,6 +1065,8 @@ pub fn apply_action_plan(
                 remote_content_hash,
                 remote_size,
                 remote_content_fingerprint,
+                remote_modified_at_unix,
+                remote_media,
             } => {
                 let normalized = normalize_path(path);
                 let full_path = root_path.join(normalized.replace('/', "\\"));
@@ -1071,6 +1085,8 @@ pub fn apply_action_plan(
                         remote_content_hash.clone(),
                         *remote_size,
                         remote_content_fingerprint.clone(),
+                        *remote_modified_at_unix,
+                        remote_media.clone(),
                     ),
                 );
                 created_placeholder_paths.insert(normalized);
@@ -1091,7 +1107,14 @@ pub fn apply_action_plan(
         let mut inputs = Vec::with_capacity(placeholders.len());
         for (
             relative_path,
-            (remote_version, remote_content_hash, remote_size, remote_content_fingerprint),
+            (
+                remote_version,
+                remote_content_hash,
+                remote_size,
+                remote_content_fingerprint,
+                remote_modified_at_unix,
+                remote_media,
+            ),
         ) in placeholders
         {
             let (parent_rel, child_name) = match relative_path.rsplit_once('/') {
@@ -1110,6 +1133,9 @@ pub fn apply_action_plan(
                 root_path.join(parent_rel.replace('/', "\\"))
             };
             let basic_info = FILE_BASIC_INFO {
+                LastWriteTime: remote_modified_at_unix
+                    .and_then(unix_seconds_to_windows_file_time)
+                    .unwrap_or_default(),
                 FileAttributes: FILE_ATTRIBUTE_NORMAL,
                 ..Default::default()
             };
@@ -1124,6 +1150,8 @@ pub fn apply_action_plan(
             identity.remote_content_hash = Some(remote_content_hash.clone());
             identity.remote_content_fingerprint = remote_content_fingerprint.clone();
             identity.remote_size_bytes = remote_size;
+            identity.remote_modified_at_unix = remote_modified_at_unix;
+            identity.remote_media = remote_media;
             identity.promote_remote_to_in_sync_content_baseline();
 
             inputs.push(PlaceholderInput {
@@ -1193,6 +1221,8 @@ pub fn apply_action_plan(
                 remote_content_hash,
                 remote_size,
                 remote_content_fingerprint,
+                remote_modified_at_unix,
+                remote_media,
             }
             | CfapiAction::HydrateOnDemand {
                 path,
@@ -1200,17 +1230,10 @@ pub fn apply_action_plan(
                 remote_content_hash,
                 remote_size,
                 remote_content_fingerprint,
+                remote_modified_at_unix,
+                remote_media,
             } => {
                 if created_placeholder_paths.contains(&normalize_path(path)) {
-                    continue;
-                }
-                let full_path = root_path.join(normalize_path(path).replace('/', "\\"));
-                if path_is_cold_in_sync_placeholder(&full_path) {
-                    tracing::info!(
-                        "apply_action_plan: skipping metadata refresh for cold placeholder {} state={}",
-                        path,
-                        describe_path_state(&full_path)
-                    );
                     continue;
                 }
                 if let Err(err) = refresh_remote_placeholder_state(
@@ -1221,6 +1244,8 @@ pub fn apply_action_plan(
                     Some(remote_content_hash),
                     *remote_size,
                     remote_content_fingerprint.as_deref(),
+                    *remote_modified_at_unix,
+                    remote_media.as_ref(),
                 ) {
                     tracing::info!(
                         "apply_action_plan: failed to refresh placeholder metadata for {}: {:#}",
@@ -1235,6 +1260,8 @@ pub fn apply_action_plan(
                 remote_content_hash,
                 remote_size,
                 remote_content_fingerprint,
+                remote_modified_at_unix,
+                remote_media,
                 ..
             } => {
                 let full_path = root_path.join(normalize_path(path).replace('/', "\\"));
@@ -1254,6 +1281,8 @@ pub fn apply_action_plan(
                     remote_content_hash.as_deref(),
                     *remote_size,
                     remote_content_fingerprint.as_deref(),
+                    *remote_modified_at_unix,
+                    remote_media.as_ref(),
                 ) {
                     tracing::info!(
                         "apply_action_plan: failed to refresh conflict placeholder metadata for {}: {:#}",
@@ -2532,6 +2561,8 @@ mod tests {
                 remote_content_hash: "h7".to_string(),
                 remote_size: None,
                 remote_content_fingerprint: None,
+                remote_modified_at_unix: None,
+                remote_media: None,
             }],
         };
 
@@ -2564,6 +2595,8 @@ mod tests {
                 remote_content_hash: "h3".to_string(),
                 remote_size: None,
                 remote_content_fingerprint: None,
+                remote_modified_at_unix: None,
+                remote_media: None,
             }],
         };
 
@@ -2677,6 +2710,8 @@ mod tests {
                     remote_content_hash: "h1".to_string(),
                     remote_size: None,
                     remote_content_fingerprint: None,
+                    remote_modified_at_unix: None,
+                    remote_media: None,
                 },
                 CfapiAction::HydrateOnDemand {
                     path: "docs/photo.jpg".to_string(),
@@ -2684,6 +2719,8 @@ mod tests {
                     remote_content_hash: "h2".to_string(),
                     remote_size: None,
                     remote_content_fingerprint: None,
+                    remote_modified_at_unix: None,
+                    remote_media: None,
                 },
                 CfapiAction::QueueUploadOnClose {
                     path: "draft.txt".to_string(),
@@ -2696,6 +2733,8 @@ mod tests {
                     remote_content_hash: Some("hr".to_string()),
                     remote_size: None,
                     remote_content_fingerprint: None,
+                    remote_modified_at_unix: None,
+                    remote_media: None,
                 },
             ],
         };
@@ -2739,6 +2778,15 @@ mod tests {
                 remote_content_hash: "h1".to_string(),
                 remote_size: Some(10_000),
                 remote_content_fingerprint: Some("cfp-remote-movie".to_string()),
+                remote_modified_at_unix: Some(1_723_456_789),
+                remote_media: Some(NamespaceMediaMetadata {
+                    media_type: Some("video".to_string()),
+                    mime_type: Some("video/x-matroska".to_string()),
+                    width: Some(1_920),
+                    height: Some(1_080),
+                    duration_millis: Some(42_125),
+                    ..Default::default()
+                }),
             }],
         };
 
@@ -2765,6 +2813,15 @@ mod tests {
         assert_eq!(
             decoded.in_sync_content_fingerprint.as_deref(),
             Some("cfp-remote-movie")
+        );
+        assert_eq!(decoded.remote_modified_at_unix, Some(1_723_456_789));
+        assert_eq!(
+            decoded.remote_media.as_ref().and_then(|media| media.width),
+            Some(1_920)
+        );
+        assert_eq!(
+            info.info().FsMetadata.BasicInfo.LastWriteTime,
+            unix_seconds_to_windows_file_time(1_723_456_789).unwrap()
         );
 
         let encoded =

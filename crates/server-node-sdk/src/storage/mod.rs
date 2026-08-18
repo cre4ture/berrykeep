@@ -73,8 +73,8 @@ pub(crate) use media_cache::mobile_viewer_thumbnail_profile;
 #[cfg(test)]
 use media_cache::{
     MEDIA_CACHE_INCOMPLETE_RETRY_SECS, MEDIA_CACHE_SCHEMA_VERSION, MediaCacheImageLimits,
-    exif_gps_coordinate, parse_exif_taken_at, persist_media_cache_record_with_payload,
-    preferred_video_seek_time,
+    exif_gps_coordinate, parse_exif_taken_at, parse_ffprobe_timestamp, parse_frame_rate_millihertz,
+    persist_media_cache_record_with_payload, preferred_video_seek_time,
 };
 pub(crate) use media_cache::{MediaCacheWorker, current_media_cache_metadata};
 pub(crate) use media_cache::{grid_thumbnail_profile, thumbnail_profile_from_query};

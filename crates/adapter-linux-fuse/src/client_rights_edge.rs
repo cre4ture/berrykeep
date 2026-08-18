@@ -385,6 +385,8 @@ impl ClientRightsEdgeState {
                     content_hash: Some(entry.content_hash.clone()),
                     content_fingerprint: None,
                     size_bytes: Some(entry.size),
+                    modified_at_unix: None,
+                    media: None,
                 },
                 PinState::Pinned,
                 HydrationState::Hydrated,

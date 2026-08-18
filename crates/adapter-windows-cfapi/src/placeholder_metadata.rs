@@ -4,12 +4,15 @@ use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info_with_identity,
     cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_with_oplock,
-    describe_path_state, open_sync_path, path_is_placeholder,
+    cf_update_placeholder_metadata_and_identity,
+    cf_update_placeholder_metadata_and_identity_with_oplock, describe_path_state, open_sync_path,
+    path_is_placeholder,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::content_fingerprint::file_content_fingerprint;
 use crate::helpers::{
     PlaceholderFileIdentity, decode_placeholder_file_identity, normalize_path, path_to_relative,
+    unix_seconds_to_windows_file_time,
 };
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use anyhow::{Context, Result};
@@ -19,6 +22,8 @@ use std::path::Path;
 use sync_core::{EntryKind, SyncSnapshot};
 use uuid::Uuid;
 use walkdir::WalkDir;
+use windows_sys::Win32::Storage::CloudFilters::CF_FS_METADATA;
+use windows_sys::Win32::Storage::FileSystem::FILE_BASIC_INFO;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RemoteDeleteReconcileReport {
@@ -64,7 +69,7 @@ pub fn record_in_sync_content_baseline(
         return Ok(());
     }
 
-    mutate_placeholder_identity_for_path(sync_root_path, &normalized, |identity| {
+    mutate_placeholder_identity_for_path(sync_root_path, &normalized, None, |identity| {
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
         identity.set_in_sync_content_baseline(in_sync_content_fingerprint);
@@ -81,7 +86,7 @@ pub fn promote_remote_to_in_sync_content_baseline(
         return Ok(());
     }
 
-    mutate_placeholder_identity_for_path(sync_root_path, &normalized, |identity| {
+    mutate_placeholder_identity_for_path(sync_root_path, &normalized, None, |identity| {
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
         identity.promote_remote_to_in_sync_content_baseline();
@@ -96,6 +101,8 @@ pub fn refresh_remote_placeholder_state(
     remote_content_hash: Option<&str>,
     remote_size_bytes: Option<u64>,
     remote_content_fingerprint: Option<&str>,
+    remote_modified_at_unix: Option<u64>,
+    remote_media: Option<&sync_core::NamespaceMediaMetadata>,
 ) -> Result<()> {
     let normalized = normalize_path(relative_path);
     if normalized.is_empty() || is_internal_sync_root_relative_path(&normalized) {
@@ -114,7 +121,21 @@ pub fn refresh_remote_placeholder_state(
         return Ok(());
     }
 
-    mutate_placeholder_identity_for_path(sync_root_path, &normalized, |identity| {
+    let file_size = remote_size_bytes
+        .and_then(|value| i64::try_from(value).ok())
+        .or_else(|| i64::try_from(metadata.len()).ok())
+        .unwrap_or_default();
+    let fs_metadata = remote_modified_at_unix
+        .and_then(unix_seconds_to_windows_file_time)
+        .map(|last_write_time| CF_FS_METADATA {
+            BasicInfo: FILE_BASIC_INFO {
+                LastWriteTime: last_write_time,
+                ..Default::default()
+            },
+            FileSize: file_size,
+        });
+
+    mutate_placeholder_identity_for_path(sync_root_path, &normalized, fs_metadata, |identity| {
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
         identity.remote_version = remote_version
@@ -130,6 +151,8 @@ pub fn refresh_remote_placeholder_state(
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
         identity.remote_size_bytes = remote_size_bytes;
+        identity.remote_modified_at_unix = remote_modified_at_unix;
+        identity.remote_media = remote_media.cloned();
     })
 }
 
@@ -319,6 +342,7 @@ pub fn reconcile_remote_delete_state(
 fn mutate_placeholder_identity_for_path(
     sync_root_path: &Path,
     relative_path: &str,
+    fs_metadata: Option<CF_FS_METADATA>,
     mutator: impl FnOnce(&mut PlaceholderFileIdentity),
 ) -> Result<()> {
     let full_path = sync_root_path.join(relative_path.replace('/', "\\"));
@@ -336,12 +360,18 @@ fn mutate_placeholder_identity_for_path(
     };
     let original_identity = identity.clone();
     mutator(&mut identity);
-    if identity == original_identity {
+    if identity == original_identity && fs_metadata.is_none() {
         return Ok(());
     }
     let encoded = identity.encoded();
 
-    match cf_update_placeholder_file_identity_with_oplock(&full_path, &encoded) {
+    let oplock_result = match fs_metadata.as_ref() {
+        Some(metadata) => {
+            cf_update_placeholder_metadata_and_identity_with_oplock(&full_path, metadata, &encoded)
+        }
+        None => cf_update_placeholder_file_identity_with_oplock(&full_path, &encoded),
+    };
+    match oplock_result {
         Ok(()) => Ok(()),
         Err(oplock_err) => {
             if path_is_placeholder(&full_path) {
@@ -359,7 +389,12 @@ fn mutate_placeholder_identity_for_path(
                 )
             })?;
             cf_ensure_placeholder_identity(&writable_file, relative_path)?;
-            cf_update_placeholder_file_identity(&writable_file, &encoded)
+            match fs_metadata.as_ref() {
+                Some(metadata) => {
+                    cf_update_placeholder_metadata_and_identity(&writable_file, metadata, &encoded)
+                }
+                None => cf_update_placeholder_file_identity(&writable_file, &encoded),
+            }
         }
     }
 }
@@ -407,6 +442,8 @@ fn identity_has_remote_baseline(identity: &PlaceholderFileIdentity) -> bool {
         || identity.remote_content_hash.is_some()
         || identity.remote_content_fingerprint.is_some()
         || identity.remote_size_bytes.is_some()
+        || identity.remote_modified_at_unix.is_some()
+        || identity.remote_media.is_some()
         || identity.in_sync_content_fingerprint.is_some()
 }
 

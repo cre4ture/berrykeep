@@ -52,7 +52,7 @@ sysinfo = { version = "0.38.4", default-features = false, features = ["component
 tokio.workspace = true
 tokio-rusqlite = "0.6"
 tokio-rustls = "0.26"
-time = "0.3"
+time = { version = "0.3", features = ["parsing"] }
 transport-sdk = { path = "../transport-sdk" }
 turso = { version = "0.6.0-pre.2", optional = true }
 tower = "0.5"

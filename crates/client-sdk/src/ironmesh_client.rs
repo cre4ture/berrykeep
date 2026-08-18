@@ -3532,7 +3532,21 @@ pub struct StoreIndexMedia {
     #[serde(default)]
     pub taken_at_unix: Option<u64>,
     #[serde(default)]
+    pub date_encoded_unix: Option<u64>,
+    #[serde(default)]
+    pub duration_millis: Option<u64>,
+    #[serde(default)]
+    pub frame_rate_millihertz: Option<u32>,
+    #[serde(default)]
+    pub total_bitrate_bps: Option<u64>,
+    #[serde(default)]
+    pub codec_name: Option<String>,
+    #[serde(default)]
+    pub codec_fourcc: Option<String>,
+    #[serde(default)]
     pub gps: Option<StoreIndexGps>,
+    #[serde(default)]
+    pub photo: Option<StoreIndexPhoto>,
     #[serde(default)]
     pub thumbnail: Option<StoreIndexThumbnail>,
     #[serde(default)]
@@ -3543,6 +3557,30 @@ pub struct StoreIndexMedia {
 pub struct StoreIndexGps {
     pub latitude: f64,
     pub longitude: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreIndexPhoto {
+    #[serde(default)]
+    pub camera_manufacturer: Option<String>,
+    #[serde(default)]
+    pub camera_model: Option<String>,
+    #[serde(default)]
+    pub lens_manufacturer: Option<String>,
+    #[serde(default)]
+    pub lens_model: Option<String>,
+    #[serde(default)]
+    pub iso_speed: Option<u32>,
+    #[serde(default)]
+    pub exposure_time_seconds: Option<f64>,
+    #[serde(default)]
+    pub f_number: Option<f64>,
+    #[serde(default)]
+    pub focal_length_mm: Option<f64>,
+    #[serde(default)]
+    pub flash: Option<u16>,
+    #[serde(default)]
+    pub white_balance: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8355,12 +8393,47 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
         let mut remote_entry =
             NamespaceEntry::file_sized(entry.path.clone(), version, content_hash, entry.size_bytes);
         remote_entry.content_fingerprint = entry.content_fingerprint;
+        remote_entry.modified_at_unix = entry.modified_at_unix;
+        remote_entry.media = entry.media.map(namespace_media_metadata);
         remote.push(remote_entry);
     }
 
     SyncSnapshot {
         local: Vec::new(),
         remote,
+    }
+}
+
+pub fn namespace_media_metadata(media: StoreIndexMedia) -> sync_core::NamespaceMediaMetadata {
+    sync_core::NamespaceMediaMetadata {
+        media_type: media.media_type,
+        mime_type: media.mime_type,
+        width: media.width,
+        height: media.height,
+        orientation: media.orientation,
+        taken_at_unix: media.taken_at_unix,
+        date_encoded_unix: media.date_encoded_unix,
+        duration_millis: media.duration_millis,
+        frame_rate_millihertz: media.frame_rate_millihertz,
+        total_bitrate_bps: media.total_bitrate_bps,
+        codec_name: media.codec_name,
+        codec_fourcc: media.codec_fourcc,
+        gps: media.gps.map(|gps| sync_core::NamespaceGpsCoordinates {
+            latitude: gps.latitude,
+            longitude: gps.longitude,
+        }),
+        photo: media.photo.map(|photo| sync_core::NamespacePhotoMetadata {
+            camera_manufacturer: photo.camera_manufacturer,
+            camera_model: photo.camera_model,
+            lens_manufacturer: photo.lens_manufacturer,
+            lens_model: photo.lens_model,
+            iso_speed: photo.iso_speed,
+            exposure_time_seconds: photo.exposure_time_seconds,
+            f_number: photo.f_number,
+            focal_length_mm: photo.focal_length_mm,
+            flash: photo.flash,
+            white_balance: photo.white_balance,
+        }),
     }
 }
 

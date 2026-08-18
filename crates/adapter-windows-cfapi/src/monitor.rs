@@ -1604,6 +1604,8 @@ mod tests {
                 remote_content_hash: "h1".to_string(),
                 remote_size: None,
                 remote_content_fingerprint: None,
+                remote_modified_at_unix: None,
+                remote_media: None,
             }],
         });
         monitor.walk();

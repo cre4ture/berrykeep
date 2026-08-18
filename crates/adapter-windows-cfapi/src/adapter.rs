@@ -1,6 +1,16 @@
 use std::collections::HashMap;
 
-use sync_core::{SyncOperation, SyncPlan, SyncPolicy, SyncSnapshot, plan_sync};
+use sync_core::{
+    NamespaceMediaMetadata, SyncOperation, SyncPlan, SyncPolicy, SyncSnapshot, plan_sync,
+};
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RemoteFileMetadata {
+    pub size_bytes: Option<u64>,
+    pub content_fingerprint: Option<String>,
+    pub modified_at_unix: Option<u64>,
+    pub media: Option<NamespaceMediaMetadata>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsCfapiAdapter {
@@ -23,7 +33,12 @@ impl WindowsCfapiAdapter {
             .map(|entry| {
                 (
                     entry.path.clone(),
-                    (entry.size_bytes, entry.content_fingerprint.clone()),
+                    RemoteFileMetadata {
+                        size_bytes: entry.size_bytes,
+                        content_fingerprint: entry.content_fingerprint.clone(),
+                        modified_at_unix: entry.modified_at_unix,
+                        media: entry.media.clone(),
+                    },
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -31,12 +46,12 @@ impl WindowsCfapiAdapter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CfapiActionPlan {
     pub actions: Vec<CfapiAction>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CfapiAction {
     EnsureDirectory {
         path: String,
@@ -47,6 +62,8 @@ pub enum CfapiAction {
         remote_content_hash: String,
         remote_size: Option<u64>,
         remote_content_fingerprint: Option<String>,
+        remote_modified_at_unix: Option<u64>,
+        remote_media: Option<NamespaceMediaMetadata>,
     },
     HydrateOnDemand {
         path: String,
@@ -54,6 +71,8 @@ pub enum CfapiAction {
         remote_content_hash: String,
         remote_size: Option<u64>,
         remote_content_fingerprint: Option<String>,
+        remote_modified_at_unix: Option<u64>,
+        remote_media: Option<NamespaceMediaMetadata>,
     },
     QueueUploadOnClose {
         path: String,
@@ -66,12 +85,14 @@ pub enum CfapiAction {
         remote_content_hash: Option<String>,
         remote_size: Option<u64>,
         remote_content_fingerprint: Option<String>,
+        remote_modified_at_unix: Option<u64>,
+        remote_media: Option<NamespaceMediaMetadata>,
     },
 }
 
 pub fn map_sync_plan_to_cfapi_actions(
     sync_plan: &SyncPlan,
-    remote_metadata_by_path: &HashMap<String, (Option<u64>, Option<String>)>,
+    remote_metadata_by_path: &HashMap<String, RemoteFileMetadata>,
 ) -> CfapiActionPlan {
     let mut actions = Vec::with_capacity(sync_plan.operations.len());
 
@@ -90,10 +111,16 @@ pub fn map_sync_plan_to_cfapi_actions(
                 remote_content_hash: remote_content_hash.clone(),
                 remote_size: remote_metadata_by_path
                     .get(path)
-                    .and_then(|(size, _)| *size),
+                    .and_then(|metadata| metadata.size_bytes),
                 remote_content_fingerprint: remote_metadata_by_path
                     .get(path)
-                    .and_then(|(_, fingerprint)| fingerprint.clone()),
+                    .and_then(|metadata| metadata.content_fingerprint.clone()),
+                remote_modified_at_unix: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|metadata| metadata.modified_at_unix),
+                remote_media: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|metadata| metadata.media.clone()),
             },
             SyncOperation::Hydrate {
                 path,
@@ -105,10 +132,16 @@ pub fn map_sync_plan_to_cfapi_actions(
                 remote_content_hash: remote_content_hash.clone(),
                 remote_size: remote_metadata_by_path
                     .get(path)
-                    .and_then(|(size, _)| *size),
+                    .and_then(|metadata| metadata.size_bytes),
                 remote_content_fingerprint: remote_metadata_by_path
                     .get(path)
-                    .and_then(|(_, fingerprint)| fingerprint.clone()),
+                    .and_then(|metadata| metadata.content_fingerprint.clone()),
+                remote_modified_at_unix: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|metadata| metadata.modified_at_unix),
+                remote_media: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|metadata| metadata.media.clone()),
             },
             SyncOperation::Upload {
                 path,
@@ -129,10 +162,16 @@ pub fn map_sync_plan_to_cfapi_actions(
                 remote_content_hash: remote_content_hash.clone(),
                 remote_size: remote_metadata_by_path
                     .get(path)
-                    .and_then(|(size, _)| *size),
+                    .and_then(|metadata| metadata.size_bytes),
                 remote_content_fingerprint: remote_metadata_by_path
                     .get(path)
-                    .and_then(|(_, fingerprint)| fingerprint.clone()),
+                    .and_then(|metadata| metadata.content_fingerprint.clone()),
+                remote_modified_at_unix: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|metadata| metadata.modified_at_unix),
+                remote_media: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|metadata| metadata.media.clone()),
             },
         };
 
@@ -165,6 +204,8 @@ mod tests {
                 remote_content_hash: "h1".to_string(),
                 remote_size: None,
                 remote_content_fingerprint: None,
+                remote_modified_at_unix: None,
+                remote_media: None,
             }],
         );
     }
@@ -215,21 +256,27 @@ mod tests {
                 remote_content_hash: Some("h2".to_string()),
                 remote_size: None,
                 remote_content_fingerprint: None,
+                remote_modified_at_unix: None,
+                remote_media: None,
             }],
         );
     }
 
     #[test]
-    fn adapter_carries_remote_size_for_file_actions() {
+    fn adapter_carries_remote_metadata_for_file_actions() {
         let adapter = WindowsCfapiAdapter::new("Ironmesh");
+        let mut remote = NamespaceEntry::file_sized("docs/readme.md", "v1", "h1", Some(42));
+        remote.modified_at_unix = Some(1_723_456_789);
+        remote.media = Some(NamespaceMediaMetadata {
+            media_type: Some("image".to_string()),
+            mime_type: Some("image/jpeg".to_string()),
+            width: Some(4_032),
+            height: Some(3_024),
+            ..Default::default()
+        });
         let snapshot = SyncSnapshot {
             local: vec![],
-            remote: vec![NamespaceEntry::file_sized(
-                "docs/readme.md",
-                "v1",
-                "h1",
-                Some(42),
-            )],
+            remote: vec![remote],
         };
 
         let plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
@@ -242,6 +289,14 @@ mod tests {
                 remote_content_hash: "h1".to_string(),
                 remote_size: Some(42),
                 remote_content_fingerprint: None,
+                remote_modified_at_unix: Some(1_723_456_789),
+                remote_media: Some(NamespaceMediaMetadata {
+                    media_type: Some("image".to_string()),
+                    mime_type: Some("image/jpeg".to_string()),
+                    width: Some(4_032),
+                    height: Some(3_024),
+                    ..Default::default()
+                }),
             }],
         );
     }

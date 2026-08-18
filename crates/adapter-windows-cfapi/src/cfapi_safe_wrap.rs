@@ -376,16 +376,24 @@ pub(crate) fn convert_to_placeholder(handle: HANDLE, file_identity: Option<&[u8]
 
 pub(crate) fn update_placeholder(
     handle: HANDLE,
+    fs_metadata: Option<&CF_FS_METADATA>,
     file_identity: &[u8],
     dehydrate_ranges: Option<&[CF_FILE_RANGE]>,
     update_flags: CF_UPDATE_FLAGS,
 ) -> Result<()> {
-    let hr = update_placeholder_hresult(handle, file_identity, dehydrate_ranges, update_flags);
+    let hr = update_placeholder_hresult(
+        handle,
+        fs_metadata,
+        file_identity,
+        dehydrate_ranges,
+        update_flags,
+    );
     hresult_nonneg(hr, "CfUpdatePlaceholder")
 }
 
 pub(crate) fn update_placeholder_hresult(
     handle: HANDLE,
+    fs_metadata: Option<&CF_FS_METADATA>,
     file_identity: &[u8],
     dehydrate_ranges: Option<&[CF_FILE_RANGE]>,
     update_flags: CF_UPDATE_FLAGS,
@@ -393,7 +401,7 @@ pub(crate) fn update_placeholder_hresult(
     unsafe {
         CfUpdatePlaceholder(
             handle,
-            null(),
+            fs_metadata.map_or(null(), |metadata| metadata as *const CF_FS_METADATA),
             if file_identity.is_empty() {
                 null()
             } else {

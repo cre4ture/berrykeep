@@ -3,6 +3,7 @@ use normpath::PathExt;
 use std::fmt;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use sync_core::NamespaceMediaMetadata;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -58,13 +59,26 @@ pub fn normalize_path(path: &str) -> String {
         .replace('\\', "/")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+const WINDOWS_FILE_TIME_UNIX_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
+const WINDOWS_FILE_TIME_TICKS_PER_SEC: u64 = 10_000_000;
+const MAX_CFAPI_FILE_IDENTITY_BYTES: usize = 4_096;
+
+pub fn unix_seconds_to_windows_file_time(unix_seconds: u64) -> Option<i64> {
+    let ticks = unix_seconds
+        .checked_add(WINDOWS_FILE_TIME_UNIX_EPOCH_OFFSET_SECS)?
+        .checked_mul(WINDOWS_FILE_TIME_TICKS_PER_SEC)?;
+    i64::try_from(ticks).ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct PlaceholderFileIdentity {
     pub path: String,
     pub remote_version: Option<String>,
     pub remote_content_hash: Option<String>,
     pub remote_content_fingerprint: Option<String>,
     pub remote_size_bytes: Option<u64>,
+    pub remote_modified_at_unix: Option<u64>,
+    pub remote_media: Option<NamespaceMediaMetadata>,
     // Baseline fingerprint for the content version that should be treated as
     // clean/in sync, even when that content is not fully materialized locally.
     pub in_sync_content_fingerprint: Option<String>,
@@ -96,7 +110,7 @@ impl PlaceholderFileIdentity {
     }
 
     pub fn encoded(&self) -> Vec<u8> {
-        let mut lines = Vec::with_capacity(9);
+        let mut lines = Vec::with_capacity(11);
         lines.push(format!("v={}", Self::SCHEMA_VERSION));
         lines.push(format!("p={}", normalize_path(&self.path)));
         if let Some(remote_version) = self
@@ -126,6 +140,14 @@ impl PlaceholderFileIdentity {
         if let Some(remote_size_bytes) = self.remote_size_bytes {
             lines.push(format!("rs={remote_size_bytes}"));
         }
+        if let Some(remote_modified_at_unix) = self.remote_modified_at_unix {
+            lines.push(format!("mt={remote_modified_at_unix}"));
+        }
+        if let Some(remote_media) = self.remote_media.as_ref()
+            && let Ok(encoded_media) = serde_json::to_string(remote_media)
+        {
+            lines.push(format!("md={encoded_media}"));
+        }
         if let Some(in_sync_content_fingerprint) = self
             .in_sync_content_fingerprint
             .as_deref()
@@ -140,7 +162,12 @@ impl PlaceholderFileIdentity {
         if let Some(provider_instance_id) = self.provider_instance_id {
             lines.push(format!("pi={provider_instance_id}"));
         }
-        lines.join("\n").into_bytes()
+        let mut encoded = lines.join("\n").into_bytes();
+        if encoded.len() > MAX_CFAPI_FILE_IDENTITY_BYTES && self.remote_media.is_some() {
+            lines.retain(|line| !line.starts_with("md="));
+            encoded = lines.join("\n").into_bytes();
+        }
+        encoded
     }
 }
 
@@ -180,6 +207,12 @@ pub fn decode_placeholder_file_identity(file_identity: &[u8]) -> Option<Placehol
             }
             "rs" => {
                 identity.remote_size_bytes = value.trim().parse::<u64>().ok();
+            }
+            "mt" => {
+                identity.remote_modified_at_unix = value.trim().parse::<u64>().ok();
+            }
+            "md" => {
+                identity.remote_media = serde_json::from_str(value).ok();
             }
             "cf" | "if" => {
                 identity.in_sync_content_fingerprint = Some(value.to_string());
@@ -326,6 +359,7 @@ mod tests {
     };
     use anyhow::Context;
     use std::path::Path;
+    use sync_core::{NamespaceMediaMetadata, NamespacePhotoMetadata};
     use uuid::Uuid;
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
@@ -397,6 +431,21 @@ mod tests {
             "cfp-b47898c3f17e6f35f2f5f7e2a28c8d7fe6cb0a58b89ea4b1d172bc5342f0cb83".to_string(),
         );
         identity.remote_size_bytes = Some(42);
+        identity.remote_modified_at_unix = Some(1_723_456_789);
+        identity.remote_media = Some(NamespaceMediaMetadata {
+            media_type: Some("image".to_string()),
+            mime_type: Some("image/jpeg".to_string()),
+            width: Some(4_032),
+            height: Some(3_024),
+            taken_at_unix: Some(1_700_000_000),
+            photo: Some(NamespacePhotoMetadata {
+                camera_manufacturer: Some("Contoso".to_string()),
+                camera_model: Some("Camera One".to_string()),
+                iso_speed: Some(200),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
         identity.in_sync_content_fingerprint = Some(
             "cfp-42f776f4d1b1e8ea8eaf9e3f7f3a814c8fdabf52c52c520909b7eb98d8eb4d2f".to_string(),
         );
@@ -408,6 +457,40 @@ mod tests {
             decode_placeholder_file_identity(&encoded).expect("extended metadata should decode");
 
         assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn placeholder_identity_drops_oversized_media_metadata() {
+        let mut identity = PlaceholderFileIdentity::new("photos/large.jpg");
+        identity.remote_modified_at_unix = Some(1_723_456_789);
+        identity.remote_media = Some(NamespaceMediaMetadata {
+            photo: Some(NamespacePhotoMetadata {
+                lens_model: Some("x".repeat(5_000)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let encoded = identity.encoded();
+        let decoded =
+            decode_placeholder_file_identity(&encoded).expect("bounded identity should decode");
+
+        assert!(encoded.len() <= super::MAX_CFAPI_FILE_IDENTITY_BYTES);
+        assert_eq!(decoded.remote_modified_at_unix, Some(1_723_456_789));
+        assert!(decoded.remote_media.is_none());
+    }
+
+    #[test]
+    fn unix_seconds_convert_to_windows_file_time() {
+        assert_eq!(
+            super::unix_seconds_to_windows_file_time(0),
+            Some(116_444_736_000_000_000)
+        );
+        assert_eq!(
+            super::unix_seconds_to_windows_file_time(1_700_000_000),
+            Some(133_444_736_000_000_000)
+        );
+        assert_eq!(super::unix_seconds_to_windows_file_time(u64::MAX), None);
     }
 
     #[test]
