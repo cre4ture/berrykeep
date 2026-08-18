@@ -30,6 +30,20 @@ public protocol AppleManualCBridgeFFI: Sendable {
     ) throws -> String
     func metadataJSON(handle: AppleRustHandle, key: String) throws -> String
     func fetchBytes(handle: AppleRustHandle, key: String) throws -> Data
+    func objectSize(
+        handle: AppleRustHandle,
+        key: String,
+        snapshot: String?,
+        version: String?
+    ) throws -> UInt64
+    func fetchRangeBytes(
+        handle: AppleRustHandle,
+        key: String,
+        offset: UInt64,
+        length: Int,
+        snapshot: String?,
+        version: String?
+    ) throws -> Data
     func fetchRelativeBytes(handle: AppleRustHandle, path: String) throws -> Data
     func putBytes(
         handle: AppleRustHandle,
@@ -65,6 +79,38 @@ public protocol AppleManualCBridgeFFI: Sendable {
         clientIdentityJSON: String?
     ) throws -> String
     func stopWebUI() throws
+}
+
+public extension AppleManualCBridgeFFI {
+    func objectSize(
+        handle: AppleRustHandle,
+        key: String,
+        snapshot: String?,
+        version: String?
+    ) throws -> UInt64 {
+        _ = handle
+        _ = key
+        _ = snapshot
+        _ = version
+        throw AppleManualCBridgeError.invalidResponse("object-size reads are unavailable")
+    }
+
+    func fetchRangeBytes(
+        handle: AppleRustHandle,
+        key: String,
+        offset: UInt64,
+        length: Int,
+        snapshot: String?,
+        version: String?
+    ) throws -> Data {
+        _ = handle
+        _ = key
+        _ = offset
+        _ = length
+        _ = snapshot
+        _ = version
+        throw AppleManualCBridgeError.invalidResponse("range reads are unavailable")
+    }
 }
 
 public struct AppleTitleLatencyMonitorSettings: Codable, Equatable, Sendable {
@@ -252,6 +298,45 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
         _ = revisionHint
         return try withHandle { handle in
             try ffi.fetchBytes(handle: handle, key: normalizedPath(path))
+        }
+    }
+
+    public func objectSize(
+        path: String,
+        snapshot: String? = nil,
+        version: String? = nil
+    ) throws -> UInt64 {
+        try withHandle { handle in
+            try ffi.objectSize(
+                handle: handle,
+                key: normalizedPath(path),
+                snapshot: snapshot,
+                version: version
+            )
+        }
+    }
+
+    public func downloadRange(
+        path: String,
+        offset: UInt64,
+        length: Int,
+        snapshot: String? = nil,
+        version: String? = nil
+    ) throws -> Data {
+        guard length >= 0, length <= 4 * 1_024 * 1_024 else {
+            throw AppleManualCBridgeError.invalidConfiguration(
+                "an Apple File Provider range must be between zero and 4 MiB"
+            )
+        }
+        return try withHandle { handle in
+            try ffi.fetchRangeBytes(
+                handle: handle,
+                key: normalizedPath(path),
+                offset: offset,
+                length: length,
+                snapshot: snapshot,
+                version: version
+            )
         }
     }
 
@@ -454,6 +539,8 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
         case .temporaryFile:
             return identifier.temporaryFilePath ?? normalizedInput
         case .file:
+            throw AppleManualCBridgeError.unsupportedIdentifier(normalizedInput)
+        case .originalShare:
             throw AppleManualCBridgeError.unsupportedIdentifier(normalizedInput)
         }
     }

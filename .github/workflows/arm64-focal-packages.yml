@@ -36,6 +36,38 @@ jobs:
         with:
           toolchain: nightly-2026-02-17
 
+      - name: Install ELF verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils file xz-utils
+
+      - name: Restore Zig toolchain cache
+        id: restore-zig
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ironmesh-build-tools
+          key: static-server-node-zig-0.16.0-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Cache static Server Node Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: static-server-node-aarch64
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build and verify static AArch64 Server Node
+        run: |
+          ./scripts/build-static-server-node.sh \
+            --target aarch64-unknown-linux-musl \
+            --variant-id aarch64-generic \
+            --run-smoke always
+
+      - name: Save Zig toolchain cache
+        if: ${{ github.event_name != 'pull_request' && steps.restore-zig.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ironmesh-build-tools
+          key: ${{ steps.restore-zig.outputs.cache-primary-key }}
+
       - name: Prepare vendored crates and web assets
         run: ./scripts/prepare-ppa-source.sh
 
@@ -93,6 +125,8 @@ jobs:
                 | tar -xz -C /tmp
               install -m 0755 "/tmp/${sccache_pkg}/sccache" /usr/local/bin/sccache
               CARGO_BUILD_JOBS=2 ./scripts/build-local-debs.sh \
+                --prebuilt-server-node \
+                  "$PWD/target/aarch64-unknown-linux-musl/release/ironmesh-server-node" \
                 --no-prepare --no-check-build-deps -- -j2
               sccache --show-stats || true
               find /build -maxdepth 1 -type f \
@@ -118,3 +152,12 @@ jobs:
           name: focal-arm64-debian-packages
           if-no-files-found: error
           path: artifacts/
+
+      - name: Upload portable AArch64 Server Node
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-server-node-linux-arm64
+          path: |
+            target/static-server-node/*.tar.gz
+            target/static-server-node/*.tar.gz.sha256
+          if-no-files-found: error

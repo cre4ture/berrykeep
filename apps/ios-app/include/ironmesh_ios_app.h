@@ -97,6 +97,22 @@ int ironmesh_ios_facade_fetch_bytes(void *handle,
                                     struct IronmeshIosBytes *out_bytes,
                                     char **out_error);
 
+int ironmesh_ios_facade_object_size(void *handle,
+                                    const char *key,
+                                    const char *snapshot,
+                                    const char *version,
+                                    uint64_t *out_size,
+                                    char **out_error);
+
+int ironmesh_ios_facade_fetch_range_bytes(void *handle,
+                                          const char *key,
+                                          uint64_t offset,
+                                          uintptr_t length,
+                                          const char *snapshot,
+                                          const char *version,
+                                          struct IronmeshIosBytes *out_bytes,
+                                          char **out_error);
+
 int ironmesh_ios_facade_fetch_relative_bytes(void *handle,
                                              const char *path,
                                              struct IronmeshIosBytes *out_bytes,

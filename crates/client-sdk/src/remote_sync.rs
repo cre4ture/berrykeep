@@ -1233,6 +1233,7 @@ mod tests {
                 has_more: false,
                 next_cursor: None,
                 sync_token: None,
+                consistency_token: None,
                 media_summary: crate::ironmesh_client::StoreIndexMediaSummary::default(),
                 entries: Vec::new(),
             })
@@ -1295,6 +1296,7 @@ mod tests {
                 has_more: false,
                 next_cursor: None,
                 sync_token: None,
+                consistency_token: None,
                 media_summary: crate::ironmesh_client::StoreIndexMediaSummary::default(),
                 entries: vec![crate::ironmesh_client::StoreIndexEntry {
                     path: "docs/readme.txt".to_string(),

@@ -14268,6 +14268,14 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
     assert!(matches!(second_path, "gallery/a.png" | "gallery/b.png"));
     assert_eq!(second_payload["total_entry_count"], 2);
     assert_eq!(second_payload["has_more"], false);
+    assert_eq!(
+        first_payload["consistency_token"], second_payload["consistency_token"],
+        "generic offset pages must identify the same namespace revision"
+    );
+    assert_eq!(
+        first_payload["media_summary"], second_payload["media_summary"],
+        "media summaries cover the whole filtered scope on every page"
+    );
 
     let cached_query = super::StoreIndexQuery {
         prefix: None,
@@ -14373,6 +14381,10 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
     assert_eq!(invalidated_payload["entries"][0]["path"], "gallery/0.png");
     assert_eq!(invalidated_payload["total_entry_count"], 3);
     assert_eq!(invalidated_payload["has_more"], true);
+    assert_ne!(
+        first_payload["consistency_token"], invalidated_payload["consistency_token"],
+        "a namespace mutation must produce a new pagination consistency token"
+    );
 
     cleanup_test_state(&state).await;
 }
@@ -14524,6 +14536,14 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
     assert_eq!(
         first_payload["sync_token"], second_payload["sync_token"],
         "offset and limit are pagination state, not sync-token scope"
+    );
+    assert_eq!(
+        first_payload["consistency_token"], second_payload["consistency_token"],
+        "captured-sort pages must identify the same gallery revision"
+    );
+    assert_eq!(
+        first_payload["media_summary"], second_payload["media_summary"],
+        "media summaries cover the whole filtered scope on every page"
     );
 
     assert_ne!(older.manifest_hash, newer.manifest_hash);

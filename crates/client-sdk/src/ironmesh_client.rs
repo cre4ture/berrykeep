@@ -3335,6 +3335,8 @@ pub struct StoreIndexResponse {
     #[serde(default)]
     pub sync_token: Option<String>,
     #[serde(default)]
+    pub consistency_token: Option<String>,
+    #[serde(default)]
     pub media_summary: StoreIndexMediaSummary,
     #[serde(default)]
     pub entries: Vec<StoreIndexEntry>,
@@ -5920,7 +5922,7 @@ impl IronMeshClient {
         Ok(())
     }
 
-    async fn download_range_to_writer_with_progress(
+    pub async fn download_range_to_writer_with_progress(
         &self,
         request: DownloadRangeRequest<'_>,
         writer: &mut dyn Write,

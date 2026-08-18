@@ -26,6 +26,22 @@ func fileProviderError(_ code: NSFileProviderError.Code) -> NSError {
     NSError(domain: NSFileProviderErrorDomain, code: code.rawValue)
 }
 
+func contentVersionUnavailableError() -> NSError {
+    #if os(macOS)
+    return fileProviderError(.versionNoLongerAvailable)
+    #else
+    return fileProviderError(.noSuchItem)
+    #endif
+}
+
+func providerDomainUnavailableError() -> NSError {
+    #if os(macOS)
+    return fileProviderError(.providerDomainNotFound)
+    #else
+    return fileProviderError(.noSuchItem)
+    #endif
+}
+
 func unsupportedFeatureError(_ message: String) -> NSError {
     NSError(
         domain: NSCocoaErrorDomain,

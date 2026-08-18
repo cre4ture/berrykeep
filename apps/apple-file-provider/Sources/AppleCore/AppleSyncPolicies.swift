@@ -77,7 +77,7 @@ public enum AppleDeletionCapabilityPolicy {
         switch kind {
         case .file, .temporaryFile, .directory:
             true
-        case .root:
+        case .root, .originalShare:
             false
         }
     }
@@ -140,6 +140,8 @@ public struct AppleProfilePathMapper: Equatable, Sendable {
             .temporaryFile(path: localPath)
         case .file:
             remoteItem.identifier
+        case .originalShare:
+            remoteItem.identifier
         }
         return AppleBridgeItem(
             path: localPath,
@@ -148,6 +150,7 @@ public struct AppleProfilePathMapper: Equatable, Sendable {
             kind: remoteItem.kind,
             objectID: remoteItem.objectID,
             revisionHint: remoteItem.revisionHint,
+            mimeType: remoteItem.mimeType,
             sizeBytes: remoteItem.sizeBytes,
             modifiedAtUnix: remoteItem.modifiedAtUnix,
             conflictState: remoteItem.conflictState

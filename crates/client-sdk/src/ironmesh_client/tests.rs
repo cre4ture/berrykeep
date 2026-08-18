@@ -1149,6 +1149,7 @@ fn folder_marker_synthesis_preserves_server_file_order_on_the_first_page() {
         has_more: true,
         next_cursor: None,
         sync_token: None,
+        consistency_token: None,
         media_summary: StoreIndexMediaSummary::default(),
         entries: vec![
             store_index_test_entry("photos/2026/newest.jpg"),
@@ -1199,6 +1200,7 @@ fn folder_marker_synthesis_leaves_later_pages_unchanged() {
         has_more: false,
         next_cursor: None,
         sync_token: None,
+        consistency_token: None,
         media_summary: StoreIndexMediaSummary::default(),
         entries: vec![
             store_index_test_entry("photos/2024/newer.jpg"),
@@ -1623,6 +1625,7 @@ fn snapshot_index_response_body(path: &str) -> Vec<u8> {
         has_more: false,
         next_cursor: None,
         sync_token: None,
+        consistency_token: None,
         media_summary: StoreIndexMediaSummary::default(),
         entries: vec![StoreIndexEntry {
             path: path.to_string(),
@@ -3410,6 +3413,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
                     has_more: false,
                     next_cursor: None,
                     sync_token: None,
+                    consistency_token: None,
                     media_summary: StoreIndexMediaSummary::default(),
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
@@ -3437,6 +3441,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
             has_more: false,
             next_cursor: None,
             sync_token: None,
+            consistency_token: None,
             media_summary: StoreIndexMediaSummary::default(),
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
@@ -4714,6 +4719,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
                     has_more: false,
                     next_cursor: None,
                     sync_token: None,
+                    consistency_token: None,
                     media_summary: StoreIndexMediaSummary::default(),
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
@@ -4741,6 +4747,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
             has_more: false,
             next_cursor: None,
             sync_token: None,
+            consistency_token: None,
             media_summary: StoreIndexMediaSummary::default(),
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),

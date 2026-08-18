@@ -30,7 +30,7 @@ runs:
 
     - name: Start GitHub-backed Bazel cache
       id: bazel-cache
-      uses: cre4ture/bazel-github-actions-cache-v2@3a768d2b634f82a23405c838a4aa9c4e971fe65b # v0.3.0
+      uses: cre4ture/bazel-github-actions-cache-v2@d648e13af2e6ec4791bd0a66a2d9bbd3605943c9 # v0.3.1
       with:
         # Fine-grained publication is intentionally limited to an explicit
         # maintainer seed. The packed backend turns many Bazel objects into

@@ -27,12 +27,12 @@ import {
 } from "react";
 import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
 import {
-  AndroidOriginalShareAction,
-  usesAndroidEmbeddedClient,
+  OriginalShareAction,
+  embeddedShareClient,
   type MediaShareRequest
-} from "./AndroidOriginalShareAction";
+} from "./OriginalShareAction";
 
-export type { MediaShareRequest } from "./AndroidOriginalShareAction";
+export type { MediaShareRequest } from "./OriginalShareAction";
 
 export type MediaPreviewRequest = {
   url: string;
@@ -162,7 +162,7 @@ export function MediaLightboxModal({
 }: MediaLightboxModalProps) {
   const [isSlideshowMode, setIsSlideshowMode] = useState(false);
   const usesEmbeddedViewport = usesEmbeddedWebUiViewport();
-  const usesAndroidShare = usesAndroidEmbeddedClient();
+  const shareClient = embeddedShareClient();
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < itemCount - 1;
   const selectedItemDownloadUrl = selectedItem ? mediaDownloadUrl(selectedItem) : null;
@@ -348,8 +348,8 @@ export function MediaLightboxModal({
                 </Group>
                 <Group data-media-actions="true" gap="xs" justify="flex-end">
                   {extraActions}
-                  {usesAndroidShare ? (
-                    <AndroidOriginalShareAction request={selectedItem.requests.share} />
+                  {shareClient ? (
+                    <OriginalShareAction client={shareClient} request={selectedItem.requests.share} />
                   ) : (
                     <Button
                       data-media-download="true"

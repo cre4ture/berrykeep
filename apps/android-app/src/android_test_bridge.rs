@@ -149,6 +149,7 @@ fn android_test_store_index_response() -> StoreIndexResponse {
         has_more: false,
         next_cursor: None,
         sync_token: None,
+        consistency_token: None,
         media_summary: StoreIndexMediaSummary::default(),
         entries: vec![StoreIndexEntry {
             path: "docs/readme.txt".to_string(),

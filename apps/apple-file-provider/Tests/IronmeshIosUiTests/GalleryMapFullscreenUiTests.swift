@@ -34,6 +34,29 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
     }
 
     @MainActor
+    func testEmbeddedGalleryOffersNativeShareInsteadOfDownload() {
+        let app = launchApp(webUIURL: "\(galleryRuntimeURL)?page=gallery&gallery_view=map")
+        let webView = app.webViews["ironmesh-hosted-web-ui"]
+        XCTAssertTrue(webView.waitForExistence(timeout: 45), "The embedded Client UI should load")
+
+        let cluster = element(in: webView, labelled: "Open map cluster with 2 items")
+        XCTAssertTrue(cluster.waitForExistence(timeout: 45), "The Gallery map should expose its cluster")
+        cluster.tap()
+        let firstImage = element(in: webView, labelled: "gallery/runtime-map-a.png")
+        XCTAssertTrue(firstImage.waitForExistence(timeout: 10), "The cluster chooser should expose an image")
+        firstImage.tap()
+
+        XCTAssertTrue(
+            element(in: webView, labelled: "Share original").waitForExistence(timeout: 10),
+            "The embedded iOS viewer should expose native sharing"
+        )
+        XCTAssertFalse(
+            element(in: webView, labelled: "Download original").exists,
+            "The embedded iOS viewer should not expose the browser download action"
+        )
+    }
+
+    @MainActor
     private func launchApp(
         embeddedSurface: String? = nil,
         webUIURL: String? = nil
