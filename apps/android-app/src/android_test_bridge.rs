@@ -147,12 +147,11 @@ fn android_test_store_index_response(request_path: &str) -> StoreIndexResponse {
     let entries = if prefix == "docs" {
         vec![android_test_document_entry()]
     } else {
-        vec![
-            android_test_folder_entry("docs/", "prefix"),
-            android_test_folder_entry("docs/", "key"),
-            android_test_folder_entry("photos/", "prefix"),
-            android_test_folder_entry("photos/", "key"),
-        ]
+        let mut entries = android_test_folder_entries();
+        if !android_test_query_matches(request_path, "view", "tree") {
+            entries.push(android_test_document_entry());
+        }
+        entries
     };
     StoreIndexResponse {
         prefix: prefix.to_string(),
@@ -191,6 +190,15 @@ fn android_test_document_entry() -> StoreIndexEntry {
         content_fingerprint: None,
         media: None,
     }
+}
+
+fn android_test_folder_entries() -> Vec<StoreIndexEntry> {
+    vec![
+        android_test_folder_entry("docs/", "prefix"),
+        android_test_folder_entry("docs/", "key"),
+        android_test_folder_entry("photos/", "prefix"),
+        android_test_folder_entry("photos/", "key"),
+    ]
 }
 
 fn android_test_folder_entry(path: &str, entry_type: &str) -> StoreIndexEntry {
