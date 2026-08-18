@@ -82,6 +82,48 @@ export type StoreIndexViewport = {
   east: number;
 };
 
+export type GalleryMapBounds = StoreIndexViewport;
+
+export type GalleryMapCluster = {
+  cluster_id: string;
+  count: number;
+  latitude: number;
+  longitude: number;
+  bounds: GalleryMapBounds;
+  entry?: StoreIndexEntry | null;
+};
+
+export type GalleryMapClustersResponse = {
+  prefix: string;
+  depth: number;
+  zoom: number;
+  resolution: number;
+  total_entry_count: number;
+  visible_geotagged_count: number;
+  media_summary: StoreIndexMediaSummary;
+  query_token: string;
+  clusters: GalleryMapCluster[];
+};
+
+export type GalleryMapClusterEntriesResponse = {
+  cluster_id: string;
+  entry_count: number;
+  total_entry_count: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
+  query_token: string;
+  entries: StoreIndexEntry[];
+};
+
+export type GalleryMapClustersRequest = {
+  prefix?: string;
+  depth: number;
+  mediaFilter: StoreListMediaFilter;
+  viewport: StoreIndexViewport;
+  zoom: number;
+};
+
 export type StoreListView = "raw" | "tree";
 
 export type StoreListSortOrder =
