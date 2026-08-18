@@ -2696,6 +2696,7 @@ function GalleryWorldMap({
 }: GalleryWorldMapProps) {
   const [clusterDialog, setClusterDialog] = useState<{
     cluster: GalleryMapCluster;
+    queryToken: string;
     entries: GalleryEntry[];
     totalEntryCount: number;
     hasMore: boolean;
@@ -2734,13 +2735,14 @@ function GalleryWorldMap({
   ).length;
 
   async function loadWorldClusterDialogPage(cluster: GalleryMapCluster, append: boolean) {
-    const queryToken = clustersPayload?.query_token;
+    const queryToken = append ? clusterDialog?.queryToken : clustersPayload?.query_token;
     if (!queryToken) {
       return;
     }
     const existingEntries = append ? clusterDialog?.entries ?? [] : [];
     setClusterDialog({
       cluster,
+      queryToken,
       entries: existingEntries,
       totalEntryCount: append ? clusterDialog?.totalEntryCount ?? cluster.count : cluster.count,
       hasMore: append ? clusterDialog?.hasMore ?? true : true,
@@ -2756,6 +2758,7 @@ function GalleryWorldMap({
       );
       setClusterDialog({
         cluster,
+        queryToken,
         entries: [...existingEntries, ...page.entries],
         totalEntryCount: page.total_entry_count,
         hasMore: page.has_more,
@@ -2765,6 +2768,7 @@ function GalleryWorldMap({
     } catch (nextError) {
       setClusterDialog({
         cluster,
+        queryToken,
         entries: existingEntries,
         totalEntryCount: cluster.count,
         hasMore: append,

@@ -225,6 +225,7 @@ export function GalleryBasemapMap({
   const [viewportVersion, setViewportVersion] = useState(0);
   const [clusterDialog, setClusterDialog] = useState<{
     cluster: GalleryBasemapMapCluster;
+    queryToken: string;
     entries: GalleryBasemapMapEntry[];
     totalEntryCount: number;
     hasMore: boolean;
@@ -243,10 +244,6 @@ export function GalleryBasemapMap({
   useEffect(() => {
     onViewportChangeRef.current = onViewportChange;
   }, [onViewportChange]);
-
-  useEffect(() => {
-    setClusterDialog(null);
-  }, [clustersPayload?.query_token]);
 
   useEffect(() => {
     let cancelled = false;
@@ -503,13 +500,14 @@ export function GalleryBasemapMap({
   }
 
   async function loadClusterDialogPage(cluster: GalleryBasemapMapCluster, append: boolean) {
-    const queryToken = clustersPayload?.query_token;
+    const queryToken = append ? clusterDialog?.queryToken : clustersPayload?.query_token;
     if (!queryToken) {
       return;
     }
     const existingEntries = append ? clusterDialog?.entries ?? [] : [];
     setClusterDialog({
       cluster,
+      queryToken,
       entries: existingEntries,
       totalEntryCount: append ? clusterDialog?.totalEntryCount ?? cluster.count : cluster.count,
       hasMore: append ? clusterDialog?.hasMore ?? true : true,
@@ -525,6 +523,7 @@ export function GalleryBasemapMap({
       );
       setClusterDialog({
         cluster,
+        queryToken,
         entries: [...existingEntries, ...page.entries],
         totalEntryCount: page.total_entry_count,
         hasMore: page.has_more,
@@ -534,6 +533,7 @@ export function GalleryBasemapMap({
     } catch (error) {
       setClusterDialog({
         cluster,
+        queryToken,
         entries: existingEntries,
         totalEntryCount: cluster.count,
         hasMore: append,

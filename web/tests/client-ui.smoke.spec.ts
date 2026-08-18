@@ -480,6 +480,52 @@ test("client-ui gallery loads bounded server-side map clusters", async ({ page }
   ).toBe(true);
 });
 
+test("client-ui keeps an open server cluster stable across viewport refreshes", async ({ page }) => {
+  const storeEntries = createMockStoreEntries().map((entry) =>
+    entry.path === "gallery/dog.jpg" && entry.media
+      ? {
+          ...entry,
+          media: {
+            ...entry.media,
+            gps: {
+              latitude: 47.3769,
+              longitude: 8.5417
+            }
+          }
+        }
+      : entry
+  );
+  const mapClusterRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/map/clusters")) {
+      mapClusterRequests.push(url);
+    }
+  });
+
+  await installClientUiMocks(page, {
+    storeEntries,
+    mapClusterRefreshDelayMs: 750,
+    mapClusterEntriesDelayMs: 1_500
+  });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  const map = page.locator('[aria-label="Geotagged gallery map"]');
+  const cluster = page.getByRole("button", { name: "Open map cluster with 2 items" });
+  await expect(cluster).toBeVisible();
+  await map.hover({ position: { x: 80, y: 80 } });
+  await page.mouse.wheel(0, -400);
+  await expect.poll(() => mapClusterRequests.length).toBeGreaterThan(1);
+  await cluster.click();
+
+  const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
+  await expect(chooser).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/cat.png" })).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/dog.jpg" })).toBeVisible();
+});
+
 test("client-ui keeps the direct iOS gallery map inside the WebView viewport", async ({ page }) => {
   await installClientUiMocks(page);
   await page.goto("/?embedded=gallery_map&embedded_client=ios");
@@ -1232,6 +1278,8 @@ type InstallClientUiMocksOptions = {
   mapMetadataStatus?: number;
   mapConfigurationStatus?: number;
   mapConfiguration?: MockGalleryMapConfiguration;
+  mapClusterRefreshDelayMs?: number;
+  mapClusterEntriesDelayMs?: number;
 };
 
 type MockGalleryMapConfiguration = {
@@ -1277,6 +1325,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   let cacheScope = options?.cacheScope === undefined ? "a".repeat(64) : options.cacheScope;
   let galleryOffline = false;
   let galleryStoreListRequestCount = 0;
+  let galleryMapClusterRequestCount = 0;
   const galleryMapMock = new GalleryMapMockSession<MockStoreEntry>();
   let galleryStoreListDelayMs = 0;
   const galleryStoreListDelayByMediaFilter = new Map<string, number>();
@@ -1739,10 +1788,17 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     }
 
     if (pathname === apiV1("/store/map/clusters") && method === "GET") {
+      galleryMapClusterRequestCount += 1;
+      if (galleryMapClusterRequestCount > 1 && options?.mapClusterRefreshDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, options.mapClusterRefreshDelayMs));
+      }
       return json(route, galleryMapMock.clusters(storeEntries, searchParams));
     }
 
     if (pathname === apiV1("/store/map/cluster-entries") && method === "GET") {
+      if (options?.mapClusterEntriesDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, options.mapClusterEntriesDelayMs));
+      }
       return json(
         route,
         galleryMapMock.clusterEntries(searchParams)
