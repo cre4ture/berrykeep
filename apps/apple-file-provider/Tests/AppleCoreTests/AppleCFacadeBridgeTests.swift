@@ -146,6 +146,41 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(ffi.lastDeletePath, "docs/archive/")
     }
 
+    func testRangeReadsPreserveImmutableSelectorsAndEnforceChunkLimit() throws {
+        let ffi = MockFFI()
+        ffi.objectSizeResponse = 9_000_000
+        ffi.rangeResponseData = Data("range".utf8)
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
+
+        let size = try bridge.objectSize(
+            path: "/gallery/cat.png/",
+            snapshot: "snapshot-1"
+        )
+        let bytes = try bridge.downloadRange(
+            path: "/gallery/cat.png/",
+            offset: 4_096,
+            length: 5,
+            version: "version-1"
+        )
+
+        XCTAssertEqual(size, 9_000_000)
+        XCTAssertEqual(String(decoding: bytes, as: UTF8.self), "range")
+        XCTAssertEqual(ffi.lastObjectSizeKey, "gallery/cat.png")
+        XCTAssertEqual(ffi.lastObjectSizeSnapshot, "snapshot-1")
+        XCTAssertEqual(ffi.lastRangeKey, "gallery/cat.png")
+        XCTAssertEqual(ffi.lastRangeOffset, 4_096)
+        XCTAssertEqual(ffi.lastRangeLength, 5)
+        XCTAssertEqual(ffi.lastRangeVersion, "version-1")
+        XCTAssertThrowsError(
+            try bridge.downloadRange(
+                path: "gallery/cat.png",
+                offset: 0,
+                length: 4 * 1_024 * 1_024 + 1
+            )
+        )
+    }
+
     func testUploadReportsDivergentHeadsForVisibleConflictRecovery() throws {
         let ffi = MockFFI()
         ffi.putResponseJSON = """
@@ -297,6 +332,12 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var lastStoreIndexSort: String?
     var lastStoreIndexMediaFilter: String?
     var lastRelativePath: String?
+    var lastObjectSizeKey: String?
+    var lastObjectSizeSnapshot: String?
+    var lastRangeKey: String?
+    var lastRangeOffset: UInt64?
+    var lastRangeLength: Int?
+    var lastRangeVersion: String?
 
     var listResponseJSON = #"{"entries":[]}"#
     var storeIndexResponseJSON = #"{"prefix":"","depth":1,"entry_count":0,"total_entry_count":0,"offset":0,"has_more":false,"media_summary":{"ready_count":0,"pending_count":0,"incomplete_count":0,"image_count":0,"video_count":0,"geotagged_count":0},"entries":[]}"#
@@ -304,6 +345,8 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var putResponseJSON = #"{"item_id":"file:path:test.txt"}"#
     var fetchResponseData = Data()
     var relativeResponseData = Data()
+    var objectSizeResponse: UInt64 = 0
+    var rangeResponseData = Data()
     var diagnosticsResponseJSON = #"{"endpoints":[]}"#
     var routeSnapshotResponseJSON = #"{"ranked_indices":[],"endpoints":[]}"#
     var clientIdentityUpdateJSON = ""
@@ -383,6 +426,36 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = handle
         _ = key
         return fetchResponseData
+    }
+
+    func objectSize(
+        handle: AppleRustHandle,
+        key: String,
+        snapshot: String?,
+        version: String?
+    ) throws -> UInt64 {
+        _ = handle
+        _ = version
+        lastObjectSizeKey = key
+        lastObjectSizeSnapshot = snapshot
+        return objectSizeResponse
+    }
+
+    func fetchRangeBytes(
+        handle: AppleRustHandle,
+        key: String,
+        offset: UInt64,
+        length: Int,
+        snapshot: String?,
+        version: String?
+    ) throws -> Data {
+        _ = handle
+        _ = snapshot
+        lastRangeKey = key
+        lastRangeOffset = offset
+        lastRangeLength = length
+        lastRangeVersion = version
+        return rangeResponseData
     }
 
     func fetchRelativeBytes(handle: AppleRustHandle, path: String) throws -> Data {

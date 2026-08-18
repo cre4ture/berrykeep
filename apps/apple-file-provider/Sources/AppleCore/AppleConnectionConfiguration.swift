@@ -97,6 +97,7 @@ public struct AppleBridgeItem: Sendable, Codable, Equatable {
     public var kind: AppleFileProviderItemKind
     public var objectID: String?
     public var revisionHint: String?
+    public var mimeType: String?
     public var sizeBytes: Int64?
     public var modifiedAtUnix: Int64?
     public var conflictState: AppleConflictState?
@@ -108,6 +109,7 @@ public struct AppleBridgeItem: Sendable, Codable, Equatable {
         kind: AppleFileProviderItemKind,
         objectID: String? = nil,
         revisionHint: String? = nil,
+        mimeType: String? = nil,
         sizeBytes: Int64? = nil,
         modifiedAtUnix: Int64? = nil,
         conflictState: AppleConflictState? = nil
@@ -118,6 +120,7 @@ public struct AppleBridgeItem: Sendable, Codable, Equatable {
         self.kind = kind
         self.objectID = objectID?.nilIfBlank
         self.revisionHint = revisionHint?.nilIfBlank
+        self.mimeType = mimeType?.nilIfBlank
         self.sizeBytes = sizeBytes
         self.modifiedAtUnix = modifiedAtUnix
         self.conflictState = conflictState

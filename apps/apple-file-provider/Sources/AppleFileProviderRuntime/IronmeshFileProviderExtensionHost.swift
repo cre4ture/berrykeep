@@ -34,3 +34,7 @@ open class IronmeshFileProviderExtensionHost: NSObject, NSFileProviderReplicated
         workingSetSignals.invalidate()
     }
 }
+
+#if os(macOS)
+extension IronmeshFileProviderExtensionHost: NSFileProviderPartialContentFetching {}
+#endif

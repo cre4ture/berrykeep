@@ -5920,7 +5920,7 @@ impl IronMeshClient {
         Ok(())
     }
 
-    async fn download_range_to_writer_with_progress(
+    pub async fn download_range_to_writer_with_progress(
         &self,
         request: DownloadRangeRequest<'_>,
         writer: &mut dyn Write,
