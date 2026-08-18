@@ -144,11 +144,14 @@ fn android_test_store_index_response(request_path: &str) -> StoreIndexResponse {
     } else {
         ""
     };
+    let is_tree_view = android_test_query_matches(request_path, "view", "tree");
     let entries = if prefix == "docs" {
         vec![android_test_document_entry()]
     } else {
         let mut entries = android_test_folder_entries();
-        if !android_test_query_matches(request_path, "view", "tree") {
+        if is_tree_view {
+            entries = android_test_collapse_entries_for_tree_view(entries);
+        } else {
             entries.push(android_test_document_entry());
         }
         entries
@@ -167,6 +170,36 @@ fn android_test_store_index_response(request_path: &str) -> StoreIndexResponse {
         media_summary: StoreIndexMediaSummary::default(),
         entries,
     }
+}
+
+// Mirrors server-node-sdk's `collapse_store_index_entries_for_tree_view`, which the real
+// server applies whenever `view=tree` is requested: trailing-slash and "prefix" entries for
+// the same path are deduplicated into a single canonical "prefix" entry.
+fn android_test_collapse_entries_for_tree_view(
+    entries: Vec<StoreIndexEntry>,
+) -> Vec<StoreIndexEntry> {
+    let mut collapsed: Vec<StoreIndexEntry> = Vec::new();
+    for entry in entries {
+        let is_directory_like = entry.entry_type == "prefix" || entry.path.ends_with('/');
+        if !is_directory_like {
+            collapsed.push(entry);
+            continue;
+        }
+        if collapsed.iter().any(|existing| existing.path == entry.path) {
+            continue;
+        }
+        collapsed.push(StoreIndexEntry {
+            path: entry.path,
+            entry_type: "prefix".to_string(),
+            version: None,
+            content_hash: None,
+            size_bytes: None,
+            modified_at_unix: None,
+            content_fingerprint: None,
+            media: None,
+        });
+    }
+    collapsed
 }
 
 fn android_test_query_matches(request_path: &str, name: &str, expected_value: &str) -> bool {

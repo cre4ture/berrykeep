@@ -166,7 +166,11 @@ class IronmeshDocumentsProviderInstrumentationTest {
     }
 
     @Test
-    fun queryChildDocuments_deduplicatesFolderMarkerObjectsWithoutUnnamedRows() {
+    fun queryChildDocuments_treeViewFolderMarkersAreNamedWithoutDuplicates() {
+        // The mock server collapses trailing-slash/"prefix" duplicates into a single
+        // canonical "prefix" entry per directory when view=tree is requested, matching the
+        // production server contract (see collapse_store_index_entries_for_tree_view). The
+        // provider trusts that contract rather than re-deriving directory-ness itself.
         configureProviderDownloadScenario()
         val childrenUri = DocumentsContract.buildChildDocumentsUri(
             "${appContext.packageName}.documents",

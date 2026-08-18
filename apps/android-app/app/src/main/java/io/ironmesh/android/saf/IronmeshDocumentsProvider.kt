@@ -85,13 +85,17 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         }
 
         val prefix = parent.path.takeIf { it.isNotBlank() }
+        // loadDirectoryEntries() always requests the store index view=tree, whose server-side
+        // contract collapses trailing-slash folder markers into a single canonical "prefix"
+        // entry per directory. SAF can rely on entry_type alone rather than re-deriving
+        // directory-ness from the path.
         val entries = runBlocking {
             loadDirectoryEntries(prefix)
         }
         val emittedDocumentIds = LinkedHashSet<String>()
 
         entries.forEach { entry ->
-            if (entry.entry_type == "prefix" || entry.path.endsWith('/')) {
+            if (entry.entry_type == "prefix") {
                 val dirPath = entry.path.trimEnd('/')
                 if (!isDirectStoreIndexChildPath(parent.path, dirPath)) {
                     return@forEach
