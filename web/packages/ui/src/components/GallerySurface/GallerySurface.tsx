@@ -2025,6 +2025,11 @@ export function GallerySurface({
         onSelectIndex={(index) =>
           versionPreviewIndex === null ? showEntryAtIndex(index) : setVersionPreviewIndex(index)
         }
+        resolveShareVersionId={
+          loadVersions
+            ? async (key) => (await loadVersions(key)).preferred_head_version_id?.trim() || null
+            : undefined
+        }
         extraActions={
           loadVersions && activeMediaHistoryKey ? (
             <Button
