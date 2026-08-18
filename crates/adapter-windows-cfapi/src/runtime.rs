@@ -30,7 +30,7 @@ use crate::hydration_control::{
     mark_active_hydration,
 };
 use crate::placeholder_metadata::{
-    refresh_remote_conflict_identity, refresh_remote_placeholder_state,
+    RemotePlaceholderState, refresh_remote_conflict_identity, refresh_remote_placeholder_state,
 };
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use crate::sync_root_identity::{
@@ -1031,17 +1031,16 @@ pub fn apply_action_plan(
         set
     };
 
-    let mut placeholders: BTreeMap<
-        String,
-        (
-            String,
-            String,
-            Option<u64>,
-            Option<String>,
-            Option<u64>,
-            Option<NamespaceMediaMetadata>,
-        ),
-    > = BTreeMap::new();
+    struct PendingPlaceholder {
+        remote_version: String,
+        remote_content_hash: String,
+        remote_size: Option<u64>,
+        remote_content_fingerprint: Option<String>,
+        remote_modified_at_unix: Option<u64>,
+        remote_media: Option<NamespaceMediaMetadata>,
+    }
+
+    let mut placeholders: BTreeMap<String, PendingPlaceholder> = BTreeMap::new();
     let mut created_placeholder_paths = BTreeSet::new();
     for action in &plan.actions {
         match action {
@@ -1082,14 +1081,14 @@ pub fn apply_action_plan(
                 }
                 placeholders.insert(
                     normalized.clone(),
-                    (
-                        remote_version.clone(),
-                        remote_content_hash.clone(),
-                        *remote_size,
-                        remote_content_fingerprint.clone(),
-                        *remote_modified_at_unix,
-                        remote_media.clone(),
-                    ),
+                    PendingPlaceholder {
+                        remote_version: remote_version.clone(),
+                        remote_content_hash: remote_content_hash.clone(),
+                        remote_size: *remote_size,
+                        remote_content_fingerprint: remote_content_fingerprint.clone(),
+                        remote_modified_at_unix: *remote_modified_at_unix,
+                        remote_media: remote_media.clone(),
+                    },
                 );
                 created_placeholder_paths.insert(normalized);
             }
@@ -1107,18 +1106,15 @@ pub fn apply_action_plan(
         }
 
         let mut inputs = Vec::with_capacity(placeholders.len());
-        for (
-            relative_path,
-            (
+        for (relative_path, placeholder) in placeholders {
+            let PendingPlaceholder {
                 remote_version,
                 remote_content_hash,
                 remote_size,
                 remote_content_fingerprint,
                 remote_modified_at_unix,
                 remote_media,
-            ),
-        ) in placeholders
-        {
+            } = placeholder;
             let (parent_rel, child_name) = match relative_path.rsplit_once('/') {
                 Some((parent, child)) => (parent, child),
                 None => ("", relative_path.as_str()),
@@ -1242,12 +1238,14 @@ pub fn apply_action_plan(
                     root_path,
                     path,
                     provider_instance_id,
-                    Some(remote_version),
-                    Some(remote_content_hash),
-                    *remote_size,
-                    remote_content_fingerprint.as_deref(),
-                    *remote_modified_at_unix,
-                    remote_media.as_ref(),
+                    RemotePlaceholderState {
+                        remote_version: Some(remote_version),
+                        remote_content_hash: Some(remote_content_hash),
+                        remote_size_bytes: *remote_size,
+                        remote_content_fingerprint: remote_content_fingerprint.as_deref(),
+                        remote_modified_at_unix: *remote_modified_at_unix,
+                        remote_media: remote_media.as_ref(),
+                    },
                 ) {
                     tracing::info!(
                         "apply_action_plan: failed to refresh placeholder metadata for {}: {:#}",
@@ -1279,12 +1277,14 @@ pub fn apply_action_plan(
                     root_path,
                     path,
                     provider_instance_id,
-                    remote_version.as_deref(),
-                    remote_content_hash.as_deref(),
-                    *remote_size,
-                    remote_content_fingerprint.as_deref(),
-                    *remote_modified_at_unix,
-                    remote_media.as_ref(),
+                    RemotePlaceholderState {
+                        remote_version: remote_version.as_deref(),
+                        remote_content_hash: remote_content_hash.as_deref(),
+                        remote_size_bytes: *remote_size,
+                        remote_content_fingerprint: remote_content_fingerprint.as_deref(),
+                        remote_modified_at_unix: *remote_modified_at_unix,
+                        remote_media: remote_media.as_ref(),
+                    },
                 ) {
                     tracing::info!(
                         "apply_action_plan: failed to refresh conflict placeholder metadata for {}: {:#}",

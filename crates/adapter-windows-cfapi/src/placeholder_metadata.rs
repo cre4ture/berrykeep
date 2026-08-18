@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use sync_core::{EntryKind, SyncSnapshot};
+use sync_core::{EntryKind, NamespaceMediaMetadata, SyncSnapshot};
 use uuid::Uuid;
 use walkdir::WalkDir;
 use windows_sys::Win32::Storage::CloudFilters::CF_FS_METADATA;
@@ -36,6 +36,16 @@ pub struct RemoteDeleteReconcileReport {
 enum RemoteFileMetadataPolicy {
     ApplyAndMarkInSync,
     PreserveLocalConflict,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RemotePlaceholderState<'a> {
+    pub remote_version: Option<&'a str>,
+    pub remote_content_hash: Option<&'a str>,
+    pub remote_size_bytes: Option<u64>,
+    pub remote_content_fingerprint: Option<&'a str>,
+    pub remote_modified_at_unix: Option<u64>,
+    pub remote_media: Option<&'a NamespaceMediaMetadata>,
 }
 
 pub fn record_in_sync_local_file_state(
@@ -103,23 +113,13 @@ pub fn refresh_remote_placeholder_state(
     sync_root_path: &Path,
     relative_path: &str,
     provider_instance_id: Uuid,
-    remote_version: Option<&str>,
-    remote_content_hash: Option<&str>,
-    remote_size_bytes: Option<u64>,
-    remote_content_fingerprint: Option<&str>,
-    remote_modified_at_unix: Option<u64>,
-    remote_media: Option<&sync_core::NamespaceMediaMetadata>,
+    remote: RemotePlaceholderState<'_>,
 ) -> Result<()> {
     refresh_remote_placeholder_state_with_policy(
         sync_root_path,
         relative_path,
         provider_instance_id,
-        remote_version,
-        remote_content_hash,
-        remote_size_bytes,
-        remote_content_fingerprint,
-        remote_modified_at_unix,
-        remote_media,
+        remote,
         RemoteFileMetadataPolicy::ApplyAndMarkInSync,
     )
 }
@@ -128,23 +128,13 @@ pub fn refresh_remote_conflict_identity(
     sync_root_path: &Path,
     relative_path: &str,
     provider_instance_id: Uuid,
-    remote_version: Option<&str>,
-    remote_content_hash: Option<&str>,
-    remote_size_bytes: Option<u64>,
-    remote_content_fingerprint: Option<&str>,
-    remote_modified_at_unix: Option<u64>,
-    remote_media: Option<&sync_core::NamespaceMediaMetadata>,
+    remote: RemotePlaceholderState<'_>,
 ) -> Result<()> {
     refresh_remote_placeholder_state_with_policy(
         sync_root_path,
         relative_path,
         provider_instance_id,
-        remote_version,
-        remote_content_hash,
-        remote_size_bytes,
-        remote_content_fingerprint,
-        remote_modified_at_unix,
-        remote_media,
+        remote,
         RemoteFileMetadataPolicy::PreserveLocalConflict,
     )
 }
@@ -153,14 +143,17 @@ fn refresh_remote_placeholder_state_with_policy(
     sync_root_path: &Path,
     relative_path: &str,
     provider_instance_id: Uuid,
-    remote_version: Option<&str>,
-    remote_content_hash: Option<&str>,
-    remote_size_bytes: Option<u64>,
-    remote_content_fingerprint: Option<&str>,
-    remote_modified_at_unix: Option<u64>,
-    remote_media: Option<&sync_core::NamespaceMediaMetadata>,
+    remote: RemotePlaceholderState<'_>,
     file_metadata_policy: RemoteFileMetadataPolicy,
 ) -> Result<()> {
+    let RemotePlaceholderState {
+        remote_version,
+        remote_content_hash,
+        remote_size_bytes,
+        remote_content_fingerprint,
+        remote_modified_at_unix,
+        remote_media,
+    } = remote;
     let normalized = normalize_path(relative_path);
     if normalized.is_empty() || is_internal_sync_root_relative_path(&normalized) {
         return Ok(());
