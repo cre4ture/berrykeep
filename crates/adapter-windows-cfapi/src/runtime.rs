@@ -2517,6 +2517,7 @@ mod tests {
     use crate::helpers::decode_placeholder_file_identity;
     use std::collections::{HashMap, HashSet};
     use std::mem::size_of;
+    use std::os::windows::fs::MetadataExt;
     use std::ptr::null;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
@@ -2820,8 +2821,10 @@ mod tests {
             Some(1_920)
         );
         assert_eq!(
-            info.info().FsMetadata.BasicInfo.LastWriteTime,
-            unix_seconds_to_windows_file_time(1_723_456_789).unwrap()
+            std::fs::metadata(&placeholder_path)
+                .expect("placeholder metadata should be readable")
+                .last_write_time(),
+            unix_seconds_to_windows_file_time(1_723_456_789).unwrap() as u64
         );
 
         let encoded =
