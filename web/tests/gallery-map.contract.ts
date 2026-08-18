@@ -95,7 +95,14 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
   test(`${target.name} gallery map contract lists visible configured styles`, async ({ page }) => {
     await target.setup(page, { mapConfiguration: configuredMapVariants });
     await target.openGallery(page);
+    await expect(page.getByLabel("Depth")).toHaveValue("64");
+    const firstMapPageRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return url.searchParams.has("media_filter") && url.searchParams.get("limit") === "500";
+    });
     await page.getByRole("button", { name: "Map" }).click();
+    const firstMapPageUrl = new URL((await firstMapPageRequest).url());
+    expect(firstMapPageUrl.searchParams.get("offset")).toBe("0");
 
     await expect(page.getByText("Map styles could not be refreshed")).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Retry map styles" })).toHaveCount(0);

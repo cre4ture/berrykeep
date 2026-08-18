@@ -3335,6 +3335,8 @@ pub struct StoreIndexResponse {
     #[serde(default)]
     pub sync_token: Option<String>,
     #[serde(default)]
+    pub consistency_token: Option<String>,
+    #[serde(default)]
     pub media_summary: StoreIndexMediaSummary,
     #[serde(default)]
     pub entries: Vec<StoreIndexEntry>,

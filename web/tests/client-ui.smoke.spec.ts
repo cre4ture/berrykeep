@@ -438,6 +438,48 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   expect(requestedPaths).not.toContain("/api/maps/logical-file");
 });
 
+test("client-ui gallery loads map entries in bounded pages", async ({ page }) => {
+  const mapPageOffsets: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (
+      url.pathname !== apiV1("/store/list") ||
+      !url.searchParams.has("media_filter") ||
+      url.searchParams.get("limit") !== "500"
+    ) {
+      return;
+    }
+    mapPageOffsets.push(url.searchParams.get("offset") ?? "");
+  });
+
+  await installClientUiMocks(page, {
+    storeEntries: createGalleryPaginationMockStoreEntries(520),
+    mapConsistencyMismatchOnce: true
+  });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByText("523 items", { exact: true })).toBeVisible();
+  await expect(page.getByText("522 photos", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 movie", { exact: true })).toBeVisible();
+  await expect(page.getByText("522 ready", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 pending", { exact: true })).toBeVisible();
+  await expect(page.getByText("2 markers", { exact: true })).toBeVisible();
+  await expect(page.getByText("521 without GPS", { exact: true })).toBeVisible();
+  await expect
+    .poll(() => [...new Set(mapPageOffsets)].sort().join(","))
+    .toBe("0,500");
+  await expect
+    .poll(() => mapPageOffsets.filter((offset) => offset === "0").length)
+    .toBe(2);
+  await expect
+    .poll(() => mapPageOffsets.filter((offset) => offset === "500").length)
+    .toBe(2);
+});
+
 test("client-ui keeps the direct iOS gallery map inside the WebView viewport", async ({ page }) => {
   await installClientUiMocks(page);
   await page.goto("/?embedded=gallery_map&embedded_client=ios");
@@ -1183,6 +1225,7 @@ test("client-ui mobile drawer reveals and navigates its menu items", async ({ pa
 
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
+  mapConsistencyMismatchOnce?: boolean;
   cacheScope?: string | null;
   mapMetadataStatus?: number;
   mapConfigurationStatus?: number;
@@ -1232,6 +1275,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   let cacheScope = options?.cacheScope === undefined ? "a".repeat(64) : options.cacheScope;
   let galleryOffline = false;
   let galleryStoreListRequestCount = 0;
+  let mapPaginationAttempt = 0;
   let galleryStoreListDelayMs = 0;
   const galleryStoreListDelayByMediaFilter = new Map<string, number>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
@@ -1709,7 +1753,19 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       if (storeListDelay > 0) {
         await new Promise((resolve) => setTimeout(resolve, storeListDelay));
       }
-      return json(route, buildMockStoreListResponse(storeEntries, searchParams));
+      const response = buildMockStoreListResponse(storeEntries, searchParams);
+      const isMapPage =
+        searchParams.get("limit") === "500" && searchParams.has("media_filter");
+      if (isMapPage && searchParams.get("offset") === "0") {
+        mapPaginationAttempt += 1;
+      }
+      if (isMapPage && options?.mapConsistencyMismatchOnce) {
+        response.consistency_token =
+          mapPaginationAttempt === 1 && searchParams.get("offset") !== "0"
+            ? "mock-store-revision-2"
+            : `mock-store-revision-${mapPaginationAttempt}`;
+      }
+      return json(route, response);
     }
 
     if ((pathname === apiV1("/media/thumbnail") || pathname === "/media/thumbnail") && method === "GET") {
@@ -2196,6 +2252,7 @@ function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URL
     offset,
     limit,
     has_more: offset + pagedEntries.length < totalEntryCount,
+    consistency_token: "mock-store-revision-1",
     media_summary: summarizeMockGalleryEntries(filteredEntries),
     entries: pagedEntries
   };

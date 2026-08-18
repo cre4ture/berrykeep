@@ -13247,6 +13247,8 @@ struct StoreIndexResponse {
     next_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    consistency_token: Option<String>,
     media_summary: StoreIndexMediaSummary,
     entries: Vec<StoreIndexEntry>,
 }
@@ -15612,6 +15614,7 @@ fn store_index_response_from_gallery_index_page(
         revision: page.revision,
         scope: gallery_sync_scope_from_query(gallery_query),
     });
+    let consistency_token = format!("gallery:{sync_token}");
     let total_entry_count = page.total_entry_count;
     let offset = query.offset.unwrap_or(0).min(total_entry_count);
     let limit = query.limit.map(|value| value.max(1));
@@ -15632,6 +15635,7 @@ fn store_index_response_from_gallery_index_page(
             .unwrap_or(false),
         next_cursor: None,
         sync_token: Some(sync_token),
+        consistency_token: Some(consistency_token),
         media_summary: StoreIndexMediaSummary {
             ready_count: page.media_summary.ready_count,
             pending_count: page.media_summary.pending_count,
@@ -15751,6 +15755,7 @@ fn cached_store_index_page_response(
             has_more,
             next_cursor: None,
             sync_token: None,
+            consistency_token: Some(format!("namespace:{namespace_change_sequence}")),
             media_summary: cached.media_summary.clone(),
             entries,
         }),
@@ -16277,6 +16282,7 @@ async fn list_store_index_response_attempt(
             has_more,
             next_cursor: None,
             sync_token: None,
+            consistency_token: Some(format!("namespace:{namespace_change_sequence}")),
             media_summary,
             entries,
         }),
@@ -16584,6 +16590,10 @@ async fn list_store_index_response_cursor_mode(
         );
     }
 
+    let change_sequence = state
+        .storage
+        .namespace_change_sequence
+        .load(Ordering::SeqCst);
     let mut response = (
         StatusCode::OK,
         Json(StoreIndexResponse {
@@ -16596,15 +16606,12 @@ async fn list_store_index_response_cursor_mode(
             has_more: page.has_more,
             next_cursor: page.next_cursor,
             sync_token: None,
+            consistency_token: Some(format!("namespace:{change_sequence}")),
             media_summary,
             entries,
         }),
     )
         .into_response();
-    let change_sequence = state
-        .storage
-        .namespace_change_sequence
-        .load(Ordering::SeqCst);
     if let Ok(header_value) = HeaderValue::from_str(&change_sequence.to_string()) {
         response
             .headers_mut()
