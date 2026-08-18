@@ -75,7 +75,7 @@ pub fn record_in_sync_content_baseline(
         return Ok(());
     }
 
-    mutate_placeholder_identity_for_path(sync_root_path, &normalized, None, |identity| {
+    mutate_placeholder_identity_for_path(sync_root_path, &normalized, None, true, |identity| {
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
         identity.set_in_sync_content_baseline(in_sync_content_fingerprint);
@@ -92,7 +92,7 @@ pub fn promote_remote_to_in_sync_content_baseline(
         return Ok(());
     }
 
-    mutate_placeholder_identity_for_path(sync_root_path, &normalized, None, |identity| {
+    mutate_placeholder_identity_for_path(sync_root_path, &normalized, None, true, |identity| {
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
         identity.promote_remote_to_in_sync_content_baseline();
@@ -184,26 +184,40 @@ fn refresh_remote_placeholder_state_with_policy(
         .unwrap_or_default();
     let fs_metadata =
         remote_file_system_metadata(file_metadata_policy, remote_modified_at_unix, file_size);
+    let fs_metadata_is_current = match file_metadata_policy {
+        RemoteFileMetadataPolicy::ApplyAndMarkInSync => remote_file_system_metadata_is_current(
+            &metadata,
+            remote_modified_at_unix,
+            remote_size_bytes,
+        ),
+        RemoteFileMetadataPolicy::PreserveLocalConflict => true,
+    };
 
-    mutate_placeholder_identity_for_path(sync_root_path, &normalized, fs_metadata, |identity| {
-        identity.path = normalized.clone();
-        identity.provider_instance_id = Some(provider_instance_id);
-        identity.remote_version = remote_version
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-        identity.remote_content_hash = remote_content_hash
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-        identity.remote_content_fingerprint = remote_content_fingerprint
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-        identity.remote_size_bytes = remote_size_bytes;
-        identity.remote_modified_at_unix = remote_modified_at_unix;
-        identity.set_remote_media(remote_media.cloned());
-    })
+    mutate_placeholder_identity_for_path(
+        sync_root_path,
+        &normalized,
+        fs_metadata,
+        fs_metadata_is_current,
+        |identity| {
+            identity.path = normalized.clone();
+            identity.provider_instance_id = Some(provider_instance_id);
+            identity.remote_version = remote_version
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            identity.remote_content_hash = remote_content_hash
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            identity.remote_content_fingerprint = remote_content_fingerprint
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            identity.remote_size_bytes = remote_size_bytes;
+            identity.remote_modified_at_unix = remote_modified_at_unix;
+            identity.set_remote_media(remote_media.cloned());
+        },
+    )
 }
 
 fn remote_file_system_metadata(
@@ -223,6 +237,22 @@ fn remote_file_system_metadata(
             }),
         RemoteFileMetadataPolicy::PreserveLocalConflict => None,
     }
+}
+
+fn remote_file_system_metadata_is_current(
+    metadata: &fs::Metadata,
+    remote_modified_at_unix: Option<u64>,
+    remote_size_bytes: Option<u64>,
+) -> bool {
+    let size_is_current = remote_size_bytes.is_none_or(|size| metadata.len() == size);
+    let modified_at_is_current = remote_modified_at_unix.is_none_or(|modified_at| {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|value| value.as_secs() == modified_at)
+    });
+    size_is_current && modified_at_is_current
 }
 
 pub fn reconcile_remote_delete_state(
@@ -412,6 +442,7 @@ fn mutate_placeholder_identity_for_path(
     sync_root_path: &Path,
     relative_path: &str,
     fs_metadata: Option<CF_FS_METADATA>,
+    fs_metadata_is_current: bool,
     mutator: impl FnOnce(&mut PlaceholderFileIdentity),
 ) -> Result<()> {
     let full_path = sync_root_path.join(relative_path.replace('/', "\\"));
@@ -429,10 +460,10 @@ fn mutate_placeholder_identity_for_path(
     };
     let original_identity = identity.clone();
     mutator(&mut identity);
-    // The remote modification time is part of the identity. If the identity is
-    // unchanged, the requested filesystem metadata was already applied by the
-    // update that stored it, so avoid reopening every placeholder on refresh.
-    if identity == original_identity {
+    let fs_metadata_needs_update = fs_metadata.is_some() && !fs_metadata_is_current;
+    // Avoid reopening unchanged placeholders, while still repairing a stale
+    // LastWriteTime or file size even when the encoded identity already matches.
+    if identity == original_identity && !fs_metadata_needs_update {
         return Ok(());
     }
     let encoded = identity.encoded();
@@ -529,6 +560,7 @@ fn is_internal_sync_root_relative_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
     use sync_core::NamespaceEntry;
 
     #[test]
@@ -549,6 +581,41 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn remote_metadata_comparison_detects_stale_timestamp_and_size() {
+        let root =
+            std::env::temp_dir().join(format!("ironmesh-placeholder-meta-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("test directory should exist");
+        let path = root.join("photo.jpg");
+        fs::write(&path, vec![0_u8; 42]).expect("test file should be written");
+        let modified_at = 1_723_456_789;
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("test file should open")
+            .set_modified(UNIX_EPOCH + Duration::from_secs(modified_at))
+            .expect("test timestamp should be set");
+        let metadata = fs::metadata(&path).expect("test metadata should load");
+
+        assert!(remote_file_system_metadata_is_current(
+            &metadata,
+            Some(modified_at),
+            Some(42),
+        ));
+        assert!(!remote_file_system_metadata_is_current(
+            &metadata,
+            Some(modified_at + 1),
+            Some(42),
+        ));
+        assert!(!remote_file_system_metadata_is_current(
+            &metadata,
+            Some(modified_at),
+            Some(43),
+        ));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
