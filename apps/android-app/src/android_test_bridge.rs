@@ -146,11 +146,6 @@ fn android_test_store_index_response(request_path: &str) -> StoreIndexResponse {
     };
     let entries = if prefix == "docs" {
         vec![android_test_document_entry()]
-    } else if android_test_query_matches(request_path, "view", "tree") {
-        vec![
-            android_test_folder_entry("docs/", "prefix"),
-            android_test_folder_entry("photos/", "prefix"),
-        ]
     } else {
         vec![
             android_test_folder_entry("docs/", "prefix"),
