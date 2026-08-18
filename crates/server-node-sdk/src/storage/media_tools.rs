@@ -402,15 +402,15 @@ fn windows_dependency_candidates(path: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 pub(super) struct FfprobeOutput {
-    #[serde(default)]
     pub(super) streams: Vec<FfprobeStream>,
-    #[serde(default)]
     pub(super) format: Option<FfprobeFormat>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 pub(super) struct FfprobeStream {
     pub(super) width: Option<u32>,
     pub(super) height: Option<u32>,
@@ -418,20 +418,41 @@ pub(super) struct FfprobeStream {
     pub(super) codec_tag_string: Option<String>,
     pub(super) avg_frame_rate: Option<String>,
     pub(super) bit_rate: Option<String>,
-    #[serde(default)]
-    pub(super) tags: FfprobeTags,
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct FfprobeFormat {
-    pub(super) format_name: Option<String>,
-    pub(super) duration: Option<String>,
-    pub(super) bit_rate: Option<String>,
-    #[serde(default)]
     pub(super) tags: FfprobeTags,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub(super) struct FfprobeFormat {
+    pub(super) format_name: Option<String>,
+    pub(super) duration: Option<String>,
+    pub(super) bit_rate: Option<String>,
+    pub(super) tags: FfprobeTags,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 pub(super) struct FfprobeTags {
     pub(super) creation_time: Option<String>,
+}
+
+#[cfg(test)]
+mod ffprobe_deserialization_tests {
+    use super::FfprobeOutput;
+
+    #[test]
+    fn missing_optional_ffprobe_fields_default_to_none() {
+        let output: FfprobeOutput = serde_json::from_str(r#"{"streams":[{}],"format":{}}"#)
+            .expect("sparse ffprobe output should deserialize");
+
+        let stream = output.streams.first().expect("stream should deserialize");
+        assert!(stream.width.is_none());
+        assert!(stream.codec_name.is_none());
+        assert!(stream.avg_frame_rate.is_none());
+        assert!(stream.bit_rate.is_none());
+        let format = output.format.expect("format should deserialize");
+        assert!(format.format_name.is_none());
+        assert!(format.duration.is_none());
+        assert!(format.bit_rate.is_none());
+    }
 }
