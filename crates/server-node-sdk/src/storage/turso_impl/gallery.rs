@@ -15,6 +15,8 @@ use super::super::{
     gallery_index_media_type_from_metadata, gallery_media_type_for_path,
     sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
 };
+#[cfg(test)]
+use super::turso_test_db_path;
 use super::{TursoMetadataStore, row_string, row_u64};
 
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
@@ -1333,18 +1335,6 @@ mod tests {
     use crate::storage::{
         ClientCredentialState, MediaCacheStatus, MetadataStore, RepairAttemptRecord,
     };
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn turso_test_db_path(name: &str) -> std::path::PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "ironmesh-{name}-{}-{stamp}.turso.db",
-            std::process::id()
-        ))
-    }
 
     async fn insert_gallery_fixture(
         connection: &turso::Connection,
@@ -1767,6 +1757,88 @@ mod tests {
         );
 
         drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_transaction_helpers_roll_back_errors() {
+        let metadata_db_path = turso_test_db_path("gallery-transaction-rollback");
+        let database = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+            .build()
+            .await
+            .expect("Turso test database should open");
+        let connection = database
+            .connect()
+            .expect("Turso test database should connect");
+        super::super::init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should initialize");
+
+        let write_transaction =
+            Transaction::new_unchecked(&connection, TransactionBehavior::Immediate)
+                .await
+                .expect("gallery write transaction should begin");
+        write_transaction
+            .execute(
+                "INSERT INTO current_objects (key, manifest_hash, object_id)
+                 VALUES (?1, ?2, ?3)",
+                (
+                    "gallery/rollback.jpg",
+                    "manifest-rollback",
+                    "object-rollback",
+                ),
+            )
+            .await
+            .expect("transactional fixture should insert");
+        let write_error = finish_gallery_transaction::<()>(
+            write_transaction,
+            Err(anyhow::anyhow!("forced gallery write failure")),
+        )
+        .await
+        .expect_err("gallery write error should propagate");
+        assert!(
+            write_error
+                .to_string()
+                .contains("forced gallery write failure")
+        );
+
+        let mut rows = connection
+            .query(
+                "SELECT COUNT(*) FROM current_objects WHERE key = ?1",
+                ("gallery/rollback.jpg",),
+            )
+            .await
+            .expect("rolled back row count should query");
+        let row = rows
+            .next()
+            .await
+            .expect("rolled back row count should load")
+            .expect("rolled back row count should contain a row");
+        assert_eq!(row_u64(&row, 0, "current_objects.count").unwrap(), 0);
+        drop(rows);
+
+        let read_transaction =
+            Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)
+                .await
+                .expect("gallery read transaction should begin");
+        let read_error = finish_gallery_read_transaction::<()>(
+            read_transaction,
+            Err(anyhow::anyhow!("forced gallery read failure")),
+        )
+        .await
+        .expect_err("gallery read error should propagate");
+        assert!(
+            read_error
+                .to_string()
+                .contains("forced gallery read failure")
+        );
+        connection
+            .query("SELECT 1", ())
+            .await
+            .expect("connection should remain usable after read rollback");
+
+        drop(connection);
+        drop(database);
         let _ = std::fs::remove_file(metadata_db_path);
     }
 

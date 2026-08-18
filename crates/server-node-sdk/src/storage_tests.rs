@@ -4803,6 +4803,33 @@ run_on_all_metadata_backends!(
     persist_and_load_cluster_replicas_roundtrip_turso
 );
 
+async fn persist_cluster_replicas_rolls_back_on_duplicate_rows_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cluster-replicas-rollback").await;
+    let original = HashMap::from([("subject-original".to_string(), vec![NodeId::new_v4()])]);
+    store.persist_cluster_replicas(&original).await.unwrap();
+
+    let duplicate_node_id = NodeId::new_v4();
+    let invalid = HashMap::from([(
+        "subject-invalid".to_string(),
+        vec![duplicate_node_id, duplicate_node_id],
+    )]);
+    store
+        .persist_cluster_replicas(&invalid)
+        .await
+        .expect_err("duplicate replica rows should violate the primary key");
+
+    assert_eq!(store.load_cluster_replicas().await.unwrap(), original);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    persist_cluster_replicas_rolls_back_on_duplicate_rows_impl,
+    persist_cluster_replicas_rolls_back_on_duplicate_rows,
+    persist_cluster_replicas_rolls_back_on_duplicate_rows_turso
+);
+
 async fn persist_and_load_cluster_nodes_roundtrip_impl(backend: StorageTestBackend) {
     let (root, store) = backend.init_store("cluster-nodes-roundtrip").await;
     let remote_node_id = NodeId::new_v4();
@@ -6589,6 +6616,47 @@ run_on_all_metadata_backends!(
     importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl,
     importing_replica_manifest_marks_manifest_owned_and_clears_cached_records,
     importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_turso
+);
+
+async fn locally_owned_manifest_delete_roundtrip_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("locally-owned-manifest-delete").await;
+    let manifest_hash = "locally-owned-manifest";
+    store
+        .metadata_store
+        .mark_manifest_locally_owned(manifest_hash, 123)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .metadata_store
+            .list_locally_owned_manifests()
+            .await
+            .unwrap(),
+        vec![manifest_hash.to_string()]
+    );
+
+    store
+        .metadata_store
+        .delete_locally_owned_manifest(manifest_hash)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .metadata_store
+            .list_locally_owned_manifests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    locally_owned_manifest_delete_roundtrip_impl,
+    locally_owned_manifest_delete_roundtrip,
+    locally_owned_manifest_delete_roundtrip_turso
 );
 
 async fn store_index_uses_persisted_manifest_summary_when_manifest_file_is_missing_impl(

@@ -18,14 +18,15 @@ use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GalleryDeltaCursorError, GalleryDeltaPage,
-    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, ManifestSummary,
-    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
-    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, METADATA_SCHEMA_VERSION_CURRENT,
+    ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
+    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
+    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
+    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
+    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    compress_snapshot_json, decompress_snapshot_json, metadata_db_logical_summary_query,
+    metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -2470,6 +2471,45 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
         }
     }
     gallery::init_gallery_projection(connection).await?;
+
+    let mut rows = connection
+        .query(
+            "SELECT value FROM metadata_meta WHERE key = ?1",
+            ("schema_version",),
+        )
+        .await
+        .context("failed to read Turso metadata schema version")?;
+    let stored_version = match rows.next().await? {
+        Some(row) => Some(row_string(&row, 0, "metadata_meta.schema_version")?),
+        None => None,
+    };
+    drop(rows);
+
+    let schema_version = match stored_version {
+        Some(raw) => raw
+            .parse::<i64>()
+            .with_context(|| format!("invalid Turso metadata schema version: {raw}"))?,
+        None => METADATA_SCHEMA_VERSION_CURRENT,
+    };
+    if schema_version != METADATA_SCHEMA_VERSION_CURRENT {
+        bail!(
+            "unsupported Turso metadata schema version: {} (current={})",
+            schema_version,
+            METADATA_SCHEMA_VERSION_CURRENT
+        );
+    }
+
+    connection
+        .execute(
+            "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (
+                "schema_version",
+                METADATA_SCHEMA_VERSION_CURRENT.to_string(),
+            ),
+        )
+        .await
+        .context("failed to persist Turso metadata schema version")?;
     Ok(())
 }
 
@@ -2541,4 +2581,125 @@ fn row_opt_u32(row: &turso::Row, idx: usize, label: &str) -> Result<Option<u32>>
             u32::try_from(value).with_context(|| format!("integer overflow for {label}: {value}"))
         })
         .transpose()
+}
+
+#[cfg(test)]
+fn turso_test_db_path(name: &str) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "ironmesh-{name}-{}-{stamp}.turso.db",
+        std::process::id()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn open_test_database(name: &str) -> (PathBuf, turso::Database, turso::Connection) {
+        let metadata_db_path = turso_test_db_path(name);
+        let database = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+            .build()
+            .await
+            .expect("Turso test database should open");
+        let connection = database
+            .connect()
+            .expect("Turso test database should connect");
+        (metadata_db_path, database, connection)
+    }
+
+    async fn stored_schema_version(connection: &turso::Connection) -> String {
+        let mut rows = connection
+            .query(
+                "SELECT value FROM metadata_meta WHERE key = ?1",
+                ("schema_version",),
+            )
+            .await
+            .expect("schema version should query");
+        let row = rows
+            .next()
+            .await
+            .expect("schema version row should load")
+            .expect("schema version should exist");
+        row_string(&row, 0, "metadata_meta.schema_version").expect("schema version should be text")
+    }
+
+    #[tokio::test]
+    async fn init_metadata_db_persists_schema_version() {
+        let (metadata_db_path, database, connection) =
+            open_test_database("turso-schema-version").await;
+
+        init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should initialize");
+
+        assert_eq!(
+            stored_schema_version(&connection).await,
+            METADATA_SCHEMA_VERSION_CURRENT.to_string()
+        );
+
+        drop(connection);
+        drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn init_metadata_db_accepts_missing_legacy_schema_version() {
+        let (metadata_db_path, database, connection) =
+            open_test_database("turso-legacy-schema-version").await;
+        init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should initialize");
+        connection
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                ("schema_version",),
+            )
+            .await
+            .expect("schema version row should delete");
+
+        init_metadata_db(&connection)
+            .await
+            .expect("legacy metadata schema should be accepted");
+
+        assert_eq!(
+            stored_schema_version(&connection).await,
+            METADATA_SCHEMA_VERSION_CURRENT.to_string()
+        );
+
+        drop(connection);
+        drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn init_metadata_db_rejects_future_schema_version() {
+        let (metadata_db_path, database, connection) =
+            open_test_database("turso-future-schema-version").await;
+        init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should initialize");
+        connection
+            .execute(
+                "UPDATE metadata_meta SET value = ?2 WHERE key = ?1",
+                ("schema_version", "99"),
+            )
+            .await
+            .expect("future schema version should write");
+
+        let err = init_metadata_db(&connection)
+            .await
+            .expect_err("future metadata schema should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported Turso metadata schema version: 99")
+        );
+
+        drop(connection);
+        drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
 }
