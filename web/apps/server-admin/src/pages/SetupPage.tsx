@@ -22,7 +22,7 @@ import {
   Text,
   Textarea
 } from "@mantine/core";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 import { SetupTelemetryDisclosure } from "../components/SetupTelemetryDisclosure";
 
@@ -42,14 +42,22 @@ export function SetupPage() {
   const [joinRequestOutput, setJoinRequestOutput] = useState<Record<string, unknown> | null>(null);
   const [transitionOutput, setTransitionOutput] = useState<SetupTransitionResponse | null>(null);
   const [pendingAction, setPendingAction] = useState<"start" | "join-request" | "import" | null>(null);
+  const startBackendTouched = useRef(false);
+  const joinBackendTouched = useRef(false);
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
       const payload = await getSetupStatus();
       setStatus(payload);
-      setStartMetadataBackend(payload.metadata_backend);
-      setJoinMetadataBackend(payload.metadata_backend);
+      // Recovery locks the join backend to the node's existing store, so keep it in sync even
+      // after the admin has picked a value elsewhere; otherwise preserve their explicit choice.
+      if (!startBackendTouched.current) {
+        setStartMetadataBackend(payload.metadata_backend);
+      }
+      if (!joinBackendTouched.current || payload.state === "recovery") {
+        setJoinMetadataBackend(payload.metadata_backend);
+      }
       setAvailability("available");
     } catch (refreshError) {
       if (isHttpErrorStatus(refreshError, 401, 403, 404)) {
@@ -232,6 +240,7 @@ export function SetupPage() {
                 allowDeselect={false}
                 onChange={(value) => {
                   if (value) {
+                    startBackendTouched.current = true;
                     setStartMetadataBackend(value as MetadataDbBackendKind);
                   }
                 }}
@@ -305,6 +314,7 @@ export function SetupPage() {
             disabled={status?.state === "recovery"}
             onChange={(value) => {
               if (value) {
+                joinBackendTouched.current = true;
                 setJoinMetadataBackend(value as MetadataDbBackendKind);
               }
             }}

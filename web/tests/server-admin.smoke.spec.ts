@@ -1586,6 +1586,31 @@ test("server-admin setup defaults to Turso and submits the selected metadata bac
   });
 });
 
+test("server-admin setup preserves an explicit join backend choice across a status refresh", async ({ page }) => {
+  await installServerAdminMocks(page, { setupMode: true });
+
+  await page.goto("/");
+
+  await expect(page.getByText("live first-run bootstrap UI", { exact: false })).toBeVisible();
+  const backendSelectors = page.getByRole("textbox", { name: "Metadata database backend" });
+  await expect(backendSelectors).toHaveCount(2);
+  const joinBackendSelector = backendSelectors.nth(1);
+  await expect(joinBackendSelector).toHaveValue("Turso (Pure Rust)");
+
+  await joinBackendSelector.click();
+  await page.getByRole("option", { name: "SQLite (rusqlite)" }).click();
+  await expect(joinBackendSelector).toHaveValue("SQLite (rusqlite)");
+
+  // The mocked /setup/status always reports "turso"; generating a join request triggers a
+  // status refresh, which previously clobbered the admin's explicit selection back to "turso".
+  const statusRefreshPromise = page.waitForResponse(
+    (response) => response.url().endsWith("/setup/status") && response.request().method() === "GET"
+  );
+  await page.getByRole("button", { name: "Generate join request" }).click();
+  await statusRefreshPromise;
+  await expect(joinBackendSelector).toHaveValue("SQLite (rusqlite)");
+});
+
 test("server-admin runtime ignores auth-protected setup probes", async ({ page }) => {
   await installServerAdminMocks(page, { setupProbeStatus: 401 });
 
