@@ -138,12 +138,29 @@ fn android_test_client_identity() -> Result<ClientIdentityMaterial> {
     Ok(identity)
 }
 
-fn android_test_store_index_response() -> StoreIndexResponse {
+fn android_test_store_index_response(request_path: &str) -> StoreIndexResponse {
+    let prefix = if android_test_query_matches(request_path, "prefix", "docs") {
+        "docs"
+    } else {
+        ""
+    };
+    let is_tree_view = android_test_query_matches(request_path, "view", "tree");
+    let entries = if prefix == "docs" {
+        vec![android_test_document_entry()]
+    } else {
+        let mut entries = android_test_folder_entries();
+        if is_tree_view {
+            entries = android_test_collapse_entries_for_tree_view(entries);
+        } else {
+            entries.push(android_test_document_entry());
+        }
+        entries
+    };
     StoreIndexResponse {
-        prefix: String::new(),
+        prefix: prefix.to_string(),
         depth: 1,
-        entry_count: 1,
-        total_entry_count: 1,
+        entry_count: entries.len(),
+        total_entry_count: entries.len(),
         offset: 0,
         limit: None,
         has_more: false,
@@ -151,16 +168,83 @@ fn android_test_store_index_response() -> StoreIndexResponse {
         sync_token: None,
         consistency_token: None,
         media_summary: StoreIndexMediaSummary::default(),
-        entries: vec![StoreIndexEntry {
-            path: "docs/readme.txt".to_string(),
-            entry_type: "key".to_string(),
-            version: Some("v1".to_string()),
-            content_hash: Some("hash-1".to_string()),
-            size_bytes: Some(TEST_DOCUMENT_SIZE_BYTES as u64),
+        entries,
+    }
+}
+
+// Mirrors server-node-sdk's `collapse_store_index_entries_for_tree_view`, which the real
+// server applies whenever `view=tree` is requested: trailing-slash and "prefix" entries for
+// the same path are deduplicated into a single canonical "prefix" entry.
+fn android_test_collapse_entries_for_tree_view(
+    entries: Vec<StoreIndexEntry>,
+) -> Vec<StoreIndexEntry> {
+    let mut collapsed: Vec<StoreIndexEntry> = Vec::new();
+    for entry in entries {
+        let is_directory_like = entry.entry_type == "prefix" || entry.path.ends_with('/');
+        if !is_directory_like {
+            collapsed.push(entry);
+            continue;
+        }
+        if collapsed.iter().any(|existing| existing.path == entry.path) {
+            continue;
+        }
+        collapsed.push(StoreIndexEntry {
+            path: entry.path,
+            entry_type: "prefix".to_string(),
+            version: None,
+            content_hash: None,
+            size_bytes: None,
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
-        }],
+        });
+    }
+    collapsed
+}
+
+fn android_test_query_matches(request_path: &str, name: &str, expected_value: &str) -> bool {
+    request_path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter_map(|pair| pair.split_once('='))
+        .any(|(candidate_name, value)| candidate_name == name && value == expected_value)
+}
+
+fn android_test_document_entry() -> StoreIndexEntry {
+    StoreIndexEntry {
+        path: TEST_DOCUMENT_PATH.to_string(),
+        entry_type: "key".to_string(),
+        version: Some("v1".to_string()),
+        content_hash: Some("hash-1".to_string()),
+        size_bytes: Some(TEST_DOCUMENT_SIZE_BYTES as u64),
+        modified_at_unix: None,
+        content_fingerprint: None,
+        media: None,
+    }
+}
+
+fn android_test_folder_entries() -> Vec<StoreIndexEntry> {
+    vec![
+        android_test_folder_entry("docs/", "prefix"),
+        android_test_folder_entry("docs/", "key"),
+        android_test_folder_entry("photos/", "prefix"),
+        android_test_folder_entry("photos/", "key"),
+    ]
+}
+
+fn android_test_folder_entry(path: &str, entry_type: &str) -> StoreIndexEntry {
+    let is_object = entry_type == "key";
+    StoreIndexEntry {
+        path: path.to_string(),
+        entry_type: entry_type.to_string(),
+        version: None,
+        content_hash: is_object.then(|| "folder-marker".to_string()),
+        size_bytes: is_object.then_some(0),
+        modified_at_unix: None,
+        content_fingerprint: None,
+        media: None,
     }
 }
 
@@ -390,7 +474,7 @@ fn android_transport_response(
             Ok((200, json_headers(body.len()), body))
         }
         ("GET", "/api/v1/store/index") => {
-            let body = serde_json::to_vec(&android_test_store_index_response())
+            let body = serde_json::to_vec(&android_test_store_index_response(path))
                 .context("failed to serialize android store index response")?;
             Ok((200, json_headers(body.len()), body))
         }
