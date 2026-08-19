@@ -8,6 +8,10 @@ build = "build.rs"
 default-run = "ironmesh-server-node"
 autobins = false
 
+[features]
+default = ["turso-metadata"]
+turso-metadata = ["server-node-sdk/turso-metadata"]
+
 [[bin]]
 name = "ironmesh-server-node"
 path = "src/main.rs"

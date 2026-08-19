@@ -1,3 +1,4 @@
+use fs2::FileExt;
 use std::env;
 use std::fs;
 use std::io;
@@ -171,6 +172,13 @@ fn main() {
             prebuilt_web_dir.join("client-ui").display()
         );
     }
+
+    // This build script and server-node-sdk's build script share the worktree's node_modules
+    // directory. Cargo can run them concurrently, so keep dependency installation and frontend
+    // compilation inside the same cross-process critical section.
+    let _frontend_build_lock = prebuilt_web_dir
+        .is_none()
+        .then(|| FrontendBuildLock::acquire(&web_workspace_dir));
 
     let generated_index = out_dir.join("client_ui_index.html");
     let generated_css = out_dir.join("client_ui_app.css");
@@ -487,6 +495,41 @@ fn format_path_list(paths: &[PathBuf]) -> String {
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+struct FrontendBuildLock {
+    file: fs::File,
+}
+
+impl FrontendBuildLock {
+    fn acquire(web_workspace_dir: &Path) -> Self {
+        let lock_path = web_workspace_dir.join(".ironmesh-build.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed opening frontend build lock {}: {error}",
+                    lock_path.display()
+                )
+            });
+        FileExt::lock_exclusive(&file).unwrap_or_else(|error| {
+            panic!(
+                "failed acquiring frontend build lock {}: {error}",
+                lock_path.display()
+            )
+        });
+        Self { file }
+    }
+}
+
+impl Drop for FrontendBuildLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 fn run_frontend_build(web_workspace_dir: &Path, generated_dist_dir: &Path) {

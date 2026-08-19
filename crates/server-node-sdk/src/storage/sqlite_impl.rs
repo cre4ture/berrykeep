@@ -20,20 +20,19 @@ use super::{
     DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
     GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
     GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
-    GalleryIndexPage, GalleryIndexQuery, ManifestSummary, ManualRepairActionRunRecord,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
-    MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord,
-    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
-    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
-    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
-    compress_snapshot_json, current_media_cache_metadata, decompress_snapshot_json,
-    effective_gallery_captured_at_unix, gallery_index_media_status,
+    GalleryIndexPage, GalleryIndexQuery, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
+    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
+    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
+    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
+    StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
+    decompress_snapshot_json, effective_gallery_captured_at_unix, gallery_index_media_status,
     gallery_index_media_type_from_metadata, gallery_media_type_for_path,
     metadata_db_logical_summary_query, metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload,
 };
 
-const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SQLITE_READ_CONNECTION_COUNT: usize = 4;
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;

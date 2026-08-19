@@ -29,5 +29,8 @@ uuid.workspace = true
 [dev-dependencies]
 http-body-util = "0.1"
 
+[build-dependencies]
+fs2 = "0.4"
+
 [lints]
 workspace = true

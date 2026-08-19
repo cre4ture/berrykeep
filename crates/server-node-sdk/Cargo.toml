@@ -64,5 +64,8 @@ x509-parser = "0.16"
 [dev-dependencies]
 client-sdk = { path = "../client-sdk" }
 
+[build-dependencies]
+fs2 = "0.4"
+
 [lints]
 workspace = true
