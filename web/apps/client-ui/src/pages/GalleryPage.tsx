@@ -12,7 +12,9 @@ import {
   galleryBasemapsFromConfiguration,
   galleryMapConfigurationQueryPolicy,
   galleryQueryKeys,
+  MOBILE_VIEWER_THUMBNAIL_PROFILE,
   PageHeader,
+  withMediaThumbnailProfile,
   type GalleryDataSource,
   type GalleryEntry,
   type GalleryMediaRequests,
@@ -21,8 +23,6 @@ import {
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { createPersistentGalleryDataSource } from "../gallery-cache/gallery-persistent-data-source";
-
-const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
 
 type GalleryPageProps = {
   initialViewMode?: GallerySurfaceViewMode;
@@ -65,12 +65,12 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
           fullscreen:
             thumbnailUrl && entry.media?.media_type !== "video"
               ? {
-                  url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
+                  url: withMediaThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
                 }
               : null,
           original,
           download: original,
-          share: immutableMediaShareRequest(entry, snapshotId, versionId)
+          share: mediaShareRequest(entry, snapshotId, versionId)
         };
       },
       loadVersions: getVersionGraph,
@@ -110,17 +110,13 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
   );
 }
 
-function immutableMediaShareRequest(
+function mediaShareRequest(
   entry: GalleryEntry,
   snapshotId: string | null,
   versionId?: string | null
 ): GalleryMediaRequests["share"] {
   const snapshot = snapshotId?.trim() || null;
   const version = snapshot ? null : versionId?.trim() || entry.version?.trim() || null;
-  if (!snapshot && !version) {
-    return null;
-  }
-
   return {
     key: entry.path,
     snapshotId: snapshot,
@@ -168,11 +164,4 @@ function binaryMediaUrl(
   versionId?: string | null
 ): string {
   return getBinaryObjectStreamUrl(key, snapshotId, versionId);
-}
-
-function withThumbnailProfile(url: string, profile: string): string {
-  const baseOrigin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
-  const resolved = new URL(url, baseOrigin);
-  resolved.searchParams.set("profile", profile);
-  return `${resolved.pathname}${resolved.search}${resolved.hash}`;
 }

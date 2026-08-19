@@ -29,6 +29,7 @@ import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
 import {
   OriginalShareAction,
   embeddedShareClient,
+  type MediaShareVersionResolver,
   type MediaShareRequest
 } from "./OriginalShareAction";
 
@@ -83,6 +84,7 @@ type MediaLightboxModalProps = {
   selectedItem: MediaLightboxItem | null;
   getItemAtIndex: (index: number) => MediaLightboxItem | null;
   onSelectIndex: (index: number) => void | Promise<void>;
+  resolveShareVersionId?: MediaShareVersionResolver;
   extraActions?: ReactNode;
   renderDetails?: (item: MediaLightboxItem) => ReactNode;
 };
@@ -157,6 +159,7 @@ export function MediaLightboxModal({
   selectedItem,
   getItemAtIndex,
   onSelectIndex,
+  resolveShareVersionId,
   extraActions,
   renderDetails
 }: MediaLightboxModalProps) {
@@ -349,7 +352,11 @@ export function MediaLightboxModal({
                 <Group data-media-actions="true" gap="xs" justify="flex-end">
                   {extraActions}
                   {shareClient ? (
-                    <OriginalShareAction client={shareClient} request={selectedItem.requests.share} />
+                    <OriginalShareAction
+                      client={shareClient}
+                      request={selectedItem.requests.share}
+                      resolveVersionId={resolveShareVersionId}
+                    />
                   ) : (
                     <Button
                       data-media-download="true"
