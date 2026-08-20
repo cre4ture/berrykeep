@@ -13315,6 +13315,22 @@ struct GalleryMapClusterResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct GallerySummaryStatusResponse {
+    refreshing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress_percent: Option<u8>,
+}
+
+impl From<storage::GallerySummaryRefreshStatus> for GallerySummaryStatusResponse {
+    fn from(status: storage::GallerySummaryRefreshStatus) -> Self {
+        Self {
+            refreshing: status.refreshing,
+            progress_percent: status.progress_percent,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct GalleryMapClustersResponse {
     prefix: String,
     depth: usize,
@@ -13323,6 +13339,10 @@ struct GalleryMapClustersResponse {
     total_entry_count: usize,
     visible_geotagged_count: usize,
     media_summary: StoreIndexMediaSummary,
+    /// Whether `total_entry_count`/`media_summary` came from a cache that may lag the current
+    /// `query_token` revision by a refresh cycle, and if so, roughly how far along that refresh
+    /// is. The viewport `clusters` below are always computed fresh for this request.
+    summary_status: GallerySummaryStatusResponse,
     query_token: String,
     clusters: Vec<GalleryMapClusterResponse>,
 }
@@ -15580,6 +15600,7 @@ async fn gallery_map_clusters_response(
         total_entry_count: page.total_entry_count,
         visible_geotagged_count: page.visible_geotagged_count,
         media_summary: store_index_media_summary_from_gallery(page.media_summary),
+        summary_status: page.summary_status.into(),
         query_token,
         clusters: page
             .clusters

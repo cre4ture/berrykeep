@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 pub(super) mod data_scrub;
 mod gallery_capture_time;
+mod gallery_summary_cache;
 pub(super) mod manifest_reader;
 pub(super) mod media_cache;
 pub(super) mod media_tools;
@@ -49,6 +50,11 @@ mod sqlite_impl;
 #[cfg(feature = "turso-metadata")]
 mod turso_impl;
 
+use self::gallery_summary_cache::GallerySummaryCache;
+pub(crate) use self::gallery_summary_cache::{
+    GallerySummaryCacheValue, GallerySummaryProgress, GallerySummaryRefreshStatus,
+    GallerySummaryScope,
+};
 use self::sqlite_impl::SqliteMetadataStore;
 #[cfg(feature = "turso-metadata")]
 use self::turso_impl::TursoMetadataStore;
@@ -981,7 +987,7 @@ pub(super) struct CurrentObjectEntry {
 
 /// A persisted, current-state projection used to serve the paginated gallery without
 /// first materializing every object in the namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum GalleryIndexMediaFilter {
     All,
     Image,
@@ -1082,6 +1088,10 @@ pub(crate) struct GalleryMapClusterPage {
     pub(crate) visible_geotagged_count: usize,
     pub(crate) resolution: u32,
     pub(crate) clusters: Vec<GalleryMapCluster>,
+    /// Whether `total_entry_count`/`media_summary` came from a cache that is being refreshed in
+    /// the background. Callers may serve these numbers immediately even while stale; an exact
+    /// history_id/revision match is not required (see `GallerySummaryCache`).
+    pub(crate) summary_status: GallerySummaryRefreshStatus,
 }
 
 #[derive(Debug, Clone)]

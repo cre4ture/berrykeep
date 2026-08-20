@@ -3527,6 +3527,14 @@ pub struct GalleryMapCluster {
     pub entry: Option<StoreIndexEntry>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct GallerySummaryStatus {
+    #[serde(default)]
+    pub refreshing: bool,
+    #[serde(default)]
+    pub progress_percent: Option<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GalleryMapClustersResponse {
     pub prefix: String,
@@ -3537,6 +3545,11 @@ pub struct GalleryMapClustersResponse {
     pub visible_geotagged_count: usize,
     #[serde(default)]
     pub media_summary: StoreIndexMediaSummary,
+    /// Whether `total_entry_count`/`media_summary` may lag behind the current gallery state and,
+    /// if so, roughly how far along the server's background refresh is. Older servers omit this
+    /// field, in which case it defaults to "not refreshing".
+    #[serde(default)]
+    pub summary_status: GallerySummaryStatus,
     pub query_token: String,
     #[serde(default)]
     pub clusters: Vec<GalleryMapCluster>,

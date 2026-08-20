@@ -93,6 +93,11 @@ export type GalleryMapCluster = {
   entry?: StoreIndexEntry | null;
 };
 
+export type GallerySummaryStatus = {
+  refreshing: boolean;
+  progress_percent?: number | null;
+};
+
 export type GalleryMapClustersResponse = {
   prefix: string;
   depth: number;
@@ -101,6 +106,12 @@ export type GalleryMapClustersResponse = {
   total_entry_count: number;
   visible_geotagged_count: number;
   media_summary: StoreIndexMediaSummary;
+  /**
+   * Whether `total_entry_count`/`media_summary` may lag behind the current gallery state and,
+   * if so, roughly how far along the server's background refresh is. Missing on older servers,
+   * which never lagged because they always recomputed the summary synchronously.
+   */
+  summary_status?: GallerySummaryStatus | null;
   query_token: string;
   clusters: GalleryMapCluster[];
 };

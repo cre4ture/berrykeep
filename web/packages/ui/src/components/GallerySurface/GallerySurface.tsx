@@ -215,6 +215,11 @@ export type GalleryMapCluster = {
   entry?: GalleryEntry | null;
 };
 
+export type GallerySummaryStatus = {
+  refreshing: boolean;
+  progress_percent?: number | null;
+};
+
 export type GalleryMapClustersPayload = {
   prefix: string;
   depth: number;
@@ -223,6 +228,11 @@ export type GalleryMapClustersPayload = {
   total_entry_count: number;
   visible_geotagged_count: number;
   media_summary: GalleryMediaSummary;
+  /**
+   * Set while the server is still catching total_entry_count/media_summary up to the latest
+   * gallery state in the background. The viewport clusters themselves are always current.
+   */
+  summary_status?: GallerySummaryStatus | null;
   query_token: string;
   clusters: GalleryMapCluster[];
 };
@@ -1776,6 +1786,18 @@ export function GallerySurface({
                 <Badge variant="light">
                   {totalMediaCount} {totalMediaCount === 1 ? "item" : "items"}
                 </Badge>
+                {viewMode === "map" && mapClustersPayload?.summary_status?.refreshing ? (
+                  <Badge
+                    variant="light"
+                    color="gray"
+                    leftSection={<Loader size={10} color="gray" />}
+                  >
+                    Updating counts
+                    {typeof mapClustersPayload.summary_status.progress_percent === "number"
+                      ? ` ${mapClustersPayload.summary_status.progress_percent}%`
+                      : ""}
+                  </Badge>
+                ) : null}
                 {imageCount > 0 ? (
                   <Badge color="blue" variant="light">
                     {imageCount} {imageCount === 1 ? "photo" : "photos"}

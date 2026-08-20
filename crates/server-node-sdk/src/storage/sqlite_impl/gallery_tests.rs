@@ -444,6 +444,78 @@ fn gallery_map_clusters_are_bounded_and_preserve_scope_summary() {
     assert!(page.clusters[0].entry.is_none());
 }
 
+#[tokio::test]
+async fn gallery_map_summary_cache_serves_stale_value_and_refreshes_in_background() {
+    let metadata_db_path = sqlite_test_db_path("gallery-map-summary-cache");
+    let store = SqliteMetadataStore::open(&metadata_db_path)
+        .await
+        .expect("sqlite metadata store should open");
+    store
+        .write_tx(|db| {
+            insert_gallery_fixture(db, "gallery/a.jpg", "image", 1, Some(47.4), Some(8.5));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let viewport = GalleryViewportBounds {
+        south: -90.0,
+        west: -180.0,
+        north: 90.0,
+        east: 180.0,
+    };
+    let query = gallery_map_query(viewport, 1024, 512);
+
+    // Cold cache: computed synchronously, so the very first caller still gets a real answer.
+    let first = store
+        .query_gallery_map_clusters(&query)
+        .await
+        .unwrap()
+        .expect("gallery map clusters should be available");
+    assert_eq!(first.total_entry_count, 1);
+    assert!(!first.summary_status.refreshing);
+
+    store
+        .write_tx(|db| {
+            insert_gallery_fixture(db, "gallery/b.jpg", "image", 2, Some(47.4), Some(8.5));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // Warm but stale cache: the (now outdated) cached summary is served immediately rather than
+    // blocking this request on a recompute, while a background refresh is kicked off.
+    let second = store
+        .query_gallery_map_clusters(&query)
+        .await
+        .unwrap()
+        .expect("gallery map clusters should be available");
+    assert_eq!(second.total_entry_count, 1);
+    assert!(second.summary_status.refreshing);
+    // The viewport-bounded clusters themselves are never served from the summary cache.
+    assert_eq!(second.visible_geotagged_count, 2);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let refreshed = store
+            .query_gallery_map_clusters(&query)
+            .await
+            .unwrap()
+            .expect("gallery map clusters should be available");
+        if refreshed.total_entry_count == 2 && !refreshed.summary_status.refreshing {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background gallery map summary refresh did not complete in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    drop(store);
+    let _ = std::fs::remove_file(metadata_db_path);
+}
+
 #[test]
 fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
     let db = Connection::open_in_memory().expect("in-memory sqlite should open");
