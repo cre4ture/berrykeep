@@ -1028,9 +1028,42 @@ fn snapshot_conversion_maps_prefix_and_keys() {
             version: None,
             content_hash: None,
             size_bytes: Some(42),
-            modified_at_unix: None,
+            modified_at_unix: Some(1_723_456_789),
             content_fingerprint: Some("cfp-readme".to_string()),
-            media: None,
+            media: Some(StoreIndexMedia {
+                status: "ready".to_string(),
+                content_fingerprint: "cfp-readme".to_string(),
+                media_type: Some("image".to_string()),
+                mime_type: Some("image/jpeg".to_string()),
+                width: Some(4_032),
+                height: Some(3_024),
+                orientation: Some(6),
+                taken_at_unix: Some(1_700_000_000),
+                date_encoded_unix: None,
+                duration_millis: None,
+                frame_rate_millihertz: None,
+                total_bitrate_bps: None,
+                codec_name: None,
+                codec_fourcc: None,
+                gps: Some(StoreIndexGps {
+                    latitude: 47.3769,
+                    longitude: 8.5417,
+                }),
+                photo: Some(StoreIndexPhoto {
+                    camera_manufacturer: Some("Contoso".to_string()),
+                    camera_model: Some("Camera One".to_string()),
+                    lens_manufacturer: None,
+                    lens_model: Some("Prime 35".to_string()),
+                    iso_speed: Some(200),
+                    exposure_time_seconds: Some(0.008),
+                    f_number: Some(2.8),
+                    focal_length_mm: Some(35.0),
+                    flash: Some(0),
+                    white_balance: Some(1),
+                }),
+                thumbnail: None,
+                error: None,
+            }),
         },
     ]);
 
@@ -1048,6 +1081,21 @@ fn snapshot_conversion_maps_prefix_and_keys() {
         Some("cfp-readme")
     );
     assert_eq!(snapshot.remote[1].size_bytes, Some(42));
+    assert_eq!(snapshot.remote[1].modified_at_unix, Some(1_723_456_789));
+    let media = snapshot.remote[1]
+        .media
+        .as_ref()
+        .expect("media metadata should survive snapshot conversion");
+    assert_eq!(media.mime_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(media.orientation, Some(6));
+    assert_eq!(media.gps.as_ref().map(|gps| gps.latitude), Some(47.3769));
+    assert_eq!(
+        media
+            .photo
+            .as_ref()
+            .and_then(|photo| photo.camera_model.as_deref()),
+        Some("Camera One")
+    );
 }
 
 #[test]
