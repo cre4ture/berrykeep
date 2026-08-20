@@ -8,6 +8,7 @@ export * from "./components/ExplorerSurface/ExplorerSurface";
 export * from "./components/GallerySurface/GallerySurface";
 export * from "./components/GallerySurface/gallery-map-configuration";
 export * from "./components/GallerySurface/gallery-query";
+export * from "./components/MediaViewer/media-preview-profiles";
 export * from "./components/IronmeshBrand/IronmeshBrand";
 export * from "./components/ColorSchemeControl/ColorSchemeControl";
 export * from "./components/NavigationShell/NavigationShell";

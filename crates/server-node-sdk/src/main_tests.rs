@@ -515,7 +515,7 @@ case "$input" in
   http+unix://*|http://127.0.0.1:*) ;;
   *) printf 'unexpected input: %s\n' "$input" >&2; exit 1 ;;
 esac
-printf '%s\n' '{"streams":[{"width":1920,"height":1080}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.0"}}'
+printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264","codec_tag_string":"avc1","avg_frame_rate":"30000/1001","bit_rate":"4000000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.125","bit_rate":"4500000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}}'
 "#;
     std::fs::write(&ffprobe_path, ffprobe_script).unwrap();
 
@@ -13943,6 +13943,12 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
     assert_eq!(media["mime_type"], "video/mp4");
     assert_eq!(media["width"], 1920);
     assert_eq!(media["height"], 1080);
+    assert_eq!(media["date_encoded_unix"], 1_709_528_767u64);
+    assert_eq!(media["duration_millis"], 42_125u64);
+    assert_eq!(media["frame_rate_millihertz"], 29_970u64);
+    assert_eq!(media["total_bitrate_bps"], 4_500_000u64);
+    assert_eq!(media["codec_name"], "h264");
+    assert_eq!(media["codec_fourcc"], "avc1");
     assert!(
         media["thumbnail"]["url"]
             .as_str()
@@ -15092,7 +15098,14 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 height: None,
                 orientation: None,
                 taken_at_unix: Some(50),
+                date_encoded_unix: None,
+                duration_millis: None,
+                frame_rate_millihertz: None,
+                total_bitrate_bps: None,
+                codec_name: None,
+                codec_fourcc: None,
                 gps: None,
+                photo: None,
                 thumbnail: None,
                 error: None,
             }),
@@ -15114,10 +15127,17 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 height: None,
                 orientation: None,
                 taken_at_unix: Some(100),
+                date_encoded_unix: None,
+                duration_millis: None,
+                frame_rate_millihertz: None,
+                total_bitrate_bps: None,
+                codec_name: None,
+                codec_fourcc: None,
                 gps: Some(super::MediaGpsResponse {
                     latitude: 1.0,
                     longitude: 2.0,
                 }),
+                photo: None,
                 thumbnail: None,
                 error: None,
             }),
@@ -15139,7 +15159,14 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 height: None,
                 orientation: None,
                 taken_at_unix: Some(75),
+                date_encoded_unix: None,
+                duration_millis: None,
+                frame_rate_millihertz: None,
+                total_bitrate_bps: None,
+                codec_name: None,
+                codec_fourcc: None,
                 gps: None,
+                photo: None,
                 thumbnail: None,
                 error: None,
             }),
@@ -15250,7 +15277,14 @@ fn store_index_prepared_sort_materializes_only_requested_prefix() {
                 height: None,
                 orientation: None,
                 taken_at_unix: Some(index),
+                date_encoded_unix: None,
+                duration_millis: None,
+                frame_rate_millihertz: None,
+                total_bitrate_bps: None,
+                codec_name: None,
+                codec_fourcc: None,
                 gps: None,
+                photo: None,
                 thumbnail: None,
                 error: None,
             }),

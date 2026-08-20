@@ -166,6 +166,59 @@ class IronmeshDocumentsProviderInstrumentationTest {
     }
 
     @Test
+    fun queryChildDocuments_treeViewFolderMarkersAreNamedWithoutDuplicates() {
+        // The mock server collapses trailing-slash/"prefix" duplicates into a single
+        // canonical "prefix" entry per directory when view=tree is requested, matching the
+        // production server contract (see collapse_store_index_entries_for_tree_view). The
+        // provider trusts that contract rather than re-deriving directory-ness itself.
+        configureProviderDownloadScenario()
+        val childrenUri = DocumentsContract.buildChildDocumentsUri(
+            "${appContext.packageName}.documents",
+            "dir:",
+        )
+        val cursor = requireNotNull(
+            appContext.contentResolver.query(
+                childrenUri,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                ),
+                null,
+                null,
+                null,
+            ),
+        )
+
+        val rows = cursor.use {
+            buildList {
+                while (it.moveToNext()) {
+                    add(
+                        it.getString(0) to it.getString(1),
+                    )
+                }
+            }
+        }
+
+        assertEquals(
+            listOf(
+                "dir:docs" to "docs",
+                "dir:photos" to "photos",
+            ),
+            rows,
+        )
+        assertTrue(
+            "SAF directory rows must always have a display name: $rows",
+            rows.all { (_, displayName) -> displayName.isNotBlank() },
+        )
+        assertTrue(
+            "SAF directory listing should request the deduplicated tree view",
+            jsonArrayStrings(RustClientTestBridge.getCapturedRequestPaths()).any { path ->
+                path.startsWith("/api/v1/store/index?") && path.contains("view=tree")
+            },
+        )
+    }
+
+    @Test
     fun openDocument_concurrentReadsOfSameRemoteFileReturnCompleteContents() {
         val scenario = configureProviderDownloadScenario()
         val startBarrier = CyclicBarrier(CONCURRENT_OPEN_COUNT)

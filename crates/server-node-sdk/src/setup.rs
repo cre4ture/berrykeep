@@ -12,7 +12,8 @@ use std::net::Ipv4Addr;
 use tokio::sync::mpsc::{self, OwnedPermit};
 
 const LEGACY_SETUP_STATE_VERSION: u32 = 1;
-const SETUP_STATE_VERSION: u32 = 2;
+const LEGACY_SETUP_STATE_VERSION_2: u32 = 2;
+const SETUP_STATE_VERSION: u32 = 3;
 const MANAGED_SIGNER_BACKUP_VERSION: u32 = 1;
 const MANAGED_RENDEZVOUS_FAILOVER_VERSION: u32 = 1;
 const MANAGED_SIGNER_BACKUP_SALT_LEN: usize = 16;
@@ -54,6 +55,63 @@ enum SetupLifecycleState {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+enum SetupMetadataBackend {
+    Sqlite,
+    Turso,
+}
+
+impl SetupMetadataBackend {
+    fn into_runtime_kind(self) -> Result<MetadataBackendKind> {
+        match self {
+            Self::Sqlite => Ok(MetadataBackendKind::Sqlite),
+            Self::Turso => {
+                #[cfg(feature = "turso-metadata")]
+                {
+                    Ok(MetadataBackendKind::Turso)
+                }
+                #[cfg(not(feature = "turso-metadata"))]
+                {
+                    bail!("the Turso metadata backend is unavailable in this server-node build")
+                }
+            }
+        }
+    }
+}
+
+impl From<MetadataBackendKind> for SetupMetadataBackend {
+    fn from(value: MetadataBackendKind) -> Self {
+        match value {
+            MetadataBackendKind::Sqlite => Self::Sqlite,
+            #[cfg(feature = "turso-metadata")]
+            MetadataBackendKind::Turso => Self::Turso,
+        }
+    }
+}
+
+fn default_setup_metadata_backend() -> SetupMetadataBackend {
+    #[cfg(feature = "turso-metadata")]
+    {
+        SetupMetadataBackend::Turso
+    }
+    #[cfg(not(feature = "turso-metadata"))]
+    {
+        SetupMetadataBackend::Sqlite
+    }
+}
+
+fn available_setup_metadata_backends() -> Vec<SetupMetadataBackend> {
+    #[cfg(feature = "turso-metadata")]
+    {
+        vec![SetupMetadataBackend::Sqlite, SetupMetadataBackend::Turso]
+    }
+    #[cfg(not(feature = "turso-metadata"))]
+    {
+        vec![SetupMetadataBackend::Sqlite]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 enum ManagedRecoveryReasonCode {
     EnrollmentPackageMissing,
     EnrollmentPackageInvalid,
@@ -87,14 +145,18 @@ pub(crate) struct ManagedSetupState {
     updated_at_unix: u64,
     cluster_id: Option<ClusterId>,
     node_id: Option<NodeId>,
-    /// Read-only compatibility input for setup-state v1. Version 2 derives the enrollment path
-    /// from the setup data directory and never serializes this field.
+    /// Read-only compatibility input for setup-state v1. Version 2 and later derive the enrollment
+    /// path from the setup data directory and never serialize this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_node_enrollment_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_data_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_reason: Option<ManagedRecoveryReason>,
+    /// Absent only in setup-state v1/v2. Migration imports the legacy environment selection once,
+    /// falling back to SQLite, and version 3 then treats this persisted value as authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata_backend: Option<SetupMetadataBackend>,
     pub(crate) admin_password_hash: Option<String>,
     managed_rendezvous_bind_addr: Option<String>,
     managed_rendezvous_public_url: Option<String>,
@@ -112,6 +174,7 @@ impl Default for ManagedSetupState {
             runtime_node_enrollment_path: None,
             runtime_data_dir: None,
             recovery_reason: None,
+            metadata_backend: Some(default_setup_metadata_backend()),
             admin_password_hash: None,
             managed_rendezvous_bind_addr: None,
             managed_rendezvous_public_url: None,
@@ -231,6 +294,8 @@ struct SetupStatusResponse {
     cluster_id: Option<ClusterId>,
     node_id: Option<NodeId>,
     recovery_reason: Option<ManagedRecoveryReason>,
+    metadata_backend: SetupMetadataBackend,
+    available_metadata_backends: Vec<SetupMetadataBackend>,
     pending_join_request: Option<NodeJoinRequest>,
 }
 
@@ -238,6 +303,8 @@ struct SetupStatusResponse {
 struct SetupStartClusterRequest {
     admin_password: String,
     public_origin: String,
+    #[serde(default)]
+    metadata_backend: Option<SetupMetadataBackend>,
     /// Setup-time reliability-telemetry disclosure choice
     /// (`docs/server-node-hardware-reliability-telemetry-strategy.md` Section 4.4). The setup
     /// wizard's disclosure step always sends this explicitly, pre-checked `true`; it defaults to
@@ -259,6 +326,8 @@ struct SetupImportEnrollmentRequest {
     // existing cluster member.
     admin_password: String,
     package_json: String,
+    #[serde(default)]
+    metadata_backend: Option<SetupMetadataBackend>,
     /// See `SetupStartClusterRequest::telemetry_enabled` (doc Section 4.4); the join flow shows
     /// the same disclosure step and defaults identically.
     #[serde(default = "default_setup_telemetry_enabled")]
@@ -275,6 +344,7 @@ struct SetupTransitionResponse {
     cluster_id: ClusterId,
     node_id: NodeId,
     public_url: Option<String>,
+    metadata_backend: SetupMetadataBackend,
     restart_required: bool,
 }
 
@@ -319,6 +389,14 @@ pub(crate) fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<
         );
         return Ok(StartupMode::Setup(config));
     };
+
+    let metadata_backend_migrated =
+        migrate_managed_setup_metadata_backend(&config.state_path, &mut managed_state)
+            .context("failed migrating managed setup metadata backend")?;
+    let metadata_backend = managed_state
+        .metadata_backend
+        .context("managed setup state is missing metadata_backend")?
+        .into_runtime_kind()?;
 
     if !matches!(
         managed_state.state,
@@ -435,7 +513,10 @@ pub(crate) fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<
             }
         };
     let canonical_enrollment_path = runtime_node_enrollment_path(&config.data_dir);
-    let mut runtime = match ServerNodeConfig::from_enrollment(managed_package.clone()) {
+    let mut runtime = match ServerNodeConfig::from_enrollment_with_metadata_backend(
+        managed_package.clone(),
+        metadata_backend,
+    ) {
         Ok(runtime) => runtime,
         Err(err) => {
             tracing::error!(
@@ -505,17 +586,18 @@ pub(crate) fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<
 
     let recovered = managed_state.state == SetupLifecycleState::Recovery;
     let runtime_data_dir_string = runtime_data_dir.display().to_string();
-    let model_migrated = managed_state.version != SETUP_STATE_VERSION
+    let setup_model_changed = managed_state.version != SETUP_STATE_VERSION
         || managed_state.cluster_id != Some(runtime.cluster_id)
         || managed_state.node_id != Some(runtime.node_id)
         || managed_state.runtime_node_enrollment_path.is_some()
         || managed_state.runtime_data_dir.as_deref() != Some(runtime_data_dir_string.as_str());
+    let model_migrated = metadata_backend_migrated || setup_model_changed;
     managed_state.version = SETUP_STATE_VERSION;
     managed_state.cluster_id = Some(runtime.cluster_id);
     managed_state.node_id = Some(runtime.node_id);
     managed_state.runtime_node_enrollment_path = None;
     managed_state.runtime_data_dir = Some(runtime_data_dir_string);
-    if model_migrated {
+    if setup_model_changed {
         managed_state.updated_at_unix = unix_ts();
         write_managed_setup_state(&config.state_path, &managed_state)?;
     }
@@ -673,6 +755,10 @@ async fn get_setup_status(State(state): State<SetupServerState>) -> impl IntoRes
             cluster_id: managed.cluster_id,
             node_id: managed.node_id,
             recovery_reason: managed.recovery_reason,
+            metadata_backend: managed
+                .metadata_backend
+                .unwrap_or_else(default_setup_metadata_backend),
+            available_metadata_backends: available_setup_metadata_backends(),
             pending_join_request: managed.pending_join_request,
         }),
     )
@@ -685,6 +771,19 @@ async fn start_new_cluster(
     if let Err(message) = validate_admin_password(&request.admin_password) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
     }
+    let metadata_backend = request
+        .metadata_backend
+        .unwrap_or_else(default_setup_metadata_backend);
+    let runtime_metadata_backend = match metadata_backend.into_runtime_kind() {
+        Ok(backend) => backend,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
 
     {
         let managed = state.managed_state.lock().await;
@@ -860,6 +959,7 @@ async fn start_new_cluster(
     managed.runtime_node_enrollment_path = None;
     managed.runtime_data_dir = Some(state.config.data_dir.display().to_string());
     managed.recovery_reason = None;
+    managed.metadata_backend = Some(metadata_backend);
     managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     managed.managed_rendezvous_bind_addr = Some(managed_rendezvous_bind_addr.to_string());
     managed.managed_rendezvous_public_url = Some(managed_rendezvous_public_url.clone());
@@ -874,7 +974,10 @@ async fn start_new_cluster(
     let managed_snapshot = managed.clone();
     drop(managed);
 
-    let mut config = match ServerNodeConfig::from_enrollment_path(&runtime_enrollment_path) {
+    let mut config = match ServerNodeConfig::from_enrollment_path_with_metadata_backend(
+        &runtime_enrollment_path,
+        runtime_metadata_backend,
+    ) {
         Ok(config) => config,
         Err(err) => {
             return (
@@ -906,6 +1009,7 @@ async fn start_new_cluster(
             cluster_id,
             node_id,
             public_url: Some(public_url),
+            metadata_backend,
             restart_required: false,
         }),
     )
@@ -1012,6 +1116,27 @@ async fn import_node_enrollment_package(
     };
 
     let mut managed = state.managed_state.lock().await;
+    let metadata_backend = match resolve_setup_metadata_backend(request.metadata_backend, &managed)
+    {
+        Ok(backend) => backend,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let runtime_metadata_backend = match metadata_backend.into_runtime_kind() {
+        Ok(backend) => backend,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
     if managed.state == SetupLifecycleState::Recovery {
         if let Some(expected_node_id) = managed.node_id
             && package.bootstrap.node_id != expected_node_id
@@ -1071,6 +1196,7 @@ async fn import_node_enrollment_package(
     managed.runtime_node_enrollment_path = None;
     managed.runtime_data_dir = Some(state.config.data_dir.display().to_string());
     managed.recovery_reason = None;
+    managed.metadata_backend = Some(metadata_backend);
     managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     managed.managed_rendezvous_bind_addr = None;
     managed.managed_rendezvous_public_url = None;
@@ -1085,7 +1211,10 @@ async fn import_node_enrollment_package(
     let managed_snapshot = managed.clone();
     drop(managed);
 
-    let mut config = match ServerNodeConfig::from_enrollment_path(&runtime_enrollment_path) {
+    let mut config = match ServerNodeConfig::from_enrollment_path_with_metadata_backend(
+        &runtime_enrollment_path,
+        runtime_metadata_backend,
+    ) {
         Ok(config) => config,
         Err(err) => {
             return (
@@ -1117,10 +1246,28 @@ async fn import_node_enrollment_package(
             cluster_id: package.bootstrap.cluster_id,
             node_id: package.bootstrap.node_id,
             public_url: package.bootstrap.public_url.clone(),
+            metadata_backend,
             restart_required: false,
         }),
     )
         .into_response()
+}
+
+fn resolve_setup_metadata_backend(
+    requested: Option<SetupMetadataBackend>,
+    managed: &ManagedSetupState,
+) -> Result<SetupMetadataBackend> {
+    if managed.state != SetupLifecycleState::Recovery {
+        return Ok(requested.unwrap_or_else(default_setup_metadata_backend));
+    }
+
+    let persisted = managed
+        .metadata_backend
+        .context("recovering managed setup state is missing metadata_backend")?;
+    if requested.is_some_and(|backend| backend != persisted) {
+        bail!("metadata backend cannot be changed while recovering an initialized node");
+    }
+    Ok(persisted)
 }
 
 fn explicit_runtime_env_vars_present() -> Vec<&'static str> {
@@ -1468,7 +1615,8 @@ async fn apply_setup_telemetry_choice(
 }
 
 fn ensure_managed_setup_state(path: &std::path::Path) -> Result<ManagedSetupState> {
-    if let Some(existing) = read_managed_setup_state(path)? {
+    if let Some(mut existing) = read_managed_setup_state(path)? {
+        migrate_managed_setup_metadata_backend(path, &mut existing)?;
         return Ok(existing);
     }
     let state = ManagedSetupState::default();
@@ -1488,7 +1636,7 @@ pub(crate) fn read_managed_setup_state(
         .with_context(|| format!("failed parsing {}", path.display()))?;
     if !matches!(
         state.version,
-        LEGACY_SETUP_STATE_VERSION | SETUP_STATE_VERSION
+        LEGACY_SETUP_STATE_VERSION | LEGACY_SETUP_STATE_VERSION_2 | SETUP_STATE_VERSION
     ) {
         bail!("unsupported managed setup state version {}", state.version);
     }
@@ -1504,11 +1652,78 @@ pub(crate) fn write_managed_setup_state(
             .with_context(|| format!("failed creating {}", parent.display()))?;
     }
     let mut persisted_state = state.clone();
+    populate_legacy_metadata_backend_from_env(&mut persisted_state)?;
     persisted_state.version = SETUP_STATE_VERSION;
     persisted_state.runtime_node_enrollment_path = None;
     let payload = serde_json::to_string_pretty(&persisted_state)
         .context("failed serializing managed setup state")?;
     std::fs::write(path, payload).with_context(|| format!("failed writing {}", path.display()))
+}
+
+fn migrate_managed_setup_metadata_backend(
+    path: &std::path::Path,
+    state: &mut ManagedSetupState,
+) -> Result<bool> {
+    if state.metadata_backend.is_some() {
+        return Ok(false);
+    }
+    let legacy_env_value = std::env::var(METADATA_BACKEND_ENV).ok();
+    migrate_managed_setup_metadata_backend_with_value(path, state, legacy_env_value.as_deref())
+}
+
+fn migrate_managed_setup_metadata_backend_with_value(
+    path: &std::path::Path,
+    state: &mut ManagedSetupState,
+    legacy_env_value: Option<&str>,
+) -> Result<bool> {
+    if state.metadata_backend.is_some() {
+        return Ok(false);
+    }
+    if state.version >= SETUP_STATE_VERSION {
+        bail!(
+            "managed setup state version {} is missing metadata_backend",
+            state.version
+        );
+    }
+
+    let metadata_backend = legacy_setup_metadata_backend(legacy_env_value)?;
+    state.metadata_backend = Some(metadata_backend);
+    state.version = SETUP_STATE_VERSION;
+    state.updated_at_unix = unix_ts();
+    write_managed_setup_state(path, state)?;
+    tracing::info!(
+        state_path = %path.display(),
+        metadata_backend = ?metadata_backend,
+        source = if legacy_env_value.is_some() {
+            METADATA_BACKEND_ENV
+        } else {
+            "legacy_sqlite_default"
+        },
+        "managed setup state persisted legacy metadata backend selection"
+    );
+    Ok(true)
+}
+
+fn populate_legacy_metadata_backend_from_env(state: &mut ManagedSetupState) -> Result<()> {
+    if state.metadata_backend.is_some() {
+        return Ok(());
+    }
+    if state.version >= SETUP_STATE_VERSION {
+        bail!(
+            "managed setup state version {} is missing metadata_backend",
+            state.version
+        );
+    }
+    let legacy_env_value = std::env::var(METADATA_BACKEND_ENV).ok();
+    state.metadata_backend = Some(legacy_setup_metadata_backend(legacy_env_value.as_deref())?);
+    Ok(())
+}
+
+fn legacy_setup_metadata_backend(raw: Option<&str>) -> Result<SetupMetadataBackend> {
+    match raw {
+        Some(raw) => parse_metadata_backend(raw).map(SetupMetadataBackend::from),
+        None => Ok(SetupMetadataBackend::Sqlite),
+    }
 }
 
 pub(crate) fn write_managed_signer_material(
@@ -2390,6 +2605,7 @@ mod tests {
             runtime_node_enrollment_path: Some("managed/runtime/node-enrollment.json".to_string()),
             runtime_data_dir: Some(dir.display().to_string()),
             recovery_reason: None,
+            metadata_backend: Some(SetupMetadataBackend::Sqlite),
             admin_password_hash: Some(hash_token("super-secret-password")),
             managed_rendezvous_bind_addr: Some("0.0.0.0:9443".to_string()),
             managed_rendezvous_public_url: Some("https://node-a.local:9443".to_string()),
@@ -2440,12 +2656,88 @@ mod tests {
             restored.managed_rendezvous_public_url.as_deref(),
             Some("https://node-a.local:9443")
         );
+        assert_eq!(
+            restored.metadata_backend,
+            Some(SetupMetadataBackend::Sqlite)
+        );
+    }
+
+    #[test]
+    fn new_managed_setup_state_uses_available_default_backend() {
+        let state = ManagedSetupState::default();
+        #[cfg(feature = "turso-metadata")]
+        assert_eq!(state.metadata_backend, Some(SetupMetadataBackend::Turso));
+        #[cfg(not(feature = "turso-metadata"))]
+        assert_eq!(state.metadata_backend, Some(SetupMetadataBackend::Sqlite));
+    }
+
+    #[test]
+    fn legacy_metadata_backend_migration_defaults_to_sqlite_once() {
+        let dir = temp_dir("legacy-metadata-backend-default");
+        let path = managed_setup_state_path(&dir);
+        let mut state = ManagedSetupState {
+            version: LEGACY_SETUP_STATE_VERSION_2,
+            metadata_backend: None,
+            ..ManagedSetupState::default()
+        };
+
+        assert!(
+            migrate_managed_setup_metadata_backend_with_value(&path, &mut state, None).unwrap()
+        );
+        assert_eq!(state.metadata_backend, Some(SetupMetadataBackend::Sqlite));
+        assert_eq!(state.version, SETUP_STATE_VERSION);
+
+        assert!(
+            !migrate_managed_setup_metadata_backend_with_value(&path, &mut state, Some("turso"))
+                .unwrap()
+        );
+        let persisted = read_managed_setup_state(&path).unwrap().unwrap();
+        assert_eq!(
+            persisted.metadata_backend,
+            Some(SetupMetadataBackend::Sqlite)
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_backend_migration_uses_environment_value() {
+        let dir = temp_dir("legacy-metadata-backend-environment");
+        let path = managed_setup_state_path(&dir);
+        let mut state = ManagedSetupState {
+            version: LEGACY_SETUP_STATE_VERSION_2,
+            metadata_backend: None,
+            ..ManagedSetupState::default()
+        };
+
+        assert!(
+            migrate_managed_setup_metadata_backend_with_value(&path, &mut state, Some("sqlite"))
+                .unwrap()
+        );
+        assert_eq!(state.metadata_backend, Some(SetupMetadataBackend::Sqlite));
+    }
+
+    #[cfg(feature = "turso-metadata")]
+    #[test]
+    fn legacy_metadata_backend_migration_preserves_turso_environment_value() {
+        let dir = temp_dir("legacy-metadata-backend-turso");
+        let path = managed_setup_state_path(&dir);
+        let mut state = ManagedSetupState {
+            version: LEGACY_SETUP_STATE_VERSION_2,
+            metadata_backend: None,
+            ..ManagedSetupState::default()
+        };
+
+        assert!(
+            migrate_managed_setup_metadata_backend_with_value(&path, &mut state, Some("turso"))
+                .unwrap()
+        );
+        assert_eq!(state.metadata_backend, Some(SetupMetadataBackend::Turso));
     }
 
     #[test]
     fn derived_runtime_node_enrollment_path_resolves_without_doubling_data_dir_prefix() {
-        // Regression test for the v1 failure mode. Version 2 no longer persists this derivable
-        // path, but its fixed relative form must still resolve exactly once against `data_dir`.
+        // Regression test for the v1 failure mode. Version 2 and later no longer persist this
+        // derivable path, but its fixed relative form must still resolve exactly once against
+        // `data_dir`.
         let relative_data_dir = std::path::PathBuf::from("./data/server-node");
         let stored = runtime_node_enrollment_relative_path()
             .display()
@@ -2524,11 +2816,13 @@ mod tests {
             cluster_id: Some(cluster_id),
             node_id: Some(node_id),
             runtime_node_enrollment_path: Some(enrollment_path.display().to_string()),
+            metadata_backend: None,
             ..ManagedSetupState::default()
         };
         let legacy_payload = serde_json::to_string_pretty(&legacy_state).unwrap();
         assert!(!legacy_payload.contains("runtime_data_dir"));
         assert!(!legacy_payload.contains("recovery_reason"));
+        assert!(!legacy_payload.contains("metadata_backend"));
         std::fs::write(&config.state_path, legacy_payload).unwrap();
 
         let startup_mode = load_managed_startup_mode(config.clone()).unwrap();
@@ -2536,6 +2830,10 @@ mod tests {
             panic!("valid embedded enrollment material should self-heal recovery");
         };
         assert_eq!(runtime.data_dir, absolute_runtime_data_dir);
+        assert!(matches!(
+            runtime.metadata_backend,
+            MetadataBackendKind::Sqlite
+        ));
         assert_eq!(
             runtime.internal_tls.as_ref().unwrap().cert_path,
             absolute_runtime_data_dir.join(MANAGED_INTERNAL_CERT_PATH)
@@ -2557,6 +2855,10 @@ mod tests {
             Some(absolute_runtime_data_dir.to_string_lossy().as_ref())
         );
         assert!(migrated.recovery_reason.is_none());
+        assert_eq!(
+            migrated.metadata_backend,
+            Some(SetupMetadataBackend::Sqlite)
+        );
 
         let migrated_package = NodeEnrollmentPackage::from_path(&enrollment_path).unwrap();
         assert_eq!(
@@ -2590,6 +2892,27 @@ mod tests {
         let data_dir = std::path::PathBuf::from("./data/server-node");
 
         assert!(resolve_materialized_path(&data_dir, "../node-enrollment.json").is_err());
+    }
+
+    #[test]
+    fn recovery_preserves_persisted_metadata_backend() {
+        let managed = ManagedSetupState {
+            state: SetupLifecycleState::Recovery,
+            metadata_backend: Some(SetupMetadataBackend::Sqlite),
+            ..ManagedSetupState::default()
+        };
+
+        assert_eq!(
+            resolve_setup_metadata_backend(None, &managed).unwrap(),
+            SetupMetadataBackend::Sqlite
+        );
+        assert_eq!(
+            resolve_setup_metadata_backend(Some(SetupMetadataBackend::Sqlite), &managed).unwrap(),
+            SetupMetadataBackend::Sqlite
+        );
+        assert!(
+            resolve_setup_metadata_backend(Some(SetupMetadataBackend::Turso), &managed).is_err()
+        );
     }
 
     #[test]
@@ -2716,6 +3039,7 @@ mod tests {
             Json(SetupImportEnrollmentRequest {
                 admin_password: node_admin_password.clone(),
                 package_json: package.to_json_pretty().unwrap(),
+                metadata_backend: Some(SetupMetadataBackend::Sqlite),
                 telemetry_enabled: true,
             }),
         )
@@ -2742,6 +3066,10 @@ mod tests {
             .await
             .expect("runtime transition should be scheduled")
             .expect("runtime transition channel should stay open");
+        assert!(matches!(
+            completion.config.metadata_backend,
+            MetadataBackendKind::Sqlite
+        ));
         let runtime_hash = completion
             .config
             .admin_password_hash
@@ -2807,6 +3135,7 @@ mod tests {
             Json(SetupStartClusterRequest {
                 admin_password,
                 public_origin: "https://node-a.local:18443".to_string(),
+                metadata_backend: None,
                 telemetry_enabled: true,
             }),
         )
@@ -2814,10 +3143,18 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let _completion = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+        let completion = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
             .await
             .expect("runtime transition should be scheduled")
             .expect("runtime transition channel should stay open");
+        assert_eq!(
+            SetupMetadataBackend::from(completion.config.metadata_backend),
+            default_setup_metadata_backend()
+        );
+        assert_eq!(
+            state.managed_state.lock().await.metadata_backend,
+            Some(default_setup_metadata_backend())
+        );
 
         // The setup-time choice must land in exactly the same persisted override the admin
         // toggle uses, so a fresh load of the runtime sees it as an explicit override, not just
@@ -2849,6 +3186,7 @@ mod tests {
             Json(SetupImportEnrollmentRequest {
                 admin_password,
                 package_json: package.to_json_pretty().unwrap(),
+                metadata_backend: Some(SetupMetadataBackend::Sqlite),
                 telemetry_enabled: false,
             }),
         )
@@ -2856,10 +3194,14 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let _completion = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+        let completion = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
             .await
             .expect("runtime transition should be scheduled")
             .expect("runtime transition channel should stay open");
+        assert!(matches!(
+            completion.config.metadata_backend,
+            MetadataBackendKind::Sqlite
+        ));
 
         let runtime = reliability_telemetry::ReliabilityTelemetryRuntime::load(&data_dir);
         assert!(!runtime.effective_enabled());

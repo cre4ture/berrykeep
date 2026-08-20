@@ -232,6 +232,7 @@ const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thum
 const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP";
 const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS";
 const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
+const METADATA_BACKEND_ENV: &str = "IRONMESH_METADATA_BACKEND";
 const TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV: &str =
     "IRONMESH_TEST_SEED_PROCESS_TEMPERATURE_STATS";
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
@@ -3769,6 +3770,14 @@ fn parse_metadata_backend(raw: &str) -> Result<MetadataBackendKind> {
     }
 }
 
+fn metadata_backend_from_env() -> Result<MetadataBackendKind> {
+    parse_metadata_backend(
+        std::env::var(METADATA_BACKEND_ENV)
+            .unwrap_or_else(|_| "sqlite".to_string())
+            .as_str(),
+    )
+}
+
 fn path_has_parent_traversal(path: &FsPath) -> bool {
     path.components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -5802,8 +5811,15 @@ fn node_enrollment_auto_renew_check_secs() -> u64 {
 
 impl ServerNodeConfig {
     pub fn from_enrollment_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::from_enrollment_path_with_metadata_backend(path, metadata_backend_from_env()?)
+    }
+
+    fn from_enrollment_path_with_metadata_backend(
+        path: impl AsRef<std::path::Path>,
+        metadata_backend: MetadataBackendKind,
+    ) -> Result<Self> {
         let package = NodeEnrollmentPackage::from_path(path.as_ref())?;
-        let mut config = Self::from_enrollment(package)?;
+        let mut config = Self::from_enrollment_with_metadata_backend(package, metadata_backend)?;
         // The enrollment package is an operator-selected import artifact. It may live outside
         // the runtime data directory; only the TLS paths carried by the package are confined
         // before they are ever opened by the running node.
@@ -5816,8 +5832,15 @@ impl ServerNodeConfig {
     }
 
     pub fn from_enrollment(package: NodeEnrollmentPackage) -> Result<Self> {
+        Self::from_enrollment_with_metadata_backend(package, metadata_backend_from_env()?)
+    }
+
+    fn from_enrollment_with_metadata_backend(
+        package: NodeEnrollmentPackage,
+        metadata_backend: MetadataBackendKind,
+    ) -> Result<Self> {
         let bootstrap = materialize_node_enrollment_package(package)?;
-        Self::from_bootstrap(bootstrap)
+        Self::from_bootstrap_with_metadata_backend(bootstrap, metadata_backend)
     }
 
     pub fn from_bootstrap_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -5826,6 +5849,13 @@ impl ServerNodeConfig {
     }
 
     pub fn from_bootstrap(bootstrap: TransportNodeBootstrap) -> Result<Self> {
+        Self::from_bootstrap_with_metadata_backend(bootstrap, metadata_backend_from_env()?)
+    }
+
+    fn from_bootstrap_with_metadata_backend(
+        bootstrap: TransportNodeBootstrap,
+        metadata_backend: MetadataBackendKind,
+    ) -> Result<Self> {
         bootstrap.validate()?;
         transport_sdk::node_connection_priority_from_labels(&bootstrap.labels)
             .context("invalid node connection priority in bootstrap labels")?;
@@ -5894,11 +5924,7 @@ impl ServerNodeConfig {
             cluster_id: bootstrap.cluster_id,
             node_id: bootstrap.node_id,
             data_dir,
-            metadata_backend: parse_metadata_backend(
-                std::env::var("IRONMESH_METADATA_BACKEND")
-                    .unwrap_or_else(|_| "sqlite".to_string())
-                    .as_str(),
-            )?,
+            metadata_backend,
             bind_addr,
             public_url: bootstrap.public_url,
             s3_bind_addr: std::env::var("IRONMESH_S3_BIND")
@@ -6211,11 +6237,7 @@ impl ServerNodeConfig {
             cluster_id,
             node_id,
             data_dir,
-            metadata_backend: parse_metadata_backend(
-                std::env::var("IRONMESH_METADATA_BACKEND")
-                    .unwrap_or_else(|_| "sqlite".to_string())
-                    .as_str(),
-            )?,
+            metadata_backend: metadata_backend_from_env()?,
             bind_addr,
             public_url,
             s3_bind_addr,
@@ -13223,6 +13245,20 @@ struct MediaGpsResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct MediaPhotoResponse {
+    camera_manufacturer: Option<String>,
+    camera_model: Option<String>,
+    lens_manufacturer: Option<String>,
+    lens_model: Option<String>,
+    iso_speed: Option<u32>,
+    exposure_time_seconds: Option<f64>,
+    f_number: Option<f64>,
+    focal_length_mm: Option<f64>,
+    flash: Option<u16>,
+    white_balance: Option<u16>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct MediaThumbnailResponse {
     url: String,
     profile: String,
@@ -13242,7 +13278,14 @@ struct MediaIndexResponse {
     height: Option<u32>,
     orientation: Option<u16>,
     taken_at_unix: Option<u64>,
+    date_encoded_unix: Option<u64>,
+    duration_millis: Option<u64>,
+    frame_rate_millihertz: Option<u32>,
+    total_bitrate_bps: Option<u64>,
+    codec_name: Option<String>,
+    codec_fourcc: Option<String>,
     gps: Option<MediaGpsResponse>,
+    photo: Option<MediaPhotoResponse>,
     thumbnail: Option<MediaThumbnailResponse>,
     error: Option<String>,
 }
@@ -17354,7 +17397,25 @@ fn build_media_index_response(
             height: metadata.height,
             orientation: metadata.orientation,
             taken_at_unix: metadata.taken_at_unix,
+            date_encoded_unix: metadata.date_encoded_unix,
+            duration_millis: metadata.duration_millis,
+            frame_rate_millihertz: metadata.frame_rate_millihertz,
+            total_bitrate_bps: metadata.total_bitrate_bps,
+            codec_name: metadata.codec_name.clone(),
+            codec_fourcc: metadata.codec_fourcc.clone(),
             gps: metadata.gps.as_ref().map(media_gps_response),
+            photo: metadata.photo.as_ref().map(|photo| MediaPhotoResponse {
+                camera_manufacturer: photo.camera_manufacturer.clone(),
+                camera_model: photo.camera_model.clone(),
+                lens_manufacturer: photo.lens_manufacturer.clone(),
+                lens_model: photo.lens_model.clone(),
+                iso_speed: photo.iso_speed,
+                exposure_time_seconds: photo.exposure_time_seconds,
+                f_number: photo.f_number,
+                focal_length_mm: photo.focal_length_mm,
+                flash: photo.flash,
+                white_balance: photo.white_balance,
+            }),
             thumbnail: indexed_thumbnail_response(metadata, &thumbnail_url),
             error: metadata.error.clone(),
         },
@@ -17367,7 +17428,14 @@ fn build_media_index_response(
             height: None,
             orientation: None,
             taken_at_unix: None,
+            date_encoded_unix: None,
+            duration_millis: None,
+            frame_rate_millihertz: None,
+            total_bitrate_bps: None,
+            codec_name: None,
+            codec_fourcc: None,
             gps: None,
+            photo: None,
             thumbnail: Some(placeholder_thumbnail_response(thumbnail_url)),
             error: None,
         },

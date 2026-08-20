@@ -44,6 +44,38 @@ async function dispatchCtrlWheel(locator: Locator, deltaY: number): Promise<void
   }, deltaY);
 }
 
+async function installAndroidShareBridgeMock(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const messages: string[] = [];
+    const listeners = new Set<(event: { data: string }) => void>();
+    Object.assign(window, {
+      __ironmeshShareMessages: messages,
+      IronmeshAndroidShare: {
+        postMessage(message: string) {
+          messages.push(message);
+          const request = JSON.parse(message) as { requestId: string };
+          queueMicrotask(() => {
+            const response = JSON.stringify({ requestId: request.requestId, status: "opened" });
+            listeners.forEach((listener) => listener({ data: response }));
+          });
+        },
+        addEventListener(_type: "message", listener: (event: { data: string }) => void) {
+          listeners.add(listener);
+        },
+        removeEventListener(_type: "message", listener: (event: { data: string }) => void) {
+          listeners.delete(listener);
+        }
+      }
+    });
+  });
+}
+
+async function androidShareMessages(page: Page): Promise<string[]> {
+  return page.evaluate(
+    () => (window as typeof window & { __ironmeshShareMessages: string[] }).__ironmeshShareMessages
+  );
+}
+
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
   test.setTimeout(45_000);
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
@@ -156,7 +188,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("row", { name: /gallery\/cat\.png/ }).getByRole("button", { name: "History" }).click();
   await expect(page.getByLabel("Key")).toHaveValue("gallery/cat.png");
   const versionHistoryTable = page.getByRole("table").nth(1);
-  await expect(versionHistoryTable.getByRole("cell", { name: "version-cat-001" })).toBeVisible();
+  await expect(
+    versionHistoryTable.getByRole("cell", { name: "version-cat-001", exact: true })
+  ).toBeVisible();
   await expect(versionHistoryTable.getByRole("row", { name: /version-cat-001/ })).toContainText("3.0 MB");
   await expect(
     versionHistoryTable.getByRole("row", { name: /version-cat-001/ }).getByRole("button", { name: "Restore" })
@@ -180,7 +214,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     .toBe(true);
   await expect(page.getByText('"target_path": "gallery/cat.png"')).toBeVisible();
   await page.keyboard.press("Escape");
-  await page.getByText("Show thumbnails", { exact: true }).click();
+  await expect(page.getByRole("switch", { name: "Show thumbnails" })).toBeChecked();
   await page.getByRole("button", { name: "Version history" }).click();
   await expect(page.getByRole("button", { name: "Thumbnail for gallery/cat.png" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Thumbnail for version version-cat-001" })).toBeVisible();
@@ -270,7 +304,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("button", { name: "Uploads 4/5 · 1 canceled" })).toBeVisible();
   await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
-  await page.getByRole("row", { name: /^docs\/\s+prefix/i }).getByRole("button", { name: "Open" }).click();
+  await page.getByRole("row", { name: /docs\/\s+prefix/i }).getByRole("button", { name: "Open" }).click();
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("row", { name: /scratch\/\s+prefix/i }).getByRole("button", { name: "Delete" }).click();
   await expect(page.getByRole("cell", { name: "scratch/" })).toHaveCount(0);
@@ -281,7 +315,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("button", { name: "Version history" }).click();
   await page.getByLabel("Key").fill("docs/readme.txt");
   await page.getByRole("button", { name: "Load versions" }).click();
-  await expect(page.getByRole("cell", { name: "version-001" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "version-001", exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
   await page.getByText("Gallery", { exact: true }).click();
@@ -579,29 +613,7 @@ for (const embeddedClient of [null] as const) {
 test("client-ui Android media viewer shares an immutable original through the native bridge", async ({
   page
 }) => {
-  await page.addInitScript(() => {
-    const messages: string[] = [];
-    const listeners = new Set<(event: { data: string }) => void>();
-    Object.assign(window, {
-      __ironmeshShareMessages: messages,
-      IronmeshAndroidShare: {
-        postMessage(message: string) {
-          messages.push(message);
-          const request = JSON.parse(message) as { requestId: string };
-          queueMicrotask(() => {
-            const response = JSON.stringify({ requestId: request.requestId, status: "opened" });
-            listeners.forEach((listener) => listener({ data: response }));
-          });
-        },
-        addEventListener(_type: "message", listener: (event: { data: string }) => void) {
-          listeners.add(listener);
-        },
-        removeEventListener(_type: "message", listener: (event: { data: string }) => void) {
-          listeners.delete(listener);
-        }
-      }
-    });
-  });
+  await installAndroidShareBridgeMock(page);
   await installClientUiMocks(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/?page=gallery&embedded_client=android");
@@ -614,9 +626,7 @@ test("client-ui Android media viewer shares an immutable original through the na
   await dialog.getByRole("button", { name: "Share original" }).click();
   await expect(dialog.getByRole("button", { name: "Share opened" })).toBeVisible();
 
-  const payloads = await page.evaluate(
-    () => (window as typeof window & { __ironmeshShareMessages: string[] }).__ironmeshShareMessages
-  );
+  const payloads = await androidShareMessages(page);
   expect(payloads).toHaveLength(1);
   expect(JSON.parse(payloads[0])).toMatchObject({
     action: "share-original",
@@ -671,6 +681,40 @@ test("client-ui iOS media viewer shares an immutable original through the native
     key: "gallery/cat.png",
     versionId: null,
     snapshotId: "snapshot-001",
+    fileName: "cat.png",
+    mimeType: "image/png",
+    sizeBytes: 3_145_728
+  });
+});
+
+test("client-ui Android explorer resolves the preferred current version before sharing", async ({
+  page
+}) => {
+  await installAndroidShareBridgeMock(page);
+  const mocks = await installClientUiMocks(page, {
+    storeEntries: createMockStoreEntries().map((entry) =>
+      entry.path === "gallery/cat.png" ? { ...entry, version: undefined } : entry
+    )
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/?page=explorer&embedded_client=android");
+  await page.getByRole("button", { name: "Thumbnail for gallery/cat.png" }).click();
+
+  const dialog = page.getByRole("dialog");
+  const shareButton = dialog.getByRole("button", { name: "Share original" });
+  await expect(shareButton).toBeEnabled();
+  expect(mocks.requestedPaths()).not.toContain(apiV1("/versions"));
+  await shareButton.click();
+  await expect(dialog.getByRole("button", { name: "Share opened" })).toBeVisible();
+  expect(mocks.requestedPaths()).toContain(apiV1("/versions"));
+
+  const payloads = await androidShareMessages(page);
+  expect(payloads).toHaveLength(1);
+  expect(JSON.parse(payloads[0])).toMatchObject({
+    action: "share-original",
+    key: "gallery/cat.png",
+    versionId: "version-cat-001",
+    snapshotId: null,
     fileName: "cat.png",
     mimeType: "image/png",
     sizeBytes: 3_145_728
@@ -1022,7 +1066,7 @@ test("client-ui gallery lightbox skips unsupported iOS originals and keeps the t
   expect((await downloadPromise).suggestedFilename()).toBe("ios-photo.heic");
 });
 
-test("client-ui gallery lightbox prefers the mobile viewer thumbnail on narrow touch viewports", async ({
+test("client-ui gallery and explorer lightboxes prefer the mobile viewer thumbnail on narrow touch viewports", async ({
   page
 }) => {
   test.setTimeout(45_000);
@@ -1079,6 +1123,15 @@ test("client-ui gallery lightbox prefers the mobile viewer thumbnail on narrow t
       )
     )
     .toBe(true);
+
+  await page.keyboard.press("Escape");
+  await page.goto("/?page=explorer");
+  await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await expect(page.getByRole("switch", { name: "Show thumbnails" })).toBeChecked();
+  await page.getByRole("button", { name: "Thumbnail for gallery/cat.png" }).click();
+  await expect(
+    page.getByRole("dialog").locator('img[src*="profile=mobile_viewer"]').first()
+  ).toBeVisible();
 });
 
 test("client-ui gallery virtual pages do not keep oversized spacer heights after sidebar resizing", async ({

@@ -4,6 +4,7 @@ import {
   importSetupEnrollmentPackage,
   isHttpErrorStatus,
   startSetupCluster,
+  type MetadataDbBackendKind,
   type SetupStatus,
   type SetupTransitionResponse
 } from "@ironmesh/api";
@@ -16,11 +17,12 @@ import {
   Grid,
   Group,
   PasswordInput,
+  Select,
   Stack,
   Text,
   Textarea
 } from "@mantine/core";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 import { SetupTelemetryDisclosure } from "../components/SetupTelemetryDisclosure";
 
@@ -31,19 +33,31 @@ export function SetupPage() {
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [startPassword, setStartPassword] = useState("");
+  const [startMetadataBackend, setStartMetadataBackend] = useState<MetadataDbBackendKind>("turso");
   const [startTelemetryEnabled, setStartTelemetryEnabled] = useState(true);
   const [nodeAdminPassword, setNodeAdminPassword] = useState("");
+  const [joinMetadataBackend, setJoinMetadataBackend] = useState<MetadataDbBackendKind>("turso");
   const [joinTelemetryEnabled, setJoinTelemetryEnabled] = useState(true);
   const [enrollmentJson, setEnrollmentJson] = useState("");
   const [joinRequestOutput, setJoinRequestOutput] = useState<Record<string, unknown> | null>(null);
   const [transitionOutput, setTransitionOutput] = useState<SetupTransitionResponse | null>(null);
   const [pendingAction, setPendingAction] = useState<"start" | "join-request" | "import" | null>(null);
+  const startBackendTouched = useRef(false);
+  const joinBackendTouched = useRef(false);
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
       const payload = await getSetupStatus();
       setStatus(payload);
+      // Recovery locks the join backend to the node's existing store, so keep it in sync even
+      // after the admin has picked a value elsewhere; otherwise preserve their explicit choice.
+      if (!startBackendTouched.current) {
+        setStartMetadataBackend(payload.metadata_backend);
+      }
+      if (!joinBackendTouched.current || payload.state === "recovery") {
+        setJoinMetadataBackend(payload.metadata_backend);
+      }
       setAvailability("available");
     } catch (refreshError) {
       if (isHttpErrorStatus(refreshError, 401, 403, 404)) {
@@ -73,6 +87,7 @@ export function SetupPage() {
       const payload = await startSetupCluster({
         admin_password: startPassword,
         public_origin: window.location.origin,
+        metadata_backend: startMetadataBackend,
         telemetry_enabled: startTelemetryEnabled
       });
       setTransitionOutput(payload);
@@ -116,6 +131,7 @@ export function SetupPage() {
       const payload = await importSetupEnrollmentPackage({
         admin_password: nodeAdminPassword,
         package_json: enrollmentJson,
+        metadata_backend: joinMetadataBackend,
         telemetry_enabled: joinTelemetryEnabled
       });
       setTransitionOutput(payload);
@@ -144,6 +160,13 @@ export function SetupPage() {
       </Stack>
     );
   }
+
+  const metadataBackendOptions = (status?.available_metadata_backends ?? ["turso", "sqlite"]).map(
+    (backend) => ({
+      value: backend,
+      label: backend === "turso" ? "Turso (Pure Rust)" : "SQLite (rusqlite)"
+    })
+  );
 
   return (
     <Stack gap="lg">
@@ -209,6 +232,19 @@ export function SetupPage() {
                 value={startPassword}
                 onChange={(event) => setStartPassword(event.currentTarget.value)}
               />
+              <Select
+                label="Metadata database backend"
+                description="Turso is the default pure-Rust, SQLite-compatible engine. SQLite uses the established rusqlite implementation."
+                data={metadataBackendOptions}
+                value={startMetadataBackend}
+                allowDeselect={false}
+                onChange={(value) => {
+                  if (value) {
+                    startBackendTouched.current = true;
+                    setStartMetadataBackend(value as MetadataDbBackendKind);
+                  }
+                }}
+              />
               <SetupTelemetryDisclosure
                 enabled={startTelemetryEnabled}
                 onChange={setStartTelemetryEnabled}
@@ -264,6 +300,24 @@ export function SetupPage() {
             value={enrollmentJson}
             onChange={(event) => setEnrollmentJson(event.currentTarget.value)}
             placeholder='{"bootstrap": ...}'
+          />
+          <Select
+            label="Metadata database backend"
+            description={
+              status?.state === "recovery"
+                ? "Recovery keeps the backend already used by this node. Changing it would require a separate metadata migration."
+                : "Turso is the default pure-Rust, SQLite-compatible engine. The selection is local to this node."
+            }
+            data={metadataBackendOptions}
+            value={joinMetadataBackend}
+            allowDeselect={false}
+            disabled={status?.state === "recovery"}
+            onChange={(value) => {
+              if (value) {
+                joinBackendTouched.current = true;
+                setJoinMetadataBackend(value as MetadataDbBackendKind);
+              }
+            }}
           />
           <SetupTelemetryDisclosure
             enabled={joinTelemetryEnabled}

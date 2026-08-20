@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = ["turso-metadata"]
+turso-metadata = ["server-node-sdk/turso-metadata"]
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 

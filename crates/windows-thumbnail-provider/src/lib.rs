@@ -14,10 +14,15 @@ use adapter_windows_cfapi::auth::{
     inspect_persisted_client_identity_paths, is_internal_client_identity_relative_path,
     load_persisted_client_identity,
 };
+use adapter_windows_cfapi::cfapi::{
+    cf_get_placeholder_standard_info_with_identity, open_sync_path,
+};
 use adapter_windows_cfapi::connection_config::{
     is_internal_connection_bootstrap_relative_path, resolve_connection_config,
 };
-use adapter_windows_cfapi::helpers::{normalize_path, path_to_relative};
+use adapter_windows_cfapi::helpers::{
+    PlaceholderFileIdentity, decode_placeholder_file_identity, normalize_path, path_to_relative,
+};
 use adapter_windows_cfapi::hydration_control::{
     is_active_hydration_marked, request_hydration_cancel,
 };
@@ -27,13 +32,26 @@ use adapter_windows_cfapi::sync_root_identity::{
 use anyhow::{Context, Result as AnyhowResult, anyhow, bail};
 use image::{DynamicImage, RgbaImage};
 use reqwest::{StatusCode, Url};
+use sync_core::NamespaceMediaMetadata;
+use windows::Storage::Provider::{
+    IStorageProviderPropertyCapabilities, IStorageProviderPropertyCapabilities_Impl,
+};
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_NOTIMPL, E_POINTER, S_FALSE,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL,
+    E_POINTER, FILETIME, PROPERTYKEY, S_FALSE, STG_E_ACCESSDENIED,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, HBITMAP,
 };
+use windows::Win32::System::Com::StructuredStorage::{
+    InitPropVariantFromDoubleVector, InitPropVariantFromFileTime, PROPVARIANT, PVCHF_DEFAULT,
+    PropVariantChangeType,
+};
 use windows::Win32::System::Com::{CoTaskMemFree, IClassFactory, IClassFactory_Impl};
+use windows::Win32::System::Variant::VT_LPWSTR;
+use windows::Win32::UI::Shell::PropertiesSystem::{
+    IPropertyStore, IPropertyStore_Impl, PSGetPropertyKeyFromName,
+};
 use windows::Win32::UI::Shell::{
     ECF_DEFAULT, ECS_ENABLED, ECS_HIDDEN, IEnumExplorerCommand, IExplorerCommand,
     IExplorerCommand_Impl, IInitializeWithItem, IInitializeWithItem_Impl, IShellItem,
@@ -41,7 +59,7 @@ use windows::Win32::UI::Shell::{
     WTS_ALPHATYPE, WTS_E_EXTRACTIONPENDING, WTS_E_FAILEDEXTRACTION, WTSAT_ARGB, WTSAT_UNKNOWN,
 };
 use windows_core::{
-    BOOL, GUID, HRESULT, IUnknown, Interface, PCWSTR, PWSTR, Ref, Result, implement,
+    BOOL, GUID, HRESULT, HSTRING, IUnknown, Interface, PCWSTR, PWSTR, Ref, Result, implement,
 };
 
 pub const THUMBNAIL_PROVIDER_CLSID: GUID = GUID::from_u128(0xd2e0fd2a_1d7b_4be4_920a_8a6d019454cb);
@@ -62,6 +80,39 @@ const MIN_THUMBNAIL_SIZE: u32 = 32;
 const MAX_THUMBNAIL_SIZE: u32 = 512;
 const MAX_CACHED_THUMBNAILS: usize = 128;
 const MAX_CACHED_THUMBNAIL_CLIENTS: usize = 16;
+
+const SUPPORTED_PROPERTY_NAMES: &[&str] = &[
+    "System.ItemDate",
+    "System.MIMEType",
+    "System.Photo.DateTaken",
+    "System.Photo.Orientation",
+    "System.Image.HorizontalSize",
+    "System.Image.VerticalSize",
+    "System.Image.Dimensions",
+    "System.Video.FrameWidth",
+    "System.Video.FrameHeight",
+    "System.Media.DateEncoded",
+    "System.Media.Duration",
+    "System.Video.FrameRate",
+    "System.Video.TotalBitrate",
+    "System.Video.FourCC",
+    "System.GPS.LatitudeDecimal",
+    "System.GPS.LongitudeDecimal",
+    "System.GPS.Latitude",
+    "System.GPS.LatitudeRef",
+    "System.GPS.Longitude",
+    "System.GPS.LongitudeRef",
+    "System.Photo.CameraManufacturer",
+    "System.Photo.CameraModel",
+    "System.Photo.LensManufacturer",
+    "System.Photo.LensModel",
+    "System.Photo.ISOSpeed",
+    "System.Photo.ExposureTime",
+    "System.Photo.FNumber",
+    "System.Photo.FocalLength",
+    "System.Photo.Flash",
+    "System.Photo.WhiteBalance",
+];
 
 #[derive(Debug, Clone)]
 pub struct DebugThumbnailFetchResult {
@@ -162,6 +213,39 @@ impl IronmeshThumbnailProvider {
         Self {
             source_path: Mutex::new(None),
         }
+    }
+}
+
+#[allow(unsafe_code)]
+#[implement(
+    IInitializeWithItem,
+    IPropertyStore,
+    IStorageProviderPropertyCapabilities
+)]
+struct IronmeshExtendedPropertyHandler {
+    source_path: Mutex<Option<String>>,
+    metadata: OnceLock<Option<PlaceholderFileIdentity>>,
+}
+
+impl IronmeshExtendedPropertyHandler {
+    fn new() -> Self {
+        Self {
+            source_path: Mutex::new(None),
+            metadata: OnceLock::new(),
+        }
+    }
+
+    fn metadata(&self) -> Option<&PlaceholderFileIdentity> {
+        self.metadata
+            .get_or_init(|| {
+                let source_path = self
+                    .source_path
+                    .lock()
+                    .expect("property source path lock poisoned")
+                    .clone()?;
+                load_property_metadata_for_source_path(&source_path).ok()
+            })
+            .as_ref()
     }
 }
 
@@ -267,6 +351,234 @@ fn duplicate_shell_text(value: &str) -> Result<PWSTR> {
     unsafe { SHStrDupW(PCWSTR::from_raw(utf16.as_ptr())) }
 }
 
+fn property_key_from_name(name: &str) -> Result<PROPERTYKEY> {
+    let encoded = name.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut key = PROPERTYKEY::default();
+    unsafe {
+        PSGetPropertyKeyFromName(PCWSTR::from_raw(encoded.as_ptr()), &mut key)?;
+    }
+    Ok(key)
+}
+
+fn supported_property_keys() -> &'static [(PROPERTYKEY, &'static str)] {
+    static KEYS: OnceLock<Vec<(PROPERTYKEY, &'static str)>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        SUPPORTED_PROPERTY_NAMES
+            .iter()
+            .filter_map(|&name| property_key_from_name(name).ok().map(|key| (key, name)))
+            .collect()
+    })
+}
+
+fn canonical_property_name(key: &PROPERTYKEY) -> Option<&'static str> {
+    supported_property_keys()
+        .iter()
+        .find_map(|(candidate, name)| (candidate == key).then_some(*name))
+}
+
+fn string_property_value(value: &str) -> Result<PROPVARIANT> {
+    let source = PROPVARIANT::from(value);
+    let mut destination = PROPVARIANT::default();
+    unsafe {
+        PropVariantChangeType(&mut destination, &source, PVCHF_DEFAULT, VT_LPWSTR)?;
+    }
+    Ok(destination)
+}
+
+fn unix_timestamp_property_value(unix_timestamp: u64) -> Result<PROPVARIANT> {
+    let file_time =
+        adapter_windows_cfapi::helpers::unix_seconds_to_windows_file_time(unix_timestamp)
+            .ok_or_else(|| windows_core::Error::from(E_INVALIDARG))? as u64;
+    let file_time = FILETIME {
+        dwLowDateTime: file_time as u32,
+        dwHighDateTime: (file_time >> 32) as u32,
+    };
+    unsafe { InitPropVariantFromFileTime(&file_time) }
+}
+
+fn decimal_degrees_to_dms(value: f64) -> [f64; 3] {
+    let absolute = value.abs();
+    let degrees = absolute.floor();
+    let minutes_with_fraction = (absolute - degrees) * 60.0;
+    let minutes = minutes_with_fraction.floor();
+    let seconds = (minutes_with_fraction - minutes) * 60.0;
+    [degrees, minutes, seconds]
+}
+
+fn fourcc_property_value(value: &str) -> Option<u32> {
+    let bytes: [u8; 4] = value.as_bytes().try_into().ok()?;
+    bytes
+        .iter()
+        .all(u8::is_ascii)
+        .then(|| u32::from_le_bytes(bytes))
+}
+
+fn media_dimension_property_value(
+    name: &str,
+    media: &NamespaceMediaMetadata,
+) -> Result<PROPVARIANT> {
+    match name {
+        "System.Image.HorizontalSize" if media.media_type.as_deref() == Some("image") => {
+            Ok(media.width.map(PROPVARIANT::from).unwrap_or_default())
+        }
+        "System.Image.VerticalSize" if media.media_type.as_deref() == Some("image") => {
+            Ok(media.height.map(PROPVARIANT::from).unwrap_or_default())
+        }
+        "System.Image.Dimensions" if media.media_type.as_deref() == Some("image") => {
+            match (media.width, media.height) {
+                (Some(width), Some(height)) => {
+                    string_property_value(&format!("{width} x {height}"))
+                }
+                _ => Ok(PROPVARIANT::default()),
+            }
+        }
+        "System.Video.FrameWidth" if media.media_type.as_deref() == Some("video") => {
+            Ok(media.width.map(PROPVARIANT::from).unwrap_or_default())
+        }
+        "System.Video.FrameHeight" if media.media_type.as_deref() == Some("video") => {
+            Ok(media.height.map(PROPVARIANT::from).unwrap_or_default())
+        }
+        _ => Ok(PROPVARIANT::default()),
+    }
+}
+
+fn gps_property_value(name: &str, media: &NamespaceMediaMetadata) -> Result<PROPVARIANT> {
+    let Some(gps) = media.gps.as_ref() else {
+        return Ok(PROPVARIANT::default());
+    };
+    match name {
+        "System.GPS.LatitudeDecimal" => Ok(PROPVARIANT::from(gps.latitude)),
+        "System.GPS.LongitudeDecimal" => Ok(PROPVARIANT::from(gps.longitude)),
+        "System.GPS.Latitude" => unsafe {
+            InitPropVariantFromDoubleVector(Some(&decimal_degrees_to_dms(gps.latitude)))
+        },
+        "System.GPS.Longitude" => unsafe {
+            InitPropVariantFromDoubleVector(Some(&decimal_degrees_to_dms(gps.longitude)))
+        },
+        "System.GPS.LatitudeRef" => {
+            string_property_value(if gps.latitude < 0.0 { "S" } else { "N" })
+        }
+        "System.GPS.LongitudeRef" => {
+            string_property_value(if gps.longitude < 0.0 { "W" } else { "E" })
+        }
+        _ => Ok(PROPVARIANT::default()),
+    }
+}
+
+fn photo_property_value(name: &str, media: &NamespaceMediaMetadata) -> Result<PROPVARIANT> {
+    let Some(photo) = media.photo.as_ref() else {
+        return Ok(PROPVARIANT::default());
+    };
+    match name {
+        "System.Photo.CameraManufacturer" => photo
+            .camera_manufacturer
+            .as_deref()
+            .map(string_property_value)
+            .unwrap_or_else(|| Ok(PROPVARIANT::default())),
+        "System.Photo.CameraModel" => photo
+            .camera_model
+            .as_deref()
+            .map(string_property_value)
+            .unwrap_or_else(|| Ok(PROPVARIANT::default())),
+        "System.Photo.LensManufacturer" => photo
+            .lens_manufacturer
+            .as_deref()
+            .map(string_property_value)
+            .unwrap_or_else(|| Ok(PROPVARIANT::default())),
+        "System.Photo.LensModel" => photo
+            .lens_model
+            .as_deref()
+            .map(string_property_value)
+            .unwrap_or_else(|| Ok(PROPVARIANT::default())),
+        "System.Photo.ISOSpeed" => Ok(photo
+            .iso_speed
+            .and_then(|value| u16::try_from(value).ok())
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
+        "System.Photo.ExposureTime" => Ok(photo
+            .exposure_time_seconds
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
+        "System.Photo.FNumber" => Ok(photo.f_number.map(PROPVARIANT::from).unwrap_or_default()),
+        "System.Photo.FocalLength" => Ok(photo
+            .focal_length_mm
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
+        "System.Photo.Flash" => Ok(photo
+            .flash
+            .and_then(|value| u8::try_from(value).ok())
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
+        "System.Photo.WhiteBalance" => Ok(photo
+            .white_balance
+            .map(u32::from)
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
+        _ => Ok(PROPVARIANT::default()),
+    }
+}
+
+fn explorer_property_value(name: &str, identity: &PlaceholderFileIdentity) -> Result<PROPVARIANT> {
+    let media = identity.remote_media.as_ref();
+    match name {
+        "System.ItemDate" => media
+            .and_then(|media| media.taken_at_unix.or(media.date_encoded_unix))
+            .or(identity.remote_modified_at_unix)
+            .map(unix_timestamp_property_value)
+            .unwrap_or_else(|| Ok(PROPVARIANT::default())),
+        "System.MIMEType" => media
+            .and_then(|media| media.mime_type.as_deref())
+            .map(string_property_value)
+            .unwrap_or_else(|| Ok(PROPVARIANT::default())),
+        "System.Photo.DateTaken" => media
+            .and_then(|media| media.taken_at_unix)
+            .map(unix_timestamp_property_value)
+            .unwrap_or_else(|| Ok(PROPVARIANT::default())),
+        "System.Media.DateEncoded" => media
+            .and_then(|media| media.date_encoded_unix)
+            .map(unix_timestamp_property_value)
+            .unwrap_or_else(|| Ok(PROPVARIANT::default())),
+        "System.Photo.Orientation" => Ok(media
+            .and_then(|media| media.orientation)
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
+        "System.Media.Duration" => Ok(media
+            .and_then(|media| media.duration_millis)
+            .and_then(|millis| millis.checked_mul(10_000))
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
+        "System.Video.FrameRate" => Ok(media
+            .and_then(|media| media.frame_rate_millihertz)
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
+        "System.Video.TotalBitrate" => Ok(media
+            .and_then(|media| media.total_bitrate_bps)
+            .and_then(|value| u32::try_from(value).ok())
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
+        "System.Video.FourCC" => Ok(media
+            .and_then(|media| media.codec_fourcc.as_deref())
+            .and_then(fourcc_property_value)
+            .map(PROPVARIANT::from)
+            .unwrap_or_default()),
+        name if name.starts_with("System.Image.") || name.starts_with("System.Video.Frame") => {
+            media.map_or_else(
+                || Ok(PROPVARIANT::default()),
+                |media| media_dimension_property_value(name, media),
+            )
+        }
+        name if name.starts_with("System.GPS.") => media.map_or_else(
+            || Ok(PROPVARIANT::default()),
+            |media| gps_property_value(name, media),
+        ),
+        name if name.starts_with("System.Photo.") => media.map_or_else(
+            || Ok(PROPVARIANT::default()),
+            |media| photo_property_value(name, media),
+        ),
+        _ => Ok(PROPVARIANT::default()),
+    }
+}
+
 #[allow(unsafe_code)]
 #[allow(non_snake_case)]
 impl IInitializeWithItem_Impl for IronmeshThumbnailProvider_Impl {
@@ -283,6 +595,72 @@ impl IInitializeWithItem_Impl for IronmeshThumbnailProvider_Impl {
             .lock()
             .expect("thumbnail path lock poisoned") = resolved;
         Ok(())
+    }
+}
+
+#[allow(unsafe_code)]
+#[allow(non_snake_case)]
+impl IInitializeWithItem_Impl for IronmeshExtendedPropertyHandler_Impl {
+    fn Initialize(&self, psi: Ref<'_, IShellItem>, _grfmode: u32) -> Result<()> {
+        let resolved = psi
+            .as_ref()
+            .and_then(|item| unsafe { shell_item_path(item) });
+        *self
+            .source_path
+            .lock()
+            .expect("property source path lock poisoned") = resolved;
+        Ok(())
+    }
+}
+
+#[allow(non_snake_case)]
+impl IStorageProviderPropertyCapabilities_Impl for IronmeshExtendedPropertyHandler_Impl {
+    fn IsPropertySupported(&self, propertycanonicalname: &HSTRING) -> Result<bool> {
+        let name = propertycanonicalname.to_string_lossy();
+        Ok(SUPPORTED_PROPERTY_NAMES.contains(&name.as_str()))
+    }
+}
+
+#[allow(unsafe_code)]
+#[allow(non_snake_case)]
+impl IPropertyStore_Impl for IronmeshExtendedPropertyHandler_Impl {
+    fn GetCount(&self) -> Result<u32> {
+        Ok(SUPPORTED_PROPERTY_NAMES.len() as u32)
+    }
+
+    fn GetAt(&self, iprop: u32, pkey: *mut PROPERTYKEY) -> Result<()> {
+        if pkey.is_null() {
+            return Err(E_POINTER.into());
+        }
+        let name = SUPPORTED_PROPERTY_NAMES
+            .get(iprop as usize)
+            .ok_or_else(|| windows_core::Error::from(E_INVALIDARG))?;
+        let key = property_key_from_name(name)?;
+        unsafe {
+            pkey.write(key);
+        }
+        Ok(())
+    }
+
+    fn GetValue(&self, key: *const PROPERTYKEY) -> Result<PROPVARIANT> {
+        if key.is_null() {
+            return Err(E_POINTER.into());
+        }
+        let Some(name) = canonical_property_name(unsafe { &*key }) else {
+            return Ok(PROPVARIANT::default());
+        };
+        let Some(metadata) = self.metadata() else {
+            return Ok(PROPVARIANT::default());
+        };
+        explorer_property_value(name, metadata)
+    }
+
+    fn SetValue(&self, _key: *const PROPERTYKEY, _propvar: *const PROPVARIANT) -> Result<()> {
+        Err(STG_E_ACCESSDENIED.into())
+    }
+
+    fn Commit(&self) -> Result<()> {
+        Err(STG_E_ACCESSDENIED.into())
     }
 }
 
@@ -457,6 +835,39 @@ impl IClassFactory_Impl for IronmeshThumbnailProviderFactory_Impl {
 
 #[allow(unsafe_code)]
 #[implement(IClassFactory)]
+struct IronmeshExtendedPropertyHandlerFactory;
+
+#[allow(unsafe_code)]
+#[allow(non_snake_case)]
+impl IClassFactory_Impl for IronmeshExtendedPropertyHandlerFactory_Impl {
+    fn CreateInstance(
+        &self,
+        punkouter: Ref<'_, IUnknown>,
+        riid: *const GUID,
+        ppvobject: *mut *mut c_void,
+    ) -> Result<()> {
+        if !punkouter.is_null() {
+            return Err(CLASS_E_NOAGGREGATION.into());
+        }
+        if riid.is_null() || ppvobject.is_null() {
+            return Err(E_POINTER.into());
+        }
+
+        unsafe {
+            *ppvobject = null_mut();
+        }
+
+        let unknown: IUnknown = IronmeshExtendedPropertyHandler::new().into();
+        unsafe { unknown.query(riid, ppvobject).ok() }
+    }
+
+    fn LockServer(&self, _flock: BOOL) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[allow(unsafe_code)]
+#[implement(IClassFactory)]
 struct IronmeshCancelHydrationCommandFactory;
 
 #[allow(unsafe_code)]
@@ -536,6 +947,8 @@ pub unsafe extern "system" fn DllGetClassObject(
     let clsid = unsafe { *rclsid };
     let factory: IUnknown = if clsid == THUMBNAIL_PROVIDER_CLSID {
         IronmeshThumbnailProviderFactory.into()
+    } else if clsid == EXTENDED_PROPERTY_HANDLER_CLSID {
+        IronmeshExtendedPropertyHandlerFactory.into()
     } else if clsid == CONTEXT_MENU_HANDLER_CLSID {
         IronmeshCancelHydrationCommandFactory.into()
     } else if is_unsupported_handler_clsid(clsid) {
@@ -559,7 +972,6 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 
 fn is_unsupported_handler_clsid(clsid: GUID) -> bool {
     clsid == CUSTOM_STATE_HANDLER_CLSID
-        || clsid == EXTENDED_PROPERTY_HANDLER_CLSID
         || clsid == BANNERS_HANDLER_CLSID
         || clsid == CONTENT_URI_SOURCE_CLSID
         || clsid == STATUS_UI_SOURCE_FACTORY_CLSID
@@ -1005,6 +1417,56 @@ fn load_thumbnail_client_identity(
     })
 }
 
+fn load_property_metadata_for_source_path(
+    source_path: &str,
+) -> AnyhowResult<PlaceholderFileIdentity> {
+    let source_path = PathBuf::from(source_path);
+    let local_identity = open_sync_path(&source_path, false)
+        .ok()
+        .and_then(|file| cf_get_placeholder_standard_info_with_identity(&file).ok())
+        .and_then(|info| decode_placeholder_file_identity(info.file_identity()));
+
+    if local_identity
+        .as_ref()
+        .is_some_and(PlaceholderFileIdentity::has_remote_media_result)
+    {
+        return Ok(local_identity.expect("checked local property metadata"));
+    }
+
+    let (sync_root_path, sync_root_context) = find_registered_sync_root(&source_path)?;
+    let relative_path = path_to_relative(&sync_root_path, &source_path.to_string_lossy());
+    if relative_path.is_empty() {
+        bail!("resolved empty sync-root relative property path");
+    }
+    let remote_key = remote_key_for_item(&sync_root_context.identity.prefix, &relative_path);
+    let resolved = resolve_connection_config(&sync_root_path, None, None, None, None, None, None)?;
+    let client_build = build_thumbnail_client(&sync_root_path, &resolved)
+        .map_err(|error| anyhow!("failed to build property metadata client: {error:#}"))?;
+    let response = client_build
+        .client
+        .store_index_blocking(Some(&remote_key), 1, None)
+        .with_context(|| format!("failed to fetch property metadata for {remote_key}"))?;
+    let entry = response
+        .entries
+        .into_iter()
+        .find(|entry| normalize_path(&entry.path) == normalize_path(&remote_key))
+        .ok_or_else(|| anyhow!("property metadata entry not found for {remote_key}"))?;
+
+    let mut identity =
+        local_identity.unwrap_or_else(|| PlaceholderFileIdentity::new(&relative_path));
+    identity.remote_version = entry.version;
+    identity.remote_content_hash = entry.content_hash;
+    identity.remote_content_fingerprint = entry.content_fingerprint;
+    identity.remote_size_bytes = entry.size_bytes;
+    identity.remote_modified_at_unix = entry.modified_at_unix;
+    identity.set_remote_media(
+        entry
+            .media
+            .map(client_sdk::ironmesh_client::namespace_media_metadata),
+    );
+    Ok(identity)
+}
+
 fn fetch_thumbnail_for_source_path(source_path: &str) -> ThumbnailProviderResult<FetchedThumbnail> {
     let source_path = PathBuf::from(source_path);
     let (sync_root_path, sync_root_context) = find_registered_sync_root(&source_path)
@@ -1445,17 +1907,41 @@ fn fill_circle(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CACHED_THUMBNAIL_CLIENTS, MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE, ThumbnailClientBuild,
-        ThumbnailClientCache, ThumbnailClientCacheKey, ThumbnailFailureKind,
-        ThumbnailProviderError, media_thumbnail_request_path, modified_at_unix_ms,
-        prototype_bgra_pixels, remote_key_for_item, rgba_pixels_to_bgra,
+        MAX_CACHED_THUMBNAIL_CLIENTS, MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE,
+        SUPPORTED_PROPERTY_NAMES, ThumbnailClientBuild, ThumbnailClientCache,
+        ThumbnailClientCacheKey, ThumbnailFailureKind, ThumbnailProviderError,
+        canonical_property_name, decimal_degrees_to_dms, explorer_property_value,
+        fourcc_property_value, media_thumbnail_request_path, modified_at_unix_ms,
+        property_key_from_name, prototype_bgra_pixels, remote_key_for_item, rgba_pixels_to_bgra,
         thumbnail_client_cache_key, thumbnail_status_should_retry,
     };
+    use adapter_windows_cfapi::helpers::PlaceholderFileIdentity;
     use anyhow::anyhow;
     use reqwest::StatusCode;
+    use std::ffi::c_void;
     use std::path::{Path, PathBuf};
+    use std::ptr::null_mut;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use sync_core::{NamespaceGpsCoordinates, NamespaceMediaMetadata, NamespacePhotoMetadata};
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::System::Variant::{VT_FILETIME, VT_UI1, VT_UI2, VT_UI4};
+    use windows::Win32::UI::Shell::PropertiesSystem::{
+        IPropertyDescription, PSGetPropertyDescription,
+    };
     use windows::Win32::UI::Shell::{WTS_E_EXTRACTIONPENDING, WTS_E_FAILEDEXTRACTION};
+    use windows_core::Interface;
+
+    fn canonical_property_type(name: &str) -> u16 {
+        let key = property_key_from_name(name).expect("property key should resolve");
+        let mut description = null_mut::<c_void>();
+        unsafe {
+            PSGetPropertyDescription(&key, &IPropertyDescription::IID, &mut description)
+                .expect("property description should resolve");
+            IPropertyDescription::from_raw(description)
+                .GetPropertyType()
+                .expect("property type should resolve")
+        }
+    }
 
     fn test_temp_dir(label: &str) -> PathBuf {
         let unique_suffix = SystemTime::now()
@@ -1530,6 +2016,101 @@ mod tests {
     fn prototype_bitmap_writes_pixels_in_bgra_order() {
         let pixels = prototype_bgra_pixels(64);
         assert_eq!(&pixels[..4], &[70, 48, 24, 255]);
+    }
+
+    #[test]
+    fn all_declared_explorer_properties_have_registered_canonical_keys() {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .expect("COM should initialize for property-system lookup");
+        for name in SUPPORTED_PROPERTY_NAMES {
+            let key = property_key_from_name(name)
+                .unwrap_or_else(|error| panic!("{name} should resolve to a PROPERTYKEY: {error}"));
+            assert_eq!(canonical_property_name(&key), Some(*name));
+        }
+        let unsupported = property_key_from_name("System.Title")
+            .expect("unsupported canonical property key should resolve");
+        assert_eq!(canonical_property_name(&unsupported), None);
+        unsafe { CoUninitialize() };
+    }
+
+    #[test]
+    fn explorer_property_values_use_windows_property_types_and_units() {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .expect("COM should initialize for property descriptions");
+        let mut identity = PlaceholderFileIdentity::new("photos/camera.jpg");
+        identity.remote_modified_at_unix = Some(1_723_456_789);
+        identity.remote_media = Some(NamespaceMediaMetadata {
+            media_type: Some("image".to_string()),
+            mime_type: Some("image/jpeg".to_string()),
+            width: Some(4_032),
+            height: Some(3_024),
+            orientation: Some(6),
+            taken_at_unix: Some(1_700_000_000),
+            date_encoded_unix: Some(1_699_999_000),
+            duration_millis: Some(123_456),
+            frame_rate_millihertz: Some(29_970),
+            total_bitrate_bps: Some(8_000_000),
+            codec_fourcc: Some("avc1".to_string()),
+            gps: Some(NamespaceGpsCoordinates {
+                latitude: 47.3769,
+                longitude: 8.5417,
+            }),
+            photo: Some(NamespacePhotoMetadata {
+                camera_manufacturer: Some("Contoso".to_string()),
+                camera_model: Some("Camera One".to_string()),
+                lens_manufacturer: Some("Contoso".to_string()),
+                lens_model: Some("Prime 50".to_string()),
+                iso_speed: Some(200),
+                exposure_time_seconds: Some(0.008),
+                f_number: Some(2.8),
+                focal_length_mm: Some(50.0),
+                flash: Some(7),
+                white_balance: Some(1),
+            }),
+            ..Default::default()
+        });
+
+        let item_date = explorer_property_value("System.ItemDate", &identity).unwrap();
+        assert_eq!(item_date.vt(), VT_FILETIME);
+        let width = explorer_property_value("System.Image.HorizontalSize", &identity).unwrap();
+        assert_eq!(u32::try_from(&width).unwrap(), 4_032);
+        let iso = explorer_property_value("System.Photo.ISOSpeed", &identity).unwrap();
+        assert_eq!(iso.vt(), VT_UI2);
+        assert_eq!(u16::try_from(&iso).unwrap(), 200);
+        let exposure = explorer_property_value("System.Photo.ExposureTime", &identity).unwrap();
+        assert_eq!(f64::try_from(&exposure).unwrap(), 0.008);
+        let flash = explorer_property_value("System.Photo.Flash", &identity).unwrap();
+        assert_eq!(flash.vt(), VT_UI1);
+        let white_balance =
+            explorer_property_value("System.Photo.WhiteBalance", &identity).unwrap();
+        assert_eq!(white_balance.vt(), VT_UI4);
+        assert_eq!(u32::try_from(&white_balance).unwrap(), 1);
+        for name in SUPPORTED_PROPERTY_NAMES {
+            let mut property_identity = identity.clone();
+            if name.starts_with("System.Video.") {
+                property_identity
+                    .remote_media
+                    .as_mut()
+                    .expect("test media should exist")
+                    .media_type = Some("video".to_string());
+            }
+            let value = explorer_property_value(name, &property_identity)
+                .unwrap_or_else(|error| panic!("{name} should produce a value: {error}"));
+            assert_eq!(
+                value.vt().0 as u16,
+                canonical_property_type(name),
+                "{name} should use its canonical Windows property type"
+            );
+        }
+        assert_eq!(decimal_degrees_to_dms(-47.5), [47.0, 30.0, 0.0]);
+        assert_eq!(
+            fourcc_property_value("avc1"),
+            Some(u32::from_le_bytes(*b"avc1"))
+        );
+        assert_eq!(fourcc_property_value("h265x"), None);
+        unsafe { CoUninitialize() };
     }
 
     #[test]

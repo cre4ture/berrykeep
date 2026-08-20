@@ -8,13 +8,26 @@ Current status:
 - it implements:
   - `IInitializeWithItem`
   - `IThumbnailProvider`
+  - `IPropertyStore`
+  - `IStorageProviderPropertyCapabilities`
   - `IClassFactory`
 - it now tries to fetch the real media thumbnail for the placeholder's remote object without hydrating the placeholder itself
 - it uses the sync root registration plus per-sync-root state under `%LocalAppData%\Ironmesh\sync-roots\...` for the persisted connection bootstrap and client identity
 - if the server has no thumbnail or the request fails permanently, the provider now lets Explorer keep the normal file-type icon instead of replacing it with a dummy bitmap
 - if the thumbnail request fails transiently, the provider returns a retry-later shell status so Explorer can ask again
 - it also registers a Cloud Files Explorer context-menu verb named `Cancel Hydration` for active placeholder hydrations
+- it exposes server-indexed media metadata through standard Windows Property System fields without hydrating the placeholder
+- CFAPI placeholders receive the remote object's modification time as their Windows last-write time
 - the package scaffold in this folder is the Explorer/MSIX side of the prototype
+
+The read-only property handler currently serves these Explorer properties when the cluster has the corresponding metadata:
+
+- general: item date and MIME type
+- image: dimensions and EXIF orientation
+- photo: date taken, camera and lens make/model, ISO, exposure time, aperture, focal length, flash, white balance, and GPS coordinates
+- video: encoded date, duration, frame size, frame rate, total bitrate, and FourCC
+
+The media metadata and remote modification time are stored in the CFAPI placeholder identity during synchronization. This lets Explorer inspect an online-only item without opening its content. Legacy identities fall back to the server store index until the next sync refreshes them.
 
 ## Files
 
@@ -67,8 +80,10 @@ For normal packaged-client testing, start IronMesh through the packaged config a
    - Later runs for the same sync root can omit `--bootstrap-file`.
 7. Restart Explorer.
 8. Open an Ironmesh sync root in large-icon view and confirm that dehydrated placeholders use the real server thumbnail when available.
-9. If a file type has no generated thumbnail yet, expect Explorer's normal file-type icon rather than an Ironmesh-branded fallback image.
-10. If you intentionally trigger a long-running hydration for testing, right-click the active placeholder and use `Cancel Hydration`.
+9. Switch to Details view, add the relevant media columns such as `Date taken`, `Dimensions`, `Length`, `Frame rate`, or `Camera model`, and confirm the values appear without hydrating the file.
+10. Confirm the Explorer `Date modified` column matches the remote object modification time.
+11. If a file type has no generated thumbnail yet, expect Explorer's normal file-type icon rather than an Ironmesh-branded fallback image.
+12. If you intentionally trigger a long-running hydration for testing, right-click the active placeholder and use `Cancel Hydration`.
 
 Why this matters:
 

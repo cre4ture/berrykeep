@@ -152,6 +152,90 @@ fn sample_media_jpeg_with_gps_bytes() -> Vec<u8> {
     )
 }
 
+fn sample_media_jpeg_with_photo_metadata_bytes() -> Vec<u8> {
+    let jpeg = sample_media_jpeg_bytes();
+    assert!(jpeg.starts_with(&[0xff, 0xd8]));
+
+    let mut encoded = Vec::with_capacity(jpeg.len() + 256);
+    encoded.extend_from_slice(&jpeg[..2]);
+    encoded.extend_from_slice(&exif_photo_metadata_app1_segment());
+    encoded.extend_from_slice(&jpeg[2..]);
+    encoded
+}
+
+fn exif_photo_metadata_app1_segment() -> Vec<u8> {
+    const MAKE: &[u8] = b"Contoso\0";
+    const MODEL: &[u8] = b"Camera One\0";
+    const LENS_MAKE: &[u8] = b"LensCo\0";
+    const LENS_MODEL: &[u8] = b"Prime 35\0";
+
+    let ifd0_offset = 8u32;
+    let ifd0_size = 2u32 + (3 * 12) + 4;
+    let make_offset = ifd0_offset + ifd0_size;
+    let model_offset = make_offset + MAKE.len() as u32;
+    let exif_ifd_offset = model_offset + MODEL.len() as u32 + 1;
+    let exif_ifd_size = 2u32 + (8 * 12) + 4;
+    let exposure_offset = exif_ifd_offset + exif_ifd_size;
+    let f_number_offset = exposure_offset + 8;
+    let focal_length_offset = f_number_offset + 8;
+    let lens_make_offset = focal_length_offset + 8;
+    let lens_model_offset = lens_make_offset + LENS_MAKE.len() as u32;
+
+    let mut tiff = Vec::with_capacity((lens_model_offset as usize) + LENS_MODEL.len());
+    tiff.extend_from_slice(b"MM");
+    tiff.extend_from_slice(&42u16.to_be_bytes());
+    tiff.extend_from_slice(&ifd0_offset.to_be_bytes());
+
+    tiff.extend_from_slice(&3u16.to_be_bytes());
+    append_ifd_entry(&mut tiff, 0x010f, 2, MAKE.len() as u32, make_offset);
+    append_ifd_entry(&mut tiff, 0x0110, 2, MODEL.len() as u32, model_offset);
+    append_ifd_entry(&mut tiff, 0x8769, 4, 1, exif_ifd_offset);
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    tiff.extend_from_slice(MAKE);
+    tiff.extend_from_slice(MODEL);
+    tiff.push(0);
+
+    assert_eq!(tiff.len(), exif_ifd_offset as usize);
+    tiff.extend_from_slice(&8u16.to_be_bytes());
+    append_ifd_entry(&mut tiff, 0x829a, 5, 1, exposure_offset);
+    append_ifd_entry(&mut tiff, 0x829d, 5, 1, f_number_offset);
+    append_ifd_inline_entry(&mut tiff, 0x8827, 3, 1, [0, 200, 0, 0]);
+    append_ifd_inline_entry(&mut tiff, 0x9209, 3, 1, [0, 1, 0, 0]);
+    append_ifd_entry(&mut tiff, 0x920a, 5, 1, focal_length_offset);
+    append_ifd_inline_entry(&mut tiff, 0xa403, 3, 1, [0, 1, 0, 0]);
+    append_ifd_entry(
+        &mut tiff,
+        0xa433,
+        2,
+        LENS_MAKE.len() as u32,
+        lens_make_offset,
+    );
+    append_ifd_entry(
+        &mut tiff,
+        0xa434,
+        2,
+        LENS_MODEL.len() as u32,
+        lens_model_offset,
+    );
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    for (numerator, denominator) in [(1u32, 125u32), (28, 10), (35, 1)] {
+        tiff.extend_from_slice(&numerator.to_be_bytes());
+        tiff.extend_from_slice(&denominator.to_be_bytes());
+    }
+    tiff.extend_from_slice(LENS_MAKE);
+    tiff.extend_from_slice(LENS_MODEL);
+
+    let mut payload = Vec::with_capacity(6 + tiff.len());
+    payload.extend_from_slice(b"Exif\0\0");
+    payload.extend_from_slice(&tiff);
+
+    let mut segment = Vec::with_capacity(4 + payload.len());
+    segment.extend_from_slice(&[0xff, 0xe1]);
+    segment.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    segment.extend_from_slice(&payload);
+    segment
+}
+
 fn jpeg_with_exif_gps(
     jpeg: Vec<u8>,
     latitude_ref: u8,
@@ -323,6 +407,20 @@ fn preferred_video_seek_time_falls_back_to_sixty_seconds_without_duration() {
     assert_eq!(preferred_video_seek_time(None).as_deref(), Some("60.000"));
 }
 
+#[test]
+fn ffprobe_frame_rate_and_timestamp_values_are_normalized() {
+    assert_eq!(parse_frame_rate_millihertz("30000/1001"), Some(29_970));
+    assert_eq!(parse_frame_rate_millihertz("25"), Some(25_000));
+    assert_eq!(parse_frame_rate_millihertz("0/0"), None);
+    assert_eq!(parse_frame_rate_millihertz("invalid"), None);
+
+    assert_eq!(
+        parse_ffprobe_timestamp("2024-03-04T05:06:07Z"),
+        Some(1_709_528_767)
+    );
+    assert_eq!(parse_ffprobe_timestamp("invalid"), None);
+}
+
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()
@@ -370,7 +468,7 @@ case "$input" in
   http+unix://*|http://127.0.0.1:*) ;;
   *) printf 'unexpected input: %s\n' "$input" >&2; exit 1 ;;
 esac
-printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.0"}}'
+printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264","codec_tag_string":"avc1","avg_frame_rate":"30000/1001","bit_rate":"4000000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.125","bit_rate":"4500000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}}'
 "#;
     std::fs::write(&ffprobe_path, ffprobe_script).unwrap();
 
@@ -4803,6 +4901,33 @@ run_on_all_metadata_backends!(
     persist_and_load_cluster_replicas_roundtrip_turso
 );
 
+async fn persist_cluster_replicas_rolls_back_on_duplicate_rows_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cluster-replicas-rollback").await;
+    let original = HashMap::from([("subject-original".to_string(), vec![NodeId::new_v4()])]);
+    store.persist_cluster_replicas(&original).await.unwrap();
+
+    let duplicate_node_id = NodeId::new_v4();
+    let invalid = HashMap::from([(
+        "subject-invalid".to_string(),
+        vec![duplicate_node_id, duplicate_node_id],
+    )]);
+    store
+        .persist_cluster_replicas(&invalid)
+        .await
+        .expect_err("duplicate replica rows should violate the primary key");
+
+    assert_eq!(store.load_cluster_replicas().await.unwrap(), original);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    persist_cluster_replicas_rolls_back_on_duplicate_rows_impl,
+    persist_cluster_replicas_rolls_back_on_duplicate_rows,
+    persist_cluster_replicas_rolls_back_on_duplicate_rows_turso
+);
+
 async fn persist_and_load_cluster_nodes_roundtrip_impl(backend: StorageTestBackend) {
     let (root, store) = backend.init_store("cluster-nodes-roundtrip").await;
     let remote_node_id = NodeId::new_v4();
@@ -5174,6 +5299,50 @@ run_on_all_metadata_backends!(
     ensure_media_metadata_persists_without_thumbnail_turso
 );
 
+async fn ensure_media_metadata_extracts_standard_photo_properties_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("media-photo-properties").await;
+
+    let put = store
+        .put_object_versioned(
+            "photos/camera.jpg",
+            Bytes::from(sample_media_jpeg_with_photo_metadata_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_metadata(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let photo = metadata.photo.expect("expected EXIF photo metadata");
+
+    assert_eq!(photo.camera_manufacturer.as_deref(), Some("Contoso"));
+    assert_eq!(photo.camera_model.as_deref(), Some("Camera One"));
+    assert_eq!(photo.lens_manufacturer.as_deref(), Some("LensCo"));
+    assert_eq!(photo.lens_model.as_deref(), Some("Prime 35"));
+    assert_eq!(photo.iso_speed, Some(200));
+    assert_eq!(photo.exposure_time_seconds, Some(1.0 / 125.0));
+    assert_eq!(photo.f_number, Some(2.8));
+    assert_eq!(photo.focal_length_mm, Some(35.0));
+    assert_eq!(photo.flash, Some(1));
+    assert_eq!(photo.white_balance, Some(1));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_media_metadata_extracts_standard_photo_properties_impl,
+    ensure_media_metadata_extracts_standard_photo_properties,
+    ensure_media_metadata_extracts_standard_photo_properties_turso
+);
+
 async fn ensure_media_cache_rejects_thumbnail_builds_that_exceed_image_limits_impl(
     backend: StorageTestBackend,
 ) {
@@ -5262,6 +5431,12 @@ async fn ensure_media_cache_generates_thumbnail_for_mp4_impl(backend: StorageTes
     assert_eq!(metadata.mime_type.as_deref(), Some("video/mp4"));
     assert_eq!(metadata.width, Some(1920));
     assert_eq!(metadata.height, Some(1080));
+    assert_eq!(metadata.date_encoded_unix, Some(1_709_528_767));
+    assert_eq!(metadata.duration_millis, Some(42_125));
+    assert_eq!(metadata.frame_rate_millihertz, Some(29_970));
+    assert_eq!(metadata.total_bitrate_bps, Some(4_500_000));
+    assert_eq!(metadata.codec_name.as_deref(), Some("h264"));
+    assert_eq!(metadata.codec_fourcc.as_deref(), Some("avc1"));
 
     let thumb = metadata.thumbnail.as_ref().expect("expected thumbnail");
     assert_eq!((thumb.width, thumb.height), (256, 144));
@@ -6589,6 +6764,47 @@ run_on_all_metadata_backends!(
     importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl,
     importing_replica_manifest_marks_manifest_owned_and_clears_cached_records,
     importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_turso
+);
+
+async fn locally_owned_manifest_delete_roundtrip_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("locally-owned-manifest-delete").await;
+    let manifest_hash = "locally-owned-manifest";
+    store
+        .metadata_store
+        .mark_manifest_locally_owned(manifest_hash, 123)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .metadata_store
+            .list_locally_owned_manifests()
+            .await
+            .unwrap(),
+        vec![manifest_hash.to_string()]
+    );
+
+    store
+        .metadata_store
+        .delete_locally_owned_manifest(manifest_hash)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .metadata_store
+            .list_locally_owned_manifests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    locally_owned_manifest_delete_roundtrip_impl,
+    locally_owned_manifest_delete_roundtrip,
+    locally_owned_manifest_delete_roundtrip_turso
 );
 
 async fn store_index_uses_persisted_manifest_summary_when_manifest_file_is_missing_impl(

@@ -12,6 +12,9 @@ test("server-admin setup mode uses the shared React app and transitions to runti
       "Set the password used to administer this node after enrollment. It is stored locally and does not need to match other cluster nodes."
     )
   ).toBeVisible();
+  await expect(
+    page.getByRole("textbox", { name: "Metadata database backend" }).first()
+  ).toHaveValue("Turso (Pure Rust)");
 
   await page.getByLabel("Initial admin password").fill("playwright-setup-password");
   await page.getByRole("button", { name: "Start a new cluster" }).click();

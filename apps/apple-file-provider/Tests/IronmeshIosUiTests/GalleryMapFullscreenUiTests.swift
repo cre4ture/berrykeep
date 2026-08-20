@@ -39,6 +39,14 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         let webView = app.webViews["ironmesh-hosted-web-ui"]
         XCTAssertTrue(webView.waitForExistence(timeout: 45), "The embedded Client UI should load")
 
+        let fullscreenButton = element(in: webView, labelled: "Fullscreen map")
+        guard fullscreenButton.waitForExistence(timeout: 45) else {
+            XCTFail("The Gallery map should load")
+            return
+        }
+        fullscreenButton.tap()
+        assertFullscreenMapRemainsVisible(in: webView)
+
         let cluster = element(in: webView, labelled: "Open map cluster with 2 items")
         XCTAssertTrue(cluster.waitForExistence(timeout: 45), "The Gallery map should expose its cluster")
         cluster.tap()
