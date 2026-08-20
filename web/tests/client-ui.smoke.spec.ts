@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import { registerGalleryMapContractTests } from "./gallery-map.contract";
+import { GalleryMapMockSession } from "./gallery-map.mock";
 import {
   filterMockStoreEntriesToPrefix,
   projectMockStoreTreeEntries
@@ -472,23 +473,17 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   expect(requestedPaths).not.toContain("/api/maps/logical-file");
 });
 
-test("client-ui gallery loads map entries in bounded pages", async ({ page }) => {
-  const mapPageOffsets: string[] = [];
+test("client-ui gallery loads bounded server-side map clusters", async ({ page }) => {
+  const mapClusterRequests: URL[] = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
-    if (
-      url.pathname !== apiV1("/store/list") ||
-      !url.searchParams.has("media_filter") ||
-      url.searchParams.get("limit") !== "500"
-    ) {
-      return;
+    if (url.pathname === apiV1("/store/map/clusters")) {
+      mapClusterRequests.push(url);
     }
-    mapPageOffsets.push(url.searchParams.get("offset") ?? "");
   });
 
   await installClientUiMocks(page, {
-    storeEntries: createGalleryPaginationMockStoreEntries(520),
-    mapConsistencyMismatchOnce: true
+    storeEntries: createGalleryPaginationMockStoreEntries(520)
   });
   await page.goto("/");
   await page.getByText("Gallery", { exact: true }).click();
@@ -503,15 +498,66 @@ test("client-ui gallery loads map entries in bounded pages", async ({ page }) =>
   await expect(page.getByText("1 pending", { exact: true })).toBeVisible();
   await expect(page.getByText("2 markers", { exact: true })).toBeVisible();
   await expect(page.getByText("521 without GPS", { exact: true })).toBeVisible();
-  await expect
-    .poll(() => [...new Set(mapPageOffsets)].sort().join(","))
-    .toBe("0,500");
-  await expect
-    .poll(() => mapPageOffsets.filter((offset) => offset === "0").length)
-    .toBe(2);
-  await expect
-    .poll(() => mapPageOffsets.filter((offset) => offset === "500").length)
-    .toBe(2);
+  await expect.poll(() => mapClusterRequests.length).toBeGreaterThan(0);
+  expect(mapClusterRequests.every((request) => request.searchParams.get("depth") === "64")).toBe(
+    true
+  );
+  expect(
+    mapClusterRequests.every(
+      (request) =>
+        request.searchParams.has("south") &&
+        request.searchParams.has("west") &&
+        request.searchParams.has("north") &&
+        request.searchParams.has("east") &&
+        request.searchParams.has("zoom")
+    )
+  ).toBe(true);
+});
+
+test("client-ui keeps an open server cluster stable across viewport refreshes", async ({ page }) => {
+  const storeEntries = createMockStoreEntries().map((entry) =>
+    entry.path === "gallery/dog.jpg" && entry.media
+      ? {
+          ...entry,
+          media: {
+            ...entry.media,
+            gps: {
+              latitude: 47.3769,
+              longitude: 8.5417
+            }
+          }
+        }
+      : entry
+  );
+  const mapClusterRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/map/clusters")) {
+      mapClusterRequests.push(url);
+    }
+  });
+
+  await installClientUiMocks(page, {
+    storeEntries,
+    mapClusterRefreshDelayMs: 750,
+    mapClusterEntriesDelayMs: 1_500
+  });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  const map = page.locator('[aria-label="Geotagged gallery map"]');
+  const cluster = page.getByRole("button", { name: "Open map cluster with 2 items" });
+  await expect(cluster).toBeVisible();
+  await map.hover({ position: { x: 80, y: 80 } });
+  await page.mouse.wheel(0, -400);
+  await expect.poll(() => mapClusterRequests.length).toBeGreaterThan(1);
+  await cluster.click();
+
+  const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
+  await expect(chooser).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/cat.png" })).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/dog.jpg" })).toBeVisible();
 });
 
 test("client-ui keeps the direct iOS gallery map inside the WebView viewport", async ({ page }) => {
@@ -571,8 +617,9 @@ test("client-ui Android media viewer shares an immutable original through the na
   await installClientUiMocks(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/?page=gallery&embedded_client=android");
-  await page.getByRole("button", { name: "Map" }).click();
-  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+  await page.getByRole("textbox", { name: "Snapshot" }).click();
+  await page.getByRole("option", { name: "snapshot-001" }).click();
+  await page.getByText("gallery/cat.png", { exact: true }).click();
 
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("button", { name: "Download original" })).toHaveCount(0);
@@ -614,8 +661,9 @@ test("client-ui iOS media viewer shares an immutable original through the native
   await installClientUiMocks(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/?page=gallery&embedded_client=ios");
-  await page.getByRole("button", { name: "Map" }).click();
-  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+  await page.getByRole("textbox", { name: "Snapshot" }).click();
+  await page.getByRole("option", { name: "snapshot-001" }).click();
+  await page.getByText("gallery/cat.png", { exact: true }).click();
 
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("button", { name: "Download original" })).toHaveCount(0);
@@ -706,8 +754,9 @@ test("client-ui iOS media viewer ignores stale native share responses", async ({
   await installClientUiMocks(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/?page=gallery&embedded_client=ios");
-  await page.getByRole("button", { name: "Map" }).click();
-  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+  await page.getByRole("textbox", { name: "Snapshot" }).click();
+  await page.getByRole("option", { name: "snapshot-001" }).click();
+  await page.getByText("gallery/cat.png", { exact: true }).click();
 
   const dialog = page.getByRole("dialog");
   await dialog.getByRole("button", { name: "Share original" }).click();
@@ -1278,11 +1327,12 @@ test("client-ui mobile drawer reveals and navigates its menu items", async ({ pa
 
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
-  mapConsistencyMismatchOnce?: boolean;
   cacheScope?: string | null;
   mapMetadataStatus?: number;
   mapConfigurationStatus?: number;
   mapConfiguration?: MockGalleryMapConfiguration;
+  mapClusterRefreshDelayMs?: number;
+  mapClusterEntriesDelayMs?: number;
 };
 
 type MockGalleryMapConfiguration = {
@@ -1328,7 +1378,8 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   let cacheScope = options?.cacheScope === undefined ? "a".repeat(64) : options.cacheScope;
   let galleryOffline = false;
   let galleryStoreListRequestCount = 0;
-  let mapPaginationAttempt = 0;
+  let galleryMapClusterRequestCount = 0;
+  const galleryMapMock = new GalleryMapMockSession<MockStoreEntry>();
   let galleryStoreListDelayMs = 0;
   const galleryStoreListDelayByMediaFilter = new Map<string, number>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
@@ -1789,6 +1840,24 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       return;
     }
 
+    if (pathname === apiV1("/store/map/clusters") && method === "GET") {
+      galleryMapClusterRequestCount += 1;
+      if (galleryMapClusterRequestCount > 1 && options?.mapClusterRefreshDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, options.mapClusterRefreshDelayMs));
+      }
+      return json(route, galleryMapMock.clusters(storeEntries, searchParams));
+    }
+
+    if (pathname === apiV1("/store/map/cluster-entries") && method === "GET") {
+      if (options?.mapClusterEntriesDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, options.mapClusterEntriesDelayMs));
+      }
+      return json(
+        route,
+        galleryMapMock.clusterEntries(searchParams)
+      );
+    }
+
     if (pathname === apiV1("/store/list") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
       galleryStoreListRequestCount += 1;
@@ -1807,17 +1876,6 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         await new Promise((resolve) => setTimeout(resolve, storeListDelay));
       }
       const response = buildMockStoreListResponse(storeEntries, searchParams);
-      const isMapPage =
-        searchParams.get("limit") === "500" && searchParams.has("media_filter");
-      if (isMapPage && searchParams.get("offset") === "0") {
-        mapPaginationAttempt += 1;
-      }
-      if (isMapPage && options?.mapConsistencyMismatchOnce) {
-        response.consistency_token =
-          mapPaginationAttempt === 1 && searchParams.get("offset") !== "0"
-            ? "mock-store-revision-2"
-            : `mock-store-revision-${mapPaginationAttempt}`;
-      }
       return json(route, response);
     }
 

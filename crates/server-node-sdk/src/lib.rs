@@ -116,6 +116,9 @@ const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const STORE_INDEX_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_INDEX_PAGE_CACHE_MAX_SCOPES: usize = 2;
 const STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
+const GALLERY_MAP_MAX_CLUSTERS: usize = 512;
+const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
+const GALLERY_MAP_CLUSTER_ENTRY_MAX_LIMIT: usize = 500;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
 const CLIENT_MUTATION_OPERATION_TTL_SECS: u64 = 15 * 60;
 const DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 10;
@@ -133,6 +136,7 @@ use x509_parser::prelude::FromDer;
 
 mod cluster;
 mod embedded_rendezvous;
+mod gallery_map;
 mod gallery_sync;
 mod hardware_health;
 mod host_storage;
@@ -7580,6 +7584,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/index/delta", get(get_store_index_delta))
+        .route("/store/map/clusters", get(list_gallery_map_clusters))
+        .route(
+            "/store/map/cluster-entries",
+            get(list_gallery_map_cluster_entries),
+        )
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
@@ -7666,6 +7675,14 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
         .route("/auth/store/index/delta", get(get_store_index_delta_admin))
+        .route(
+            "/auth/store/map/clusters",
+            get(list_gallery_map_clusters_admin),
+        )
+        .route(
+            "/auth/store/map/cluster-entries",
+            get(list_gallery_map_cluster_entries_admin),
+        )
         .route("/auth/data-changes", get(list_data_change_events))
         .route(
             "/auth/maps/config",
@@ -7998,6 +8015,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/index/delta", get(get_store_index_delta))
+        .route("/store/map/clusters", get(list_gallery_map_clusters))
+        .route(
+            "/store/map/cluster-entries",
+            get(list_gallery_map_cluster_entries),
+        )
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
@@ -13131,6 +13153,26 @@ struct StoreIndexDeltaQuery {
     limit: Option<usize>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct GalleryMapClustersQuery {
+    prefix: Option<String>,
+    depth: Option<usize>,
+    media_filter: Option<StoreIndexMediaFilter>,
+    south: Option<f64>,
+    west: Option<f64>,
+    north: Option<f64>,
+    east: Option<f64>,
+    zoom: Option<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GalleryMapClusterEntriesQuery {
+    query_token: Option<String>,
+    cluster_id: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum StoreIndexView {
@@ -13293,6 +13335,70 @@ struct StoreIndexResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     consistency_token: Option<String>,
     media_summary: StoreIndexMediaSummary,
+    entries: Vec<StoreIndexEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct GalleryMapBoundsResponse {
+    south: f64,
+    west: f64,
+    north: f64,
+    east: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct GalleryMapClusterResponse {
+    cluster_id: String,
+    count: usize,
+    latitude: f64,
+    longitude: f64,
+    bounds: GalleryMapBoundsResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry: Option<StoreIndexEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct GallerySummaryStatusResponse {
+    refreshing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress_percent: Option<u8>,
+}
+
+impl From<storage::GallerySummaryRefreshStatus> for GallerySummaryStatusResponse {
+    fn from(status: storage::GallerySummaryRefreshStatus) -> Self {
+        Self {
+            refreshing: status.refreshing,
+            progress_percent: status.progress_percent,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct GalleryMapClustersResponse {
+    prefix: String,
+    depth: usize,
+    zoom: u8,
+    resolution: u32,
+    total_entry_count: usize,
+    visible_geotagged_count: usize,
+    media_summary: StoreIndexMediaSummary,
+    /// Whether `total_entry_count`/`media_summary` came from a cache that may lag the current
+    /// `query_token` revision by a refresh cycle, and if so, roughly how far along that refresh
+    /// is. The viewport `clusters` below are always computed fresh for this request.
+    summary_status: GallerySummaryStatusResponse,
+    query_token: String,
+    clusters: Vec<GalleryMapClusterResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct GalleryMapClusterEntriesResponse {
+    cluster_id: String,
+    entry_count: usize,
+    total_entry_count: usize,
+    offset: usize,
+    limit: usize,
+    has_more: bool,
+    query_token: String,
     entries: Vec<StoreIndexEntry>,
 }
 
@@ -15400,6 +15506,304 @@ async fn list_store_index_admin(
     }
 
     list_store_index_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_gallery_map_clusters(
+    State(state): State<ServerState>,
+    Query(query): Query<GalleryMapClustersQuery>,
+) -> impl IntoResponse {
+    gallery_map_clusters_response(&state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_gallery_map_clusters_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<GalleryMapClustersQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "auth/store/map/clusters/get",
+        true,
+        true,
+        json!({
+            "prefix": query.prefix.clone(),
+            "depth": query.depth,
+            "media_filter": query.media_filter,
+            "south": query.south,
+            "west": query.west,
+            "north": query.north,
+            "east": query.east,
+            "zoom": query.zoom,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    gallery_map_clusters_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_gallery_map_cluster_entries(
+    State(state): State<ServerState>,
+    Query(query): Query<GalleryMapClusterEntriesQuery>,
+) -> impl IntoResponse {
+    gallery_map_cluster_entries_response(&state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_gallery_map_cluster_entries_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<GalleryMapClusterEntriesQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "auth/store/map/cluster-entries/get",
+        true,
+        true,
+        json!({
+            "cluster_id": query.cluster_id.clone(),
+            "offset": query.offset,
+            "limit": query.limit,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    gallery_map_cluster_entries_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE)
+        .await
+}
+
+async fn gallery_map_clusters_response(
+    state: &ServerState,
+    query: GalleryMapClustersQuery,
+    thumbnail_route: &str,
+) -> Response {
+    let viewport = match gallery_map_viewport_from_query(&query) {
+        Ok(viewport) => viewport,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
+    let prefix = query
+        .prefix
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    let depth = query.depth.unwrap_or(1).max(1);
+    let media_filter = query.media_filter.unwrap_or(StoreIndexMediaFilter::All);
+    let zoom = query.zoom.unwrap_or(1).min(20);
+    let page = {
+        let store = read_store(state, "gallery_map.clusters").await;
+        store
+            .query_gallery_map_clusters(&storage::GalleryMapClusterQuery {
+                prefix: prefix.clone(),
+                depth,
+                media_filter: gallery_map::storage_media_filter(media_filter),
+                viewport: gallery_map::storage_viewport(viewport),
+                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(zoom),
+                max_clusters: GALLERY_MAP_MAX_CLUSTERS,
+            })
+            .await
+    };
+    let page = match page {
+        Ok(Some(page)) => page,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "error": "gallery map clustering requires a metadata backend with gallery projection support"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to query gallery map clusters");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let query_token =
+        gallery_map::encode_gallery_map_query_token(&gallery_map::GalleryMapQueryTokenPayload {
+            history_id: page.history_id,
+            revision: page.revision,
+            prefix: prefix.clone(),
+            depth,
+            media_filter,
+            viewport,
+            resolution: page.resolution,
+        });
+    Json(GalleryMapClustersResponse {
+        prefix,
+        depth,
+        zoom,
+        resolution: page.resolution,
+        total_entry_count: page.total_entry_count,
+        visible_geotagged_count: page.visible_geotagged_count,
+        media_summary: store_index_media_summary_from_gallery(page.media_summary),
+        summary_status: page.summary_status.into(),
+        query_token,
+        clusters: page
+            .clusters
+            .into_iter()
+            .map(|cluster| GalleryMapClusterResponse {
+                cluster_id: gallery_map::encode_gallery_map_cluster_id(
+                    cluster.cell_x,
+                    cluster.cell_y,
+                ),
+                count: cluster.count,
+                latitude: cluster.latitude,
+                longitude: cluster.longitude,
+                bounds: GalleryMapBoundsResponse {
+                    south: cluster.bounds.south,
+                    west: cluster.bounds.west,
+                    north: cluster.bounds.north,
+                    east: cluster.bounds.east,
+                },
+                entry: cluster
+                    .entry
+                    .map(|entry| store_index_entry_from_gallery_entry(entry, thumbnail_route)),
+            })
+            .collect(),
+    })
+    .into_response()
+}
+
+async fn gallery_map_cluster_entries_response(
+    state: &ServerState,
+    query: GalleryMapClusterEntriesQuery,
+    thumbnail_route: &str,
+) -> Response {
+    let Some(query_token) = query.query_token.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "query_token is required" })),
+        )
+            .into_response();
+    };
+    let Some(token) = gallery_map::decode_gallery_map_query_token(query_token) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "query_token is malformed or unsupported" })),
+        )
+            .into_response();
+    };
+    let Some(cluster_id) = query.cluster_id.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "cluster_id is required" })),
+        )
+            .into_response();
+    };
+    let Some((cell_x, cell_y)) =
+        gallery_map::decode_gallery_map_cluster_id(cluster_id, token.resolution)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "cluster_id is malformed or outside the query grid" })),
+        )
+            .into_response();
+    };
+    let limit = query
+        .limit
+        .unwrap_or(GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT)
+        .clamp(1, GALLERY_MAP_CLUSTER_ENTRY_MAX_LIMIT);
+    let requested_offset = query.offset.unwrap_or(0);
+    let page = {
+        let store = read_store(state, "gallery_map.cluster_entries").await;
+        store
+            .query_gallery_map_cluster_entries(&storage::GalleryMapClusterEntriesQuery {
+                prefix: token.prefix.clone(),
+                depth: token.depth,
+                media_filter: gallery_map::storage_media_filter(token.media_filter),
+                viewport: gallery_map::storage_viewport(token.viewport),
+                resolution: token.resolution,
+                cell_x,
+                cell_y,
+                offset: requested_offset,
+                limit,
+            })
+            .await
+    };
+    let page = match page {
+        Ok(Some(page)) => page,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "error": "gallery map cluster entries require a metadata backend with gallery projection support"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to query gallery map cluster entries");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if page.history_id != token.history_id || page.revision != token.revision {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "code": "gallery_map_cluster_stale",
+                "reset": true,
+                "message": "the gallery changed; reload map clusters before opening this cluster"
+            })),
+        )
+            .into_response();
+    }
+    let offset = requested_offset.min(page.total_entry_count);
+    let entries = page
+        .entries
+        .into_iter()
+        .map(|entry| store_index_entry_from_gallery_entry(entry, thumbnail_route))
+        .collect::<Vec<_>>();
+    Json(GalleryMapClusterEntriesResponse {
+        cluster_id: cluster_id.to_string(),
+        entry_count: entries.len(),
+        total_entry_count: page.total_entry_count,
+        offset,
+        limit,
+        has_more: offset.saturating_add(entries.len()) < page.total_entry_count,
+        query_token: query_token.to_string(),
+        entries,
+    })
+    .into_response()
+}
+
+fn gallery_map_viewport_from_query(
+    query: &GalleryMapClustersQuery,
+) -> std::result::Result<gallery_map::GalleryMapViewport, &'static str> {
+    let (Some(south), Some(west), Some(north), Some(east)) =
+        (query.south, query.west, query.north, query.east)
+    else {
+        return Err("south, west, north, and east are required");
+    };
+    let viewport = gallery_map::GalleryMapViewport {
+        south,
+        west,
+        north,
+        east,
+    };
+    if !gallery_map::gallery_map_viewport_is_valid(viewport) {
+        return Err("gallery map viewport bounds are invalid");
+    }
+    Ok(viewport)
+}
+
+fn store_index_media_summary_from_gallery(
+    summary: storage::GalleryIndexMediaSummary,
+) -> StoreIndexMediaSummary {
+    StoreIndexMediaSummary {
+        ready_count: summary.ready_count,
+        pending_count: summary.pending_count,
+        incomplete_count: summary.incomplete_count,
+        image_count: summary.image_count,
+        video_count: summary.video_count,
+        geotagged_count: summary.geotagged_count,
+    }
 }
 
 async fn get_store_index_delta(

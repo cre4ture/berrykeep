@@ -155,6 +155,59 @@ function galleryIndexResponse(url) {
   };
 }
 
+function galleryMapClustersResponse(url) {
+  const prefix = url.searchParams.get("prefix") ?? "";
+  const depth = Math.max(1, Number(url.searchParams.get("depth") ?? "1") || 1);
+  const zoom = Math.max(0, Math.min(20, Number(url.searchParams.get("zoom") ?? "1") || 0));
+  return {
+    prefix,
+    depth,
+    zoom,
+    resolution: 2 ** (Math.floor(zoom) + 2),
+    total_entry_count: galleryEntries.length,
+    visible_geotagged_count: galleryEntries.length,
+    media_summary: {
+      ready_count: galleryEntries.length,
+      pending_count: 0,
+      incomplete_count: 0,
+      image_count: galleryEntries.length,
+      video_count: 0,
+      geotagged_count: galleryEntries.length
+    },
+    query_token: "gallery-runtime-map-token-1",
+    clusters: [
+      {
+        cluster_id: "runtime-zurich",
+        count: galleryEntries.length,
+        latitude: 47.3769,
+        longitude: 8.5417,
+        bounds: {
+          south: 47.3769,
+          west: 8.5417,
+          north: 47.3769,
+          east: 8.5417
+        }
+      }
+    ]
+  };
+}
+
+function galleryMapClusterEntriesResponse(url) {
+  const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
+  const limit = Math.max(1, Number(url.searchParams.get("limit") ?? "100") || 100);
+  const entries = galleryEntries.slice(offset, offset + limit);
+  return {
+    cluster_id: url.searchParams.get("cluster_id") ?? "runtime-zurich",
+    entry_count: entries.length,
+    total_entry_count: galleryEntries.length,
+    offset,
+    limit,
+    has_more: offset + entries.length < galleryEntries.length,
+    query_token: url.searchParams.get("query_token") ?? "gallery-runtime-map-token-1",
+    entries
+  };
+}
+
 function json(response, status, body) {
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
@@ -184,6 +237,14 @@ function upstreamRequest(request, response) {
   }
   if (request.method === "GET" && url.pathname === "/api/v1/store/index") {
     json(response, 200, galleryIndexResponse(url));
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/v1/store/map/clusters") {
+    json(response, 200, galleryMapClustersResponse(url));
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/v1/store/map/cluster-entries") {
+    json(response, 200, galleryMapClusterEntriesResponse(url));
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/v1/media/thumbnail") {

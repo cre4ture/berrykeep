@@ -1951,6 +1951,140 @@ run_on_main_metadata_backends!(
     gallery_delta_admin_route_requires_authorization_and_accepts_current_token_turso
 );
 
+async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let second_png = {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([90, 80, 70, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    };
+    let first_manifest_hash = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let first = locked
+            .put_object_versioned(
+                "gallery/first.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let second = locked
+            .put_object_versioned(
+                "gallery/second.png",
+                bytes::Bytes::from(second_png),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        for (manifest_hash, captured_at_unix) in
+            [(&first.manifest_hash, 100), (&second.manifest_hash, 200)]
+        {
+            let mut metadata = locked
+                .ensure_media_metadata(manifest_hash)
+                .await
+                .unwrap()
+                .unwrap();
+            metadata.taken_at_unix = Some(captured_at_unix);
+            metadata.gps = Some(super::storage::MediaGpsCoordinates {
+                latitude: 47.3769,
+                longitude: 8.5417,
+            });
+            locked.persist_media_cache_record(&metadata).await.unwrap();
+        }
+        first.manifest_hash
+    };
+
+    let clusters = super::gallery_map_clusters_response(
+        &state,
+        super::GalleryMapClustersQuery {
+            prefix: Some("gallery".to_string()),
+            depth: Some(64),
+            media_filter: Some(super::StoreIndexMediaFilter::Image),
+            south: Some(-90.0),
+            west: Some(-180.0),
+            north: Some(90.0),
+            east: Some(180.0),
+            zoom: Some(20),
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(clusters.status(), StatusCode::OK);
+    let clusters_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(clusters.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(clusters_payload["total_entry_count"], 2);
+    assert_eq!(clusters_payload["visible_geotagged_count"], 2);
+    assert_eq!(clusters_payload["clusters"].as_array().unwrap().len(), 1);
+    assert_eq!(clusters_payload["clusters"][0]["count"], 2);
+    let query_token = clusters_payload["query_token"].as_str().unwrap();
+    let cluster_id = clusters_payload["clusters"][0]["cluster_id"]
+        .as_str()
+        .unwrap();
+
+    let first_page = super::gallery_map_cluster_entries_response(
+        &state,
+        super::GalleryMapClusterEntriesQuery {
+            query_token: Some(query_token.to_string()),
+            cluster_id: Some(cluster_id.to_string()),
+            offset: Some(0),
+            limit: Some(1),
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_page_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(first_page.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(first_page_payload["entry_count"], 1);
+    assert_eq!(first_page_payload["total_entry_count"], 2);
+    assert_eq!(first_page_payload["has_more"], true);
+    assert_eq!(
+        first_page_payload["entries"][0]["path"],
+        "gallery/second.png"
+    );
+
+    {
+        let locked = lock_store(&state, "tests.state.store").await;
+        let mut metadata = locked
+            .ensure_media_metadata(&first_manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        metadata.width = Some(metadata.width.unwrap_or_default().saturating_add(1));
+        locked.persist_media_cache_record(&metadata).await.unwrap();
+    }
+
+    let stale_page = super::gallery_map_cluster_entries_response(
+        &state,
+        super::GalleryMapClusterEntriesQuery {
+            query_token: Some(query_token.to_string()),
+            cluster_id: Some(cluster_id.to_string()),
+            offset: Some(1),
+            limit: Some(1),
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(stale_page.status(), StatusCode::CONFLICT);
+    let stale_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(stale_page.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(stale_payload["code"], "gallery_map_cluster_stale");
+    assert_eq!(stale_payload["reset"], true);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl,
+    gallery_map_cluster_leaf_pages_reject_stale_query_tokens,
+    gallery_map_cluster_leaf_pages_reject_stale_query_tokens_turso
+);
+
 #[test]
 fn gallery_sync_token_is_opaque_versioned_and_rejects_malformed_values() {
     let payload = super::GallerySyncTokenPayload {

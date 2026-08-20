@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -18,24 +18,79 @@ use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GalleryDeltaCursorError, GalleryDeltaPage,
-    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, METADATA_SCHEMA_VERSION_CURRENT,
-    ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
-    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
-    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
-    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
-    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, GalleryMapClusterEntriesQuery,
+    GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache,
+    METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
+    MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord,
+    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
+    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
     compress_snapshot_json, decompress_snapshot_json, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
-    _database: turso::Database,
+    database: turso::Database,
     connection: turso::Connection,
     writer_lock: tokio::sync::Mutex<()>,
-    gallery_readers: Vec<tokio::sync::Mutex<turso::Connection>>,
-    next_gallery_reader: AtomicUsize,
+    gallery_read_permits: Arc<tokio::sync::Semaphore>,
     metadata_path: PathBuf,
+    gallery_map_summary_cache: Arc<GallerySummaryCache>,
+}
+
+/// A gallery read connection, valid for exactly one transaction.
+///
+/// Turso 0.6 connections do not survive being reused across `BEGIN`/`COMMIT` cycles: after a
+/// handful of transactions on the same connection, the next commit fails with "cannot commit - no
+/// transaction is active". So instead of pooling long-lived connections, each read opens a fresh
+/// connection and drops it when done; the semaphore is what actually bounds concurrency.
+pub(super) struct GalleryReadConnection {
+    connection: turso::Connection,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl std::ops::Deref for GalleryReadConnection {
+    type Target = turso::Connection;
+
+    fn deref(&self) -> &turso::Connection {
+        &self.connection
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct GalleryReadConnectionFactory {
+    database: turso::Database,
+    metadata_path: PathBuf,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl GalleryReadConnectionFactory {
+    pub(super) async fn open(&self) -> Result<GalleryReadConnection> {
+        open_gallery_read_connection(&self.database, &self.metadata_path, self.permits.clone())
+            .await
+    }
+}
+
+async fn open_gallery_read_connection(
+    database: &turso::Database,
+    metadata_path: &Path,
+    permits: Arc<tokio::sync::Semaphore>,
+) -> Result<GalleryReadConnection> {
+    let permit = permits
+        .acquire_owned()
+        .await
+        .context("gallery read semaphore should not be closed")?;
+    let connection = database.connect().with_context(|| {
+        format!(
+            "failed to open a Turso gallery read connection to {}",
+            metadata_path.display()
+        )
+    })?;
+    Ok(GalleryReadConnection {
+        connection,
+        _permit: permit,
+    })
 }
 
 impl TursoMetadataStore {
@@ -62,25 +117,15 @@ impl TursoMetadataStore {
             )
         })?;
 
-        let mut gallery_readers = Vec::with_capacity(DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT);
-        for _ in 0..DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT {
-            gallery_readers.push(tokio::sync::Mutex::new(db.connect().with_context(
-                || {
-                    format!(
-                        "failed to open a Turso gallery read connection to {}",
-                        metadata_path.display()
-                    )
-                },
-            )?));
-        }
-
         let store = Self {
-            _database: db,
+            database: db,
             connection: conn,
             writer_lock: tokio::sync::Mutex::new(()),
-            gallery_readers,
-            next_gallery_reader: AtomicUsize::new(0),
+            gallery_read_permits: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT,
+            )),
             metadata_path: metadata_path.to_path_buf(),
+            gallery_map_summary_cache: Arc::new(GallerySummaryCache::new()),
         };
         store.backfill_gallery_objects().await?;
         Ok(store)
@@ -90,10 +135,24 @@ impl TursoMetadataStore {
         let _ = self.connection.execute_batch("ROLLBACK").await;
     }
 
-    async fn gallery_read_connection(&self) -> tokio::sync::MutexGuard<'_, turso::Connection> {
-        let index =
-            self.next_gallery_reader.fetch_add(1, Ordering::Relaxed) % self.gallery_readers.len();
-        self.gallery_readers[index].lock().await
+    async fn gallery_read_connection(&self) -> Result<GalleryReadConnection> {
+        open_gallery_read_connection(
+            &self.database,
+            &self.metadata_path,
+            self.gallery_read_permits.clone(),
+        )
+        .await
+    }
+
+    /// Everything a `tokio::spawn`ed background gallery read needs to open its own connection
+    /// without borrowing `&self`. It takes a permit from the same semaphore as foreground reads,
+    /// so background work still counts against the gallery read concurrency limit.
+    fn gallery_read_connection_factory(&self) -> GalleryReadConnectionFactory {
+        GalleryReadConnectionFactory {
+            database: self.database.clone(),
+            metadata_path: self.metadata_path.clone(),
+            permits: self.gallery_read_permits.clone(),
+        }
     }
 
     fn decode_json<T: serde::de::DeserializeOwned>(
@@ -172,6 +231,22 @@ impl MetadataStore for TursoMetadataStore {
         query: &GalleryIndexQuery,
     ) -> Result<Option<GalleryIndexPage>> {
         self.query_turso_gallery_index(query).await.map(Some)
+    }
+
+    async fn query_gallery_map_clusters(
+        &self,
+        query: &GalleryMapClusterQuery,
+    ) -> Result<Option<GalleryMapClusterPage>> {
+        self.query_turso_gallery_map_clusters(query).await.map(Some)
+    }
+
+    async fn query_gallery_map_cluster_entries(
+        &self,
+        query: &GalleryMapClusterEntriesQuery,
+    ) -> Result<Option<GalleryIndexPage>> {
+        self.query_turso_gallery_map_cluster_entries(query)
+            .await
+            .map(Some)
     }
 
     async fn query_gallery_delta(

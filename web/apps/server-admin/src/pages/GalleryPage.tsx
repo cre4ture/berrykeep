@@ -1,5 +1,7 @@
 import {
   getAdminGalleryMapConfiguration,
+  getAdminGalleryMapClusterEntries,
+  getAdminGalleryMapClusters,
   getAdminVersionGraph,
   listAdminSnapshots,
   listAdminStoreEntries,
@@ -44,6 +46,9 @@ export function GalleryPage() {
       loadSnapshots: () => listAdminSnapshots(),
       loadEntries: (prefix, depth, snapshotId, options) =>
         listAdminStoreEntries(prefix, depth, snapshotId, undefined, options),
+      loadMapClusters: (request) => getAdminGalleryMapClusters(request),
+      loadMapClusterEntries: (queryToken, clusterId, offset, limit) =>
+        getAdminGalleryMapClusterEntries(queryToken, clusterId, offset, limit),
       loadVersions: (key) => getAdminVersionGraph(key),
       getMediaRequests: (entry, snapshotId, versionId) => {
         const thumbnailUrl = entry.media?.thumbnail?.url ?? null;

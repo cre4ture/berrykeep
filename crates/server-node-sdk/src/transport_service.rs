@@ -19,10 +19,11 @@ use crate::{
     confirm_version, copy_object_path, delete_object, delete_object_by_query,
     delete_upload_session, enroll_client_device, execute_replication_cleanup, get_media_thumbnail,
     get_media_thumbnail_response, get_object, get_object_response, get_store_index_delta,
-    get_upload_session, head_object, health, latency_diagnostic, list_nodes, list_snapshots,
-    list_store_index, list_store_index_response, list_tombstone_archives, list_versions,
-    list_versions_response, placement_for_key, process_stats_current, process_stats_history,
-    put_object, reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
+    get_upload_session, head_object, health, latency_diagnostic, list_gallery_map_cluster_entries,
+    list_gallery_map_clusters, list_nodes, list_snapshots, list_store_index,
+    list_store_index_response, list_tombstone_archives, list_versions, list_versions_response,
+    placement_for_key, process_stats_current, process_stats_history, put_object,
+    reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
     rendezvous_contact_config, renew_device_rendezvous_identity, replication, replication_plan,
     request_has_admin_auth, require_client_auth, require_client_or_admin_auth,
     require_internal_caller, restore_snapshot_path, restore_version_path, run_cleanup,
@@ -532,6 +533,11 @@ fn build_public_transport_router(state: ServerState) -> Router {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/index/delta", get(get_store_index_delta))
+        .route("/store/map/clusters", get(list_gallery_map_clusters))
+        .route(
+            "/store/map/cluster-entries",
+            get(list_gallery_map_cluster_entries),
+        )
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
@@ -706,6 +712,11 @@ fn build_internal_transport_router(state: ServerState) -> Router {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/index/delta", get(get_store_index_delta))
+        .route("/store/map/clusters", get(list_gallery_map_clusters))
+        .route(
+            "/store/map/cluster-entries",
+            get(list_gallery_map_cluster_entries),
+        )
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
