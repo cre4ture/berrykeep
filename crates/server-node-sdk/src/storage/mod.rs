@@ -43,6 +43,7 @@ use uuid::Uuid;
 
 pub(super) mod data_scrub;
 mod gallery_capture_time;
+mod gallery_labels;
 pub(super) mod manifest_reader;
 pub(super) mod media_cache;
 pub(super) mod media_tools;
@@ -68,6 +69,10 @@ pub(crate) use data_scrub::DataScrubber;
 pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTestHook};
 pub(crate) use gallery_capture_time::effective_gallery_captured_at_unix;
 pub(super) use gallery_capture_time::version_created_at_unix_from_payload;
+pub(super) use gallery_labels::{
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, decode_gallery_labels,
+    encode_gallery_labels,
+};
 use media_cache::MediaCacheBuildConfig;
 #[cfg(test)]
 pub(crate) use media_cache::mobile_viewer_thumbnail_profile;
@@ -1042,6 +1047,11 @@ pub(crate) struct GalleryIndexEntry {
     pub(crate) modified_at_unix: Option<u64>,
     pub(crate) content_fingerprint: Option<String>,
     pub(crate) media_metadata: Option<CachedMediaMetadata>,
+    /// User labels of the object, materialized from the projection's label
+    /// column. Populated by the sidecar ingest; empty until then.
+    // Read by the gallery label filter, which lands in a following change.
+    #[allow(dead_code)]
+    pub(crate) labels: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2287,6 +2297,11 @@ trait MetadataStore: Send + Sync {
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
     async fn remove_current_object(&self, key: &str) -> Result<()>;
+    /// Replaces the user labels of a projected object. This is the entry point
+    /// for the sidecar ingest, which resolves the labels of a media key from its
+    /// XMP sidecar.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()>;
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
@@ -3540,6 +3555,22 @@ impl PersistentStore {
         query: &GalleryIndexQuery,
     ) -> Result<Option<GalleryIndexPage>> {
         self.metadata_store.query_gallery_index(query).await
+    }
+
+    /// Replaces the user labels the gallery projection holds for `key`.
+    ///
+    /// The sidecar ingest calls this after resolving the labels of a media key
+    /// from its XMP sidecar; the projection itself never parses sidecar files.
+    // The sidecar ingest that calls this lands in the following change.
+    #[allow(dead_code)]
+    pub(crate) async fn set_gallery_object_labels(
+        &self,
+        key: &str,
+        labels: &[String],
+    ) -> Result<()> {
+        self.metadata_store
+            .set_gallery_object_labels(key, labels)
+            .await
     }
 
     pub(crate) async fn query_gallery_delta(

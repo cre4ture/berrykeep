@@ -18,18 +18,20 @@ use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
-    GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
-    GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
-    GalleryIndexPage, GalleryIndexQuery, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GalleryDeltaChange,
+    GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope,
+    GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage,
+    GalleryIndexQuery, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
     ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
     RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
     S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
     SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
     StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
-    decompress_snapshot_json, effective_gallery_captured_at_unix, gallery_index_media_status,
-    gallery_index_media_type_from_metadata, gallery_media_type_for_path,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
+    decode_gallery_labels, decompress_snapshot_json, effective_gallery_captured_at_unix,
+    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
+    gallery_media_type_for_path, metadata_db_logical_summary_query,
+    metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload,
 };
 
@@ -646,7 +648,8 @@ fn query_gallery_index_in_transaction(
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
-             version_indexes.index_json
+             version_indexes.index_json,
+             gallery_objects.labels_json
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -682,6 +685,7 @@ fn query_gallery_index_in_transaction(
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<Vec<u8>>>(4)?,
                 row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, String>(6)?,
             ))
         },
     )?;
@@ -694,6 +698,7 @@ fn query_gallery_index_in_transaction(
             content_fingerprint,
             metadata_payload,
             version_index_payload,
+            labels_json,
         ) = row?;
         entries.push(materialize_gallery_index_entry(
             key,
@@ -702,6 +707,7 @@ fn query_gallery_index_in_transaction(
             content_fingerprint,
             metadata_payload,
             version_index_payload,
+            labels_json,
         )?);
     }
     Ok(GalleryIndexPage {
@@ -720,6 +726,7 @@ fn materialize_gallery_index_entry(
     content_fingerprint: Option<String>,
     metadata_payload: Option<Vec<u8>>,
     version_index_payload: Option<Vec<u8>>,
+    labels_json: String,
 ) -> Result<GalleryIndexEntry> {
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in sqlite"))
@@ -729,6 +736,7 @@ fn materialize_gallery_index_entry(
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
+    let labels = decode_gallery_labels(&labels_json)?;
     Ok(GalleryIndexEntry {
         key,
         manifest_hash,
@@ -736,6 +744,7 @@ fn materialize_gallery_index_entry(
         modified_at_unix,
         content_fingerprint,
         media_metadata,
+        labels,
     })
 }
 
@@ -755,7 +764,8 @@ fn query_gallery_entry_from_db(
                  version_indexes.index_json,
                  gallery_objects.media_type,
                  gallery_objects.latitude,
-                 gallery_objects.longitude
+                 gallery_objects.longitude,
+                 gallery_objects.labels_json
              FROM gallery_objects
              LEFT JOIN manifest_summaries
                ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -777,15 +787,16 @@ fn query_gallery_entry_from_db(
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<f64>>(7)?,
                     row.get::<_, Option<f64>>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             },
         )
         .optional()?;
-    row.filter(|(key, _, _, _, _, _, media_type, latitude, longitude)| {
+    row.filter(|(key, _, _, _, _, _, media_type, latitude, longitude, _)| {
         gallery_entry_matches_delta_scope(key, media_type.as_deref(), *latitude, *longitude, scope)
     })
     .map(
-        |(key, manifest_hash, size, fingerprint, metadata, versions, _, _, _)| {
+        |(key, manifest_hash, size, fingerprint, metadata, versions, _, _, _, labels_json)| {
             materialize_gallery_index_entry(
                 key,
                 manifest_hash,
@@ -793,6 +804,7 @@ fn query_gallery_entry_from_db(
                 fingerprint,
                 metadata,
                 versions,
+                labels_json,
             )
         },
     )
@@ -1093,6 +1105,19 @@ impl MetadataStore for SqliteMetadataStore {
         self.write_tx(move |db| {
             db.execute("DELETE FROM current_objects WHERE key = ?1", params![key])?;
             db.execute("DELETE FROM gallery_objects WHERE key = ?1", params![key])?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()> {
+        let key = key.to_string();
+        let labels_json = encode_gallery_labels(labels)?;
+        self.write_tx(move |db| {
+            db.execute(
+                "UPDATE gallery_objects SET labels_json = ?2 WHERE key = ?1",
+                params![key, labels_json],
+            )?;
             Ok(())
         })
         .await
@@ -3435,7 +3460,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             media_status TEXT,
             geotagged INTEGER NOT NULL DEFAULT 0,
             latitude REAL,
-            longitude REAL
+            longitude REAL,
+            labels_json TEXT NOT NULL DEFAULT '[]'
         );
 
         CREATE TABLE IF NOT EXISTS gallery_changes (
@@ -3668,6 +3694,12 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     add_sqlite_column_if_missing(db, "gallery_objects", "longitude", "REAL")?;
     add_sqlite_column_if_missing(
         db,
+        "gallery_objects",
+        GALLERY_LABELS_COLUMN,
+        GALLERY_LABELS_COLUMN_DEFINITION,
+    )?;
+    add_sqlite_column_if_missing(
+        db,
         "gallery_changes",
         "previous_inferred_media_type",
         "TEXT",
@@ -3787,6 +3819,7 @@ fn init_gallery_change_log(db: &Connection) -> Result<()> {
           OR OLD.geotagged IS NOT NEW.geotagged
           OR OLD.latitude IS NOT NEW.latitude
           OR OLD.longitude IS NOT NEW.longitude
+          OR OLD.labels_json IS NOT NEW.labels_json
         BEGIN
             UPDATE metadata_meta
                SET value = CAST(value AS INTEGER) + 1

@@ -7,13 +7,13 @@ use uuid::Uuid;
 
 use super::super::{
     CachedMediaMetadata, CurrentObjectEntry, FileVersionIndex,
-    GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY, GalleryDeltaChange, GalleryDeltaCursorError,
-    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
-    GalleryIndexEntry, GalleryIndexMediaFilter, GalleryIndexMediaSummary, GalleryIndexPage,
-    GalleryIndexQuery, ManifestSummary, current_media_cache_metadata,
-    effective_gallery_captured_at_unix, gallery_index_media_status,
-    gallery_index_media_type_from_metadata, gallery_media_type_for_path,
-    sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
+    GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY, GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION,
+    GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
+    GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaFilter,
+    GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery, ManifestSummary,
+    current_media_cache_metadata, decode_gallery_labels, effective_gallery_captured_at_unix,
+    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
+    gallery_media_type_for_path, sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
 };
 #[cfg(test)]
 use super::turso_test_db_path;
@@ -46,7 +46,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                 media_status TEXT,
                 geotagged INTEGER NOT NULL DEFAULT 0,
                 latitude REAL,
-                longitude REAL
+                longitude REAL,
+                labels_json TEXT NOT NULL DEFAULT '[]'
             );
 
             CREATE TABLE IF NOT EXISTS gallery_changes (
@@ -70,6 +71,13 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
             ",
         )
         .await?;
+    super::add_column_if_missing(
+        connection,
+        "gallery_objects",
+        GALLERY_LABELS_COLUMN,
+        GALLERY_LABELS_COLUMN_DEFINITION,
+    )
+    .await?;
     connection
         .execute(
             "INSERT INTO metadata_meta(key, value) VALUES('gallery_history_id', ?1)
@@ -114,6 +122,7 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
               OR OLD.geotagged IS NOT NEW.geotagged
               OR OLD.latitude IS NOT NEW.latitude
               OR OLD.longitude IS NOT NEW.longitude
+              OR OLD.labels_json IS NOT NEW.labels_json
             BEGIN
                 UPDATE metadata_meta
                    SET value = CAST(value AS INTEGER) + 1
@@ -271,6 +280,34 @@ impl TursoMetadataStore {
                 .await?;
             connection
                 .execute("DELETE FROM gallery_objects WHERE key = ?1", (key,))
+                .await?;
+            Ok(())
+        }
+        .await;
+        finish_gallery_transaction(transaction, result).await
+    }
+
+    /// Replaces the user labels the projection holds for `key`.
+    ///
+    /// Runs inside the gallery transaction so the change log trigger observes the
+    /// label update and assigns it a revision, which is what lets delta sync
+    /// propagate label changes to clients.
+    pub(super) async fn store_gallery_object_labels(
+        &self,
+        key: &str,
+        labels: &[String],
+    ) -> Result<()> {
+        let labels_json = encode_gallery_labels(labels)?;
+        let _writer = self.writer_lock.lock().await;
+        let connection = &self.connection;
+        let transaction =
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
+        let result = async {
+            connection
+                .execute(
+                    "UPDATE gallery_objects SET labels_json = ?2 WHERE key = ?1",
+                    (key, labels_json.as_str()),
+                )
                 .await?;
             Ok(())
         }
@@ -935,7 +972,8 @@ async fn query_gallery_index(
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
-             version_indexes.index_json
+             version_indexes.index_json,
+             gallery_objects.labels_json
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -966,6 +1004,7 @@ async fn query_gallery_index(
             row_opt_string(&row, 3, "manifest_summaries.content_fingerprint")?,
             row_opt_blob(&row, 4, "media_cache.metadata_json")?,
             row_opt_blob(&row, 5, "version_indexes.index_json")?,
+            row_string(&row, 6, "gallery_objects.labels_json")?,
         )?);
     }
     Ok(GalleryIndexPage {
@@ -1107,7 +1146,8 @@ async fn query_gallery_entry(
                  version_indexes.index_json,
                  gallery_objects.media_type,
                  gallery_objects.latitude,
-                 gallery_objects.longitude
+                 gallery_objects.longitude,
+                 gallery_objects.labels_json
              FROM gallery_objects
              LEFT JOIN manifest_summaries
                ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1137,6 +1177,7 @@ async fn query_gallery_entry(
         row_opt_string(&row, 3, "manifest_summaries.content_fingerprint")?,
         row_opt_blob(&row, 4, "media_cache.metadata_json")?,
         row_opt_blob(&row, 5, "version_indexes.index_json")?,
+        row_string(&row, 9, "gallery_objects.labels_json")?,
     )?))
 }
 
@@ -1177,6 +1218,7 @@ fn materialize_gallery_index_entry(
     content_fingerprint: Option<String>,
     metadata_payload: Option<Vec<u8>>,
     version_index_payload: Option<Vec<u8>>,
+    labels_json: String,
 ) -> Result<GalleryIndexEntry> {
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in Turso"))
@@ -1186,6 +1228,7 @@ fn materialize_gallery_index_entry(
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
+    let labels = decode_gallery_labels(&labels_json)?;
     Ok(GalleryIndexEntry {
         key,
         manifest_hash,
@@ -1193,6 +1236,7 @@ fn materialize_gallery_index_entry(
         modified_at_unix,
         content_fingerprint,
         media_metadata,
+        labels,
     })
 }
 
@@ -1971,6 +2015,113 @@ mod tests {
         }));
 
         drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    /// Labels live outside the content-addressed media bytes, so re-uploading an
+    /// image must not discard them. The upsert deliberately omits `labels_json`
+    /// from its conflict clause; this pins that behaviour down.
+    #[tokio::test]
+    async fn gallery_labels_survive_a_projection_refresh() {
+        let metadata_db_path = turso_test_db_path("gallery-labels-refresh");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let key = "gallery/labelled.jpg";
+        store
+            .upsert_current_object_with_gallery(
+                key,
+                &CurrentObjectEntry {
+                    manifest_hash: "manifest-first".to_string(),
+                    object_id: "object-first".to_string(),
+                },
+            )
+            .await
+            .expect("current object should persist");
+        store
+            .store_gallery_object_labels(key, &["private".to_string()])
+            .await
+            .expect("labels should persist");
+
+        store
+            .upsert_current_object_with_gallery(
+                key,
+                &CurrentObjectEntry {
+                    manifest_hash: "manifest-second".to_string(),
+                    object_id: "object-first".to_string(),
+                },
+            )
+            .await
+            .expect("re-uploaded object should persist");
+
+        let mut rows = store
+            .connection
+            .query(
+                "SELECT labels_json FROM gallery_objects WHERE key = ?1",
+                (key,),
+            )
+            .await
+            .expect("labels should be queryable");
+        let row = rows.next().await.unwrap().expect("row should exist");
+        assert_eq!(
+            row_string(&row, 0, "gallery_objects.labels_json").unwrap(),
+            "[\"private\"]"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    /// Databases created before the label column exists must gain it through the
+    /// additive migration rather than needing a projection rebuild.
+    #[tokio::test]
+    async fn gallery_labels_column_is_added_to_preexisting_databases() {
+        let metadata_db_path = turso_test_db_path("gallery-labels-migration");
+        let database = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+            .build()
+            .await
+            .expect("turso should open");
+        let connection = database.connect().expect("turso should connect");
+        connection
+            .execute(
+                "CREATE TABLE gallery_objects (
+                     key TEXT PRIMARY KEY,
+                     manifest_hash TEXT NOT NULL,
+                     object_id TEXT NOT NULL,
+                     inferred_media_type TEXT,
+                     media_type TEXT,
+                     captured_at_unix INTEGER NOT NULL DEFAULT 0,
+                     media_status TEXT,
+                     geotagged INTEGER NOT NULL DEFAULT 0,
+                     latitude REAL,
+                     longitude REAL
+                 )",
+                (),
+            )
+            .await
+            .expect("legacy projection table should be created");
+
+        super::super::init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should migrate");
+
+        insert_gallery_fixture(&connection, "gallery/legacy.jpg", "image", 10, None, None).await;
+        let mut rows = connection
+            .query(
+                "SELECT labels_json FROM gallery_objects WHERE key = ?1",
+                ("gallery/legacy.jpg",),
+            )
+            .await
+            .expect("migrated column should be queryable");
+        let row = rows.next().await.unwrap().expect("row should exist");
+        assert_eq!(
+            row_string(&row, 0, "gallery_objects.labels_json").unwrap(),
+            "[]",
+            "migrated rows should default to no labels"
+        );
+
+        drop(rows);
+        drop(connection);
         let _ = std::fs::remove_file(metadata_db_path);
     }
 }
