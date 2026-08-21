@@ -7882,3 +7882,278 @@ run_on_all_metadata_backends!(
     gallery_labels_survive_a_malformed_sidecar,
     gallery_labels_survive_a_malformed_sidecar_turso
 );
+
+/// A sidecar as an external editor writes it: keywords next to camera raw and
+/// Photoshop properties that Ironmesh neither models nor could reconstruct.
+const THIRD_PARTY_SIDECAR: &str = concat!(
+    "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
+    "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core\">\n",
+    " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
+    "  <rdf:Description rdf:about=\"\"\n",
+    "    xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n",
+    "    xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"\n",
+    "    xmlns:photoshop=\"http://ns.adobe.com/photoshop/1.0/\"\n",
+    "   crs:Exposure2012=\"+0.35\"\n",
+    "   photoshop:City=\"Zurich\">\n",
+    "   <dc:subject>\n",
+    "    <rdf:Bag>\n",
+    "     <rdf:li>lightroom</rdf:li>\n",
+    "    </rdf:Bag>\n",
+    "   </dc:subject>\n",
+    "  </rdf:Description>\n",
+    " </rdf:RDF>\n",
+    "</x:xmpmeta>\n",
+    "<?xpacket end=\"w\"?>\n",
+);
+
+/// Reads the raw sidecar object stored next to `media_key`.
+async fn stored_sidecar_text(store: &PersistentStore, media_key: &str) -> String {
+    let sidecar_key = sidecar_key_for_media(media_key);
+    let bytes = store
+        .get_object(&sidecar_key, None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap_or_else(|err| panic!("missing sidecar object for {media_key}: {err}"));
+    String::from_utf8(bytes.to_vec()).expect("a sidecar must be valid UTF-8")
+}
+
+/// Labelling media that has no sidecar yet has to create one, and that sidecar
+/// has to reach the gallery projection like any externally uploaded one.
+async fn media_labels_create_a_missing_sidecar_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-labels-create").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .set_media_labels("album/photo.jpg", vec!["beach".to_string()])
+        .await
+        .unwrap()
+        .expect("creating the first sidecar must write an object version");
+
+    let stored = stored_sidecar_text(&store, "album/photo.jpg").await;
+    let sidecar = XmpSidecar::parse(stored.as_bytes())
+        .expect("the generated sidecar must be a valid XMP packet");
+    assert_eq!(sidecar.keywords(), ["beach".to_string()]);
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["beach".to_string()],
+        "the sidecar write must reach the gallery projection"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_create_a_missing_sidecar_impl,
+    media_labels_create_a_missing_sidecar,
+    media_labels_create_a_missing_sidecar_turso
+);
+
+/// Labelling must edit an existing sidecar instead of replacing it: a rewritten
+/// packet would silently drop the develop settings and IPTC fields that the
+/// authoring tool owns.
+async fn media_labels_preserve_third_party_properties_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-labels-third-party").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            Bytes::from_static(THIRD_PARTY_SIDECAR.as_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .set_media_labels(
+            "album/photo.jpg",
+            vec!["beach".to_string(), "vacation".to_string()],
+        )
+        .await
+        .unwrap()
+        .expect("changed labels must write an object version");
+
+    let stored = stored_sidecar_text(&store, "album/photo.jpg").await;
+    assert!(
+        stored.contains("crs:Exposure2012=\"+0.35\""),
+        "camera raw settings must survive a label write: {stored}"
+    );
+    assert!(
+        stored.contains("photoshop:City=\"Zurich\""),
+        "Photoshop properties must survive a label write: {stored}"
+    );
+
+    let sidecar = XmpSidecar::parse(stored.as_bytes()).expect("the sidecar must stay parsable");
+    assert_eq!(
+        sidecar.keywords(),
+        ["beach".to_string(), "vacation".to_string()],
+        "the requested labels replace the previous keywords"
+    );
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["beach".to_string(), "vacation".to_string()]
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_preserve_third_party_properties_impl,
+    media_labels_preserve_third_party_properties,
+    media_labels_preserve_third_party_properties_turso
+);
+
+/// A packet that cannot be parsed cannot be edited without losing its content,
+/// so the write is refused. Ingest deliberately tolerates such packets; refusing
+/// to write over them is the complementary half of that decision.
+async fn media_labels_refuse_to_overwrite_a_malformed_sidecar_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-labels-malformed").await;
+    let malformed = Bytes::from_static(b"<rdf:RDF><unclosed>");
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            malformed.clone(),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let error = store
+        .set_media_labels("album/photo.jpg", vec!["beach".to_string()])
+        .await
+        .expect_err("a malformed sidecar must not be overwritten");
+    assert!(
+        error.to_string().contains("malformed XMP sidecar"),
+        "the error has to name the refused sidecar: {error:#}"
+    );
+    assert_eq!(
+        store
+            .get_object("album/photo.jpg.xmp", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap(),
+        malformed,
+        "the refused write must leave the stored bytes untouched"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_refuse_to_overwrite_a_malformed_sidecar_impl,
+    media_labels_refuse_to_overwrite_a_malformed_sidecar,
+    media_labels_refuse_to_overwrite_a_malformed_sidecar_turso
+);
+
+/// Storing the labels a media object already has must not spend an object
+/// version, and media without labels must not gain an empty sidecar object.
+async fn media_labels_skip_writes_that_change_nothing_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-labels-noop").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .set_media_labels("album/photo.jpg", Vec::new())
+            .await
+            .unwrap()
+            .is_none(),
+        "clearing labels of unlabelled media must not create a sidecar"
+    );
+    assert!(
+        store
+            .get_object("album/photo.jpg.xmp", None, None, ObjectReadMode::Preferred)
+            .await
+            .is_err(),
+        "no sidecar object may exist after a no-op label write"
+    );
+
+    let created = store
+        .set_media_labels("album/photo.jpg", vec!["beach".to_string()])
+        .await
+        .unwrap()
+        .expect("the first label write must create a sidecar");
+    let repeated = store
+        .set_media_labels("album/photo.jpg", vec!["beach".to_string()])
+        .await
+        .unwrap();
+    assert!(
+        repeated.is_none(),
+        "re-storing identical labels must not create a version"
+    );
+    assert_eq!(
+        store
+            .list_versions("album/photo.jpg.xmp")
+            .await
+            .unwrap()
+            .unwrap()
+            .preferred_head_version_id,
+        Some(created.version_id),
+        "the sidecar must still point at the version of the only real write"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_skip_writes_that_change_nothing_impl,
+    media_labels_skip_writes_that_change_nothing,
+    media_labels_skip_writes_that_change_nothing_turso
+);
+
+/// Sidecars describe media objects, so addressing one directly is a caller bug
+/// rather than a request to create `photo.jpg.xmp.xmp`.
+async fn media_labels_reject_a_sidecar_key_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-labels-sidecar-key").await;
+
+    let error = store
+        .set_media_labels("album/photo.jpg.xmp", vec!["beach".to_string()])
+        .await
+        .expect_err("a sidecar key must be rejected");
+    assert!(
+        error.to_string().contains("album/photo.jpg.xmp"),
+        "the error has to name the rejected key: {error:#}"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_reject_a_sidecar_key_impl,
+    media_labels_reject_a_sidecar_key,
+    media_labels_reject_a_sidecar_key_turso
+);

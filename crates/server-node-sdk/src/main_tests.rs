@@ -13331,6 +13331,78 @@ run_on_main_metadata_backends!(
     delete_object_handler_marks_tombstone_and_removes_current_key_turso
 );
 
+async fn set_media_labels_handler_writes_the_sidecar_object_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let media_key = "album/photo.jpg";
+    let sidecar_key = "album/photo.jpg.xmp";
+
+    let rejected = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: sidecar_key.to_string(),
+            labels: vec!["beach".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::BAD_REQUEST,
+        "labels address the media object, never its sidecar"
+    );
+
+    let applied = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: media_key.to_string(),
+            labels: vec!["beach".to_string(), "vacation".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(applied.status(), StatusCode::NO_CONTENT);
+
+    let stored = {
+        let store = read_store(&state, "tests.media_labels.sidecar").await;
+        store
+            .get_object(
+                sidecar_key,
+                None,
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("the handler must have written a sidecar object")
+    };
+    assert_eq!(
+        common::xmp::XmpSidecar::parse(&stored).unwrap().keywords(),
+        ["beach".to_string(), "vacation".to_string()]
+    );
+
+    let unchanged = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: media_key.to_string(),
+            labels: vec!["beach".to_string(), "vacation".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(
+        unchanged.status(),
+        StatusCode::NO_CONTENT,
+        "re-storing identical labels stays successful"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    set_media_labels_handler_writes_the_sidecar_object_impl,
+    set_media_labels_handler_writes_the_sidecar_object,
+    set_media_labels_handler_writes_the_sidecar_object_turso
+);
+
 async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
     backend: MainTestBackend,
 ) {

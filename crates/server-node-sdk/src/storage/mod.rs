@@ -33,7 +33,7 @@ use bytes::{Bytes, BytesMut};
 use common::NodeId;
 use common::content_fingerprint::content_fingerprint_from_chunk_refs;
 use common::range_chunk_cache::RangeChunkCache;
-use common::xmp::{XmpSidecar, media_key_for_sidecar, sidecar_key_for_media};
+use common::xmp::{XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -8088,6 +8088,78 @@ impl PersistentStore {
             .unwrap()
             .remove(&key.to_string());
         self.sync_sidecar_labels_after_removal(key).await
+    }
+
+    /// Makes the XMP sidecar of `media_key` carry exactly `labels`.
+    ///
+    /// The sidecar object is the source of truth for user labels, so labelling
+    /// is an ordinary versioned write of `<media_key>.xmp`. Going through
+    /// [`PersistentStore::put_object_versioned`] keeps labels replicated,
+    /// snapshotted and undoable like any other object, and lets the ingest hook
+    /// refresh the gallery projection instead of duplicating that logic here.
+    ///
+    /// Returns `None` when the stored sidecar already carries these labels and
+    /// no write was necessary.
+    pub async fn set_media_labels(
+        &mut self,
+        media_key: &str,
+        labels: Vec<String>,
+    ) -> Result<Option<PutResult>> {
+        if is_sidecar_key(media_key) {
+            bail!("labels belong to a media object, not to the sidecar {media_key}");
+        }
+
+        let sidecar_key = sidecar_key_for_media(media_key);
+        let stored = self.load_stored_sidecar(&sidecar_key).await?;
+        if !Self::sidecar_write_required(stored.as_ref(), &labels) {
+            return Ok(None);
+        }
+
+        let mut sidecar = stored.unwrap_or_else(XmpSidecar::new_empty);
+        sidecar.set_keywords(labels);
+        let bytes = sidecar
+            .to_bytes()
+            .with_context(|| format!("failed to serialize the XMP sidecar {sidecar_key}"))?;
+
+        self.put_object_versioned(&sidecar_key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .map(Some)
+    }
+
+    /// Whether `labels` differ from what the stored sidecar already holds.
+    ///
+    /// Rewriting an unchanged sidecar would spend an object version, new chunks
+    /// and replication work on a no-op, and media without a sidecar needs none
+    /// created just to record that it carries no labels.
+    fn sidecar_write_required(stored: Option<&XmpSidecar>, labels: &[String]) -> bool {
+        match stored {
+            Some(sidecar) => sidecar.keywords() != labels,
+            None => !labels.is_empty(),
+        }
+    }
+
+    /// Loads the sidecar currently stored at `sidecar_key`, or `None` when the
+    /// media object has none yet.
+    ///
+    /// A stored packet that cannot be parsed is reported rather than replaced:
+    /// it may hold third-party properties Ironmesh neither models nor can
+    /// reconstruct, so overwriting it would destroy user data. Ingest tolerates
+    /// such packets on purpose, because rejecting them there would fail an
+    /// upload whose bytes the client owns; refusing to write over them here
+    /// protects those same bytes.
+    async fn load_stored_sidecar(&self, sidecar_key: &str) -> Result<Option<XmpSidecar>> {
+        let Some(entry) = self.current_object_entry(sidecar_key).await? else {
+            return Ok(None);
+        };
+
+        let bytes = self
+            .read_sidecar_bytes(&entry.manifest_hash)
+            .await
+            .with_context(|| format!("failed to read the XMP sidecar {sidecar_key}"))?;
+        let sidecar = XmpSidecar::parse(&bytes).with_context(|| {
+            format!("refusing to overwrite the malformed XMP sidecar {sidecar_key}")
+        })?;
+        Ok(Some(sidecar))
     }
 
     /// Applies the label side effects of `key` becoming the current object.

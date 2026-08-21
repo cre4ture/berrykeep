@@ -38,6 +38,7 @@ use bytes::Bytes;
 use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
+use common::xmp::{is_sidecar_key, sidecar_key_for_media};
 use common::{ClusterId, DeviceId, HealthStatus, NodeId};
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
@@ -7607,6 +7608,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
@@ -8019,6 +8021,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
@@ -13587,6 +13590,17 @@ struct PathMutationRequest {
     expected_revision: Option<String>,
 }
 
+/// Replaces the labels of the media object at `path`.
+///
+/// The labels are stored in the XMP sidecar of that media object, so `path`
+/// names the media object itself, never its `.xmp` sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MediaLabelsRequest {
+    path: String,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotRestoreRequest {
     snapshot: String,
@@ -14130,6 +14144,86 @@ async fn copy_object_path_response(
                 error = %err,
                 "failed to copy object path"
             );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn set_media_labels(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<MediaLabelsRequest>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint("set_media_labels", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            set_media_labels_response(&state_for_request, request, Some(actor)).await
+        },
+    )
+    .await
+}
+
+/// Rewrites the XMP sidecar of a media object so that it carries exactly the
+/// requested labels.
+///
+/// Labelling is a write of the sidecar object, so it follows the path mutation
+/// idiom of this router: mutate under the store lock, then publish the namespace
+/// change and refresh local availability so the new sidecar version is announced
+/// like any other object write.
+async fn set_media_labels_response(
+    state: &ServerState,
+    request: MediaLabelsRequest,
+    actor: Option<DataChangeActorContext>,
+) -> Response {
+    let path = request.path.trim();
+    if path.is_empty() || is_sidecar_key(path) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let mut store = lock_store(state, "store_object.labels").await;
+    let outcome = store.set_media_labels(path, request.labels).await;
+    drop(store);
+
+    match outcome {
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(result)) => {
+            publish_namespace_change(state);
+            request_local_availability_refresh(state);
+            record_data_change_event(
+                state,
+                PendingDataChangeEvent {
+                    action: DataChangeAction::Upload,
+                    actor,
+                    path: sidecar_key_for_media(path),
+                    from_path: None,
+                    to_path: None,
+                    recursive: false,
+                    affected_path_count: 1,
+                    total_size_bytes: None,
+                    version_id: Some(result.version_id.clone()),
+                    snapshot_id: Some(result.snapshot_id.clone()),
+                    upload_mode: Some(DataChangeUploadMode::Direct),
+                },
+            )
+            .await;
+            info!(
+                path,
+                version_id = %result.version_id,
+                "stored media labels"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => {
+            tracing::error!(path, error = %err, "failed to store media labels");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
