@@ -38,11 +38,23 @@ class GalleryMapFullscreenInstrumentationTest {
 
         ActivityScenario.launch<GalleryMapWebUiTestActivity>(intent).use { scenario ->
             assertFullscreenMapRemainsVisible(scenario)
-            assertDirectGalleryMapUsesTheFullAppSurface(scenario)
-            assertFullscreenExitRestoresTheNativeAppChrome(scenario)
-            assertFullscreenMapRemainsVisible(scenario)
             assertFullscreenMapClusterChooserIsVisible(scenario)
             assertFullscreenMapLightboxIsVisible(scenario)
+        }
+    }
+
+    @Test
+    fun directGalleryMapFullscreenUsesTheFullAppSurfaceAndRestoresChrome() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val session = testSession()
+        val intent = Intent(context, GalleryMapWebUiTestActivity::class.java)
+            .putExtra(GalleryMapWebUiTestActivity.EXTRA_WEB_UI_URL, session.url)
+            .putExtra(GalleryMapWebUiTestActivity.EXTRA_WEB_UI_AUTHORIZATION, session.authorization)
+
+        ActivityScenario.launch<GalleryMapWebUiTestActivity>(intent).use { scenario ->
+            assertFullscreenMapRemainsVisible(scenario)
+            assertDirectGalleryMapUsesTheFullAppSurface(scenario)
+            assertFullscreenExitRestoresTheNativeAppChrome(scenario)
         }
     }
 
