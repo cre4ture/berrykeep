@@ -105,4 +105,14 @@ class GalleryPresentationTest {
         assertFalse(shouldRequestGalleryFullResolution(1.01f))
         assertTrue(shouldRequestGalleryFullResolution(1.02f))
     }
+
+    @Test
+    fun galleryImageResolutionProgressivelyIncreasesWithZoom() {
+        assertNull(galleryImageResolutionForScale(1f))
+        assertEquals(GalleryImageResolution.DETAIL, galleryImageResolutionForScale(1.02f))
+        assertEquals(GalleryImageResolution.DETAIL, galleryImageResolutionForScale(2f))
+        assertEquals(GalleryImageResolution.HIGH, galleryImageResolutionForScale(2.01f))
+        assertEquals(GalleryImageResolution.HIGH, galleryImageResolutionForScale(3.5f))
+        assertEquals(GalleryImageResolution.ORIGINAL, galleryImageResolutionForScale(3.51f))
+    }
 }
