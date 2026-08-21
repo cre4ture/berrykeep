@@ -48,6 +48,8 @@ test("client-ui runtime keeps the map photo viewer visible in an embedded viewpo
   await page.goto("/?embedded_client=android");
   await page.getByText("Gallery", { exact: true }).click();
   await page.getByRole("button", { name: "Map" }).click();
+  await page.getByRole("button", { name: "Fullscreen map" }).click();
+  await expect(page.getByRole("button", { name: "Exit fullscreen map" })).toBeVisible();
 
   const cluster = page.getByRole("button", { name: "Open map cluster with 2 items" });
   await expect(cluster).toBeVisible();
