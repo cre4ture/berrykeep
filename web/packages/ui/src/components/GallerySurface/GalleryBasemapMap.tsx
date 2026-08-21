@@ -404,16 +404,24 @@ export function GalleryBasemapMap({
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || typeof window === "undefined") {
+    const container = containerRef.current;
+    if (!map || !container || typeof window === "undefined") {
       return;
     }
 
-    const frameId = window.requestAnimationFrame(() => {
+    const resizeMap = () => {
       map.resize();
-    });
+    };
+    const frameId = window.requestAnimationFrame(resizeMap);
+    const resizeObserver =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(resizeMap);
+    resizeObserver?.observe(container);
 
-    return () => window.cancelAnimationFrame(frameId);
-  }, [isFullscreen]);
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      resizeObserver?.disconnect();
+    };
+  }, [isFullscreen, mapReady]);
 
   const map = mapRef.current;
   const mapWidth = map?.getContainer().clientWidth ?? 0;

@@ -38,6 +38,9 @@ class GalleryMapFullscreenInstrumentationTest {
 
         ActivityScenario.launch<GalleryMapWebUiTestActivity>(intent).use { scenario ->
             assertFullscreenMapRemainsVisible(scenario)
+            assertDirectGalleryMapUsesTheFullAppSurface(scenario)
+            assertFullscreenExitRestoresTheNativeAppChrome(scenario)
+            assertFullscreenMapRemainsVisible(scenario)
             assertFullscreenMapClusterChooserIsVisible(scenario)
             assertFullscreenMapLightboxIsVisible(scenario)
         }
@@ -105,6 +108,61 @@ class GalleryMapFullscreenInstrumentationTest {
 
         assertEquals("Fullscreen must not finish the Web UI activity", Lifecycle.State.RESUMED, scenario.state)
         assertTrue("The embedded WebView must remain visible", webView.visibility == View.VISIBLE)
+        waitForCondition(webView, "fullscreen gallery map should expose an exit control") {
+            """
+            (() => {
+              const control = document.querySelector('[data-gallery-map-fullscreen-exit]');
+              const controlRect = control?.getBoundingClientRect();
+              return Boolean(
+                control &&
+                controlRect &&
+                controlRect.width > 0 &&
+                controlRect.height > 0 &&
+                getComputedStyle(control).position === 'fixed' &&
+                Number(getComputedStyle(control).zIndex) > 150
+              );
+            })()
+            """.trimIndent()
+        }
+    }
+
+    private fun assertDirectGalleryMapUsesTheFullAppSurface(
+        scenario: ActivityScenario<GalleryMapWebUiTestActivity>,
+    ) {
+        val webView = waitForWebView(scenario)
+        waitUntil("fullscreen map should fill the native app content surface") {
+            scenario.onActivity { activity ->
+                val appContent = activity.findViewById<View>(android.R.id.content)
+                assertEquals(appContent.width, webView.width)
+                assertEquals(appContent.height, webView.height)
+            }
+            true
+        }
+    }
+
+    private fun assertFullscreenExitRestoresTheNativeAppChrome(
+        scenario: ActivityScenario<GalleryMapWebUiTestActivity>,
+    ) {
+        val webView = waitForWebView(scenario)
+        clickButton(webView, "Exit fullscreen map")
+        waitForCondition(webView, "gallery map should leave fullscreen") {
+            """
+            (() => {
+              const map = document.querySelector('[aria-label="Geotagged gallery map"]');
+              return Boolean(map && getComputedStyle(map).position === 'relative');
+            })()
+            """.trimIndent()
+        }
+        waitUntil("native app chrome should constrain the direct gallery map again") {
+            scenario.onActivity { activity ->
+                val appContent = activity.findViewById<View>(android.R.id.content)
+                assertTrue(
+                    "Expected the native app chrome to reserve space after fullscreen exits",
+                    webView.width < appContent.width || webView.height < appContent.height,
+                )
+            }
+            true
+        }
     }
 
     private fun <T : Activity> assertFullscreenMapClusterChooserIsVisible(scenario: ActivityScenario<T>) {

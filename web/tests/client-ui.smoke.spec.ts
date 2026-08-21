@@ -530,6 +530,79 @@ test("client-ui keeps the direct iOS gallery map inside the WebView viewport", a
     .toBeGreaterThan(0.9);
 });
 
+test("client-ui synchronizes direct Android gallery fullscreen with its native host", async ({ page }) => {
+  await page.addInitScript(() => {
+    const messages: string[] = [];
+    (window as Window & {
+      IronmeshAndroidUi?: { postMessage: (message: string) => void };
+      ironmeshAndroidFullscreenMessages?: string[];
+    }).IronmeshAndroidUi = {
+      postMessage(message) {
+        messages.push(message);
+      }
+    };
+    (window as Window & { ironmeshAndroidFullscreenMessages?: string[] })
+      .ironmeshAndroidFullscreenMessages = messages;
+  });
+  await installClientUiMocks(page);
+  await page.goto("/?embedded=gallery_map&embedded_client=android");
+
+  await page.getByRole("button", { name: "Fullscreen map" }).click();
+
+  const fullscreenMap = page.getByLabel("Geotagged gallery map");
+  await expect
+    .poll(() =>
+      fullscreenMap.evaluate((element) => element.getBoundingClientRect().height / window.innerHeight)
+    )
+    .toBeGreaterThan(0.9);
+
+  const exitControl = page.locator('[data-gallery-map-fullscreen-exit="true"]');
+  await expect(exitControl).toBeVisible();
+  expect(
+    await exitControl.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return style.position === "fixed" && Number(style.zIndex) > 150;
+    })
+  ).toBe(true);
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const messages = (window as Window & { ironmeshAndroidFullscreenMessages?: string[] })
+          .ironmeshAndroidFullscreenMessages ?? [];
+        return JSON.parse(messages[messages.length - 1] ?? "{}").fullscreen;
+      })
+    )
+    .toBe(true);
+
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event("ironmesh:gallery-map-exit-fullscreen"));
+  });
+  await expect(exitControl).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const messages = (window as Window & { ironmeshAndroidFullscreenMessages?: string[] })
+          .ironmeshAndroidFullscreenMessages ?? [];
+        return JSON.parse(messages[messages.length - 1] ?? "{}").fullscreen;
+      })
+    )
+    .toBe(false);
+
+  await page.getByRole("button", { name: "Fullscreen map" }).click();
+  await expect(exitControl).toBeVisible();
+  await exitControl.getByRole("button", { name: "Exit fullscreen map" }).click();
+  await expect(exitControl).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const messages = (window as Window & { ironmeshAndroidFullscreenMessages?: string[] })
+          .ironmeshAndroidFullscreenMessages ?? [];
+        return JSON.parse(messages[messages.length - 1] ?? "{}").fullscreen;
+      })
+    )
+    .toBe(false);
+});
+
 for (const embeddedClient of [null] as const) {
   const clientLabel = embeddedClient ?? "browser";
   test(`client-ui ${clientLabel} media viewer downloads the original`, async ({ page }) => {

@@ -50,6 +50,7 @@ fun IronmeshAppShell(
     onExportDiagnosticLog: () -> Unit,
     onNavigateBack: (() -> Unit)? = null,
     topBarActions: @Composable RowScope.() -> Unit = {},
+    fullscreenContent: Boolean = false,
     content: @Composable (Modifier) -> Unit,
 ) {
     BoxWithConstraints(
@@ -60,32 +61,71 @@ fun IronmeshAppShell(
         val useRail = maxWidth >= 720.dp
         if (useRail) {
             Row(modifier = Modifier.fillMaxSize()) {
-                Surface(
-                    modifier = Modifier.fillMaxHeight(),
-                    color = MaterialTheme.colorScheme.surface,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .statusBarsPadding()
-                            .padding(top = 8.dp),
+                if (!fullscreenContent) {
+                    Surface(
+                        modifier = Modifier.fillMaxHeight(),
+                        color = MaterialTheme.colorScheme.surface,
                     ) {
-                        NavigationRail(
-                            containerColor = MaterialTheme.colorScheme.surface,
+                        Column(
+                            modifier = Modifier
+                                .statusBarsPadding()
+                                .padding(top = 8.dp),
                         ) {
-                            shellItems().forEach { item ->
-                                NavigationRailItem(
-                                    selected = selectedSection == item.section,
-                                    onClick = { onSelectSection(item.section) },
-                                    icon = {},
-                                    label = { Text(stringResource(item.labelRes)) },
-                                )
+                            NavigationRail(
+                                containerColor = MaterialTheme.colorScheme.surface,
+                            ) {
+                                shellItems().forEach { item ->
+                                    NavigationRailItem(
+                                        selected = selectedSection == item.section,
+                                        onClick = { onSelectSection(item.section) },
+                                        icon = {},
+                                        label = { Text(stringResource(item.labelRes)) },
+                                    )
+                                }
                             }
                         }
                     }
                 }
                 Scaffold(
-                    modifier = Modifier.weight(1f),
+                    modifier = if (fullscreenContent) Modifier.fillMaxSize() else Modifier.weight(1f),
                     topBar = {
+                        if (!fullscreenContent) {
+                            IronmeshTopBar(
+                                selectedSection = selectedSection,
+                                deviceLabel = deviceLabel,
+                                titleLatencyStatus = titleLatencyStatus,
+                                onOpenConnectionDiagnostics = onOpenConnectionDiagnostics,
+                                onExportDiagnosticLog = onExportDiagnosticLog,
+                                onNavigateBack = onNavigateBack,
+                                actions = topBarActions,
+                            )
+                        }
+                    },
+                    snackbarHost = {
+                        if (!fullscreenContent) {
+                            SnackbarHost(hostState = snackbarHostState)
+                        }
+                    },
+                    contentWindowInsets = shellContentWindowInsets(fullscreenContent),
+                ) { innerPadding ->
+                    content(
+                        Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding)
+                            .then(
+                                if (fullscreenContent) {
+                                    Modifier
+                                } else {
+                                    Modifier.padding(horizontal = 20.dp, vertical = 16.dp)
+                                },
+                            ),
+                    )
+                }
+            }
+        } else {
+            Scaffold(
+                topBar = {
+                    if (!fullscreenContent) {
                         IronmeshTopBar(
                             selectedSection = selectedSection,
                             deviceLabel = deviceLabel,
@@ -95,56 +135,53 @@ fun IronmeshAppShell(
                             onNavigateBack = onNavigateBack,
                             actions = topBarActions,
                         )
-                    },
-                    snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
-                    contentWindowInsets = WindowInsets.navigationBars,
-                ) { innerPadding ->
-                    content(
-                        Modifier
-                            .fillMaxSize()
-                            .padding(innerPadding)
-                            .padding(horizontal = 20.dp, vertical = 16.dp),
-                    )
-                }
-            }
-        } else {
-            Scaffold(
-                topBar = {
-                    IronmeshTopBar(
-                        selectedSection = selectedSection,
-                        deviceLabel = deviceLabel,
-                        titleLatencyStatus = titleLatencyStatus,
-                        onOpenConnectionDiagnostics = onOpenConnectionDiagnostics,
-                        onExportDiagnosticLog = onExportDiagnosticLog,
-                        onNavigateBack = onNavigateBack,
-                        actions = topBarActions,
-                    )
+                    }
                 },
                 bottomBar = {
-                    NavigationBar {
-                        shellItems().forEach { item ->
-                            NavigationBarItem(
-                                selected = selectedSection == item.section,
-                                onClick = { onSelectSection(item.section) },
-                                icon = {},
-                                label = { Text(stringResource(item.labelRes)) },
-                            )
+                    if (!fullscreenContent) {
+                        NavigationBar {
+                            shellItems().forEach { item ->
+                                NavigationBarItem(
+                                    selected = selectedSection == item.section,
+                                    onClick = { onSelectSection(item.section) },
+                                    icon = {},
+                                    label = { Text(stringResource(item.labelRes)) },
+                                )
+                            }
                         }
                     }
                 },
-                snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
-                contentWindowInsets = WindowInsets.navigationBars,
+                snackbarHost = {
+                    if (!fullscreenContent) {
+                        SnackbarHost(hostState = snackbarHostState)
+                    }
+                },
+                contentWindowInsets = shellContentWindowInsets(fullscreenContent),
             ) { innerPadding ->
                 content(
                     Modifier
                         .fillMaxSize()
                         .padding(innerPadding)
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                        .then(
+                            if (fullscreenContent) {
+                                Modifier
+                            } else {
+                                Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                            },
+                        ),
                 )
             }
         }
     }
 }
+
+@Composable
+private fun shellContentWindowInsets(fullscreenContent: Boolean): WindowInsets =
+    if (fullscreenContent) {
+        WindowInsets(0, 0, 0, 0)
+    } else {
+        WindowInsets.navigationBars
+    }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
