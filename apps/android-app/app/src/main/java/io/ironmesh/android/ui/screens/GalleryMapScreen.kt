@@ -1,5 +1,6 @@
 package io.ironmesh.android.ui.screens
 
+import android.webkit.WebView
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,6 +24,8 @@ import io.ironmesh.android.ui.components.IronmeshEmbeddedWebUi
 fun GalleryMapScreen(
     state: GalleryMapUiState,
     onStartGalleryMap: () -> Unit,
+    onFullscreenChanged: (Boolean) -> Unit = {},
+    onWebViewCreated: (WebView) -> Unit = {},
 ) {
     val galleryMapSession = galleryMapWebUiSession(state.webUiSession)
 
@@ -30,6 +33,8 @@ fun GalleryMapScreen(
         IronmeshEmbeddedWebUi(
             session = galleryMapSession,
             modifier = Modifier.fillMaxSize(),
+            onCreated = onWebViewCreated,
+            onGalleryMapFullscreenChanged = onFullscreenChanged,
         )
         return
     }

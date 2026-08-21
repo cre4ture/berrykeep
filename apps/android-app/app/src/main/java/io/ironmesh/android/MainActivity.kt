@@ -5,7 +5,9 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.webkit.WebView
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -28,6 +30,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -39,6 +43,7 @@ import io.ironmesh.android.ui.MainViewModel
 import io.ironmesh.android.ui.LibraryScreenActions
 import io.ironmesh.android.ui.SyncScreenActions
 import io.ironmesh.android.ui.components.IronmeshAppShell
+import io.ironmesh.android.ui.components.requestGalleryMapFullscreenExit
 import io.ironmesh.android.ui.screens.ConnectionPathsScreen
 import io.ironmesh.android.ui.screens.HomeScreen
 import io.ironmesh.android.ui.screens.GalleryMapScreen
@@ -76,6 +81,36 @@ class MainActivity : ComponentActivity() {
         setContent {
             val vm: MainViewModel = viewModel()
             val state by vm.uiState
+            var galleryMapFullscreen by remember { mutableStateOf(false) }
+            var galleryMapWebView by remember { mutableStateOf<WebView?>(null) }
+            val showsGalleryMapFullscreen =
+                state.selectedSection == MainSection.GALLERY_MAP && galleryMapFullscreen
+
+            LaunchedEffect(state.selectedSection) {
+                if (state.selectedSection != MainSection.GALLERY_MAP) {
+                    galleryMapFullscreen = false
+                    galleryMapWebView = null
+                }
+            }
+            LaunchedEffect(showsGalleryMapFullscreen) {
+                WindowInsetsControllerCompat(window, window.decorView).apply {
+                    systemBarsBehavior =
+                        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    if (showsGalleryMapFullscreen) {
+                        hide(WindowInsetsCompat.Type.statusBars())
+                    } else {
+                        show(WindowInsetsCompat.Type.statusBars())
+                    }
+                }
+            }
+            BackHandler(enabled = showsGalleryMapFullscreen) {
+                val webView = galleryMapWebView
+                if (webView == null) {
+                    galleryMapFullscreen = false
+                } else {
+                    webView.requestGalleryMapFullscreenExit()
+                }
+            }
             val syncActions = remember(vm) {
                 SyncScreenActions(
                     runNow = vm::runFolderSyncNow,
@@ -295,6 +330,7 @@ class MainActivity : ComponentActivity() {
                         } else {
                             null
                         },
+                        fullscreenContent = showsGalleryMapFullscreen,
                         topBarActions = {
                             if (
                                 state.selectedSection == MainSection.CONNECTIVITY ||
@@ -355,6 +391,12 @@ class MainActivity : ComponentActivity() {
                                 MainSection.GALLERY_MAP -> GalleryMapScreen(
                                     state = state.toGalleryMapUiState(),
                                     onStartGalleryMap = vm::startWebUi,
+                                    onFullscreenChanged = { fullscreen ->
+                                        galleryMapFullscreen = fullscreen
+                                    },
+                                    onWebViewCreated = { webView ->
+                                        galleryMapWebView = webView
+                                    },
                                 )
 
                                 MainSection.SETTINGS -> SettingsScreen(
