@@ -7643,3 +7643,242 @@ run_on_all_metadata_backends!(
     data_scrub_reports_chunk_size_mismatch_per_manifest_reference,
     data_scrub_reports_chunk_size_mismatch_per_manifest_reference_turso
 );
+
+/// Builds an XMP sidecar packet carrying the given `dc:subject` keywords.
+fn sample_xmp_sidecar_bytes(keywords: &[&str]) -> Bytes {
+    let mut sidecar = XmpSidecar::new_empty();
+    sidecar.set_keywords(
+        keywords
+            .iter()
+            .map(|keyword| (*keyword).to_string())
+            .collect(),
+    );
+    Bytes::from(sidecar.to_bytes().unwrap())
+}
+
+/// Reads the labels the gallery projection currently holds for `key`.
+async fn gallery_labels_for_key(store: &PersistentStore, key: &str) -> Vec<String> {
+    let page = store
+        .query_gallery_index(&GalleryIndexQuery {
+            prefix: String::new(),
+            depth: 8,
+            media_filter: GalleryIndexMediaFilter::All,
+            captured_sort: GalleryIndexCapturedSort::Desc,
+            offset: 0,
+            limit: 64,
+            viewport: None,
+        })
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page");
+
+    page.entries
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .unwrap_or_else(|| panic!("missing gallery entry for {key}"))
+        .labels
+}
+
+/// A sidecar uploaded by a third-party tool next to an existing image has to
+/// reach the projection, because that is where the gallery reads labels from.
+async fn gallery_labels_follow_a_sidecar_upload_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-upload").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        gallery_labels_for_key(&store, "album/photo.jpg")
+            .await
+            .is_empty(),
+        "an image without a sidecar must not carry labels"
+    );
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            sample_xmp_sidecar_bytes(&["beach", "vacation"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["beach".to_string(), "vacation".to_string()]
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_labels_follow_a_sidecar_upload_impl,
+    gallery_labels_follow_a_sidecar_upload,
+    gallery_labels_follow_a_sidecar_upload_turso
+);
+
+/// A sidecar synced ahead of its image cannot update a projection row that does
+/// not exist yet, so the image ingest has to pick the stored sidecar up.
+async fn gallery_labels_apply_when_the_sidecar_precedes_the_image_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-first").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            sample_xmp_sidecar_bytes(&["private"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["private".to_string()]
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_labels_apply_when_the_sidecar_precedes_the_image_impl,
+    gallery_labels_apply_when_the_sidecar_precedes_the_image,
+    gallery_labels_apply_when_the_sidecar_precedes_the_image_turso
+);
+
+/// Deleting the sidecar deletes the labels: the sidecar object is the source of
+/// truth, the projection column only caches it.
+async fn gallery_labels_are_cleared_when_the_sidecar_is_deleted_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-delete").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            sample_xmp_sidecar_bytes(&["private"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["private".to_string()]
+    );
+
+    store
+        .tombstone_object("album/photo.jpg.xmp", PutOptions::default())
+        .await
+        .unwrap();
+
+    assert!(
+        gallery_labels_for_key(&store, "album/photo.jpg")
+            .await
+            .is_empty(),
+        "removing the sidecar must clear the labels it contributed"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_labels_are_cleared_when_the_sidecar_is_deleted_impl,
+    gallery_labels_are_cleared_when_the_sidecar_is_deleted,
+    gallery_labels_are_cleared_when_the_sidecar_is_deleted_turso
+);
+
+/// Sidecars come from foreign tools, so a broken packet is an expected input.
+/// It must neither fail the upload nor corrupt the labels already projected.
+async fn gallery_labels_survive_a_malformed_sidecar_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-malformed").await;
+    let malformed = Bytes::from_static(b"<rdf:RDF><unclosed>");
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            sample_xmp_sidecar_bytes(&["private"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            malformed.clone(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("a malformed sidecar must not fail the upload");
+    assert_eq!(
+        store
+            .get_object("album/photo.jpg.xmp", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap(),
+        malformed,
+        "the malformed sidecar must still be stored verbatim"
+    );
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["private".to_string()],
+        "a malformed sidecar must leave the projection untouched"
+    );
+
+    store
+        .put_object_versioned(
+            "album/other.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned("album/other.jpg.xmp", malformed, PutOptions::default())
+        .await
+        .expect("a malformed sidecar must not fail the upload");
+    assert!(
+        gallery_labels_for_key(&store, "album/other.jpg")
+            .await
+            .is_empty()
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_labels_survive_a_malformed_sidecar_impl,
+    gallery_labels_survive_a_malformed_sidecar,
+    gallery_labels_survive_a_malformed_sidecar_turso
+);
