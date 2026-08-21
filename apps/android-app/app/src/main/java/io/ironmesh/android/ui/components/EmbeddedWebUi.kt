@@ -22,11 +22,15 @@ import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.share.OriginalShareCoordinator
 import java.net.URI
 import java.util.concurrent.Executors
+import org.json.JSONObject
 
 private const val EMBEDDED_WEB_UI_SESSION_HEADER = "X-IronMesh-Web-Ui-Session"
 private const val EMBEDDED_WEB_UI_CLIENT_PARAMETER = "embedded_client"
 private const val ANDROID_WEB_UI_CLIENT = "android"
 private const val ANDROID_SHARE_JAVASCRIPT_OBJECT = "IronmeshAndroidShare"
+private const val ANDROID_UI_JAVASCRIPT_OBJECT = "IronmeshAndroidUi"
+private const val GALLERY_MAP_FULLSCREEN_MESSAGE_TYPE = "gallery-map-fullscreen"
+private const val GALLERY_MAP_FULLSCREEN_EXIT_EVENT = "ironmesh:gallery-map-exit-fullscreen"
 private val androidShareExecutor = Executors.newSingleThreadExecutor { runnable ->
     Thread(runnable, "ironmesh-original-share").apply { isDaemon = true }
 }
@@ -36,6 +40,7 @@ fun IronmeshEmbeddedWebUi(
     session: EmbeddedWebUiSession,
     modifier: Modifier = Modifier,
     onCreated: ((WebView) -> Unit)? = null,
+    onGalleryMapFullscreenChanged: ((Boolean) -> Unit)? = null,
 ) {
     val embeddedSession = session.withUrl(
         Uri.parse(session.url)
@@ -48,7 +53,10 @@ fun IronmeshEmbeddedWebUi(
         modifier = modifier,
         factory = { context ->
             WebView(context).apply {
-                configureEmbeddedWebUi(embeddedSession)
+                configureEmbeddedWebUi(
+                    session = embeddedSession,
+                    onGalleryMapFullscreenChanged = onGalleryMapFullscreenChanged,
+                )
                 onCreated?.invoke(this)
             }
         },
@@ -61,7 +69,10 @@ fun IronmeshEmbeddedWebUi(
 }
 
 @SuppressLint("SetJavaScriptEnabled")
-private fun WebView.configureEmbeddedWebUi(session: EmbeddedWebUiSession) {
+private fun WebView.configureEmbeddedWebUi(
+    session: EmbeddedWebUiSession,
+    onGalleryMapFullscreenChanged: ((Boolean) -> Unit)?,
+) {
     settings.javaScriptEnabled = true
     settings.domStorageEnabled = true
     settings.allowFileAccess = false
@@ -73,7 +84,16 @@ private fun WebView.configureEmbeddedWebUi(session: EmbeddedWebUiSession) {
     webChromeClient = EmbeddedWebUiChromeClient()
     setDownloadListener(EmbeddedWebUiDownloadListener(context, session.url))
     installAndroidShareBridge(session.url)
+    installGalleryMapFullscreenBridge(session.url, onGalleryMapFullscreenChanged)
     loadEmbeddedWebUi(session)
+}
+
+/** Requests that the direct gallery-map surface leaves its transient fullscreen mode. */
+fun WebView.requestGalleryMapFullscreenExit() {
+    evaluateJavascript(
+        "window.dispatchEvent(new Event('$GALLERY_MAP_FULLSCREEN_EXIT_EVENT'));",
+        null,
+    )
 }
 
 private fun WebView.installAndroidShareBridge(initialUrl: String) {
@@ -116,6 +136,54 @@ private fun WebView.installAndroidShareBridge(initialUrl: String) {
             }
         }
     }
+}
+
+private fun WebView.installGalleryMapFullscreenBridge(
+    initialUrl: String,
+    onGalleryMapFullscreenChanged: ((Boolean) -> Unit)?,
+) {
+    if (onGalleryMapFullscreenChanged == null) {
+        return
+    }
+    if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+        EmbeddedWebUiDiagnostics.report(
+            EmbeddedWebUiDiagnostic(
+                level = EmbeddedWebUiDiagnosticLevel.WARN,
+                event = "android_gallery_map_fullscreen_bridge_unavailable",
+                pageUrl = initialUrl,
+                detail = "The installed Android WebView does not support origin-scoped web messages",
+            ),
+        )
+        return
+    }
+
+    val allowedOrigin = embeddedWebUiOrigin(initialUrl)
+    WebViewCompat.addWebMessageListener(
+        this,
+        ANDROID_UI_JAVASCRIPT_OBJECT,
+        setOf(allowedOrigin),
+    ) { webView, message, sourceOrigin, isMainFrame, _ ->
+        val trustedMessage =
+            isMainFrame &&
+                isSameEmbeddedWebUiOrigin(initialUrl, sourceOrigin.toString()) &&
+                message.type == WebMessageCompat.TYPE_STRING
+        if (!trustedMessage) {
+            return@addWebMessageListener
+        }
+
+        val isFullscreen = parseGalleryMapFullscreenMessage(message.data) ?: return@addWebMessageListener
+        webView.post {
+            onGalleryMapFullscreenChanged(isFullscreen)
+        }
+    }
+}
+
+private fun parseGalleryMapFullscreenMessage(rawMessage: String?): Boolean? {
+    val payload = runCatching { JSONObject(rawMessage.orEmpty()) }.getOrNull() ?: return null
+    if (payload.optString("type") != GALLERY_MAP_FULLSCREEN_MESSAGE_TYPE) {
+        return null
+    }
+    return payload.opt("fullscreen") as? Boolean
 }
 
 private fun untrustedShareResponse(): String =
