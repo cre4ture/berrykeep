@@ -211,7 +211,7 @@ class GalleryMapFullscreenInstrumentationTest {
 
     private fun <T : Activity> assertFullscreenMapLightboxIsVisible(scenario: ActivityScenario<T>) {
         val webView = waitForWebView(scenario)
-        clickButton(webView, "gallery/runtime-map-a.png")
+        clickMapClusterItem(webView, "gallery/runtime-map-a.png")
         try {
             waitForCondition(webView, "fullscreen map photo lightbox should remain visible") {
                 """
@@ -384,6 +384,23 @@ class GalleryMapFullscreenInstrumentationTest {
             """.trimIndent(),
         )
         assertTrue("Expected a '$label' button in the Client UI", clicked)
+    }
+
+    private fun clickMapClusterItem(webView: WebView, label: String) {
+        val clicked = evaluateBoolean(
+            webView,
+            """
+            (() => {
+              const dialog = document.querySelector('[data-gallery-map-cluster-dialog] [role="dialog"]');
+              const button = [...(dialog?.querySelectorAll('button') ?? [])]
+                .find((candidate) => candidate.textContent?.trim() === '$label');
+              if (!button) return false;
+              button.click();
+              return true;
+            })()
+            """.trimIndent(),
+        )
+        assertTrue("Expected a '$label' button in the map cluster dialog", clicked)
     }
 
     private fun <T : Activity> waitForWebView(scenario: ActivityScenario<T>): WebView {
