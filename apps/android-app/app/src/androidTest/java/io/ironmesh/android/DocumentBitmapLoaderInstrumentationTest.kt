@@ -71,6 +71,30 @@ class DocumentBitmapLoaderInstrumentationTest {
         assertNull(bitmap)
     }
 
+    @Test
+    fun cachedDocument_reusesOneProviderReadForProgressiveDecodes() {
+        TestTreeDocumentsProvider.seedFile(appContext, "images/progressive.png", createPngBytes(64, 32))
+        val documentUri = documentUriFor("images/progressive.png")
+
+        val cachedFile = DocumentBitmapLoader.cacheDocument(
+            context = appContext,
+            contentResolver = appContext.contentResolver,
+            documentUri = documentUri,
+        )
+        try {
+            val detail = DocumentBitmapLoader.load(cachedFile, maxDimensionPx = 16)
+            val original = DocumentBitmapLoader.load(cachedFile, maxDimensionPx = null)
+
+            assertEquals(16, detail?.width)
+            assertEquals(8, detail?.height)
+            assertEquals(64, original?.width)
+            assertEquals(32, original?.height)
+            assertEquals(1, TestTreeDocumentsProvider.openCountFor("images/progressive.png"))
+        } finally {
+            cachedFile.delete()
+        }
+    }
+
     private fun documentUriFor(relativePath: String) =
         DocumentsContract.buildDocumentUri(
             TestTreeDocumentsProvider.AUTHORITY,
