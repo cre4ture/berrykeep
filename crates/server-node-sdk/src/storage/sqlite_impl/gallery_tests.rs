@@ -47,6 +47,7 @@ fn gallery_delta_scope() -> GalleryDeltaScope {
         media_filter: GalleryIndexMediaFilter::All,
         captured_sort: GalleryIndexCapturedSort::Desc,
         viewport: None,
+        label_filter: Default::default(),
     }
 }
 
@@ -244,6 +245,7 @@ fn gallery_index_token_precedes_concurrent_writes_replayed_by_delta() {
             offset: 0,
             limit: 10,
             viewport: None,
+            label_filter: Default::default(),
         },
         history_id.clone(),
         revision,
@@ -318,6 +320,7 @@ fn gallery_viewport_query_filters_and_wraps_antimeridian() {
         offset: 0,
         limit: 10,
         viewport: Some(viewport),
+        label_filter: Default::default(),
     };
     let zurich = query_gallery_index_from_db(
         &db,
@@ -400,6 +403,7 @@ fn gallery_delta_reconciles_entries_entering_and_leaving_token_scope() {
             north: 49.0,
             east: 11.0,
         }),
+        label_filter: Default::default(),
     };
 
     db.execute(

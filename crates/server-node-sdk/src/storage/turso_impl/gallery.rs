@@ -13,7 +13,8 @@ use super::super::{
     GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery, ManifestSummary,
     current_media_cache_metadata, decode_gallery_labels, effective_gallery_captured_at_unix,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_media_type_for_path, sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
+    gallery_label_predicates, gallery_media_type_for_path, sqlite_like_prefix_pattern,
+    version_created_at_unix_from_payload,
 };
 #[cfg(test)]
 use super::turso_test_db_path;
@@ -929,6 +930,8 @@ async fn query_gallery_index(
             )
         )";
     let params = gallery_scope_values(&prefix, &prefix_pattern, depth, query);
+    let (summary_label_sql, summary_label_values) =
+        gallery_label_predicates(&query.label_filter, params.len() + 1)?;
     let summary_sql = format!(
         "SELECT
              COUNT(*),
@@ -939,10 +942,12 @@ async fn query_gallery_index(
              COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(geotagged), 0)
          FROM gallery_objects
-         WHERE {scope}"
+         WHERE {scope}{summary_label_sql}"
     );
+    let mut summary_values = params.clone();
+    summary_values.extend(summary_label_values.into_iter().map(Value::Text));
     let mut summary_rows = connection
-        .query(summary_sql, params_from_iter(params.clone()))
+        .query(summary_sql, params_from_iter(summary_values))
         .await?;
     let summary = summary_rows
         .next()
@@ -965,6 +970,10 @@ async fn query_gallery_index(
         GalleryIndexCapturedSort::Asc => "ASC",
         GalleryIndexCapturedSort::Desc => "DESC",
     };
+    // The page statement binds the scope, then LIMIT/OFFSET, so its label
+    // placeholders continue after those two.
+    let (page_label_sql, page_label_values) =
+        gallery_label_predicates(&query.label_filter, params.len() + 3)?;
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
@@ -981,7 +990,7 @@ async fn query_gallery_index(
            ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
          LEFT JOIN version_indexes
            ON version_indexes.object_id = gallery_objects.object_id
-         WHERE {scope}
+         WHERE {scope}{page_label_sql}
          ORDER BY gallery_objects.captured_at_unix {sort_direction}, gallery_objects.key ASC
          LIMIT ?9 OFFSET ?10"
     );
@@ -992,6 +1001,7 @@ async fn query_gallery_index(
     page_params.push(Value::from(
         i64::try_from(query.offset).context("gallery index offset overflow")?,
     ));
+    page_params.extend(page_label_values.into_iter().map(Value::Text));
     let mut rows = connection
         .query(page_sql, params_from_iter(page_params))
         .await?;
@@ -1135,9 +1145,16 @@ async fn query_gallery_entry(
     key: &str,
     scope: &GalleryDeltaScope,
 ) -> Result<Option<GalleryIndexEntry>> {
+    // Filtering here rather than against the change log is what makes labelling
+    // a photo `private` reach the client as a removal: the entry stops
+    // resolving, and the caller falls through to its removal branch.
+    let (label_sql, label_values) = gallery_label_predicates(&scope.label_filter, 2)?;
+    let mut values = vec![Value::from(key)];
+    values.extend(label_values.into_iter().map(Value::Text));
     let mut rows = connection
         .query(
-            "SELECT
+            &format!(
+                "SELECT
                  gallery_objects.key,
                  gallery_objects.manifest_hash,
                  manifest_summaries.total_size_bytes,
@@ -1156,8 +1173,9 @@ async fn query_gallery_entry(
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
              WHERE gallery_objects.key = ?1
-               AND gallery_objects.inferred_media_type IS NOT NULL",
-            (key,),
+               AND gallery_objects.inferred_media_type IS NOT NULL{label_sql}"
+            ),
+            params_from_iter(values),
         )
         .await?;
     let Some(row) = rows.next().await? else {
@@ -1416,6 +1434,7 @@ mod tests {
             media_filter: GalleryIndexMediaFilter::All,
             captured_sort: GalleryIndexCapturedSort::Desc,
             viewport: None,
+            label_filter: Default::default(),
         }
     }
 
@@ -1736,6 +1755,7 @@ mod tests {
             offset: 0,
             limit: 10,
             viewport: None,
+            label_filter: Default::default(),
         };
         let (first, second) = tokio::join!(
             store.query_turso_gallery_index(&query),

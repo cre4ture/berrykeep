@@ -71,8 +71,8 @@ pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTest
 pub(crate) use gallery_capture_time::effective_gallery_captured_at_unix;
 pub(super) use gallery_capture_time::version_created_at_unix_from_payload;
 pub(super) use gallery_labels::{
-    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, decode_gallery_labels,
-    encode_gallery_labels,
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GalleryLabelFilter,
+    decode_gallery_labels, encode_gallery_labels, gallery_label_predicates,
 };
 use media_cache::MediaCacheBuildConfig;
 #[cfg(test)]
@@ -1025,6 +1025,7 @@ pub(crate) struct GalleryIndexQuery {
     pub(crate) offset: usize,
     pub(crate) limit: usize,
     pub(crate) viewport: Option<GalleryViewportBounds>,
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1055,8 +1056,6 @@ pub(crate) struct GalleryIndexEntry {
     pub(crate) media_metadata: Option<CachedMediaMetadata>,
     /// User labels of the object, materialized from the projection's label
     /// column. Populated by the sidecar ingest; empty until then.
-    // Read by the gallery label filter, which lands in a following change.
-    #[allow(dead_code)]
     pub(crate) labels: Vec<String>,
 }
 
@@ -1076,6 +1075,7 @@ pub(crate) struct GalleryDeltaScope {
     pub(crate) media_filter: GalleryIndexMediaFilter,
     pub(crate) captured_sort: GalleryIndexCapturedSort,
     pub(crate) viewport: Option<GalleryViewportBounds>,
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

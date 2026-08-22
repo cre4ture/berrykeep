@@ -30,7 +30,7 @@ use super::{
     StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
     decode_gallery_labels, decompress_snapshot_json, effective_gallery_captured_at_unix,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_media_type_for_path, metadata_db_logical_summary_query,
+    gallery_label_predicates, gallery_media_type_for_path, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload,
 };
@@ -539,6 +539,29 @@ fn query_gallery_index_from_db(
     Ok(page)
 }
 
+/// Binds the shared gallery scope parameters in the order `scope` expects them,
+/// so that label predicates can be appended with the placeholders that follow.
+fn gallery_scope_values(
+    prefix: &str,
+    prefix_pattern: &str,
+    depth: i64,
+    media_type: Option<&str>,
+    viewport: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+) -> Vec<Value> {
+    let (south, north, west, east) = viewport;
+    let real = |value: Option<f64>| value.map_or(Value::Null, Value::Real);
+    vec![
+        Value::Text(prefix.to_string()),
+        Value::Text(prefix_pattern.to_string()),
+        Value::Integer(depth),
+        media_type.map_or(Value::Null, |value| Value::Text(value.to_string())),
+        real(south),
+        real(north),
+        real(west),
+        real(east),
+    ]
+}
+
 fn query_gallery_index_in_transaction(
     db: &Connection,
     query: &GalleryIndexQuery,
@@ -588,6 +611,15 @@ fn query_gallery_index_in_transaction(
             )
         })
         .unwrap_or((None, None, None, None));
+    let scope_values = gallery_scope_values(
+        &prefix,
+        &prefix_pattern,
+        depth,
+        media_type,
+        (south, north, west, east),
+    );
+    let (summary_label_sql, summary_label_values) =
+        gallery_label_predicates(&query.label_filter, scope_values.len() + 1)?;
     let summary_sql = format!(
         "SELECT
              COUNT(*),
@@ -598,21 +630,12 @@ fn query_gallery_index_in_transaction(
              COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(geotagged), 0)
          FROM gallery_objects
-         WHERE {scope}"
+         WHERE {scope}{summary_label_sql}"
     );
-    let (total_entry_count, media_summary) = db.query_row(
-        &summary_sql,
-        params![
-            prefix,
-            prefix_pattern,
-            depth,
-            media_type,
-            south,
-            north,
-            west,
-            east
-        ],
-        |row| {
+    let mut summary_values = scope_values.clone();
+    summary_values.extend(summary_label_values.into_iter().map(Value::Text));
+    let (total_entry_count, media_summary) =
+        db.query_row(&summary_sql, params_from_iter(summary_values), |row| {
             let count = |index| {
                 row.get::<_, i64>(index).and_then(|value| {
                     usize::try_from(value).map_err(|error| {
@@ -635,12 +658,17 @@ fn query_gallery_index_in_transaction(
                     geotagged_count: count(6)?,
                 },
             ))
-        },
-    )?;
+        })?;
     let sort_direction = match query.captured_sort {
         GalleryIndexCapturedSort::Asc => "ASC",
         GalleryIndexCapturedSort::Desc => "DESC",
     };
+    let limit = i64::try_from(query.limit).context("gallery index limit overflow")?;
+    let offset = i64::try_from(query.offset).context("gallery index offset overflow")?;
+    // The page statement binds the scope, then LIMIT/OFFSET, so its label
+    // placeholders continue after those two.
+    let (page_label_sql, page_label_values) =
+        gallery_label_predicates(&query.label_filter, scope_values.len() + 3)?;
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
@@ -657,38 +685,26 @@ fn query_gallery_index_in_transaction(
            ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
          LEFT JOIN version_indexes
            ON version_indexes.object_id = gallery_objects.object_id
-         WHERE {scope}
+         WHERE {scope}{page_label_sql}
          ORDER BY gallery_objects.captured_at_unix {sort_direction}, gallery_objects.key ASC
          LIMIT ?9 OFFSET ?10"
     );
-    let limit = i64::try_from(query.limit).context("gallery index limit overflow")?;
-    let offset = i64::try_from(query.offset).context("gallery index offset overflow")?;
     let mut statement = db.prepare(&page_sql)?;
-    let rows = statement.query_map(
-        params![
-            prefix,
-            prefix_pattern,
-            depth,
-            media_type,
-            south,
-            north,
-            west,
-            east,
-            limit,
-            offset
-        ],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?,
-                row.get::<_, Option<Vec<u8>>>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        },
-    )?;
+    let mut page_values = scope_values;
+    page_values.push(Value::Integer(limit));
+    page_values.push(Value::Integer(offset));
+    page_values.extend(page_label_values.into_iter().map(Value::Text));
+    let rows = statement.query_map(params_from_iter(page_values), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
     let mut entries = Vec::new();
     for row in rows {
         let (
@@ -753,9 +769,16 @@ fn query_gallery_entry_from_db(
     key: &str,
     scope: &GalleryDeltaScope,
 ) -> Result<Option<GalleryIndexEntry>> {
+    // Filtering here rather than against the change log is what makes labelling
+    // a photo `private` reach the client as a removal: the entry stops
+    // resolving, and the caller falls through to its removal branch.
+    let (label_sql, label_values) = gallery_label_predicates(&scope.label_filter, 2)?;
+    let mut values = vec![Value::Text(key.to_string())];
+    values.extend(label_values.into_iter().map(Value::Text));
     let row = db
         .query_row(
-            "SELECT
+            &format!(
+                "SELECT
                  gallery_objects.key,
                  gallery_objects.manifest_hash,
                  manifest_summaries.total_size_bytes,
@@ -774,8 +797,9 @@ fn query_gallery_entry_from_db(
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
              WHERE gallery_objects.key = ?1
-               AND gallery_objects.inferred_media_type IS NOT NULL",
-            params![key],
+               AND gallery_objects.inferred_media_type IS NOT NULL{label_sql}"
+            ),
+            params_from_iter(values),
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,

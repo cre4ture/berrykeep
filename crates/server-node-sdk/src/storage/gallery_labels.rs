@@ -7,6 +7,7 @@
 //! filtered without parsing sidecar files per request.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 /// Name of the projection column holding the canonical label list.
 pub(crate) const GALLERY_LABELS_COLUMN: &str = "labels_json";
@@ -35,6 +36,77 @@ pub(crate) fn encode_gallery_labels(labels: &[String]) -> Result<String> {
 pub(crate) fn decode_gallery_labels(raw: &str) -> Result<Vec<String>> {
     serde_json::from_str(raw)
         .with_context(|| format!("invalid gallery labels in projection column: {raw}"))
+}
+
+/// Restricts gallery listings to entries whose labels satisfy it.
+///
+/// The motivating case is keeping media labelled `private` out of the default
+/// view, but the filter is deliberately symmetric so a caller can also ask for
+/// exactly those entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GalleryLabelFilter {
+    /// Labels an entry must carry to be listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) required: Vec<String>,
+    /// Labels that keep an entry out of the listing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) excluded: Vec<String>,
+}
+
+impl GalleryLabelFilter {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.required.is_empty() && self.excluded.is_empty()
+    }
+}
+
+/// Builds a `LIKE` pattern matching projection rows whose label list contains
+/// `label`.
+///
+/// The canonical encoding quotes every entry, so matching the quoted form only
+/// ever matches whole labels: `not-private` is stored as `"not-private"` and
+/// cannot satisfy the pattern built for `private`. `LIKE` metacharacters in the
+/// label itself are escaped, which the callers pair with `ESCAPE '\'`.
+fn gallery_label_like_pattern(label: &str) -> Result<String> {
+    let encoded =
+        serde_json::to_string(label).context("failed to encode a gallery label filter")?;
+    let mut pattern = String::with_capacity(encoded.len() + 2);
+    pattern.push('%');
+    for character in encoded.chars() {
+        if matches!(character, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push('%');
+    Ok(pattern)
+}
+
+/// Renders `filter` as SQL predicates plus their bind values.
+///
+/// Placeholders are numbered from `first_placeholder`, so a caller can append
+/// the predicates to a statement that already binds parameters of its own.
+pub(crate) fn gallery_label_predicates(
+    filter: &GalleryLabelFilter,
+    first_placeholder: usize,
+) -> Result<(String, Vec<String>)> {
+    let mut predicates = String::new();
+    let mut values = Vec::new();
+    let mut placeholder = first_placeholder;
+    let mut push = |keyword: &str, label: &str, placeholder: usize| -> Result<String> {
+        values.push(gallery_label_like_pattern(label)?);
+        Ok(format!(
+            " AND {GALLERY_LABELS_COLUMN} {keyword} ?{placeholder} ESCAPE '\\'"
+        ))
+    };
+    for label in &filter.required {
+        predicates.push_str(&push("LIKE", label, placeholder)?);
+        placeholder += 1;
+    }
+    for label in &filter.excluded {
+        predicates.push_str(&push("NOT LIKE", label, placeholder)?);
+        placeholder += 1;
+    }
+    Ok((predicates, values))
 }
 
 #[cfg(test)]

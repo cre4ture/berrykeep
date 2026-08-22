@@ -7667,6 +7667,7 @@ async fn gallery_labels_for_key(store: &PersistentStore, key: &str) -> Vec<Strin
             offset: 0,
             limit: 64,
             viewport: None,
+            label_filter: Default::default(),
         })
         .await
         .unwrap()
@@ -7678,6 +7679,166 @@ async fn gallery_labels_for_key(store: &PersistentStore, key: &str) -> Vec<Strin
         .unwrap_or_else(|| panic!("missing gallery entry for {key}"))
         .labels
 }
+
+/// Lists the gallery keys that survive `label_filter`, sorted for comparison.
+async fn gallery_keys_matching_labels(
+    store: &PersistentStore,
+    label_filter: GalleryLabelFilter,
+) -> Vec<String> {
+    let page = store
+        .query_gallery_index(&GalleryIndexQuery {
+            prefix: String::new(),
+            depth: 8,
+            media_filter: GalleryIndexMediaFilter::All,
+            captured_sort: GalleryIndexCapturedSort::Desc,
+            offset: 0,
+            limit: 64,
+            viewport: None,
+            label_filter,
+        })
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page");
+
+    let mut keys = page
+        .entries
+        .into_iter()
+        .map(|entry| entry.key)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+/// Stores `key` as an image carrying `labels`, so a filter has something to act on.
+async fn put_labelled_image(store: &mut PersistentStore, key: &str, labels: &[&str]) {
+    store
+        .put_object_versioned(
+            key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let labels = labels.iter().map(|label| label.to_string()).collect();
+    store.set_media_labels(key, labels).await.unwrap();
+}
+
+/// Hiding media labelled `private` is the motivating case for the filter, and
+/// asking for exactly those entries is its mirror image.
+async fn gallery_label_filter_selects_entries_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-label-filter").await;
+
+    put_labelled_image(&mut store, "album/plain.jpg", &[]).await;
+    put_labelled_image(&mut store, "album/secret.jpg", &["private"]).await;
+    put_labelled_image(&mut store, "album/both.jpg", &["private", "beach"]).await;
+
+    assert_eq!(
+        gallery_keys_matching_labels(&store, GalleryLabelFilter::default()).await,
+        vec![
+            "album/both.jpg".to_string(),
+            "album/plain.jpg".to_string(),
+            "album/secret.jpg".to_string(),
+        ],
+        "an empty filter must not hide anything"
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/plain.jpg".to_string()],
+        "excluding a label must hide every entry carrying it"
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/both.jpg".to_string(), "album/secret.jpg".to_string()],
+        "requiring a label must keep exactly the entries carrying it"
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string(), "beach".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/both.jpg".to_string()],
+        "every required label has to be present"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_label_filter_selects_entries_impl,
+    gallery_label_filter_selects_entries,
+    gallery_label_filter_selects_entries_turso
+);
+
+/// The filter matches a JSON array, so it has to match whole labels. Were it a
+/// plain substring match, hiding `private` would also hide `not-private` and
+/// `private-beach`.
+async fn gallery_label_filter_matches_whole_labels_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-label-substrings").await;
+
+    put_labelled_image(&mut store, "album/exact.jpg", &["private"]).await;
+    put_labelled_image(&mut store, "album/prefixed.jpg", &["not-private"]).await;
+    put_labelled_image(&mut store, "album/suffixed.jpg", &["private-beach"]).await;
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![
+            "album/prefixed.jpg".to_string(),
+            "album/suffixed.jpg".to_string(),
+        ],
+        "only the exact label may be excluded"
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/exact.jpg".to_string()],
+        "only the exact label may satisfy the requirement"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_label_filter_matches_whole_labels_impl,
+    gallery_label_filter_matches_whole_labels,
+    gallery_label_filter_matches_whole_labels_turso
+);
 
 /// A sidecar uploaded by a third-party tool next to an existing image has to
 /// reach the projection, because that is where the gallery reads labels from.

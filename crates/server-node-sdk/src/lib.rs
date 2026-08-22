@@ -13126,6 +13126,27 @@ struct StoreIndexQuery {
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
+    /// Comma-separated labels an entry must carry to be listed.
+    require_labels: Option<String>,
+    /// Comma-separated labels that keep an entry out of the listing, which is
+    /// how a client keeps media labelled `private` out of the default view.
+    exclude_labels: Option<String>,
+}
+
+/// Splits a comma-separated label parameter into the labels it names.
+///
+/// Blank entries are dropped, so a trailing comma or an empty parameter does
+/// not become a filter on the empty label.
+fn store_index_labels(raw: Option<&String>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -13267,6 +13288,10 @@ struct StoreIndexEntry {
     content_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     media: Option<MediaIndexResponse>,
+    /// User labels carried by the entry's XMP sidecar. Omitted when it has
+    /// none, so responses for unlabelled media stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -15735,6 +15760,10 @@ fn store_index_gallery_query(
         offset: query.offset.unwrap_or(0),
         limit: query.limit?.max(1),
         viewport: store_index_viewport_bounds(query).ok()?,
+        label_filter: storage::GalleryLabelFilter {
+            required: store_index_labels(query.require_labels.as_ref()),
+            excluded: store_index_labels(query.exclude_labels.as_ref()),
+        },
     })
 }
 
@@ -15813,6 +15842,7 @@ fn store_index_entry_from_gallery_entry(
         modified_at_unix: entry.modified_at_unix,
         content_fingerprint: entry.content_fingerprint,
         media,
+        labels: entry.labels,
     }
 }
 
@@ -16801,6 +16831,7 @@ fn collapse_store_index_entries_for_tree_view(
                 modified_at_unix: None,
                 content_fingerprint: None,
                 media: None,
+                labels: Vec::new(),
             });
     }
 
@@ -17363,6 +17394,9 @@ fn build_store_index_prefix_entry(path: String) -> StoreIndexEntry {
         modified_at_unix: None,
         content_fingerprint: None,
         media: None,
+        // Labels are a property of the gallery projection; the generic listing
+        // does not resolve them.
+        labels: Vec::new(),
     }
 }
 
@@ -17394,6 +17428,9 @@ fn build_store_index_object_entry(
         modified_at_unix,
         content_fingerprint,
         media: None,
+        // Labels are a property of the gallery projection; the generic listing
+        // does not resolve them.
+        labels: Vec::new(),
     }
 }
 

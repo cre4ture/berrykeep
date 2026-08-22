@@ -24,6 +24,11 @@ pub(super) struct GallerySyncScope {
     pub(super) media_filter: StoreIndexMediaFilter,
     pub(super) captured_sort: StoreIndexSortOrder,
     pub(super) viewport: Option<GallerySyncViewport>,
+    /// Carried in the token so that deltas resolve the same membership the
+    /// index query did. Defaulted, so tokens issued before labels existed stay
+    /// valid and simply filter nothing.
+    #[serde(default, skip_serializing_if = "storage::GalleryLabelFilter::is_empty")]
+    pub(super) label_filter: storage::GalleryLabelFilter,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -87,6 +92,7 @@ pub(super) fn gallery_delta_scope_from_sync(
                 north: viewport.north,
                 east: viewport.east,
             }),
+        label_filter: scope.label_filter.clone(),
     }
 }
 
@@ -111,6 +117,7 @@ pub(super) fn gallery_sync_scope_from_query(
             north: canonical_gallery_bound(viewport.north),
             east: canonical_gallery_bound(viewport.east),
         }),
+        label_filter: query.label_filter.clone(),
     }
 }
 
@@ -151,6 +158,7 @@ mod tests {
                 media_filter: StoreIndexMediaFilter::Image,
                 captured_sort: StoreIndexSortOrder::CapturedDesc,
                 viewport: None,
+                label_filter: Default::default(),
             },
         }
     }
@@ -184,6 +192,7 @@ mod tests {
                 north: 10.0,
                 east: 20.0,
             }),
+            label_filter: Default::default(),
         };
         let negative = gallery_sync_scope_from_query(&query(-0.0));
         let positive = gallery_sync_scope_from_query(&query(0.0));
