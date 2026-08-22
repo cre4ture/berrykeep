@@ -53,9 +53,9 @@ jobs:
             --allowed-tools "mcp__github_inline_comment__create_inline_comment,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git blame:*)"
 
       # Correction pushes while the PR is still being iterated on: use the
-      # cheaper/faster model. It also reports how many findings it posted
-      # (via structured output) so a clean pass can trigger one last Opus
-      # run below.
+      # cheaper/faster model. It also assesses whether the change is
+      # significant enough to warrant a deeper look (via structured output),
+      # which can trigger one last Opus run below.
       - name: Run Claude Code Review (Sonnet, correction push)
         id: sonnet-review
         if: github.event.action == 'synchronize'
@@ -79,23 +79,27 @@ jobs:
             to flag specific lines. Use `gh pr comment` only for feedback that isn't tied to
             a specific line. Only post GitHub comments - don't submit review text as messages.
 
-            Finally, report the number of issues you posted as `findings_count` in your
-            structured output (0 if you found nothing).
+            Finally, assess whether this change is significant enough to warrant a
+            second review pass by a more capable model - e.g. it touches
+            security-sensitive code, core architecture, or is otherwise a large or
+            complex diff, as opposed to a small, low-risk, mechanical, or
+            well-contained change. Report that as `significant_change` (boolean) in
+            your structured output.
 
           claude_args: |
             --model claude-sonnet-5
             --allowed-tools "mcp__github_inline_comment__create_inline_comment,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git blame:*)"
-            --json-schema '{"type":"object","properties":{"findings_count":{"type":"integer","minimum":0,"description":"Number of issues posted as PR comments during this review"}},"required":["findings_count"]}'
+            --json-schema '{"type":"object","properties":{"significant_change":{"type":"boolean","description":"True if this PR is large or risky enough that a second review pass by a more capable model is worthwhile (e.g. touches security-sensitive code, core architecture, or is a large/complex diff). False for small, low-risk, mechanical, or well-contained changes."}},"required":["significant_change"]}'
 
-      # Sonnet came back clean on a correction push - spend one more Opus
-      # pass as a final check before the PR is considered done, in case
-      # Sonnet missed something.
+      # Sonnet flagged this correction push as a significant change - spend
+      # one more Opus pass as a deeper final check before the PR is
+      # considered done.
       - name: Run Claude Code Review (Opus, final check)
         id: opus-final-review
         if: >-
           github.event.action == 'synchronize' &&
           steps.sonnet-review.outcome == 'success' &&
-          fromJSON(steps.sonnet-review.outputs.structured_output).findings_count == 0
+          fromJSON(steps.sonnet-review.outputs.structured_output).significant_change == true
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
@@ -106,10 +110,11 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            Sonnet just reviewed this pull request and found nothing to flag. Do one
-            more thorough pass as a final check before this PR is considered done -
-            look for bugs, correctness issues, and security problems. Only report on
-            issues you actually find. Be concise.
+            Sonnet just reviewed this pull request and flagged it as a significant
+            change that warrants a deeper look. Do one more thorough pass as a final
+            check before this PR is considered done - look for bugs, correctness
+            issues, and security problems. Only report on issues you actually find.
+            Be concise.
 
             Note: The PR branch is already checked out in the current working directory,
             so you can read files directly for context beyond the diff.
