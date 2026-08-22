@@ -30,6 +30,13 @@ internal fun galleryImageResolutionForScale(scale: Float): GalleryImageResolutio
         else -> null
     }
 
+internal fun shouldLoadGalleryImageResolution(
+    requestedResolution: GalleryImageResolution?,
+    loadedResolution: GalleryImageResolution?,
+): Boolean =
+    requestedResolution != null &&
+        (loadedResolution == null || loadedResolution.ordinal < requestedResolution.ordinal)
+
 /**
  * Holds a small set of source files for the life of one fullscreen gallery session.
  * Decoding additional zoom levels from the local copy avoids repeated SAF downloads.

@@ -115,4 +115,28 @@ class GalleryPresentationTest {
         assertEquals(GalleryImageResolution.HIGH, galleryImageResolutionForScale(3.5f))
         assertEquals(GalleryImageResolution.ORIGINAL, galleryImageResolutionForScale(3.51f))
     }
+
+    @Test
+    fun galleryImageResolutionOnlyLoadsWhenItImprovesTheDisplayedImage() {
+        assertFalse(shouldLoadGalleryImageResolution(null, null))
+        assertTrue(shouldLoadGalleryImageResolution(GalleryImageResolution.DETAIL, null))
+        assertFalse(
+            shouldLoadGalleryImageResolution(
+                GalleryImageResolution.DETAIL,
+                GalleryImageResolution.DETAIL,
+            ),
+        )
+        assertTrue(
+            shouldLoadGalleryImageResolution(
+                GalleryImageResolution.HIGH,
+                GalleryImageResolution.DETAIL,
+            ),
+        )
+        assertFalse(
+            shouldLoadGalleryImageResolution(
+                GalleryImageResolution.DETAIL,
+                GalleryImageResolution.HIGH,
+            ),
+        )
+    }
 }

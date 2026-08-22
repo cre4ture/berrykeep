@@ -749,17 +749,17 @@ private fun GalleryFullscreenPage(
     LaunchedEffect(documentUri, requestedResolution, fullResolutionRetryGeneration) {
         val resolvedItem = item
         val loadedImage = loadedFullResolutionImage
+        val resolutionToLoad = requestedResolution?.takeIf { resolution ->
+            shouldLoadGalleryImageResolution(resolution, loadedImage?.resolution)
+        }
         if (
-            requestedResolution == null ||
             resolvedItem == null ||
-            (loadedImage != null && loadedImage.resolution.ordinal >= requestedResolution.ordinal)
+            resolutionToLoad == null
         ) {
-            if (loadedImage == null) {
-                fullResolutionState = GalleryFullResolutionState.NotRequested
-            }
+            fullResolutionState = GalleryFullResolutionState.NotRequested
             return@LaunchedEffect
         }
-        fullResolutionState = GalleryFullResolutionState.Loading(requestedResolution)
+        fullResolutionState = GalleryFullResolutionState.Loading(resolutionToLoad)
         val bitmap = withContext(Dispatchers.IO) {
             runCatching {
                 val originalFile = originalImageCache.fileFor(
@@ -767,16 +767,16 @@ private fun GalleryFullscreenPage(
                     contentResolver = context.contentResolver,
                     documentUri = resolvedItem.documentUri,
                 )
-                DocumentBitmapLoader.load(originalFile, requestedResolution.maxDecodeDimensionPx)
+                DocumentBitmapLoader.load(originalFile, resolutionToLoad.maxDecodeDimensionPx)
             }.onFailure { error ->
                 Log.w("LibraryScreen", "Full image load failed for ${resolvedItem.documentUri}", error)
             }.getOrNull()
         }
         if (bitmap != null) {
-            loadedFullResolutionImage = GalleryLoadedImage(requestedResolution, bitmap)
+            loadedFullResolutionImage = GalleryLoadedImage(resolutionToLoad, bitmap)
             fullResolutionState = GalleryFullResolutionState.NotRequested
         } else {
-            fullResolutionState = GalleryFullResolutionState.Failed(requestedResolution)
+            fullResolutionState = GalleryFullResolutionState.Failed(resolutionToLoad)
         }
     }
 
