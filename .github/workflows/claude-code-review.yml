@@ -25,6 +25,7 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -46,3 +47,48 @@ jobs:
 
           claude_args: |
             --allowed-tools "mcp__github_inline_comment__create_inline_comment,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git blame:*)"
+
+      # anthropics/claude-code-action redacts the SDK's error text from the job
+      # log by default (only `show_full_output: true` prints it, which also
+      # dumps every tool call's raw output - too broad for a PR-triggered,
+      # semi-trusted workflow). The unredacted result is still written to
+      # `execution_file` on disk even on failure, so pull just the terminal
+      # result message's `.result`/`.errors` out of it - enough to see *why*
+      # it failed without echoing full tool transcripts.
+      - name: Surface Claude Code failure reason
+        if: steps.claude-review.outcome == 'failure'
+        run: |
+          FILE="${{ steps.claude-review.outputs.execution_file }}"
+          {
+            echo "## :x: Claude Code Review failed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$FILE" ] && [ -f "$FILE" ]; then
+            SUBTYPE=$(jq -r '([.[] | select(.type == "result")] | last | .subtype) // "unknown"' "$FILE")
+            REASON=$(jq -r '
+              ([.[] | select(.type == "result")] | last) as $r
+              | if $r == null then
+                  "no result message found in execution file"
+                else
+                  ($r.result // (($r.errors // ["result message had no .result or .errors field"]) | join("; ")))
+                end
+            ' "$FILE")
+
+            {
+              echo "**subtype:** \`$SUBTYPE\`"
+              echo '```'
+              echo "$REASON"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            ANNOTATION=$(printf '%s' "$REASON" | tr '\n' ' ' | cut -c1-500)
+            echo "::error::Claude Code Review failed ($SUBTYPE): $ANNOTATION"
+          else
+            MSG="No execution file was produced - Claude Code likely failed before or during startup (auth, installation, or setup). Check the steps above this one in the job log."
+            echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$MSG"
+          fi
+
+      - name: Fail job if Claude Code Review failed
+        if: steps.claude-review.outcome == 'failure'
+        run: exit 1
