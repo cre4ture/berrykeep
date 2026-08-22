@@ -167,6 +167,10 @@ impl MetadataStore for TursoMetadataStore {
         self.remove_current_object_with_gallery(key).await
     }
 
+    async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()> {
+        self.store_gallery_object_labels(key, labels).await
+    }
+
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
@@ -2230,6 +2234,28 @@ impl MetadataStore for TursoMetadataStore {
     }
 }
 
+/// Adds a column to an existing table, tolerating databases that already have it.
+///
+/// Turso has no `ADD COLUMN IF NOT EXISTS`, so the duplicate-column error is the
+/// only reliable signal that the migration already ran on this database.
+pub(super) async fn add_column_if_missing(
+    connection: &turso::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let statement = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    if let Err(err) = connection.execute(&statement, ()).await {
+        let duplicate_column = err
+            .to_string()
+            .contains(&format!("duplicate column name: {column}"));
+        if !duplicate_column {
+            return Err(err).with_context(|| format!("failed to migrate turso {table}.{column}"));
+        }
+    }
+    Ok(())
+}
+
 async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
     connection
         .execute_batch(
@@ -2456,20 +2482,13 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             ",
         )
         .await?;
-    if let Err(err) = connection
-        .execute(
-            "ALTER TABLE s3_access_keys ADD COLUMN allow_manage INTEGER NOT NULL DEFAULT 0",
-            (),
-        )
-        .await
-    {
-        let duplicate_column = err
-            .to_string()
-            .contains("duplicate column name: allow_manage");
-        if !duplicate_column {
-            return Err(err).context("failed to migrate turso s3_access_keys.allow_manage");
-        }
-    }
+    add_column_if_missing(
+        connection,
+        "s3_access_keys",
+        "allow_manage",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
     gallery::init_gallery_projection(connection).await?;
 
     let mut rows = connection

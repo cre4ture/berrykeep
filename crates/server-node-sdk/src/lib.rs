@@ -38,6 +38,7 @@ use bytes::Bytes;
 use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
+use common::xmp::{is_sidecar_key, sidecar_key_for_media};
 use common::{ClusterId, DeviceId, HealthStatus, NodeId};
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
@@ -7607,6 +7608,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
@@ -8019,6 +8021,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
@@ -13123,6 +13126,27 @@ struct StoreIndexQuery {
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
+    /// Comma-separated labels an entry must carry to be listed.
+    require_labels: Option<String>,
+    /// Comma-separated labels that keep an entry out of the listing, which is
+    /// how a client keeps media labelled `private` out of the default view.
+    exclude_labels: Option<String>,
+}
+
+/// Splits a comma-separated label parameter into the labels it names.
+///
+/// Blank entries are dropped, so a trailing comma or an empty parameter does
+/// not become a filter on the empty label.
+fn store_index_labels(raw: Option<&String>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -13264,6 +13288,10 @@ struct StoreIndexEntry {
     content_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     media: Option<MediaIndexResponse>,
+    /// User labels carried by the entry's XMP sidecar. Omitted when it has
+    /// none, so responses for unlabelled media stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -13585,6 +13613,17 @@ struct PathMutationRequest {
     overwrite: bool,
     #[serde(default)]
     expected_revision: Option<String>,
+}
+
+/// Replaces the labels of the media object at `path`.
+///
+/// The labels are stored in the XMP sidecar of that media object, so `path`
+/// names the media object itself, never its `.xmp` sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MediaLabelsRequest {
+    path: String,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14130,6 +14169,86 @@ async fn copy_object_path_response(
                 error = %err,
                 "failed to copy object path"
             );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn set_media_labels(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<MediaLabelsRequest>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint("set_media_labels", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            set_media_labels_response(&state_for_request, request, Some(actor)).await
+        },
+    )
+    .await
+}
+
+/// Rewrites the XMP sidecar of a media object so that it carries exactly the
+/// requested labels.
+///
+/// Labelling is a write of the sidecar object, so it follows the path mutation
+/// idiom of this router: mutate under the store lock, then publish the namespace
+/// change and refresh local availability so the new sidecar version is announced
+/// like any other object write.
+async fn set_media_labels_response(
+    state: &ServerState,
+    request: MediaLabelsRequest,
+    actor: Option<DataChangeActorContext>,
+) -> Response {
+    let path = request.path.trim();
+    if path.is_empty() || is_sidecar_key(path) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let mut store = lock_store(state, "store_object.labels").await;
+    let outcome = store.set_media_labels(path, request.labels).await;
+    drop(store);
+
+    match outcome {
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(result)) => {
+            publish_namespace_change(state);
+            request_local_availability_refresh(state);
+            record_data_change_event(
+                state,
+                PendingDataChangeEvent {
+                    action: DataChangeAction::Upload,
+                    actor,
+                    path: sidecar_key_for_media(path),
+                    from_path: None,
+                    to_path: None,
+                    recursive: false,
+                    affected_path_count: 1,
+                    total_size_bytes: None,
+                    version_id: Some(result.version_id.clone()),
+                    snapshot_id: Some(result.snapshot_id.clone()),
+                    upload_mode: Some(DataChangeUploadMode::Direct),
+                },
+            )
+            .await;
+            info!(
+                path,
+                version_id = %result.version_id,
+                "stored media labels"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => {
+            tracing::error!(path, error = %err, "failed to store media labels");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -15641,6 +15760,10 @@ fn store_index_gallery_query(
         offset: query.offset.unwrap_or(0),
         limit: query.limit?.max(1),
         viewport: store_index_viewport_bounds(query).ok()?,
+        label_filter: storage::GalleryLabelFilter {
+            required: store_index_labels(query.require_labels.as_ref()),
+            excluded: store_index_labels(query.exclude_labels.as_ref()),
+        },
     })
 }
 
@@ -15719,6 +15842,7 @@ fn store_index_entry_from_gallery_entry(
         modified_at_unix: entry.modified_at_unix,
         content_fingerprint: entry.content_fingerprint,
         media,
+        labels: entry.labels,
     }
 }
 
@@ -16707,6 +16831,7 @@ fn collapse_store_index_entries_for_tree_view(
                 modified_at_unix: None,
                 content_fingerprint: None,
                 media: None,
+                labels: Vec::new(),
             });
     }
 
@@ -17269,6 +17394,9 @@ fn build_store_index_prefix_entry(path: String) -> StoreIndexEntry {
         modified_at_unix: None,
         content_fingerprint: None,
         media: None,
+        // Labels are a property of the gallery projection; the generic listing
+        // does not resolve them.
+        labels: Vec::new(),
     }
 }
 
@@ -17300,6 +17428,9 @@ fn build_store_index_object_entry(
         modified_at_unix,
         content_fingerprint,
         media: None,
+        // Labels are a property of the gallery projection; the generic listing
+        // does not resolve them.
+        labels: Vec::new(),
     }
 }
 

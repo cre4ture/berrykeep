@@ -1962,6 +1962,7 @@ fn gallery_sync_token_is_opaque_versioned_and_rejects_malformed_values() {
             media_filter: super::StoreIndexMediaFilter::Image,
             captured_sort: super::StoreIndexSortOrder::CapturedDesc,
             viewport: None,
+            label_filter: Default::default(),
         },
     };
     let token = super::encode_gallery_sync_token(&payload);
@@ -1988,6 +1989,8 @@ fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
         west,
         north,
         east,
+        require_labels: None,
+        exclude_labels: None,
     };
     assert!(
         super::store_index_viewport_bounds(&query(Some(1.0), None, Some(2.0), Some(3.0))).is_err()
@@ -2057,6 +2060,8 @@ async fn turso_gallery_projection_supports_viewport_and_delta() {
                 west: Some(5.0),
                 north: Some(49.0),
                 east: Some(11.0),
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -12441,6 +12446,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
+            labels: Vec::new(),
         },
         super::StoreIndexEntry {
             path: "images/".to_string(),
@@ -12451,6 +12457,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
+            labels: Vec::new(),
         },
         super::StoreIndexEntry {
             path: "images/cat.png".to_string(),
@@ -12461,6 +12468,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
+            labels: Vec::new(),
         },
     ];
 
@@ -13331,6 +13339,78 @@ run_on_main_metadata_backends!(
     delete_object_handler_marks_tombstone_and_removes_current_key_turso
 );
 
+async fn set_media_labels_handler_writes_the_sidecar_object_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let media_key = "album/photo.jpg";
+    let sidecar_key = "album/photo.jpg.xmp";
+
+    let rejected = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: sidecar_key.to_string(),
+            labels: vec!["beach".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::BAD_REQUEST,
+        "labels address the media object, never its sidecar"
+    );
+
+    let applied = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: media_key.to_string(),
+            labels: vec!["beach".to_string(), "vacation".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(applied.status(), StatusCode::NO_CONTENT);
+
+    let stored = {
+        let store = read_store(&state, "tests.media_labels.sidecar").await;
+        store
+            .get_object(
+                sidecar_key,
+                None,
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("the handler must have written a sidecar object")
+    };
+    assert_eq!(
+        common::xmp::XmpSidecar::parse(&stored).unwrap().keywords(),
+        ["beach".to_string(), "vacation".to_string()]
+    );
+
+    let unchanged = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: media_key.to_string(),
+            labels: vec!["beach".to_string(), "vacation".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(
+        unchanged.status(),
+        StatusCode::NO_CONTENT,
+        "re-storing identical labels stays successful"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    set_media_labels_handler_writes_the_sidecar_object_impl,
+    set_media_labels_handler_writes_the_sidecar_object,
+    set_media_labels_handler_writes_the_sidecar_object_turso
+);
+
 async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
     backend: MainTestBackend,
 ) {
@@ -13480,6 +13560,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13564,6 +13646,8 @@ async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13641,6 +13725,8 @@ async fn list_store_index_keeps_batch_media_lookup_failures_best_effort_impl(
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13714,6 +13800,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13792,6 +13880,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13872,6 +13962,8 @@ async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13946,6 +14038,8 @@ async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTest
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14016,6 +14110,8 @@ async fn list_store_index_sets_timing_headers_impl(backend: MainTestBackend) {
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14096,6 +14192,8 @@ async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBa
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14132,6 +14230,8 @@ async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBa
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14196,6 +14296,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14242,6 +14344,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14298,6 +14402,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         west: None,
         north: None,
         east: None,
+        require_labels: None,
+        exclude_labels: None,
     };
     let cached_sequence = state
         .storage
@@ -14360,6 +14466,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14472,6 +14580,8 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14526,6 +14636,8 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14649,6 +14761,8 @@ async fn list_store_index_uses_filename_capture_fallback_after_extraction_impl(
                     west: None,
                     north: None,
                     east: None,
+                    require_labels: None,
+                    exclude_labels: None,
                 }),
             )
             .await,
@@ -14712,6 +14826,8 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14742,6 +14858,8 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14857,6 +14975,8 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14887,6 +15007,8 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14975,6 +15097,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 thumbnail: None,
                 error: None,
             }),
+            labels: Vec::new(),
         },
         super::StoreIndexEntry {
             path: "gallery/newer.jpg".to_string(),
@@ -15007,6 +15130,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 thumbnail: None,
                 error: None,
             }),
+            labels: Vec::new(),
         },
         super::StoreIndexEntry {
             path: "gallery/clip.mp4".to_string(),
@@ -15036,6 +15160,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 thumbnail: None,
                 error: None,
             }),
+            labels: Vec::new(),
         },
         super::StoreIndexEntry {
             path: "gallery/subdir/".to_string(),
@@ -15046,6 +15171,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
+            labels: Vec::new(),
         },
     ];
 
@@ -15154,6 +15280,7 @@ fn store_index_prepared_sort_materializes_only_requested_prefix() {
                 thumbnail: None,
                 error: None,
             }),
+            labels: Vec::new(),
         })
         .collect::<Vec<_>>();
     let mut prepared = super::StoreIndexPreparedEntries::new(
@@ -15316,6 +15443,8 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -15761,6 +15890,8 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,

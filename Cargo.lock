@@ -1084,6 +1084,7 @@ version = "1.0.46"
 dependencies = [
  "anyhow",
  "blake3",
+ "quick-xml",
  "serde",
  "time",
  "tokio",

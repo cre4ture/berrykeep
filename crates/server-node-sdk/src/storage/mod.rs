@@ -33,6 +33,7 @@ use bytes::{Bytes, BytesMut};
 use common::NodeId;
 use common::content_fingerprint::content_fingerprint_from_chunk_refs;
 use common::range_chunk_cache::RangeChunkCache;
+use common::xmp::{XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -43,6 +44,7 @@ use uuid::Uuid;
 
 pub(super) mod data_scrub;
 mod gallery_capture_time;
+mod gallery_labels;
 pub(super) mod manifest_reader;
 pub(super) mod media_cache;
 pub(super) mod media_tools;
@@ -68,6 +70,10 @@ pub(crate) use data_scrub::DataScrubber;
 pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTestHook};
 pub(crate) use gallery_capture_time::effective_gallery_captured_at_unix;
 pub(super) use gallery_capture_time::version_created_at_unix_from_payload;
+pub(super) use gallery_labels::{
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GalleryLabelFilter,
+    decode_gallery_labels, encode_gallery_labels, gallery_label_predicates,
+};
 use media_cache::MediaCacheBuildConfig;
 #[cfg(test)]
 pub(crate) use media_cache::mobile_viewer_thumbnail_profile;
@@ -103,6 +109,11 @@ const STORAGE_POOL_CONFIG_ENV: &str = "IRONMESH_STORAGE_CONFIG";
 const STORAGE_POOL_CONFIG_FILE: &str = "storage-pool.json";
 const STORAGE_POOL_PATH_MARKER_FILE: &str = ".ironmesh-storage-path.json";
 const STORAGE_POOL_CONFIG_VERSION: u32 = 1;
+/// Largest XMP sidecar the label ingest reads into memory. Sidecars written by
+/// cameras and photo tools stay in the kilobyte range; the bound keeps an
+/// arbitrary object that merely carries the `.xmp` suffix from being assembled
+/// in full just to be parsed.
+const MAX_SIDECAR_INGEST_BYTES: usize = 4 * 1024 * 1024;
 
 fn manifest_hash_looks_safe_filename(manifest_hash: &str) -> bool {
     manifest_hash.len() == blake3::OUT_LEN * 2
@@ -1014,6 +1025,7 @@ pub(crate) struct GalleryIndexQuery {
     pub(crate) offset: usize,
     pub(crate) limit: usize,
     pub(crate) viewport: Option<GalleryViewportBounds>,
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1042,6 +1054,9 @@ pub(crate) struct GalleryIndexEntry {
     pub(crate) modified_at_unix: Option<u64>,
     pub(crate) content_fingerprint: Option<String>,
     pub(crate) media_metadata: Option<CachedMediaMetadata>,
+    /// User labels of the object, materialized from the projection's label
+    /// column. Populated by the sidecar ingest; empty until then.
+    pub(crate) labels: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1060,6 +1075,7 @@ pub(crate) struct GalleryDeltaScope {
     pub(crate) media_filter: GalleryIndexMediaFilter,
     pub(crate) captured_sort: GalleryIndexCapturedSort,
     pub(crate) viewport: Option<GalleryViewportBounds>,
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2287,6 +2303,10 @@ trait MetadataStore: Send + Sync {
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
     async fn remove_current_object(&self, key: &str) -> Result<()>;
+    /// Replaces the user labels of a projected object. This is the entry point
+    /// for the sidecar ingest, which resolves the labels of a media key from its
+    /// XMP sidecar.
+    async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()>;
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
@@ -3540,6 +3560,20 @@ impl PersistentStore {
         query: &GalleryIndexQuery,
     ) -> Result<Option<GalleryIndexPage>> {
         self.metadata_store.query_gallery_index(query).await
+    }
+
+    /// Replaces the user labels the gallery projection holds for `key`.
+    ///
+    /// The sidecar ingest calls this after resolving the labels of a media key
+    /// from its XMP sidecar; the projection itself never parses sidecar files.
+    pub(crate) async fn set_gallery_object_labels(
+        &self,
+        key: &str,
+        labels: &[String],
+    ) -> Result<()> {
+        self.metadata_store
+            .set_gallery_object_labels(key, labels)
+            .await
     }
 
     pub(crate) async fn query_gallery_delta(
@@ -8038,11 +8072,13 @@ impl PersistentStore {
         self.metadata_store
             .upsert_current_object(key, &entry)
             .await?;
+        let manifest_hash = entry.manifest_hash.clone();
         self.current_objects_cache
             .lock()
             .unwrap()
             .insert(key.to_string(), entry);
-        Ok(())
+        self.sync_sidecar_labels_after_upsert(key, &manifest_hash)
+            .await
     }
 
     async fn remove_current_object(&self, key: &str) -> Result<()> {
@@ -8051,7 +8087,192 @@ impl PersistentStore {
             .lock()
             .unwrap()
             .remove(&key.to_string());
-        Ok(())
+        self.sync_sidecar_labels_after_removal(key).await
+    }
+
+    /// Makes the XMP sidecar of `media_key` carry exactly `labels`.
+    ///
+    /// The sidecar object is the source of truth for user labels, so labelling
+    /// is an ordinary versioned write of `<media_key>.xmp`. Going through
+    /// [`PersistentStore::put_object_versioned`] keeps labels replicated,
+    /// snapshotted and undoable like any other object, and lets the ingest hook
+    /// refresh the gallery projection instead of duplicating that logic here.
+    ///
+    /// Returns `None` when the stored sidecar already carries these labels and
+    /// no write was necessary.
+    pub async fn set_media_labels(
+        &mut self,
+        media_key: &str,
+        labels: Vec<String>,
+    ) -> Result<Option<PutResult>> {
+        if is_sidecar_key(media_key) {
+            bail!("labels belong to a media object, not to the sidecar {media_key}");
+        }
+
+        let sidecar_key = sidecar_key_for_media(media_key);
+        let stored = self.load_stored_sidecar(&sidecar_key).await?;
+        if !Self::sidecar_write_required(stored.as_ref(), &labels) {
+            return Ok(None);
+        }
+
+        let mut sidecar = stored.unwrap_or_else(XmpSidecar::new_empty);
+        sidecar.set_keywords(labels);
+        let bytes = sidecar
+            .to_bytes()
+            .with_context(|| format!("failed to serialize the XMP sidecar {sidecar_key}"))?;
+
+        self.put_object_versioned(&sidecar_key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .map(Some)
+    }
+
+    /// Whether `labels` differ from what the stored sidecar already holds.
+    ///
+    /// Rewriting an unchanged sidecar would spend an object version, new chunks
+    /// and replication work on a no-op, and media without a sidecar needs none
+    /// created just to record that it carries no labels.
+    fn sidecar_write_required(stored: Option<&XmpSidecar>, labels: &[String]) -> bool {
+        match stored {
+            Some(sidecar) => sidecar.keywords() != labels,
+            None => !labels.is_empty(),
+        }
+    }
+
+    /// Loads the sidecar currently stored at `sidecar_key`, or `None` when the
+    /// media object has none yet.
+    ///
+    /// A stored packet that cannot be parsed is reported rather than replaced:
+    /// it may hold third-party properties Ironmesh neither models nor can
+    /// reconstruct, so overwriting it would destroy user data. Ingest tolerates
+    /// such packets on purpose, because rejecting them there would fail an
+    /// upload whose bytes the client owns; refusing to write over them here
+    /// protects those same bytes.
+    async fn load_stored_sidecar(&self, sidecar_key: &str) -> Result<Option<XmpSidecar>> {
+        let Some(entry) = self.current_object_entry(sidecar_key).await? else {
+            return Ok(None);
+        };
+
+        let bytes = self
+            .read_sidecar_bytes(&entry.manifest_hash)
+            .await
+            .with_context(|| format!("failed to read the XMP sidecar {sidecar_key}"))?;
+        let sidecar = XmpSidecar::parse(&bytes).with_context(|| {
+            format!("refusing to overwrite the malformed XMP sidecar {sidecar_key}")
+        })?;
+        Ok(Some(sidecar))
+    }
+
+    /// Applies the label side effects of `key` becoming the current object.
+    ///
+    /// The XMP sidecar object is the source of truth for user labels; the
+    /// projection column only caches them. Both orders in which the two objects
+    /// can arrive are handled: a sidecar landing next to a media object updates
+    /// that object's labels, and a media object landing after its sidecar picks
+    /// the labels up from the sidecar that is already stored. Without the second
+    /// direction a sidecar uploaded ahead of its image would be dropped
+    /// silently, because the projection row it targets does not exist yet.
+    async fn sync_sidecar_labels_after_upsert(&self, key: &str, manifest_hash: &str) -> Result<()> {
+        match media_key_for_sidecar(key) {
+            Some(media_key) => self.apply_sidecar_labels(&media_key, manifest_hash).await,
+            None => self.apply_stored_sidecar_labels(key).await,
+        }
+    }
+
+    /// Clears the labels a removed sidecar contributed to its media object.
+    ///
+    /// Removing a media object needs no counterpart: its projection row, and
+    /// with it the label column, is deleted along with the object.
+    async fn sync_sidecar_labels_after_removal(&self, key: &str) -> Result<()> {
+        let Some(media_key) = media_key_for_sidecar(key) else {
+            return Ok(());
+        };
+        self.set_gallery_object_labels(&media_key, &[]).await
+    }
+
+    /// Applies the labels of the sidecar already stored for `media_key`, if any.
+    ///
+    /// Only objects the gallery projects can surface labels, and the current
+    /// object cache does not retain misses. Gating on the media type therefore
+    /// keeps the common ingest of non-media files from paying a sidecar lookup
+    /// that can never resolve to a visible label.
+    async fn apply_stored_sidecar_labels(&self, media_key: &str) -> Result<()> {
+        if gallery_media_type_for_path(media_key).is_none() {
+            return Ok(());
+        }
+        let sidecar_key = sidecar_key_for_media(media_key);
+        let Some(sidecar) = self.current_object_entry(&sidecar_key).await? else {
+            return Ok(());
+        };
+        self.apply_sidecar_labels(media_key, &sidecar.manifest_hash)
+            .await
+    }
+
+    /// Stores the keywords of the given sidecar object on the projection row of
+    /// `media_key`.
+    async fn apply_sidecar_labels(&self, media_key: &str, manifest_hash: &str) -> Result<()> {
+        let Some(keywords) = self.read_sidecar_keywords(media_key, manifest_hash).await else {
+            return Ok(());
+        };
+        self.set_gallery_object_labels(media_key, &keywords).await
+    }
+
+    /// Reads the keywords of a sidecar object, or `None` when the sidecar cannot
+    /// be read or parsed.
+    ///
+    /// Sidecars are authored by third-party tools, so an unreadable packet is an
+    /// expected input rather than a storage fault: it is reported and the
+    /// projection is left untouched. Aborting here would fail the upload of a
+    /// file whose own bytes are perfectly fine.
+    async fn read_sidecar_keywords(
+        &self,
+        media_key: &str,
+        manifest_hash: &str,
+    ) -> Option<Vec<String>> {
+        let bytes = match self.read_sidecar_bytes(manifest_hash).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    media_key,
+                    manifest_hash,
+                    error = %err,
+                    "unreadable XMP sidecar, keeping the gallery labels unchanged"
+                );
+                return None;
+            }
+        };
+
+        match XmpSidecar::parse(&bytes) {
+            Ok(sidecar) => Some(sidecar.keywords().to_vec()),
+            Err(err) => {
+                warn!(
+                    media_key,
+                    manifest_hash,
+                    error = %err,
+                    "malformed XMP sidecar, keeping the gallery labels unchanged"
+                );
+                None
+            }
+        }
+    }
+
+    /// Reads a whole sidecar object, refusing packets that are too large to be
+    /// one.
+    ///
+    /// Real sidecars are a few kilobytes, so the size bound keeps an object that
+    /// merely carries the sidecar suffix from being assembled into memory.
+    async fn read_sidecar_bytes(&self, manifest_hash: &str) -> Result<Bytes> {
+        let manifest = self
+            .load_manifest_by_hash(manifest_hash)
+            .await?
+            .with_context(|| format!("manifest missing for hash={manifest_hash}"))?;
+        if manifest.total_size_bytes > MAX_SIDECAR_INGEST_BYTES {
+            bail!(
+                "sidecar of {} bytes exceeds the ingest limit of {MAX_SIDECAR_INGEST_BYTES} bytes",
+                manifest.total_size_bytes
+            );
+        }
+
+        Ok(self.read_object_by_manifest_hash(manifest_hash).await?)
     }
 
     async fn object_id_for_key(&self, key: &str) -> Result<Option<String>> {
