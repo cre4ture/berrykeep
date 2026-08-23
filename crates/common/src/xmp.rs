@@ -294,6 +294,8 @@ struct PacketStructure {
     description_first_child: Option<usize>,
     /// The first `dc:subject` property of any top-level `rdf:Description`.
     subject: Option<ElementSpan>,
+    /// The top-level `rdf:Description` that contains [`Self::subject`].
+    subject_description: Option<usize>,
 }
 
 /// Position at which the regenerated `dc:subject` property is spliced into the
@@ -448,6 +450,7 @@ fn note_element_start(
         && is_element(resolved, DC_NAMESPACE, b"subject")
     {
         structure.subject = Some(ElementSpan::new(index, self_closing));
+        structure.subject_description = parent;
     }
 }
 
@@ -609,18 +612,21 @@ fn preceding_line_indent(events: &[ResolvedEvent], index: usize) -> Option<Strin
 /// ones when the packet does not bind a namespace yet.
 ///
 /// Only elements that are actual ancestors of the generated `dc:subject` --
-/// `rdf:RDF` and, when one exists, the target `rdf:Description` -- are
-/// searched. A namespace bound on an unrelated element elsewhere in the
-/// packet, for example a sibling `rdf:Description`, is not in scope at the
-/// insertion point: using its prefix without redeclaring it would emit an
-/// unbound prefix.
+/// `rdf:RDF` and its target `rdf:Description` -- are searched. When an
+/// existing subject is regenerated, its containing description is the target;
+/// otherwise the first description is. A namespace bound on an unrelated
+/// element elsewhere in the packet, for example a sibling `rdf:Description`,
+/// is not in scope at the insertion point: using its prefix without
+/// redeclaring it would emit an unbound prefix.
 fn generated_namespaces(
     events: &[ResolvedEvent],
     structure: &PacketStructure,
 ) -> GeneratedNamespaces {
     let scope: Vec<usize> = [
         structure.rdf_root.map(|span| span.start),
-        structure.description.map(|span| span.start),
+        structure
+            .subject_description
+            .or(structure.description.map(|span| span.start)),
     ]
     .into_iter()
     .flatten()
@@ -980,6 +986,39 @@ mod tests {
         // The regression: parsing back must find the keyword. Before the fix,
         // dc:subject silently used an unbound prefix, so the write round-tripped
         // to zero keywords and labelling a photo private had no effect.
+        assert_eq!(
+            XmpSidecar::parse(serialized.as_bytes())?.keywords(),
+            ["private"]
+        );
+        Ok(())
+    }
+
+    /// An existing subject can be in a later top-level description. Its prefix
+    /// scope is independent from the first description, which only serves as
+    /// the insertion target when no subject exists yet.
+    #[test]
+    fn existing_subject_uses_its_own_description_namespace_scope() -> Result<()> {
+        const SUBJECT_IN_LATER_DESCRIPTION: &str = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n",
+            " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
+            "  <rdf:Description rdf:about=\"\" xmlns:dcx=\"http://purl.org/dc/elements/1.1/\" dcx:format=\"image/jpeg\"/>\n",
+            "  <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n",
+            "   <dc:subject><rdf:Bag><rdf:li>alpha</rdf:li></rdf:Bag></dc:subject>\n",
+            "  </rdf:Description>\n",
+            " </rdf:RDF>\n",
+            "</x:xmpmeta>\n",
+        );
+
+        let mut sidecar = XmpSidecar::parse(SUBJECT_IN_LATER_DESCRIPTION.as_bytes())?;
+        assert_eq!(sidecar.keywords(), ["alpha"]);
+
+        sidecar.set_keywords(vec!["private".to_owned()]);
+        let serialized = serialize(&sidecar)?;
+
+        assert!(
+            serialized.contains("<dc:subject>") && !serialized.contains("<dcx:subject>"),
+            "the regenerated subject must use the prefix in scope at its target, got:\n{serialized}"
+        );
         assert_eq!(
             XmpSidecar::parse(serialized.as_bytes())?.keywords(),
             ["private"]

@@ -59,39 +59,6 @@ impl GalleryLabelFilter {
     }
 }
 
-/// Builds a `GLOB` pattern matching projection rows whose label list contains
-/// `label`.
-///
-/// `GLOB` is used instead of `LIKE` because SQLite's (and Turso's) `LIKE` only
-/// case-folds ASCII by default, which would make a filter for `private` also
-/// match an entry labelled only `Private` -- silently contradicting the
-/// storage layer, where `encode_gallery_labels` treats case as significant.
-/// `GLOB` is always case-sensitive.
-///
-/// The canonical encoding quotes every entry, so matching the quoted form only
-/// ever matches whole labels: `not-private` is stored as `"not-private"` and
-/// cannot satisfy the pattern built for `private`. `GLOB` has no `ESCAPE`
-/// clause, so its metacharacters (`*`, `?`, `[`) in the label are neutralised
-/// by wrapping each in a single-character bracket class, which `GLOB` matches
-/// literally rather than as a wildcard.
-fn gallery_label_glob_pattern(label: &str) -> Result<String> {
-    let encoded =
-        serde_json::to_string(label).context("failed to encode a gallery label filter")?;
-    let mut pattern = String::with_capacity(encoded.len() + 2);
-    pattern.push('*');
-    for character in encoded.chars() {
-        if matches!(character, '*' | '?' | '[') {
-            pattern.push('[');
-            pattern.push(character);
-            pattern.push(']');
-        } else {
-            pattern.push(character);
-        }
-    }
-    pattern.push('*');
-    Ok(pattern)
-}
-
 /// Renders `filter` as SQL predicates plus their bind values.
 ///
 /// Placeholders are numbered from `first_placeholder`, so a caller can append
@@ -103,18 +70,19 @@ pub(crate) fn gallery_label_predicates(
     let mut predicates = String::new();
     let mut values = Vec::new();
     let mut placeholder = first_placeholder;
-    let mut push = |keyword: &str, label: &str, placeholder: usize| -> Result<String> {
-        values.push(gallery_label_glob_pattern(label)?);
-        Ok(format!(
-            " AND {GALLERY_LABELS_COLUMN} {keyword} ?{placeholder}"
-        ))
+    let mut push = |negated: bool, label: &str, placeholder: usize| {
+        values.push(label.to_owned());
+        let operator = if negated { "NOT EXISTS" } else { "EXISTS" };
+        format!(
+            " AND {operator} (SELECT 1 FROM json_each({GALLERY_LABELS_COLUMN}) WHERE json_each.value = ?{placeholder})"
+        )
     };
     for label in &filter.required {
-        predicates.push_str(&push("GLOB", label, placeholder)?);
+        predicates.push_str(&push(false, label, placeholder));
         placeholder += 1;
     }
     for label in &filter.excluded {
-        predicates.push_str(&push("NOT GLOB", label, placeholder)?);
+        predicates.push_str(&push(true, label, placeholder));
         placeholder += 1;
     }
     Ok((predicates, values))

@@ -15366,7 +15366,7 @@ async fn delete_object_response(
             })
     } else {
         store
-            .tombstone_object(
+            .tombstone_object_with_companions(
                 &key,
                 PutOptions {
                     parent_version_ids: query.parent,
@@ -15377,7 +15377,12 @@ async fn delete_object_response(
                 },
             )
             .await
-            .map(|version_id| vec![(key.clone(), version_id)])
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|entry| (entry.path, entry.version_id))
+                    .collect::<Vec<_>>()
+            })
     };
 
     match delete_result {

@@ -1832,6 +1832,13 @@ pub struct PutOptions {
     pub explicit_version_id: Option<String>,
 }
 
+#[derive(Debug)]
+enum SidecarPathMutation {
+    Absent,
+    Ready { from: String, to: String },
+    TargetExists,
+}
+
 impl Default for PutOptions {
     fn default() -> Self {
         Self {
@@ -6890,7 +6897,7 @@ impl PersistentStore {
         per_path_options.create_snapshot = false;
         for target in targets {
             let version_id = self
-                .tombstone_object(&target, per_path_options.clone())
+                .tombstone_object_single(&target, per_path_options.clone())
                 .await?;
             results.push(TombstonePathResult {
                 path: target,
@@ -6909,6 +6916,52 @@ impl PersistentStore {
     }
 
     pub async fn tombstone_object(&mut self, key: &str, options: PutOptions) -> Result<String> {
+        let deleted = self.tombstone_object_with_companions(key, options).await?;
+        Ok(deleted
+            .into_iter()
+            .next()
+            .expect("media tombstone must always produce a result")
+            .version_id)
+    }
+
+    /// Tombstones an object and its XMP sidecar, returning every affected path.
+    ///
+    /// The additional result lets callers publish replication and data-change
+    /// events for the sidecar rather than hiding a namespace mutation behind a
+    /// media-only API result.
+    pub async fn tombstone_object_with_companions(
+        &mut self,
+        key: &str,
+        options: PutOptions,
+    ) -> Result<Vec<TombstonePathResult>> {
+        let version_id = self.tombstone_object_single(key, options.clone()).await?;
+        let mut deleted = vec![TombstonePathResult {
+            path: key.to_owned(),
+            version_id,
+        }];
+
+        if is_sidecar_key(key) {
+            return Ok(deleted);
+        }
+
+        let sidecar_key = sidecar_key_for_media(key);
+        if self.current_object_entry(&sidecar_key).await?.is_none() {
+            return Ok(deleted);
+        }
+
+        let mut sidecar_options = options;
+        sidecar_options.parent_version_ids.clear();
+        sidecar_options.explicit_version_id = None;
+        let sidecar_version_id =
+            Box::pin(self.tombstone_object_single(&sidecar_key, sidecar_options)).await?;
+        deleted.push(TombstonePathResult {
+            path: sidecar_key,
+            version_id: sidecar_version_id,
+        });
+        Ok(deleted)
+    }
+
+    async fn tombstone_object_single(&mut self, key: &str, options: PutOptions) -> Result<String> {
         let object_id = self
             .object_id_for_key(key)
             .await?
@@ -7050,6 +7103,13 @@ impl PersistentStore {
             return Ok(PathMutationResult::TargetExists);
         }
 
+        let sidecar_mutation = self
+            .prepare_sidecar_path_mutation(from_path, to_path, false)
+            .await?;
+        if matches!(sidecar_mutation, SidecarPathMutation::TargetExists) {
+            return Ok(PathMutationResult::TargetExists);
+        }
+
         let Some(mut index) = self.load_version_index_by_object_id(&object_id).await? else {
             return Ok(PathMutationResult::SourceMissing);
         };
@@ -7140,12 +7200,29 @@ impl PersistentStore {
         // The media object already landed at `to_path` above, so the sidecar's
         // own ingest hook has a projection row to write into rather than
         // no-op'ing against one that does not exist yet.
-        let sidecar_from = sidecar_key_for_media(from_path);
-        let sidecar_to = sidecar_key_for_media(to_path);
-        if self.current_object_entry(&sidecar_from).await?.is_some() {
-            match Box::pin(self.rename_object_path(&sidecar_from, &sidecar_to, overwrite)).await? {
-                PathMutationResult::Applied | PathMutationResult::SourceMissing => {}
-                other => return Ok(other),
+        if let SidecarPathMutation::Ready {
+            from: sidecar_from,
+            to: sidecar_to,
+        } = sidecar_mutation
+        {
+            match Box::pin(self.rename_object_path(&sidecar_from, &sidecar_to, overwrite)).await {
+                Ok(PathMutationResult::Applied | PathMutationResult::SourceMissing) => {}
+                Ok(result) => warn!(
+                    from_path,
+                    to_path,
+                    sidecar_from,
+                    sidecar_to,
+                    ?result,
+                    "sidecar rename did not complete after its media had moved"
+                ),
+                Err(err) => warn!(
+                    from_path,
+                    to_path,
+                    sidecar_from,
+                    sidecar_to,
+                    error = %err,
+                    "sidecar rename failed after its media had moved"
+                ),
             }
         }
 
@@ -7167,6 +7244,13 @@ impl PersistentStore {
         };
 
         if self.current_object_entry(to_path).await?.is_some() && !overwrite {
+            return Ok(PathMutationResult::TargetExists);
+        }
+
+        let sidecar_mutation = self
+            .prepare_sidecar_path_mutation(from_path, to_path, overwrite)
+            .await?;
+        if matches!(sidecar_mutation, SidecarPathMutation::TargetExists) {
             return Ok(PathMutationResult::TargetExists);
         }
 
@@ -7213,16 +7297,58 @@ impl PersistentStore {
         // be copied alongside the media so the label survives, and it has to
         // happen after the media landed at `to_path` so the ingest hook has a
         // projection row to write into.
-        let sidecar_from = sidecar_key_for_media(from_path);
-        let sidecar_to = sidecar_key_for_media(to_path);
-        if self.current_object_entry(&sidecar_from).await?.is_some() {
-            match Box::pin(self.copy_object_path(&sidecar_from, &sidecar_to, overwrite)).await? {
-                PathMutationResult::Applied | PathMutationResult::SourceMissing => {}
-                other => return Ok(other),
+        if let SidecarPathMutation::Ready {
+            from: sidecar_from,
+            to: sidecar_to,
+        } = sidecar_mutation
+        {
+            match Box::pin(self.copy_object_path(&sidecar_from, &sidecar_to, overwrite)).await {
+                Ok(PathMutationResult::Applied | PathMutationResult::SourceMissing) => {}
+                Ok(result) => warn!(
+                    from_path,
+                    to_path,
+                    sidecar_from,
+                    sidecar_to,
+                    ?result,
+                    "sidecar copy did not complete after its media had copied"
+                ),
+                Err(err) => warn!(
+                    from_path,
+                    to_path,
+                    sidecar_from,
+                    sidecar_to,
+                    error = %err,
+                    "sidecar copy failed after its media had copied"
+                ),
             }
         }
 
         Ok(PathMutationResult::Applied)
+    }
+
+    /// Checks whether an existing XMP companion can follow a media path mutation.
+    ///
+    /// A conflict must be found before the media mutation is committed. Once the
+    /// media moves or copies, reporting a later sidecar conflict as the overall
+    /// result would tell callers that an operation failed even though it already
+    /// changed the namespace.
+    async fn prepare_sidecar_path_mutation(
+        &self,
+        from_path: &str,
+        to_path: &str,
+        overwrite: bool,
+    ) -> Result<SidecarPathMutation> {
+        let from = sidecar_key_for_media(from_path);
+        if self.current_object_entry(&from).await?.is_none() {
+            return Ok(SidecarPathMutation::Absent);
+        }
+
+        let to = sidecar_key_for_media(to_path);
+        if self.current_object_entry(&to).await?.is_some() && !overwrite {
+            return Ok(SidecarPathMutation::TargetExists);
+        }
+
+        Ok(SidecarPathMutation::Ready { from, to })
     }
 
     pub async fn restore_snapshot_path(

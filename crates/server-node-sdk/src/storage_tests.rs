@@ -3300,6 +3300,81 @@ run_on_all_metadata_backends!(
     copy_carries_the_sidecar_and_its_label_along_turso
 );
 
+/// A conflicting destination sidecar must reject the operation before the
+/// media mutation is persisted, otherwise callers receive a failure for a path
+/// that already moved or copied.
+async fn sidecar_target_conflicts_do_not_partially_apply_media_mutations_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("sidecar-target-conflict").await;
+
+    put_labelled_image(&mut store, "album/a.jpg", &["private"]).await;
+    store
+        .set_media_labels("album/b.jpg", vec!["stale".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .rename_object_path("album/a.jpg", "album/b.jpg", false)
+            .await
+            .unwrap(),
+        PathMutationResult::TargetExists,
+        "the sidecar conflict must be found before renaming the media"
+    );
+    assert_eq!(
+        store
+            .copy_object_path("album/a.jpg", "album/b.jpg", false)
+            .await
+            .unwrap(),
+        PathMutationResult::TargetExists,
+        "the sidecar conflict must be found before copying the media"
+    );
+
+    store
+        .get_object("album/a.jpg", None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("the source media must remain in place after both rejected operations");
+    assert!(
+        store
+            .get_object("album/b.jpg", None, None, ObjectReadMode::Preferred)
+            .await
+            .is_err(),
+        "neither rejected operation may create the destination media"
+    );
+    store
+        .get_object("album/a.jpg.xmp", None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("the source sidecar must remain in place");
+    store
+        .get_object("album/b.jpg.xmp", None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("the conflicting destination sidecar must remain in place");
+
+    assert_eq!(
+        store
+            .copy_object_path("album/a.jpg", "album/b.jpg", true)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied,
+        "copy with overwrite may replace a conflicting sidecar with the source label"
+    );
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/b.jpg").await,
+        vec!["private".to_string()],
+        "the copied media must not retain the destination sidecar's stale label"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    sidecar_target_conflicts_do_not_partially_apply_media_mutations_impl,
+    sidecar_target_conflicts_do_not_partially_apply_media_mutations,
+    sidecar_target_conflicts_do_not_partially_apply_media_mutations_turso
+);
+
 async fn reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_impl(
     backend: StorageTestBackend,
 ) {
@@ -7987,6 +8062,56 @@ run_on_all_metadata_backends!(
     gallery_label_filter_is_case_sensitive_turso
 );
 
+/// JSON string escaping must not turn a quote inside one label into the
+/// delimiter of a different label while filtering the projection.
+async fn gallery_label_filter_does_not_match_inside_quoted_labels_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("gallery-label-quoted").await;
+
+    put_labelled_image(&mut store, "album/exact.jpg", &["private"]).await;
+    put_labelled_image(&mut store, "album/embedded.jpg", &["a\"private"]).await;
+    put_labelled_image(&mut store, "album/leading.jpg", &["\"private"]).await;
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![
+            "album/embedded.jpg".to_string(),
+            "album/leading.jpg".to_string(),
+        ],
+        "excluding a label must not match within another JSON string"
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/exact.jpg".to_string()],
+        "requiring a label must not match within another JSON string"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_label_filter_does_not_match_inside_quoted_labels_impl,
+    gallery_label_filter_does_not_match_inside_quoted_labels,
+    gallery_label_filter_does_not_match_inside_quoted_labels_turso
+);
+
 /// A sidecar uploaded by a third-party tool next to an existing image has to
 /// reach the projection, because that is where the gallery reads labels from.
 async fn gallery_labels_follow_a_sidecar_upload_impl(backend: StorageTestBackend) {
@@ -8116,6 +8241,64 @@ run_on_all_metadata_backends!(
     gallery_labels_are_cleared_when_the_sidecar_is_deleted_impl,
     gallery_labels_are_cleared_when_the_sidecar_is_deleted,
     gallery_labels_are_cleared_when_the_sidecar_is_deleted_turso
+);
+
+/// Deleting media must delete its path-keyed sidecar too. Otherwise that stale
+/// metadata survives as an orphan and labels an unrelated future upload at the
+/// same path.
+async fn deleting_media_removes_its_sidecar_and_cannot_leak_labels_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("gallery-media-delete-sidecar").await;
+
+    put_labelled_image(&mut store, "album/photo.jpg", &["private"]).await;
+    let deleted = store
+        .tombstone_object_with_companions("album/photo.jpg", PutOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>(),
+        vec![
+            "album/photo.jpg".to_string(),
+            "album/photo.jpg.xmp".to_string()
+        ],
+        "callers must receive both paths so they can publish the complete delete"
+    );
+
+    assert!(
+        store
+            .get_object("album/photo.jpg.xmp", None, None, ObjectReadMode::Preferred,)
+            .await
+            .is_err(),
+        "deleting media must also remove its sidecar"
+    );
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        gallery_labels_for_key(&store, "album/photo.jpg")
+            .await
+            .is_empty(),
+        "a later upload must not inherit labels from deleted media"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    deleting_media_removes_its_sidecar_and_cannot_leak_labels_impl,
+    deleting_media_removes_its_sidecar_and_cannot_leak_labels,
+    deleting_media_removes_its_sidecar_and_cannot_leak_labels_turso
 );
 
 /// Sidecars come from foreign tools, so a broken packet is an expected input.

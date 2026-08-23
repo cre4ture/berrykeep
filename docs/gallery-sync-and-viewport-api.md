@@ -130,6 +130,8 @@ admin authorization as other admin store routes.
 `/store/rename` and `/store/copy` carry a media object's sidecar along automatically: renaming or
 copying `album/photo.jpg` also renames or copies `album/photo.jpg.xmp` when one exists, so a
 label survives the operation instead of staying orphaned at the old path.
+Deleting `album/photo.jpg` also deletes its sidecar, so a later unrelated upload at that path
+cannot inherit labels from deleted media.
 
 Gallery queries and viewport queries accept a label filter:
 
