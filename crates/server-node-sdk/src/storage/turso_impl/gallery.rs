@@ -13,8 +13,8 @@ use super::super::{
     GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery, ManifestSummary,
     current_media_cache_metadata, decode_gallery_labels, effective_gallery_captured_at_unix,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_label_predicates, gallery_media_type_for_path, sqlite_like_prefix_pattern,
-    version_created_at_unix_from_payload,
+    gallery_label_filter_matches_json, gallery_label_predicates, gallery_media_type_for_path,
+    sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
 };
 #[cfg(test)]
 use super::turso_test_db_path;
@@ -58,7 +58,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                 previous_inferred_media_type TEXT,
                 previous_media_type TEXT,
                 previous_latitude REAL,
-                previous_longitude REAL
+                previous_longitude REAL,
+                previous_labels_json TEXT NOT NULL DEFAULT '[]'
             );
 
             CREATE INDEX IF NOT EXISTS idx_gallery_objects_media_order
@@ -77,6 +78,13 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
         "gallery_objects",
         GALLERY_LABELS_COLUMN,
         GALLERY_LABELS_COLUMN_DEFINITION,
+    )
+    .await?;
+    super::add_column_if_missing(
+        connection,
+        "gallery_changes",
+        "previous_labels_json",
+        "TEXT NOT NULL DEFAULT '[]'",
     )
     .await?;
     connection
@@ -135,7 +143,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                     previous_inferred_media_type,
                     previous_media_type,
                     previous_latitude,
-                    previous_longitude
+                    previous_longitude,
+                    previous_labels_json
                 )
                 SELECT
                     CAST(value AS INTEGER),
@@ -144,7 +153,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                     OLD.inferred_media_type,
                     OLD.media_type,
                     OLD.latitude,
-                    OLD.longitude
+                    OLD.longitude,
+                    OLD.labels_json
                   FROM metadata_meta WHERE key = 'gallery_revision';
                 DELETE FROM gallery_changes
                  WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};
@@ -163,7 +173,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                     previous_inferred_media_type,
                     previous_media_type,
                     previous_latitude,
-                    previous_longitude
+                    previous_longitude,
+                    previous_labels_json
                 )
                 SELECT
                     CAST(value AS INTEGER),
@@ -172,7 +183,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                     OLD.inferred_media_type,
                     OLD.media_type,
                     OLD.latitude,
-                    OLD.longitude
+                    OLD.longitude,
+                    OLD.labels_json
                   FROM metadata_meta WHERE key = 'gallery_revision';
                 DELETE FROM gallery_changes
                  WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};
@@ -1071,7 +1083,8 @@ async fn query_gallery_delta(
                  previous_inferred_media_type,
                  previous_media_type,
                  previous_latitude,
-                 previous_longitude
+                 previous_longitude,
+                 previous_labels_json
              FROM gallery_changes
              WHERE revision > ?1
              ORDER BY revision ASC
@@ -1091,6 +1104,7 @@ async fn query_gallery_delta(
             row_opt_string(&row, 3, "gallery_changes.previous_media_type")?,
             row_opt_f64(&row, 4, "gallery_changes.previous_latitude")?,
             row_opt_f64(&row, 5, "gallery_changes.previous_longitude")?,
+            row_string(&row, 6, "gallery_changes.previous_labels_json")?,
         ));
     }
     let has_more = raw_changes.len() > limit;
@@ -1107,6 +1121,7 @@ async fn query_gallery_delta(
         previous_media_type,
         previous_latitude,
         previous_longitude,
+        previous_labels_json,
     ) in raw_changes
     {
         let entry = query_gallery_entry(connection, &key, scope).await?;
@@ -1124,6 +1139,7 @@ async fn query_gallery_delta(
                 previous_longitude,
                 scope,
             )
+            && gallery_label_filter_matches_json(&previous_labels_json, &scope.label_filter)?
         {
             changes.push(GalleryDeltaChange {
                 key,

@@ -18,10 +18,10 @@ use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
-    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GalleryDeltaChange,
-    GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope,
-    GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage,
-    GalleryIndexQuery, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
+    GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
+    GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
+    GalleryIndexPage, GalleryIndexQuery, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
     ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
     RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
@@ -30,8 +30,8 @@ use super::{
     StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
     decode_gallery_labels, decompress_snapshot_json, effective_gallery_captured_at_unix,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_label_predicates, gallery_media_type_for_path, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
+    gallery_label_filter_matches_json, gallery_label_predicates, gallery_media_type_for_path,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload,
 };
 
@@ -961,7 +961,8 @@ fn query_gallery_delta_in_transaction(
              previous_inferred_media_type,
              previous_media_type,
              previous_latitude,
-             previous_longitude
+             previous_longitude,
+             previous_labels_json
          FROM gallery_changes
          WHERE revision > ?1
          ORDER BY revision ASC
@@ -975,6 +976,7 @@ fn query_gallery_delta_in_transaction(
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<f64>>(4)?,
             row.get::<_, Option<f64>>(5)?,
+            row.get::<_, String>(6)?,
         ))
     })?;
     let mut raw_changes = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -992,6 +994,7 @@ fn query_gallery_delta_in_transaction(
         previous_media_type,
         previous_latitude,
         previous_longitude,
+        previous_labels_json,
     ) in raw_changes
     {
         let entry = query_gallery_entry_from_db(db, &key, scope)?;
@@ -1009,6 +1012,7 @@ fn query_gallery_delta_in_transaction(
                 previous_longitude,
                 scope,
             )
+            && gallery_label_filter_matches_json(&previous_labels_json, &scope.label_filter)?
         {
             changes.push(GalleryDeltaChange {
                 key,
@@ -1084,6 +1088,32 @@ fn map_tokio_rusqlite_error(error: tokio_rusqlite::Error) -> anyhow::Error {
 
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
+    async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![GALLERY_SIDECAR_LABEL_BACKFILL_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_none())
+        })
+        .await
+    }
+
+    async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![GALLERY_SIDECAR_LABEL_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn load_current_state(&self) -> Result<CurrentState> {
         self.read(|db| load_current_state_from_db(db)).await
     }
@@ -3495,7 +3525,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             previous_inferred_media_type TEXT,
             previous_media_type TEXT,
             previous_latitude REAL,
-            previous_longitude REAL
+            previous_longitude REAL,
+            previous_labels_json TEXT NOT NULL DEFAULT '[]'
         );
 
         CREATE TABLE IF NOT EXISTS version_indexes (
@@ -3731,6 +3762,12 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_media_type", "TEXT")?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_longitude", "REAL")?;
+    add_sqlite_column_if_missing(
+        db,
+        "gallery_changes",
+        "previous_labels_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_gallery_objects_viewport
          ON gallery_objects(latitude, longitude, media_type, captured_at_unix DESC, key ASC)",
@@ -3855,7 +3892,8 @@ fn init_gallery_change_log(db: &Connection) -> Result<()> {
                 previous_inferred_media_type,
                 previous_media_type,
                 previous_latitude,
-                previous_longitude
+                previous_longitude,
+                previous_labels_json
             )
             SELECT
                 CAST(value AS INTEGER),
@@ -3864,7 +3902,8 @@ fn init_gallery_change_log(db: &Connection) -> Result<()> {
                 OLD.inferred_media_type,
                 OLD.media_type,
                 OLD.latitude,
-                OLD.longitude
+                OLD.longitude,
+                OLD.labels_json
               FROM metadata_meta WHERE key = 'gallery_revision';
             DELETE FROM gallery_changes
              WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};
@@ -3883,7 +3922,8 @@ fn init_gallery_change_log(db: &Connection) -> Result<()> {
                 previous_inferred_media_type,
                 previous_media_type,
                 previous_latitude,
-                previous_longitude
+                previous_longitude,
+                previous_labels_json
             )
             SELECT
                 CAST(value AS INTEGER),
@@ -3892,7 +3932,8 @@ fn init_gallery_change_log(db: &Connection) -> Result<()> {
                 OLD.inferred_media_type,
                 OLD.media_type,
                 OLD.latitude,
-                OLD.longitude
+                OLD.longitude,
+                OLD.labels_json
               FROM metadata_meta WHERE key = 'gallery_revision';
             DELETE FROM gallery_changes
              WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};

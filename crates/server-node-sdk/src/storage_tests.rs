@@ -668,6 +668,42 @@ impl StorageTestBackend {
             Self::Turso => false,
         }
     }
+
+    /// Puts a current database in the state from immediately before the sidecar
+    /// label backfill existed, while retaining its real media and sidecar data.
+    async fn reset_gallery_sidecar_label_backfill(self, root: &Path) {
+        match self {
+            Self::Sqlite => {
+                let database = rusqlite::Connection::open(root.join("state/metadata.sqlite"))
+                    .expect("sqlite metadata database should open");
+                database
+                    .execute_batch(
+                        "UPDATE gallery_objects SET labels_json = '[]';
+                         DELETE FROM metadata_meta
+                          WHERE key = 'gallery_sidecar_labels_v1';",
+                    )
+                    .expect("legacy sqlite label projection should persist");
+            }
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => {
+                let database = turso::Builder::new_local(
+                    &root.join("state/metadata.turso.db").to_string_lossy(),
+                )
+                .build()
+                .await
+                .expect("turso metadata database should open");
+                let connection = database.connect().expect("turso metadata should connect");
+                connection
+                    .execute_batch(
+                        "UPDATE gallery_objects SET labels_json = '[]';
+                         DELETE FROM metadata_meta
+                          WHERE key = 'gallery_sidecar_labels_v1';",
+                    )
+                    .await
+                    .expect("legacy Turso label projection should persist");
+            }
+        }
+    }
 }
 
 macro_rules! run_on_all_metadata_backends {
@@ -8247,6 +8283,137 @@ run_on_all_metadata_backends!(
     gallery_labels_follow_a_sidecar_upload_impl,
     gallery_labels_follow_a_sidecar_upload,
     gallery_labels_follow_a_sidecar_upload_turso
+);
+
+/// Existing XMP sidecars must populate the new projection column on upgrade;
+/// otherwise `exclude_labels=private` would disclose media until it was
+/// re-uploaded.
+async fn gallery_label_backfill_replays_existing_sidecars_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-label-backfill").await;
+    let media_key = "album/photo.jpg";
+
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            sample_xmp_sidecar_bytes(&["private"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    backend.reset_gallery_sidecar_label_backfill(&root).await;
+    let store = backend.open_store(root.clone()).await;
+
+    assert_eq!(
+        gallery_labels_for_key(&store, media_key).await,
+        vec!["private".to_string()],
+        "the one-time backfill must recover labels from a sidecar that predates the projection"
+    );
+    assert!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await
+        .is_empty(),
+        "backfilled private media must be excluded immediately after upgrade"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_label_backfill_replays_existing_sidecars_impl,
+    gallery_label_backfill_replays_existing_sidecars,
+    gallery_label_backfill_replays_existing_sidecars_turso
+);
+
+/// A delta only removes an entry when the caller could have held it before the
+/// change. In particular, a scope that excludes `private` must not disclose a
+/// private key merely because another label on it changes.
+async fn gallery_delta_does_not_disclose_previously_filtered_labelled_paths_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("gallery-delta-label-privacy").await;
+    let media_key = "family/private-scan.jpg";
+    put_labelled_image(&mut store, media_key, &["private"]).await;
+
+    let label_filter = GalleryLabelFilter {
+        excluded: vec!["private".to_string()],
+        ..Default::default()
+    };
+    let index = store
+        .query_gallery_index(&GalleryIndexQuery {
+            prefix: String::new(),
+            depth: 8,
+            media_filter: GalleryIndexMediaFilter::All,
+            captured_sort: GalleryIndexCapturedSort::Desc,
+            offset: 0,
+            limit: 64,
+            viewport: None,
+            label_filter: label_filter.clone(),
+        })
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page");
+    assert!(
+        index.entries.is_empty(),
+        "the private image must stay unseen"
+    );
+
+    store
+        .set_media_labels(
+            media_key,
+            vec!["private".to_string(), "refreshed".to_string()],
+        )
+        .await
+        .unwrap()
+        .expect("the changed sidecar must create a gallery change");
+
+    let delta = store
+        .query_gallery_delta(
+            &index.history_id,
+            index.revision,
+            64,
+            &GalleryDeltaScope {
+                prefix: String::new(),
+                depth: 8,
+                media_filter: GalleryIndexMediaFilter::All,
+                captured_sort: GalleryIndexCapturedSort::Desc,
+                viewport: None,
+                label_filter,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve deltas")
+        .expect("the delta cursor should remain valid");
+    assert!(
+        delta.changes.iter().all(|change| change.key != media_key),
+        "a private key absent from the original index must not be disclosed as a removal"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_delta_does_not_disclose_previously_filtered_labelled_paths_impl,
+    gallery_delta_does_not_disclose_previously_filtered_labelled_paths,
+    gallery_delta_does_not_disclose_previously_filtered_labelled_paths_turso
 );
 
 /// Sidecars are relevant only to gallery media. A non-media `.xmp` upload must

@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
+pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
 
 fn current_objects_cache_capacity() -> usize {
     std::env::var("IRONMESH_CURRENT_OBJECTS_CACHE_CAPACITY")
@@ -72,7 +73,8 @@ pub(crate) use gallery_capture_time::effective_gallery_captured_at_unix;
 pub(super) use gallery_capture_time::version_created_at_unix_from_payload;
 pub(super) use gallery_labels::{
     GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GalleryLabelFilter,
-    decode_gallery_labels, encode_gallery_labels, gallery_label_predicates,
+    decode_gallery_labels, encode_gallery_labels, gallery_label_filter_matches_json,
+    gallery_label_predicates,
 };
 use media_cache::MediaCacheBuildConfig;
 #[cfg(test)]
@@ -113,7 +115,7 @@ const STORAGE_POOL_CONFIG_VERSION: u32 = 1;
 /// cameras and photo tools stay in the kilobyte range; the bound keeps an
 /// arbitrary object that merely carries the `.xmp` suffix from being assembled
 /// in full just to be parsed.
-const MAX_SIDECAR_INGEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SIDECAR_INGEST_BYTES: usize = 256 * 1024;
 
 /// Returned when changing labels would produce a sidecar that label ingest
 /// would later refuse to read.
@@ -2326,6 +2328,12 @@ struct ArchivedTombstoneIndexRecord {
 
 #[async_trait]
 trait MetadataStore: Send + Sync {
+    /// Whether current XMP sidecars still need a one-time label projection
+    /// backfill after this feature was introduced.
+    async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool>;
+    /// Marks the sidecar label projection backfill complete only after every
+    /// current sidecar has been considered successfully.
+    async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()>;
     async fn load_current_state(&self) -> Result<CurrentState>;
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
@@ -3390,7 +3398,7 @@ impl PersistentStore {
             storage_stats_lock.clone(),
         );
 
-        Ok(Self {
+        let store = Self {
             root_dir,
             storage_pool,
             metadata_backend_kind: backend,
@@ -3407,7 +3415,43 @@ impl PersistentStore {
             media_tools: MediaToolPaths::default(),
             #[cfg(test)]
             data_scrub_run_test_hook: None,
-        })
+        };
+        store
+            .backfill_gallery_labels_from_current_sidecars()
+            .await?;
+        Ok(store)
+    }
+
+    /// Replays existing XMP sidecars into the gallery label projection once per
+    /// metadata database. New uploads are handled by the normal ingest hooks;
+    /// this covers sidecars that already existed when the label column was
+    /// introduced.
+    async fn backfill_gallery_labels_from_current_sidecars(&self) -> Result<()> {
+        if !self
+            .metadata_store
+            .gallery_sidecar_labels_backfill_needed()
+            .await?
+        {
+            return Ok(());
+        }
+
+        let current = self.metadata_store.load_current_state().await?;
+        for (sidecar_key, sidecar_manifest_hash) in &current.objects {
+            let Some(media_key) = media_key_for_sidecar(sidecar_key) else {
+                continue;
+            };
+            if gallery_media_type_for_path(&media_key).is_none()
+                || !current.objects.contains_key(&media_key)
+            {
+                continue;
+            }
+            self.apply_sidecar_labels(&media_key, sidecar_manifest_hash)
+                .await?;
+        }
+
+        self.metadata_store
+            .mark_gallery_sidecar_labels_backfill_complete()
+            .await
     }
 
     pub(crate) fn chunk_ingestor(&self) -> ChunkIngestor {

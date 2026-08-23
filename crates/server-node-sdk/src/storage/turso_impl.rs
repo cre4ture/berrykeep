@@ -17,16 +17,16 @@ const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GalleryDeltaCursorError, GalleryDeltaPage,
-    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, METADATA_SCHEMA_VERSION_CURRENT,
-    ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
-    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
-    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
-    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
-    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
-    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
-    compress_snapshot_json, decompress_snapshot_json, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs,
+    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
+    GalleryDeltaCursorError, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexPage,
+    GalleryIndexQuery, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
+    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
+    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
+    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
+    StorageStatsSample, StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -112,6 +112,29 @@ impl TursoMetadataStore {
 
 #[async_trait]
 impl MetadataStore for TursoMetadataStore {
+    async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (GALLERY_SIDECAR_LABEL_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(rows.next().await?.is_none())
+    }
+
+    async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (GALLERY_SIDECAR_LABEL_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn load_current_state(&self) -> Result<CurrentState> {
         let mut rows = self
             .connection

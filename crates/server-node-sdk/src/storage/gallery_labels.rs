@@ -59,6 +59,26 @@ impl GalleryLabelFilter {
     }
 }
 
+/// Returns whether `labels` satisfy `filter` using the same exact-match
+/// semantics as [`gallery_label_predicates`].
+pub(crate) fn gallery_label_filter_matches(labels: &[String], filter: &GalleryLabelFilter) -> bool {
+    filter.required.iter().all(|label| labels.contains(label))
+        && filter.excluded.iter().all(|label| !labels.contains(label))
+}
+
+/// Decodes a persisted label list before applying a filter to a historical
+/// gallery change. Invalid stored data fails closed instead of leaking a key
+/// through a delta removal.
+pub(crate) fn gallery_label_filter_matches_json(
+    labels_json: &str,
+    filter: &GalleryLabelFilter,
+) -> Result<bool> {
+    Ok(gallery_label_filter_matches(
+        &decode_gallery_labels(labels_json)?,
+        filter,
+    ))
+}
+
 /// Renders `filter` as SQL predicates plus their bind values.
 ///
 /// Placeholders are numbered from `first_placeholder`, so a caller can append
@@ -128,6 +148,25 @@ mod tests {
     #[test]
     fn the_column_default_decodes_to_no_labels() {
         assert!(decode_gallery_labels(EMPTY_LABELS_JSON).unwrap().is_empty());
+    }
+
+    #[test]
+    fn label_filter_matching_agrees_with_the_listing_predicates() {
+        let labels = vec!["beach".to_string(), "private".to_string()];
+        assert!(gallery_label_filter_matches(
+            &labels,
+            &GalleryLabelFilter {
+                required: vec!["beach".to_string()],
+                excluded: vec!["nsfw".to_string()],
+            }
+        ));
+        assert!(!gallery_label_filter_matches(
+            &labels,
+            &GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        ));
     }
 
     #[test]
