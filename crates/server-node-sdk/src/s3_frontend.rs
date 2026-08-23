@@ -2673,11 +2673,20 @@ async fn execute_s3_current_object_delete(
 ) -> Result<S3DeleteExecutionOutcome, S3DeleteExecutionError> {
     let actor = s3_actor_context(&request.access_key);
     let mut store = lock_store(state, "s3.delete_object.store").await;
-    let version_id = store
-        .tombstone_object(full_key, PutOptions::default())
+    let deleted_paths = store
+        .tombstone_object_with_companions(full_key, PutOptions::default())
         .await
         .map_err(|err| {
             S3DeleteExecutionError::Internal(format!("failed to delete S3 object: {err:#}"))
+        })?;
+    let version_id = deleted_paths
+        .iter()
+        .find(|entry| entry.path == full_key)
+        .map(|entry| entry.version_id.clone())
+        .ok_or_else(|| {
+            S3DeleteExecutionError::Internal(format!(
+                "S3 delete did not produce a tombstone for {full_key}"
+            ))
         })?;
     let s3_object_version = S3ObjectVersionRecord {
         bucket_name: bucket.bucket_name.clone(),
@@ -2696,8 +2705,13 @@ async fn execute_s3_current_object_delete(
 
     publish_namespace_change(state);
     let mut cluster = state.cluster.lock().await;
-    cluster.note_replica(full_key, state.node_id);
-    cluster.note_replica(format!("{}@{}", full_key, version_id), state.node_id);
+    for deleted in &deleted_paths {
+        cluster.note_replica(&deleted.path, state.node_id);
+        cluster.note_replica(
+            format!("{}@{}", deleted.path, deleted.version_id),
+            state.node_id,
+        );
+    }
     drop(cluster);
     if let Err(err) = persist_cluster_replicas_state(state).await {
         warn!(
@@ -2710,11 +2724,15 @@ async fn execute_s3_current_object_delete(
         state.autonomous_replication_on_put_enabled,
         false,
     ) {
-        enqueue_autonomous_post_write_replication(
-            state,
-            autonomous_post_write_replication_subjects(full_key, &version_id),
-        )
-        .await;
+        let mut subjects = BTreeSet::new();
+        for deleted in &deleted_paths {
+            append_autonomous_post_write_replication_subjects(
+                &mut subjects,
+                &deleted.path,
+                &deleted.version_id,
+            );
+        }
+        enqueue_autonomous_post_write_replication(state, subjects).await;
     }
     record_data_change_event(
         state,
@@ -2725,7 +2743,7 @@ async fn execute_s3_current_object_delete(
             from_path: None,
             to_path: None,
             recursive: false,
-            affected_path_count: 1,
+            affected_path_count: deleted_paths.len(),
             total_size_bytes: None,
             version_id: Some(version_id.clone()),
             snapshot_id: None,

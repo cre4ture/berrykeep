@@ -4306,7 +4306,7 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
     assert!(!put_version_id.is_empty());
 
     {
-        let store = lock_store(&state, "tests.s3_listener.verify_put_metadata").await;
+        let mut store = lock_store(&state, "tests.s3_listener.verify_put_metadata").await;
         let metadata = store
             .load_object_version_metadata(&put_version_id)
             .await
@@ -4332,6 +4332,12 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
             .unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version_id, put_version_id);
+
+        store
+            .set_media_labels("tenant/photos/docs/hello.txt", vec!["private".to_string()])
+            .await
+            .unwrap()
+            .expect("the label API must create a sidecar for the S3 object");
     }
 
     let list_objects = app
@@ -4441,6 +4447,18 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
             versions
                 .iter()
                 .any(|record| record.version_id == delete_version_id)
+        );
+        assert!(
+            store
+                .get_object(
+                    "tenant/photos/docs/hello.txt.xmp",
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .is_err(),
+            "deleting a media object through S3 must tombstone its label sidecar too"
         );
     }
 
