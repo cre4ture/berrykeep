@@ -2014,6 +2014,48 @@ fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
     assert!(antimeridian.west > antimeridian.east);
 }
 
+#[tokio::test]
+async fn gallery_label_filter_limit_returns_bad_request() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let labels = (0..=super::MAX_GALLERY_LABEL_FILTER_LABELS)
+        .map(|index| format!("label-{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(64),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(100),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+                south: None,
+                west: None,
+                north: None,
+                east: None,
+                require_labels: Some(labels),
+                exclude_labels: None,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        payload["error"],
+        "at most 64 labels may be specified across require_labels and exclude_labels"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
 #[cfg(feature = "turso-metadata")]
 #[tokio::test]
 async fn turso_gallery_projection_supports_viewport_and_delta() {
@@ -13456,6 +13498,37 @@ async fn set_media_labels_handler_writes_the_sidecar_object_impl(backend: MainTe
         StatusCode::BAD_REQUEST,
         "labels address the media object, never its sidecar"
     );
+
+    let oversized_media_key = "album/oversized.jpg";
+    let oversized = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: oversized_media_key.to_string(),
+            labels: vec!["x".repeat(4 * 1024 * 1024)],
+        }),
+    )
+    .await;
+    assert_eq!(
+        oversized.status(),
+        StatusCode::BAD_REQUEST,
+        "a label update that would create an unreadable sidecar is a client error"
+    );
+    {
+        let store = read_store(&state, "tests.media_labels.oversized_sidecar").await;
+        assert!(
+            store
+                .get_object(
+                    "album/oversized.jpg.xmp",
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .is_err(),
+            "the rejected update must not create a sidecar object"
+        );
+    }
 
     let applied = super::set_media_labels(
         axum::extract::State(state.clone()),

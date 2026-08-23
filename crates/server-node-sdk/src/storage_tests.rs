@@ -8590,6 +8590,52 @@ run_on_all_metadata_backends!(
     media_labels_refuse_to_overwrite_a_malformed_sidecar_turso
 );
 
+/// A label update must never create a sidecar that later label reads reject.
+async fn media_labels_refuse_sidecars_larger_than_the_ingest_limit_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("media-labels-size-limit").await;
+    let media_key = "album/photo.jpg";
+
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .set_media_labels(media_key, vec!["kept".to_string()])
+        .await
+        .unwrap()
+        .expect("the initial sidecar must be stored");
+    let before = stored_sidecar_text(&store, media_key).await;
+
+    let error = store
+        .set_media_labels(media_key, vec!["x".repeat(MAX_SIDECAR_INGEST_BYTES)])
+        .await
+        .expect_err("an oversized serialized sidecar must be rejected");
+    assert!(
+        error.downcast_ref::<SidecarWriteSizeLimitError>().is_some(),
+        "the caller needs a distinct error to map this request to 400: {error:#}"
+    );
+    assert_eq!(
+        stored_sidecar_text(&store, media_key).await,
+        before,
+        "a rejected update must preserve the readable sidecar that was already stored"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_refuse_sidecars_larger_than_the_ingest_limit_impl,
+    media_labels_refuse_sidecars_larger_than_the_ingest_limit,
+    media_labels_refuse_sidecars_larger_than_the_ingest_limit_turso
+);
+
 /// Storing the labels a media object already has must not spend an object
 /// version, and media without labels must not gain an empty sidecar object.
 async fn media_labels_skip_writes_that_change_nothing_impl(backend: StorageTestBackend) {

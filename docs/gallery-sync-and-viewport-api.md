@@ -126,6 +126,9 @@ POST /api/v1/store/labels
 partial add/remove. Writing an unchanged set, or clearing labels on media that has no sidecar
 yet, is a no-op and creates no object version. `POST /api/v1/auth/store/labels` applies the same
 admin authorization as other admin store routes.
+If the resulting XMP sidecar would exceed 4 MiB, the request is rejected with `400` and any
+existing sidecar remains unchanged, matching the maximum sidecar size accepted during label
+ingest.
 
 `/store/rename` and `/store/copy` carry a media object's sidecar along automatically: renaming or
 copying `album/photo.jpg` also renames or copies `album/photo.jpg.xmp` when one exists, so a
@@ -144,7 +147,8 @@ Both accept a comma-separated label list. `require_labels` keeps only entries ca
 listed label; `exclude_labels` drops any entry carrying any listed label. The motivating case is
 `exclude_labels=private`, which is how a client keeps labelled-private media out of its default
 gallery view. Labels are matched exactly: excluding `private` does not affect `not-private` or
-`private-beach`.
+`private-beach`. To bound the gallery query cost, at most 64 non-blank labels may be supplied
+across both parameters; requests over that limit receive `400`.
 
 The label filter is part of the query's normalized membership, exactly like prefix, depth, media
 filter, and viewport: it is captured in the `sync_token`, and the delta feed reconciles it the

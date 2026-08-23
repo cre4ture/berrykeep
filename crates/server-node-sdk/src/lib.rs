@@ -13134,6 +13134,9 @@ struct StoreIndexQuery {
     exclude_labels: Option<String>,
 }
 
+/// Bounds the number of correlated JSON predicates a gallery query can add.
+const MAX_GALLERY_LABEL_FILTER_LABELS: usize = 64;
+
 /// Splits a comma-separated label parameter into the labels it names.
 ///
 /// Blank entries are dropped, so a trailing comma or an empty parameter does
@@ -13148,6 +13151,19 @@ fn store_index_labels(raw: Option<&String>) -> Vec<String> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+fn store_index_label_filter(
+    query: &StoreIndexQuery,
+) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
+    let required = store_index_labels(query.require_labels.as_ref());
+    let excluded = store_index_labels(query.exclude_labels.as_ref());
+    if required.len() > MAX_GALLERY_LABEL_FILTER_LABELS
+        || excluded.len() > MAX_GALLERY_LABEL_FILTER_LABELS - required.len()
+    {
+        return Err("at most 64 labels may be specified across require_labels and exclude_labels");
+    }
+    Ok(storage::GalleryLabelFilter { required, excluded })
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -14285,6 +14301,18 @@ async fn set_media_labels_response(
                 "stored media labels"
             );
             StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err)
+            if err
+                .downcast_ref::<storage::SidecarWriteSizeLimitError>()
+                .is_some() =>
+        {
+            tracing::warn!(path, error = %err, "refused media labels that exceed the sidecar size limit");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response()
         }
         Err(err) => {
             tracing::error!(path, error = %err, "failed to store media labels");
@@ -15780,15 +15808,15 @@ fn store_index_viewport_bounds(
 /// to be told the request could not be honoured rather than silently receiving
 /// an unfiltered `200` -- the motivating use case is keeping `private` media
 /// out of a view, so a silent fallback would leak it.
-fn store_index_label_filter_requested(query: &StoreIndexQuery) -> bool {
-    !store_index_labels(query.require_labels.as_ref()).is_empty()
-        || !store_index_labels(query.exclude_labels.as_ref()).is_empty()
+fn store_index_label_filter_requested(label_filter: &storage::GalleryLabelFilter) -> bool {
+    !label_filter.is_empty()
 }
 
 fn store_index_gallery_query(
     query: &StoreIndexQuery,
     prefix: &str,
     depth: usize,
+    label_filter: storage::GalleryLabelFilter,
 ) -> Option<storage::GalleryIndexQuery> {
     if query.snapshot.is_some() || query.cursor.is_some() || query.page_size.is_some() {
         return None;
@@ -15811,10 +15839,7 @@ fn store_index_gallery_query(
         offset: query.offset.unwrap_or(0),
         limit: query.limit?.max(1),
         viewport: store_index_viewport_bounds(query).ok()?,
-        label_filter: storage::GalleryLabelFilter {
-            required: store_index_labels(query.require_labels.as_ref()),
-            excluded: store_index_labels(query.exclude_labels.as_ref()),
-        },
+        label_filter,
     })
 }
 
@@ -16010,6 +16035,12 @@ async fn list_store_index_response_attempt(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
         }
     };
+    let label_filter = match store_index_label_filter(&query) {
+        Ok(label_filter) => label_filter,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
     let request_id = Uuid::new_v4();
     let request_started_at = Instant::now();
     let prefix = query.prefix.clone().unwrap_or_default();
@@ -16022,8 +16053,8 @@ async fn list_store_index_response_attempt(
         .namespace_change_sequence
         .load(Ordering::SeqCst);
 
-    let label_filter_requested = store_index_label_filter_requested(&query);
-    let gallery_query = store_index_gallery_query(&query, &prefix, depth);
+    let label_filter_requested = store_index_label_filter_requested(&label_filter);
+    let gallery_query = store_index_gallery_query(&query, &prefix, depth, label_filter);
     if viewport.is_some() && gallery_query.is_none() {
         return (
             StatusCode::BAD_REQUEST,

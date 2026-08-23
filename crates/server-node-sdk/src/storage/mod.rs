@@ -115,6 +115,25 @@ const STORAGE_POOL_CONFIG_VERSION: u32 = 1;
 /// in full just to be parsed.
 const MAX_SIDECAR_INGEST_BYTES: usize = 4 * 1024 * 1024;
 
+/// Returned when changing labels would produce a sidecar that label ingest
+/// would later refuse to read.
+#[derive(Debug)]
+pub(crate) struct SidecarWriteSizeLimitError {
+    actual_size_bytes: usize,
+}
+
+impl std::fmt::Display for SidecarWriteSizeLimitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "serialized XMP sidecar of {} bytes exceeds the ingest limit of {MAX_SIDECAR_INGEST_BYTES} bytes",
+            self.actual_size_bytes
+        )
+    }
+}
+
+impl std::error::Error for SidecarWriteSizeLimitError {}
+
 fn manifest_hash_looks_safe_filename(manifest_hash: &str) -> bool {
     manifest_hash.len() == blake3::OUT_LEN * 2
         && manifest_hash.chars().all(|ch| ch.is_ascii_hexdigit())
@@ -8275,6 +8294,12 @@ impl PersistentStore {
         let bytes = sidecar
             .to_bytes()
             .with_context(|| format!("failed to serialize the XMP sidecar {sidecar_key}"))?;
+        if bytes.len() > MAX_SIDECAR_INGEST_BYTES {
+            return Err(SidecarWriteSizeLimitError {
+                actual_size_bytes: bytes.len(),
+            }
+            .into());
+        }
 
         self.put_object_versioned(&sidecar_key, Bytes::from(bytes), PutOptions::default())
             .await
