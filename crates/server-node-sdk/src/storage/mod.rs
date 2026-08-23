@@ -7118,7 +7118,7 @@ impl PersistentStore {
         }
 
         let sidecar_mutation = self
-            .prepare_sidecar_path_mutation(from_path, to_path, false)
+            .prepare_sidecar_path_mutation(from_path, to_path, overwrite)
             .await?;
         if matches!(sidecar_mutation, SidecarPathMutation::TargetExists) {
             return Ok(PathMutationResult::TargetExists);
