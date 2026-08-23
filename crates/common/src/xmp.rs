@@ -177,7 +177,12 @@ impl XmpSidecar {
             subject.push_attribute((declaration.attribute.as_str(), declaration.namespace));
         }
 
-        let mut events = Vec::with_capacity(6 + self.keywords.len() * 4);
+        // No capacity pre-allocation: `self.keywords.len()` can originate from
+        // an externally supplied sidecar (a synced third-party `.xmp` file or a
+        // `/store/labels` request), and reserving space proportional to it in
+        // one allocation would let a crafted keyword list trigger a single
+        // outsized allocation. `Vec::push` grows amortized instead.
+        let mut events = Vec::new();
         self.push_line_break(&mut events, 1);
         events.push(Event::Start(subject));
         self.push_line_break(&mut events, 2);
