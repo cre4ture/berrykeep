@@ -153,9 +153,12 @@ mod web_maps;
 
 #[cfg(test)]
 use gallery_sync::GallerySyncScope;
+#[cfg(test)]
+use gallery_sync::MAX_GALLERY_LABEL_FILTER_LABELS;
 use gallery_sync::{
     GallerySyncTokenPayload, decode_gallery_sync_token, encode_gallery_sync_token,
-    gallery_delta_scope_from_sync, gallery_sync_scope_from_query,
+    gallery_delta_scope_from_sync, gallery_label_filter_is_within_limit,
+    gallery_sync_scope_from_query,
 };
 
 const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -13134,9 +13137,6 @@ struct StoreIndexQuery {
     exclude_labels: Option<String>,
 }
 
-/// Bounds the number of correlated JSON predicates a gallery query can add.
-const MAX_GALLERY_LABEL_FILTER_LABELS: usize = 64;
-
 /// Splits a comma-separated label parameter into the labels it names.
 ///
 /// Blank entries are dropped, so a trailing comma or an empty parameter does
@@ -13158,12 +13158,11 @@ fn store_index_label_filter(
 ) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
     let required = store_index_labels(query.require_labels.as_ref());
     let excluded = store_index_labels(query.exclude_labels.as_ref());
-    if required.len() > MAX_GALLERY_LABEL_FILTER_LABELS
-        || excluded.len() > MAX_GALLERY_LABEL_FILTER_LABELS - required.len()
-    {
+    let label_filter = storage::GalleryLabelFilter { required, excluded };
+    if !gallery_label_filter_is_within_limit(&label_filter) {
         return Err("at most 64 labels may be specified across require_labels and exclude_labels");
     }
-    Ok(storage::GalleryLabelFilter { required, excluded })
+    Ok(label_filter)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -15450,11 +15449,10 @@ async fn delete_object_response(
             }
 
             if !query.internal_replication {
-                let version_id = if deleted_paths.len() == 1 {
-                    Some(deleted_paths[0].1.clone())
-                } else {
-                    None
-                };
+                let version_id = deleted_paths
+                    .iter()
+                    .find(|(deleted_path, _)| deleted_path == &key)
+                    .map(|(_, version_id)| version_id.clone());
                 record_data_change_event(
                     state,
                     PendingDataChangeEvent {

@@ -3375,6 +3375,99 @@ run_on_all_metadata_backends!(
     sidecar_target_conflicts_do_not_partially_apply_media_mutations_turso
 );
 
+/// Overwriting with media that has no sidecar must not leave the destination's
+/// stale label sidecar attached to unrelated bytes.
+async fn overwrite_without_a_source_sidecar_clears_the_destination_sidecar_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("sidecar-overwrite-without-source").await;
+
+    store
+        .put_object_versioned(
+            "album/copy-source.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    put_labelled_image(&mut store, "album/copy-target.jpg", &["private"]).await;
+
+    assert_eq!(
+        store
+            .copy_object_path("album/copy-source.jpg", "album/copy-target.jpg", true)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    assert!(
+        store
+            .get_object(
+                "album/copy-target.jpg.xmp",
+                None,
+                None,
+                ObjectReadMode::Preferred,
+            )
+            .await
+            .is_err(),
+        "copy overwrite must delete a destination sidecar the source does not carry"
+    );
+    assert!(
+        gallery_labels_for_key(&store, "album/copy-target.jpg")
+            .await
+            .is_empty(),
+        "copied bytes must not retain labels that described the replaced destination"
+    );
+
+    store
+        .put_object_versioned(
+            "album/rename-source.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .set_media_labels("album/rename-target.jpg", vec!["private".to_string()])
+        .await
+        .unwrap()
+        .expect("the stale destination sidecar must exist before the rename");
+
+    assert_eq!(
+        store
+            .rename_object_path("album/rename-source.jpg", "album/rename-target.jpg", true)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    assert!(
+        store
+            .get_object(
+                "album/rename-target.jpg.xmp",
+                None,
+                None,
+                ObjectReadMode::Preferred,
+            )
+            .await
+            .is_err(),
+        "rename overwrite must delete a destination sidecar the source does not carry"
+    );
+    assert!(
+        gallery_labels_for_key(&store, "album/rename-target.jpg")
+            .await
+            .is_empty(),
+        "renamed bytes must not inherit labels from an orphaned destination sidecar"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    overwrite_without_a_source_sidecar_clears_the_destination_sidecar_impl,
+    overwrite_without_a_source_sidecar_clears_the_destination_sidecar,
+    overwrite_without_a_source_sidecar_clears_the_destination_sidecar_turso
+);
+
 async fn reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_impl(
     backend: StorageTestBackend,
 ) {
@@ -8154,6 +8247,67 @@ run_on_all_metadata_backends!(
     gallery_labels_follow_a_sidecar_upload_impl,
     gallery_labels_follow_a_sidecar_upload,
     gallery_labels_follow_a_sidecar_upload_turso
+);
+
+/// Sidecars are relevant only to gallery media. A non-media `.xmp` upload must
+/// not also update the row of its derived non-media key. The sidecar's own
+/// projection insertion and metadata refresh consume two revisions.
+async fn non_media_sidecars_do_not_mutate_derived_gallery_labels_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-non-media-sidecar").await;
+    let query = GalleryIndexQuery {
+        prefix: String::new(),
+        depth: 8,
+        media_filter: GalleryIndexMediaFilter::All,
+        captured_sort: GalleryIndexCapturedSort::Desc,
+        offset: 0,
+        limit: 64,
+        viewport: None,
+        label_filter: Default::default(),
+    };
+
+    store
+        .put_object_versioned(
+            "notes/report.txt",
+            Bytes::from_static(b"not gallery media"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let revision_before_sidecar = store
+        .query_gallery_index(&query)
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page")
+        .revision;
+
+    store
+        .put_object_versioned(
+            "notes/report.txt.xmp",
+            sample_xmp_sidecar_bytes(&["private"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let revision_after_sidecar = store
+        .query_gallery_index(&query)
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page")
+        .revision;
+    assert_eq!(
+        revision_after_sidecar,
+        revision_before_sidecar + 2,
+        "the sidecar must not also update the non-media derived key"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    non_media_sidecars_do_not_mutate_derived_gallery_labels_impl,
+    non_media_sidecars_do_not_mutate_derived_gallery_labels,
+    non_media_sidecars_do_not_mutate_derived_gallery_labels_turso
 );
 
 /// A sidecar synced ahead of its image cannot update a projection row that does

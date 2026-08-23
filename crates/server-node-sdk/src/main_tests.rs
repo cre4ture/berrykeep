@@ -13445,6 +13445,18 @@ async fn delete_object_handler_cascades_sidecars_only_for_public_deletes_impl(
         let keys = store.current_keys().await.unwrap();
         assert!(!keys.contains(&media_key.to_string()));
         assert!(!keys.contains(&sidecar_key.to_string()));
+        let event = store
+            .list_data_change_events(&super::storage::DataChangeEventQuery::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.path == media_key)
+            .expect("the public delete must be recorded as a data-change event");
+        assert_eq!(event.affected_path_count, 2);
+        assert!(
+            event.version_id.is_some(),
+            "a companion tombstone must not hide the deleted media version ID"
+        );
     }
 
     {
