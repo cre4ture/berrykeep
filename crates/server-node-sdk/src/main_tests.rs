@@ -4305,7 +4305,7 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
     assert!(put_etag.starts_with('"'));
     assert!(!put_version_id.is_empty());
 
-    {
+    let sidecar_payload = {
         let mut store = lock_store(&state, "tests.s3_listener.verify_put_metadata").await;
         let metadata = store
             .load_object_version_metadata(&put_version_id)
@@ -4338,7 +4338,36 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
             .await
             .unwrap()
             .expect("the label API must create a sidecar for the S3 object");
-    }
+        store
+            .get_object(
+                "tenant/photos/docs/hello.txt.xmp",
+                None,
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("the label sidecar must be readable before S3 upload")
+    };
+
+    let put_sidecar = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/photos.example/docs/hello.txt.xmp",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/rdf+xml")],
+            sidecar_payload,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_sidecar.status(), StatusCode::OK);
+    let put_sidecar_version_id = put_sidecar
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
 
     let list_objects = app
         .clone()
@@ -4447,6 +4476,34 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
             versions
                 .iter()
                 .any(|record| record.version_id == delete_version_id)
+        );
+        let sidecar_versions = store
+            .list_s3_object_versions_for_key("photos.example", "tenant/photos/docs/hello.txt.xmp")
+            .await
+            .unwrap();
+        assert_eq!(sidecar_versions.len(), 2);
+        assert!(
+            sidecar_versions
+                .iter()
+                .any(|record| record.version_id == put_sidecar_version_id)
+        );
+        let sidecar_delete_version_id = sidecar_versions
+            .iter()
+            .find(|record| record.version_id != put_sidecar_version_id)
+            .expect("deleting media through S3 must persist its companion sidecar tombstone")
+            .version_id
+            .clone();
+        assert!(
+            store
+                .inspect_object_version(
+                    "tenant/photos/docs/hello.txt.xmp",
+                    &sidecar_delete_version_id,
+                )
+                .await
+                .unwrap()
+                .expect("the companion S3 tombstone record must resolve to a version")
+                .is_delete_marker,
+            "the companion S3 ledger record must describe its delete marker"
         );
         assert!(
             store

@@ -2688,18 +2688,21 @@ async fn execute_s3_current_object_delete(
                 "S3 delete did not produce a tombstone for {full_key}"
             ))
         })?;
-    let s3_object_version = S3ObjectVersionRecord {
-        bucket_name: bucket.bucket_name.clone(),
-        ironmesh_key: full_key.to_string(),
-        version_id: version_id.clone(),
-        etag: object_etag(TOMBSTONE_MANIFEST_HASH),
-        multipart_part_count: None,
-        created_at_unix: unix_ts(),
-    };
-    if let Err(err) = store.persist_s3_object_version(&s3_object_version).await {
-        return Err(S3DeleteExecutionError::Internal(format!(
-            "failed to persist S3 tombstone version record: {err:#}"
-        )));
+    for deleted in &deleted_paths {
+        let s3_object_version = S3ObjectVersionRecord {
+            bucket_name: bucket.bucket_name.clone(),
+            ironmesh_key: deleted.path.clone(),
+            version_id: deleted.version_id.clone(),
+            etag: object_etag(TOMBSTONE_MANIFEST_HASH),
+            multipart_part_count: None,
+            created_at_unix: unix_ts(),
+        };
+        if let Err(err) = store.persist_s3_object_version(&s3_object_version).await {
+            return Err(S3DeleteExecutionError::Internal(format!(
+                "failed to persist S3 tombstone version record for {}: {err:#}",
+                deleted.path
+            )));
+        }
     }
     drop(store);
 
