@@ -13339,6 +13339,104 @@ run_on_main_metadata_backends!(
     delete_object_handler_marks_tombstone_and_removes_current_key_turso
 );
 
+/// Public deletes own the media-sidecar cascade, but replication receives the
+/// two tombstones independently so every node preserves the same sidecar
+/// version graph.
+async fn delete_object_handler_cascades_sidecars_only_for_public_deletes_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let media_key = "album/photo.jpg";
+    let sidecar_key = "album/photo.jpg.xmp";
+
+    {
+        let mut store = lock_store(&state, "tests.delete_sidecar.public.seed").await;
+        store
+            .put_object_versioned(
+                media_key,
+                bytes::Bytes::from_static(b"first-photo"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .set_media_labels(media_key, vec!["private".to_string()])
+            .await
+            .unwrap();
+    }
+
+    let public_response = super::delete_object(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::extract::Path(media_key.to_string()),
+        axum::extract::Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(public_response.status(), StatusCode::CREATED);
+    {
+        let store = lock_store(&state, "tests.delete_sidecar.public.verify").await;
+        let keys = store.current_keys().await.unwrap();
+        assert!(!keys.contains(&media_key.to_string()));
+        assert!(!keys.contains(&sidecar_key.to_string()));
+    }
+
+    {
+        let mut store = lock_store(&state, "tests.delete_sidecar.replication.seed").await;
+        store
+            .put_object_versioned(
+                media_key,
+                bytes::Bytes::from_static(b"replicated-photo"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .set_media_labels(media_key, vec!["private".to_string()])
+            .await
+            .unwrap();
+    }
+
+    let replicated_response = super::delete_object(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::extract::Path(media_key.to_string()),
+        axum::extract::Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            version_id: Some("repl-media-delete".to_string()),
+            internal_replication: true,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(replicated_response.status(), StatusCode::CREATED);
+    {
+        let store = lock_store(&state, "tests.delete_sidecar.replication.verify").await;
+        let keys = store.current_keys().await.unwrap();
+        assert!(!keys.contains(&media_key.to_string()));
+        assert!(
+            keys.contains(&sidecar_key.to_string()),
+            "the explicit sidecar tombstone must arrive as its own replicated version"
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    delete_object_handler_cascades_sidecars_only_for_public_deletes_impl,
+    delete_object_handler_cascades_sidecars_only_for_public_deletes,
+    delete_object_handler_cascades_sidecars_only_for_public_deletes_turso
+);
+
 async fn set_media_labels_handler_writes_the_sidecar_object_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let media_key = "album/photo.jpg";

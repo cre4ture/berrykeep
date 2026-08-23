@@ -6916,12 +6916,7 @@ impl PersistentStore {
     }
 
     pub async fn tombstone_object(&mut self, key: &str, options: PutOptions) -> Result<String> {
-        let deleted = self.tombstone_object_with_companions(key, options).await?;
-        Ok(deleted
-            .into_iter()
-            .next()
-            .expect("media tombstone must always produce a result")
-            .version_id)
+        self.tombstone_object_single(key, options).await
     }
 
     /// Tombstones an object and its XMP sidecar, returning every affected path.

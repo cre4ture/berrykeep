@@ -8301,6 +8301,35 @@ run_on_all_metadata_backends!(
     deleting_media_removes_its_sidecar_and_cannot_leak_labels_turso
 );
 
+/// The single-object primitive intentionally keeps companions out of its
+/// result. Protocol frontends with separate sidecar version records (such as
+/// S3) use it to keep their own delete bookkeeping in sync.
+async fn single_object_tombstone_does_not_implicitly_delete_a_sidecar_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("single-object-tombstone-sidecar").await;
+
+    put_labelled_image(&mut store, "album/photo.jpg", &["private"]).await;
+    store
+        .tombstone_object("album/photo.jpg", PutOptions::default())
+        .await
+        .unwrap();
+
+    store
+        .get_object("album/photo.jpg.xmp", None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("the single-object primitive must leave companion handling to its caller");
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    single_object_tombstone_does_not_implicitly_delete_a_sidecar_impl,
+    single_object_tombstone_does_not_implicitly_delete_a_sidecar,
+    single_object_tombstone_does_not_implicitly_delete_a_sidecar_turso
+);
+
 /// Sidecars come from foreign tools, so a broken packet is an expected input.
 /// It must neither fail the upload nor corrupt the labels already projected.
 async fn gallery_labels_survive_a_malformed_sidecar_impl(backend: StorageTestBackend) {

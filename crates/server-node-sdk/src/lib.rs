@@ -14249,14 +14249,25 @@ async fn set_media_labels_response(
     match outcome {
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Ok(Some(result)) => {
+            let sidecar_key = sidecar_key_for_media(path);
             publish_namespace_change(state);
             request_local_availability_refresh(state);
+            if should_trigger_autonomous_post_write_replication(
+                state.autonomous_replication_on_put_enabled,
+                false,
+            ) {
+                enqueue_autonomous_post_write_replication(
+                    state,
+                    autonomous_post_write_replication_subjects(&sidecar_key, &result.version_id),
+                )
+                .await;
+            }
             record_data_change_event(
                 state,
                 PendingDataChangeEvent {
                     action: DataChangeAction::Upload,
                     actor,
-                    path: sidecar_key_for_media(path),
+                    path: sidecar_key,
                     from_path: None,
                     to_path: None,
                     recursive: false,
@@ -15345,18 +15356,16 @@ async fn delete_object_response(
             return StatusCode::CONFLICT;
         }
     }
+    let tombstone_options = PutOptions {
+        parent_version_ids: query.parent,
+        state: version_state,
+        inherit_preferred_parent: true,
+        create_snapshot: !query.internal_replication,
+        explicit_version_id: query.version_id,
+    };
     let delete_result = if recursive {
         store
-            .tombstone_subtree(
-                &key,
-                PutOptions {
-                    parent_version_ids: query.parent,
-                    state: version_state,
-                    inherit_preferred_parent: true,
-                    create_snapshot: !query.internal_replication,
-                    explicit_version_id: query.version_id,
-                },
-            )
+            .tombstone_subtree(&key, tombstone_options)
             .await
             .map(|results| {
                 results
@@ -15364,18 +15373,14 @@ async fn delete_object_response(
                     .map(|entry| (entry.path, entry.version_id))
                     .collect::<Vec<_>>()
             })
+    } else if query.internal_replication {
+        store
+            .tombstone_object(&key, tombstone_options)
+            .await
+            .map(|version_id| vec![(key.clone(), version_id)])
     } else {
         store
-            .tombstone_object_with_companions(
-                &key,
-                PutOptions {
-                    parent_version_ids: query.parent,
-                    state: version_state,
-                    inherit_preferred_parent: true,
-                    create_snapshot: !query.internal_replication,
-                    explicit_version_id: query.version_id,
-                },
-            )
+            .tombstone_object_with_companions(&key, tombstone_options)
             .await
             .map(|results| {
                 results
