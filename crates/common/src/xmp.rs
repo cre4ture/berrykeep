@@ -85,7 +85,7 @@ impl XmpSidecar {
             Some(subject) => read_keywords(&events, subject)?,
             None => Vec::new(),
         };
-        let namespaces = generated_namespaces(&events);
+        let namespaces = generated_namespaces(&events, &structure);
         let layout = plan_layout(&events, &structure);
         if let Some(replaced) = layout.replaced.clone() {
             events.drain(replaced);
@@ -602,10 +602,28 @@ fn preceding_line_indent(events: &[ResolvedEvent], index: usize) -> Option<Strin
 
 /// Picks the prefixes for generated markup, falling back to freshly declared
 /// ones when the packet does not bind a namespace yet.
-fn generated_namespaces(events: &[ResolvedEvent]) -> GeneratedNamespaces {
+///
+/// Only elements that are actual ancestors of the generated `dc:subject` --
+/// `rdf:RDF` and, when one exists, the target `rdf:Description` -- are
+/// searched. A namespace bound on an unrelated element elsewhere in the
+/// packet, for example a sibling `rdf:Description`, is not in scope at the
+/// insertion point: using its prefix without redeclaring it would emit an
+/// unbound prefix.
+fn generated_namespaces(
+    events: &[ResolvedEvent],
+    structure: &PacketStructure,
+) -> GeneratedNamespaces {
+    let scope: Vec<usize> = [
+        structure.rdf_root.map(|span| span.start),
+        structure.description.map(|span| span.start),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
     let mut declarations = Vec::new();
     let mut prefix_for = |namespace: &'static str, fallback: &str| {
-        declared_prefix(events, namespace).unwrap_or_else(|| {
+        declared_prefix(events, &scope, namespace).unwrap_or_else(|| {
             declarations.push(NamespaceDeclaration {
                 attribute: format!("xmlns:{fallback}"),
                 namespace,
@@ -623,9 +641,9 @@ fn generated_namespaces(events: &[ResolvedEvent]) -> GeneratedNamespaces {
     }
 }
 
-/// Finds the first prefix the packet binds to the given namespace.
-fn declared_prefix(events: &[ResolvedEvent], namespace: &str) -> Option<String> {
-    events.iter().find_map(|resolved| match &resolved.event {
+/// Finds the prefix bound to `namespace` on one of the given scope elements.
+fn declared_prefix(events: &[ResolvedEvent], scope: &[usize], namespace: &str) -> Option<String> {
+    scope.iter().find_map(|&index| match &events[index].event {
         Event::Start(element) | Event::Empty(element) => prefix_declaration(element, namespace),
         _ => None,
     })
@@ -690,7 +708,9 @@ pub fn is_sidecar_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media};
+    use super::{
+        DC_NAMESPACE, XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media,
+    };
     use anyhow::Result;
 
     /// Sidecar in the shape Lightroom writes it: many namespaces Ironmesh does
@@ -918,6 +938,46 @@ mod tests {
         assert_eq!(
             XmpSidecar::parse(serialized.as_bytes())?.keywords(),
             ["beta"]
+        );
+        Ok(())
+    }
+
+    /// A namespace bound on a *sibling* `rdf:Description` is not in scope at
+    /// the insertion point. exiftool and other tools regularly split
+    /// properties across several top-level `rdf:Description` elements; the
+    /// first one -- where `dc:subject` is inserted -- must not borrow a prefix
+    /// declared only on a later one.
+    #[test]
+    fn dc_prefix_bound_only_on_a_sibling_description_is_not_reused() -> Result<()> {
+        const SPLIT_ACROSS_DESCRIPTIONS: &str = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n",
+            " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
+            "  <rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmp:Rating=\"3\"/>\n",
+            "  <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n",
+            "   <dc:title>t</dc:title>\n",
+            "  </rdf:Description>\n",
+            " </rdf:RDF>\n",
+            "</x:xmpmeta>\n",
+        );
+
+        let mut sidecar = XmpSidecar::parse(SPLIT_ACROSS_DESCRIPTIONS.as_bytes())?;
+        assert!(sidecar.keywords().is_empty());
+
+        sidecar.set_keywords(vec!["private".to_owned()]);
+        let serialized = serialize(&sidecar)?;
+
+        assert!(
+            serialized.contains(&format!("<dc:subject xmlns:dc=\"{DC_NAMESPACE}\">")),
+            "dc:subject must declare its own namespace since the sibling description's \
+             binding is not in scope here, got:\n{serialized}"
+        );
+
+        // The regression: parsing back must find the keyword. Before the fix,
+        // dc:subject silently used an unbound prefix, so the write round-tripped
+        // to zero keywords and labelling a photo private had no effect.
+        assert_eq!(
+            XmpSidecar::parse(serialized.as_bytes())?.keywords(),
+            ["private"]
         );
         Ok(())
     }
