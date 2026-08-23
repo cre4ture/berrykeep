@@ -457,6 +457,9 @@ export function GallerySurface({
   const galleryNavigationIconSize = compactGalleryGrid ? 46 : 54;
   const galleryNavigationGlyphSize = compactGalleryGrid ? 24 : 28;
   const galleryVirtualPageSize = resolveGalleryVirtualPageSize(galleryGridColumns);
+  // Only grid pagination depends on the measured grid width. In map mode, a
+  // native fullscreen resize must not reload the current gallery scope.
+  const galleryReloadPageSize = viewMode === "grid" ? galleryVirtualPageSize : null;
   const enabledMediaKinds: GalleryMediaKind[] = allowedMediaKinds?.length
     ? [...allowedMediaKinds]
     : ["image"];
@@ -673,7 +676,7 @@ export function GallerySurface({
     }
 
     void reloadAppliedEntries();
-  }, [galleryVirtualPageSize, mediaFilter, sortOrder, viewMode]);
+  }, [galleryReloadPageSize, mediaFilter, sortOrder, viewMode]);
 
   async function refreshSnapshots(forceRevalidation = true) {
     if (forceRevalidation) {
