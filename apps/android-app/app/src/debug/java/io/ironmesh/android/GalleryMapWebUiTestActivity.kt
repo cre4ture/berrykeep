@@ -3,11 +3,18 @@ package io.ironmesh.android
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.Surface
+import androidx.compose.foundation.layout.Box
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import io.ironmesh.android.data.EmbeddedWebUiSession
+import io.ironmesh.android.data.TitleLatencyProbeStatus
 import io.ironmesh.android.ui.GalleryMapUiState
+import io.ironmesh.android.ui.MainSection
+import io.ironmesh.android.ui.components.IronmeshAppShell
 import io.ironmesh.android.ui.screens.GalleryMapScreen
 import io.ironmesh.android.ui.theme.IronmeshTheme
 
@@ -26,15 +33,28 @@ class GalleryMapWebUiTestActivity : ComponentActivity() {
 
         setContent {
             IronmeshTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    GalleryMapScreen(
-                        state = GalleryMapUiState(
-                            webUiSession = EmbeddedWebUiSession(url, authorization),
-                            loading = false,
-                            status = "Ready",
-                        ),
-                        onStartGalleryMap = {},
-                    )
+                var fullscreenContent by remember { mutableStateOf(false) }
+                IronmeshAppShell(
+                    selectedSection = MainSection.GALLERY_MAP,
+                    onSelectSection = {},
+                    snackbarHostState = remember { SnackbarHostState() },
+                    deviceLabel = null,
+                    titleLatencyStatus = TitleLatencyProbeStatus(),
+                    onOpenConnectionDiagnostics = {},
+                    onExportDiagnosticLog = {},
+                    fullscreenContent = fullscreenContent,
+                ) { contentModifier ->
+                    Box(modifier = contentModifier) {
+                        GalleryMapScreen(
+                            state = GalleryMapUiState(
+                                webUiSession = EmbeddedWebUiSession(url, authorization),
+                                loading = false,
+                                status = "Ready",
+                            ),
+                            onStartGalleryMap = {},
+                            onFullscreenChanged = { fullscreenContent = it },
+                        )
+                    }
                 }
             }
         }
