@@ -13411,6 +13411,79 @@ run_on_main_metadata_backends!(
     set_media_labels_handler_writes_the_sidecar_object_turso
 );
 
+/// `/auth/store/labels` lets an admin -- who has no client-device credentials
+/// -- set labels, mirroring `/auth/store/rename` and `/auth/store/delete`.
+async fn media_labels_admin_route_requires_admin_token_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    let admin_token = fresh_test_secret("media-labels-admin");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
+    let app = super::build_server_apps(&state).public_app;
+    let media_key = "album/photo.jpg";
+
+    let request_body = || {
+        Body::from(
+            serde_json::json!({
+                "path": media_key,
+                "labels": ["private"],
+            })
+            .to_string(),
+        )
+    };
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/store/labels")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(request_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/store/labels")
+                .header(super::ADMIN_TOKEN_HEADER, admin_token)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(request_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::NO_CONTENT);
+
+    let stored = {
+        let store = read_store(&state, "tests.media_labels_admin.verify").await;
+        store
+            .get_object(
+                "album/photo.jpg.xmp",
+                None,
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("the admin route must have written a sidecar object")
+    };
+    assert_eq!(
+        common::xmp::XmpSidecar::parse(&stored).unwrap().keywords(),
+        ["private".to_string()]
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    media_labels_admin_route_requires_admin_token_impl,
+    media_labels_admin_route_requires_admin_token,
+    media_labels_admin_route_requires_admin_token_turso
+);
+
 async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
     backend: MainTestBackend,
 ) {

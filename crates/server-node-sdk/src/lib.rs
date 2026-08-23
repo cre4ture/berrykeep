@@ -7705,6 +7705,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/auth/store/delete", post(delete_object_by_query_admin))
         .route("/auth/store/rename", post(rename_object_path_admin))
+        .route("/auth/store/labels", post(set_media_labels_admin))
         .route("/auth/store/restore", post(restore_snapshot_path))
         .route("/auth/media/thumbnail", get(get_media_thumbnail_admin))
         .route("/auth/media/cache/retry", post(retry_media_cache_admin))
@@ -14174,6 +14175,33 @@ async fn copy_object_path_response(
     }
 }
 
+async fn set_media_labels_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<MediaLabelsRequest>,
+) -> Response {
+    let action = "auth/store/labels";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "path": request.path.clone(),
+            "labels": request.labels.clone(),
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let actor = data_change_actor_from_admin_request(&authz);
+    set_media_labels_response(&state, request, Some(actor)).await
+}
+
 async fn set_media_labels(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -15734,6 +15762,19 @@ fn store_index_viewport_bounds(
     }))
 }
 
+/// Whether `query` asks for a label filter, independent of whether the gallery
+/// fast path can actually honour it.
+///
+/// The generic listing fallback hard-codes `labels: Vec::new()` on every entry
+/// and cannot filter by label at all, so a caller that requested filtering has
+/// to be told the request could not be honoured rather than silently receiving
+/// an unfiltered `200` -- the motivating use case is keeping `private` media
+/// out of a view, so a silent fallback would leak it.
+fn store_index_label_filter_requested(query: &StoreIndexQuery) -> bool {
+    !store_index_labels(query.require_labels.as_ref()).is_empty()
+        || !store_index_labels(query.exclude_labels.as_ref()).is_empty()
+}
+
 fn store_index_gallery_query(
     query: &StoreIndexQuery,
     prefix: &str,
@@ -15971,12 +16012,22 @@ async fn list_store_index_response_attempt(
         .namespace_change_sequence
         .load(Ordering::SeqCst);
 
+    let label_filter_requested = store_index_label_filter_requested(&query);
     let gallery_query = store_index_gallery_query(&query, &prefix, depth);
     if viewport.is_some() && gallery_query.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "viewport bounds require a current, paginated gallery query sorted by captured time"
+            })),
+        )
+            .into_response();
+    }
+    if label_filter_requested && gallery_query.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "label filters require a current, paginated gallery query sorted by captured time"
             })),
         )
             .into_response();
@@ -16040,7 +16091,25 @@ async fn list_store_index_response_attempt(
                 )
                     .into_response();
             }
+            Ok(None) if label_filter_requested => {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(json!({
+                        "error": "label filters require a metadata backend with gallery projection support"
+                    })),
+                )
+                    .into_response();
+            }
             Ok(None) => {}
+            Err(err) if label_filter_requested => {
+                tracing::error!(
+                    error = %err,
+                    prefix = %prefix,
+                    "gallery index fast path failed while a label filter was requested; \
+                     refusing to fall back to the unfiltered generic store index"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
             Err(err) => {
                 warn!(
                     error = %err,

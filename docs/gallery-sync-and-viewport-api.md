@@ -127,6 +127,10 @@ partial add/remove. Writing an unchanged set, or clearing labels on media that h
 yet, is a no-op and creates no object version. `POST /api/v1/auth/store/labels` applies the same
 admin authorization as other admin store routes.
 
+`/store/rename` and `/store/copy` carry a media object's sidecar along automatically: renaming or
+copying `album/photo.jpg` also renames or copies `album/photo.jpg.xmp` when one exists, so a
+label survives the operation instead of staying orphaned at the old path.
+
 Gallery queries and viewport queries accept a label filter:
 
 ```text

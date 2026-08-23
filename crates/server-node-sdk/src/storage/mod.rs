@@ -7134,6 +7134,21 @@ impl PersistentStore {
         self.persist_current_state_with_snapshot_batch(touched_paths, true, unix_ts())
             .await?;
 
+        // Labels live outside the media bytes in a sidecar keyed by path
+        // (`storage/gallery_labels.rs`), so renaming the media alone would
+        // silently drop them and leave the sidecar orphaned at the old path.
+        // The media object already landed at `to_path` above, so the sidecar's
+        // own ingest hook has a projection row to write into rather than
+        // no-op'ing against one that does not exist yet.
+        let sidecar_from = sidecar_key_for_media(from_path);
+        let sidecar_to = sidecar_key_for_media(to_path);
+        if self.current_object_entry(&sidecar_from).await?.is_some() {
+            match Box::pin(self.rename_object_path(&sidecar_from, &sidecar_to, overwrite)).await? {
+                PathMutationResult::Applied | PathMutationResult::SourceMissing => {}
+                other => return Ok(other),
+            }
+        }
+
         Ok(PathMutationResult::Applied)
     }
 
@@ -7178,17 +7193,36 @@ impl PersistentStore {
         let copied_manifest_hash = self
             .clone_manifest_for_key(&source_head.manifest_hash, to_path)
             .await?;
-        self.persist_copied_version_to_target(
-            from_path,
-            to_path,
-            copied_manifest_hash,
-            Some(source_object_id),
-            Some(source_head.version_id.clone()),
-            source_head.state.clone(),
-            "copy",
-            true,
-        )
-        .await
+        let result = self
+            .persist_copied_version_to_target(
+                from_path,
+                to_path,
+                copied_manifest_hash,
+                Some(source_object_id),
+                Some(source_head.version_id.clone()),
+                source_head.state.clone(),
+                "copy",
+                true,
+            )
+            .await?;
+        if !matches!(result, PathMutationResult::Applied) {
+            return Ok(result);
+        }
+
+        // See the matching comment in `rename_object_path`: the sidecar has to
+        // be copied alongside the media so the label survives, and it has to
+        // happen after the media landed at `to_path` so the ingest hook has a
+        // projection row to write into.
+        let sidecar_from = sidecar_key_for_media(from_path);
+        let sidecar_to = sidecar_key_for_media(to_path);
+        if self.current_object_entry(&sidecar_from).await?.is_some() {
+            match Box::pin(self.copy_object_path(&sidecar_from, &sidecar_to, overwrite)).await? {
+                PathMutationResult::Applied | PathMutationResult::SourceMissing => {}
+                other => return Ok(other),
+            }
+        }
+
+        Ok(PathMutationResult::Applied)
     }
 
     pub async fn restore_snapshot_path(

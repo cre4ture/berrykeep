@@ -59,25 +59,36 @@ impl GalleryLabelFilter {
     }
 }
 
-/// Builds a `LIKE` pattern matching projection rows whose label list contains
+/// Builds a `GLOB` pattern matching projection rows whose label list contains
 /// `label`.
+///
+/// `GLOB` is used instead of `LIKE` because SQLite's (and Turso's) `LIKE` only
+/// case-folds ASCII by default, which would make a filter for `private` also
+/// match an entry labelled only `Private` -- silently contradicting the
+/// storage layer, where `encode_gallery_labels` treats case as significant.
+/// `GLOB` is always case-sensitive.
 ///
 /// The canonical encoding quotes every entry, so matching the quoted form only
 /// ever matches whole labels: `not-private` is stored as `"not-private"` and
-/// cannot satisfy the pattern built for `private`. `LIKE` metacharacters in the
-/// label itself are escaped, which the callers pair with `ESCAPE '\'`.
-fn gallery_label_like_pattern(label: &str) -> Result<String> {
+/// cannot satisfy the pattern built for `private`. `GLOB` has no `ESCAPE`
+/// clause, so its metacharacters (`*`, `?`, `[`) in the label are neutralised
+/// by wrapping each in a single-character bracket class, which `GLOB` matches
+/// literally rather than as a wildcard.
+fn gallery_label_glob_pattern(label: &str) -> Result<String> {
     let encoded =
         serde_json::to_string(label).context("failed to encode a gallery label filter")?;
     let mut pattern = String::with_capacity(encoded.len() + 2);
-    pattern.push('%');
+    pattern.push('*');
     for character in encoded.chars() {
-        if matches!(character, '%' | '_' | '\\') {
-            pattern.push('\\');
+        if matches!(character, '*' | '?' | '[') {
+            pattern.push('[');
+            pattern.push(character);
+            pattern.push(']');
+        } else {
+            pattern.push(character);
         }
-        pattern.push(character);
     }
-    pattern.push('%');
+    pattern.push('*');
     Ok(pattern)
 }
 
@@ -93,17 +104,17 @@ pub(crate) fn gallery_label_predicates(
     let mut values = Vec::new();
     let mut placeholder = first_placeholder;
     let mut push = |keyword: &str, label: &str, placeholder: usize| -> Result<String> {
-        values.push(gallery_label_like_pattern(label)?);
+        values.push(gallery_label_glob_pattern(label)?);
         Ok(format!(
-            " AND {GALLERY_LABELS_COLUMN} {keyword} ?{placeholder} ESCAPE '\\'"
+            " AND {GALLERY_LABELS_COLUMN} {keyword} ?{placeholder}"
         ))
     };
     for label in &filter.required {
-        predicates.push_str(&push("LIKE", label, placeholder)?);
+        predicates.push_str(&push("GLOB", label, placeholder)?);
         placeholder += 1;
     }
     for label in &filter.excluded {
-        predicates.push_str(&push("NOT LIKE", label, placeholder)?);
+        predicates.push_str(&push("NOT GLOB", label, placeholder)?);
         placeholder += 1;
     }
     Ok((predicates, values))

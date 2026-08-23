@@ -3199,6 +3199,107 @@ run_on_all_metadata_backends!(
     rename_preserves_object_id_and_history_turso
 );
 
+/// A label lives in a path-keyed sidecar object next to the media, not inside
+/// the media bytes. Renaming the media alone would silently drop the label and
+/// leave the sidecar orphaned at the old path -- worse, a photo labelled
+/// `private` would reappear in a client view built on `exclude_labels=private`.
+async fn rename_carries_the_sidecar_and_its_label_along_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("rename-carries-sidecar").await;
+
+    put_labelled_image(&mut store, "album/a.jpg", &["private"]).await;
+
+    let mutation = store
+        .rename_object_path("album/a.jpg", "album/b.jpg", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    assert!(
+        store
+            .get_object("album/a.jpg.xmp", None, None, ObjectReadMode::Preferred)
+            .await
+            .is_err(),
+        "the sidecar must not stay orphaned at the old path"
+    );
+    let moved_sidecar = store
+        .get_object("album/b.jpg.xmp", None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("the sidecar must have moved to the new path");
+    assert_eq!(
+        common::xmp::XmpSidecar::parse(&moved_sidecar)
+            .unwrap()
+            .keywords(),
+        ["private".to_string()]
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        Vec::<String>::new(),
+        "the renamed photo must still be excluded, not reappear unlabelled"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    rename_carries_the_sidecar_and_its_label_along_impl,
+    rename_carries_the_sidecar_and_its_label_along,
+    rename_carries_the_sidecar_and_its_label_along_turso
+);
+
+/// The copy counterpart of `rename_carries_the_sidecar_and_its_label_along`:
+/// copying a labelled photo must copy its sidecar too, and the original must
+/// keep its own label untouched.
+async fn copy_carries_the_sidecar_and_its_label_along_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("copy-carries-sidecar").await;
+
+    put_labelled_image(&mut store, "album/source.jpg", &["private"]).await;
+
+    let mutation = store
+        .copy_object_path("album/source.jpg", "album/copy.jpg", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    for key in ["album/source.jpg.xmp", "album/copy.jpg.xmp"] {
+        let sidecar = store
+            .get_object(key, None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap_or_else(|_| panic!("{key} should carry the copied label"));
+        assert_eq!(
+            common::xmp::XmpSidecar::parse(&sidecar).unwrap().keywords(),
+            ["private".to_string()]
+        );
+    }
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/copy.jpg".to_string(), "album/source.jpg".to_string()],
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    copy_carries_the_sidecar_and_its_label_along_impl,
+    copy_carries_the_sidecar_and_its_label_along,
+    copy_carries_the_sidecar_and_its_label_along_turso
+);
+
 async fn reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_impl(
     backend: StorageTestBackend,
 ) {
@@ -7838,6 +7939,52 @@ run_on_all_metadata_backends!(
     gallery_label_filter_matches_whole_labels_impl,
     gallery_label_filter_matches_whole_labels,
     gallery_label_filter_matches_whole_labels_turso
+);
+
+/// `encode_gallery_labels` treats case as significant -- `"private"` and
+/// `"Private"` are distinct labels that can coexist. The filter has to agree,
+/// or a client hiding `private` media would silently also hide (or fail to
+/// hide) media labelled with a different case.
+async fn gallery_label_filter_is_case_sensitive_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-label-case").await;
+
+    put_labelled_image(&mut store, "album/lower.jpg", &["private"]).await;
+    put_labelled_image(&mut store, "album/upper.jpg", &["Private"]).await;
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/upper.jpg".to_string()],
+        "excluding \"private\" must not affect \"Private\""
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/lower.jpg".to_string()],
+        "requiring \"private\" must not match \"Private\""
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_label_filter_is_case_sensitive_impl,
+    gallery_label_filter_is_case_sensitive,
+    gallery_label_filter_is_case_sensitive_turso
 );
 
 /// A sidecar uploaded by a third-party tool next to an existing image has to
