@@ -7,6 +7,9 @@ use crate::storage;
 
 use super::{StoreIndexMediaFilter, StoreIndexSortOrder};
 
+/// Bounds the correlated JSON predicates a gallery index or delta query can add.
+pub(super) const MAX_GALLERY_LABEL_FILTER_LABELS: usize = 64;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct GallerySyncViewport {
@@ -24,6 +27,11 @@ pub(super) struct GallerySyncScope {
     pub(super) media_filter: StoreIndexMediaFilter,
     pub(super) captured_sort: StoreIndexSortOrder,
     pub(super) viewport: Option<GallerySyncViewport>,
+    /// Carried in the token so that deltas resolve the same membership the
+    /// index query did. Defaulted, so tokens issued before labels existed stay
+    /// valid and simply filter nothing.
+    #[serde(default, skip_serializing_if = "storage::GalleryLabelFilter::is_empty")]
+    pub(super) label_filter: storage::GalleryLabelFilter,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -56,10 +64,17 @@ pub(super) fn decode_gallery_sync_token(token: &str) -> Option<GallerySyncTokenP
             StoreIndexSortOrder::CapturedAsc | StoreIndexSortOrder::CapturedDesc
         )
         || !gallery_sync_viewport_is_valid(payload.scope.viewport.as_ref())
+        || !gallery_label_filter_is_within_limit(&payload.scope.label_filter)
     {
         return None;
     }
     Some(payload)
+}
+
+pub(super) fn gallery_label_filter_is_within_limit(filter: &storage::GalleryLabelFilter) -> bool {
+    filter.required.len() <= MAX_GALLERY_LABEL_FILTER_LABELS
+        && filter.excluded.len()
+            <= MAX_GALLERY_LABEL_FILTER_LABELS.saturating_sub(filter.required.len())
 }
 
 pub(super) fn gallery_delta_scope_from_sync(
@@ -87,6 +102,7 @@ pub(super) fn gallery_delta_scope_from_sync(
                 north: viewport.north,
                 east: viewport.east,
             }),
+        label_filter: scope.label_filter.clone(),
     }
 }
 
@@ -111,6 +127,7 @@ pub(super) fn gallery_sync_scope_from_query(
             north: canonical_gallery_bound(viewport.north),
             east: canonical_gallery_bound(viewport.east),
         }),
+        label_filter: query.label_filter.clone(),
     }
 }
 
@@ -151,6 +168,7 @@ mod tests {
                 media_filter: StoreIndexMediaFilter::Image,
                 captured_sort: StoreIndexSortOrder::CapturedDesc,
                 viewport: None,
+                label_filter: Default::default(),
             },
         }
     }
@@ -184,11 +202,22 @@ mod tests {
                 north: 10.0,
                 east: 20.0,
             }),
+            label_filter: Default::default(),
         };
         let negative = gallery_sync_scope_from_query(&query(-0.0));
         let positive = gallery_sync_scope_from_query(&query(0.0));
         assert_eq!(negative, positive);
         assert_eq!(negative.prefix, "gallery");
         assert!(!negative.viewport.unwrap().south.is_sign_negative());
+    }
+
+    #[test]
+    fn gallery_sync_token_rejects_label_filters_over_the_index_limit() {
+        let mut payload = token_payload();
+        payload.scope.label_filter.required = (0..=MAX_GALLERY_LABEL_FILTER_LABELS)
+            .map(|index| format!("label-{index}"))
+            .collect();
+
+        assert!(decode_gallery_sync_token(&encode_gallery_sync_token(&payload)).is_none());
     }
 }

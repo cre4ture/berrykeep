@@ -27,9 +27,10 @@ use crate::{
     request_has_admin_auth, require_client_auth, require_client_or_admin_auth,
     require_internal_caller, restore_snapshot_path, restore_version_path, run_cleanup,
     run_tombstone_archive_purge, run_tombstone_archive_restore, run_tombstone_compaction,
-    s3_frontend, start_upload_session, storage_stats_current, storage_stats_history,
-    store_index_delta_response, transport_headers_from_response, trigger_replication_audit,
-    upload_session_chunk, validate_client_auth_request, wait_for_store_index_change,
+    s3_frontend, set_media_labels, start_upload_session, storage_stats_current,
+    storage_stats_history, store_index_delta_response, transport_headers_from_response,
+    trigger_replication_audit, upload_session_chunk, validate_client_auth_request,
+    wait_for_store_index_change,
 };
 
 #[derive(Clone)]
@@ -558,6 +559,7 @@ fn build_public_transport_router(state: ServerState) -> Router {
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
@@ -727,6 +729,7 @@ fn build_internal_transport_router(state: ServerState) -> Router {
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",

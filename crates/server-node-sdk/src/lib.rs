@@ -38,6 +38,7 @@ use bytes::Bytes;
 use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
+use common::xmp::{is_sidecar_key, sidecar_key_for_media};
 use common::{ClusterId, DeviceId, HealthStatus, NodeId};
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
@@ -152,9 +153,12 @@ mod web_maps;
 
 #[cfg(test)]
 use gallery_sync::GallerySyncScope;
+#[cfg(test)]
+use gallery_sync::MAX_GALLERY_LABEL_FILTER_LABELS;
 use gallery_sync::{
     GallerySyncTokenPayload, decode_gallery_sync_token, encode_gallery_sync_token,
-    gallery_delta_scope_from_sync, gallery_sync_scope_from_query,
+    gallery_delta_scope_from_sync, gallery_label_filter_is_within_limit,
+    gallery_sync_scope_from_query,
 };
 
 const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -7607,6 +7611,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
@@ -7703,6 +7708,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/auth/store/delete", post(delete_object_by_query_admin))
         .route("/auth/store/rename", post(rename_object_path_admin))
+        .route("/auth/store/labels", post(set_media_labels_admin))
         .route("/auth/store/restore", post(restore_snapshot_path))
         .route("/auth/media/thumbnail", get(get_media_thumbnail_admin))
         .route("/auth/media/cache/retry", post(retry_media_cache_admin))
@@ -8019,6 +8025,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
@@ -13123,6 +13130,39 @@ struct StoreIndexQuery {
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
+    /// Comma-separated labels an entry must carry to be listed.
+    require_labels: Option<String>,
+    /// Comma-separated labels that keep an entry out of the listing, which is
+    /// how a client keeps media labelled `private` out of the default view.
+    exclude_labels: Option<String>,
+}
+
+/// Splits a comma-separated label parameter into the labels it names.
+///
+/// Blank entries are dropped, so a trailing comma or an empty parameter does
+/// not become a filter on the empty label.
+fn store_index_labels(raw: Option<&String>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn store_index_label_filter(
+    query: &StoreIndexQuery,
+) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
+    let required = store_index_labels(query.require_labels.as_ref());
+    let excluded = store_index_labels(query.exclude_labels.as_ref());
+    let label_filter = storage::GalleryLabelFilter { required, excluded };
+    if !gallery_label_filter_is_within_limit(&label_filter) {
+        return Err("at most 64 labels may be specified across require_labels and exclude_labels");
+    }
+    Ok(label_filter)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -13264,6 +13304,10 @@ struct StoreIndexEntry {
     content_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     media: Option<MediaIndexResponse>,
+    /// User labels carried by the entry's XMP sidecar. Omitted when it has
+    /// none, so responses for unlabelled media stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -13585,6 +13629,17 @@ struct PathMutationRequest {
     overwrite: bool,
     #[serde(default)]
     expected_revision: Option<String>,
+}
+
+/// Replaces the labels of the media object at `path`.
+///
+/// The labels are stored in the XMP sidecar of that media object, so `path`
+/// names the media object itself, never its `.xmp` sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MediaLabelsRequest {
+    path: String,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14130,6 +14185,136 @@ async fn copy_object_path_response(
                 error = %err,
                 "failed to copy object path"
             );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn set_media_labels_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<MediaLabelsRequest>,
+) -> Response {
+    let action = "auth/store/labels";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "path": request.path.clone(),
+            "labels": request.labels.clone(),
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let actor = data_change_actor_from_admin_request(&authz);
+    set_media_labels_response(&state, request, Some(actor)).await
+}
+
+async fn set_media_labels(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<MediaLabelsRequest>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint("set_media_labels", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            set_media_labels_response(&state_for_request, request, Some(actor)).await
+        },
+    )
+    .await
+}
+
+/// Rewrites the XMP sidecar of a media object so that it carries exactly the
+/// requested labels.
+///
+/// Labelling is a write of the sidecar object, so it follows the path mutation
+/// idiom of this router: mutate under the store lock, then publish the namespace
+/// change and refresh local availability so the new sidecar version is announced
+/// like any other object write.
+async fn set_media_labels_response(
+    state: &ServerState,
+    request: MediaLabelsRequest,
+    actor: Option<DataChangeActorContext>,
+) -> Response {
+    let path = request.path.trim();
+    if path.is_empty() || is_sidecar_key(path) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let mut store = lock_store(state, "store_object.labels").await;
+    let outcome = store.set_media_labels(path, request.labels).await;
+    drop(store);
+
+    match outcome {
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(result)) => {
+            let sidecar_key = sidecar_key_for_media(path);
+            publish_namespace_change(state);
+            request_local_availability_refresh(state);
+            if should_trigger_autonomous_post_write_replication(
+                state.autonomous_replication_on_put_enabled,
+                false,
+            ) {
+                enqueue_autonomous_post_write_replication(
+                    state,
+                    autonomous_post_write_replication_subjects(&sidecar_key, &result.version_id),
+                )
+                .await;
+            }
+            record_data_change_event(
+                state,
+                PendingDataChangeEvent {
+                    action: DataChangeAction::Upload,
+                    actor,
+                    path: sidecar_key,
+                    from_path: None,
+                    to_path: None,
+                    recursive: false,
+                    affected_path_count: 1,
+                    total_size_bytes: None,
+                    version_id: Some(result.version_id.clone()),
+                    snapshot_id: Some(result.snapshot_id.clone()),
+                    upload_mode: Some(DataChangeUploadMode::Direct),
+                },
+            )
+            .await;
+            info!(
+                path,
+                version_id = %result.version_id,
+                "stored media labels"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err)
+            if err
+                .downcast_ref::<storage::SidecarWriteSizeLimitError>()
+                .is_some() =>
+        {
+            tracing::warn!(path, error = %err, "refused media labels that exceed the sidecar size limit");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            tracing::error!(path, error = %err, "failed to store media labels");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -15198,18 +15383,16 @@ async fn delete_object_response(
             return StatusCode::CONFLICT;
         }
     }
+    let tombstone_options = PutOptions {
+        parent_version_ids: query.parent,
+        state: version_state,
+        inherit_preferred_parent: true,
+        create_snapshot: !query.internal_replication,
+        explicit_version_id: query.version_id,
+    };
     let delete_result = if recursive {
         store
-            .tombstone_subtree(
-                &key,
-                PutOptions {
-                    parent_version_ids: query.parent,
-                    state: version_state,
-                    inherit_preferred_parent: true,
-                    create_snapshot: !query.internal_replication,
-                    explicit_version_id: query.version_id,
-                },
-            )
+            .tombstone_subtree(&key, tombstone_options)
             .await
             .map(|results| {
                 results
@@ -15217,20 +15400,21 @@ async fn delete_object_response(
                     .map(|entry| (entry.path, entry.version_id))
                     .collect::<Vec<_>>()
             })
-    } else {
+    } else if query.internal_replication {
         store
-            .tombstone_object(
-                &key,
-                PutOptions {
-                    parent_version_ids: query.parent,
-                    state: version_state,
-                    inherit_preferred_parent: true,
-                    create_snapshot: !query.internal_replication,
-                    explicit_version_id: query.version_id,
-                },
-            )
+            .tombstone_object(&key, tombstone_options)
             .await
             .map(|version_id| vec![(key.clone(), version_id)])
+    } else {
+        store
+            .tombstone_object_with_companions(&key, tombstone_options)
+            .await
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|entry| (entry.path, entry.version_id))
+                    .collect::<Vec<_>>()
+            })
     };
 
     match delete_result {
@@ -15265,11 +15449,10 @@ async fn delete_object_response(
             }
 
             if !query.internal_replication {
-                let version_id = if deleted_paths.len() == 1 {
-                    Some(deleted_paths[0].1.clone())
-                } else {
-                    None
-                };
+                let version_id = deleted_paths
+                    .iter()
+                    .find(|(deleted_path, _)| deleted_path == &key)
+                    .map(|(_, version_id)| version_id.clone());
                 record_data_change_event(
                     state,
                     PendingDataChangeEvent {
@@ -15615,10 +15798,23 @@ fn store_index_viewport_bounds(
     }))
 }
 
+/// Whether `query` asks for a label filter, independent of whether the gallery
+/// fast path can actually honour it.
+///
+/// The generic listing fallback hard-codes `labels: Vec::new()` on every entry
+/// and cannot filter by label at all, so a caller that requested filtering has
+/// to be told the request could not be honoured rather than silently receiving
+/// an unfiltered `200` -- the motivating use case is keeping `private` media
+/// out of a view, so a silent fallback would leak it.
+fn store_index_label_filter_requested(label_filter: &storage::GalleryLabelFilter) -> bool {
+    !label_filter.is_empty()
+}
+
 fn store_index_gallery_query(
     query: &StoreIndexQuery,
     prefix: &str,
     depth: usize,
+    label_filter: storage::GalleryLabelFilter,
 ) -> Option<storage::GalleryIndexQuery> {
     if query.snapshot.is_some() || query.cursor.is_some() || query.page_size.is_some() {
         return None;
@@ -15641,6 +15837,7 @@ fn store_index_gallery_query(
         offset: query.offset.unwrap_or(0),
         limit: query.limit?.max(1),
         viewport: store_index_viewport_bounds(query).ok()?,
+        label_filter,
     })
 }
 
@@ -15719,6 +15916,7 @@ fn store_index_entry_from_gallery_entry(
         modified_at_unix: entry.modified_at_unix,
         content_fingerprint: entry.content_fingerprint,
         media,
+        labels: entry.labels,
     }
 }
 
@@ -15835,6 +16033,12 @@ async fn list_store_index_response_attempt(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
         }
     };
+    let label_filter = match store_index_label_filter(&query) {
+        Ok(label_filter) => label_filter,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
     let request_id = Uuid::new_v4();
     let request_started_at = Instant::now();
     let prefix = query.prefix.clone().unwrap_or_default();
@@ -15847,12 +16051,22 @@ async fn list_store_index_response_attempt(
         .namespace_change_sequence
         .load(Ordering::SeqCst);
 
-    let gallery_query = store_index_gallery_query(&query, &prefix, depth);
+    let label_filter_requested = store_index_label_filter_requested(&label_filter);
+    let gallery_query = store_index_gallery_query(&query, &prefix, depth, label_filter);
     if viewport.is_some() && gallery_query.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "viewport bounds require a current, paginated gallery query sorted by captured time"
+            })),
+        )
+            .into_response();
+    }
+    if label_filter_requested && gallery_query.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "label filters require a current, paginated gallery query sorted by captured time"
             })),
         )
             .into_response();
@@ -15916,7 +16130,25 @@ async fn list_store_index_response_attempt(
                 )
                     .into_response();
             }
+            Ok(None) if label_filter_requested => {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(json!({
+                        "error": "label filters require a metadata backend with gallery projection support"
+                    })),
+                )
+                    .into_response();
+            }
             Ok(None) => {}
+            Err(err) if label_filter_requested => {
+                tracing::error!(
+                    error = %err,
+                    prefix = %prefix,
+                    "gallery index fast path failed while a label filter was requested; \
+                     refusing to fall back to the unfiltered generic store index"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
             Err(err) => {
                 warn!(
                     error = %err,
@@ -16707,6 +16939,7 @@ fn collapse_store_index_entries_for_tree_view(
                 modified_at_unix: None,
                 content_fingerprint: None,
                 media: None,
+                labels: Vec::new(),
             });
     }
 
@@ -17269,6 +17502,9 @@ fn build_store_index_prefix_entry(path: String) -> StoreIndexEntry {
         modified_at_unix: None,
         content_fingerprint: None,
         media: None,
+        // Labels are a property of the gallery projection; the generic listing
+        // does not resolve them.
+        labels: Vec::new(),
     }
 }
 
@@ -17300,6 +17536,9 @@ fn build_store_index_object_entry(
         modified_at_unix,
         content_fingerprint,
         media: None,
+        // Labels are a property of the gallery projection; the generic listing
+        // does not resolve them.
+        labels: Vec::new(),
     }
 }
 
