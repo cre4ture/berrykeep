@@ -46,7 +46,6 @@ class FolderSyncForegroundService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val reconcileMutex = Mutex()
     private var statusJob: Job? = null
-    private var retryJob: Job? = null
     private var lastLoggedStatusLine: String? = null
     private var lastDesiredSignature: String? = null
     private var waitingSummary: String? = null
@@ -205,24 +204,11 @@ class FolderSyncForegroundService : Service() {
     }
 
     private fun schedulePersistedRetryWakeup(state: FolderSyncOutageRetryState) {
-        cancelRetryWakeup()
-        val delayMs = state.nextRetryAtEpochMs - System.currentTimeMillis()
-        if (state.failureCount == 0 || delayMs <= 0L) {
-            return
-        }
-        retryJob = scope.launch {
-            delay(delayMs)
-            retryJob = null
-            requestReconcile(
-                reason = "outage backoff expired",
-                trigger = FolderSyncRetryTrigger.BACKOFF_TIMER,
-            )
-        }
+        FolderSyncOutageRetryScheduler.schedule(applicationContext, state)
     }
 
     private fun cancelRetryWakeup() {
-        retryJob?.cancel()
-        retryJob = null
+        FolderSyncOutageRetryScheduler.cancel(applicationContext)
     }
 
     private fun buildRetryMessage(reason: String, state: FolderSyncOutageRetryState): String {

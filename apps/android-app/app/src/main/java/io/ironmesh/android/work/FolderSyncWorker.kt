@@ -45,7 +45,7 @@ class FolderSyncWorker(
                 .filter { it.enabled }
 
             if (profiles.isEmpty()) {
-                outageRetryStore.clear()
+                clearOutageRetry()
                 return@withContext Result.success()
             }
 
@@ -90,10 +90,11 @@ class FolderSyncWorker(
             }
 
             if (failures.isEmpty()) {
-                outageRetryStore.clear()
+                clearOutageRetry()
                 Result.success()
             } else {
                 val retryState = outageRetryStore.recordFailure()
+                FolderSyncOutageRetryScheduler.schedule(applicationContext, retryState)
                 Log.i(
                     TAG,
                     "one-shot sync failure recorded; next eligible retry is after ${retryState.nextRetryAtEpochMs}",
@@ -135,6 +136,11 @@ class FolderSyncWorker(
         )
 
         Log.i(TAG, "synced profile=${profile.id} via rust runtime")
+    }
+
+    private fun clearOutageRetry() {
+        outageRetryStore.clear()
+        FolderSyncOutageRetryScheduler.cancel(applicationContext)
     }
 
     private companion object {
