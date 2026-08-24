@@ -29,8 +29,9 @@ mod tests {
     use anyhow::{Context, Result};
     use bytes::Bytes;
     use client_sdk::{
-        BootstrapEndpointUse, ClientConnectionDiagnosticImpact, ClientNode, ConnectionBootstrap,
-        ContentAddressedClientCache, IronMeshClient, LatencyProbeConfig,
+        BootstrapEndpointUse, ClientConnectionDiagnosticImpact, ClientNode,
+        ClientRouteMaintenancePolicy, ConnectionBootstrap, ContentAddressedClientCache,
+        IronMeshClient, LatencyProbeConfig,
         PlannedConnectionBootstrapTarget, UploadMode, UploadSessionChunkRef,
         build_http_client_from_planned_targets,
         build_http_client_with_identity_from_planned_targets, enroll_connection_input_blocking,
@@ -1779,24 +1780,19 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(2)).await;
             client.refresh_due_connection_route_snapshot().await;
 
-            let primary_failures_before = client
-                .connection_diagnostics()
+            let outage_diagnostics = client.connection_diagnostics();
+            let primary_before_recovery = outage_diagnostics
                 .endpoints
                 .iter()
                 .find(|endpoint| endpoint.request_base_url == primary_url)
                 .context("primary route diagnostics are missing")?
-                .total_failures;
+                .clone();
             assert_eq!(
-                primary_failures_before, 2,
+                primary_before_recovery.total_failures, 2,
                 "expected exactly one foreground failure and one maintenance probe while the primary is down"
             );
             assert!(
-                client
-                    .connection_diagnostics()
-                    .endpoints
-                    .iter()
-                    .find(|endpoint| endpoint.request_base_url == primary_url)
-                    .context("primary route diagnostics are missing after maintenance")?
+                primary_before_recovery
                     .recent_attempts
                     .iter()
                     .any(|attempt| {
@@ -1819,7 +1815,7 @@ mod tests {
                 .context("primary route diagnostics are missing after fallback traffic")?
                 .total_failures;
             assert_eq!(
-                primary_failures_during_outage, primary_failures_before,
+                primary_failures_during_outage, primary_before_recovery.total_failures,
                 "fallback traffic retried the cooling primary route instead of respecting its circuit breaker"
             );
 
@@ -1843,7 +1839,7 @@ mod tests {
                 .context("primary route is missing from the recovered diagnostics")?;
             assert_eq!(recovered_primary.consecutive_failures, 0);
             assert!(
-                recovered_primary.total_successes >= 2,
+                recovered_primary.total_successes > primary_before_recovery.total_successes,
                 "primary route was not reprobed after its server recovered: {recovered_primary:#?}"
             );
             assert!(recovered_primary.last_error.is_none());
@@ -1862,12 +1858,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_only_client_stays_idle_during_rendezvous_outage_and_recovers() -> Result<()> {
-        let rendezvous_bind = "127.0.0.1:19272";
+    async fn relay_only_client_bounds_maintenance_during_rendezvous_outage_and_recovers(
+    ) -> Result<()> {
+        let rendezvous_bind_a = "127.0.0.1:19272";
+        let rendezvous_bind_b = "127.0.0.1:19274";
         let server_bind = "127.0.0.1:19273";
         let cluster_id = "11111111-1111-7111-8111-111111111172";
         let node_id = "00000000-0000-0000-0000-000000000972";
-        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let rendezvous_url_a = format!("http://{rendezvous_bind_a}");
+        let rendezvous_url_b = format!("http://{rendezvous_bind_b}");
+        let rendezvous_urls = format!("{rendezvous_url_a},{rendezvous_url_b}");
         let server_url = format!("http://{server_bind}");
         let client_dir = fresh_data_dir("bounded-relay-outage-client");
         let server_data_dir = fresh_data_dir("bounded-relay-outage-server");
@@ -1875,14 +1875,15 @@ mod tests {
 
         let node_env = [
             ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
             ("IRONMESH_RELAY_MODE", "fallback"),
             ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
             ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
             ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
         ];
 
-        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut rendezvous_a = start_rendezvous_service(rendezvous_bind_a).await?;
+        let mut rendezvous_b = start_rendezvous_service(rendezvous_bind_b).await?;
         let mut server = start_open_server_with_env(
             server_bind,
             &server_data_dir,
@@ -1894,7 +1895,8 @@ mod tests {
         let http = reqwest::Client::new();
 
         let result = async {
-            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url_a, 1, 120).await?;
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url_b, 1, 120).await?;
             let enrolled = issue_bootstrap_bundle_and_enroll_client(
                 &http,
                 &server_url,
@@ -1914,60 +1916,109 @@ mod tests {
                 tokio::task::spawn_blocking(move || bootstrap.build_client_with_identity(&identity))
                     .await
                     .context("relay-only client construction task panicked")??
-            };
+            }
+            .with_route_maintenance_policy(ClientRouteMaintenancePolicy::mobile_background());
             assert!(relay_client.uses_relay_transport());
             relay_client.get_json_path("/cluster/status").await?;
+            let relay_successes_before_outage = relay_client
+                .connection_diagnostics()
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.path_kind == "relay")
+                .map(|endpoint| endpoint.total_successes)
+                .sum::<u64>();
+            assert_eq!(
+                relay_client
+                    .connection_diagnostics()
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.path_kind == "relay")
+                    .count(),
+                2,
+                "expected one relay route per configured rendezvous service"
+            );
 
-            stop_server(&mut rendezvous).await;
+            stop_server(&mut rendezvous_a).await;
+            stop_server(&mut rendezvous_b).await;
             assert!(
                 relay_client.get_json_path("/cluster/status").await.is_err(),
-                "relay-only request unexpectedly succeeded while its rendezvous service was stopped"
+                "relay-only request unexpectedly succeeded while both rendezvous services were stopped"
             );
 
-            let failed_relay = relay_client
+            let outage_failures = relay_client
                 .connection_diagnostics()
                 .endpoints
-                .into_iter()
-                .find(|endpoint| endpoint.path_kind == "relay")
-                .context("relay-only client diagnostics are missing its relay route")?;
-            assert_eq!(failed_relay.total_failures, 1);
-            assert_eq!(failed_relay.consecutive_failures, 1);
+                .iter()
+                .filter(|endpoint| endpoint.path_kind == "relay")
+                .map(|endpoint| endpoint.total_failures)
+                .sum::<u64>();
+            assert!(
+                outage_failures >= 1,
+                "relay-only client did not record the rendezvous outage"
+            );
 
+            // Drive the same status-maintenance entry point used by an app scheduler. The mobile
+            // policy permits one candidate per 15-minute batch, so an outage cannot fan out into
+            // an unbounded sequence of rendezvous attempts.
             tokio::time::sleep(Duration::from_secs(2)).await;
-            let idle_relay = relay_client
+            relay_client.refresh_due_connection_route_snapshot().await;
+            let failures_after_maintenance = relay_client
                 .connection_diagnostics()
                 .endpoints
-                .into_iter()
-                .find(|endpoint| endpoint.path_kind == "relay")
-                .context("relay-only route diagnostics disappeared during outage")?;
+                .iter()
+                .filter(|endpoint| endpoint.path_kind == "relay")
+                .map(|endpoint| endpoint.total_failures)
+                .sum::<u64>();
+            assert!(
+                failures_after_maintenance <= outage_failures + 1,
+                "mobile maintenance probed more than one unavailable rendezvous relay: {failures_after_maintenance} failures after {outage_failures} outage failures"
+            );
+            relay_client.refresh_due_connection_route_snapshot().await;
+            let failures_after_immediate_retry = relay_client
+                .connection_diagnostics()
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.path_kind == "relay")
+                .map(|endpoint| endpoint.total_failures)
+                .sum::<u64>();
             assert_eq!(
-                idle_relay.total_failures, failed_relay.total_failures,
-                "the idle client retried the unavailable rendezvous relay without a foreground request"
+                failures_after_immediate_retry, failures_after_maintenance,
+                "mobile maintenance retried unavailable rendezvous relays before its probe interval elapsed"
             );
 
-            rendezvous = start_rendezvous_service(rendezvous_bind).await?;
-            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+            rendezvous_a = start_rendezvous_service(rendezvous_bind_a).await?;
+            rendezvous_b = start_rendezvous_service(rendezvous_bind_b).await?;
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url_a, 1, 120).await?;
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url_b, 1, 120).await?;
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             relay_client.get_json_path("/cluster/status").await?;
-            let recovered_relay = relay_client
-                .connection_diagnostics()
+            let recovered_diagnostics = relay_client.connection_diagnostics();
+            let recovered_relay_successes = recovered_diagnostics
                 .endpoints
-                .into_iter()
-                .find(|endpoint| endpoint.path_kind == "relay")
-                .context("recovered relay route diagnostics are missing")?;
-            assert_eq!(recovered_relay.consecutive_failures, 0);
+                .iter()
+                .filter(|endpoint| endpoint.path_kind == "relay")
+                .map(|endpoint| endpoint.total_successes)
+                .sum::<u64>();
             assert!(
-                recovered_relay.total_successes > failed_relay.total_successes,
-                "the relay route did not record a successful recovery: {recovered_relay:#?}"
+                recovered_relay_successes > relay_successes_before_outage,
+                "the relay routes did not record a successful recovery: {recovered_diagnostics:#?}"
             );
-            assert!(recovered_relay.last_error.is_none());
+            assert!(
+                recovered_diagnostics.endpoints.iter().any(|endpoint| {
+                    endpoint.path_kind == "relay"
+                        && endpoint.consecutive_failures == 0
+                        && endpoint.last_error.is_none()
+                }),
+                "no relay route cleared its failure state after rendezvous recovery: {recovered_diagnostics:#?}"
+            );
 
             Ok::<(), anyhow::Error>(())
         }
         .await;
 
-        stop_server(&mut rendezvous).await;
+        stop_server(&mut rendezvous_a).await;
+        stop_server(&mut rendezvous_b).await;
         stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&client_dir);
         let _ = fs::remove_dir_all(&server_data_dir);
