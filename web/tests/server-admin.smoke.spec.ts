@@ -3,6 +3,7 @@ import { gzipSync } from "node:zlib";
 import type { GalleryMapConfiguration } from "@ironmesh/api";
 import { expect, test, type Page, type Route } from "@playwright/test";
 import { registerGalleryMapContractTests } from "./gallery-map.contract";
+import { GalleryMapMockSession } from "./gallery-map.mock";
 import {
   filterMockStoreEntriesToPrefix,
   projectMockStoreTreeEntries
@@ -719,7 +720,9 @@ test("server-admin explorer loads version history with thumbnails", async ({ pag
 
   await expect(page.getByLabel("Key")).toHaveValue("gallery/cat.png");
   const versionHistoryTable = page.getByRole("table").nth(1);
-  await expect(versionHistoryTable.getByRole("cell", { name: "version-cat-001" })).toBeVisible();
+  await expect(
+    versionHistoryTable.getByRole("cell", { name: "version-cat-001", exact: true })
+  ).toBeVisible();
   await expect(versionHistoryTable.getByRole("row", { name: /version-cat-001/ })).toContainText("3.0 MB");
   await expect(
     versionHistoryTable.getByRole("row", { name: /version-cat-001/ }).getByRole("button", { name: "Restore" })
@@ -750,7 +753,7 @@ test("server-admin explorer loads version history with thumbnails", async ({ pag
     .toBe(true);
 
   await page.keyboard.press("Escape");
-  await page.getByText("Show thumbnails", { exact: true }).click();
+  await expect(page.getByRole("switch", { name: "Show thumbnails" })).toBeChecked();
   await page.getByRole("button", { name: "Version history" }).click();
   await expect(page.getByRole("button", { name: "Thumbnail for gallery/cat.png" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Thumbnail for version version-cat-001" })).toBeVisible();
@@ -1463,7 +1466,7 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
 
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("12 markers", { exact: true })).toBeVisible();
-  await expect(page.getByText("1 visible clusters", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 server cluster", { exact: true })).toBeVisible();
 
   const clusterButton = page.getByRole("button", {
     name: "Open map cluster with 12 items"
@@ -1482,7 +1485,7 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
   ).toBeVisible();
 });
 
-test("server-admin gallery only auto-zooms spread map clusters on ctrl-click", async ({ page }) => {
+test("server-admin gallery drills into geographically spread server clusters", async ({ page }) => {
   await installServerAdminMocks(page, {
     galleryEntries: createGeoSpreadClusteredAdminGalleryEntries(12)
   });
@@ -1501,7 +1504,7 @@ test("server-admin gallery only auto-zooms spread map clusters on ctrl-click", a
 
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("12 markers", { exact: true })).toBeVisible();
-  await expect(page.getByText("1 visible clusters", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 server cluster", { exact: true })).toBeVisible();
 
   const clusterButton = page.getByRole("button", {
     name: "Open map cluster with 12 items"
@@ -1512,14 +1515,8 @@ test("server-admin gallery only auto-zooms spread map clusters on ctrl-click", a
 
   await expect(clusterButton).toBeVisible();
   await clusterButton.click();
-  await expect(clusterDialogTitle).toBeVisible();
-
-  await page.keyboard.press("Escape");
   await expect(clusterDialogTitle).toHaveCount(0);
-
-  await clusterButton.click({ modifiers: ["Control"] });
-  await expect(clusterDialogTitle).toHaveCount(0);
-  await expect(page.getByText("1 visible clusters", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("1 server cluster", { exact: true })).toHaveCount(0);
 });
 
 test("server-admin provisioning falls back to the full bootstrap bundle when claim issuance returns 502", async ({ page }) => {
@@ -1560,6 +1557,55 @@ test("server-admin provisioning does not fall back when a specific rendezvous se
 
   await expect(page.getByText("Request failed", { exact: true })).toBeVisible();
   await expect(page.getByText("Compact claim issuance is temporarily unavailable on this node, so the page fell back to a full bootstrap QR.")).toHaveCount(0);
+});
+
+test("server-admin setup defaults to Turso and submits the selected metadata backend", async ({ page }) => {
+  await installServerAdminMocks(page, { setupMode: true });
+
+  await page.goto("/");
+
+  await expect(page.getByText("live first-run bootstrap UI", { exact: false })).toBeVisible();
+  const backendSelectors = page.getByRole("textbox", { name: "Metadata database backend" });
+  await expect(backendSelectors).toHaveCount(2);
+  await expect(backendSelectors.first()).toHaveValue("Turso (Pure Rust)");
+
+  await backendSelectors.first().click();
+  await page.getByRole("option", { name: "SQLite (rusqlite)" }).click();
+  await page.getByLabel("Initial admin password").fill("setup-password-long-enough");
+  const requestPromise = page.waitForRequest(
+    (request) => request.url().endsWith("/setup/start-cluster") && request.method() === "POST"
+  );
+  await page.getByRole("button", { name: "Start a new cluster" }).click();
+  const request = await requestPromise;
+
+  expect(request.postDataJSON()).toMatchObject({
+    metadata_backend: "sqlite"
+  });
+});
+
+test("server-admin setup preserves an explicit join backend choice across a status refresh", async ({ page }) => {
+  await installServerAdminMocks(page, { setupMode: true });
+
+  await page.goto("/");
+
+  await expect(page.getByText("live first-run bootstrap UI", { exact: false })).toBeVisible();
+  const backendSelectors = page.getByRole("textbox", { name: "Metadata database backend" });
+  await expect(backendSelectors).toHaveCount(2);
+  const joinBackendSelector = backendSelectors.nth(1);
+  await expect(joinBackendSelector).toHaveValue("Turso (Pure Rust)");
+
+  await joinBackendSelector.click();
+  await page.getByRole("option", { name: "SQLite (rusqlite)" }).click();
+  await expect(joinBackendSelector).toHaveValue("SQLite (rusqlite)");
+
+  // The mocked /setup/status always reports "turso"; generating a join request triggers a
+  // status refresh, which previously clobbered the admin's explicit selection back to "turso".
+  const statusRefreshPromise = page.waitForResponse(
+    (response) => response.url().endsWith("/setup/status") && response.request().method() === "GET"
+  );
+  await page.getByRole("button", { name: "Generate join request" }).click();
+  await statusRefreshPromise;
+  await expect(joinBackendSelector).toHaveValue("SQLite (rusqlite)");
 });
 
 test("server-admin runtime ignores auth-protected setup probes", async ({ page }) => {
@@ -1754,6 +1800,7 @@ async function installServerAdminMocks(
     version_id: "rendezvous-contact-version-1"
   };
   const galleryEntries = options?.galleryEntries ?? createDefaultAdminGalleryEntries();
+  const galleryMapMock = new GalleryMapMockSession<AdminMockStoreEntry>();
   let storagePoolConfig: StoragePoolMockConfig = {
     version: 1,
     paths: [
@@ -2018,6 +2065,14 @@ async function installServerAdminMocks(
     if (pathname === apiV1("/auth/store/index") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
       return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
+    }
+
+    if (pathname === apiV1("/auth/store/map/clusters") && method === "GET") {
+      return json(route, galleryMapMock.clusters(galleryEntries, searchParams));
+    }
+
+    if (pathname === apiV1("/auth/store/map/cluster-entries") && method === "GET") {
+      return json(route, galleryMapMock.clusterEntries(searchParams));
     }
 
     if (pathname === apiV1("/auth/client-connections") && method === "GET") {
@@ -2794,6 +2849,9 @@ async function installServerAdminMocks(
         bootstrap_tls_fingerprint: "setup-fingerprint",
         cluster_id: null,
         node_id: "node-beta",
+        recovery_reason: null,
+        metadata_backend: "turso",
+        available_metadata_backends: ["sqlite", "turso"],
         pending_join_request: {
           version: 1,
           node_id: "node-beta",
@@ -2823,6 +2881,7 @@ async function installServerAdminMocks(
         cluster_id: "cluster-new",
         node_id: "node-new",
         public_url: "https://node-new.local",
+        metadata_backend: "turso",
         restart_required: false
       });
     }
@@ -2841,6 +2900,7 @@ async function installServerAdminMocks(
         cluster_id: "cluster-alpha",
         node_id: "node-beta",
         public_url: "https://node-beta.local",
+        metadata_backend: "turso",
         restart_required: false
       });
     }
@@ -3582,7 +3642,7 @@ function createGeoSpreadClusteredAdminGalleryEntries(count: number): AdminMockSt
 
   return Array.from({ length: count }, (_, index) => {
     const path = `gallery/spread-cluster-${String(index + 1).padStart(2, "0")}.png`;
-    const offset = (index - centerOffset) * 0.0003;
+    const offset = (index - centerOffset) * 0.02;
 
     return {
       path,

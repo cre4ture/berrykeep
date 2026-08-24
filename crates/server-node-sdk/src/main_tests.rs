@@ -515,7 +515,7 @@ case "$input" in
   http+unix://*|http://127.0.0.1:*) ;;
   *) printf 'unexpected input: %s\n' "$input" >&2; exit 1 ;;
 esac
-printf '%s\n' '{"streams":[{"width":1920,"height":1080}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.0"}}'
+printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264","codec_tag_string":"avc1","avg_frame_rate":"30000/1001","bit_rate":"4000000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.125","bit_rate":"4500000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}}'
 "#;
     std::fs::write(&ffprobe_path, ffprobe_script).unwrap();
 
@@ -1951,6 +1951,140 @@ run_on_main_metadata_backends!(
     gallery_delta_admin_route_requires_authorization_and_accepts_current_token_turso
 );
 
+async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let second_png = {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([90, 80, 70, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    };
+    let first_manifest_hash = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let first = locked
+            .put_object_versioned(
+                "gallery/first.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let second = locked
+            .put_object_versioned(
+                "gallery/second.png",
+                bytes::Bytes::from(second_png),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        for (manifest_hash, captured_at_unix) in
+            [(&first.manifest_hash, 100), (&second.manifest_hash, 200)]
+        {
+            let mut metadata = locked
+                .ensure_media_metadata(manifest_hash)
+                .await
+                .unwrap()
+                .unwrap();
+            metadata.taken_at_unix = Some(captured_at_unix);
+            metadata.gps = Some(super::storage::MediaGpsCoordinates {
+                latitude: 47.3769,
+                longitude: 8.5417,
+            });
+            locked.persist_media_cache_record(&metadata).await.unwrap();
+        }
+        first.manifest_hash
+    };
+
+    let clusters = super::gallery_map_clusters_response(
+        &state,
+        super::GalleryMapClustersQuery {
+            prefix: Some("gallery".to_string()),
+            depth: Some(64),
+            media_filter: Some(super::StoreIndexMediaFilter::Image),
+            south: Some(-90.0),
+            west: Some(-180.0),
+            north: Some(90.0),
+            east: Some(180.0),
+            zoom: Some(20),
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(clusters.status(), StatusCode::OK);
+    let clusters_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(clusters.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(clusters_payload["total_entry_count"], 2);
+    assert_eq!(clusters_payload["visible_geotagged_count"], 2);
+    assert_eq!(clusters_payload["clusters"].as_array().unwrap().len(), 1);
+    assert_eq!(clusters_payload["clusters"][0]["count"], 2);
+    let query_token = clusters_payload["query_token"].as_str().unwrap();
+    let cluster_id = clusters_payload["clusters"][0]["cluster_id"]
+        .as_str()
+        .unwrap();
+
+    let first_page = super::gallery_map_cluster_entries_response(
+        &state,
+        super::GalleryMapClusterEntriesQuery {
+            query_token: Some(query_token.to_string()),
+            cluster_id: Some(cluster_id.to_string()),
+            offset: Some(0),
+            limit: Some(1),
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_page_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(first_page.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(first_page_payload["entry_count"], 1);
+    assert_eq!(first_page_payload["total_entry_count"], 2);
+    assert_eq!(first_page_payload["has_more"], true);
+    assert_eq!(
+        first_page_payload["entries"][0]["path"],
+        "gallery/second.png"
+    );
+
+    {
+        let locked = lock_store(&state, "tests.state.store").await;
+        let mut metadata = locked
+            .ensure_media_metadata(&first_manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        metadata.width = Some(metadata.width.unwrap_or_default().saturating_add(1));
+        locked.persist_media_cache_record(&metadata).await.unwrap();
+    }
+
+    let stale_page = super::gallery_map_cluster_entries_response(
+        &state,
+        super::GalleryMapClusterEntriesQuery {
+            query_token: Some(query_token.to_string()),
+            cluster_id: Some(cluster_id.to_string()),
+            offset: Some(1),
+            limit: Some(1),
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(stale_page.status(), StatusCode::CONFLICT);
+    let stale_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(stale_page.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(stale_payload["code"], "gallery_map_cluster_stale");
+    assert_eq!(stale_payload["reset"], true);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl,
+    gallery_map_cluster_leaf_pages_reject_stale_query_tokens,
+    gallery_map_cluster_leaf_pages_reject_stale_query_tokens_turso
+);
+
 #[test]
 fn gallery_sync_token_is_opaque_versioned_and_rejects_malformed_values() {
     let payload = super::GallerySyncTokenPayload {
@@ -1962,6 +2096,7 @@ fn gallery_sync_token_is_opaque_versioned_and_rejects_malformed_values() {
             media_filter: super::StoreIndexMediaFilter::Image,
             captured_sort: super::StoreIndexSortOrder::CapturedDesc,
             viewport: None,
+            label_filter: Default::default(),
         },
     };
     let token = super::encode_gallery_sync_token(&payload);
@@ -1988,6 +2123,8 @@ fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
         west,
         north,
         east,
+        require_labels: None,
+        exclude_labels: None,
     };
     assert!(
         super::store_index_viewport_bounds(&query(Some(1.0), None, Some(2.0), Some(3.0))).is_err()
@@ -2009,6 +2146,48 @@ fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
     .unwrap()
     .unwrap();
     assert!(antimeridian.west > antimeridian.east);
+}
+
+#[tokio::test]
+async fn gallery_label_filter_limit_returns_bad_request() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let labels = (0..=super::MAX_GALLERY_LABEL_FILTER_LABELS)
+        .map(|index| format!("label-{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(64),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(100),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+                south: None,
+                west: None,
+                north: None,
+                east: None,
+                require_labels: Some(labels),
+                exclude_labels: None,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        payload["error"],
+        "at most 64 labels may be specified across require_labels and exclude_labels"
+    );
+
+    cleanup_test_state(&state).await;
 }
 
 #[cfg(feature = "turso-metadata")]
@@ -2057,6 +2236,8 @@ async fn turso_gallery_projection_supports_viewport_and_delta() {
                 west: Some(5.0),
                 north: Some(49.0),
                 east: Some(11.0),
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -4258,8 +4439,8 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
     assert!(put_etag.starts_with('"'));
     assert!(!put_version_id.is_empty());
 
-    {
-        let store = lock_store(&state, "tests.s3_listener.verify_put_metadata").await;
+    let sidecar_payload = {
+        let mut store = lock_store(&state, "tests.s3_listener.verify_put_metadata").await;
         let metadata = store
             .load_object_version_metadata(&put_version_id)
             .await
@@ -4285,7 +4466,42 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
             .unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version_id, put_version_id);
-    }
+
+        store
+            .set_media_labels("tenant/photos/docs/hello.txt", vec!["private".to_string()])
+            .await
+            .unwrap()
+            .expect("the label API must create a sidecar for the S3 object");
+        store
+            .get_object(
+                "tenant/photos/docs/hello.txt.xmp",
+                None,
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("the label sidecar must be readable before S3 upload")
+    };
+
+    let put_sidecar = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/photos.example/docs/hello.txt.xmp",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/rdf+xml")],
+            sidecar_payload,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_sidecar.status(), StatusCode::OK);
+    let put_sidecar_version_id = put_sidecar
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
 
     let list_objects = app
         .clone()
@@ -4394,6 +4610,46 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
             versions
                 .iter()
                 .any(|record| record.version_id == delete_version_id)
+        );
+        let sidecar_versions = store
+            .list_s3_object_versions_for_key("photos.example", "tenant/photos/docs/hello.txt.xmp")
+            .await
+            .unwrap();
+        assert_eq!(sidecar_versions.len(), 2);
+        assert!(
+            sidecar_versions
+                .iter()
+                .any(|record| record.version_id == put_sidecar_version_id)
+        );
+        let sidecar_delete_version_id = sidecar_versions
+            .iter()
+            .find(|record| record.version_id != put_sidecar_version_id)
+            .expect("deleting media through S3 must persist its companion sidecar tombstone")
+            .version_id
+            .clone();
+        assert!(
+            store
+                .inspect_object_version(
+                    "tenant/photos/docs/hello.txt.xmp",
+                    &sidecar_delete_version_id,
+                )
+                .await
+                .unwrap()
+                .expect("the companion S3 tombstone record must resolve to a version")
+                .is_delete_marker,
+            "the companion S3 ledger record must describe its delete marker"
+        );
+        assert!(
+            store
+                .get_object(
+                    "tenant/photos/docs/hello.txt.xmp",
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .is_err(),
+            "deleting a media object through S3 must tombstone its label sidecar too"
         );
     }
 
@@ -12441,6 +12697,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
+            labels: Vec::new(),
         },
         super::StoreIndexEntry {
             path: "images/".to_string(),
@@ -12451,6 +12708,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
+            labels: Vec::new(),
         },
         super::StoreIndexEntry {
             path: "images/cat.png".to_string(),
@@ -12461,6 +12719,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
+            labels: Vec::new(),
         },
     ];
 
@@ -13331,6 +13590,292 @@ run_on_main_metadata_backends!(
     delete_object_handler_marks_tombstone_and_removes_current_key_turso
 );
 
+/// Public deletes own the media-sidecar cascade, but replication receives the
+/// two tombstones independently so every node preserves the same sidecar
+/// version graph.
+async fn delete_object_handler_cascades_sidecars_only_for_public_deletes_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let media_key = "album/photo.jpg";
+    let sidecar_key = "album/photo.jpg.xmp";
+
+    {
+        let mut store = lock_store(&state, "tests.delete_sidecar.public.seed").await;
+        store
+            .put_object_versioned(
+                media_key,
+                bytes::Bytes::from_static(b"first-photo"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .set_media_labels(media_key, vec!["private".to_string()])
+            .await
+            .unwrap();
+    }
+
+    let public_response = super::delete_object(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::extract::Path(media_key.to_string()),
+        axum::extract::Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(public_response.status(), StatusCode::CREATED);
+    {
+        let store = lock_store(&state, "tests.delete_sidecar.public.verify").await;
+        let keys = store.current_keys().await.unwrap();
+        assert!(!keys.contains(&media_key.to_string()));
+        assert!(!keys.contains(&sidecar_key.to_string()));
+        let event = store
+            .list_data_change_events(&super::storage::DataChangeEventQuery::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.path == media_key)
+            .expect("the public delete must be recorded as a data-change event");
+        assert_eq!(event.affected_path_count, 2);
+        assert!(
+            event.version_id.is_some(),
+            "a companion tombstone must not hide the deleted media version ID"
+        );
+    }
+
+    {
+        let mut store = lock_store(&state, "tests.delete_sidecar.replication.seed").await;
+        store
+            .put_object_versioned(
+                media_key,
+                bytes::Bytes::from_static(b"replicated-photo"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .set_media_labels(media_key, vec!["private".to_string()])
+            .await
+            .unwrap();
+    }
+
+    let replicated_response = super::delete_object(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::extract::Path(media_key.to_string()),
+        axum::extract::Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            version_id: Some("repl-media-delete".to_string()),
+            internal_replication: true,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(replicated_response.status(), StatusCode::CREATED);
+    {
+        let store = lock_store(&state, "tests.delete_sidecar.replication.verify").await;
+        let keys = store.current_keys().await.unwrap();
+        assert!(!keys.contains(&media_key.to_string()));
+        assert!(
+            keys.contains(&sidecar_key.to_string()),
+            "the explicit sidecar tombstone must arrive as its own replicated version"
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    delete_object_handler_cascades_sidecars_only_for_public_deletes_impl,
+    delete_object_handler_cascades_sidecars_only_for_public_deletes,
+    delete_object_handler_cascades_sidecars_only_for_public_deletes_turso
+);
+
+async fn set_media_labels_handler_writes_the_sidecar_object_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let media_key = "album/photo.jpg";
+    let sidecar_key = "album/photo.jpg.xmp";
+
+    let rejected = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: sidecar_key.to_string(),
+            labels: vec!["beach".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::BAD_REQUEST,
+        "labels address the media object, never its sidecar"
+    );
+
+    let oversized_media_key = "album/oversized.jpg";
+    let oversized = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: oversized_media_key.to_string(),
+            labels: vec!["x".repeat(4 * 1024 * 1024)],
+        }),
+    )
+    .await;
+    assert_eq!(
+        oversized.status(),
+        StatusCode::BAD_REQUEST,
+        "a label update that would create an unreadable sidecar is a client error"
+    );
+    {
+        let store = read_store(&state, "tests.media_labels.oversized_sidecar").await;
+        assert!(
+            store
+                .get_object(
+                    "album/oversized.jpg.xmp",
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .is_err(),
+            "the rejected update must not create a sidecar object"
+        );
+    }
+
+    let applied = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: media_key.to_string(),
+            labels: vec!["beach".to_string(), "vacation".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(applied.status(), StatusCode::NO_CONTENT);
+
+    let stored = {
+        let store = read_store(&state, "tests.media_labels.sidecar").await;
+        store
+            .get_object(
+                sidecar_key,
+                None,
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("the handler must have written a sidecar object")
+    };
+    assert_eq!(
+        common::xmp::XmpSidecar::parse(&stored).unwrap().keywords(),
+        ["beach".to_string(), "vacation".to_string()]
+    );
+
+    let unchanged = super::set_media_labels(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::MediaLabelsRequest {
+            path: media_key.to_string(),
+            labels: vec!["beach".to_string(), "vacation".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(
+        unchanged.status(),
+        StatusCode::NO_CONTENT,
+        "re-storing identical labels stays successful"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    set_media_labels_handler_writes_the_sidecar_object_impl,
+    set_media_labels_handler_writes_the_sidecar_object,
+    set_media_labels_handler_writes_the_sidecar_object_turso
+);
+
+/// `/auth/store/labels` lets an admin -- who has no client-device credentials
+/// -- set labels, mirroring `/auth/store/rename` and `/auth/store/delete`.
+async fn media_labels_admin_route_requires_admin_token_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    let admin_token = fresh_test_secret("media-labels-admin");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
+    let app = super::build_server_apps(&state).public_app;
+    let media_key = "album/photo.jpg";
+
+    let request_body = || {
+        Body::from(
+            serde_json::json!({
+                "path": media_key,
+                "labels": ["private"],
+            })
+            .to_string(),
+        )
+    };
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/store/labels")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(request_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/store/labels")
+                .header(super::ADMIN_TOKEN_HEADER, admin_token)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(request_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::NO_CONTENT);
+
+    let stored = {
+        let store = read_store(&state, "tests.media_labels_admin.verify").await;
+        store
+            .get_object(
+                "album/photo.jpg.xmp",
+                None,
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("the admin route must have written a sidecar object")
+    };
+    assert_eq!(
+        common::xmp::XmpSidecar::parse(&stored).unwrap().keywords(),
+        ["private".to_string()]
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    media_labels_admin_route_requires_admin_token_impl,
+    media_labels_admin_route_requires_admin_token,
+    media_labels_admin_route_requires_admin_token_turso
+);
+
 async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
     backend: MainTestBackend,
 ) {
@@ -13480,6 +14025,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13564,6 +14111,8 @@ async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13641,6 +14190,8 @@ async fn list_store_index_keeps_batch_media_lookup_failures_best_effort_impl(
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13714,6 +14265,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13792,6 +14345,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13809,6 +14364,12 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
     assert_eq!(media["mime_type"], "video/mp4");
     assert_eq!(media["width"], 1920);
     assert_eq!(media["height"], 1080);
+    assert_eq!(media["date_encoded_unix"], 1_709_528_767u64);
+    assert_eq!(media["duration_millis"], 42_125u64);
+    assert_eq!(media["frame_rate_millihertz"], 29_970u64);
+    assert_eq!(media["total_bitrate_bps"], 4_500_000u64);
+    assert_eq!(media["codec_name"], "h264");
+    assert_eq!(media["codec_fourcc"], "avc1");
     assert!(
         media["thumbnail"]["url"]
             .as_str()
@@ -13866,6 +14427,8 @@ async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -13940,6 +14503,8 @@ async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTest
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14010,6 +14575,8 @@ async fn list_store_index_sets_timing_headers_impl(backend: MainTestBackend) {
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14090,6 +14657,8 @@ async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBa
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14126,6 +14695,8 @@ async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBa
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14190,6 +14761,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14236,6 +14809,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14268,6 +14843,14 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
     assert!(matches!(second_path, "gallery/a.png" | "gallery/b.png"));
     assert_eq!(second_payload["total_entry_count"], 2);
     assert_eq!(second_payload["has_more"], false);
+    assert_eq!(
+        first_payload["consistency_token"], second_payload["consistency_token"],
+        "generic offset pages must identify the same namespace revision"
+    );
+    assert_eq!(
+        first_payload["media_summary"], second_payload["media_summary"],
+        "media summaries cover the whole filtered scope on every page"
+    );
 
     let cached_query = super::StoreIndexQuery {
         prefix: None,
@@ -14284,6 +14867,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         west: None,
         north: None,
         east: None,
+        require_labels: None,
+        exclude_labels: None,
     };
     let cached_sequence = state
         .storage
@@ -14346,6 +14931,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14373,6 +14960,10 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
     assert_eq!(invalidated_payload["entries"][0]["path"], "gallery/0.png");
     assert_eq!(invalidated_payload["total_entry_count"], 3);
     assert_eq!(invalidated_payload["has_more"], true);
+    assert_ne!(
+        first_payload["consistency_token"], invalidated_payload["consistency_token"],
+        "a namespace mutation must produce a new pagination consistency token"
+    );
 
     cleanup_test_state(&state).await;
 }
@@ -14454,6 +15045,8 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14508,6 +15101,8 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14524,6 +15119,14 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
     assert_eq!(
         first_payload["sync_token"], second_payload["sync_token"],
         "offset and limit are pagination state, not sync-token scope"
+    );
+    assert_eq!(
+        first_payload["consistency_token"], second_payload["consistency_token"],
+        "captured-sort pages must identify the same gallery revision"
+    );
+    assert_eq!(
+        first_payload["media_summary"], second_payload["media_summary"],
+        "media summaries cover the whole filtered scope on every page"
     );
 
     assert_ne!(older.manifest_hash, newer.manifest_hash);
@@ -14623,6 +15226,8 @@ async fn list_store_index_uses_filename_capture_fallback_after_extraction_impl(
                     west: None,
                     north: None,
                     east: None,
+                    require_labels: None,
+                    exclude_labels: None,
                 }),
             )
             .await,
@@ -14686,6 +15291,8 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14716,6 +15323,8 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14831,6 +15440,8 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14861,6 +15472,8 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -14938,10 +15551,18 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 height: None,
                 orientation: None,
                 taken_at_unix: Some(50),
+                date_encoded_unix: None,
+                duration_millis: None,
+                frame_rate_millihertz: None,
+                total_bitrate_bps: None,
+                codec_name: None,
+                codec_fourcc: None,
                 gps: None,
+                photo: None,
                 thumbnail: None,
                 error: None,
             }),
+            labels: Vec::new(),
         },
         super::StoreIndexEntry {
             path: "gallery/newer.jpg".to_string(),
@@ -14960,13 +15581,21 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 height: None,
                 orientation: None,
                 taken_at_unix: Some(100),
+                date_encoded_unix: None,
+                duration_millis: None,
+                frame_rate_millihertz: None,
+                total_bitrate_bps: None,
+                codec_name: None,
+                codec_fourcc: None,
                 gps: Some(super::MediaGpsResponse {
                     latitude: 1.0,
                     longitude: 2.0,
                 }),
+                photo: None,
                 thumbnail: None,
                 error: None,
             }),
+            labels: Vec::new(),
         },
         super::StoreIndexEntry {
             path: "gallery/clip.mp4".to_string(),
@@ -14985,10 +15614,18 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 height: None,
                 orientation: None,
                 taken_at_unix: Some(75),
+                date_encoded_unix: None,
+                duration_millis: None,
+                frame_rate_millihertz: None,
+                total_bitrate_bps: None,
+                codec_name: None,
+                codec_fourcc: None,
                 gps: None,
+                photo: None,
                 thumbnail: None,
                 error: None,
             }),
+            labels: Vec::new(),
         },
         super::StoreIndexEntry {
             path: "gallery/subdir/".to_string(),
@@ -14999,6 +15636,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
+            labels: Vec::new(),
         },
     ];
 
@@ -15096,10 +15734,18 @@ fn store_index_prepared_sort_materializes_only_requested_prefix() {
                 height: None,
                 orientation: None,
                 taken_at_unix: Some(index),
+                date_encoded_unix: None,
+                duration_millis: None,
+                frame_rate_millihertz: None,
+                total_bitrate_bps: None,
+                codec_name: None,
+                codec_fourcc: None,
                 gps: None,
+                photo: None,
                 thumbnail: None,
                 error: None,
             }),
+            labels: Vec::new(),
         })
         .collect::<Vec<_>>();
     let mut prepared = super::StoreIndexPreparedEntries::new(
@@ -15262,6 +15908,8 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,
@@ -15707,6 +16355,8 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
                 west: None,
                 north: None,
                 east: None,
+                require_labels: None,
+                exclude_labels: None,
             }),
         )
         .await,

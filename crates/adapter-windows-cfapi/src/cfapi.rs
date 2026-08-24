@@ -12,9 +12,9 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Storage::CloudFilters::{
-    CF_CONNECTION_KEY, CF_FILE_RANGE, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO,
+    CF_CONNECTION_KEY, CF_FILE_RANGE, CF_FS_METADATA, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO,
     CF_PLACEHOLDER_STATE, CF_PLACEHOLDER_STATE_PLACEHOLDER, CF_SET_PIN_FLAGS,
-    CF_UPDATE_FLAG_DEHYDRATE, CF_UPDATE_FLAG_MARK_IN_SYNC,
+    CF_UPDATE_FLAG_DEHYDRATE, CF_UPDATE_FLAG_MARK_IN_SYNC, CF_UPDATE_FLAG_VERIFY_IN_SYNC,
 };
 
 pub struct PlaceholderStandardInfo {
@@ -65,6 +65,7 @@ pub fn cf_update_placeholder_file_identity(
 ) -> Result<()> {
     update_placeholder(
         file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+        None,
         file_identity,
         None,
         0,
@@ -82,7 +83,45 @@ pub fn cf_update_placeholder_file_identity_with_oplock(
     with_cf_oplock_handle(
         path,
         CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
-        |handle| update_placeholder(handle, file_identity, None, 0),
+        |handle| update_placeholder(handle, None, file_identity, None, 0),
+    )
+}
+
+pub fn cf_update_placeholder_metadata_and_identity(
+    file: &std::fs::File,
+    metadata: &CF_FS_METADATA,
+    file_identity: &[u8],
+) -> Result<()> {
+    update_placeholder(
+        file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+        Some(metadata),
+        file_identity,
+        None,
+        CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_VERIFY_IN_SYNC,
+    )
+}
+
+pub fn cf_update_placeholder_metadata_and_identity_with_oplock(
+    path: &Path,
+    metadata: &CF_FS_METADATA,
+    file_identity: &[u8],
+) -> Result<()> {
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CF_OPEN_FILE_FLAG_EXCLUSIVE, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+    };
+
+    with_cf_oplock_handle(
+        path,
+        CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+        |handle| {
+            update_placeholder(
+                handle,
+                Some(metadata),
+                file_identity,
+                None,
+                CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_VERIFY_IN_SYNC,
+            )
+        },
     )
 }
 
@@ -236,6 +275,7 @@ pub fn cf_dehydrate_placeholder_with_oplock(path: &Path, relative_path: &str) ->
             );
             let hr = update_placeholder_hresult(
                 handle,
+                None,
                 file_identity,
                 Some(std::slice::from_ref(&dehydrate_range)),
                 CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_DEHYDRATE,

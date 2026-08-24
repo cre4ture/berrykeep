@@ -13,7 +13,8 @@ use image::metadata::Orientation;
 use image::{DynamicImage, ImageFormat, ImageReader};
 use imagesize::{Compression as HeifCompression, ImageType as SizeImageType};
 use serde::{Deserialize, Serialize};
-use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
+use time::format_description::well_known::Rfc3339;
+use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 use tokio::fs;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -33,7 +34,7 @@ use super::{
     content_fingerprint_from_manifest, hash_hex, unix_ts, write_atomic,
 };
 
-pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 7;
+pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 8;
 pub(super) const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
 const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
 const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
@@ -118,6 +119,30 @@ pub struct CachedThumbnailInfo {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CachedPhotoMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_manufacturer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lens_manufacturer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lens_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iso_speed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_time_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub f_number: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focal_length_mm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flash: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub white_balance: Option<u16>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedMediaMetadata {
     pub schema_version: u32,
@@ -130,7 +155,21 @@ pub struct CachedMediaMetadata {
     pub height: Option<u32>,
     pub orientation: Option<u16>,
     pub taken_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_encoded_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_rate_millihertz: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bitrate_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_fourcc: Option<String>,
     pub gps: Option<MediaGpsCoordinates>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<CachedPhotoMetadata>,
     pub thumbnail: Option<CachedThumbnailInfo>,
     pub source_size_bytes: usize,
     pub generated_at_unix: u64,
@@ -733,7 +772,14 @@ fn base_media_metadata(
         height: None,
         orientation: None,
         taken_at_unix: None,
+        date_encoded_unix: None,
+        duration_millis: None,
+        frame_rate_millihertz: None,
+        total_bitrate_bps: None,
+        codec_name: None,
+        codec_fourcc: None,
         gps: None,
+        photo: None,
         thumbnail: None,
         source_size_bytes,
         generated_at_unix,
@@ -1213,7 +1259,9 @@ async fn derive_video_media_cache(
             .arg("-select_streams")
             .arg("v:0")
             .arg("-show_entries")
-            .arg("stream=width,height,codec_name:format=format_name,duration")
+            .arg(
+                "stream=width,height,codec_name,codec_tag_string,avg_frame_rate,bit_rate:stream_tags=creation_time:format=format_name,duration,bit_rate:format_tags=creation_time",
+            )
             .arg("-of")
             .arg("json")
             .arg(&video_url);
@@ -1238,12 +1286,38 @@ async fn derive_video_media_cache(
                 .as_ref()
                 .and_then(|format| format.format_name.as_deref()),
         );
+        let duration_secs = probe
+            .format
+            .as_ref()
+            .and_then(|format| format.duration.as_deref())
+            .and_then(parse_positive_f64);
+        let date_encoded_unix = probe
+            .format
+            .as_ref()
+            .and_then(|format| format.tags.creation_time.as_deref())
+            .or(stream.tags.creation_time.as_deref())
+            .and_then(parse_ffprobe_timestamp);
+        let total_bitrate_bps = probe
+            .format
+            .as_ref()
+            .and_then(|format| format.bit_rate.as_deref())
+            .or(stream.bit_rate.as_deref())
+            .and_then(parse_positive_u64);
         let metadata = CachedMediaMetadata {
             status: MediaCacheStatus::Ready,
             media_type: Some("video".to_string()),
             mime_type,
             width: stream.width,
             height: stream.height,
+            date_encoded_unix,
+            duration_millis: duration_secs.and_then(seconds_to_millis),
+            frame_rate_millihertz: stream
+                .avg_frame_rate
+                .as_deref()
+                .and_then(parse_frame_rate_millihertz),
+            total_bitrate_bps,
+            codec_name: trimmed_metadata_string(stream.codec_name.as_deref()),
+            codec_fourcc: trimmed_metadata_string(stream.codec_tag_string.as_deref()),
             ..base_media_metadata(
                 manifest_hash,
                 content_fingerprint,
@@ -1258,13 +1332,6 @@ async fn derive_video_media_cache(
                 thumbnail_payload: None,
             });
         }
-
-        let duration_secs = probe
-            .format
-            .as_ref()
-            .and_then(|format| format.duration.as_deref())
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value > 0.0);
 
         let mut ffmpeg = Command::new(&media_tools.ffmpeg);
         ffmpeg.arg("-v").arg("error").arg("-nostdin");
@@ -1343,6 +1410,53 @@ fn trimmed_command_output(stderr: &[u8]) -> String {
     } else {
         value
     }
+}
+
+fn parse_positive_f64(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn parse_positive_u64(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok().filter(|value| *value > 0)
+}
+
+fn seconds_to_millis(seconds: f64) -> Option<u64> {
+    let millis = seconds * 1_000.0;
+    (millis.is_finite() && millis > 0.0 && millis <= u64::MAX as f64).then(|| millis.round() as u64)
+}
+
+pub(super) fn parse_frame_rate_millihertz(value: &str) -> Option<u32> {
+    let value = value.trim();
+    let frames_per_second = match value.split_once('/') {
+        Some((numerator, denominator)) => {
+            let numerator = numerator.trim().parse::<f64>().ok()?;
+            let denominator = denominator.trim().parse::<f64>().ok()?;
+            (denominator != 0.0).then_some(numerator / denominator)?
+        }
+        None => value.parse::<f64>().ok()?,
+    };
+    let millihertz = frames_per_second * 1_000.0;
+    (millihertz.is_finite() && millihertz > 0.0 && millihertz <= u32::MAX as f64)
+        .then(|| millihertz.round() as u32)
+}
+
+pub(super) fn parse_ffprobe_timestamp(value: &str) -> Option<u64> {
+    let timestamp = OffsetDateTime::parse(value.trim(), &Rfc3339)
+        .ok()?
+        .unix_timestamp();
+    u64::try_from(timestamp).ok()
+}
+
+fn trimmed_metadata_string(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(256).collect())
 }
 
 pub(super) fn preferred_video_seek_time(duration_secs: Option<f64>) -> Option<String> {
@@ -1464,7 +1578,7 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
     };
 
     let (width, height) = image_dimensions_from_reader(reader, format)?;
-    let (orientation, gps, taken_at_unix) = extract_exif_fields_from_reader(reader);
+    let (orientation, gps, taken_at_unix, photo) = extract_exif_fields_from_reader(reader);
     let mut metadata = CachedMediaMetadata {
         status: MediaCacheStatus::Ready,
         media_type: Some("image".to_string()),
@@ -1474,6 +1588,7 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
         orientation,
         taken_at_unix,
         gps,
+        photo,
         ..base_media_metadata(
             manifest_hash,
             content_fingerprint,
@@ -1803,7 +1918,7 @@ fn render_image_thumbnail_payload(
         return Ok(None);
     }
 
-    let (orientation, _, _) = extract_exif_fields_from_reader(&mut reader);
+    let (orientation, _, _, _) = extract_exif_fields_from_reader(&mut reader);
     let rendered =
         match render_thumbnail_from_reader(&mut reader, format, orientation, profile, image_limits)
         {
@@ -1841,13 +1956,18 @@ fn apply_exif_orientation(image: &mut DynamicImage, orientation: Option<u16>) {
 
 fn extract_exif_fields_from_reader<R: BufRead + Seek>(
     reader: &mut R,
-) -> (Option<u16>, Option<MediaGpsCoordinates>, Option<u64>) {
+) -> (
+    Option<u16>,
+    Option<MediaGpsCoordinates>,
+    Option<u64>,
+    Option<CachedPhotoMetadata>,
+) {
     if reader.seek(SeekFrom::Start(0)).is_err() {
-        return (None, None, None);
+        return (None, None, None, None);
     }
     let exif = match ExifReader::new().read_from_container(reader) {
         Ok(value) => value,
-        Err(_) => return (None, None, None),
+        Err(_) => return (None, None, None, None),
     };
 
     let orientation = exif
@@ -1883,8 +2003,64 @@ fn extract_exif_fields_from_reader<R: BufRead + Seek>(
     };
 
     let taken_at_unix = exif_taken_at_unix(&exif);
+    let photo = exif_photo_metadata(&exif);
 
-    (orientation, gps, taken_at_unix)
+    (orientation, gps, taken_at_unix, photo)
+}
+
+fn exif_photo_metadata(exif: &exif::Exif) -> Option<CachedPhotoMetadata> {
+    let metadata = CachedPhotoMetadata {
+        camera_manufacturer: exif_metadata_string(exif, Tag::Make),
+        camera_model: exif_metadata_string(exif, Tag::Model),
+        lens_manufacturer: exif_metadata_string(exif, Tag::LensMake),
+        lens_model: exif_metadata_string(exif, Tag::LensModel),
+        iso_speed: exif
+            .get_field(Tag::ISOSpeed, In::PRIMARY)
+            .or_else(|| exif.get_field(Tag::PhotographicSensitivity, In::PRIMARY))
+            .and_then(|field| field.value.get_uint(0)),
+        exposure_time_seconds: exif_first_f64(exif, Tag::ExposureTime),
+        f_number: exif_first_f64(exif, Tag::FNumber),
+        focal_length_mm: exif_first_f64(exif, Tag::FocalLength),
+        flash: exif
+            .get_field(Tag::Flash, In::PRIMARY)
+            .and_then(|field| field.value.get_uint(0))
+            .and_then(|value| u16::try_from(value).ok()),
+        white_balance: exif
+            .get_field(Tag::WhiteBalance, In::PRIMARY)
+            .and_then(|field| field.value.get_uint(0))
+            .and_then(|value| u16::try_from(value).ok()),
+    };
+
+    (!metadata.is_empty()).then_some(metadata)
+}
+
+impl CachedPhotoMetadata {
+    fn is_empty(&self) -> bool {
+        self.camera_manufacturer.is_none()
+            && self.camera_model.is_none()
+            && self.lens_manufacturer.is_none()
+            && self.lens_model.is_none()
+            && self.iso_speed.is_none()
+            && self.exposure_time_seconds.is_none()
+            && self.f_number.is_none()
+            && self.focal_length_mm.is_none()
+            && self.flash.is_none()
+            && self.white_balance.is_none()
+    }
+}
+
+fn exif_metadata_string(exif: &exif::Exif, tag: Tag) -> Option<String> {
+    trimmed_metadata_string(exif_ascii_string(exif.get_field(tag, In::PRIMARY)))
+}
+
+fn exif_first_f64(exif: &exif::Exif, tag: Tag) -> Option<f64> {
+    let value = &exif.get_field(tag, In::PRIMARY)?.value;
+    let value = match value {
+        Value::Rational(values) => values.first()?.to_f64(),
+        Value::SRational(values) => values.first()?.to_f64(),
+        _ => return None,
+    };
+    (value.is_finite() && value > 0.0).then_some(value)
 }
 
 fn exif_taken_at_unix(exif: &exif::Exif) -> Option<u64> {

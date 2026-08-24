@@ -29,6 +29,10 @@ import {
   type MediaPreviewRequest
 } from "../MediaViewer/MediaViewer";
 import {
+  MOBILE_VIEWER_THUMBNAIL_PROFILE,
+  withMediaThumbnailProfile
+} from "../MediaViewer/media-preview-profiles";
+import {
   normalizeStorePath,
   normalizeStorePrefix,
   parentStorePrefix,
@@ -199,7 +203,7 @@ export function ExplorerSurface({
   const [error, setError] = useState<string | null>(null);
   const [sortField, setSortField] = useState<ExplorerSortField>("path");
   const [sortDirection, setSortDirection] = useState<ExplorerSortDirection>("asc");
-  const [showThumbnails, setShowThumbnails] = useState(false);
+  const [showThumbnails, setShowThumbnails] = useState(true);
   const quickUploadInputRef = useRef<HTMLInputElement | null>(null);
   const canCreateFolder = snapshotId == null && mutations?.createFolderMarker != null;
   const canDeleteCurrentStore = snapshotId == null && mutations?.deletePath != null;
@@ -1265,6 +1269,11 @@ export function ExplorerSurface({
               : current
           );
         }}
+        resolveShareVersionId={
+          loadVersions
+            ? async (key) => (await loadVersions(key)).preferred_head_version_id?.trim() || null
+            : undefined
+        }
         extraActions={
           loadVersions && activeMediaHistoryKey ? (
             <Button
@@ -1499,9 +1508,10 @@ function buildExplorerEntryLightboxItem(
     kind,
     requests: {
       thumbnail: thumbnailRequestForExplorerMedia(entry.media),
+      fullscreen: mobileViewerRequestForExplorerMedia(entry.media, kind),
       original: { url: originalUrl },
       download: { url: originalUrl },
-      share: immutableExplorerShareRequest(
+      share: explorerShareRequest(
         entry.path,
         snapshotId,
         snapshotId ? null : entry.version,
@@ -1546,9 +1556,10 @@ function buildExplorerVersionLightboxItem(
     kind,
     requests: {
       thumbnail: thumbnailRequestForExplorerMedia(version.media),
+      fullscreen: mobileViewerRequestForExplorerMedia(version.media, kind),
       original: { url: originalUrl },
       download: { url: originalUrl },
-      share: immutableExplorerShareRequest(
+      share: explorerShareRequest(
         sourceKey,
         null,
         version.version_id,
@@ -1564,7 +1575,7 @@ function buildExplorerVersionLightboxItem(
   };
 }
 
-function immutableExplorerShareRequest(
+function explorerShareRequest(
   key: string,
   snapshotId: string | null,
   versionId: string | null | undefined,
@@ -1573,9 +1584,6 @@ function immutableExplorerShareRequest(
 ) {
   const snapshot = snapshotId?.trim() || null;
   const version = snapshot ? null : versionId?.trim() || null;
-  if (!snapshot && !version) {
-    return null;
-  }
   return {
     key,
     snapshotId: snapshot,
@@ -1591,6 +1599,20 @@ function thumbnailRequestForExplorerMedia(
 ): MediaPreviewRequest | null {
   const url = thumbnailUrlForExplorerMedia(media);
   return url ? { url } : null;
+}
+
+function mobileViewerRequestForExplorerMedia(
+  media: Record<string, unknown> | null | undefined,
+  kind: MediaKind
+): MediaPreviewRequest | null {
+  if (kind !== "image") {
+    return null;
+  }
+
+  const url = thumbnailUrlForExplorerMedia(media);
+  return url
+    ? { url: withMediaThumbnailProfile(url, MOBILE_VIEWER_THUMBNAIL_PROFILE) }
+    : null;
 }
 
 function explorerMediaKind(

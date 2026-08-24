@@ -19,7 +19,45 @@ pub enum HydrationState {
     Hydrated,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamespaceGpsCoordinates {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NamespacePhotoMetadata {
+    pub camera_manufacturer: Option<String>,
+    pub camera_model: Option<String>,
+    pub lens_manufacturer: Option<String>,
+    pub lens_model: Option<String>,
+    pub iso_speed: Option<u32>,
+    pub exposure_time_seconds: Option<f64>,
+    pub f_number: Option<f64>,
+    pub focal_length_mm: Option<f64>,
+    pub flash: Option<u16>,
+    pub white_balance: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NamespaceMediaMetadata {
+    pub media_type: Option<String>,
+    pub mime_type: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub orientation: Option<u16>,
+    pub taken_at_unix: Option<u64>,
+    pub date_encoded_unix: Option<u64>,
+    pub duration_millis: Option<u64>,
+    pub frame_rate_millihertz: Option<u32>,
+    pub total_bitrate_bps: Option<u64>,
+    pub codec_name: Option<String>,
+    pub codec_fourcc: Option<String>,
+    pub gps: Option<NamespaceGpsCoordinates>,
+    pub photo: Option<NamespacePhotoMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceEntry {
     pub path: String,
     pub kind: EntryKind,
@@ -29,6 +67,10 @@ pub struct NamespaceEntry {
     pub content_fingerprint: Option<String>,
     #[serde(default)]
     pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub modified_at_unix: Option<u64>,
+    #[serde(default)]
+    pub media: Option<NamespaceMediaMetadata>,
 }
 
 impl NamespaceEntry {
@@ -53,6 +95,8 @@ impl NamespaceEntry {
             content_hash: Some(hash.into()),
             content_fingerprint: None,
             size_bytes,
+            modified_at_unix: None,
+            media: None,
         }
     }
 
@@ -64,11 +108,13 @@ impl NamespaceEntry {
             content_hash: None,
             content_fingerprint: None,
             size_bytes: None,
+            modified_at_unix: None,
+            media: None,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocalEntry {
     pub namespace: NamespaceEntry,
     pub pin_state: PinState,
@@ -89,7 +135,7 @@ impl LocalEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SyncSnapshot {
     pub local: Vec<LocalEntry>,
     pub remote: Vec<NamespaceEntry>,

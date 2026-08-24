@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -13,12 +13,15 @@ use crate::cluster::NodeDescriptor;
 mod gallery;
 
 const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
+const DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT: usize = 1;
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GalleryDeltaCursorError, GalleryDeltaPage,
-    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, ManifestSummary,
+    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
+    GalleryDeltaCursorError, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexPage,
+    GalleryIndexQuery, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
+    GalleryMapClusterQuery, GallerySummaryCache, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
     ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
     RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
@@ -29,12 +32,67 @@ use super::{
 };
 
 pub(super) struct TursoMetadataStore {
-    _database: turso::Database,
+    database: turso::Database,
     connection: turso::Connection,
     writer_lock: tokio::sync::Mutex<()>,
-    gallery_readers: Vec<tokio::sync::Mutex<turso::Connection>>,
-    next_gallery_reader: AtomicUsize,
+    gallery_read_permits: Arc<tokio::sync::Semaphore>,
+    gallery_summary_read_permits: Arc<tokio::sync::Semaphore>,
     metadata_path: PathBuf,
+    gallery_map_summary_cache: Arc<GallerySummaryCache>,
+}
+
+/// A gallery read connection, valid for exactly one transaction.
+///
+/// Turso 0.6 connections do not survive being reused across `BEGIN`/`COMMIT` cycles: after a
+/// handful of transactions on the same connection, the next commit fails with "cannot commit - no
+/// transaction is active". So instead of pooling long-lived connections, each read opens a fresh
+/// connection and drops it when done; the semaphore is what actually bounds concurrency.
+pub(super) struct GalleryReadConnection {
+    connection: turso::Connection,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl std::ops::Deref for GalleryReadConnection {
+    type Target = turso::Connection;
+
+    fn deref(&self) -> &turso::Connection {
+        &self.connection
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct GalleryReadConnectionFactory {
+    database: turso::Database,
+    metadata_path: PathBuf,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl GalleryReadConnectionFactory {
+    pub(super) async fn open(&self) -> Result<GalleryReadConnection> {
+        open_gallery_read_connection(&self.database, &self.metadata_path, self.permits.clone())
+            .await
+    }
+}
+
+async fn open_gallery_read_connection(
+    database: &turso::Database,
+    metadata_path: &Path,
+    permits: Arc<tokio::sync::Semaphore>,
+) -> Result<GalleryReadConnection> {
+    let permit = permits
+        .acquire_owned()
+        .await
+        .context("gallery read semaphore should not be closed")?;
+    let connection = database.connect().with_context(|| {
+        format!(
+            "failed to open a Turso gallery read connection to {}",
+            metadata_path.display()
+        )
+    })?;
+    Ok(GalleryReadConnection {
+        connection,
+        _permit: permit,
+    })
 }
 
 impl TursoMetadataStore {
@@ -61,25 +119,18 @@ impl TursoMetadataStore {
             )
         })?;
 
-        let mut gallery_readers = Vec::with_capacity(DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT);
-        for _ in 0..DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT {
-            gallery_readers.push(tokio::sync::Mutex::new(db.connect().with_context(
-                || {
-                    format!(
-                        "failed to open a Turso gallery read connection to {}",
-                        metadata_path.display()
-                    )
-                },
-            )?));
-        }
-
         let store = Self {
-            _database: db,
+            database: db,
             connection: conn,
             writer_lock: tokio::sync::Mutex::new(()),
-            gallery_readers,
-            next_gallery_reader: AtomicUsize::new(0),
+            gallery_read_permits: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT,
+            )),
+            gallery_summary_read_permits: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT,
+            )),
             metadata_path: metadata_path.to_path_buf(),
+            gallery_map_summary_cache: Arc::new(GallerySummaryCache::new()),
         };
         store.backfill_gallery_objects().await?;
         Ok(store)
@@ -89,10 +140,24 @@ impl TursoMetadataStore {
         let _ = self.connection.execute_batch("ROLLBACK").await;
     }
 
-    async fn gallery_read_connection(&self) -> tokio::sync::MutexGuard<'_, turso::Connection> {
-        let index =
-            self.next_gallery_reader.fetch_add(1, Ordering::Relaxed) % self.gallery_readers.len();
-        self.gallery_readers[index].lock().await
+    async fn gallery_read_connection(&self) -> Result<GalleryReadConnection> {
+        open_gallery_read_connection(
+            &self.database,
+            &self.metadata_path,
+            self.gallery_read_permits.clone(),
+        )
+        .await
+    }
+
+    /// Everything a `tokio::spawn`ed background gallery summary refresh needs to open its own
+    /// connection without borrowing `&self`. Its one-permit semaphore is intentionally separate
+    /// from foreground gallery reads, so a large refresh cannot exhaust their connection budget.
+    fn gallery_summary_read_connection_factory(&self) -> GalleryReadConnectionFactory {
+        GalleryReadConnectionFactory {
+            database: self.database.clone(),
+            metadata_path: self.metadata_path.clone(),
+            permits: self.gallery_summary_read_permits.clone(),
+        }
     }
 
     fn decode_json<T: serde::de::DeserializeOwned>(
@@ -111,6 +176,29 @@ impl TursoMetadataStore {
 
 #[async_trait]
 impl MetadataStore for TursoMetadataStore {
+    async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (GALLERY_SIDECAR_LABEL_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(rows.next().await?.is_none())
+    }
+
+    async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (GALLERY_SIDECAR_LABEL_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn load_current_state(&self) -> Result<CurrentState> {
         let mut rows = self
             .connection
@@ -166,11 +254,31 @@ impl MetadataStore for TursoMetadataStore {
         self.remove_current_object_with_gallery(key).await
     }
 
+    async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()> {
+        self.store_gallery_object_labels(key, labels).await
+    }
+
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
     ) -> Result<Option<GalleryIndexPage>> {
         self.query_turso_gallery_index(query).await.map(Some)
+    }
+
+    async fn query_gallery_map_clusters(
+        &self,
+        query: &GalleryMapClusterQuery,
+    ) -> Result<Option<GalleryMapClusterPage>> {
+        self.query_turso_gallery_map_clusters(query).await.map(Some)
+    }
+
+    async fn query_gallery_map_cluster_entries(
+        &self,
+        query: &GalleryMapClusterEntriesQuery,
+    ) -> Result<Option<GalleryIndexPage>> {
+        self.query_turso_gallery_map_cluster_entries(query)
+            .await
+            .map(Some)
     }
 
     async fn query_gallery_delta(
@@ -2229,6 +2337,28 @@ impl MetadataStore for TursoMetadataStore {
     }
 }
 
+/// Adds a column to an existing table, tolerating databases that already have it.
+///
+/// Turso has no `ADD COLUMN IF NOT EXISTS`, so the duplicate-column error is the
+/// only reliable signal that the migration already ran on this database.
+pub(super) async fn add_column_if_missing(
+    connection: &turso::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let statement = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    if let Err(err) = connection.execute(&statement, ()).await {
+        let duplicate_column = err
+            .to_string()
+            .contains(&format!("duplicate column name: {column}"));
+        if !duplicate_column {
+            return Err(err).with_context(|| format!("failed to migrate turso {table}.{column}"));
+        }
+    }
+    Ok(())
+}
+
 async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
     connection
         .execute_batch(
@@ -2455,21 +2585,53 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             ",
         )
         .await?;
-    if let Err(err) = connection
-        .execute(
-            "ALTER TABLE s3_access_keys ADD COLUMN allow_manage INTEGER NOT NULL DEFAULT 0",
-            (),
+    add_column_if_missing(
+        connection,
+        "s3_access_keys",
+        "allow_manage",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    gallery::init_gallery_projection(connection).await?;
+
+    let mut rows = connection
+        .query(
+            "SELECT value FROM metadata_meta WHERE key = ?1",
+            ("schema_version",),
         )
         .await
-    {
-        let duplicate_column = err
-            .to_string()
-            .contains("duplicate column name: allow_manage");
-        if !duplicate_column {
-            return Err(err).context("failed to migrate turso s3_access_keys.allow_manage");
-        }
+        .context("failed to read Turso metadata schema version")?;
+    let stored_version = match rows.next().await? {
+        Some(row) => Some(row_string(&row, 0, "metadata_meta.schema_version")?),
+        None => None,
+    };
+    drop(rows);
+
+    let schema_version = match stored_version {
+        Some(raw) => raw
+            .parse::<i64>()
+            .with_context(|| format!("invalid Turso metadata schema version: {raw}"))?,
+        None => METADATA_SCHEMA_VERSION_CURRENT,
+    };
+    if schema_version != METADATA_SCHEMA_VERSION_CURRENT {
+        bail!(
+            "unsupported Turso metadata schema version: {} (current={})",
+            schema_version,
+            METADATA_SCHEMA_VERSION_CURRENT
+        );
     }
-    gallery::init_gallery_projection(connection).await?;
+
+    connection
+        .execute(
+            "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (
+                "schema_version",
+                METADATA_SCHEMA_VERSION_CURRENT.to_string(),
+            ),
+        )
+        .await
+        .context("failed to persist Turso metadata schema version")?;
     Ok(())
 }
 
@@ -2541,4 +2703,125 @@ fn row_opt_u32(row: &turso::Row, idx: usize, label: &str) -> Result<Option<u32>>
             u32::try_from(value).with_context(|| format!("integer overflow for {label}: {value}"))
         })
         .transpose()
+}
+
+#[cfg(test)]
+fn turso_test_db_path(name: &str) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "ironmesh-{name}-{}-{stamp}.turso.db",
+        std::process::id()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn open_test_database(name: &str) -> (PathBuf, turso::Database, turso::Connection) {
+        let metadata_db_path = turso_test_db_path(name);
+        let database = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+            .build()
+            .await
+            .expect("Turso test database should open");
+        let connection = database
+            .connect()
+            .expect("Turso test database should connect");
+        (metadata_db_path, database, connection)
+    }
+
+    async fn stored_schema_version(connection: &turso::Connection) -> String {
+        let mut rows = connection
+            .query(
+                "SELECT value FROM metadata_meta WHERE key = ?1",
+                ("schema_version",),
+            )
+            .await
+            .expect("schema version should query");
+        let row = rows
+            .next()
+            .await
+            .expect("schema version row should load")
+            .expect("schema version should exist");
+        row_string(&row, 0, "metadata_meta.schema_version").expect("schema version should be text")
+    }
+
+    #[tokio::test]
+    async fn init_metadata_db_persists_schema_version() {
+        let (metadata_db_path, database, connection) =
+            open_test_database("turso-schema-version").await;
+
+        init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should initialize");
+
+        assert_eq!(
+            stored_schema_version(&connection).await,
+            METADATA_SCHEMA_VERSION_CURRENT.to_string()
+        );
+
+        drop(connection);
+        drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn init_metadata_db_accepts_missing_legacy_schema_version() {
+        let (metadata_db_path, database, connection) =
+            open_test_database("turso-legacy-schema-version").await;
+        init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should initialize");
+        connection
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                ("schema_version",),
+            )
+            .await
+            .expect("schema version row should delete");
+
+        init_metadata_db(&connection)
+            .await
+            .expect("legacy metadata schema should be accepted");
+
+        assert_eq!(
+            stored_schema_version(&connection).await,
+            METADATA_SCHEMA_VERSION_CURRENT.to_string()
+        );
+
+        drop(connection);
+        drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn init_metadata_db_rejects_future_schema_version() {
+        let (metadata_db_path, database, connection) =
+            open_test_database("turso-future-schema-version").await;
+        init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should initialize");
+        connection
+            .execute(
+                "UPDATE metadata_meta SET value = ?2 WHERE key = ?1",
+                ("schema_version", "99"),
+            )
+            .await
+            .expect("future schema version should write");
+
+        let err = init_metadata_db(&connection)
+            .await
+            .expect_err("future metadata schema should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported Turso metadata schema version: 99")
+        );
+
+        drop(connection);
+        drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
 }

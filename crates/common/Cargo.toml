@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+quick-xml.workspace = true
 serde.workspace = true
 time = { version = "0.3", features = ["formatting"] }
 tokio.workspace = true

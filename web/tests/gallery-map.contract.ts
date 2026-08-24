@@ -95,7 +95,18 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
   test(`${target.name} gallery map contract lists visible configured styles`, async ({ page }) => {
     await target.setup(page, { mapConfiguration: configuredMapVariants });
     await target.openGallery(page);
+    await expect(page.getByLabel("Depth")).toHaveValue("64");
+    const firstMapClusterRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return url.pathname.endsWith("/store/map/clusters");
+    });
     await page.getByRole("button", { name: "Map" }).click();
+    const firstMapClusterUrl = new URL((await firstMapClusterRequest).url());
+    expect(firstMapClusterUrl.searchParams.get("depth")).toBe("64");
+    expect(firstMapClusterUrl.searchParams.get("media_filter")).toBe("all");
+    expect(firstMapClusterUrl.searchParams.get("zoom")).toBe("1");
+    expect(firstMapClusterUrl.searchParams.has("offset")).toBe(false);
+    expect(firstMapClusterUrl.searchParams.has("limit")).toBe(false);
 
     await expect(page.getByText("Map styles could not be refreshed")).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Retry map styles" })).toHaveCount(0);

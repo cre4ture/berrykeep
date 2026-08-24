@@ -11,6 +11,7 @@ server_bootstrap.txt
 web/node_modules
 web/**/node_modules
 web/**/dist
+web/.ironmesh-build.lock
 web/.turbo
 web/playwright-report
 web/test-results

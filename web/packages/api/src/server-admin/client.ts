@@ -1,5 +1,10 @@
 import { fetchJson } from "../shared/http";
-import type { StoreIndexMedia } from "../shared/store-index";
+import type {
+  GalleryMapClusterEntriesResponse,
+  GalleryMapClustersRequest,
+  GalleryMapClustersResponse,
+  StoreIndexMedia
+} from "../shared/store-index";
 import type {
   StoreIndexDeltaResponse,
   AdminMapDatasetImportStatusResponse,
@@ -43,6 +48,7 @@ import type {
   ManualRepairActionListResponse,
   ManualRepairActionTriggerResponse,
   MemoryAttributionSample,
+  MetadataDbBackendKind,
   MetadataDbLogicalDistributionStatusResponse,
   MetadataDbLogicalDistributionTriggerResponse,
   NodeCertificateStatusResponse,
@@ -194,6 +200,47 @@ export async function listAdminStoreEntries(
   return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
     adminTokenOverride
   });
+}
+
+export async function getAdminGalleryMapClusters(
+  request: GalleryMapClustersRequest,
+  adminTokenOverride?: string
+): Promise<GalleryMapClustersResponse> {
+  const query = new URLSearchParams({
+    depth: String(Math.max(1, Math.floor(request.depth))),
+    media_filter: request.mediaFilter,
+    south: String(request.viewport.south),
+    west: String(request.viewport.west),
+    north: String(request.viewport.north),
+    east: String(request.viewport.east),
+    zoom: String(Math.max(0, Math.min(20, Math.floor(request.zoom))))
+  });
+  if (request.prefix?.trim()) {
+    query.set("prefix", request.prefix.trim());
+  }
+  return fetchAdminJson<GalleryMapClustersResponse>(
+    `${apiV1("/auth/store/map/clusters")}?${query.toString()}`,
+    { adminTokenOverride }
+  );
+}
+
+export async function getAdminGalleryMapClusterEntries(
+  queryToken: string,
+  clusterId: string,
+  offset = 0,
+  limit = 100,
+  adminTokenOverride?: string
+): Promise<GalleryMapClusterEntriesResponse> {
+  const query = new URLSearchParams({
+    query_token: queryToken,
+    cluster_id: clusterId,
+    offset: String(Math.max(0, Math.floor(offset))),
+    limit: String(Math.max(1, Math.floor(limit)))
+  });
+  return fetchAdminJson<GalleryMapClusterEntriesResponse>(
+    `${apiV1("/auth/store/map/cluster-entries")}?${query.toString()}`,
+    { adminTokenOverride }
+  );
 }
 
 export async function getAdminStoreIndexDelta(
@@ -973,6 +1020,7 @@ export async function getSetupStatus(): Promise<SetupStatus> {
 export async function startSetupCluster(request: {
   admin_password: string;
   public_origin: string;
+  metadata_backend: MetadataDbBackendKind;
   telemetry_enabled: boolean;
 }): Promise<SetupTransitionResponse> {
   return fetchJson<SetupTransitionResponse>("/setup/start-cluster", {
@@ -1002,6 +1050,7 @@ export async function generateSetupJoinRequest(request: {
 export async function importSetupEnrollmentPackage(request: {
   admin_password: string;
   package_json: string;
+  metadata_backend: MetadataDbBackendKind;
   telemetry_enabled: boolean;
 }): Promise<SetupTransitionResponse> {
   return fetchJson<SetupTransitionResponse>("/setup/join/import", {

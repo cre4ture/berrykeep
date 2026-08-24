@@ -80,7 +80,7 @@ export function createPersistentGalleryDataSource(
     });
   }
 
-  async function loadResource<T>(config: ResourceConfig<T>): Promise<T> {
+  async function loadResource<T>(config: ResourceConfig<T>, fresh = false): Promise<T> {
     const context = await cacheContextPromise;
     if (!context) {
       return config.fetcher();
@@ -89,6 +89,10 @@ export function createPersistentGalleryDataSource(
     const cacheKey = JSON.stringify(config.descriptor);
     const queryKey: QueryKey = ["gallery", "persistent", context.scope, config.descriptor];
     const generation = revalidationGeneration.get(config.descriptor.kind) ?? 0;
+    if (fresh) {
+      revalidatedKeys.set(cacheKey, generation);
+      return fetchAndPersist(config, context, cacheKey, queryKey);
+    }
     const memoryValue = queryClient.getQueryData(queryKey);
     if (config.validate(memoryValue)) {
       revalidateInBackground(config, context, cacheKey, queryKey, generation);
@@ -166,11 +170,14 @@ export function createPersistentGalleryDataSource(
         validate: isGallerySnapshotList
       }),
     loadEntries: (prefix, depth, snapshotId, options) =>
-      loadResource({
-        descriptor: entryDescriptor(prefix, depth, snapshotId, options),
-        fetcher: () => liveDataSource.loadEntries(prefix, depth, snapshotId, options),
-        validate: isGalleryPayload
-      }),
+      loadResource(
+        {
+          descriptor: entryDescriptor(prefix, depth, snapshotId, options),
+          fetcher: () => liveDataSource.loadEntries(prefix, depth, snapshotId, options),
+          validate: isGalleryPayload
+        },
+        options?.fresh === true
+      ),
     requestRevalidation: (kind) => {
       revalidationGeneration.set(kind, (revalidationGeneration.get(kind) ?? 0) + 1);
     },

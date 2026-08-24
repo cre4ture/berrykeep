@@ -340,7 +340,7 @@ $cargoTargetDir = if ($CargoTargetDir) {
     (New-Item -ItemType Directory -Force -Path $CargoTargetDir).FullName
 }
 else {
-    Join-Path $artifactRoot ('cargo-target-' + [Guid]::NewGuid().ToString('N'))
+    Join-Path (Join-Path $repoRoot 'target\store-upload') ('msix-' + [Guid]::NewGuid().ToString('N'))
 }
 $packagePath = Join-Path $artifactRoot ($artifactName + '.msix')
 $uploadPath = Join-Path $artifactRoot ($artifactName + '.msixupload')

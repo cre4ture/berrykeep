@@ -1,6 +1,11 @@
 import { fetchJson } from "../shared/http";
 import type { GalleryMapConfigurationResponse } from "../shared/map-config";
-import type { StoreIndexMedia } from "../shared/store-index";
+import type {
+  GalleryMapClusterEntriesResponse,
+  GalleryMapClustersRequest,
+  GalleryMapClustersResponse,
+  StoreIndexMedia
+} from "../shared/store-index";
 import type {
   StoreIndexDeltaResponse,
   ClientConnectionRouteSnapshot,
@@ -212,6 +217,48 @@ export async function listStoreEntries(
     query.set("east", String(options.viewport.east));
   }
   return fetchJson<StoreListResponse>(`${apiV1("/store/list")}?${query.toString()}`);
+}
+
+export async function getGalleryMapClusters(
+  request: GalleryMapClustersRequest
+): Promise<GalleryMapClustersResponse> {
+  const query = galleryMapClusterQuery(request);
+  return fetchJson<GalleryMapClustersResponse>(
+    `${apiV1("/store/map/clusters")}?${query.toString()}`
+  );
+}
+
+export async function getGalleryMapClusterEntries(
+  queryToken: string,
+  clusterId: string,
+  offset = 0,
+  limit = 100
+): Promise<GalleryMapClusterEntriesResponse> {
+  const query = new URLSearchParams({
+    query_token: queryToken,
+    cluster_id: clusterId,
+    offset: String(Math.max(0, Math.floor(offset))),
+    limit: String(Math.max(1, Math.floor(limit)))
+  });
+  return fetchJson<GalleryMapClusterEntriesResponse>(
+    `${apiV1("/store/map/cluster-entries")}?${query.toString()}`
+  );
+}
+
+function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchParams {
+  const query = new URLSearchParams({
+    depth: String(Math.max(1, Math.floor(request.depth))),
+    media_filter: request.mediaFilter,
+    south: String(request.viewport.south),
+    west: String(request.viewport.west),
+    north: String(request.viewport.north),
+    east: String(request.viewport.east),
+    zoom: String(Math.max(0, Math.min(20, Math.floor(request.zoom))))
+  });
+  if (request.prefix?.trim()) {
+    query.set("prefix", request.prefix.trim());
+  }
+  return query;
 }
 
 export async function getStoreIndexDelta(

@@ -10,8 +10,9 @@ Request a current, paginated gallery view through `GET /api/v1/store/index` (or
 `GET /api/v1/auth/store/index`). Gallery fast-path responses backed by persistent metadata include an opaque
 `sync_token`. Store the response and token atomically on the client. The token is versioned but
 must not be parsed by clients. It binds the persistent server history and the normalized query
-membership (`prefix`, `depth`, media filter, captured sort, and optional viewport). Offset and
-limit are intentionally excluded, so pages from the same bootstrap have byte-identical tokens.
+membership (`prefix`, `depth`, media filter, captured sort, optional viewport, and optional label
+filter). Offset and limit are intentionally excluded, so pages from the same bootstrap have
+byte-identical tokens.
 
 When a full bootstrap needs multiple offset/limit pages, all pages must carry the same
 `sync_token`. If any page returns a different token, the underlying current projection changed
@@ -100,10 +101,168 @@ are excluded. Prefix/depth, media filter, captured ordering, offset, limit, and 
 applied by the same persistent gallery projection, so the server does not materialize the whole
 library.
 
+## Server-side map clustering
+
+The interactive map does not traverse the full gallery index. It requests a bounded set of
+server-side spatial clusters for the current camera:
+
+```text
+GET /api/v1/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1
+GET /api/v1/auth/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1
+```
+
+All four viewport bounds are required and use the same antimeridian rules as viewport index
+queries. `zoom` is clamped to `0..20`. The Gallery UI starts with the world viewport and the
+maximum supported UI depth (`64`), then issues a new request after each map movement. Map
+clustering is available for current data; selecting an immutable snapshot switches the Gallery to
+grid view.
+
+Each metadata backend persists normalized Web Mercator `x`/`y` values next to valid GPS metadata
+and maintains a B-tree spatial index. The cluster query restricts that index to the viewport and
+groups matching rows into a zoom-dependent Web Mercator grid. It initially uses cells equivalent
+to 64 screen pixels. If the requested grid would return more than 512 clusters, the server halves
+the effective grid resolution until the response is bounded. This makes response size independent
+of total library size while still allowing the client to refine the result by zooming or panning.
+Latitude/longitude bounds remain as an exact check around the indexed projected range.
+
+A response has this shape:
+
+```json
+{
+  "prefix": "",
+  "depth": 64,
+  "zoom": 1,
+  "resolution": 8,
+  "total_entry_count": 125000,
+  "visible_geotagged_count": 84231,
+  "media_summary": {
+    "ready_count": 120000,
+    "pending_count": 4500,
+    "incomplete_count": 500,
+    "image_count": 118000,
+    "video_count": 7000,
+    "geotagged_count": 84231
+  },
+  "query_token": "gm1_...",
+  "clusters": [
+    {
+      "cluster_id": "4_2",
+      "count": 731,
+      "latitude": 47.2,
+      "longitude": 8.4,
+      "bounds": {
+        "south": 46.8,
+        "west": 7.9,
+        "north": 47.7,
+        "east": 9.0
+      }
+    }
+  ]
+}
+```
+
+`total_entry_count` and `media_summary` describe the complete prefix/depth/media-filter scope;
+`visible_geotagged_count` describes the current viewport. A one-entry cluster additionally carries
+the complete store-index `entry`, so its marker can open without another list query. Multi-entry
+clusters carry a centroid and exact member bounds. Clients normally zoom to those bounds. When a
+cluster remains dense at high zoom or has identical coordinates, its members are available through
+the bounded leaf endpoint:
+
+```text
+GET /api/v1/store/map/cluster-entries?query_token=<query_token>&cluster_id=4_2&offset=0&limit=100
+GET /api/v1/auth/store/map/cluster-entries?query_token=<query_token>&cluster_id=4_2&offset=0&limit=100
+```
+
+The default leaf page size is 100 and the server caps it at 500. Entries are ordered by capture
+time descending and path ascending. The opaque map query token binds the persistent gallery
+history/revision, normalized scope, viewport, media filter, and effective grid resolution. Clients
+must not parse it. If the gallery revision changes before a leaf page is read, the server rejects
+the page with HTTP `409`:
+
+```json
+{
+  "code": "gallery_map_cluster_stale",
+  "reset": true,
+  "message": "the gallery changed; reload map clusters before opening this cluster"
+}
+```
+
+On that response the client reloads clusters for its current camera before attempting to open the
+cluster again. This prevents offset pagination from combining members from different spatial
+snapshots.
+
+## User labels
+
+Media can carry user labels — for example `private` — without touching the media bytes
+themselves. Labels are stored in an XMP sidecar object next to the media, named by appending
+`.xmp` to the media's key (`album/photo.jpg` sidecar is `album/photo.jpg.xmp`). The sidecar is an
+ordinary object: it can be written by Ironmesh itself, or produced and synced by a third-party
+tool such as Lightroom or digiKam, and either path updates the gallery projection.
+
+Because labelling only rewrites the small sidecar object, it costs no new version, chunks, or
+manifest on the image itself. An existing sidecar is read-modify-written, so third-party XMP
+properties Ironmesh does not model survive a label change untouched. A sidecar that cannot be
+parsed is left in place rather than overwritten, to avoid destroying metadata Ironmesh cannot
+interpret.
+
+Set labels with:
+
+```text
+POST /api/v1/store/labels
+{ "path": "album/photo.jpg", "labels": ["private", "beach"] }
+```
+
+`path` must name the media object, not its sidecar. The full label set is replaced; there is no
+partial add/remove. Writing an unchanged set, or clearing labels on media that has no sidecar
+yet, is a no-op and creates no object version. `POST /api/v1/auth/store/labels` applies the same
+admin authorization as other admin store routes.
+If the resulting XMP sidecar would exceed 4 MiB, the request is rejected with `400` and any
+existing sidecar remains unchanged, matching the maximum sidecar size accepted during label
+ingest.
+
+`/store/rename` and `/store/copy` carry a media object's sidecar along automatically: renaming or
+copying `album/photo.jpg` also renames or copies `album/photo.jpg.xmp` when one exists, so a
+label survives the operation instead of staying orphaned at the old path.
+Deleting `album/photo.jpg` also deletes its sidecar, so a later unrelated upload at that path
+cannot inherit labels from deleted media.
+
+Gallery queries and viewport queries accept a label filter:
+
+```text
+require_labels=beach,vacation
+exclude_labels=private
+```
+
+Both accept a comma-separated label list. `require_labels` keeps only entries carrying every
+listed label; `exclude_labels` drops any entry carrying any listed label. The motivating case is
+`exclude_labels=private`, which is how a client keeps labelled-private media out of its default
+gallery view. Labels are matched exactly: excluding `private` does not affect `not-private` or
+`private-beach`. To bound the gallery query cost, at most 64 non-blank labels may be supplied
+across both parameters; requests over that limit receive `400`.
+
+The label filter is part of the query's normalized membership, exactly like prefix, depth, media
+filter, and viewport: it is captured in the `sync_token`, and the delta feed reconciles it the
+same way. Labelling media `private` while a client holds a token without `exclude_labels=private`
+has no effect on that client's feed; labelling media that already matches
+`exclude_labels=private` is delivered to that client as a removal, because the entry stops
+resolving against the token's scope. Tokens issued before labels existed have no label filter and
+therefore filter nothing, so they remain valid.
+
 ## Metadata backend capability
 
-SQLite is the default server-node metadata backend. The optional `turso-metadata` backend provides
-the same durable gallery projection, viewport index, and revision log. Both maintain changes as
-part of their metadata updates, and preserve the history identifier and revision across a restart.
-Gallery queries, viewport queries, and delta requests therefore have the same API contract on both
-backends.
+Managed first-run setup offers SQLite and the `turso-metadata` backend, with Turso selected by
+default in the distributed server-node builds. The selected backend is node-local and is persisted
+in `managed/setup-state.json`; subsequent managed starts use that value instead of reevaluating
+`IRONMESH_METADATA_BACKEND`.
+
+Setup-state versions that predate the persisted selection are migrated once. The migration imports
+`IRONMESH_METADATA_BACKEND` when it is set and otherwise records SQLite, which was the historical
+default. Recovery keeps the recorded backend because changing between `state/metadata.sqlite` and
+`state/metadata.turso.db` requires an explicit metadata migration rather than a configuration
+toggle. Environment-only, unmanaged server-node startup continues to use
+`IRONMESH_METADATA_BACKEND` on each start.
+
+Both backends provide the same durable gallery projection, viewport and Web Mercator indexes,
+spatial clustering, and revision log. Both maintain changes as part of their metadata updates, and
+preserve the history identifier and revision across a restart. Gallery queries, viewport queries,
+map cluster queries, and delta requests therefore have the same API contract on both backends.

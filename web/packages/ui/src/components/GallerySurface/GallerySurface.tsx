@@ -39,11 +39,6 @@ import {
   type GalleryBasemapConfig,
   type GalleryMapProjection
 } from "./GalleryBasemapMap";
-import {
-  clusterScreenPoints,
-  type ClusterableScreenPoint,
-  type ScreenPointCluster
-} from "./gallery-marker-clusters";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
@@ -75,8 +70,11 @@ const GALLERY_SORT_OPTIONS = [
 
 type GallerySortOrder = (typeof GALLERY_SORT_OPTIONS)[number]["value"];
 type GalleryMediaKind = "image" | "video";
-type GalleryMediaFilter = "all" | GalleryMediaKind;
+export type GalleryMediaFilter = "all" | GalleryMediaKind;
 type GalleryViewMode = "grid" | "map";
+type AndroidUiBridge = {
+  postMessage: (message: string) => void;
+};
 
 const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"];
 const videoExtensions = [".m4v", ".mkv", ".mov", ".mp4", ".ogv", ".webm"];
@@ -86,14 +84,45 @@ const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
 const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
 const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
 const GALLERY_MAP_FULLSCREEN_HISTORY_KEY = "ironmesh.gallery.map_fullscreen";
+const GALLERY_MAP_FULLSCREEN_MESSAGE_TYPE = "gallery-map-fullscreen";
+const GALLERY_MAP_FULLSCREEN_EXIT_EVENT = "ironmesh:gallery-map-exit-fullscreen";
+const GALLERY_MAX_DEPTH = 64;
+const GALLERY_MAP_INITIAL_VIEWPORT: GalleryMapViewport = {
+  south: -90,
+  west: -180,
+  north: 90,
+  east: 180
+};
+const GALLERY_MAP_INITIAL_ZOOM = 1;
 const MAX_WORLD_MAP_THUMBNAIL_MARKERS = 120;
-const MIN_WORLD_MAP_CLUSTER_RADIUS_PX = 28;
-const MAX_WORLD_MAP_CLUSTER_RADIUS_PX = 54;
+const GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE = 100;
 const GALLERY_VIRTUAL_PAGE_ROW_COUNT = 8;
 const GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS = 1;
 const GALLERY_VIRTUAL_PAGE_KEEP_RADIUS = 2;
 const GALLERY_VIRTUAL_PAGE_ROOT_MARGIN = "900px 0px";
 const GALLERY_GRID_PAGE_CACHE_MAX_ENTRY_COUNT = 2_048;
+
+function notifyAndroidGalleryMapFullscreen(fullscreen: boolean) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  const bridge = (window as Window & { IronmeshAndroidUi?: AndroidUiBridge }).IronmeshAndroidUi;
+  if (!bridge) {
+    return;
+  }
+
+  try {
+    bridge.postMessage(
+      JSON.stringify({
+        type: GALLERY_MAP_FULLSCREEN_MESSAGE_TYPE,
+        fullscreen
+      })
+    );
+  } catch {
+    // The native bridge is optional for browser and standalone-WebView clients.
+  }
+}
 
 const EMPTY_GALLERY_MEDIA_SUMMARY: GalleryMediaSummary = {
   ready_count: 0,
@@ -140,6 +169,8 @@ export type GalleryPayload = {
   offset?: number;
   limit?: number | null;
   has_more?: boolean;
+  sync_token?: string | null;
+  consistency_token?: string | null;
   media_summary?: GalleryMediaSummary | null;
   entries: GalleryEntry[];
   [key: string]: unknown;
@@ -191,6 +222,57 @@ export type GalleryLoadEntriesOptions = {
   limit?: number;
   sort?: GallerySortOrder;
   mediaFilter?: GalleryMediaFilter;
+  /** Bypasses application caches when a consistent multi-page read must be retried. */
+  fresh?: boolean;
+};
+
+export type GalleryMapViewport = {
+  south: number;
+  west: number;
+  north: number;
+  east: number;
+};
+
+export type GalleryMapCluster = {
+  cluster_id: string;
+  count: number;
+  latitude: number;
+  longitude: number;
+  bounds: GalleryMapViewport;
+  entry?: GalleryEntry | null;
+};
+
+export type GallerySummaryStatus = {
+  refreshing: boolean;
+  progress_percent?: number | null;
+};
+
+export type GalleryMapClustersPayload = {
+  prefix: string;
+  depth: number;
+  zoom: number;
+  resolution: number;
+  total_entry_count: number;
+  visible_geotagged_count: number;
+  media_summary: GalleryMediaSummary;
+  /**
+   * Set while the server is still catching total_entry_count/media_summary up to the latest
+   * gallery state in the background. The viewport clusters themselves are always current.
+   */
+  summary_status?: GallerySummaryStatus | null;
+  query_token: string;
+  clusters: GalleryMapCluster[];
+};
+
+export type GalleryMapClusterEntriesPayload = {
+  cluster_id: string;
+  entry_count: number;
+  total_entry_count: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
+  query_token: string;
+  entries: GalleryEntry[];
 };
 
 export type GalleryDataUpdateKind = "snapshots" | "entries";
@@ -245,7 +327,12 @@ type GalleryGridCollection = {
   pageCount: number;
 };
 
-type GalleryWorldMarkerPoint = ClusterableScreenPoint<GalleryEntry>;
+type GalleryWorldMarkerPoint = {
+  id: string;
+  item: GalleryMapCluster;
+  x: number;
+  y: number;
+};
 
 /**
  * Application-specific gallery transport and media behavior.
@@ -262,6 +349,19 @@ export type GalleryDataSource = {
     snapshotId: string | null,
     options?: GalleryLoadEntriesOptions
   ) => Promise<GalleryPayload>;
+  loadMapClusters: (request: {
+    prefix: string;
+    depth: number;
+    mediaFilter: GalleryMediaFilter;
+    viewport: GalleryMapViewport;
+    zoom: number;
+  }) => Promise<GalleryMapClustersPayload>;
+  loadMapClusterEntries: (
+    queryToken: string,
+    clusterId: string,
+    offset: number,
+    limit: number
+  ) => Promise<GalleryMapClusterEntriesPayload>;
   getMediaRequests: (
     entry: GalleryEntry,
     snapshotId: string | null,
@@ -310,6 +410,8 @@ export function GallerySurface({
   const {
     loadSnapshots,
     loadEntries,
+    loadMapClusters,
+    loadMapClusterEntries,
     getMediaRequests,
     loadVersions,
     restoreVersion,
@@ -318,7 +420,7 @@ export function GallerySurface({
     subscribeToUpdates
   } = dataSource;
   const [prefix, setPrefix] = useState("");
-  const [depth, setDepth] = useState(4);
+  const [depth, setDepth] = useState(GALLERY_MAX_DEPTH);
   const [thumbnailsPerRow, setThumbnailsPerRow] = useState(loadStoredThumbnailsPerRow);
   const [showMetadata, setShowMetadata] = useState(loadStoredShowMetadata);
   const { ref: galleryGridRef, width: galleryGridWidth } = useElementSize();
@@ -329,7 +431,10 @@ export function GallerySurface({
   const [snapshots, setSnapshots] = useState<GallerySnapshot[]>([]);
   const [loadedScope, setLoadedScope] = useState<GalleryLoadedScope | null>(null);
   const [navigationPayload, setNavigationPayload] = useState<GalleryPayload | null>(null);
-  const [mapPayload, setMapPayload] = useState<GalleryPayload | null>(null);
+  const [mapClustersPayload, setMapClustersPayload] = useState<GalleryMapClustersPayload | null>(
+    null
+  );
+  const [mapSelectionEntries, setMapSelectionEntries] = useState<GalleryEntry[]>([]);
   const [gridCollection, setGridCollection] = useState<GalleryGridCollection | null>(null);
   const [gridPages, setGridPages] = useState<Record<number, GalleryGridPageState>>({});
   const [gridPageHeights, setGridPageHeights] = useState<Record<number, number>>({});
@@ -353,6 +458,11 @@ export function GallerySurface({
   const gridCollectionRef = useRef<GalleryGridCollection | null>(null);
   const gridPagesRef = useRef<Record<number, GalleryGridPageState>>({});
   const gridPageCacheRef = useRef<GalleryGridPageCache>(new Map());
+  const mapClusterRequestVersionRef = useRef(0);
+  const lastMapViewportRequestRef = useRef({
+    viewport: GALLERY_MAP_INITIAL_VIEWPORT,
+    zoom: GALLERY_MAP_INITIAL_ZOOM
+  });
   const galleryRequestVersionRef = useRef(0);
   const activeGalleryRequestRef = useRef({
     viewMode,
@@ -422,6 +532,9 @@ export function GallerySurface({
   const galleryNavigationIconSize = compactGalleryGrid ? 46 : 54;
   const galleryNavigationGlyphSize = compactGalleryGrid ? 24 : 28;
   const galleryVirtualPageSize = resolveGalleryVirtualPageSize(galleryGridColumns);
+  // Only grid pagination depends on the measured grid width. In map mode, a
+  // native fullscreen resize must not reload the current gallery scope.
+  const galleryReloadPageSize = viewMode === "grid" ? galleryVirtualPageSize : null;
   const enabledMediaKinds: GalleryMediaKind[] = allowedMediaKinds?.length
     ? [...allowedMediaKinds]
     : ["image"];
@@ -456,19 +569,29 @@ export function GallerySurface({
     navigationPayload?.entries ?? [],
     currentGalleryPrefix
   );
-  const mapMediaEntries = mapPayload?.entries ?? [];
+  const mapMediaEntries = useMemo(() => {
+    const entriesByPath = new Map<string, GalleryEntry>();
+    for (const cluster of mapClustersPayload?.clusters ?? []) {
+      if (cluster.entry) {
+        entriesByPath.set(cluster.entry.path, cluster.entry);
+      }
+    }
+    for (const entry of mapSelectionEntries) {
+      entriesByPath.set(entry.path, entry);
+    }
+    return [...entriesByPath.values()];
+  }, [mapClustersPayload, mapSelectionEntries]);
   const mapMediaEntriesByPath = useMemo(
     () => new Map(mapMediaEntries.map((entry) => [entry.path, entry] as const)),
     [mapMediaEntries]
   );
-  const geotaggedEntries = mapMediaEntries.filter(hasGalleryGpsCoordinates);
   const activeMediaSummary =
     viewMode === "map"
-      ? galleryPayloadMediaSummary(mapPayload)
+      ? mapClustersPayload?.media_summary ?? EMPTY_GALLERY_MEDIA_SUMMARY
       : gridCollection?.mediaSummary ?? EMPTY_GALLERY_MEDIA_SUMMARY;
   const totalMediaCount =
     viewMode === "map"
-      ? galleryPayloadTotalEntryCount(mapPayload)
+      ? mapClustersPayload?.total_entry_count ?? 0
       : gridCollection?.totalEntryCount ?? 0;
   const readyCount = activeMediaSummary.ready_count;
   const pendingCount = activeMediaSummary.pending_count;
@@ -638,7 +761,7 @@ export function GallerySurface({
     }
 
     void reloadAppliedEntries();
-  }, [galleryVirtualPageSize, mediaFilter, sortOrder, viewMode]);
+  }, [galleryReloadPageSize, mediaFilter, sortOrder, viewMode]);
 
   async function refreshSnapshots(forceRevalidation = true) {
     if (forceRevalidation) {
@@ -650,9 +773,9 @@ export function GallerySurface({
     try {
       const payload = await loadSnapshots();
       setSnapshots(payload);
-      if (payload.length > 0) {
-        setSnapshotId((current) => current ?? payload[0]?.id ?? null);
-      }
+      setSnapshotId((current) =>
+        current && payload.some((snapshot) => snapshot.id === current) ? current : null
+      );
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed to load snapshots");
     } finally {
@@ -663,7 +786,8 @@ export function GallerySurface({
   async function refreshEntries(
     nextPrefix?: string,
     nextSnapshotId?: string | null,
-    forceRevalidation = true
+    forceRevalidation = true,
+    targetViewMode: GalleryViewMode = viewMode
   ) {
     if (forceRevalidation) {
       requestRevalidation?.("entries");
@@ -673,7 +797,7 @@ export function GallerySurface({
       depth,
       snapshotId: nextSnapshotId === undefined ? snapshotId : nextSnapshotId
     };
-    await loadGalleryScope(targetScope, typeof nextPrefix === "string");
+    await loadGalleryScope(targetScope, typeof nextPrefix === "string", targetViewMode);
   }
 
   async function reloadAppliedEntries() {
@@ -725,9 +849,8 @@ export function GallerySurface({
     }
 
     if (activeRequest.viewMode === "map") {
-      if (update.options.offset === undefined && update.options.limit === undefined) {
-        setMapPayload(update.payload);
-      }
+      const { viewport, zoom } = lastMapViewportRequestRef.current;
+      void loadMapClustersForViewport(viewport, zoom, scope);
       return;
     }
 
@@ -849,15 +972,75 @@ export function GallerySurface({
     }
   }
 
-  async function loadGalleryScope(targetScope: GalleryLoadedScope, syncPrefixInput: boolean) {
+  async function loadMapClustersForViewport(
+    viewport: GalleryMapViewport,
+    zoom: number,
+    targetScope = loadedScopeRef.current
+  ): Promise<GalleryMapClustersPayload | null> {
+    if (!targetScope || targetScope.snapshotId) {
+      return null;
+    }
+    lastMapViewportRequestRef.current = { viewport, zoom };
+    const requestVersion = mapClusterRequestVersionRef.current + 1;
+    mapClusterRequestVersionRef.current = requestVersion;
+    try {
+      const payload = await loadMapClusters({
+        prefix: targetScope.prefix,
+        depth: targetScope.depth,
+        mediaFilter: requestedServerMediaFilter,
+        viewport,
+        zoom
+      });
+      if (requestVersion !== mapClusterRequestVersionRef.current) {
+        return null;
+      }
+      setMapClustersPayload(payload);
+      return payload;
+    } catch (nextError) {
+      if (requestVersion === mapClusterRequestVersionRef.current) {
+        setError(
+          nextError instanceof Error ? nextError.message : "Failed to load gallery map clusters"
+        );
+      }
+      return null;
+    }
+  }
+
+  async function loadMapClusterEntriesWithRecovery(
+    queryToken: string,
+    clusterId: string,
+    offset: number,
+    limit: number
+  ): Promise<GalleryMapClusterEntriesPayload> {
+    try {
+      return await loadMapClusterEntries(queryToken, clusterId, offset, limit);
+    } catch (clusterError) {
+      if (!isGalleryMapClusterStaleError(clusterError)) {
+        throw clusterError;
+      }
+      const { viewport, zoom } = lastMapViewportRequestRef.current;
+      await loadMapClustersForViewport(viewport, zoom);
+      throw new Error("The gallery changed. Map clusters were refreshed; select the cluster again.");
+    }
+  }
+
+  async function loadGalleryScope(
+    targetScope: GalleryLoadedScope,
+    syncPrefixInput: boolean,
+    targetViewMode: GalleryViewMode = viewMode
+  ) {
+    const mapViewportRequest = lastMapViewportRequestRef.current;
     const requestVersion = galleryRequestVersionRef.current + 1;
     galleryRequestVersionRef.current = requestVersion;
+    loadedScopeRef.current = null;
     setLoading("entries");
     setError(null);
     setSelection(null);
     setVersionPreviewIndex(null);
     setNavigationPayload(null);
-    setMapPayload(null);
+    setMapClustersPayload(null);
+    setMapSelectionEntries([]);
+    mapClusterRequestVersionRef.current += 1;
     setGridCollection(null);
     gridPagesRef.current = {};
     setGridPages({});
@@ -870,13 +1053,15 @@ export function GallerySurface({
         view: "tree"
       });
 
-      if (viewMode === "map") {
-        const [navigation, mediaPayload] = await Promise.all([
+      if (targetViewMode === "map" && !targetScope.snapshotId) {
+        const [navigation, mapClusters] = await Promise.all([
           navigationPromise,
-          loadEntries(targetScope.prefix, targetScope.depth, targetScope.snapshotId, {
-            view: "tree",
-            sort: sortOrder,
-            mediaFilter: requestedServerMediaFilter
+          loadMapClusters({
+            prefix: targetScope.prefix,
+            depth: targetScope.depth,
+            mediaFilter: requestedServerMediaFilter,
+            viewport: mapViewportRequest.viewport,
+            zoom: mapViewportRequest.zoom
           })
         ]);
 
@@ -885,7 +1070,7 @@ export function GallerySurface({
         }
 
         setNavigationPayload(navigation);
-        setMapPayload(mediaPayload);
+        setMapClustersPayload(mapClusters);
         loadedScopeRef.current = targetScope;
         setLoadedScope(targetScope);
         if (syncPrefixInput) {
@@ -1091,30 +1276,36 @@ export function GallerySurface({
   }, []);
 
   function replaceGalleryEntryMedia(path: string, media: GalleryEntry["media"] | null) {
-    setMapPayload((current) => {
+    setMapClustersPayload((current) => {
       if (!current) {
         return current;
       }
 
       let changed = false;
-      const entries = current.entries.map((entry) => {
-        if (entry.path !== path) {
-          return entry;
+      const clusters = current.clusters.map((cluster) => {
+        if (cluster.entry?.path !== path) {
+          return cluster;
         }
         changed = true;
         return {
-          ...entry,
-          media
+          ...cluster,
+          entry: {
+            ...cluster.entry,
+            media
+          }
         };
       });
 
       return changed
         ? {
             ...current,
-            entries
+            clusters
           }
         : current;
     });
+    setMapSelectionEntries((current) =>
+      current.map((entry) => (entry.path === path ? { ...entry, media } : entry))
+    );
 
     setGridPages((current) => {
       let changed = false;
@@ -1256,8 +1447,8 @@ export function GallerySurface({
 
   const galleryDebugValue =
     viewMode === "map"
-      ? mapPayload ?? {
-          message: "No gallery payload loaded yet."
+      ? mapClustersPayload ?? {
+          message: "No gallery map clusters loaded yet."
         }
       : gridCollection
         ? {
@@ -1505,7 +1696,7 @@ export function GallerySurface({
                 <NumberInput
                   label="Depth"
                   min={1}
-                  max={64}
+                  max={GALLERY_MAX_DEPTH}
                   value={depth}
                   onChange={(value) => setDepth(typeof value === "number" && value > 0 ? value : 1)}
                 />
@@ -1519,7 +1710,11 @@ export function GallerySurface({
                   onChange={(value) => {
                     const nextSnapshot = value || null;
                     setSnapshotId(nextSnapshot);
-                    void refreshEntries(undefined, nextSnapshot);
+                    const nextViewMode = nextSnapshot ? "grid" : viewMode;
+                    if (nextSnapshot) {
+                      setViewMode("grid");
+                    }
+                    void refreshEntries(undefined, nextSnapshot, true, nextViewMode);
                   }}
                 />
               </SimpleGrid>
@@ -1576,6 +1771,7 @@ export function GallerySurface({
                       variant={viewMode === "map" ? "filled" : "default"}
                       leftSection={<IconMap2 size={14} />}
                       aria-pressed={viewMode === "map"}
+                      disabled={Boolean(loadedScope?.snapshotId)}
                       onClick={() => setViewMode("map")}
                     >
                       Map
@@ -1619,6 +1815,18 @@ export function GallerySurface({
                 <Badge variant="light">
                   {totalMediaCount} {totalMediaCount === 1 ? "item" : "items"}
                 </Badge>
+                {viewMode === "map" && mapClustersPayload?.summary_status?.refreshing ? (
+                  <Badge
+                    variant="light"
+                    color="gray"
+                    leftSection={<Loader size={10} color="gray" />}
+                  >
+                    Updating counts
+                    {typeof mapClustersPayload.summary_status.progress_percent === "number"
+                      ? ` ${mapClustersPayload.summary_status.progress_percent}%`
+                      : ""}
+                  </Badge>
+                ) : null}
                 {imageCount > 0 ? (
                   <Badge color="blue" variant="light">
                     {imageCount} {imageCount === 1 ? "photo" : "photos"}
@@ -1676,7 +1884,9 @@ export function GallerySurface({
                 </Group>
               ) : null}
 
-              {geotaggedEntries.length === 0 ? (
+              {mapClustersPayload !== null &&
+              mapClustersPayload.clusters.length === 0 &&
+              activeMediaSummary.geotagged_count === 0 ? (
                 <Card withBorder radius="md" padding="xl">
                   <Stack gap="xs" align="center">
                     <Text fw={700}>No geo-tagged media in view</Text>
@@ -1697,15 +1907,20 @@ export function GallerySurface({
                   retryBasemapConfiguration={retryBasemapConfiguration}
                   activeProjection={activeMapProjection}
                   onSelectProjection={setActiveMapProjection}
-                  entries={geotaggedEntries}
+                  clustersPayload={mapClustersPayload}
                   hiddenOnMapCount={hiddenOnMapCount}
                   selectedPath={selection?.path ?? null}
                   getMarkerRequest={(entry) => getMediaRequests(entry, activeSnapshotId).thumbnail ?? null}
+                  onViewportChange={(viewport, zoom) =>
+                    void loadMapClustersForViewport(viewport, zoom)
+                  }
+                  loadClusterEntries={loadMapClusterEntriesWithRecovery}
                   onSwitchToGrid={switchToGridView}
-                  onSelectPath={(path, visiblePaths) => {
+                  onSelectPath={(path, visibleEntries) => {
+                    setMapSelectionEntries(visibleEntries);
                     const nextVisiblePaths = buildGalleryMapSelectionScope(
-                      mapMediaEntries,
-                      visiblePaths,
+                      visibleEntries,
+                      visibleEntries.map((entry) => entry.path),
                       path
                     );
                     const nextIndex = nextVisiblePaths.indexOf(path);
@@ -1925,6 +2140,11 @@ export function GallerySurface({
         }
         onSelectIndex={(index) =>
           versionPreviewIndex === null ? showEntryAtIndex(index) : setVersionPreviewIndex(index)
+        }
+        resolveShareVersionId={
+          loadVersions
+            ? async (key) => (await loadVersions(key)).preferred_head_version_id?.trim() || null
+            : undefined
         }
         extraActions={
           loadVersions && activeMediaHistoryKey ? (
@@ -2164,15 +2384,6 @@ function resolveGalleryVirtualPageEstimatedHeight(
   return rowCount * cardHeight + Math.max(0, rowCount - 1) * gap;
 }
 
-function resolveWorldMapClusterRadius(width: number, height: number): number {
-  const longestEdge = Math.max(width, height, 560);
-  const interpolated = longestEdge / 16;
-  return Math.max(
-    MIN_WORLD_MAP_CLUSTER_RADIUS_PX,
-    Math.min(MAX_WORLD_MAP_CLUSTER_RADIUS_PX, interpolated)
-  );
-}
-
 function formatGalleryClusterCount(count: number): string {
   if (count < 1000) {
     return String(count);
@@ -2231,12 +2442,14 @@ type GalleryMapPanelProps = {
   retryBasemapConfiguration?: () => void;
   activeProjection: GalleryMapProjection;
   onSelectProjection: (projection: GalleryMapProjection) => void;
-  entries: GalleryEntry[];
+  clustersPayload: GalleryMapClustersPayload | null;
   hiddenOnMapCount: number;
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
   onSwitchToGrid: () => void;
-  onSelectPath: (path: string, visiblePaths: string[]) => void;
+  onViewportChange: (viewport: GalleryMapViewport, zoom: number) => void;
+  loadClusterEntries: GalleryDataSource["loadMapClusterEntries"];
+  onSelectPath: (path: string, visibleEntries: GalleryEntry[]) => void;
 };
 
 function GalleryMapPanel({
@@ -2248,10 +2461,12 @@ function GalleryMapPanel({
   retryBasemapConfiguration,
   activeProjection,
   onSelectProjection,
-  entries,
+  clustersPayload,
   hiddenOnMapCount,
   selectedPath,
   getMarkerRequest,
+  onViewportChange,
+  loadClusterEntries,
   onSwitchToGrid,
   onSelectPath
 }: GalleryMapPanelProps) {
@@ -2263,6 +2478,7 @@ function GalleryMapPanel({
       ? null
       : new URLSearchParams(window.location.search).get("embedded_client");
   const usesEmbeddedClient = embeddedClient === "android" || embeddedClient === "ios";
+  const usesAndroidFullscreenBridge = embeddedClient === "android";
   // Android WebView can resolve dynamic viewport units to zero while this
   // surface is fullscreen, whereas iOS WebView needs an explicit height for
   // fixed inset bounds to be reflected in its rendered accessibility frame.
@@ -2320,6 +2536,25 @@ function GalleryMapPanel({
     };
   }, [isFullscreen, usesEmbeddedClient]);
 
+  useEffect(() => {
+    if (usesAndroidFullscreenBridge) {
+      notifyAndroidGalleryMapFullscreen(isFullscreen);
+    }
+  }, [isFullscreen, usesAndroidFullscreenBridge]);
+
+  useEffect(() => {
+    if (!usesAndroidFullscreenBridge || typeof window === "undefined") {
+      return;
+    }
+
+    const exitFullscreen = () => setIsFullscreen(false);
+    window.addEventListener(GALLERY_MAP_FULLSCREEN_EXIT_EVENT, exitFullscreen);
+    return () => {
+      window.removeEventListener(GALLERY_MAP_FULLSCREEN_EXIT_EVENT, exitFullscreen);
+      notifyAndroidGalleryMapFullscreen(false);
+    };
+  }, [usesAndroidFullscreenBridge]);
+
   if (!activeBasemap) {
     return (
       <GalleryMapConfigurationStatus
@@ -2332,7 +2567,7 @@ function GalleryMapPanel({
 
   const fallbackMap = (
     <GalleryWorldMap
-      entries={entries}
+      clustersPayload={clustersPayload}
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
       allowFullscreenPortal={!usesEmbeddedClient}
@@ -2340,6 +2575,7 @@ function GalleryMapPanel({
       fullscreenViewportHeight={fullscreenViewportHeight}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
+      loadClusterEntries={loadClusterEntries}
       onSelectPath={onSelectPath}
       onToggleFullscreen={toggleFullscreen}
     />
@@ -2349,7 +2585,7 @@ function GalleryMapPanel({
     <GalleryBasemapMap
       basemap={activeBasemap}
       projection={activeProjection}
-      entries={entries}
+      clustersPayload={clustersPayload}
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
       allowFullscreenPortal={!usesEmbeddedClient}
@@ -2357,6 +2593,8 @@ function GalleryMapPanel({
       fullscreenViewportHeight={fullscreenViewportHeight}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
+      onViewportChange={onViewportChange}
+      loadClusterEntries={loadClusterEntries}
       onSelectPath={onSelectPath}
       onToggleFullscreen={toggleFullscreen}
       onSwitchToGrid={switchToGrid}
@@ -2406,14 +2644,25 @@ function GalleryMapPanel({
             </Button>
           </Group>
         </Stack>
-        {isFullscreen && usesEmbeddedClient ? (
-          <Button variant="default" onClick={toggleFullscreen}>
-            Exit fullscreen map
-          </Button>
-        ) : null}
       </Group>
     </Card>
   );
+  const embeddedFullscreenExitControl =
+    isFullscreen && usesEmbeddedClient ? (
+      <div
+        data-gallery-map-fullscreen-exit="true"
+        style={{
+          position: "fixed",
+          top: "calc(env(safe-area-inset-top, 0px) + 12px)",
+          right: "calc(env(safe-area-inset-right, 0px) + 12px)",
+          zIndex: 153
+        }}
+      >
+        <Button variant="filled" color="dark" onClick={toggleFullscreen}>
+          Exit fullscreen map
+        </Button>
+      </div>
+    ) : null;
   const configurationNotice = basemapConfigurationError ? (
     <Alert color="yellow" title="Map styles could not be refreshed">
       <Stack gap="xs">
@@ -2437,22 +2686,23 @@ function GalleryMapPanel({
 
   return (
     <Stack gap="sm">
-      {fullscreenPortalTarget
-        ? createPortal(
-            <div
-              style={{
-                position: "fixed",
-                left: 12,
-                top: 12,
-                zIndex: 152,
-                width: "min(440px, calc(100vw - 24px))"
-              }}
-            >
-              {mapDisplayControls}
-            </div>,
-            fullscreenPortalTarget
-          )
-        : mapDisplayControls}
+      {embeddedFullscreenExitControl ??
+        (fullscreenPortalTarget
+          ? createPortal(
+              <div
+                style={{
+                  position: "fixed",
+                  left: 12,
+                  top: 12,
+                  zIndex: 152,
+                  width: "min(440px, calc(100vw - 24px))"
+                }}
+              >
+                {mapDisplayControls}
+              </div>,
+              fullscreenPortalTarget
+            )
+          : mapDisplayControls)}
 
       {configurationNotice}
       <div>{basemapMap}</div>
@@ -2508,7 +2758,7 @@ function GalleryMapConfigurationStatus({
 }
 
 type GalleryWorldMapProps = {
-  entries: GalleryEntry[];
+  clustersPayload: GalleryMapClustersPayload | null;
   hiddenOnMapCount: number;
   isFullscreen: boolean;
   allowFullscreenPortal: boolean;
@@ -2516,12 +2766,13 @@ type GalleryWorldMapProps = {
   fullscreenViewportHeight?: "100dvh";
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
-  onSelectPath: (path: string, visiblePaths: string[]) => void;
+  loadClusterEntries: GalleryDataSource["loadMapClusterEntries"];
+  onSelectPath: (path: string, visibleEntries: GalleryEntry[]) => void;
   onToggleFullscreen: () => void;
 };
 
 function GalleryWorldMap({
-  entries,
+  clustersPayload,
   hiddenOnMapCount,
   isFullscreen,
   allowFullscreenPortal,
@@ -2529,10 +2780,19 @@ function GalleryWorldMap({
   fullscreenViewportHeight,
   selectedPath,
   getMarkerRequest,
+  loadClusterEntries,
   onSelectPath,
   onToggleFullscreen
 }: GalleryWorldMapProps) {
-  const [clusterDialogEntries, setClusterDialogEntries] = useState<GalleryEntry[] | null>(null);
+  const [clusterDialog, setClusterDialog] = useState<{
+    cluster: GalleryMapCluster;
+    queryToken: string;
+    entries: GalleryEntry[];
+    totalEntryCount: number;
+    hasMore: boolean;
+    loading: boolean;
+    error: string | null;
+  } | null>(null);
   const { ref: mapViewportRef, width: mapViewportWidth, height: mapViewportHeight } =
     useElementSize();
   const fullscreenPortalTarget =
@@ -2541,37 +2801,73 @@ function GalleryWorldMap({
     const width = mapViewportWidth > 0 ? mapViewportWidth : 1000;
     const height = mapViewportHeight > 0 ? mapViewportHeight : 560;
 
-    return entries.flatMap((entry) => {
-      const gps = entry.media?.gps;
-      if (!gps) {
-        return [];
-      }
-
-      const projection = projectGpsToWorldMap(gps.latitude, gps.longitude);
-      return [
-        {
-          id: entry.path,
-          item: entry,
-          x: projection.x * width,
-          y: projection.y * height
-        }
-      ];
+    return (clustersPayload?.clusters ?? []).map((cluster) => {
+      const projection = projectGpsToWorldMap(cluster.latitude, cluster.longitude);
+      return {
+        id: cluster.cluster_id,
+        item: cluster,
+        x: projection.x * width,
+        y: projection.y * height
+      };
     });
-  }, [entries, mapViewportHeight, mapViewportWidth]);
-  const worldMapMarkerClusters = useMemo<ScreenPointCluster<GalleryEntry>[]>(
+  }, [clustersPayload, mapViewportHeight, mapViewportWidth]);
+  const visibleEntries = useMemo(
     () =>
-      clusterScreenPoints(
-        worldMapMarkerPoints,
-        resolveWorldMapClusterRadius(mapViewportWidth, mapViewportHeight)
+      (clustersPayload?.clusters ?? []).flatMap((cluster) =>
+        cluster.entry ? [cluster.entry] : []
       ),
-    [mapViewportHeight, mapViewportWidth, worldMapMarkerPoints]
+    [clustersPayload]
   );
-  const visiblePaths = useMemo(() => entries.map((entry) => entry.path), [entries]);
   const suppressMarkerThumbnails =
-    worldMapMarkerClusters.length > MAX_WORLD_MAP_THUMBNAIL_MARKERS;
-  const clusteredMarkerCount = worldMapMarkerClusters.filter(
-    (cluster) => cluster.points.length > 1
+    worldMapMarkerPoints.length > MAX_WORLD_MAP_THUMBNAIL_MARKERS;
+  const clusteredMarkerCount = worldMapMarkerPoints.filter(
+    (point) => point.item.count > 1
   ).length;
+
+  async function loadWorldClusterDialogPage(cluster: GalleryMapCluster, append: boolean) {
+    const queryToken = append ? clusterDialog?.queryToken : clustersPayload?.query_token;
+    if (!queryToken) {
+      return;
+    }
+    const existingEntries = append ? clusterDialog?.entries ?? [] : [];
+    setClusterDialog({
+      cluster,
+      queryToken,
+      entries: existingEntries,
+      totalEntryCount: append ? clusterDialog?.totalEntryCount ?? cluster.count : cluster.count,
+      hasMore: append ? clusterDialog?.hasMore ?? true : true,
+      loading: true,
+      error: null
+    });
+    try {
+      const page = await loadClusterEntries(
+        queryToken,
+        cluster.cluster_id,
+        existingEntries.length,
+        GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE
+      );
+      setClusterDialog({
+        cluster,
+        queryToken,
+        entries: [...existingEntries, ...page.entries],
+        totalEntryCount: page.total_entry_count,
+        hasMore: page.has_more,
+        loading: false,
+        error: null
+      });
+    } catch (nextError) {
+      setClusterDialog({
+        cluster,
+        queryToken,
+        entries: existingEntries,
+        totalEntryCount: cluster.count,
+        hasMore: append,
+        loading: false,
+        error:
+          nextError instanceof Error ? nextError.message : "Failed to load map cluster entries"
+      });
+    }
+  }
   const mapViewport = (
     <div
       ref={mapViewportRef}
@@ -2674,35 +2970,33 @@ function GalleryWorldMap({
         />
       </svg>
 
-      {worldMapMarkerClusters.map((cluster) => {
-        const selected = cluster.points.some((point) => point.item.path === selectedPath);
-        if (cluster.points.length === 1) {
-          const point = cluster.points[0];
-          if (!point) {
-            return null;
-          }
-
+      {worldMapMarkerPoints.map((point) => {
+        const cluster = point.item;
+        const selected = cluster.entry?.path === selectedPath;
+        if (cluster.count === 1 && cluster.entry) {
           return (
             <GalleryMapMarker
-              key={point.item.path}
-              entry={point.item}
-              request={!suppressMarkerThumbnails || selected ? getMarkerRequest(point.item) : null}
-              left={cluster.x}
-              top={cluster.y}
+              key={cluster.cluster_id}
+              entry={cluster.entry}
+              request={
+                !suppressMarkerThumbnails || selected ? getMarkerRequest(cluster.entry) : null
+              }
+              left={point.x}
+              top={point.y}
               selected={selected}
-              onClick={() => onSelectPath(point.item.path, visiblePaths)}
+              onClick={() => onSelectPath(cluster.entry!.path, visibleEntries)}
             />
           );
         }
 
         return (
           <GalleryMapClusterMarker
-            key={cluster.id}
-            count={cluster.points.length}
-            left={cluster.x}
-            top={cluster.y}
-            selected={selected}
-            onClick={() => setClusterDialogEntries(cluster.points.map((point) => point.item))}
+            key={cluster.cluster_id}
+            count={cluster.count}
+            left={point.x}
+            top={point.y}
+            selected={false}
+            onClick={() => void loadWorldClusterDialogPage(cluster, false)}
           />
         );
       })}
@@ -2736,8 +3030,8 @@ function GalleryWorldMap({
         >
           <Badge color="dark" variant="filled">
             {clusteredMarkerCount > 0
-              ? `Clustered ${entries.length} markers into ${worldMapMarkerClusters.length}`
-              : `Showing pins for ${worldMapMarkerClusters.length} markers`}
+              ? `Server clustered ${clustersPayload?.visible_geotagged_count ?? 0} markers into ${worldMapMarkerPoints.length}`
+              : `Showing pins for ${worldMapMarkerPoints.length} markers`}
           </Badge>
         </div>
       ) : clusteredMarkerCount > 0 ? (
@@ -2749,7 +3043,7 @@ function GalleryWorldMap({
           }}
         >
           <Badge color="dark" variant="filled">
-            {worldMapMarkerClusters.length} visible clusters
+            {clusteredMarkerCount} server cluster{clusteredMarkerCount === 1 ? "" : "s"}
           </Badge>
         </div>
       ) : null}
@@ -2786,7 +3080,7 @@ function GalleryWorldMap({
               </div>
               <Group gap="xs">
                 <Badge color="grape" variant="light">
-                  {entries.length} markers
+                  {clustersPayload?.visible_geotagged_count ?? 0} markers
                 </Badge>
                 {hiddenOnMapCount > 0 ? (
                   <Badge color="gray" variant="light">
@@ -2807,13 +3101,9 @@ function GalleryWorldMap({
       <EmbeddedViewportModal
         data-gallery-map-cluster-dialog="true"
         usesEmbeddedViewport={usesEmbeddedViewport}
-        opened={clusterDialogEntries !== null}
-        onClose={() => setClusterDialogEntries(null)}
-        title={
-          clusterDialogEntries
-            ? `${clusterDialogEntries.length} items in map cluster`
-            : "Map cluster"
-        }
+        opened={clusterDialog !== null}
+        onClose={() => setClusterDialog(null)}
+        title={clusterDialog ? `${clusterDialog.totalEntryCount} items in map cluster` : "Map cluster"}
         centered
       >
         <Stack gap="xs">
@@ -2821,20 +3111,35 @@ function GalleryWorldMap({
             This atlas view groups nearby markers. Select an item to open it in the gallery viewer.
           </Text>
           <Stack gap="xs">
-            {clusterDialogEntries?.map((entry) => (
+            {clusterDialog?.entries.map((entry) => (
               <Button
                 key={entry.path}
                 variant="default"
                 fullWidth
                 onClick={() => {
-                  setClusterDialogEntries(null);
-                  onSelectPath(entry.path, visiblePaths);
+                  const entries = clusterDialog.entries;
+                  setClusterDialog(null);
+                  onSelectPath(entry.path, entries);
                 }}
               >
                 {entry.path}
               </Button>
             ))}
           </Stack>
+          {clusterDialog?.error ? (
+            <Alert color="red" title="Cluster entries unavailable">
+              {clusterDialog.error}
+            </Alert>
+          ) : null}
+          {clusterDialog?.loading ? <Loader size="sm" /> : null}
+          {clusterDialog?.hasMore && !clusterDialog.loading ? (
+            <Button
+              variant="light"
+              onClick={() => void loadWorldClusterDialogPage(clusterDialog.cluster, true)}
+            >
+              Load more
+            </Button>
+          ) : null}
         </Stack>
       </EmbeddedViewportModal>
     </>
@@ -3764,15 +4069,15 @@ function isGalleryPrefixEntry(entry: GalleryEntry): boolean {
   return entry.entry_type === "prefix" || entry.path.endsWith("/");
 }
 
-function hasGalleryGpsCoordinates(entry: GalleryEntry): boolean {
-  const latitude = entry.media?.gps?.latitude;
-  const longitude = entry.media?.gps?.longitude;
-  return (
-    typeof latitude === "number" &&
-    Number.isFinite(latitude) &&
-    typeof longitude === "number" &&
-    Number.isFinite(longitude)
-  );
+function isGalleryMapClusterStaleError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as { status?: unknown; payload?: unknown };
+  if (candidate.status !== 409 || !candidate.payload || typeof candidate.payload !== "object") {
+    return false;
+  }
+  return (candidate.payload as { code?: unknown }).code === "gallery_map_cluster_stale";
 }
 
 function mediaStatusColor(status?: string | null): string {

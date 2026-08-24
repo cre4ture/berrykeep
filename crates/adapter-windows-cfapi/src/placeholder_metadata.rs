@@ -4,27 +4,48 @@ use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info_with_identity,
     cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_with_oplock,
-    describe_path_state, open_sync_path, path_is_placeholder,
+    cf_update_placeholder_metadata_and_identity,
+    cf_update_placeholder_metadata_and_identity_with_oplock, describe_path_state, open_sync_path,
+    path_is_placeholder,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::content_fingerprint::file_content_fingerprint;
 use crate::helpers::{
     PlaceholderFileIdentity, decode_placeholder_file_identity, normalize_path, path_to_relative,
+    unix_seconds_to_windows_file_time,
 };
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use sync_core::{EntryKind, SyncSnapshot};
+use sync_core::{EntryKind, NamespaceMediaMetadata, SyncSnapshot};
 use uuid::Uuid;
 use walkdir::WalkDir;
+use windows_sys::Win32::Storage::CloudFilters::CF_FS_METADATA;
+use windows_sys::Win32::Storage::FileSystem::FILE_BASIC_INFO;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RemoteDeleteReconcileReport {
     pub deleted_paths: BTreeSet<String>,
     pub preserved_paths: BTreeSet<String>,
     pub suppressed_startup_paths: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteFileMetadataPolicy {
+    ApplyAndMarkInSync,
+    PreserveLocalConflict,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RemotePlaceholderState<'a> {
+    pub remote_version: Option<&'a str>,
+    pub remote_content_hash: Option<&'a str>,
+    pub remote_size_bytes: Option<u64>,
+    pub remote_content_fingerprint: Option<&'a str>,
+    pub remote_modified_at_unix: Option<u64>,
+    pub remote_media: Option<&'a NamespaceMediaMetadata>,
 }
 
 pub fn record_in_sync_local_file_state(
@@ -64,7 +85,7 @@ pub fn record_in_sync_content_baseline(
         return Ok(());
     }
 
-    mutate_placeholder_identity_for_path(sync_root_path, &normalized, |identity| {
+    mutate_placeholder_identity_for_path(sync_root_path, &normalized, None, true, |identity| {
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
         identity.set_in_sync_content_baseline(in_sync_content_fingerprint);
@@ -81,7 +102,7 @@ pub fn promote_remote_to_in_sync_content_baseline(
         return Ok(());
     }
 
-    mutate_placeholder_identity_for_path(sync_root_path, &normalized, |identity| {
+    mutate_placeholder_identity_for_path(sync_root_path, &normalized, None, true, |identity| {
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
         identity.promote_remote_to_in_sync_content_baseline();
@@ -92,11 +113,47 @@ pub fn refresh_remote_placeholder_state(
     sync_root_path: &Path,
     relative_path: &str,
     provider_instance_id: Uuid,
-    remote_version: Option<&str>,
-    remote_content_hash: Option<&str>,
-    remote_size_bytes: Option<u64>,
-    remote_content_fingerprint: Option<&str>,
+    remote: RemotePlaceholderState<'_>,
 ) -> Result<()> {
+    refresh_remote_placeholder_state_with_policy(
+        sync_root_path,
+        relative_path,
+        provider_instance_id,
+        remote,
+        RemoteFileMetadataPolicy::ApplyAndMarkInSync,
+    )
+}
+
+pub fn refresh_remote_conflict_identity(
+    sync_root_path: &Path,
+    relative_path: &str,
+    provider_instance_id: Uuid,
+    remote: RemotePlaceholderState<'_>,
+) -> Result<()> {
+    refresh_remote_placeholder_state_with_policy(
+        sync_root_path,
+        relative_path,
+        provider_instance_id,
+        remote,
+        RemoteFileMetadataPolicy::PreserveLocalConflict,
+    )
+}
+
+fn refresh_remote_placeholder_state_with_policy(
+    sync_root_path: &Path,
+    relative_path: &str,
+    provider_instance_id: Uuid,
+    remote: RemotePlaceholderState<'_>,
+    file_metadata_policy: RemoteFileMetadataPolicy,
+) -> Result<()> {
+    let RemotePlaceholderState {
+        remote_version,
+        remote_content_hash,
+        remote_size_bytes,
+        remote_content_fingerprint,
+        remote_modified_at_unix,
+        remote_media,
+    } = remote;
     let normalized = normalize_path(relative_path);
     if normalized.is_empty() || is_internal_sync_root_relative_path(&normalized) {
         return Ok(());
@@ -114,23 +171,81 @@ pub fn refresh_remote_placeholder_state(
         return Ok(());
     }
 
-    mutate_placeholder_identity_for_path(sync_root_path, &normalized, |identity| {
-        identity.path = normalized.clone();
-        identity.provider_instance_id = Some(provider_instance_id);
-        identity.remote_version = remote_version
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-        identity.remote_content_hash = remote_content_hash
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-        identity.remote_content_fingerprint = remote_content_fingerprint
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-        identity.remote_size_bytes = remote_size_bytes;
-    })
+    let file_size = remote_size_bytes
+        .and_then(|value| i64::try_from(value).ok())
+        .or_else(|| i64::try_from(metadata.len()).ok())
+        .unwrap_or_default();
+    let fs_metadata =
+        remote_file_system_metadata(file_metadata_policy, remote_modified_at_unix, file_size);
+    let fs_metadata_is_current = match file_metadata_policy {
+        RemoteFileMetadataPolicy::ApplyAndMarkInSync => remote_file_system_metadata_is_current(
+            &metadata,
+            remote_modified_at_unix,
+            remote_size_bytes,
+        ),
+        RemoteFileMetadataPolicy::PreserveLocalConflict => true,
+    };
+
+    mutate_placeholder_identity_for_path(
+        sync_root_path,
+        &normalized,
+        fs_metadata,
+        fs_metadata_is_current,
+        |identity| {
+            identity.path = normalized.clone();
+            identity.provider_instance_id = Some(provider_instance_id);
+            identity.remote_version = remote_version
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            identity.remote_content_hash = remote_content_hash
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            identity.remote_content_fingerprint = remote_content_fingerprint
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            identity.remote_size_bytes = remote_size_bytes;
+            identity.remote_modified_at_unix = remote_modified_at_unix;
+            identity.set_remote_media(remote_media.cloned());
+        },
+    )
+}
+
+fn remote_file_system_metadata(
+    file_metadata_policy: RemoteFileMetadataPolicy,
+    remote_modified_at_unix: Option<u64>,
+    file_size: i64,
+) -> Option<CF_FS_METADATA> {
+    match file_metadata_policy {
+        RemoteFileMetadataPolicy::ApplyAndMarkInSync => remote_modified_at_unix
+            .and_then(unix_seconds_to_windows_file_time)
+            .map(|last_write_time| CF_FS_METADATA {
+                BasicInfo: FILE_BASIC_INFO {
+                    LastWriteTime: last_write_time,
+                    ..Default::default()
+                },
+                FileSize: file_size,
+            }),
+        RemoteFileMetadataPolicy::PreserveLocalConflict => None,
+    }
+}
+
+fn remote_file_system_metadata_is_current(
+    metadata: &fs::Metadata,
+    remote_modified_at_unix: Option<u64>,
+    remote_size_bytes: Option<u64>,
+) -> bool {
+    let size_is_current = remote_size_bytes.is_none_or(|size| metadata.len() == size);
+    let modified_at_is_current = remote_modified_at_unix.is_none_or(|modified_at| {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|value| value.as_secs() == modified_at)
+    });
+    size_is_current && modified_at_is_current
 }
 
 pub fn reconcile_remote_delete_state(
@@ -319,6 +434,8 @@ pub fn reconcile_remote_delete_state(
 fn mutate_placeholder_identity_for_path(
     sync_root_path: &Path,
     relative_path: &str,
+    fs_metadata: Option<CF_FS_METADATA>,
+    fs_metadata_is_current: bool,
     mutator: impl FnOnce(&mut PlaceholderFileIdentity),
 ) -> Result<()> {
     let full_path = sync_root_path.join(relative_path.replace('/', "\\"));
@@ -336,12 +453,21 @@ fn mutate_placeholder_identity_for_path(
     };
     let original_identity = identity.clone();
     mutator(&mut identity);
-    if identity == original_identity {
+    let fs_metadata_needs_update = fs_metadata.is_some() && !fs_metadata_is_current;
+    // Avoid reopening unchanged placeholders, while still repairing a stale
+    // LastWriteTime or file size even when the encoded identity already matches.
+    if identity == original_identity && !fs_metadata_needs_update {
         return Ok(());
     }
     let encoded = identity.encoded();
 
-    match cf_update_placeholder_file_identity_with_oplock(&full_path, &encoded) {
+    let oplock_result = match fs_metadata.as_ref() {
+        Some(metadata) => {
+            cf_update_placeholder_metadata_and_identity_with_oplock(&full_path, metadata, &encoded)
+        }
+        None => cf_update_placeholder_file_identity_with_oplock(&full_path, &encoded),
+    };
+    match oplock_result {
         Ok(()) => Ok(()),
         Err(oplock_err) => {
             if path_is_placeholder(&full_path) {
@@ -359,7 +485,12 @@ fn mutate_placeholder_identity_for_path(
                 )
             })?;
             cf_ensure_placeholder_identity(&writable_file, relative_path)?;
-            cf_update_placeholder_file_identity(&writable_file, &encoded)
+            match fs_metadata.as_ref() {
+                Some(metadata) => {
+                    cf_update_placeholder_metadata_and_identity(&writable_file, metadata, &encoded)
+                }
+                None => cf_update_placeholder_file_identity(&writable_file, &encoded),
+            }
         }
     }
 }
@@ -407,6 +538,9 @@ fn identity_has_remote_baseline(identity: &PlaceholderFileIdentity) -> bool {
         || identity.remote_content_hash.is_some()
         || identity.remote_content_fingerprint.is_some()
         || identity.remote_size_bytes.is_some()
+        || identity.remote_modified_at_unix.is_some()
+        || identity.remote_media.is_some()
+        || identity.remote_media_absent
         || identity.in_sync_content_fingerprint.is_some()
 }
 
@@ -419,7 +553,63 @@ fn is_internal_sync_root_relative_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
     use sync_core::NamespaceEntry;
+
+    #[test]
+    fn conflict_refresh_preserves_local_file_metadata_and_sync_state() {
+        assert!(
+            remote_file_system_metadata(
+                RemoteFileMetadataPolicy::PreserveLocalConflict,
+                Some(1_723_456_789),
+                42,
+            )
+            .is_none()
+        );
+        assert!(
+            remote_file_system_metadata(
+                RemoteFileMetadataPolicy::ApplyAndMarkInSync,
+                Some(1_723_456_789),
+                42,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn remote_metadata_comparison_detects_stale_timestamp_and_size() {
+        let root =
+            std::env::temp_dir().join(format!("ironmesh-placeholder-meta-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("test directory should exist");
+        let path = root.join("photo.jpg");
+        fs::write(&path, vec![0_u8; 42]).expect("test file should be written");
+        let modified_at = 1_723_456_789;
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("test file should open")
+            .set_modified(UNIX_EPOCH + Duration::from_secs(modified_at))
+            .expect("test timestamp should be set");
+        let metadata = fs::metadata(&path).expect("test metadata should load");
+
+        assert!(remote_file_system_metadata_is_current(
+            &metadata,
+            Some(modified_at),
+            Some(42),
+        ));
+        assert!(!remote_file_system_metadata_is_current(
+            &metadata,
+            Some(modified_at + 1),
+            Some(42),
+        ));
+        assert!(!remote_file_system_metadata_is_current(
+            &metadata,
+            Some(modified_at),
+            Some(43),
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn reconcile_remote_delete_preserves_local_only_plain_files() {

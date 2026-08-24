@@ -2,10 +2,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 #[cfg(test)]
 use client_sdk::EnrolledClientConnection;
+use client_sdk::ironmesh_client::DownloadRangeRequest;
 use client_sdk::{
     ClientConnectionAttempt, ClientConnectionDiagnostics, ClientConnectionRouteSnapshot,
     ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    ManagedClientOptions, ManagedIronMeshClient, ObjectHeadInfo, StoreIndexEntry,
+    ManagedClientOptions, ManagedIronMeshClient, ObjectHeadInfo, RequestedRange, StoreIndexEntry,
     StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder,
     StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig, TitleLatencyProbeStatus,
     VersionGraphSummary, enroll_client_connection_blocking,
@@ -23,6 +24,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 const FFI_OK: c_int = 0;
 const FFI_ERR: c_int = 1;
+const MAX_IOS_FILE_PROVIDER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 
 fn ios_diagnostic_log_buffer() -> Arc<common::logging::LogBuffer> {
     static LOG_BUFFER: OnceLock<Arc<common::logging::LogBuffer>> = OnceLock::new();
@@ -388,6 +390,56 @@ impl IosStorageApp {
     pub fn fetch(&self, key: impl AsRef<str>) -> Result<Vec<u8>> {
         let key = key.as_ref().to_string();
         self.runtime.block_on(self.fetch_async(key))
+    }
+
+    pub fn object_size(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<u64> {
+        self.runtime
+            .block_on(self.sdk.get_object_size(key.as_ref(), snapshot, version))
+    }
+
+    pub fn fetch_range(
+        &self,
+        key: impl AsRef<str>,
+        offset: u64,
+        length: usize,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            length <= MAX_IOS_FILE_PROVIDER_RANGE_BYTES,
+            "range length exceeds the iOS File Provider limit"
+        );
+        let mut bytes = Vec::with_capacity(length);
+        let mut on_progress = |_progress| {};
+        let should_cancel = || false;
+        let report = self
+            .runtime
+            .block_on(self.sdk.download_range_to_writer_with_progress(
+                DownloadRangeRequest {
+                    key: key.as_ref(),
+                    snapshot,
+                    version,
+                    range: RequestedRange {
+                        offset,
+                        length: length as u64,
+                    },
+                },
+                &mut bytes,
+                &mut on_progress,
+                &should_cancel,
+            ))?;
+        anyhow::ensure!(
+            report.bytes_downloaded == length as u64 && bytes.len() == length,
+            "range response size mismatch: requested={length} reported={} actual={}",
+            report.bytes_downloaded,
+            bytes.len()
+        );
+        Ok(bytes)
     }
 
     pub fn fetch_relative_path(&self, path: impl AsRef<str>) -> Result<Vec<u8>> {
@@ -812,6 +864,30 @@ fn store_index_with_options_json(
 fn fetch_bytes(handle: *mut c_void, key: impl AsRef<str>) -> Result<Vec<u8>> {
     let app = unsafe { handle_to_app(handle)? };
     app.fetch(key)
+}
+
+#[allow(unsafe_code)]
+fn object_size(
+    handle: *mut c_void,
+    key: impl AsRef<str>,
+    snapshot: Option<&str>,
+    version: Option<&str>,
+) -> Result<u64> {
+    let app = unsafe { handle_to_app(handle)? };
+    app.object_size(key, snapshot, version)
+}
+
+#[allow(unsafe_code)]
+fn fetch_range_bytes(
+    handle: *mut c_void,
+    key: impl AsRef<str>,
+    offset: u64,
+    length: usize,
+    snapshot: Option<&str>,
+    version: Option<&str>,
+) -> Result<Vec<u8>> {
+    let app = unsafe { handle_to_app(handle)? };
+    app.fetch_range(key, offset, length, snapshot, version)
 }
 
 #[allow(unsafe_code)]
@@ -1261,6 +1337,69 @@ pub extern "C" fn ironmesh_ios_facade_fetch_bytes(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_object_size(
+    handle: *mut c_void,
+    key: *const c_char,
+    snapshot: *const c_char,
+    version: *const c_char,
+    out_size: *mut u64,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_u64_out(out_size);
+    clear_error(out_error);
+    let result = (|| {
+        object_size(
+            handle,
+            required_c_string(key, "key")?,
+            optional_c_string(snapshot)?.as_deref(),
+            optional_c_string(version)?.as_deref(),
+        )
+    })();
+    match result {
+        Ok(size) => match write_u64(out_size, size) {
+            Ok(()) => FFI_OK,
+            Err(error) => {
+                write_error(out_error, error);
+                FFI_ERR
+            }
+        },
+        Err(error) => {
+            write_error(out_error, error);
+            FFI_ERR
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_fetch_range_bytes(
+    handle: *mut c_void,
+    key: *const c_char,
+    offset: u64,
+    length: usize,
+    snapshot: *const c_char,
+    version: *const c_char,
+    out_bytes: *mut IronmeshIosBytes,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_bytes_out(out_bytes);
+    clear_error(out_error);
+    run_ffi_bytes_result(out_bytes, out_error, || {
+        let snapshot = optional_c_string(snapshot)?;
+        let version = optional_c_string(version)?;
+        fetch_range_bytes(
+            handle,
+            required_c_string(key, "key")?,
+            offset,
+            length,
+            snapshot.as_deref(),
+            version.as_deref(),
+        )
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_fetch_relative_bytes(
     handle: *mut c_void,
     path: *const c_char,
@@ -1649,6 +1788,16 @@ fn clear_bytes_out(out_value: *mut IronmeshIosBytes) {
 }
 
 #[allow(unsafe_code)]
+fn clear_u64_out(out_value: *mut u64) {
+    if out_value.is_null() {
+        return;
+    }
+    unsafe {
+        *out_value = 0;
+    }
+}
+
+#[allow(unsafe_code)]
 fn write_string(out_value: *mut *mut c_char, value: String) -> Result<()> {
     if out_value.is_null() {
         bail!("output string pointer must not be null");
@@ -1675,6 +1824,17 @@ fn write_bytes(out_value: *mut IronmeshIosBytes, bytes: Vec<u8>) -> Result<()> {
     };
     std::mem::forget(bytes);
 
+    unsafe {
+        *out_value = value;
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn write_u64(out_value: *mut u64, value: u64) -> Result<()> {
+    if out_value.is_null() {
+        bail!("output integer pointer must not be null");
+    }
     unsafe {
         *out_value = value;
     }
@@ -1741,7 +1901,7 @@ where
 mod tests {
     use super::*;
     use axum::extract::{OriginalUri, Path, State};
-    use axum::http::{HeaderValue, StatusCode};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::IntoResponse;
     use axum::routing::{get, post, put};
     use axum::{Json, Router};
@@ -1852,10 +2012,41 @@ mod tests {
     async fn get_object(
         State(state): State<TestServerState>,
         Path(key): Path<String>,
+        headers: HeaderMap,
     ) -> impl IntoResponse {
         let objects = state.objects.lock().expect("lock poisoned");
         match objects.get(&key) {
-            Some(object) => (StatusCode::OK, object.bytes.clone()).into_response(),
+            Some(object) => {
+                let Some(range) = headers
+                    .get(header::RANGE)
+                    .and_then(|value| value.to_str().ok())
+                else {
+                    return (StatusCode::OK, object.bytes.clone()).into_response();
+                };
+                let Some((start, end)) = range
+                    .strip_prefix("bytes=")
+                    .and_then(|value| value.split_once('-'))
+                    .and_then(|(start, end)| {
+                        Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+                    })
+                else {
+                    return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+                };
+                if start > end || end >= object.bytes.len() {
+                    return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+                }
+                let bytes = object.bytes[start..=end].to_vec();
+                let mut response = (StatusCode::PARTIAL_CONTENT, bytes).into_response();
+                response.headers_mut().insert(
+                    header::CONTENT_RANGE,
+                    HeaderValue::from_str(&format!("bytes {start}-{end}/{}", object.bytes.len()))
+                        .expect("valid content-range header"),
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                response
+            }
             None => StatusCode::NOT_FOUND.into_response(),
         }
     }
@@ -1866,18 +2057,13 @@ mod tests {
     ) -> impl IntoResponse {
         let objects = state.objects.lock().expect("lock poisoned");
         match objects.get(&key) {
-            Some(object) => {
-                let mut response = StatusCode::OK.into_response();
-                response.headers_mut().insert(
-                    "x-ironmesh-object-size",
-                    HeaderValue::from_str(&object.bytes.len().to_string()).expect("valid header"),
-                );
-                response.headers_mut().insert(
-                    "content-length",
-                    HeaderValue::from_str(&object.bytes.len().to_string()).expect("valid header"),
-                );
-                response
-            }
+            Some(object) => axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("x-ironmesh-object-size", object.bytes.len().to_string())
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_LENGTH, object.bytes.len().to_string())
+                .body(axum::body::Body::empty())
+                .expect("head response should build"),
             None => StatusCode::NOT_FOUND.into_response(),
         }
     }
@@ -2028,6 +2214,7 @@ mod tests {
             has_more: false,
             next_cursor: None,
             sync_token: None,
+            consistency_token: None,
             media_summary: Default::default(),
             entries,
         };
@@ -2482,6 +2669,61 @@ mod tests {
         assert_eq!(status, FFI_OK);
         assert!(fetch_error.is_null());
         assert_eq!(read_bytes(bytes_out), payload);
+
+        let mut object_size = 0;
+        let mut size_error = ptr::null_mut();
+        let status = ironmesh_ios_facade_object_size(
+            handle,
+            key.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            &mut object_size,
+            &mut size_error,
+        );
+        assert_eq!(status, FFI_OK);
+        assert!(size_error.is_null());
+        assert_eq!(object_size, payload.len() as u64);
+
+        let mut range_bytes = IronmeshIosBytes {
+            data: ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+        let mut range_error = ptr::null_mut();
+        let status = ironmesh_ios_facade_fetch_range_bytes(
+            handle,
+            key.as_ptr(),
+            6,
+            5,
+            ptr::null(),
+            ptr::null(),
+            &mut range_bytes,
+            &mut range_error,
+        );
+        assert_eq!(status, FFI_OK);
+        assert!(range_error.is_null());
+        assert_eq!(read_bytes(range_bytes), b"apple");
+
+        let mut oversized_range = IronmeshIosBytes {
+            data: ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+        let mut oversized_error = ptr::null_mut();
+        let status = ironmesh_ios_facade_fetch_range_bytes(
+            handle,
+            key.as_ptr(),
+            0,
+            MAX_IOS_FILE_PROVIDER_RANGE_BYTES + 1,
+            ptr::null(),
+            ptr::null(),
+            &mut oversized_range,
+            &mut oversized_error,
+        );
+        assert_eq!(status, FFI_ERR);
+        assert!(oversized_range.data.is_null());
+        assert!(!oversized_error.is_null());
+        unsafe { ironmesh_ios_string_free(oversized_error) };
 
         let new_key = CString::new("docs/guide.txt").expect("new key should be valid");
         let mut move_error = ptr::null_mut();

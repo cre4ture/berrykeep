@@ -451,11 +451,15 @@ Working evidence log:
   | Platform | Artifact / install channel | Classification | Update path | Notes |
   | --- | --- | --- | --- | --- |
   | Windows | Store-submitted `.msixupload` / MSIX package | `public stable` | Microsoft Store | Package identity is fixed; installed package root is ephemeral; mutable runtime state must stay outside the package |
-  | Ubuntu Linux | Launchpad PPA packages `ironmesh-client`, `ironmesh-server-node`, and `ironmesh-rendezvous-service` | `public stable` | `apt upgrade`, Update Manager, or unattended-upgrades | Target PPA is `ppa:ulrich-hornung/ironmesh`; Launchpad builds per-series binaries from the Debian source package |
+  | Debian-family Server Node | Static musl `ironmesh-server-node` package, plus optional `ironmesh-server-node-map-tools` | `public stable` | Signed apt repository | One generic binary is built per CPU ABI; current `focal`/`noble` suites are migration entries before a product-owned `stable` suite |
+  | Ubuntu client and rendezvous | Launchpad PPA packages `ironmesh-client` and `ironmesh-rendezvous-service` | `public stable` | `apt upgrade`, Update Manager, or unattended-upgrades | Target PPA is `ppa:ulrich-hornung/ironmesh`; these components remain per-series source builds |
   | Android and iOS shells | Workspace code only | `out of scope for first release` | n/a | No first-release packaging or update channel is defined yet |
 - Confirmed packaging and update behavior:
    - Windows first release stays on Microsoft Store delivery; direct sideload packaging remains a development-only path.
-   - Ubuntu first release should use a Launchpad PPA as the supported install and update channel. Users add the PPA once, install the package they need with `apt`, and receive updates through normal Ubuntu package management rather than an Ironmesh self-updater.
+   - The Server Node should use the product-owned signed apt repository and a
+     static musl binary per CPU ABI. Client and rendezvous packages may keep
+     using the Launchpad PPA while they remain distribution-specific. Both
+     paths retain ordinary apt upgrades rather than an Ironmesh self-updater.
    - The current Ubuntu beta package target is `1.0.0~beta.1-1~ppa2~ubuntu24.04.1` for `noble`.
    - `ironmesh-client` installs the public `ironmesh` CLI and the packaged helpers `ironmesh-config-app`, `ironmesh-folder-agent`, `ironmesh-os-integration`, and `ironmesh-background-launcher` under one package root, with `/usr/bin` symlinks for the documented commands.
    - Linux background launching resolves sibling binaries from `current_exe().parent()`, so keeping the client helpers together under one package root is part of the update contract for `apt`-delivered upgrades.
@@ -464,15 +468,23 @@ Working evidence log:
    - The client package ships GNOME extension assets, but GNOME Shell integration remains optional and per-user. The package does not auto-enable the extension; `ironmesh-os-integration gnome install-extension` or `ironmesh-folder-agent gnome install-extension` still performs the user install step.
    - Linux `Run Enabled Services` works from the config app, and the Debian client package ships an XDG autostart entry for `ironmesh-config-app --background` so the config app can relaunch enabled managed services after graphical sign-in.
 - Findings:
-   - `decision`: [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md) should treat Launchpad PPA plus `apt` as the supported Ubuntu install and update contract for the first release; no custom in-app updater is needed on Ubuntu.
+   - `decision`: [docs/portable-server-node-package-strategy.md](portable-server-node-package-strategy.md) defines the Server Node as a generic static musl artifact per CPU ABI. [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md) retains the Launchpad source-build path for the distribution-specific client and rendezvous packages; neither path needs a custom in-app updater.
    - `minor`: Linux autostart is now package-driven through XDG Autostart rather than a user-level systemd service, so release docs should describe how users can disable the autostart entry if they do not want background desktop status.
    - `minor`: [crates/desktop-status/src/gnome.rs](../crates/desktop-status/src/gnome.rs) installs the GNOME extension into `~/.local/share/gnome-shell/extensions/...`, which keeps the extension per-user and update-safe but means the Debian package alone does not finish desktop integration.
 - Missing tests or docs:
    - The production PPA target is known. The `ppa1` upload was accepted but failed to build on Launchpad; the `ppa2` source artifact has been built locally unsigned for validation and still needs a signed upload.
    - [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md) still uses placeholder install and upload examples instead of the concrete `ppa:ulrich-hornung/ironmesh` target.
-   - Validate the real `add-apt-repository`, `apt install`, and `apt upgrade` flow against a fresh supported Ubuntu series after Launchpad publishes the packages.
+   - Validate install, start, and upgrade of the same static Server Node `.deb`
+     on fresh Debian, Ubuntu, and 64-bit Raspberry Pi OS-compatible images.
+   - Validate the real `add-apt-repository`, `apt install`, and `apt upgrade`
+     flow for the client and rendezvous packages after Launchpad publishes them.
 - Proposed pre-release actions:
-   - Build the signed source package with `./scripts/build-ppa-source.sh`, upload it with `dput ppa:ulrich-hornung/ironmesh ../ironmesh_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes`, and wait for Launchpad build success.
+   - Publish the verified static Server Node packages in the signed apt
+     repository, then run the cross-distribution install and upgrade matrix.
+   - Build the signed source package for the remaining Ubuntu components with
+     `./scripts/build-ppa-source.sh`, upload it with `dput
+     ppa:ulrich-hornung/ironmesh ../ironmesh_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes`,
+     and wait for Launchpad build success.
    - Document the final end-user install and update commands with the real PPA name.
    - Keep Linux service enablement and GNOME extension enablement as explicit opt-in steps unless a deliberate packaging hook is added later.
 - Deferred post-release items:
@@ -579,7 +591,7 @@ Working evidence log:
    - `Pass 3` inter-node protocol and identity expectations map to `crates/server-node-sdk/src/main_tests.rs::register_node_uses_structured_reachability_payload` plus the nightly relay or peer system tests in `tests/system-tests/src/cluster_test.rs`, especially `bootstrap_client_prefers_direct_and_uses_relay_after_rendezvous_restart_and_forced_direct_failure` and `relay_required_nodes_reconnect_after_rendezvous_restart_and_replicate`.
    - `Pass 4` bootstrap, enrollment, and failover handoff contracts map to `crates/server-node-sdk/src/setup.rs::managed_setup_state_roundtrip`, `crates/server-node-sdk/src/setup.rs::managed_rendezvous_failover_roundtrip_restores_material_and_state`, the bootstrap-claim issuance tests in `crates/server-node-sdk/src/main_tests.rs`, and the embedded rendezvous manual guide in `docs/manual-rendezvous-relay-test.md`.
    - `Pass 5` persisted-file and path contracts map to the desktop config migration tests in `crates/desktop-client-config/src/lib.rs` and `crates/windows-client-config/src/lib.rs`, metadata schema-marker coverage in `crates/server-node-sdk/src/storage/sqlite_impl.rs::init_metadata_db_persists_schema_version`, Windows LocalAppData restart coverage in `tests/system-tests/src/cfapi_monitor_test.rs::test_cfapi_adapter_persists_local_appdata_state_and_restarts_without_bootstrap_argument`, and folder-agent restart coverage in `tests/system-tests/src/folder_agent_test.rs`.
-   - `Pass 6` packaging and update contracts map to the build workflows `android-build`, `fuse-mount-build`, and `windows-cfapi-check`, the Linux packaged config-app handoff regression in `apps/config-app/tests/package_handoff.rs`, the Windows packaging strategy in `docs/windows-msix-release-update-strategy.md`, the Linux FUSE and packaged Windows manual flows in `docs/ci-runbook.md`, and the dedicated packaged Windows restart guide in `docs/manual-windows-sync-root-restart-test.md`.
+   - `Pass 6` packaging and update contracts map to the build workflows `android-build`, `static-server-node-build`, `fuse-mount-build`, and `windows-cfapi-check`, the static artifact checks in `scripts/build-static-server-node.sh`, the Linux packaged config-app handoff regression in `apps/config-app/tests/package_handoff.rs`, the portable Server Node and Windows packaging strategies, the Linux FUSE and packaged Windows manual flows in `docs/ci-runbook.md`, and the dedicated packaged Windows restart guide in `docs/manual-windows-sync-root-restart-test.md`.
    - `Pass 7` security and operational-safety contracts map to `crates/server-node-sdk/src/main_tests.rs::cluster_config_requires_explicit_insecure_public_http_override`, `public_logs_route_requires_client_or_admin_auth`, `admin_authorization_requires_configured_auth`, `admin_authorization_requires_token_when_configured`, and the full `cargo test -p server-node-sdk` regression suite.
 - Manual-flow coverage gathered:
    - Local 4-node cluster smoke is reproducible from `scripts/local-cluster.sh start|status|stop` and the README local-cluster section.
@@ -663,8 +675,11 @@ No CI blocker is known for the current beta candidate. The open work is release
 sign-off and publication work:
 
 1. Finish Pass 3 by writing the stable client-facing route catalog, deciding whether `web-ui-backend` routes are public or bundled-tool internal, and mapping every stable route to test coverage.
-2. Build and upload the `1.0.0-beta.1` Ubuntu `noble` source package to `ppa:ulrich-hornung/ironmesh`, then record Launchpad build results.
-3. Validate the real PPA install and update flow on a fresh Ubuntu 24.04 environment.
+2. Publish the static `amd64` and `arm64` Server Node packages through the
+   signed apt repository.
+3. Validate the same Server Node `.deb` through install, start, and upgrade on
+   fresh Debian, Ubuntu, and 64-bit Raspberry Pi OS-compatible environments;
+   separately validate the PPA flow for client and rendezvous packages.
 4. Run and record the packaged Windows sync-root restart manual test.
 5. Do a fresh-reader dry run of README plus Linux FUSE instructions.
 6. Replace remaining placeholder PPA examples with the real PPA target once the beta upload is accepted.

@@ -190,6 +190,18 @@ sudo apt update
 sudo apt install ironmesh-server-node
 ```
 
+The package contains the generic static Server Node for the selected CPU
+architecture. In particular, the `arm64` package is intended to run on 64-bit
+Raspberry Pi OS as well as supported Ubuntu ARM64 hosts. A 32-bit Raspberry Pi
+OS installation needs a separate future `armhf` package.
+
+Natural Earth map conversion is optional. Install its external GDAL and unzip
+tools separately through the companion package when required:
+
+```bash
+sudo apt install ironmesh-server-node-map-tools
+```
+
 ## Start A Server Node
 
 The `ironmesh-server-node` package installs a systemd service, but it does not

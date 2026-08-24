@@ -250,6 +250,10 @@ where
                 entry.size_bytes,
             );
             remote_entry.content_fingerprint = entry.content_fingerprint;
+            remote_entry.modified_at_unix = entry.modified_at_unix;
+            remote_entry.media = entry
+                .media
+                .map(crate::ironmesh_client::namespace_media_metadata);
             file_count += 1;
             remote.push(remote_entry);
         }
@@ -1233,6 +1237,7 @@ mod tests {
                 has_more: false,
                 next_cursor: None,
                 sync_token: None,
+                consistency_token: None,
                 media_summary: crate::ironmesh_client::StoreIndexMediaSummary::default(),
                 entries: Vec::new(),
             })
@@ -1295,6 +1300,7 @@ mod tests {
                 has_more: false,
                 next_cursor: None,
                 sync_token: None,
+                consistency_token: None,
                 media_summary: crate::ironmesh_client::StoreIndexMediaSummary::default(),
                 entries: vec![crate::ironmesh_client::StoreIndexEntry {
                     path: "docs/readme.txt".to_string(),

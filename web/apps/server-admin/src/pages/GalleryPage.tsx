@@ -1,5 +1,7 @@
 import {
   getAdminGalleryMapConfiguration,
+  getAdminGalleryMapClusterEntries,
+  getAdminGalleryMapClusters,
   getAdminVersionGraph,
   listAdminSnapshots,
   listAdminStoreEntries,
@@ -11,6 +13,8 @@ import {
   galleryBasemapsFromConfiguration,
   galleryMapConfigurationQueryPolicy,
   galleryQueryKeys,
+  MOBILE_VIEWER_THUMBNAIL_PROFILE,
+  withMediaThumbnailProfile,
   type GalleryDataSource
 } from "@ironmesh/ui";
 import { Stack, Tabs } from "@mantine/core";
@@ -19,8 +23,6 @@ import { useMemo } from "react";
 import { MapDatasetImportCard } from "../components/MapDatasetImportCard";
 import { MapVariantConfigurationCard } from "../components/MapVariantConfigurationCard";
 import { useAdminAccess } from "../lib/admin-access";
-
-const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
 
 export function GalleryPage() {
   const { sessionStatus, sessionLoading } = useAdminAccess();
@@ -44,6 +46,9 @@ export function GalleryPage() {
       loadSnapshots: () => listAdminSnapshots(),
       loadEntries: (prefix, depth, snapshotId, options) =>
         listAdminStoreEntries(prefix, depth, snapshotId, undefined, options),
+      loadMapClusters: (request) => getAdminGalleryMapClusters(request),
+      loadMapClusterEntries: (queryToken, clusterId, offset, limit) =>
+        getAdminGalleryMapClusterEntries(queryToken, clusterId, offset, limit),
       loadVersions: (key) => getAdminVersionGraph(key),
       getMediaRequests: (entry, snapshotId, versionId) => {
         const thumbnailUrl = entry.media?.thumbnail?.url ?? null;
@@ -60,7 +65,7 @@ export function GalleryPage() {
           fullscreen:
             thumbnailUrl && entry.media?.media_type !== "video"
               ? {
-                  url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
+                  url: withMediaThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
                 }
               : null,
           original,
@@ -131,11 +136,4 @@ function adminBinaryObjectUrl(
   }
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return `/api/v1/auth/store/${encodeURIComponent(key)}${suffix}`;
-}
-
-function withThumbnailProfile(url: string, profile: string): string {
-  const baseOrigin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
-  const resolved = new URL(url, baseOrigin);
-  resolved.searchParams.set("profile", profile);
-  return `${resolved.pathname}${resolved.search}${resolved.hash}`;
 }

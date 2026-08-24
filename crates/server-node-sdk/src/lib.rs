@@ -38,6 +38,7 @@ use bytes::Bytes;
 use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
+use common::xmp::{is_sidecar_key, sidecar_key_for_media};
 use common::{ClusterId, DeviceId, HealthStatus, NodeId};
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
@@ -116,6 +117,10 @@ const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const STORE_INDEX_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_INDEX_PAGE_CACHE_MAX_SCOPES: usize = 2;
 const STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
+const GALLERY_MAX_DEPTH: usize = 64;
+const GALLERY_MAP_MAX_CLUSTERS: usize = 512;
+const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
+const GALLERY_MAP_CLUSTER_ENTRY_MAX_LIMIT: usize = 500;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
 const CLIENT_MUTATION_OPERATION_TTL_SECS: u64 = 15 * 60;
 const DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 10;
@@ -133,6 +138,7 @@ use x509_parser::prelude::FromDer;
 
 mod cluster;
 mod embedded_rendezvous;
+mod gallery_map;
 mod gallery_sync;
 mod hardware_health;
 mod host_storage;
@@ -152,9 +158,12 @@ mod web_maps;
 
 #[cfg(test)]
 use gallery_sync::GallerySyncScope;
+#[cfg(test)]
+use gallery_sync::MAX_GALLERY_LABEL_FILTER_LABELS;
 use gallery_sync::{
     GallerySyncTokenPayload, decode_gallery_sync_token, encode_gallery_sync_token,
-    gallery_delta_scope_from_sync, gallery_sync_scope_from_query,
+    gallery_delta_scope_from_sync, gallery_label_filter_is_within_limit,
+    gallery_sync_scope_from_query,
 };
 
 const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -228,6 +237,7 @@ const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thum
 const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP";
 const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS";
 const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
+const METADATA_BACKEND_ENV: &str = "IRONMESH_METADATA_BACKEND";
 const TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV: &str =
     "IRONMESH_TEST_SEED_PROCESS_TEMPERATURE_STATS";
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
@@ -3765,6 +3775,14 @@ fn parse_metadata_backend(raw: &str) -> Result<MetadataBackendKind> {
     }
 }
 
+fn metadata_backend_from_env() -> Result<MetadataBackendKind> {
+    parse_metadata_backend(
+        std::env::var(METADATA_BACKEND_ENV)
+            .unwrap_or_else(|_| "sqlite".to_string())
+            .as_str(),
+    )
+}
+
 fn path_has_parent_traversal(path: &FsPath) -> bool {
     path.components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -5798,8 +5816,15 @@ fn node_enrollment_auto_renew_check_secs() -> u64 {
 
 impl ServerNodeConfig {
     pub fn from_enrollment_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::from_enrollment_path_with_metadata_backend(path, metadata_backend_from_env()?)
+    }
+
+    fn from_enrollment_path_with_metadata_backend(
+        path: impl AsRef<std::path::Path>,
+        metadata_backend: MetadataBackendKind,
+    ) -> Result<Self> {
         let package = NodeEnrollmentPackage::from_path(path.as_ref())?;
-        let mut config = Self::from_enrollment(package)?;
+        let mut config = Self::from_enrollment_with_metadata_backend(package, metadata_backend)?;
         // The enrollment package is an operator-selected import artifact. It may live outside
         // the runtime data directory; only the TLS paths carried by the package are confined
         // before they are ever opened by the running node.
@@ -5812,8 +5837,15 @@ impl ServerNodeConfig {
     }
 
     pub fn from_enrollment(package: NodeEnrollmentPackage) -> Result<Self> {
+        Self::from_enrollment_with_metadata_backend(package, metadata_backend_from_env()?)
+    }
+
+    fn from_enrollment_with_metadata_backend(
+        package: NodeEnrollmentPackage,
+        metadata_backend: MetadataBackendKind,
+    ) -> Result<Self> {
         let bootstrap = materialize_node_enrollment_package(package)?;
-        Self::from_bootstrap(bootstrap)
+        Self::from_bootstrap_with_metadata_backend(bootstrap, metadata_backend)
     }
 
     pub fn from_bootstrap_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -5822,6 +5854,13 @@ impl ServerNodeConfig {
     }
 
     pub fn from_bootstrap(bootstrap: TransportNodeBootstrap) -> Result<Self> {
+        Self::from_bootstrap_with_metadata_backend(bootstrap, metadata_backend_from_env()?)
+    }
+
+    fn from_bootstrap_with_metadata_backend(
+        bootstrap: TransportNodeBootstrap,
+        metadata_backend: MetadataBackendKind,
+    ) -> Result<Self> {
         bootstrap.validate()?;
         transport_sdk::node_connection_priority_from_labels(&bootstrap.labels)
             .context("invalid node connection priority in bootstrap labels")?;
@@ -5890,11 +5929,7 @@ impl ServerNodeConfig {
             cluster_id: bootstrap.cluster_id,
             node_id: bootstrap.node_id,
             data_dir,
-            metadata_backend: parse_metadata_backend(
-                std::env::var("IRONMESH_METADATA_BACKEND")
-                    .unwrap_or_else(|_| "sqlite".to_string())
-                    .as_str(),
-            )?,
+            metadata_backend,
             bind_addr,
             public_url: bootstrap.public_url,
             s3_bind_addr: std::env::var("IRONMESH_S3_BIND")
@@ -6207,11 +6242,7 @@ impl ServerNodeConfig {
             cluster_id,
             node_id,
             data_dir,
-            metadata_backend: parse_metadata_backend(
-                std::env::var("IRONMESH_METADATA_BACKEND")
-                    .unwrap_or_else(|_| "sqlite".to_string())
-                    .as_str(),
-            )?,
+            metadata_backend: metadata_backend_from_env()?,
             bind_addr,
             public_url,
             s3_bind_addr,
@@ -7558,6 +7589,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/index/delta", get(get_store_index_delta))
+        .route("/store/map/clusters", get(list_gallery_map_clusters))
+        .route(
+            "/store/map/cluster-entries",
+            get(list_gallery_map_cluster_entries),
+        )
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
@@ -7585,6 +7621,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
@@ -7644,6 +7681,14 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
         .route("/auth/store/index/delta", get(get_store_index_delta_admin))
+        .route(
+            "/auth/store/map/clusters",
+            get(list_gallery_map_clusters_admin),
+        )
+        .route(
+            "/auth/store/map/cluster-entries",
+            get(list_gallery_map_cluster_entries_admin),
+        )
         .route("/auth/data-changes", get(list_data_change_events))
         .route(
             "/auth/maps/config",
@@ -7681,6 +7726,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/auth/store/delete", post(delete_object_by_query_admin))
         .route("/auth/store/rename", post(rename_object_path_admin))
+        .route("/auth/store/labels", post(set_media_labels_admin))
         .route("/auth/store/restore", post(restore_snapshot_path))
         .route("/auth/media/thumbnail", get(get_media_thumbnail_admin))
         .route("/auth/media/cache/retry", post(retry_media_cache_admin))
@@ -7976,6 +8022,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/index/delta", get(get_store_index_delta))
+        .route("/store/map/clusters", get(list_gallery_map_clusters))
+        .route(
+            "/store/map/cluster-entries",
+            get(list_gallery_map_cluster_entries),
+        )
         .route(
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
@@ -7997,6 +8048,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
@@ -13101,11 +13153,64 @@ struct StoreIndexQuery {
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
+    /// Comma-separated labels an entry must carry to be listed.
+    require_labels: Option<String>,
+    /// Comma-separated labels that keep an entry out of the listing, which is
+    /// how a client keeps media labelled `private` out of the default view.
+    exclude_labels: Option<String>,
+}
+
+/// Splits a comma-separated label parameter into the labels it names.
+///
+/// Blank entries are dropped, so a trailing comma or an empty parameter does
+/// not become a filter on the empty label.
+fn store_index_labels(raw: Option<&String>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn store_index_label_filter(
+    query: &StoreIndexQuery,
+) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
+    let required = store_index_labels(query.require_labels.as_ref());
+    let excluded = store_index_labels(query.exclude_labels.as_ref());
+    let label_filter = storage::GalleryLabelFilter { required, excluded };
+    if !gallery_label_filter_is_within_limit(&label_filter) {
+        return Err("at most 64 labels may be specified across require_labels and exclude_labels");
+    }
+    Ok(label_filter)
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct StoreIndexDeltaQuery {
     token: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GalleryMapClustersQuery {
+    prefix: Option<String>,
+    depth: Option<usize>,
+    media_filter: Option<StoreIndexMediaFilter>,
+    south: Option<f64>,
+    west: Option<f64>,
+    north: Option<f64>,
+    east: Option<f64>,
+    zoom: Option<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GalleryMapClusterEntriesQuery {
+    query_token: Option<String>,
+    cluster_id: Option<String>,
+    offset: Option<usize>,
     limit: Option<usize>,
 }
 
@@ -13181,6 +13286,20 @@ struct MediaGpsResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct MediaPhotoResponse {
+    camera_manufacturer: Option<String>,
+    camera_model: Option<String>,
+    lens_manufacturer: Option<String>,
+    lens_model: Option<String>,
+    iso_speed: Option<u32>,
+    exposure_time_seconds: Option<f64>,
+    f_number: Option<f64>,
+    focal_length_mm: Option<f64>,
+    flash: Option<u16>,
+    white_balance: Option<u16>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct MediaThumbnailResponse {
     url: String,
     profile: String,
@@ -13200,7 +13319,14 @@ struct MediaIndexResponse {
     height: Option<u32>,
     orientation: Option<u16>,
     taken_at_unix: Option<u64>,
+    date_encoded_unix: Option<u64>,
+    duration_millis: Option<u64>,
+    frame_rate_millihertz: Option<u32>,
+    total_bitrate_bps: Option<u64>,
+    codec_name: Option<String>,
+    codec_fourcc: Option<String>,
     gps: Option<MediaGpsResponse>,
+    photo: Option<MediaPhotoResponse>,
     thumbnail: Option<MediaThumbnailResponse>,
     error: Option<String>,
 }
@@ -13221,6 +13347,10 @@ struct StoreIndexEntry {
     content_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     media: Option<MediaIndexResponse>,
+    /// User labels carried by the entry's XMP sidecar. Omitted when it has
+    /// none, so responses for unlabelled media stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -13247,7 +13377,73 @@ struct StoreIndexResponse {
     next_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    consistency_token: Option<String>,
     media_summary: StoreIndexMediaSummary,
+    entries: Vec<StoreIndexEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct GalleryMapBoundsResponse {
+    south: f64,
+    west: f64,
+    north: f64,
+    east: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct GalleryMapClusterResponse {
+    cluster_id: String,
+    count: usize,
+    latitude: f64,
+    longitude: f64,
+    bounds: GalleryMapBoundsResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry: Option<StoreIndexEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct GallerySummaryStatusResponse {
+    refreshing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress_percent: Option<u8>,
+}
+
+impl From<storage::GallerySummaryRefreshStatus> for GallerySummaryStatusResponse {
+    fn from(status: storage::GallerySummaryRefreshStatus) -> Self {
+        Self {
+            refreshing: status.refreshing,
+            progress_percent: status.progress_percent,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct GalleryMapClustersResponse {
+    prefix: String,
+    depth: usize,
+    zoom: u8,
+    resolution: u32,
+    total_entry_count: usize,
+    visible_geotagged_count: usize,
+    media_summary: StoreIndexMediaSummary,
+    /// Whether `total_entry_count`/`media_summary` came from a cache that may lag the current
+    /// `query_token` revision by a refresh cycle, and if so, roughly how far along that refresh
+    /// is. The viewport `clusters` below are always computed fresh for this request.
+    summary_status: GallerySummaryStatusResponse,
+    query_token: String,
+    clusters: Vec<GalleryMapClusterResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct GalleryMapClusterEntriesResponse {
+    cluster_id: String,
+    entry_count: usize,
+    total_entry_count: usize,
+    offset: usize,
+    limit: usize,
+    has_more: bool,
+    query_token: String,
     entries: Vec<StoreIndexEntry>,
 }
 
@@ -13540,6 +13736,17 @@ struct PathMutationRequest {
     overwrite: bool,
     #[serde(default)]
     expected_revision: Option<String>,
+}
+
+/// Replaces the labels of the media object at `path`.
+///
+/// The labels are stored in the XMP sidecar of that media object, so `path`
+/// names the media object itself, never its `.xmp` sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MediaLabelsRequest {
+    path: String,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14085,6 +14292,136 @@ async fn copy_object_path_response(
                 error = %err,
                 "failed to copy object path"
             );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn set_media_labels_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<MediaLabelsRequest>,
+) -> Response {
+    let action = "auth/store/labels";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "path": request.path.clone(),
+            "labels": request.labels.clone(),
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let actor = data_change_actor_from_admin_request(&authz);
+    set_media_labels_response(&state, request, Some(actor)).await
+}
+
+async fn set_media_labels(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<MediaLabelsRequest>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint("set_media_labels", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            set_media_labels_response(&state_for_request, request, Some(actor)).await
+        },
+    )
+    .await
+}
+
+/// Rewrites the XMP sidecar of a media object so that it carries exactly the
+/// requested labels.
+///
+/// Labelling is a write of the sidecar object, so it follows the path mutation
+/// idiom of this router: mutate under the store lock, then publish the namespace
+/// change and refresh local availability so the new sidecar version is announced
+/// like any other object write.
+async fn set_media_labels_response(
+    state: &ServerState,
+    request: MediaLabelsRequest,
+    actor: Option<DataChangeActorContext>,
+) -> Response {
+    let path = request.path.trim();
+    if path.is_empty() || is_sidecar_key(path) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let mut store = lock_store(state, "store_object.labels").await;
+    let outcome = store.set_media_labels(path, request.labels).await;
+    drop(store);
+
+    match outcome {
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(result)) => {
+            let sidecar_key = sidecar_key_for_media(path);
+            publish_namespace_change(state);
+            request_local_availability_refresh(state);
+            if should_trigger_autonomous_post_write_replication(
+                state.autonomous_replication_on_put_enabled,
+                false,
+            ) {
+                enqueue_autonomous_post_write_replication(
+                    state,
+                    autonomous_post_write_replication_subjects(&sidecar_key, &result.version_id),
+                )
+                .await;
+            }
+            record_data_change_event(
+                state,
+                PendingDataChangeEvent {
+                    action: DataChangeAction::Upload,
+                    actor,
+                    path: sidecar_key,
+                    from_path: None,
+                    to_path: None,
+                    recursive: false,
+                    affected_path_count: 1,
+                    total_size_bytes: None,
+                    version_id: Some(result.version_id.clone()),
+                    snapshot_id: Some(result.snapshot_id.clone()),
+                    upload_mode: Some(DataChangeUploadMode::Direct),
+                },
+            )
+            .await;
+            info!(
+                path,
+                version_id = %result.version_id,
+                "stored media labels"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err)
+            if err
+                .downcast_ref::<storage::SidecarWriteSizeLimitError>()
+                .is_some() =>
+        {
+            tracing::warn!(path, error = %err, "refused media labels that exceed the sidecar size limit");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            tracing::error!(path, error = %err, "failed to store media labels");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -15153,18 +15490,16 @@ async fn delete_object_response(
             return StatusCode::CONFLICT;
         }
     }
+    let tombstone_options = PutOptions {
+        parent_version_ids: query.parent,
+        state: version_state,
+        inherit_preferred_parent: true,
+        create_snapshot: !query.internal_replication,
+        explicit_version_id: query.version_id,
+    };
     let delete_result = if recursive {
         store
-            .tombstone_subtree(
-                &key,
-                PutOptions {
-                    parent_version_ids: query.parent,
-                    state: version_state,
-                    inherit_preferred_parent: true,
-                    create_snapshot: !query.internal_replication,
-                    explicit_version_id: query.version_id,
-                },
-            )
+            .tombstone_subtree(&key, tombstone_options)
             .await
             .map(|results| {
                 results
@@ -15172,20 +15507,21 @@ async fn delete_object_response(
                     .map(|entry| (entry.path, entry.version_id))
                     .collect::<Vec<_>>()
             })
-    } else {
+    } else if query.internal_replication {
         store
-            .tombstone_object(
-                &key,
-                PutOptions {
-                    parent_version_ids: query.parent,
-                    state: version_state,
-                    inherit_preferred_parent: true,
-                    create_snapshot: !query.internal_replication,
-                    explicit_version_id: query.version_id,
-                },
-            )
+            .tombstone_object(&key, tombstone_options)
             .await
             .map(|version_id| vec![(key.clone(), version_id)])
+    } else {
+        store
+            .tombstone_object_with_companions(&key, tombstone_options)
+            .await
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|entry| (entry.path, entry.version_id))
+                    .collect::<Vec<_>>()
+            })
     };
 
     match delete_result {
@@ -15220,11 +15556,10 @@ async fn delete_object_response(
             }
 
             if !query.internal_replication {
-                let version_id = if deleted_paths.len() == 1 {
-                    Some(deleted_paths[0].1.clone())
-                } else {
-                    None
-                };
+                let version_id = deleted_paths
+                    .iter()
+                    .find(|(deleted_path, _)| deleted_path == &key)
+                    .map(|(_, version_id)| version_id.clone());
                 record_data_change_event(
                     state,
                     PendingDataChangeEvent {
@@ -15355,6 +15690,304 @@ async fn list_store_index_admin(
     }
 
     list_store_index_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_gallery_map_clusters(
+    State(state): State<ServerState>,
+    Query(query): Query<GalleryMapClustersQuery>,
+) -> impl IntoResponse {
+    gallery_map_clusters_response(&state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_gallery_map_clusters_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<GalleryMapClustersQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "auth/store/map/clusters/get",
+        true,
+        true,
+        json!({
+            "prefix": query.prefix.clone(),
+            "depth": query.depth,
+            "media_filter": query.media_filter,
+            "south": query.south,
+            "west": query.west,
+            "north": query.north,
+            "east": query.east,
+            "zoom": query.zoom,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    gallery_map_clusters_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_gallery_map_cluster_entries(
+    State(state): State<ServerState>,
+    Query(query): Query<GalleryMapClusterEntriesQuery>,
+) -> impl IntoResponse {
+    gallery_map_cluster_entries_response(&state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_gallery_map_cluster_entries_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<GalleryMapClusterEntriesQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "auth/store/map/cluster-entries/get",
+        true,
+        true,
+        json!({
+            "cluster_id": query.cluster_id.clone(),
+            "offset": query.offset,
+            "limit": query.limit,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    gallery_map_cluster_entries_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE)
+        .await
+}
+
+async fn gallery_map_clusters_response(
+    state: &ServerState,
+    query: GalleryMapClustersQuery,
+    thumbnail_route: &str,
+) -> Response {
+    let viewport = match gallery_map_viewport_from_query(&query) {
+        Ok(viewport) => viewport,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
+    let prefix = query
+        .prefix
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    let depth = query.depth.unwrap_or(1).clamp(1, GALLERY_MAX_DEPTH);
+    let media_filter = query.media_filter.unwrap_or(StoreIndexMediaFilter::All);
+    let zoom = query.zoom.unwrap_or(1).min(20);
+    let page = {
+        let store = read_store(state, "gallery_map.clusters").await;
+        store
+            .query_gallery_map_clusters(&storage::GalleryMapClusterQuery {
+                prefix: prefix.clone(),
+                depth,
+                media_filter: gallery_map::storage_media_filter(media_filter),
+                viewport: gallery_map::storage_viewport(viewport),
+                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(zoom),
+                max_clusters: GALLERY_MAP_MAX_CLUSTERS,
+            })
+            .await
+    };
+    let page = match page {
+        Ok(Some(page)) => page,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "error": "gallery map clustering requires a metadata backend with gallery projection support"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to query gallery map clusters");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let query_token =
+        gallery_map::encode_gallery_map_query_token(&gallery_map::GalleryMapQueryTokenPayload {
+            history_id: page.history_id,
+            revision: page.revision,
+            prefix: prefix.clone(),
+            depth,
+            media_filter,
+            viewport,
+            resolution: page.resolution,
+        });
+    Json(GalleryMapClustersResponse {
+        prefix,
+        depth,
+        zoom,
+        resolution: page.resolution,
+        total_entry_count: page.total_entry_count,
+        visible_geotagged_count: page.visible_geotagged_count,
+        media_summary: store_index_media_summary_from_gallery(page.media_summary),
+        summary_status: page.summary_status.into(),
+        query_token,
+        clusters: page
+            .clusters
+            .into_iter()
+            .map(|cluster| GalleryMapClusterResponse {
+                cluster_id: gallery_map::encode_gallery_map_cluster_id(
+                    cluster.cell_x,
+                    cluster.cell_y,
+                ),
+                count: cluster.count,
+                latitude: cluster.latitude,
+                longitude: cluster.longitude,
+                bounds: GalleryMapBoundsResponse {
+                    south: cluster.bounds.south,
+                    west: cluster.bounds.west,
+                    north: cluster.bounds.north,
+                    east: cluster.bounds.east,
+                },
+                entry: cluster
+                    .entry
+                    .map(|entry| store_index_entry_from_gallery_entry(entry, thumbnail_route)),
+            })
+            .collect(),
+    })
+    .into_response()
+}
+
+async fn gallery_map_cluster_entries_response(
+    state: &ServerState,
+    query: GalleryMapClusterEntriesQuery,
+    thumbnail_route: &str,
+) -> Response {
+    let Some(query_token) = query.query_token.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "query_token is required" })),
+        )
+            .into_response();
+    };
+    let Some(token) = gallery_map::decode_gallery_map_query_token(query_token) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "query_token is malformed or unsupported" })),
+        )
+            .into_response();
+    };
+    let Some(cluster_id) = query.cluster_id.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "cluster_id is required" })),
+        )
+            .into_response();
+    };
+    let Some((cell_x, cell_y)) =
+        gallery_map::decode_gallery_map_cluster_id(cluster_id, token.resolution)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "cluster_id is malformed or outside the query grid" })),
+        )
+            .into_response();
+    };
+    let limit = query
+        .limit
+        .unwrap_or(GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT)
+        .clamp(1, GALLERY_MAP_CLUSTER_ENTRY_MAX_LIMIT);
+    let requested_offset = query.offset.unwrap_or(0);
+    let page = {
+        let store = read_store(state, "gallery_map.cluster_entries").await;
+        store
+            .query_gallery_map_cluster_entries(&storage::GalleryMapClusterEntriesQuery {
+                prefix: token.prefix.clone(),
+                depth: token.depth,
+                media_filter: gallery_map::storage_media_filter(token.media_filter),
+                viewport: gallery_map::storage_viewport(token.viewport),
+                resolution: token.resolution,
+                cell_x,
+                cell_y,
+                offset: requested_offset,
+                limit,
+            })
+            .await
+    };
+    let page = match page {
+        Ok(Some(page)) => page,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "error": "gallery map cluster entries require a metadata backend with gallery projection support"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to query gallery map cluster entries");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if page.history_id != token.history_id || page.revision != token.revision {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "code": "gallery_map_cluster_stale",
+                "reset": true,
+                "message": "the gallery changed; reload map clusters before opening this cluster"
+            })),
+        )
+            .into_response();
+    }
+    let offset = requested_offset.min(page.total_entry_count);
+    let entries = page
+        .entries
+        .into_iter()
+        .map(|entry| store_index_entry_from_gallery_entry(entry, thumbnail_route))
+        .collect::<Vec<_>>();
+    Json(GalleryMapClusterEntriesResponse {
+        cluster_id: cluster_id.to_string(),
+        entry_count: entries.len(),
+        total_entry_count: page.total_entry_count,
+        offset,
+        limit,
+        has_more: offset.saturating_add(entries.len()) < page.total_entry_count,
+        query_token: query_token.to_string(),
+        entries,
+    })
+    .into_response()
+}
+
+fn gallery_map_viewport_from_query(
+    query: &GalleryMapClustersQuery,
+) -> std::result::Result<gallery_map::GalleryMapViewport, &'static str> {
+    let (Some(south), Some(west), Some(north), Some(east)) =
+        (query.south, query.west, query.north, query.east)
+    else {
+        return Err("south, west, north, and east are required");
+    };
+    let viewport = gallery_map::GalleryMapViewport {
+        south,
+        west,
+        north,
+        east,
+    };
+    if !gallery_map::gallery_map_viewport_is_valid(viewport) {
+        return Err("gallery map viewport bounds are invalid");
+    }
+    Ok(viewport)
+}
+
+fn store_index_media_summary_from_gallery(
+    summary: storage::GalleryIndexMediaSummary,
+) -> StoreIndexMediaSummary {
+    StoreIndexMediaSummary {
+        ready_count: summary.ready_count,
+        pending_count: summary.pending_count,
+        incomplete_count: summary.incomplete_count,
+        image_count: summary.image_count,
+        video_count: summary.video_count,
+        geotagged_count: summary.geotagged_count,
+    }
 }
 
 async fn get_store_index_delta(
@@ -15570,10 +16203,23 @@ fn store_index_viewport_bounds(
     }))
 }
 
+/// Whether `query` asks for a label filter, independent of whether the gallery
+/// fast path can actually honour it.
+///
+/// The generic listing fallback hard-codes `labels: Vec::new()` on every entry
+/// and cannot filter by label at all, so a caller that requested filtering has
+/// to be told the request could not be honoured rather than silently receiving
+/// an unfiltered `200` -- the motivating use case is keeping `private` media
+/// out of a view, so a silent fallback would leak it.
+fn store_index_label_filter_requested(label_filter: &storage::GalleryLabelFilter) -> bool {
+    !label_filter.is_empty()
+}
+
 fn store_index_gallery_query(
     query: &StoreIndexQuery,
     prefix: &str,
     depth: usize,
+    label_filter: storage::GalleryLabelFilter,
 ) -> Option<storage::GalleryIndexQuery> {
     if query.snapshot.is_some() || query.cursor.is_some() || query.page_size.is_some() {
         return None;
@@ -15596,6 +16242,7 @@ fn store_index_gallery_query(
         offset: query.offset.unwrap_or(0),
         limit: query.limit?.max(1),
         viewport: store_index_viewport_bounds(query).ok()?,
+        label_filter,
     })
 }
 
@@ -15612,6 +16259,7 @@ fn store_index_response_from_gallery_index_page(
         revision: page.revision,
         scope: gallery_sync_scope_from_query(gallery_query),
     });
+    let consistency_token = format!("gallery:{sync_token}");
     let total_entry_count = page.total_entry_count;
     let offset = query.offset.unwrap_or(0).min(total_entry_count);
     let limit = query.limit.map(|value| value.max(1));
@@ -15632,6 +16280,7 @@ fn store_index_response_from_gallery_index_page(
             .unwrap_or(false),
         next_cursor: None,
         sync_token: Some(sync_token),
+        consistency_token: Some(consistency_token),
         media_summary: StoreIndexMediaSummary {
             ready_count: page.media_summary.ready_count,
             pending_count: page.media_summary.pending_count,
@@ -15672,6 +16321,7 @@ fn store_index_entry_from_gallery_entry(
         modified_at_unix: entry.modified_at_unix,
         content_fingerprint: entry.content_fingerprint,
         media,
+        labels: entry.labels,
     }
 }
 
@@ -15751,6 +16401,7 @@ fn cached_store_index_page_response(
             has_more,
             next_cursor: None,
             sync_token: None,
+            consistency_token: Some(format!("namespace:{namespace_change_sequence}")),
             media_summary: cached.media_summary.clone(),
             entries,
         }),
@@ -15787,6 +16438,12 @@ async fn list_store_index_response_attempt(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
         }
     };
+    let label_filter = match store_index_label_filter(&query) {
+        Ok(label_filter) => label_filter,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
     let request_id = Uuid::new_v4();
     let request_started_at = Instant::now();
     let prefix = query.prefix.clone().unwrap_or_default();
@@ -15799,12 +16456,22 @@ async fn list_store_index_response_attempt(
         .namespace_change_sequence
         .load(Ordering::SeqCst);
 
-    let gallery_query = store_index_gallery_query(&query, &prefix, depth);
+    let label_filter_requested = store_index_label_filter_requested(&label_filter);
+    let gallery_query = store_index_gallery_query(&query, &prefix, depth, label_filter);
     if viewport.is_some() && gallery_query.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "viewport bounds require a current, paginated gallery query sorted by captured time"
+            })),
+        )
+            .into_response();
+    }
+    if label_filter_requested && gallery_query.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "label filters require a current, paginated gallery query sorted by captured time"
             })),
         )
             .into_response();
@@ -15868,7 +16535,25 @@ async fn list_store_index_response_attempt(
                 )
                     .into_response();
             }
+            Ok(None) if label_filter_requested => {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(json!({
+                        "error": "label filters require a metadata backend with gallery projection support"
+                    })),
+                )
+                    .into_response();
+            }
             Ok(None) => {}
+            Err(err) if label_filter_requested => {
+                tracing::error!(
+                    error = %err,
+                    prefix = %prefix,
+                    "gallery index fast path failed while a label filter was requested; \
+                     refusing to fall back to the unfiltered generic store index"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
             Err(err) => {
                 warn!(
                     error = %err,
@@ -16277,6 +16962,7 @@ async fn list_store_index_response_attempt(
             has_more,
             next_cursor: None,
             sync_token: None,
+            consistency_token: Some(format!("namespace:{namespace_change_sequence}")),
             media_summary,
             entries,
         }),
@@ -16584,6 +17270,10 @@ async fn list_store_index_response_cursor_mode(
         );
     }
 
+    let change_sequence = state
+        .storage
+        .namespace_change_sequence
+        .load(Ordering::SeqCst);
     let mut response = (
         StatusCode::OK,
         Json(StoreIndexResponse {
@@ -16596,15 +17286,12 @@ async fn list_store_index_response_cursor_mode(
             has_more: page.has_more,
             next_cursor: page.next_cursor,
             sync_token: None,
+            consistency_token: Some(format!("namespace:{change_sequence}")),
             media_summary,
             entries,
         }),
     )
         .into_response();
-    let change_sequence = state
-        .storage
-        .namespace_change_sequence
-        .load(Ordering::SeqCst);
     if let Ok(header_value) = HeaderValue::from_str(&change_sequence.to_string()) {
         response
             .headers_mut()
@@ -16657,6 +17344,7 @@ fn collapse_store_index_entries_for_tree_view(
                 modified_at_unix: None,
                 content_fingerprint: None,
                 media: None,
+                labels: Vec::new(),
             });
     }
 
@@ -16943,7 +17631,25 @@ fn build_media_index_response(
             height: metadata.height,
             orientation: metadata.orientation,
             taken_at_unix: metadata.taken_at_unix,
+            date_encoded_unix: metadata.date_encoded_unix,
+            duration_millis: metadata.duration_millis,
+            frame_rate_millihertz: metadata.frame_rate_millihertz,
+            total_bitrate_bps: metadata.total_bitrate_bps,
+            codec_name: metadata.codec_name.clone(),
+            codec_fourcc: metadata.codec_fourcc.clone(),
             gps: metadata.gps.as_ref().map(media_gps_response),
+            photo: metadata.photo.as_ref().map(|photo| MediaPhotoResponse {
+                camera_manufacturer: photo.camera_manufacturer.clone(),
+                camera_model: photo.camera_model.clone(),
+                lens_manufacturer: photo.lens_manufacturer.clone(),
+                lens_model: photo.lens_model.clone(),
+                iso_speed: photo.iso_speed,
+                exposure_time_seconds: photo.exposure_time_seconds,
+                f_number: photo.f_number,
+                focal_length_mm: photo.focal_length_mm,
+                flash: photo.flash,
+                white_balance: photo.white_balance,
+            }),
             thumbnail: indexed_thumbnail_response(metadata, &thumbnail_url),
             error: metadata.error.clone(),
         },
@@ -16956,7 +17662,14 @@ fn build_media_index_response(
             height: None,
             orientation: None,
             taken_at_unix: None,
+            date_encoded_unix: None,
+            duration_millis: None,
+            frame_rate_millihertz: None,
+            total_bitrate_bps: None,
+            codec_name: None,
+            codec_fourcc: None,
             gps: None,
+            photo: None,
             thumbnail: Some(placeholder_thumbnail_response(thumbnail_url)),
             error: None,
         },
@@ -17194,6 +17907,9 @@ fn build_store_index_prefix_entry(path: String) -> StoreIndexEntry {
         modified_at_unix: None,
         content_fingerprint: None,
         media: None,
+        // Labels are a property of the gallery projection; the generic listing
+        // does not resolve them.
+        labels: Vec::new(),
     }
 }
 
@@ -17225,6 +17941,9 @@ fn build_store_index_object_entry(
         modified_at_unix,
         content_fingerprint,
         media: None,
+        // Labels are a property of the gallery projection; the generic listing
+        // does not resolve them.
+        labels: Vec::new(),
     }
 }
 

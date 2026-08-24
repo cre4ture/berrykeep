@@ -1,16 +1,24 @@
 # Ubuntu PPA Packaging
 
-This repository now contains Debian packaging metadata under `debian/` for a
-single source package that builds three installable packages:
+This repository contains Debian packaging metadata under `debian/` for a
+single source package that builds four installable packages:
 
 - `ironmesh-server-node`
+- `ironmesh-server-node-map-tools`
 - `ironmesh-client`
 - `ironmesh-rendezvous-service`
 
 ## First-release install and update strategy
 
-For Ubuntu, the first-release distribution path should be a Launchpad PPA backed
-by the source package in this repository.
+For client and rendezvous packages, the first-release Ubuntu distribution path
+remains a Launchpad PPA backed by the source package in this repository.
+
+The preferred Server Node path is now the static musl artifact described in
+`docs/portable-server-node-package-strategy.md`. The binary package workflows
+reuse that artifact instead of compiling the Server Node against each Ubuntu
+suite. Launchpad source uploads cannot consume a separately built CI artifact,
+so a PPA source build remains a distribution-native compatibility path until a
+dedicated portable Server Node package is published in the signed repository.
 
 If Launchpad is unavailable or too slow for a release, Ironmesh can also be
 published from a static signed apt repository. See
@@ -35,7 +43,8 @@ sudo apt install ironmesh-client
 
 For server deployments, install `ironmesh-server-node` and/or
 `ironmesh-rendezvous-service` instead of, or in addition to,
-`ironmesh-client`.
+`ironmesh-client`. Install `ironmesh-server-node-map-tools` only when the
+optional Natural Earth imports are needed.
 
 Package-specific notes:
 
@@ -54,6 +63,9 @@ Package-specific notes:
 - `ironmesh-server-node` creates and runs as a dedicated
   `ironmesh-server-node` system user. Its systemd state directory is
   `/var/lib/ironmesh-server-node`.
+- `ironmesh-server-node-map-tools` depends on the Server Node, `gdal-bin`, and
+  `unzip`. Keeping those tools outside the core package makes the normal
+  storage-server installation portable without bundling optional programs.
 - GNOME Shell integration stays optional. The client package ships the
   extension assets, but a user still installs or enables them through the CLI
   helper.
@@ -111,6 +123,11 @@ Optional flags:
   it.
 - `--lintian` runs `lintian` on the generated `.changes` file after a
   successful build.
+- `--prebuilt-server-node FILE` packages a previously verified static Server
+  Node while compiling the client and rendezvous components normally.
+- `--prebuilt-binaries DIR` packages a complete seven-binary bundle without a
+  Cargo rebuild; CI uses this after combining the static Server Node with the
+  other Linux release binaries.
 - `-- <args>` passes additional flags through to `dpkg-buildpackage`.
 
 Example:
@@ -120,6 +137,7 @@ Example:
 sudo apt install \
   ../ironmesh-client_1.0.0~beta.1-1_amd64.deb \
   ../ironmesh-server-node_1.0.0~beta.1-1_amd64.deb \
+  ../ironmesh-server-node-map-tools_1.0.0~beta.1-1_amd64.deb \
   ../ironmesh-rendezvous-service_1.0.0~beta.1-1_amd64.deb
 ```
 

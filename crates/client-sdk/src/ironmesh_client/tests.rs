@@ -442,6 +442,49 @@ fn first_background_probe_gets_startup_budget_but_retries_keep_short_budget() {
 }
 
 #[test]
+fn route_failure_backoff_grows_exponentially_and_caps() {
+    assert_eq!(endpoint_failure_backoff_ms(1), 1_500);
+    assert_eq!(endpoint_failure_backoff_ms(2), 3_000);
+    assert_eq!(endpoint_failure_backoff_ms(3), 6_000);
+    assert_eq!(endpoint_failure_backoff_ms(4), 12_000);
+    assert_eq!(endpoint_failure_backoff_ms(5), 24_000);
+    assert_eq!(endpoint_failure_backoff_ms(6), 30_000);
+    assert_eq!(endpoint_failure_backoff_ms(u32::MAX), 30_000);
+}
+
+#[test]
+fn mobile_background_policy_waits_for_circuit_and_probe_interval_before_retrying() {
+    let policy = ClientRouteMaintenancePolicy::mobile_background();
+    let initial_probe_at_unix_ms = 10_000;
+    let mut state = ClientEndpointState {
+        consecutive_failures: 1,
+        last_measurement_unix_ms: Some(initial_probe_at_unix_ms),
+        circuit: RouteCircuitState::OpenUntil(initial_probe_at_unix_ms),
+        ..ClientEndpointState::default()
+    };
+
+    assert!(background_probe_due(
+        &state,
+        initial_probe_at_unix_ms,
+        policy
+    ));
+
+    state.last_background_probe_unix_ms = Some(initial_probe_at_unix_ms);
+    let probe_interval_ms = duration_to_u64_ms(policy.background_probe_min_interval)
+        .expect("mobile background probe interval should fit into milliseconds");
+    assert!(!background_probe_due(
+        &state,
+        initial_probe_at_unix_ms + probe_interval_ms - 1,
+        policy
+    ));
+    assert!(background_probe_due(
+        &state,
+        initial_probe_at_unix_ms + probe_interval_ms,
+        policy
+    ));
+}
+
+#[test]
 fn mobile_background_policy_claims_one_candidate_per_batch() {
     let client = IronMeshClient::combine(vec![
         IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/"),
@@ -1028,9 +1071,42 @@ fn snapshot_conversion_maps_prefix_and_keys() {
             version: None,
             content_hash: None,
             size_bytes: Some(42),
-            modified_at_unix: None,
+            modified_at_unix: Some(1_723_456_789),
             content_fingerprint: Some("cfp-readme".to_string()),
-            media: None,
+            media: Some(StoreIndexMedia {
+                status: "ready".to_string(),
+                content_fingerprint: "cfp-readme".to_string(),
+                media_type: Some("image".to_string()),
+                mime_type: Some("image/jpeg".to_string()),
+                width: Some(4_032),
+                height: Some(3_024),
+                orientation: Some(6),
+                taken_at_unix: Some(1_700_000_000),
+                date_encoded_unix: None,
+                duration_millis: None,
+                frame_rate_millihertz: None,
+                total_bitrate_bps: None,
+                codec_name: None,
+                codec_fourcc: None,
+                gps: Some(StoreIndexGps {
+                    latitude: 47.3769,
+                    longitude: 8.5417,
+                }),
+                photo: Some(StoreIndexPhoto {
+                    camera_manufacturer: Some("Contoso".to_string()),
+                    camera_model: Some("Camera One".to_string()),
+                    lens_manufacturer: None,
+                    lens_model: Some("Prime 35".to_string()),
+                    iso_speed: Some(200),
+                    exposure_time_seconds: Some(0.008),
+                    f_number: Some(2.8),
+                    focal_length_mm: Some(35.0),
+                    flash: Some(0),
+                    white_balance: Some(1),
+                }),
+                thumbnail: None,
+                error: None,
+            }),
         },
     ]);
 
@@ -1048,6 +1124,21 @@ fn snapshot_conversion_maps_prefix_and_keys() {
         Some("cfp-readme")
     );
     assert_eq!(snapshot.remote[1].size_bytes, Some(42));
+    assert_eq!(snapshot.remote[1].modified_at_unix, Some(1_723_456_789));
+    let media = snapshot.remote[1]
+        .media
+        .as_ref()
+        .expect("media metadata should survive snapshot conversion");
+    assert_eq!(media.mime_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(media.orientation, Some(6));
+    assert_eq!(media.gps.as_ref().map(|gps| gps.latitude), Some(47.3769));
+    assert_eq!(
+        media
+            .photo
+            .as_ref()
+            .and_then(|photo| photo.camera_model.as_deref()),
+        Some("Camera One")
+    );
 }
 
 #[test]
@@ -1149,6 +1240,7 @@ fn folder_marker_synthesis_preserves_server_file_order_on_the_first_page() {
         has_more: true,
         next_cursor: None,
         sync_token: None,
+        consistency_token: None,
         media_summary: StoreIndexMediaSummary::default(),
         entries: vec![
             store_index_test_entry("photos/2026/newest.jpg"),
@@ -1199,6 +1291,7 @@ fn folder_marker_synthesis_leaves_later_pages_unchanged() {
         has_more: false,
         next_cursor: None,
         sync_token: None,
+        consistency_token: None,
         media_summary: StoreIndexMediaSummary::default(),
         entries: vec![
             store_index_test_entry("photos/2024/newer.jpg"),
@@ -1623,6 +1716,7 @@ fn snapshot_index_response_body(path: &str) -> Vec<u8> {
         has_more: false,
         next_cursor: None,
         sync_token: None,
+        consistency_token: None,
         media_summary: StoreIndexMediaSummary::default(),
         entries: vec![StoreIndexEntry {
             path: path.to_string(),
@@ -3410,6 +3504,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
                     has_more: false,
                     next_cursor: None,
                     sync_token: None,
+                    consistency_token: None,
                     media_summary: StoreIndexMediaSummary::default(),
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
@@ -3437,6 +3532,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
             has_more: false,
             next_cursor: None,
             sync_token: None,
+            consistency_token: None,
             media_summary: StoreIndexMediaSummary::default(),
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
@@ -4714,6 +4810,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
                     has_more: false,
                     next_cursor: None,
                     sync_token: None,
+                    consistency_token: None,
                     media_summary: StoreIndexMediaSummary::default(),
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
@@ -4741,6 +4838,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
             has_more: false,
             next_cursor: None,
             sync_token: None,
+            consistency_token: None,
             media_summary: StoreIndexMediaSummary::default(),
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),

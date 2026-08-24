@@ -954,13 +954,16 @@ export type AdminMediaCacheClearResponse = {
 };
 
 export type SetupStatus = {
-  state: "uninitialized" | "pending_join" | "online";
+  state: "uninitialized" | "pending_join" | "recovery" | "online";
   data_dir: string;
   bind_addr: string;
   bootstrap_tls_cert_path: string;
   bootstrap_tls_fingerprint: string | null;
   cluster_id: string | null;
   node_id: string | null;
+  recovery_reason?: Record<string, unknown> | null;
+  metadata_backend: MetadataDbBackendKind;
+  available_metadata_backends: MetadataDbBackendKind[];
   pending_join_request: Record<string, unknown> | null;
 };
 
@@ -969,6 +972,7 @@ export type SetupTransitionResponse = {
   cluster_id: string;
   node_id: string;
   public_url: string | null;
+  metadata_backend: MetadataDbBackendKind;
   restart_required: boolean;
 };
 
