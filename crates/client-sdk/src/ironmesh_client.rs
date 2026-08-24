@@ -3505,7 +3505,7 @@ pub struct GalleryMapClustersRequest {
     pub depth: usize,
     pub media_filter: StoreIndexMediaFilter,
     pub viewport: StoreIndexViewport,
-    pub zoom: u8,
+    pub zoom: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -3539,7 +3539,7 @@ pub struct GallerySummaryStatus {
 pub struct GalleryMapClustersResponse {
     pub prefix: String,
     pub depth: usize,
-    pub zoom: u8,
+    pub zoom: f64,
     pub resolution: u32,
     pub total_entry_count: usize,
     pub visible_geotagged_count: usize,
@@ -5172,6 +5172,11 @@ impl IronMeshClient {
         &self,
         request: GalleryMapClustersRequest,
     ) -> Result<GalleryMapClustersResponse> {
+        let zoom = if request.zoom.is_finite() {
+            request.zoom.clamp(0.0, 20.0)
+        } else {
+            1.0
+        };
         let mut url = self.relative_url("/store/map/clusters")?;
         {
             let mut query = url.query_pairs_mut();
@@ -5190,7 +5195,7 @@ impl IronMeshClient {
                 .append_pair("west", &request.viewport.west.to_string())
                 .append_pair("north", &request.viewport.north.to_string())
                 .append_pair("east", &request.viewport.east.to_string())
-                .append_pair("zoom", &request.zoom.min(20).to_string());
+                .append_pair("zoom", &zoom.to_string());
         }
         let response = self
             .execute_buffered_request(Method::GET, url, Vec::new(), None)

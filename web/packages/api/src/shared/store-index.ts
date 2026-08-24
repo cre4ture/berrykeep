@@ -135,6 +135,11 @@ export type GalleryMapClustersRequest = {
   zoom: number;
 };
 
+/** Keeps fractional MapLibre zoom while constraining requests to supported map levels. */
+export function clampGalleryMapZoom(zoom: number): number {
+  return Number.isFinite(zoom) ? Math.max(0, Math.min(20, zoom)) : 1;
+}
+
 export type StoreListView = "raw" | "tree";
 
 export type StoreListSortOrder =

@@ -112,7 +112,9 @@ GET /api/v1/auth/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&
 ```
 
 All four viewport bounds are required and use the same antimeridian rules as viewport index
-queries. `zoom` is clamped to `0..20`. The Gallery UI starts with the world viewport and the
+queries. `zoom` accepts the fractional MapLibre camera level and is clamped to `0..20`. The
+server derives the clustering grid from that precise value, rather than rounding it to a whole
+zoom level. The Gallery UI starts with the world viewport and the
 maximum supported UI depth (`64`), then issues a new request after each map movement. Map
 clustering is available for current data; selecting an immutable snapshot switches the Gallery to
 grid view.

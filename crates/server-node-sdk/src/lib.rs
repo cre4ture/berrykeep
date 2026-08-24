@@ -13203,7 +13203,7 @@ struct GalleryMapClustersQuery {
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
-    zoom: Option<u8>,
+    zoom: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -13422,7 +13422,7 @@ impl From<storage::GallerySummaryRefreshStatus> for GallerySummaryStatusResponse
 struct GalleryMapClustersResponse {
     prefix: String,
     depth: usize,
-    zoom: u8,
+    zoom: f64,
     resolution: u32,
     total_entry_count: usize,
     visible_geotagged_count: usize,
@@ -15779,7 +15779,16 @@ async fn gallery_map_clusters_response(
         .to_string();
     let depth = query.depth.unwrap_or(1).clamp(1, GALLERY_MAX_DEPTH);
     let media_filter = query.media_filter.unwrap_or(StoreIndexMediaFilter::All);
-    let zoom = query.zoom.unwrap_or(1).min(20);
+    let zoom = match query.zoom.unwrap_or(1.0) {
+        zoom if zoom.is_finite() => zoom.clamp(0.0, 20.0),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "zoom must be a finite number" })),
+            )
+                .into_response();
+        }
+    };
     let page = {
         let store = read_store(state, "gallery_map.clusters").await;
         store

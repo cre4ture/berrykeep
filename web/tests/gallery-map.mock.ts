@@ -28,8 +28,11 @@ export class GalleryMapMockSession<T extends GalleryMapMockEntry> {
     const prefix = searchParams.get("prefix") ?? "";
     const depth = Math.max(1, Number(searchParams.get("depth") ?? "1") || 1);
     const mediaFilter = searchParams.get("media_filter") ?? "all";
-    const zoom = Math.max(0, Math.min(20, Number(searchParams.get("zoom") ?? "1") || 0));
-    const resolution = 2 ** (Math.floor(zoom) + 2);
+    const requestedZoom = Number(searchParams.get("zoom") ?? "1");
+    const zoom = Number.isFinite(requestedZoom)
+      ? Math.max(0, Math.min(20, requestedZoom))
+      : 1;
+    const resolution = Math.ceil(8 * 2 ** zoom);
     const viewport = {
       south: Number(searchParams.get("south") ?? "-90"),
       west: Number(searchParams.get("west") ?? "-180"),

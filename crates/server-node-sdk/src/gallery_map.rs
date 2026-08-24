@@ -9,7 +9,9 @@ use super::StoreIndexMediaFilter;
 
 const GALLERY_MAP_TOKEN_PREFIX: &str = "gm1_";
 const MAX_GALLERY_MAP_TOKEN_LENGTH: usize = 65_536;
-const MAX_GALLERY_MAP_RESOLUTION: u32 = 1 << 22;
+const MAX_GALLERY_MAP_RESOLUTION: u32 = 1 << 23;
+const MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX: f64 = 512.0;
+const GALLERY_MAP_CLUSTER_CELL_WIDTH_PX: f64 = 64.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -51,7 +53,6 @@ pub(super) fn decode_gallery_map_query_token(token: &str) -> Option<GalleryMapQu
         || payload.prefix != payload.prefix.trim().trim_matches('/')
         || payload.resolution == 0
         || payload.resolution > MAX_GALLERY_MAP_RESOLUTION
-        || !payload.resolution.is_power_of_two()
         || !gallery_map_viewport_is_valid(payload.viewport)
     {
         return None;
@@ -71,8 +72,17 @@ pub(super) fn gallery_map_viewport_is_valid(viewport: GalleryMapViewport) -> boo
         && (-180.0..=180.0).contains(&viewport.east)
 }
 
-pub(super) fn gallery_map_resolution_for_zoom(zoom: u8) -> u32 {
-    1u32 << u32::from(zoom.min(20).saturating_add(2))
+pub(super) fn gallery_map_resolution_for_zoom(zoom: f64) -> u32 {
+    let zoom = if zoom.is_finite() {
+        zoom.clamp(0.0, 20.0)
+    } else {
+        0.0
+    };
+    let resolution = (MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX * 2.0_f64.powf(zoom)
+        / GALLERY_MAP_CLUSTER_CELL_WIDTH_PX)
+        .ceil();
+
+    resolution.clamp(1.0, f64::from(MAX_GALLERY_MAP_RESOLUTION)) as u32
 }
 
 pub(super) fn storage_media_filter(
@@ -146,9 +156,9 @@ mod tests {
     }
 
     #[test]
-    fn map_query_token_rejects_non_power_of_two_resolution() {
+    fn map_query_token_rejects_out_of_range_resolution() {
         let mut payload = token_payload();
-        payload.resolution = 3;
+        payload.resolution = MAX_GALLERY_MAP_RESOLUTION + 1;
         assert!(
             decode_gallery_map_query_token(&encode_gallery_map_query_token(&payload)).is_none()
         );
@@ -159,5 +169,23 @@ mod tests {
         assert_eq!(decode_gallery_map_cluster_id("7_3", 8), Some((7, 3)));
         assert_eq!(decode_gallery_map_cluster_id("8_3", 8), None);
         assert_eq!(decode_gallery_map_cluster_id("7_8", 8), None);
+    }
+
+    #[test]
+    fn map_grid_resolution_tracks_fractional_zoom_without_oversizing_cells() {
+        for zoom in [0.0, 0.25, 1.2, 3.75, 12.4, 20.0] {
+            let world_size = MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX * 2.0_f64.powf(zoom);
+            let resolution = f64::from(gallery_map_resolution_for_zoom(zoom));
+
+            assert!(
+                world_size / resolution <= GALLERY_MAP_CLUSTER_CELL_WIDTH_PX,
+                "zoom level {zoom} has an oversized cluster cell"
+            );
+        }
+
+        assert_ne!(
+            gallery_map_resolution_for_zoom(3.0),
+            gallery_map_resolution_for_zoom(3.75)
+        );
     }
 }

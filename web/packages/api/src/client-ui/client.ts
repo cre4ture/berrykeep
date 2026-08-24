@@ -1,5 +1,6 @@
 import { fetchJson } from "../shared/http";
 import type { GalleryMapConfigurationResponse } from "../shared/map-config";
+import { clampGalleryMapZoom } from "../shared/store-index";
 import type {
   GalleryMapClusterEntriesResponse,
   GalleryMapClustersRequest,
@@ -253,7 +254,7 @@ function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchPa
     west: String(request.viewport.west),
     north: String(request.viewport.north),
     east: String(request.viewport.east),
-    zoom: String(Math.max(0, Math.min(20, Math.floor(request.zoom))))
+    zoom: String(clampGalleryMapZoom(request.zoom))
   });
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());

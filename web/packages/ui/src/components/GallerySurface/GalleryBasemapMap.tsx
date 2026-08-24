@@ -318,7 +318,7 @@ export function GalleryBasemapMap({
           }
           const viewport = galleryViewportForMap(map);
           if (viewport) {
-            onViewportChangeRef.current(viewport, Math.floor(map.getZoom()));
+            onViewportChangeRef.current(viewport, map.getZoom());
           }
         };
         const markInteractionEnd = () => {

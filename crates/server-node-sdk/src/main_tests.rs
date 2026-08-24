@@ -2007,7 +2007,7 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
             west: Some(-180.0),
             north: Some(90.0),
             east: Some(180.0),
-            zoom: Some(20),
+            zoom: Some(3.75),
         },
         super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
     )
@@ -2017,6 +2017,7 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
         serde_json::from_slice(&to_bytes(clusters.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(clusters_payload["total_entry_count"], 2);
     assert_eq!(clusters_payload["visible_geotagged_count"], 2);
+    assert_eq!(clusters_payload["zoom"].as_f64(), Some(3.75));
     assert_eq!(clusters_payload["clusters"].as_array().unwrap().len(), 1);
     assert_eq!(clusters_payload["clusters"][0]["count"], 2);
     let query_token = clusters_payload["query_token"].as_str().unwrap();
