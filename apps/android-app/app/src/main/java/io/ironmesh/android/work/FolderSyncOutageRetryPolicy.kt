@@ -20,6 +20,7 @@ internal enum class FolderSyncRetryTrigger {
     APP_FOREGROUNDED,
     NETWORK_AVAILABLE,
     LOCAL_FOLDER_CHANGED,
+    BACKOFF_TIMER,
     PERIODIC_WORK,
     MANUAL_SYNC,
     CONFIGURATION_CHANGED,
@@ -83,9 +84,22 @@ internal class FolderSyncOutageRetryStore(
     )
 
     fun state(): FolderSyncOutageRetryState {
+        val now = nowEpochMs()
+        val storedNextRetryAtEpochMs = preferences
+            .getLong(KEY_NEXT_RETRY_AT_EPOCH_MS, 0L)
+            .coerceAtLeast(0L)
+        val nextRetryAtEpochMs = storedNextRetryAtEpochMs.coerceAtMost(
+            now + FolderSyncOutageRetryPolicy.MAX_DELAY_MS,
+        )
+        if (nextRetryAtEpochMs != storedNextRetryAtEpochMs) {
+            preferences.edit()
+                .putLong(KEY_NEXT_RETRY_AT_EPOCH_MS, nextRetryAtEpochMs)
+                .apply()
+        }
         return FolderSyncOutageRetryState(
             failureCount = preferences.getInt(KEY_FAILURE_COUNT, 0).coerceAtLeast(0),
-            nextRetryAtEpochMs = preferences.getLong(KEY_NEXT_RETRY_AT_EPOCH_MS, 0L).coerceAtLeast(0L),
+            // Backwards wall-clock corrections must not strand the circuit beyond its maximum.
+            nextRetryAtEpochMs = nextRetryAtEpochMs,
         )
     }
 

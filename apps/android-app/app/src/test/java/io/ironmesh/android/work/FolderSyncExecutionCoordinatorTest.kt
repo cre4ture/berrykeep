@@ -57,6 +57,16 @@ class FolderSyncExecutionCoordinatorTest {
     }
 
     @Test
+    fun oneFailedStartDoesNotReleaseAnotherPendingContinuousStart() {
+        FolderSyncExecutionCoordinator.requestContinuousStart()
+        FolderSyncExecutionCoordinator.requestContinuousStart()
+
+        FolderSyncExecutionCoordinator.cancelContinuousStartRequest()
+
+        assertFalse(FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive = false))
+    }
+
+    @Test
     fun failedRefreshDoesNotReleaseAnAlreadyActiveService() {
         FolderSyncExecutionCoordinator.markContinuousServiceActive()
         FolderSyncExecutionCoordinator.requestContinuousStart()

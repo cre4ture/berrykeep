@@ -10,6 +10,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.ironmesh.android.data.AndroidDiagnosticLog as Log
@@ -38,6 +39,7 @@ class FolderSyncForegroundService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val reconcileMutex = Mutex()
     private var statusJob: Job? = null
+    private var retryJob: Job? = null
     private var lastLoggedStatusLine: String? = null
     private var lastDesiredSignature: String? = null
     private var waitingSummary: String? = null
@@ -66,8 +68,13 @@ class FolderSyncForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        serviceRunning = true
+        synchronized(localChangeLock) {
+            lastLocalChangeElapsedMs = null
+        }
         FolderSyncExecutionCoordinator.markContinuousServiceActive()
         outageRetryStore = FolderSyncOutageRetryStore(applicationContext)
+        schedulePersistedRetryWakeup(outageRetryStore.state())
         ensureNotificationChannel()
         networkChangeNotifier = ConflatedNetworkChangeNotifier(
             scope = scope,
@@ -127,7 +134,9 @@ class FolderSyncForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        serviceRunning = false
         statusJob?.cancel()
+        cancelRetryWakeup()
         if (::networkChangeNotifier.isInitialized) {
             networkChangeNotifier.close()
         }
@@ -143,6 +152,7 @@ class FolderSyncForegroundService : Service() {
     private fun clearRetryState() {
         outageRetryArmed = false
         outageRetryStore.clear()
+        cancelRetryWakeup()
     }
 
     private fun syncNow() {
@@ -161,7 +171,29 @@ class FolderSyncForegroundService : Service() {
 
         outageRetryArmed = true
         val state = outageRetryStore.recordFailure()
+        schedulePersistedRetryWakeup(state)
         updateNotification("BerryKeep sync paused", buildRetryMessage(reason, state))
+    }
+
+    private fun schedulePersistedRetryWakeup(state: FolderSyncOutageRetryState) {
+        cancelRetryWakeup()
+        val delayMs = state.nextRetryAtEpochMs - System.currentTimeMillis()
+        if (state.failureCount == 0 || delayMs <= 0L) {
+            return
+        }
+        retryJob = scope.launch {
+            delay(delayMs)
+            retryJob = null
+            requestReconcile(
+                reason = "outage backoff expired",
+                trigger = FolderSyncRetryTrigger.BACKOFF_TIMER,
+            )
+        }
+    }
+
+    private fun cancelRetryWakeup() {
+        retryJob?.cancel()
+        retryJob = null
     }
 
     private fun buildRetryMessage(reason: String, state: FolderSyncOutageRetryState): String {
@@ -291,7 +323,7 @@ class FolderSyncForegroundService : Service() {
             )
 
             if (allowedProfiles.isEmpty()) {
-                clearRetryState()
+                cancelRetryWakeup()
                 updateNotification(
                     "Waiting for allowed network",
                     waitingSummary ?: "No enabled sync profile is allowed on the current network",
@@ -316,7 +348,7 @@ class FolderSyncForegroundService : Service() {
                 val waitingMessage = waitingSummary
                 when {
                     !waitingMessage.isNullOrBlank() && !hasAllowedProfiles && activeProfileCount == 0L -> {
-                        clearRetryState()
+                        cancelRetryWakeup()
                     }
                     (status?.errorProfileCount ?: 0L) > 0L -> {
                         armOutageRetry(currentErrorMessage(status))
@@ -614,13 +646,18 @@ class FolderSyncForegroundService : Service() {
         private const val ACTION_APP_FOREGROUNDED = "io.ironmesh.android.action.FOLDER_SYNC_APP_FOREGROUNDED"
         private const val ACTION_LOCAL_FOLDER_CHANGED = "io.ironmesh.android.action.FOLDER_SYNC_LOCAL_FOLDER_CHANGED"
         private const val ACTION_STOP = "io.ironmesh.android.action.FOLDER_SYNC_STOP"
+        private const val LOCAL_CHANGE_DEBOUNCE_MS = 5_000L
+        private val localChangeLock = Any()
+        @Volatile
+        private var serviceRunning = false
+        private var lastLocalChangeElapsedMs: Long? = null
 
         fun syncConfigChanged(context: Context) {
             startOwnedService(context, ACTION_REFRESH)
         }
 
         fun stop(context: Context) {
-            FolderSyncExecutionCoordinator.cancelContinuousStartRequest()
+            FolderSyncExecutionCoordinator.cancelAllContinuousStartRequests()
             context.stopService(Intent(context, FolderSyncForegroundService::class.java))
         }
 
@@ -642,6 +679,9 @@ class FolderSyncForegroundService : Service() {
          * work while an endpoint backoff is active.
          */
         fun localFolderChanged(context: Context, treeUriString: String) {
+            if (!serviceRunning) {
+                return
+            }
             val hasMatchingEnabledProfile = IronmeshPreferences
                 .getFolderSyncConfigs(context)
                 .any { profile ->
@@ -650,7 +690,24 @@ class FolderSyncForegroundService : Service() {
             if (!hasMatchingEnabledProfile) {
                 return
             }
-            startOwnedService(context, ACTION_LOCAL_FOLDER_CHANGED)
+            val elapsedMs = SystemClock.elapsedRealtime()
+            synchronized(localChangeLock) {
+                val previousElapsedMs = lastLocalChangeElapsedMs
+                if (
+                    previousElapsedMs != null &&
+                    elapsedMs - previousElapsedMs < LOCAL_CHANGE_DEBOUNCE_MS
+                ) {
+                    return
+                }
+                lastLocalChangeElapsedMs = elapsedMs
+            }
+            // This is delivered only to an already-running foreground service. It avoids trying
+            // to start a foreground service from a background ContentObserver callback.
+            context.startService(
+                Intent(context, FolderSyncForegroundService::class.java).apply {
+                    action = ACTION_LOCAL_FOLDER_CHANGED
+                },
+            )
         }
 
         private fun startOwnedService(context: Context, action: String) {

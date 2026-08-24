@@ -93,4 +93,27 @@ class FolderSyncOutageRetryPolicyTest {
         assertEquals(2, second.failureCount)
         assertEquals(91_000L, second.nextRetryAtEpochMs)
     }
+
+    @Test
+    fun backoffTimerIsHeldUntilTheStoredDeadline() {
+        val state = FolderSyncOutageRetryState(
+            failureCount = 1,
+            nextRetryAtEpochMs = 30_000L,
+        )
+
+        assertFalse(
+            FolderSyncOutageRetryPolicy.allowsAttempt(
+                state,
+                FolderSyncRetryTrigger.BACKOFF_TIMER,
+                nowEpochMs = 29_999L,
+            ),
+        )
+        assertTrue(
+            FolderSyncOutageRetryPolicy.allowsAttempt(
+                state,
+                FolderSyncRetryTrigger.BACKOFF_TIMER,
+                nowEpochMs = 30_000L,
+            ),
+        )
+    }
 }

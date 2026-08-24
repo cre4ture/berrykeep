@@ -65,7 +65,6 @@ class FolderSyncWorker(
 
             if (eligibleProfiles.isEmpty()) {
                 Log.i(TAG, "one-shot sync skipped because no enabled profile matches the current network policy")
-                outageRetryStore.clear()
                 return@withContext Result.success()
             }
 

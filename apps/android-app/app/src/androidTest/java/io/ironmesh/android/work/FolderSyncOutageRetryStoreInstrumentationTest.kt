@@ -39,4 +39,26 @@ class FolderSyncOutageRetryStoreInstrumentationTest {
         assertFalse(recreatedStore.allowsAttempt(FolderSyncRetryTrigger.APP_FOREGROUNDED))
         assertTrue(recreatedStore.allowsAttempt(FolderSyncRetryTrigger.MANUAL_SYNC))
     }
+
+    @Test
+    fun staleWallClockDeadlineIsClampedToTheMaximumBackoff() {
+        val writer = FolderSyncOutageRetryStore(
+            context = context,
+            nowEpochMs = { 2 * 24 * 60 * 60_000L },
+            jitterPermille = { 0 },
+        )
+        writer.clear()
+        writer.recordFailure()
+
+        val reader = FolderSyncOutageRetryStore(
+            context = context,
+            nowEpochMs = { 0L },
+            jitterPermille = { 0 },
+        )
+
+        assertEquals(
+            FolderSyncOutageRetryPolicy.MAX_DELAY_MS,
+            reader.state().nextRetryAtEpochMs,
+        )
+    }
 }
