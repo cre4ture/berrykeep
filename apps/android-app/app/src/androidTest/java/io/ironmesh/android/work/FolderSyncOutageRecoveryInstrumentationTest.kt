@@ -123,12 +123,12 @@ class FolderSyncOutageRecoveryInstrumentationTest {
             RustClientTestBridge.getFolderSyncOutageRendezvousContactAttemptCount(),
         )
 
-        // Wait for the first client route circuit window to expire before testing recovery.
-        // This keeps the recovery attempt independent of the prior route-cooling state.
-        SystemClock.sleep(1_600L)
         RustClientTestBridge.setFolderSyncOutageScenarioAvailable(true)
         RustClientBridge.notifyNetworkChanged(bootstrapJson, null, clientIdentityJson)
 
+        // An explicit foreground sync may select a cooling route when every configured route
+        // is cooling. Do not wait for a circuit timeout here: recovery must not depend on a
+        // timing margin around the adaptive backoff window.
         RustClientBridge.runFolderSyncOnce(
             bootstrapJson,
             localFolder.absolutePath,
