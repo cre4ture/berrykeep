@@ -9,6 +9,7 @@ export type GalleryMapContractSetup = {
 export type GalleryMapContractTarget = {
   name: string;
   setup: (page: Page, setup: GalleryMapContractSetup) => Promise<void>;
+  setupInitialOverviewScenario: (page: Page) => Promise<void>;
   openGallery: (page: Page) => Promise<void>;
 };
 
@@ -148,4 +149,65 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await expect(page.getByRole("button", { name: "Retry map styles" })).toBeVisible();
     await expect(page.locator('[aria-label="Geotagged gallery map"]')).toHaveCount(0);
   });
+
+  test(`${target.name} gallery map contract fits the initial server overview and opens cluster choices`, async ({
+    page
+  }) => {
+    await target.setupInitialOverviewScenario(page);
+    await target.openGallery(page);
+    await page.getByRole("button", { name: "Map" }).click();
+
+    const clusterButtons = page.getByRole("button", { name: "Open map cluster with 2 items" });
+    await expect(clusterButtons).toHaveCount(2);
+    await expect(clusterButtons.first()).toBeVisible();
+    await expect(clusterButtons.nth(1)).toBeVisible();
+
+    await clusterButtons.first().click();
+    const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
+    await expect(chooser).toBeVisible();
+    await expect(chooser.getByRole("button", { name: "gallery/new-york-a.png" })).toBeVisible();
+    await expect(chooser.getByRole("button", { name: "gallery/new-york-b.png" })).toBeVisible();
+    await expect(clusterButtons).toHaveCount(2);
+
+    await page.keyboard.press("Escape");
+    await expect(chooser).toHaveCount(0);
+    await clusterButtons.first().click({ modifiers: ["Control"] });
+    await expect(chooser).toHaveCount(0);
+    await expect(clusterButtons).toHaveCount(0);
+  });
+}
+
+export function createInitialOverviewGalleryEntries() {
+  return [
+    createGalleryEntry("gallery/new-york-a.png", 40.7128, -74.006),
+    createGalleryEntry("gallery/new-york-b.png", 40.7628, -74.056),
+    createGalleryEntry("gallery/tokyo-a.png", 35.6762, 139.6503),
+    createGalleryEntry("gallery/tokyo-b.png", 35.7262, 139.7003)
+  ];
+}
+
+function createGalleryEntry(path: string, latitude: number, longitude: number) {
+  return {
+    path,
+    entry_type: "key" as const,
+    modified_at_unix: 1_712_345_678,
+    media: {
+      status: "ready",
+      content_fingerprint: `fingerprint-${path}`,
+      media_type: "image",
+      mime_type: "image/png",
+      width: 1,
+      height: 1,
+      taken_at_unix: 1_712_345_678,
+      gps: { latitude, longitude },
+      thumbnail: {
+        url: `/api/v1/media/thumbnail?key=${encodeURIComponent(path)}`,
+        profile: "grid",
+        width: 1,
+        height: 1,
+        format: "png",
+        size_bytes: 68
+      }
+    }
+  };
 }

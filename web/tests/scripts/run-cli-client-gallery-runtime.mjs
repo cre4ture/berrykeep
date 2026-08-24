@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { cargoDebugBinaryPath } from "./cargo-target.mjs";
@@ -10,14 +11,29 @@ const upstreamPort = 18082;
 const webUiBindAddress = process.env.IRONMESH_GALLERY_RUNTIME_BIND ?? "127.0.0.1";
 const upstreamOrigin = `http://127.0.0.1:${upstreamPort}`;
 const fallbackMapManifestKey = "sys/maps/runtime-gallery-fallback.mbtiles.manifest.json";
+const fallbackMapPartKey = "sys/maps/runtime-gallery-fallback.mbtiles.part-0000";
 const tinyPngBody = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlH7u8AAAAASUVORK5CYII=",
   "base64"
 );
+const localCenterMapBody = createLocalCenterMapBody(readFileSync("tests/fixtures/smoke.mbtiles"));
+const fallbackMapManifest = {
+  manifest_version: 1,
+  type: "split_file_manifest",
+  logical_format: "mbtiles",
+  logical_key: "sys/maps/runtime-gallery-fallback.mbtiles",
+  logical_size_bytes: localCenterMapBody.length,
+  parts_count: 1,
+  parts: [
+    {
+      part_id: "part-0000",
+      key: fallbackMapPartKey,
+      offset_bytes: 0,
+      size_bytes: localCenterMapBody.length
+    }
+  ]
+};
 
-// Android's software WebView emulator does not initialize MapLibre reliably.
-// The mobile fullscreen regression is renderer-independent, so exercise the
-// built-in atlas fallback and its shared fullscreen/modal behavior here.
 const mapConfiguration = {
   stored: true,
   configuration: {
@@ -62,65 +78,28 @@ const mapConfiguration = {
 };
 
 const galleryEntries = [
+  createGalleryEntry("runtime-new-york-a", 40.7128, -74.006),
+  createGalleryEntry("runtime-new-york-b", 40.7628, -74.056),
+  createGalleryEntry("runtime-tokyo-a", 35.6762, 139.6503),
+  createGalleryEntry("runtime-tokyo-b", 35.7262, 139.7003)
+];
+
+const galleryMapClusters = [
   {
-    path: "gallery/runtime-map-a.png",
-    entry_type: "key",
-    version: "runtime-map-a-001",
-    content_hash: "runtime-map-a-hash",
-    size_bytes: 68,
-    modified_at_unix: 1712345678,
-    media: {
-      status: "ready",
-      content_fingerprint: "runtime-map-a-fingerprint",
-      media_type: "image",
-      mime_type: "image/png",
-      width: 1,
-      height: 1,
-      taken_at_unix: 1712345678,
-      gps: {
-        latitude: 47.3769,
-        longitude: 8.5417
-      },
-      thumbnail: {
-        url: "/media/thumbnail?key=gallery%2Fruntime-map-a.png",
-        profile: "grid",
-        width: 1,
-        height: 1,
-        format: "png",
-        size_bytes: 68
-      }
-    }
+    cluster_id: "runtime-new-york",
+    count: 2,
+    latitude: 40.7378,
+    longitude: -74.031,
+    bounds: { south: 40.7128, west: -74.056, north: 40.7628, east: -74.006 },
+    paths: ["gallery/runtime-new-york-a.png", "gallery/runtime-new-york-b.png"]
   },
   {
-    path: "gallery/runtime-map-b.png",
-    entry_type: "key",
-    version: "runtime-map-b-001",
-    content_hash: "runtime-map-b-hash",
-    size_bytes: 68,
-    modified_at_unix: 1712345678,
-    media: {
-      status: "ready",
-      content_fingerprint: "runtime-map-b-fingerprint",
-      media_type: "image",
-      mime_type: "image/png",
-      width: 1,
-      height: 1,
-      taken_at_unix: 1712345678,
-      // Identical coordinates intentionally exercise the direct cluster
-      // chooser instead of the basemap's zoom-to-bounds behavior.
-      gps: {
-        latitude: 47.3769,
-        longitude: 8.5417
-      },
-      thumbnail: {
-        url: "/media/thumbnail?key=gallery%2Fruntime-map-b.png",
-        profile: "grid",
-        width: 1,
-        height: 1,
-        format: "png",
-        size_bytes: 68
-      }
-    }
+    cluster_id: "runtime-tokyo",
+    count: 2,
+    latitude: 35.7012,
+    longitude: 139.6752,
+    bounds: { south: 35.6762, west: 139.6503, north: 35.7262, east: 139.7003 },
+    paths: ["gallery/runtime-tokyo-a.png", "gallery/runtime-tokyo-b.png"]
   }
 ];
 
@@ -159,13 +138,21 @@ function galleryMapClustersResponse(url) {
   const prefix = url.searchParams.get("prefix") ?? "";
   const depth = Math.max(1, Number(url.searchParams.get("depth") ?? "1") || 1);
   const zoom = Math.max(0, Math.min(20, Number(url.searchParams.get("zoom") ?? "1") || 0));
+  const viewport = {
+    south: Number(url.searchParams.get("south")),
+    west: Number(url.searchParams.get("west")),
+    north: Number(url.searchParams.get("north")),
+    east: Number(url.searchParams.get("east"))
+  };
+  const clusters = galleryMapClusters.filter((cluster) => clusterIsVisible(cluster, viewport));
+  const visibleGeotaggedCount = clusters.reduce((total, cluster) => total + cluster.count, 0);
   return {
     prefix,
     depth,
     zoom,
     resolution: 2 ** (Math.floor(zoom) + 2),
     total_entry_count: galleryEntries.length,
-    visible_geotagged_count: galleryEntries.length,
+    visible_geotagged_count: visibleGeotaggedCount,
     media_summary: {
       ready_count: galleryEntries.length,
       pending_count: 0,
@@ -175,37 +162,83 @@ function galleryMapClustersResponse(url) {
       geotagged_count: galleryEntries.length
     },
     query_token: "gallery-runtime-map-token-1",
-    clusters: [
-      {
-        cluster_id: "runtime-zurich",
-        count: galleryEntries.length,
-        latitude: 47.3769,
-        longitude: 8.5417,
-        bounds: {
-          south: 47.3769,
-          west: 8.5417,
-          north: 47.3769,
-          east: 8.5417
-        }
-      }
-    ]
+    clusters: clusters.map(({ paths: _paths, ...cluster }) => cluster)
   };
 }
 
 function galleryMapClusterEntriesResponse(url) {
   const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
   const limit = Math.max(1, Number(url.searchParams.get("limit") ?? "100") || 100);
-  const entries = galleryEntries.slice(offset, offset + limit);
+  const clusterId = url.searchParams.get("cluster_id") ?? "";
+  const cluster = galleryMapClusters.find((candidate) => candidate.cluster_id === clusterId);
+  const clusterEntries = cluster
+    ? galleryEntries.filter((entry) => cluster.paths.includes(entry.path))
+    : [];
+  const entries = clusterEntries.slice(offset, offset + limit);
   return {
-    cluster_id: url.searchParams.get("cluster_id") ?? "runtime-zurich",
+    cluster_id: clusterId,
     entry_count: entries.length,
-    total_entry_count: galleryEntries.length,
+    total_entry_count: clusterEntries.length,
     offset,
     limit,
-    has_more: offset + entries.length < galleryEntries.length,
+    has_more: offset + entries.length < clusterEntries.length,
     query_token: url.searchParams.get("query_token") ?? "gallery-runtime-map-token-1",
     entries
   };
+}
+
+function createGalleryEntry(name, latitude, longitude) {
+  const path = `gallery/${name}.png`;
+  return {
+    path,
+    entry_type: "key",
+    version: `${name}-001`,
+    content_hash: `${name}-hash`,
+    size_bytes: 68,
+    modified_at_unix: 1712345678,
+    media: {
+      status: "ready",
+      content_fingerprint: `${name}-fingerprint`,
+      media_type: "image",
+      mime_type: "image/png",
+      width: 1,
+      height: 1,
+      taken_at_unix: 1712345678,
+      gps: { latitude, longitude },
+      thumbnail: {
+        url: `/media/thumbnail?key=${encodeURIComponent(path)}`,
+        profile: "grid",
+        width: 1,
+        height: 1,
+        format: "png",
+        size_bytes: 68
+      }
+    }
+  };
+}
+
+function clusterIsVisible(cluster, viewport) {
+  if (!Object.values(viewport).every(Number.isFinite)) {
+    return true;
+  }
+  return (
+    cluster.bounds.north >= viewport.south &&
+    cluster.bounds.south <= viewport.north &&
+    cluster.bounds.east >= viewport.west &&
+    cluster.bounds.west <= viewport.east
+  );
+}
+
+function createLocalCenterMapBody(source) {
+  const mapBody = Buffer.from(source);
+  const originalCenter = Buffer.from("0,20,1");
+  const localCenter = Buffer.from("8,47,3");
+  const offset = mapBody.indexOf(originalCenter);
+  if (offset < 0 || mapBody.indexOf(originalCenter, offset + 1) >= 0) {
+    throw new Error("runtime map fixture must contain exactly one default center value");
+  }
+  localCenter.copy(mapBody, offset);
+  return mapBody;
 }
 
 function json(response, status, body) {
@@ -230,6 +263,17 @@ function upstreamRequest(request, response) {
   if (request.method === "GET" && url.pathname === "/api/v1/maps/config") {
     json(response, 200, mapConfiguration);
     return;
+  }
+  if (request.method === "GET" && url.pathname.startsWith("/api/v1/store/")) {
+    const key = decodeURIComponent(url.pathname.slice("/api/v1/store/".length));
+    if (key === fallbackMapManifestKey) {
+      json(response, 200, fallbackMapManifest);
+      return;
+    }
+    if (key === fallbackMapPartKey) {
+      binary(response, 200, localCenterMapBody, "application/octet-stream");
+      return;
+    }
   }
   if (request.method === "GET" && url.pathname === "/api/v1/snapshots") {
     json(response, 200, []);

@@ -434,6 +434,8 @@ export function GallerySurface({
   const [mapClustersPayload, setMapClustersPayload] = useState<GalleryMapClustersPayload | null>(
     null
   );
+  const [mapInitialOverviewPayload, setMapInitialOverviewPayload] =
+    useState<GalleryMapClustersPayload | null>(null);
   const [mapSelectionEntries, setMapSelectionEntries] = useState<GalleryEntry[]>([]);
   const [gridCollection, setGridCollection] = useState<GalleryGridCollection | null>(null);
   const [gridPages, setGridPages] = useState<Record<number, GalleryGridPageState>>({});
@@ -1039,6 +1041,7 @@ export function GallerySurface({
     setVersionPreviewIndex(null);
     setNavigationPayload(null);
     setMapClustersPayload(null);
+    setMapInitialOverviewPayload(null);
     setMapSelectionEntries([]);
     mapClusterRequestVersionRef.current += 1;
     setGridCollection(null);
@@ -1071,6 +1074,7 @@ export function GallerySurface({
 
         setNavigationPayload(navigation);
         setMapClustersPayload(mapClusters);
+        setMapInitialOverviewPayload(mapClusters);
         loadedScopeRef.current = targetScope;
         setLoadedScope(targetScope);
         if (syncPrefixInput) {
@@ -1908,6 +1912,7 @@ export function GallerySurface({
                   activeProjection={activeMapProjection}
                   onSelectProjection={setActiveMapProjection}
                   clustersPayload={mapClustersPayload}
+                  initialOverviewPayload={mapInitialOverviewPayload}
                   hiddenOnMapCount={hiddenOnMapCount}
                   selectedPath={selection?.path ?? null}
                   getMarkerRequest={(entry) => getMediaRequests(entry, activeSnapshotId).thumbnail ?? null}
@@ -2443,6 +2448,7 @@ type GalleryMapPanelProps = {
   activeProjection: GalleryMapProjection;
   onSelectProjection: (projection: GalleryMapProjection) => void;
   clustersPayload: GalleryMapClustersPayload | null;
+  initialOverviewPayload: GalleryMapClustersPayload | null;
   hiddenOnMapCount: number;
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
@@ -2462,6 +2468,7 @@ function GalleryMapPanel({
   activeProjection,
   onSelectProjection,
   clustersPayload,
+  initialOverviewPayload,
   hiddenOnMapCount,
   selectedPath,
   getMarkerRequest,
@@ -2586,6 +2593,7 @@ function GalleryMapPanel({
       basemap={activeBasemap}
       projection={activeProjection}
       clustersPayload={clustersPayload}
+      initialOverviewPayload={initialOverviewPayload}
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
       allowFullscreenPortal={!usesEmbeddedClient}
