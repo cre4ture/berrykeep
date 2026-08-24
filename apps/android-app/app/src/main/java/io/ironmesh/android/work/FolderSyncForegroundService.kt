@@ -137,6 +137,13 @@ class FolderSyncForegroundService : Service() {
                 )
                 return START_STICKY
             }
+            ACTION_RESTORE -> {
+                requestReconcile(
+                    reason = "sync runtime restored",
+                    trigger = FolderSyncRetryTrigger.SERVICE_START,
+                )
+                return START_STICKY
+            }
             else -> {
                 requestReconcile(
                     reason = "service start",
@@ -370,7 +377,7 @@ class FolderSyncForegroundService : Service() {
                         (status?.errorProfileCount ?: 0L) > 0L -> {
                             armOutageRetry(currentErrorMessage(status))
                         }
-                        activeProfileCount > 0L -> {
+                        (status?.runningProfileCount ?: 0L) > 0L -> {
                             clearRetryState()
                         }
                     }
@@ -739,6 +746,7 @@ class FolderSyncForegroundService : Service() {
         private const val CHANNEL_ID = "ironmesh-folder-sync"
         private const val NOTIFICATION_ID = 4001
         private const val ACTION_REFRESH = "io.ironmesh.android.action.FOLDER_SYNC_REFRESH"
+        private const val ACTION_RESTORE = "io.ironmesh.android.action.FOLDER_SYNC_RESTORE"
         private const val ACTION_SYNC_NOW = "io.ironmesh.android.action.FOLDER_SYNC_NOW"
         private const val ACTION_APP_FOREGROUNDED = "io.ironmesh.android.action.FOLDER_SYNC_APP_FOREGROUNDED"
         private const val ACTION_LOCAL_FOLDER_CHANGED = "io.ironmesh.android.action.FOLDER_SYNC_LOCAL_FOLDER_CHANGED"
@@ -751,6 +759,11 @@ class FolderSyncForegroundService : Service() {
 
         fun syncConfigChanged(context: Context) {
             startOwnedService(context, ACTION_REFRESH)
+        }
+
+        /** Restores the service after app/process startup without resetting endpoint backoff. */
+        fun syncRuntimeRestored(context: Context) {
+            startOwnedService(context, ACTION_RESTORE)
         }
 
         fun stop(context: Context) {

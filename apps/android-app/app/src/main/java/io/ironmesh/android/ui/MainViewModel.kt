@@ -351,7 +351,7 @@ class MainViewModel(
     private fun persistFolderSyncProfiles(profiles: List<FolderSyncConfig>) {
         persistPreference {
             IronmeshPreferences.setFolderSyncConfigs(getApplication(), profiles)
-            FolderSyncScheduler.reschedule(getApplication())
+            FolderSyncScheduler.reschedule(getApplication(), resetOutageBackoff = true)
         }
     }
 
@@ -1360,7 +1360,7 @@ class MainViewModel(
                     EmbeddedWebUiSessionRegistry.clear()
                     repository.stopWebUi()
                     IronmeshPreferences.setDeviceAuthState(getApplication(), authState)
-                    FolderSyncScheduler.reschedule(getApplication())
+                    FolderSyncScheduler.reschedule(getApplication(), resetOutageBackoff = true)
                 }
             } catch (error: Throwable) {
                 finishEnrollmentWithError(EnrollmentDiagnosticStepId.SAVE_IDENTITY, error)

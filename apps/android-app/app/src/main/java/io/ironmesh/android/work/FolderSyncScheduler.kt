@@ -13,7 +13,10 @@ object FolderSyncScheduler {
     private const val UNIQUE_PERIODIC_WORK = "ironmesh-folder-sync-periodic"
     private const val PERIODIC_INTERVAL_MINUTES = 15L
 
-    fun reschedule(context: Context) {
+    fun reschedule(
+        context: Context,
+        resetOutageBackoff: Boolean = false,
+    ) {
         val workManager = WorkManager.getInstance(context)
         val enabledProfiles = IronmeshPreferences
             .getFolderSyncConfigs(context)
@@ -26,7 +29,11 @@ object FolderSyncScheduler {
             return
         }
 
-        FolderSyncForegroundService.syncConfigChanged(context)
+        if (resetOutageBackoff) {
+            FolderSyncForegroundService.syncConfigChanged(context)
+        } else {
+            FolderSyncForegroundService.syncRuntimeRestored(context)
+        }
 
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(requiredNetworkType(enabledProfiles))
