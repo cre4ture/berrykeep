@@ -46,7 +46,7 @@ class FolderSyncOutageRecoveryInstrumentationTest {
      * fallback route and confirms that all planned routes are unusable before recovery.
      */
     @Test
-    fun folderSync_skipsBlockedNetwork_boundsAllRouteOutage_andRecoversThroughCachedClient() {
+    fun folderSync_skipsBlockedNetwork_doesNotRetryAutonomously_andRecoversThroughCachedClient() {
         val scenario = JSONObject(RustClientTestBridge.startFolderSyncOutageScenario())
         val bootstrapJson = scenario.getString("connectionBootstrapJson")
         val clientIdentityJson = scenario.getString("clientIdentityJson")
@@ -66,8 +66,8 @@ class FolderSyncOutageRecoveryInstrumentationTest {
                 add(routes.getJSONObject(index).getString("pathKind"))
             }
         }
-        assertTrue("expected direct node route, got $routeKinds", routeKinds.contains("directHttps"))
-        assertTrue("expected Rendezvous relay route, got $routeKinds", routeKinds.contains("relayTunnel"))
+        assertTrue("expected direct node route, got $routeKinds", routeKinds.contains("direct_https"))
+        assertTrue("expected Rendezvous relay route, got $routeKinds", routeKinds.contains("relay_tunnel"))
 
         val directAttemptsBeforeBlockedGate =
             RustClientTestBridge.getFolderSyncOutageDirectConnectionAttemptCount()
@@ -107,23 +107,24 @@ class FolderSyncOutageRecoveryInstrumentationTest {
             rendezvousAttemptsAfterOutage > rendezvousAttemptsBeforeBlockedGate,
         )
 
-        repeat(4) {
-            assertFolderSyncFails(bootstrapJson, clientIdentityJson)
-        }
-        assertTrue(
-            "immediate retry requests bypassed the direct-route circuit breaker",
-            RustClientTestBridge.getFolderSyncOutageDirectConnectionAttemptCount() <=
-                directAttemptsAfterOutage + 1,
+        // This is a one-shot sync entry point. After it returns, it must not leave an
+        // autonomous retry loop behind while the app is idle. A user-initiated foreground
+        // sync may select cooling routes again, so that behavior is deliberately not asserted
+        // here.
+        SystemClock.sleep(250L)
+        assertEquals(
+            "a failed one-shot sync started an unexpected direct-route retry",
+            directAttemptsAfterOutage,
+            RustClientTestBridge.getFolderSyncOutageDirectConnectionAttemptCount(),
         )
-        assertTrue(
-            "immediate retry requests bypassed the Rendezvous-route circuit breaker",
-            RustClientTestBridge.getFolderSyncOutageRendezvousContactAttemptCount() <=
-                rendezvousAttemptsAfterOutage + 1,
+        assertEquals(
+            "a failed one-shot sync started an unexpected Rendezvous retry",
+            rendezvousAttemptsAfterOutage,
+            RustClientTestBridge.getFolderSyncOutageRendezvousContactAttemptCount(),
         )
 
-        // The first client circuit window is 1.5 seconds. This is deliberately much shorter
-        // than Android's 15-minute mobile background probe interval and avoids a real-time
-        // long-outage wait in instrumentation CI.
+        // Wait for the first client route circuit window to expire before testing recovery.
+        // This keeps the recovery attempt independent of the prior route-cooling state.
         SystemClock.sleep(1_600L)
         RustClientTestBridge.setFolderSyncOutageScenarioAvailable(true)
         RustClientBridge.notifyNetworkChanged(bootstrapJson, null, clientIdentityJson)
