@@ -1,6 +1,12 @@
 package io.ironmesh.android.work
 
 import android.content.Context
+import androidx.work.CoroutineWorker
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.WorkerParameters
+import java.util.concurrent.TimeUnit
 
 /**
  * Persistent retry state for endpoint outages.
@@ -129,5 +135,53 @@ internal class FolderSyncOutageRetryStore(
         private const val PREFERENCES_NAME = "ironmesh-folder-sync-outage-retry"
         private const val KEY_FAILURE_COUNT = "failure_count"
         private const val KEY_NEXT_RETRY_AT_EPOCH_MS = "next_retry_at_epoch_ms"
+    }
+}
+
+/**
+ * Arms one doze-aware wake-up for the persistent circuit. The worker re-checks the wall-clock
+ * deadline because users and NTP can adjust the clock after WorkManager accepted the delay.
+ */
+internal object FolderSyncOutageRetryScheduler {
+    private const val UNIQUE_OUTAGE_RETRY_WORK = "ironmesh-folder-sync-outage-retry"
+
+    fun schedule(context: Context, state: FolderSyncOutageRetryState) {
+        if (state.failureCount == 0) {
+            cancel(context)
+            return
+        }
+        val initialDelayMs = (state.nextRetryAtEpochMs - System.currentTimeMillis()).coerceAtLeast(0L)
+        val request = OneTimeWorkRequestBuilder<FolderSyncOutageRetryWorker>()
+            .setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
+            .build()
+        WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
+            UNIQUE_OUTAGE_RETRY_WORK,
+            ExistingWorkPolicy.REPLACE,
+            request,
+        )
+    }
+
+    fun cancel(context: Context) {
+        WorkManager.getInstance(context.applicationContext).cancelUniqueWork(UNIQUE_OUTAGE_RETRY_WORK)
+    }
+}
+
+class FolderSyncOutageRetryWorker(
+    appContext: Context,
+    params: WorkerParameters,
+) : CoroutineWorker(appContext, params) {
+    override suspend fun doWork(): Result {
+        val retryStore = FolderSyncOutageRetryStore(applicationContext)
+        val state = retryStore.state()
+        if (state.failureCount == 0) {
+            return Result.success()
+        }
+        if (!retryStore.allowsAttempt(FolderSyncRetryTrigger.BACKOFF_TIMER)) {
+            FolderSyncOutageRetryScheduler.schedule(applicationContext, state)
+            return Result.success()
+        }
+
+        FolderSyncForegroundService.triggerScheduledRetry(applicationContext)
+        return Result.success()
     }
 }

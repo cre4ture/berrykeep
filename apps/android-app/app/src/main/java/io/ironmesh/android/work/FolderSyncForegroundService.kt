@@ -144,6 +144,13 @@ class FolderSyncForegroundService : Service() {
                 )
                 return START_STICKY
             }
+            ACTION_BACKOFF_TIMER -> {
+                requestReconcile(
+                    reason = "outage backoff expired",
+                    trigger = FolderSyncRetryTrigger.BACKOFF_TIMER,
+                )
+                return START_STICKY
+            }
             else -> {
                 requestReconcile(
                     reason = "service start",
@@ -269,7 +276,6 @@ class FolderSyncForegroundService : Service() {
     }
 
     private suspend fun reconcileProfilesLocked(): Boolean {
-        FolderSyncExecutionCoordinator.awaitOneShotCompletion()
         return withContext(Dispatchers.IO) {
             val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
             val connectionInput = deviceAuth.connectionBootstrapJson()
@@ -502,6 +508,7 @@ class FolderSyncForegroundService : Service() {
         trigger: FolderSyncRetryTrigger,
     ) {
         scope.launch {
+            FolderSyncExecutionCoordinator.awaitOneShotCompletion()
             val started = reconcileMutex.withLock {
                 reconcileRequestLocked(reason, trigger)
             }
@@ -603,6 +610,7 @@ class FolderSyncForegroundService : Service() {
     }
 
     private suspend fun processNetworkPolicyChange(reason: String) {
+        FolderSyncExecutionCoordinator.awaitOneShotCompletion()
         val started = reconcileMutex.withLock {
             enforceNetworkPolicyLocked()
             reconcileRequestLocked(
@@ -748,11 +756,13 @@ class FolderSyncForegroundService : Service() {
         private const val ACTION_REFRESH = "io.ironmesh.android.action.FOLDER_SYNC_REFRESH"
         private const val ACTION_RESTORE = "io.ironmesh.android.action.FOLDER_SYNC_RESTORE"
         private const val ACTION_SYNC_NOW = "io.ironmesh.android.action.FOLDER_SYNC_NOW"
+        private const val ACTION_BACKOFF_TIMER = "io.ironmesh.android.action.FOLDER_SYNC_BACKOFF_TIMER"
         private const val ACTION_APP_FOREGROUNDED = "io.ironmesh.android.action.FOLDER_SYNC_APP_FOREGROUNDED"
         private const val ACTION_LOCAL_FOLDER_CHANGED = "io.ironmesh.android.action.FOLDER_SYNC_LOCAL_FOLDER_CHANGED"
         private const val ACTION_STOP = "io.ironmesh.android.action.FOLDER_SYNC_STOP"
         private const val LOCAL_CHANGE_DEBOUNCE_MS = 5_000L
         private val localChangeLock = Any()
+        private val triggerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         @Volatile
         private var serviceRunning = false
         private val lastLocalChangeElapsedMsByTreeUri = mutableMapOf<String, Long>()
@@ -777,10 +787,16 @@ class FolderSyncForegroundService : Service() {
 
         /** A visible app is an explicit, user-initiated opportunity to retry a due outage. */
         fun appForegrounded(context: Context) {
-            if (IronmeshPreferences.getFolderSyncConfigs(context).none { profile -> profile.enabled }) {
-                return
+            val appContext = context.applicationContext
+            triggerScope.launch {
+                if (IronmeshPreferences.getFolderSyncConfigs(appContext).none { profile -> profile.enabled }) {
+                    return@launch
+                }
+                runCatching { startOwnedService(appContext, ACTION_APP_FOREGROUNDED) }
+                    .onFailure { error ->
+                        Log.w(TAG, "failed to signal app foreground to sync service: ${error.message}")
+                    }
             }
-            startOwnedService(context, ACTION_APP_FOREGROUNDED)
         }
 
         /**
@@ -803,21 +819,51 @@ class FolderSyncForegroundService : Service() {
                 }
                 lastLocalChangeElapsedMsByTreeUri[treeUriString] = elapsedMs
             }
-            val hasMatchingEnabledProfile = IronmeshPreferences
-                .getFolderSyncConfigs(context)
-                .any { profile ->
-                    profile.enabled && profile.localFolderTreeUri == treeUriString
+            val appContext = context.applicationContext
+            triggerScope.launch {
+                val hasMatchingEnabledProfile = IronmeshPreferences
+                    .getFolderSyncConfigs(appContext)
+                    .any { profile ->
+                        profile.enabled && profile.localFolderTreeUri == treeUriString
+                    }
+                if (!hasMatchingEnabledProfile || !serviceRunning) {
+                    synchronized(localChangeLock) {
+                        if (lastLocalChangeElapsedMsByTreeUri[treeUriString] == elapsedMs) {
+                            lastLocalChangeElapsedMsByTreeUri.remove(treeUriString)
+                        }
+                    }
+                    return@launch
                 }
-            if (!hasMatchingEnabledProfile) {
-                return
+                // This is delivered only to an already-running foreground service. It avoids
+                // trying to start a foreground service from a background ContentObserver.
+                runCatching {
+                    appContext.startService(
+                        Intent(appContext, FolderSyncForegroundService::class.java).apply {
+                            action = ACTION_LOCAL_FOLDER_CHANGED
+                        },
+                    )
+                }.onFailure { error ->
+                    Log.w(TAG, "failed to signal local folder change to sync service: ${error.message}")
+                }
             }
-            // This is delivered only to an already-running foreground service. It avoids trying
-            // to start a foreground service from a background ContentObserver callback.
-            context.startService(
-                Intent(context, FolderSyncForegroundService::class.java).apply {
-                    action = ACTION_LOCAL_FOLDER_CHANGED
-                },
-            )
+        }
+
+        /** Invoked by the doze-aware one-time worker at a persisted outage deadline. */
+        fun triggerScheduledRetry(context: Context) {
+            val appContext = context.applicationContext
+            runCatching {
+                if (serviceRunning) {
+                    appContext.startService(
+                        Intent(appContext, FolderSyncForegroundService::class.java).apply {
+                            action = ACTION_BACKOFF_TIMER
+                        },
+                    )
+                } else {
+                    startOwnedService(appContext, ACTION_BACKOFF_TIMER)
+                }
+            }.onFailure { error ->
+                Log.w(TAG, "failed to wake sync service for outage retry: ${error.message}")
+            }
         }
 
         private fun startOwnedService(context: Context, action: String) {
