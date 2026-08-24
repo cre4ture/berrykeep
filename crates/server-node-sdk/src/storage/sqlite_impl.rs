@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -21,7 +22,10 @@ use super::{
     GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
     GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
     GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
-    GalleryIndexPage, GalleryIndexQuery, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
+    GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue,
+    GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
+    GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
     ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
     RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
@@ -30,14 +34,16 @@ use super::{
     StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
     decode_gallery_labels, decompress_snapshot_json, effective_gallery_captured_at_unix,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_label_filter_matches_json, gallery_label_predicates, gallery_media_type_for_path,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
+    gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
+    gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
+    metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload,
 };
 
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SQLITE_READ_CONNECTION_COUNT: usize = 4;
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
+const GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS: i64 = 1_000;
 
 #[derive(Debug, PartialEq)]
 struct GalleryProjectionState {
@@ -54,7 +60,9 @@ pub(super) struct SqliteMetadataStore {
     metadata_db_path: PathBuf,
     writer: TokioConnection,
     readers: Vec<TokioConnection>,
+    gallery_summary_reader: TokioConnection,
     next_reader: AtomicUsize,
+    gallery_map_summary_cache: Arc<GallerySummaryCache>,
 }
 
 impl SqliteMetadataStore {
@@ -65,11 +73,14 @@ impl SqliteMetadataStore {
         for _ in 0..sqlite_read_connection_count() {
             readers.push(open_sqlite_reader_connection(&metadata_db_path).await?);
         }
+        let gallery_summary_reader = open_sqlite_reader_connection(&metadata_db_path).await?;
         let store = Self {
             metadata_db_path,
             writer,
             readers,
+            gallery_summary_reader,
             next_reader: AtomicUsize::new(0),
+            gallery_map_summary_cache: Arc::new(GallerySummaryCache::new()),
         };
         store.backfill_gallery_objects().await?;
         Ok(store)
@@ -89,6 +100,75 @@ impl SqliteMetadataStore {
             .call(move |db| Ok(f(db)))
             .await
             .map_err(map_tokio_rusqlite_error)?
+    }
+
+    /// Returns the whole-scope gallery map summary for `scope`, serving a cached (possibly
+    /// stale) value immediately rather than blocking the caller on the underlying aggregate
+    /// query. `history_id`/`revision` come from the viewport-bounded cluster read that always
+    /// runs alongside this call; they are only used here to detect that the cache is stale
+    /// relative to *this* request, not to guarantee the returned summary matches it exactly.
+    ///
+    /// - Cache hit, fresh: returned as-is, nothing scheduled.
+    /// - Cache hit, stale: returned as-is; a background refresh is scheduled unless one is
+    ///   already running for this scope.
+    /// - Cache miss: computed synchronously (once) so the first caller for a scope still gets a
+    ///   real answer, then cached for everyone after it.
+    async fn gallery_map_summary(
+        &self,
+        scope: GallerySummaryScope,
+        history_id: &str,
+        revision: u64,
+    ) -> Result<(usize, GalleryIndexMediaSummary, GallerySummaryRefreshStatus)> {
+        if let Some(cached) = self.gallery_map_summary_cache.cached(&scope) {
+            if cached.history_id == history_id && cached.revision == revision {
+                return Ok((
+                    cached.total_entry_count,
+                    cached.media_summary,
+                    GallerySummaryRefreshStatus::default(),
+                ));
+            }
+            if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
+                let reader = self.gallery_summary_reader.clone();
+                let cache = self.gallery_map_summary_cache.clone();
+                let refresh_scope = scope.clone();
+                let estimate = Some(cached.total_entry_count);
+                tokio::spawn(async move {
+                    let query_scope = refresh_scope.clone();
+                    let result = reader
+                        .call(move |db| {
+                            Ok(query_gallery_map_summary_from_db(
+                                db,
+                                &query_scope,
+                                estimate,
+                                Some(&progress),
+                            ))
+                        })
+                        .await
+                        .map_err(map_tokio_rusqlite_error)
+                        .and_then(|value| value);
+                    match result {
+                        Ok(value) => cache.store(refresh_scope.clone(), value),
+                        Err(error) => {
+                            warn!(error = %error, "failed to refresh gallery map summary in background")
+                        }
+                    }
+                    cache.finish_refresh(&refresh_scope);
+                });
+            }
+            let status = self.gallery_map_summary_cache.status(&scope);
+            return Ok((cached.total_entry_count, cached.media_summary, status));
+        }
+
+        let compute_scope = scope.clone();
+        let value = self
+            .read(move |db| query_gallery_map_summary_from_db(db, &compute_scope, None, None))
+            .await?;
+        self.gallery_map_summary_cache.store(scope, value.clone());
+        Ok((
+            value.total_entry_count,
+            value.media_summary,
+            GallerySummaryRefreshStatus::default(),
+        ))
     }
 
     async fn write<T, F>(&self, f: F) -> Result<T>
@@ -245,8 +325,10 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              media_status,
              geotagged,
              latitude,
-             longitude
-         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL)
+             longitude,
+             spatial_x,
+             spatial_y
+         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL)
          ON CONFLICT(key) DO UPDATE SET
              manifest_hash = excluded.manifest_hash,
              object_id = excluded.object_id,
@@ -256,7 +338,9 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              media_status = NULL,
              geotagged = 0,
              latitude = NULL,
-             longitude = NULL
+             longitude = NULL,
+             spatial_x = NULL,
+             spatial_y = NULL
          WHERE gallery_objects.manifest_hash != excluded.manifest_hash
             OR gallery_objects.object_id != excluded.object_id
             OR gallery_objects.inferred_media_type IS NOT excluded.inferred_media_type",
@@ -296,6 +380,8 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 && gps.longitude.is_finite()
                 && (-180.0..=180.0).contains(&gps.longitude)
         });
+    let spatial_position =
+        gps.and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
     let mut statement = db.prepare(
         "SELECT gallery_objects.key, version_indexes.index_json
          FROM gallery_objects
@@ -328,8 +414,10 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                  media_status = ?3,
                  geotagged = ?4,
                  latitude = ?5,
-                 longitude = ?6
-             WHERE key = ?7",
+                 longitude = ?6,
+                 spatial_x = ?7,
+                 spatial_y = ?8
+             WHERE key = ?9",
             params![
                 media_type,
                 u64_to_i64(captured_at_unix)?,
@@ -337,6 +425,8 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 if gps.is_some() { 1i64 } else { 0i64 },
                 gps.map(|gps| gps.latitude),
                 gps.map(|gps| gps.longitude),
+                spatial_position.map(|position| position.0),
+                spatial_position.map(|position| position.1),
                 key,
             ],
         )?;
@@ -539,6 +629,135 @@ fn query_gallery_index_from_db(
     Ok(page)
 }
 
+/// Computes viewport clusters and the whole-scope summary together in one shot. Production code
+/// no longer calls this directly (see `SqliteMetadataStore::query_gallery_map_clusters`, which
+/// serves the summary from `GallerySummaryCache` instead); it is kept as the ground-truth
+/// reference implementation exercised by the gallery map tests.
+#[cfg(test)]
+fn query_gallery_map_clusters_from_db(
+    db: &Connection,
+    query: &GalleryMapClusterQuery,
+) -> Result<GalleryMapClusterPage> {
+    let transaction = db.unchecked_transaction()?;
+    let history_id = current_gallery_history_id_from_db(&transaction)?;
+    let revision = current_gallery_revision_from_db(&transaction)?;
+    let page =
+        query_gallery_map_clusters_in_transaction(&transaction, query, history_id, revision)?;
+    transaction.commit()?;
+    Ok(page)
+}
+
+/// Like [`query_gallery_map_clusters_from_db`], but skips the whole-scope summary aggregation
+/// entirely. Used on the hot request path, where the summary is served from
+/// [`GallerySummaryCache`] instead so a map pan/zoom never pays for an unbounded aggregate query.
+fn query_gallery_map_cluster_cells_from_db(
+    db: &Connection,
+    query: &GalleryMapClusterQuery,
+) -> Result<(String, u64, u64, u32, usize, Vec<GalleryMapCluster>)> {
+    let transaction = db.unchecked_transaction()?;
+    let history_id = current_gallery_history_id_from_db(&transaction)?;
+    let cache_revision = current_gallery_revision_from_db(&transaction)?;
+    let prefix = query.prefix.trim().trim_matches('/').to_string();
+    let revision = current_gallery_scope_revision_from_db(&transaction, &prefix, query.depth)?;
+    let prefix_pattern = if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{prefix}/"))
+    };
+    let base_values = sqlite_gallery_map_scope_values(
+        &prefix,
+        &prefix_pattern,
+        query.depth,
+        query.media_filter,
+        query.viewport,
+    )?;
+    let (resolution, clusters) = gallery_map_cluster_cells_from_db(
+        &transaction,
+        &base_values,
+        gallery_map_bounded_resolution(
+            query.requested_resolution,
+            query.viewport,
+            query.max_clusters,
+        ),
+        query.max_clusters,
+    )?;
+    transaction.commit()?;
+    let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
+    Ok((
+        history_id,
+        cache_revision,
+        revision,
+        resolution,
+        visible_geotagged_count,
+        clusters,
+    ))
+}
+
+/// Computes the whole-scope summary for `scope`, either exactly (for the first, synchronous
+/// computation of a never-before-seen scope) or in progress-reporting chunks (for a background
+/// refresh of a scope that is already cached but stale). Both variants read `history_id`/
+/// `revision` alongside the summary so the cached value can be compared for staleness later.
+fn query_gallery_map_summary_from_db(
+    db: &Connection,
+    scope: &GallerySummaryScope,
+    total_estimate: Option<usize>,
+    progress: Option<&GallerySummaryProgress>,
+) -> Result<GallerySummaryCacheValue> {
+    let transaction = db.unchecked_transaction()?;
+    let history_id = current_gallery_history_id_from_db(&transaction)?;
+    let revision = current_gallery_revision_from_db(&transaction)?;
+    let prefix_pattern = if scope.prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{}/", scope.prefix))
+    };
+    let depth = i64::try_from(scope.depth).context("gallery map summary depth overflow")?;
+    let scope_values = vec![
+        Value::Text(scope.prefix.clone()),
+        Value::Text(prefix_pattern),
+        Value::Integer(depth),
+        scope
+            .media_filter
+            .media_type()
+            .map(|value| Value::Text(value.to_string()))
+            .unwrap_or(Value::Null),
+    ];
+    let (total_entry_count, media_summary) = match progress {
+        Some(progress) => gallery_map_summary_chunked_from_db(
+            &transaction,
+            &scope_values,
+            total_estimate,
+            progress,
+        )?,
+        None => gallery_map_summary_from_db(&transaction, &scope_values)?,
+    };
+    transaction.commit()?;
+    Ok(GallerySummaryCacheValue {
+        history_id,
+        revision,
+        total_entry_count,
+        media_summary,
+    })
+}
+
+fn query_gallery_map_cluster_entries_from_db(
+    db: &Connection,
+    query: &GalleryMapClusterEntriesQuery,
+) -> Result<GalleryIndexPage> {
+    let transaction = db.unchecked_transaction()?;
+    let history_id = current_gallery_history_id_from_db(&transaction)?;
+    let prefix = query.prefix.trim().trim_matches('/');
+    let revision = current_gallery_scope_revision_from_db(&transaction, prefix, query.depth)?;
+    let page = query_gallery_map_cluster_entries_in_transaction(
+        &transaction,
+        query,
+        history_id,
+        revision,
+    )?;
+    transaction.commit()?;
+    Ok(page)
+}
+
 /// Binds the shared gallery scope parameters in the order `scope` expects them,
 /// so that label predicates can be appended with the placeholders that follow.
 fn gallery_scope_values(
@@ -735,6 +954,449 @@ fn query_gallery_index_in_transaction(
     })
 }
 
+const GALLERY_MAP_SCOPE_SQL: &str = "
+    (?1 = '' OR gallery_objects.key = ?1 OR gallery_objects.key LIKE ?2 ESCAPE '\\')
+    AND CASE
+        WHEN ?1 = '' THEN CASE
+            WHEN trim(gallery_objects.key, '/') = '' THEN 0
+            ELSE length(trim(gallery_objects.key, '/'))
+                 - length(replace(trim(gallery_objects.key, '/'), '/', '')) + 1
+        END
+        WHEN gallery_objects.key = ?1 THEN 0
+        ELSE length(substr(gallery_objects.key, length(?1) + 2))
+             - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
+    END <= ?3
+    AND gallery_objects.inferred_media_type IS NOT NULL
+    AND (?4 IS NULL OR gallery_objects.media_type = ?4)";
+
+const GALLERY_MAP_VIEWPORT_SQL: &str = "
+    gallery_objects.latitude BETWEEN ?5 AND ?6
+    AND (
+        (?7 <= ?8 AND gallery_objects.longitude BETWEEN ?7 AND ?8)
+        OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
+    )
+    AND gallery_objects.spatial_y BETWEEN ?9 AND ?10
+    AND (
+        (?11 <= ?12 AND gallery_objects.spatial_x BETWEEN ?11 AND ?12)
+        OR (?11 > ?12 AND (gallery_objects.spatial_x >= ?11 OR gallery_objects.spatial_x <= ?12))
+    )";
+
+fn sqlite_gallery_map_scope_values(
+    prefix: &str,
+    prefix_pattern: &str,
+    depth: usize,
+    media_filter: super::GalleryIndexMediaFilter,
+    viewport: GalleryViewportBounds,
+) -> Result<Vec<Value>> {
+    let (spatial_west, spatial_south) =
+        gallery_web_mercator_position(viewport.south, viewport.west)
+            .context("validated gallery map southwest bound should project")?;
+    let (spatial_east, spatial_north) =
+        gallery_web_mercator_position(viewport.north, viewport.east)
+            .context("validated gallery map northeast bound should project")?;
+    Ok(vec![
+        Value::Text(prefix.to_string()),
+        Value::Text(prefix_pattern.to_string()),
+        Value::Integer(i64::try_from(depth).context("gallery map depth overflow")?),
+        media_filter
+            .media_type()
+            .map(|value| Value::Text(value.to_string()))
+            .unwrap_or(Value::Null),
+        Value::Real(viewport.south),
+        Value::Real(viewport.north),
+        Value::Real(viewport.west),
+        Value::Real(viewport.east),
+        Value::Real(spatial_north),
+        Value::Real(spatial_south),
+        Value::Real(spatial_west),
+        Value::Real(spatial_east),
+    ])
+}
+
+fn gallery_map_summary_from_db(
+    db: &Connection,
+    scope_values: &[Value],
+) -> Result<(usize, GalleryIndexMediaSummary)> {
+    let summary_sql = format!(
+        "SELECT
+             COUNT(*),
+             COALESCE(SUM(CASE WHEN media_status = 'ready' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_status IS NULL THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_status = 'incomplete' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_type = 'image' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(geotagged), 0)
+         FROM gallery_objects
+         WHERE {GALLERY_MAP_SCOPE_SQL}"
+    );
+    Ok(
+        db.query_row(&summary_sql, params_from_iter(scope_values.iter()), |row| {
+            let count = |index| {
+                row.get::<_, i64>(index).and_then(|value| {
+                    usize::try_from(value).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            index,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })
+                })
+            };
+            Ok((
+                count(0)?,
+                GalleryIndexMediaSummary {
+                    ready_count: count(1)?,
+                    pending_count: count(2)?,
+                    incomplete_count: count(3)?,
+                    image_count: count(4)?,
+                    video_count: count(5)?,
+                    geotagged_count: count(6)?,
+                },
+            ))
+        })?,
+    )
+}
+
+const GALLERY_MAP_SUMMARY_CHUNK_SQL: &str = "
+    SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
+           gallery_objects.geotagged
+    FROM gallery_objects
+    WHERE (?1 = '' OR gallery_objects.key = ?1 OR gallery_objects.key LIKE ?2 ESCAPE '\\')
+      AND CASE
+            WHEN ?1 = '' THEN CASE
+                WHEN trim(gallery_objects.key, '/') = '' THEN 0
+                ELSE length(trim(gallery_objects.key, '/'))
+                     - length(replace(trim(gallery_objects.key, '/'), '/', '')) + 1
+            END
+            WHEN gallery_objects.key = ?1 THEN 0
+            ELSE length(substr(gallery_objects.key, length(?1) + 2))
+                 - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
+        END <= ?3
+      AND gallery_objects.inferred_media_type IS NOT NULL
+      AND (?4 IS NULL OR gallery_objects.media_type = ?4)
+      AND (?5 IS NULL OR gallery_objects.key > ?5)
+    ORDER BY gallery_objects.key
+    LIMIT ?6";
+
+const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
+
+/// Same result as [`gallery_map_summary_from_db`], but computed in small ordered chunks so a
+/// caller can report coarse progress on a long-running background refresh instead of blocking on
+/// one unbounded aggregate query. `total_estimate` (typically the previous cached count for this
+/// scope) is only used to turn "rows scanned so far" into a percentage; it does not affect the
+/// exact result.
+fn gallery_map_summary_chunked_from_db(
+    db: &Connection,
+    scope_values: &[Value],
+    total_estimate: Option<usize>,
+    progress: &GallerySummaryProgress,
+) -> Result<(usize, GalleryIndexMediaSummary)> {
+    let mut statement = db.prepare_cached(GALLERY_MAP_SUMMARY_CHUNK_SQL)?;
+    let mut cursor: Option<String> = None;
+    let mut total = 0usize;
+    let mut summary = GalleryIndexMediaSummary::default();
+    loop {
+        let cursor_value = cursor.clone().map(Value::Text).unwrap_or(Value::Null);
+        let mut values = scope_values.to_vec();
+        values.push(cursor_value);
+        values.push(Value::Integer(GALLERY_MAP_SUMMARY_CHUNK_ROWS));
+        let mut rows = statement.query(params_from_iter(values))?;
+        let mut chunk_len = 0usize;
+        let mut last_key = None;
+        while let Some(row) = rows.next()? {
+            let key = row.get::<_, String>(0)?;
+            let media_status = row.get::<_, Option<String>>(1)?;
+            let media_type = row.get::<_, Option<String>>(2)?;
+            let geotagged = row.get::<_, i64>(3)?;
+            chunk_len += 1;
+            total += 1;
+            match media_status.as_deref() {
+                Some("ready") => summary.ready_count += 1,
+                None => summary.pending_count += 1,
+                Some("incomplete") => summary.incomplete_count += 1,
+                _ => {}
+            }
+            match media_type.as_deref() {
+                Some("image") => summary.image_count += 1,
+                Some("video") => summary.video_count += 1,
+                _ => {}
+            }
+            if geotagged != 0 {
+                summary.geotagged_count += 1;
+            }
+            last_key = Some(key);
+        }
+        if let Some(estimate) = total_estimate.filter(|value| *value > 0) {
+            let percent = ((total as f64 / estimate as f64) * 100.0).min(99.0) as u8;
+            progress.report(percent);
+        }
+        if chunk_len < GALLERY_MAP_SUMMARY_CHUNK_ROWS as usize {
+            break;
+        }
+        cursor = last_key;
+    }
+    Ok((total, summary))
+}
+
+fn gallery_map_cluster_cells_from_db(
+    db: &Connection,
+    base_values: &[Value],
+    requested_resolution: u32,
+    max_clusters: usize,
+) -> Result<(u32, Vec<GalleryMapCluster>)> {
+    let max_clusters = max_clusters.max(1);
+    let mut resolution = requested_resolution.max(1);
+    let clusters = loop {
+        let sql = format!(
+            "SELECT
+                 CAST(gallery_objects.spatial_x * ?13 AS INTEGER),
+                 CAST(gallery_objects.spatial_y * ?13 AS INTEGER),
+                 COUNT(*),
+                 AVG(gallery_objects.latitude),
+                 AVG(gallery_objects.longitude),
+                 MIN(gallery_objects.latitude),
+                 MAX(gallery_objects.latitude),
+                 MIN(gallery_objects.longitude),
+                 MAX(gallery_objects.longitude),
+                 MIN(gallery_objects.key),
+                 MIN(gallery_objects.manifest_hash),
+                 MIN(manifest_summaries.total_size_bytes),
+                 MIN(manifest_summaries.content_fingerprint),
+                 MIN(media_cache.metadata_json),
+                 MIN(version_indexes.index_json),
+                 MIN(gallery_objects.labels_json)
+             FROM gallery_objects
+             LEFT JOIN manifest_summaries
+               ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
+             LEFT JOIN media_cache
+               ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
+             LEFT JOIN version_indexes
+               ON version_indexes.object_id = gallery_objects.object_id
+             WHERE {GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
+             GROUP BY 1, 2
+             ORDER BY 2 ASC, 1 ASC
+             LIMIT ?14"
+        );
+        let mut values = base_values.to_vec();
+        values.push(Value::Integer(i64::from(resolution)));
+        values.push(Value::Integer(
+            i64::try_from(max_clusters.saturating_add(1))
+                .context("gallery map cluster limit overflow")?,
+        ));
+        let mut statement = db.prepare(&sql)?;
+        let mut rows = statement.query(params_from_iter(values))?;
+        let mut clusters = Vec::new();
+        while let Some(row) = rows.next()? {
+            let cell_x =
+                u32::try_from(row.get::<_, i64>(0)?).context("negative gallery map cell x")?;
+            let cell_y =
+                u32::try_from(row.get::<_, i64>(1)?).context("negative gallery map cell y")?;
+            let count = usize::try_from(row.get::<_, i64>(2)?)
+                .context("gallery map cluster count overflow")?;
+            let entry = if count == 1 {
+                Some(materialize_gallery_index_entry(
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                )?)
+            } else {
+                None
+            };
+            clusters.push(GalleryMapCluster {
+                cell_x,
+                cell_y,
+                count,
+                latitude: row.get(3)?,
+                longitude: row.get(4)?,
+                bounds: GalleryViewportBounds {
+                    south: row.get(5)?,
+                    north: row.get(6)?,
+                    west: row.get(7)?,
+                    east: row.get(8)?,
+                },
+                entry,
+            });
+        }
+        if clusters.len() <= max_clusters || resolution == 1 {
+            break clusters;
+        }
+        resolution = (resolution / 2).max(1);
+    };
+    Ok((resolution, clusters))
+}
+
+#[cfg(test)]
+fn query_gallery_map_clusters_in_transaction(
+    db: &Connection,
+    query: &GalleryMapClusterQuery,
+    history_id: String,
+    revision: u64,
+) -> Result<GalleryMapClusterPage> {
+    let prefix = query.prefix.trim().trim_matches('/').to_string();
+    let prefix_pattern = if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{prefix}/"))
+    };
+    let base_values = sqlite_gallery_map_scope_values(
+        &prefix,
+        &prefix_pattern,
+        query.depth,
+        query.media_filter,
+        query.viewport,
+    )?;
+    let (total_entry_count, media_summary) = gallery_map_summary_from_db(db, &base_values[..4])?;
+    let (resolution, clusters) = gallery_map_cluster_cells_from_db(
+        db,
+        &base_values,
+        gallery_map_bounded_resolution(
+            query.requested_resolution,
+            query.viewport,
+            query.max_clusters,
+        ),
+        query.max_clusters,
+    )?;
+    let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
+    Ok(GalleryMapClusterPage {
+        history_id,
+        revision,
+        total_entry_count,
+        media_summary,
+        visible_geotagged_count,
+        resolution,
+        clusters,
+        summary_status: GallerySummaryRefreshStatus::default(),
+    })
+}
+
+fn query_gallery_map_cluster_entries_in_transaction(
+    db: &Connection,
+    query: &GalleryMapClusterEntriesQuery,
+    history_id: String,
+    revision: u64,
+) -> Result<GalleryIndexPage> {
+    let prefix = query.prefix.trim().trim_matches('/').to_string();
+    let prefix_pattern = if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{prefix}/"))
+    };
+    let mut values = sqlite_gallery_map_scope_values(
+        &prefix,
+        &prefix_pattern,
+        query.depth,
+        query.media_filter,
+        query.viewport,
+    )?;
+    values.push(Value::Integer(i64::from(query.resolution.max(1))));
+    values.push(Value::Integer(i64::from(query.cell_x)));
+    values.push(Value::Integer(i64::from(query.cell_y)));
+    let cell_scope = format!(
+        "{GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
+         AND CAST(gallery_objects.spatial_x * ?13 AS INTEGER) = ?14
+         AND CAST(gallery_objects.spatial_y * ?13 AS INTEGER) = ?15"
+    );
+    let summary_sql = format!(
+        "SELECT
+             COUNT(*),
+             COALESCE(SUM(CASE WHEN media_status = 'ready' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_status IS NULL THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_status = 'incomplete' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_type = 'image' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
+             COUNT(*)
+         FROM gallery_objects
+         WHERE {cell_scope}"
+    );
+    let (total_entry_count, media_summary) =
+        db.query_row(&summary_sql, params_from_iter(values.iter()), |row| {
+            let count = |index| {
+                row.get::<_, i64>(index).and_then(|value| {
+                    usize::try_from(value).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            index,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })
+                })
+            };
+            Ok((
+                count(0)?,
+                GalleryIndexMediaSummary {
+                    ready_count: count(1)?,
+                    pending_count: count(2)?,
+                    incomplete_count: count(3)?,
+                    image_count: count(4)?,
+                    video_count: count(5)?,
+                    geotagged_count: count(6)?,
+                },
+            ))
+        })?;
+    let page_sql = format!(
+        "SELECT
+             gallery_objects.key,
+             gallery_objects.manifest_hash,
+             manifest_summaries.total_size_bytes,
+             manifest_summaries.content_fingerprint,
+             media_cache.metadata_json,
+             version_indexes.index_json,
+             gallery_objects.labels_json
+         FROM gallery_objects
+         LEFT JOIN manifest_summaries
+           ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
+         LEFT JOIN media_cache
+           ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
+         LEFT JOIN version_indexes
+           ON version_indexes.object_id = gallery_objects.object_id
+         WHERE {cell_scope}
+         ORDER BY gallery_objects.captured_at_unix DESC, gallery_objects.key ASC
+         LIMIT ?16 OFFSET ?17"
+    );
+    values.push(Value::Integer(
+        i64::try_from(query.limit.max(1)).context("gallery map entry limit overflow")?,
+    ));
+    values.push(Value::Integer(
+        i64::try_from(query.offset).context("gallery map entry offset overflow")?,
+    ));
+    let mut statement = db.prepare(&page_sql)?;
+    let rows = statement.query_map(params_from_iter(values), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (key, manifest_hash, size, fingerprint, metadata, version_index, labels_json) = row?;
+        entries.push(materialize_gallery_index_entry(
+            key,
+            manifest_hash,
+            size,
+            fingerprint,
+            metadata,
+            version_index,
+            labels_json,
+        )?);
+    }
+    Ok(GalleryIndexPage {
+        history_id,
+        revision,
+        total_entry_count,
+        media_summary,
+        entries,
+    })
+}
+
 fn materialize_gallery_index_entry(
     key: String,
     manifest_hash: String,
@@ -892,6 +1554,40 @@ fn current_gallery_revision_from_db(db: &Connection) -> Result<u64> {
     )?;
     raw.parse::<u64>()
         .with_context(|| format!("invalid persisted gallery revision: {raw}"))
+}
+
+/// Returns the most recent retained mutation that can affect a gallery map scope. Query tokens
+/// use this scoped revision rather than the library-wide revision so media ingestion elsewhere in
+/// a library does not repeatedly invalidate an open cluster or its pagination.
+fn current_gallery_scope_revision_from_db(
+    db: &Connection,
+    prefix: &str,
+    depth: usize,
+) -> Result<u64> {
+    let prefix_pattern = if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{prefix}/"))
+    };
+    let depth = i64::try_from(depth).context("gallery map scope depth overflow")?;
+    let revision = db.query_row(
+        "SELECT COALESCE(MAX(revision), 0)
+         FROM gallery_changes
+         WHERE (?1 = '' OR gallery_changes.key = ?1 OR gallery_changes.key LIKE ?2 ESCAPE '\\')
+           AND CASE
+               WHEN ?1 = '' THEN CASE
+                   WHEN trim(gallery_changes.key, '/') = '' THEN 0
+                   ELSE length(trim(gallery_changes.key, '/'))
+                        - length(replace(trim(gallery_changes.key, '/'), '/', '')) + 1
+               END
+               WHEN gallery_changes.key = ?1 THEN 0
+               ELSE length(substr(gallery_changes.key, length(?1) + 2))
+                    - length(replace(substr(gallery_changes.key, length(?1) + 2), '/', '')) + 1
+           END <= ?3",
+        params![prefix, prefix_pattern, depth],
+        |row| row.get::<_, i64>(0),
+    )?;
+    u64::try_from(revision).context("gallery map scope revision was negative")
 }
 
 fn current_gallery_history_id_from_db(db: &Connection) -> Result<String> {
@@ -1183,6 +1879,45 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<Option<GalleryIndexPage>> {
         let query = query.clone();
         self.read(move |db| query_gallery_index_from_db(db, &query).map(Some))
+            .await
+    }
+
+    async fn query_gallery_map_clusters(
+        &self,
+        query: &GalleryMapClusterQuery,
+    ) -> Result<Option<GalleryMapClusterPage>> {
+        let cluster_query = query.clone();
+        let (history_id, cache_revision, revision, resolution, visible_geotagged_count, clusters) =
+            self.read(move |db| query_gallery_map_cluster_cells_from_db(db, &cluster_query))
+                .await?;
+
+        let scope = GallerySummaryScope {
+            prefix: query.prefix.trim().trim_matches('/').to_string(),
+            depth: query.depth,
+            media_filter: query.media_filter,
+        };
+        let (total_entry_count, media_summary, summary_status) = self
+            .gallery_map_summary(scope, &history_id, cache_revision)
+            .await?;
+
+        Ok(Some(GalleryMapClusterPage {
+            history_id,
+            revision,
+            total_entry_count,
+            media_summary,
+            visible_geotagged_count,
+            resolution,
+            clusters,
+            summary_status,
+        }))
+    }
+
+    async fn query_gallery_map_cluster_entries(
+        &self,
+        query: &GalleryMapClusterEntriesQuery,
+    ) -> Result<Option<GalleryIndexPage>> {
+        let query = query.clone();
+        self.read(move |db| query_gallery_map_cluster_entries_from_db(db, &query).map(Some))
             .await
     }
 
@@ -3515,6 +4250,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             geotagged INTEGER NOT NULL DEFAULT 0,
             latitude REAL,
             longitude REAL,
+            spatial_x REAL,
+            spatial_y REAL,
             labels_json TEXT NOT NULL DEFAULT '[]'
         );
 
@@ -3747,6 +4484,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     )?;
     add_sqlite_column_if_missing(db, "gallery_objects", "latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "longitude", "REAL")?;
+    add_sqlite_column_if_missing(db, "gallery_objects", "spatial_x", "REAL")?;
+    add_sqlite_column_if_missing(db, "gallery_objects", "spatial_y", "REAL")?;
     add_sqlite_column_if_missing(
         db,
         "gallery_objects",
@@ -3773,6 +4512,26 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
          ON gallery_objects(latitude, longitude, media_type, captured_at_unix DESC, key ASC)",
         [],
     )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial
+         ON gallery_objects(spatial_y, spatial_x, media_type, key)",
+        [],
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial_backfill
+         ON gallery_objects(key)
+         WHERE geotagged != 0
+           AND latitude IS NOT NULL
+           AND longitude IS NOT NULL
+           AND (spatial_x IS NULL OR spatial_y IS NULL)",
+        [],
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gallery_changes_key_revision
+         ON gallery_changes(key, revision DESC)",
+        [],
+    )?;
+    backfill_gallery_spatial_positions(db)?;
     init_gallery_change_log(db)?;
     if let Err(err) = db.execute(
         "ALTER TABLE s3_access_keys ADD COLUMN allow_manage INTEGER NOT NULL DEFAULT 0",
@@ -3835,6 +4594,59 @@ fn add_sqlite_column_if_missing(
     {
         return Err(err).with_context(|| format!("failed to add {table}.{column}"));
     }
+    Ok(())
+}
+
+fn backfill_gallery_spatial_positions(db: &Connection) -> Result<()> {
+    let transaction = db.unchecked_transaction()?;
+    let mut select = transaction.prepare_cached(
+        "SELECT key, latitude, longitude
+         FROM gallery_objects
+         WHERE geotagged != 0
+           AND latitude IS NOT NULL
+           AND longitude IS NOT NULL
+           AND (spatial_x IS NULL OR spatial_y IS NULL)
+           AND (?1 IS NULL OR key > ?1)
+         ORDER BY key
+         LIMIT ?2",
+    )?;
+    let mut update = transaction.prepare_cached(
+        "UPDATE gallery_objects SET spatial_x = ?1, spatial_y = ?2 WHERE key = ?3",
+    )?;
+    let mut cursor: Option<String> = None;
+    loop {
+        let positions = select
+            .query_map(
+                params![cursor.as_deref(), GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if positions.is_empty() {
+            break;
+        }
+        let next_cursor = positions.last().map(|(key, _, _)| key.clone());
+        let completed = positions.len() < GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS as usize;
+        for (key, latitude, longitude) in positions {
+            let Some((spatial_x, spatial_y)) = gallery_web_mercator_position(latitude, longitude)
+            else {
+                continue;
+            };
+            update.execute(params![spatial_x, spatial_y, key])?;
+        }
+        cursor = next_cursor;
+        if completed {
+            break;
+        }
+    }
+    drop(update);
+    drop(select);
+    transaction.commit()?;
     Ok(())
 }
 

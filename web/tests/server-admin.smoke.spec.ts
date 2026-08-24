@@ -3,6 +3,7 @@ import { gzipSync } from "node:zlib";
 import type { GalleryMapConfiguration } from "@ironmesh/api";
 import { expect, test, type Page, type Route } from "@playwright/test";
 import { registerGalleryMapContractTests } from "./gallery-map.contract";
+import { GalleryMapMockSession } from "./gallery-map.mock";
 import {
   filterMockStoreEntriesToPrefix,
   projectMockStoreTreeEntries
@@ -1465,7 +1466,7 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
 
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("12 markers", { exact: true })).toBeVisible();
-  await expect(page.getByText("1 visible clusters", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 server cluster", { exact: true })).toBeVisible();
 
   const clusterButton = page.getByRole("button", {
     name: "Open map cluster with 12 items"
@@ -1484,7 +1485,7 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
   ).toBeVisible();
 });
 
-test("server-admin gallery only auto-zooms spread map clusters on ctrl-click", async ({ page }) => {
+test("server-admin gallery drills into geographically spread server clusters", async ({ page }) => {
   await installServerAdminMocks(page, {
     galleryEntries: createGeoSpreadClusteredAdminGalleryEntries(12)
   });
@@ -1503,7 +1504,7 @@ test("server-admin gallery only auto-zooms spread map clusters on ctrl-click", a
 
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("12 markers", { exact: true })).toBeVisible();
-  await expect(page.getByText("1 visible clusters", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 server cluster", { exact: true })).toBeVisible();
 
   const clusterButton = page.getByRole("button", {
     name: "Open map cluster with 12 items"
@@ -1514,14 +1515,8 @@ test("server-admin gallery only auto-zooms spread map clusters on ctrl-click", a
 
   await expect(clusterButton).toBeVisible();
   await clusterButton.click();
-  await expect(clusterDialogTitle).toBeVisible();
-
-  await page.keyboard.press("Escape");
   await expect(clusterDialogTitle).toHaveCount(0);
-
-  await clusterButton.click({ modifiers: ["Control"] });
-  await expect(clusterDialogTitle).toHaveCount(0);
-  await expect(page.getByText("1 visible clusters", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("1 server cluster", { exact: true })).toHaveCount(0);
 });
 
 test("server-admin provisioning falls back to the full bootstrap bundle when claim issuance returns 502", async ({ page }) => {
@@ -1805,6 +1800,7 @@ async function installServerAdminMocks(
     version_id: "rendezvous-contact-version-1"
   };
   const galleryEntries = options?.galleryEntries ?? createDefaultAdminGalleryEntries();
+  const galleryMapMock = new GalleryMapMockSession<AdminMockStoreEntry>();
   let storagePoolConfig: StoragePoolMockConfig = {
     version: 1,
     paths: [
@@ -2069,6 +2065,14 @@ async function installServerAdminMocks(
     if (pathname === apiV1("/auth/store/index") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
       return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
+    }
+
+    if (pathname === apiV1("/auth/store/map/clusters") && method === "GET") {
+      return json(route, galleryMapMock.clusters(galleryEntries, searchParams));
+    }
+
+    if (pathname === apiV1("/auth/store/map/cluster-entries") && method === "GET") {
+      return json(route, galleryMapMock.clusterEntries(searchParams));
     }
 
     if (pathname === apiV1("/auth/client-connections") && method === "GET") {
@@ -3638,7 +3642,7 @@ function createGeoSpreadClusteredAdminGalleryEntries(count: number): AdminMockSt
 
   return Array.from({ length: count }, (_, index) => {
     const path = `gallery/spread-cluster-${String(index + 1).padStart(2, "0")}.png`;
-    const offset = (index - centerOffset) * 0.0003;
+    const offset = (index - centerOffset) * 0.02;
 
     return {
       path,

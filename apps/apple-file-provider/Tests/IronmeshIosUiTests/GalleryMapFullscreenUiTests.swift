@@ -51,7 +51,10 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         XCTAssertTrue(cluster.waitForExistence(timeout: 45), "The Gallery map should expose its cluster")
         cluster.tap()
         let firstImage = element(in: webView, labelled: "gallery/runtime-map-a.png")
-        XCTAssertTrue(firstImage.waitForExistence(timeout: 10), "The cluster chooser should expose an image")
+        guard firstImage.waitForExistence(timeout: 45) else {
+            XCTFail("The cluster chooser should expose an image after loading its server page")
+            return
+        }
         firstImage.tap()
 
         XCTAssertTrue(

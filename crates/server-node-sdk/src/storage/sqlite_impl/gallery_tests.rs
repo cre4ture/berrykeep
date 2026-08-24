@@ -21,11 +21,15 @@ fn insert_gallery_fixture(
     latitude: Option<f64>,
     longitude: Option<f64>,
 ) {
+    let spatial_position = latitude
+        .zip(longitude)
+        .and_then(|(latitude, longitude)| gallery_web_mercator_position(latitude, longitude));
     db.execute(
         "INSERT INTO gallery_objects (
              key, manifest_hash, object_id, inferred_media_type, media_type,
-             captured_at_unix, media_status, geotagged, latitude, longitude
-         ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, 'ready', ?6, ?7, ?8)",
+             captured_at_unix, media_status, geotagged, latitude, longitude,
+             spatial_x, spatial_y
+         ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, 'ready', ?6, ?7, ?8, ?9, ?10)",
         params![
             key,
             format!("manifest-{key}"),
@@ -35,6 +39,8 @@ fn insert_gallery_fixture(
             if latitude.is_some() { 1 } else { 0 },
             latitude,
             longitude,
+            spatial_position.map(|position| position.0),
+            spatial_position.map(|position| position.1),
         ],
     )
     .expect("gallery fixture should insert");
@@ -367,6 +373,387 @@ fn gallery_viewport_query_filters_and_wraps_antimeridian() {
     );
     assert_eq!(dateline.total_entry_count, 2);
     assert_eq!(dateline.media_summary.geotagged_count, 2);
+}
+
+fn gallery_map_query(
+    viewport: GalleryViewportBounds,
+    requested_resolution: u32,
+    max_clusters: usize,
+) -> GalleryMapClusterQuery {
+    GalleryMapClusterQuery {
+        prefix: "gallery".to_string(),
+        depth: 64,
+        media_filter: GalleryIndexMediaFilter::Image,
+        viewport,
+        requested_resolution,
+        max_clusters,
+    }
+}
+
+#[test]
+fn gallery_map_clusters_are_bounded_and_preserve_scope_summary() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    insert_gallery_fixture(
+        &db,
+        "gallery/zurich.jpg",
+        "image",
+        30,
+        Some(47.4),
+        Some(8.5),
+    );
+    insert_gallery_fixture(
+        &db,
+        "gallery/new-york.jpg",
+        "image",
+        20,
+        Some(40.7),
+        Some(-74.0),
+    );
+    insert_gallery_fixture(
+        &db,
+        "gallery/sydney.jpg",
+        "image",
+        10,
+        Some(-33.9),
+        Some(151.2),
+    );
+    insert_gallery_fixture(&db, "gallery/no-gps.jpg", "image", 40, None, None);
+    insert_gallery_fixture(&db, "gallery/video.mp4", "video", 50, Some(47.4), Some(8.5));
+
+    let page = query_gallery_map_clusters_from_db(
+        &db,
+        &gallery_map_query(
+            GalleryViewportBounds {
+                south: -90.0,
+                west: -180.0,
+                north: 90.0,
+                east: 180.0,
+            },
+            4096,
+            1,
+        ),
+    )
+    .expect("gallery clusters should load");
+
+    assert_eq!(page.total_entry_count, 4);
+    assert_eq!(page.media_summary.image_count, 4);
+    assert_eq!(page.media_summary.video_count, 0);
+    assert_eq!(page.media_summary.geotagged_count, 3);
+    assert_eq!(page.visible_geotagged_count, 3);
+    assert_eq!(page.clusters.len(), 1);
+    assert!(page.resolution < 4096);
+    assert_eq!(page.clusters[0].count, 3);
+    assert!(page.clusters[0].entry.is_none());
+}
+
+#[tokio::test]
+async fn gallery_map_summary_cache_serves_stale_value_and_refreshes_in_background() {
+    let metadata_db_path = sqlite_test_db_path("gallery-map-summary-cache");
+    let store = SqliteMetadataStore::open(&metadata_db_path)
+        .await
+        .expect("sqlite metadata store should open");
+    store
+        .write_tx(|db| {
+            insert_gallery_fixture(db, "gallery/a.jpg", "image", 1, Some(47.4), Some(8.5));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let viewport = GalleryViewportBounds {
+        south: -90.0,
+        west: -180.0,
+        north: 90.0,
+        east: 180.0,
+    };
+    let query = gallery_map_query(viewport, 1024, 512);
+
+    // Cold cache: computed synchronously, so the very first caller still gets a real answer.
+    let first = store
+        .query_gallery_map_clusters(&query)
+        .await
+        .unwrap()
+        .expect("gallery map clusters should be available");
+    assert_eq!(first.total_entry_count, 1);
+    assert!(!first.summary_status.refreshing);
+
+    store
+        .write_tx(|db| {
+            insert_gallery_fixture(db, "gallery/b.jpg", "image", 2, Some(47.4), Some(8.5));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // Warm but stale cache: the (now outdated) cached summary is served immediately rather than
+    // blocking this request on a recompute, while a background refresh is kicked off.
+    let second = store
+        .query_gallery_map_clusters(&query)
+        .await
+        .unwrap()
+        .expect("gallery map clusters should be available");
+    assert_eq!(second.total_entry_count, 1);
+    assert!(second.summary_status.refreshing);
+    // The viewport-bounded clusters themselves are never served from the summary cache.
+    assert_eq!(second.visible_geotagged_count, 2);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let refreshed = store
+            .query_gallery_map_clusters(&query)
+            .await
+            .unwrap()
+            .expect("gallery map clusters should be available");
+        if refreshed.total_entry_count == 2 && !refreshed.summary_status.refreshing {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background gallery map summary refresh did not complete in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    drop(store);
+    let _ = std::fs::remove_file(metadata_db_path);
+}
+
+#[test]
+fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    insert_gallery_fixture(&db, "gallery/older.jpg", "image", 10, Some(47.4), Some(8.5));
+    insert_gallery_fixture(&db, "gallery/newer.jpg", "image", 20, Some(47.4), Some(8.5));
+
+    let viewport = GalleryViewportBounds {
+        south: 45.0,
+        west: 5.0,
+        north: 49.0,
+        east: 11.0,
+    };
+    let clusters = query_gallery_map_clusters_from_db(&db, &gallery_map_query(viewport, 1024, 512))
+        .expect("gallery clusters should load");
+    assert_eq!(clusters.clusters.len(), 1);
+    let cluster = &clusters.clusters[0];
+    assert_eq!(cluster.count, 2);
+    assert!(cluster.entry.is_none());
+
+    let first_page = query_gallery_map_cluster_entries_from_db(
+        &db,
+        &GalleryMapClusterEntriesQuery {
+            prefix: "gallery".to_string(),
+            depth: 64,
+            media_filter: GalleryIndexMediaFilter::Image,
+            viewport,
+            resolution: clusters.resolution,
+            cell_x: cluster.cell_x,
+            cell_y: cluster.cell_y,
+            offset: 0,
+            limit: 1,
+        },
+    )
+    .expect("first cluster entry page should load");
+    assert_eq!(first_page.total_entry_count, 2);
+    assert_eq!(first_page.entries.len(), 1);
+    assert_eq!(first_page.entries[0].key, "gallery/newer.jpg");
+
+    let second_page = query_gallery_map_cluster_entries_from_db(
+        &db,
+        &GalleryMapClusterEntriesQuery {
+            prefix: "gallery".to_string(),
+            depth: 64,
+            media_filter: GalleryIndexMediaFilter::Image,
+            viewport,
+            resolution: clusters.resolution,
+            cell_x: cluster.cell_x,
+            cell_y: cluster.cell_y,
+            offset: 1,
+            limit: 1,
+        },
+    )
+    .expect("second cluster entry page should load");
+    assert_eq!(second_page.entries.len(), 1);
+    assert_eq!(second_page.entries[0].key, "gallery/older.jpg");
+    assert_eq!(first_page.history_id, clusters.history_id);
+    assert_eq!(first_page.revision, clusters.revision);
+}
+
+#[test]
+fn gallery_spatial_backfill_restores_missing_positions() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    db.execute(
+        "INSERT INTO gallery_objects(
+             key, manifest_hash, object_id, inferred_media_type, media_type,
+             captured_at_unix, media_status, geotagged, latitude, longitude
+         ) VALUES (?1, ?2, ?3, 'image', 'image', 1, 'ready', 1, 47.4, 8.5)",
+        params!["gallery/missing-position.jpg", "manifest", "object"],
+    )
+    .expect("gallery fixture should insert");
+
+    backfill_gallery_spatial_positions(&db).expect("spatial positions should backfill");
+    let (spatial_x, spatial_y) = db
+        .query_row(
+            "SELECT spatial_x, spatial_y FROM gallery_objects WHERE key = ?1",
+            ["gallery/missing-position.jpg"],
+            |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?)),
+        )
+        .expect("backfilled gallery fixture should load");
+    assert!(spatial_x.is_some());
+    assert!(spatial_y.is_some());
+}
+
+#[tokio::test]
+async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope() {
+    let metadata_db_path = sqlite_test_db_path("gallery-map-token-scope");
+    let store = SqliteMetadataStore::open(&metadata_db_path)
+        .await
+        .expect("sqlite metadata store should open");
+    store
+        .write_tx(|db| {
+            insert_gallery_fixture(db, "gallery/a.jpg", "image", 10, Some(47.4), Some(8.5));
+            insert_gallery_fixture(db, "gallery/b.jpg", "image", 20, Some(47.4), Some(8.5));
+            Ok(())
+        })
+        .await
+        .expect("gallery fixtures should persist");
+
+    let viewport = GalleryViewportBounds {
+        south: 45.0,
+        west: 5.0,
+        north: 49.0,
+        east: 11.0,
+    };
+    let clusters = store
+        .query_gallery_map_clusters(&gallery_map_query(viewport, 1024, 512))
+        .await
+        .expect("gallery map clusters should load")
+        .expect("sqlite should support gallery map clusters");
+    let cluster = clusters
+        .clusters
+        .first()
+        .expect("fixture should produce one map cluster");
+
+    store
+        .write_tx(|db| {
+            insert_gallery_fixture(
+                db,
+                "elsewhere/noise.jpg",
+                "image",
+                30,
+                Some(40.7),
+                Some(-74.0),
+            );
+            Ok(())
+        })
+        .await
+        .expect("out-of-scope fixture should persist");
+
+    let page = store
+        .query_gallery_map_cluster_entries(&GalleryMapClusterEntriesQuery {
+            prefix: "gallery".to_string(),
+            depth: 64,
+            media_filter: GalleryIndexMediaFilter::Image,
+            viewport,
+            resolution: clusters.resolution,
+            cell_x: cluster.cell_x,
+            cell_y: cluster.cell_y,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("cluster page should load after unrelated ingest")
+        .expect("sqlite should support cluster pages");
+
+    assert_eq!(page.history_id, clusters.history_id);
+    assert_eq!(page.revision, clusters.revision);
+
+    store
+        .write_tx(|db| {
+            db.execute(
+                "UPDATE gallery_objects SET captured_at_unix = 40 WHERE key = 'gallery/a.jpg'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("in-scope fixture should update");
+    let changed_page = store
+        .query_gallery_map_cluster_entries(&GalleryMapClusterEntriesQuery {
+            prefix: "gallery".to_string(),
+            depth: 64,
+            media_filter: GalleryIndexMediaFilter::Image,
+            viewport,
+            resolution: clusters.resolution,
+            cell_x: cluster.cell_x,
+            cell_y: cluster.cell_y,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("cluster page should load after in-scope change")
+        .expect("sqlite should support cluster pages");
+    assert_ne!(changed_page.revision, clusters.revision);
+
+    drop(store);
+    let _ = std::fs::remove_file(metadata_db_path);
+}
+
+#[test]
+fn gallery_map_clusters_filter_an_antimeridian_viewport() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    insert_gallery_fixture(
+        &db,
+        "gallery/fiji.jpg",
+        "image",
+        30,
+        Some(-17.7),
+        Some(178.1),
+    );
+    insert_gallery_fixture(
+        &db,
+        "gallery/samoa.jpg",
+        "image",
+        20,
+        Some(-13.8),
+        Some(-171.8),
+    );
+    insert_gallery_fixture(
+        &db,
+        "gallery/zurich.jpg",
+        "image",
+        10,
+        Some(47.4),
+        Some(8.5),
+    );
+
+    let page = query_gallery_map_clusters_from_db(
+        &db,
+        &gallery_map_query(
+            GalleryViewportBounds {
+                south: -20.0,
+                west: 170.0,
+                north: -10.0,
+                east: -170.0,
+            },
+            1024,
+            512,
+        ),
+    )
+    .expect("antimeridian clusters should load");
+
+    assert_eq!(page.total_entry_count, 3);
+    assert_eq!(page.media_summary.geotagged_count, 3);
+    assert_eq!(page.visible_geotagged_count, 2);
+    assert_eq!(
+        page.clusters
+            .iter()
+            .map(|cluster| cluster.count)
+            .sum::<usize>(),
+        2
+    );
 }
 
 #[test]

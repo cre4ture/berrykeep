@@ -82,6 +82,59 @@ export type StoreIndexViewport = {
   east: number;
 };
 
+export type GalleryMapBounds = StoreIndexViewport;
+
+export type GalleryMapCluster = {
+  cluster_id: string;
+  count: number;
+  latitude: number;
+  longitude: number;
+  bounds: GalleryMapBounds;
+  entry?: StoreIndexEntry | null;
+};
+
+export type GallerySummaryStatus = {
+  refreshing: boolean;
+  progress_percent?: number | null;
+};
+
+export type GalleryMapClustersResponse = {
+  prefix: string;
+  depth: number;
+  zoom: number;
+  resolution: number;
+  total_entry_count: number;
+  visible_geotagged_count: number;
+  media_summary: StoreIndexMediaSummary;
+  /**
+   * Whether `total_entry_count`/`media_summary` may lag behind the current gallery state and,
+   * if so, roughly how far along the server's background refresh is. Missing on older servers,
+   * which never lagged because they always recomputed the summary synchronously.
+   */
+  summary_status?: GallerySummaryStatus | null;
+  query_token: string;
+  clusters: GalleryMapCluster[];
+};
+
+export type GalleryMapClusterEntriesResponse = {
+  cluster_id: string;
+  entry_count: number;
+  total_entry_count: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
+  query_token: string;
+  entries: StoreIndexEntry[];
+};
+
+export type GalleryMapClustersRequest = {
+  prefix?: string;
+  depth: number;
+  mediaFilter: StoreListMediaFilter;
+  viewport: StoreIndexViewport;
+  zoom: number;
+};
+
 export type StoreListView = "raw" | "tree";
 
 export type StoreListSortOrder =

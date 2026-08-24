@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
+use tracing::warn;
 use turso::transaction::{DropBehavior, Transaction, TransactionBehavior};
 use turso::{Value, params_from_iter};
 use uuid::Uuid;
@@ -10,17 +11,22 @@ use super::super::{
     GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY, GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION,
     GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
     GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaFilter,
-    GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery, ManifestSummary,
-    current_media_cache_metadata, decode_gallery_labels, effective_gallery_captured_at_unix,
-    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_label_filter_matches_json, gallery_label_predicates, gallery_media_type_for_path,
-    sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
+    GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster,
+    GalleryMapClusterEntriesQuery, GalleryMapClusterPage, GalleryMapClusterQuery,
+    GallerySummaryCacheValue, GallerySummaryProgress, GallerySummaryRefreshStatus,
+    GallerySummaryScope, GalleryViewportBounds, ManifestSummary, current_media_cache_metadata,
+    decode_gallery_labels, effective_gallery_captured_at_unix, encode_gallery_labels,
+    gallery_index_media_status, gallery_index_media_type_from_metadata,
+    gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
+    gallery_media_type_for_path, gallery_web_mercator_position, sqlite_like_prefix_pattern,
+    version_created_at_unix_from_payload,
 };
 #[cfg(test)]
 use super::turso_test_db_path;
 use super::{TursoMetadataStore, row_string, row_u64};
 
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
+const GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS: i64 = 1_000;
 
 #[derive(Debug, PartialEq)]
 struct GalleryProjectionState {
@@ -48,6 +54,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                 geotagged INTEGER NOT NULL DEFAULT 0,
                 latitude REAL,
                 longitude REAL,
+                spatial_x REAL,
+                spatial_y REAL,
                 labels_json TEXT NOT NULL DEFAULT '[]'
             );
 
@@ -68,11 +76,34 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                 ON gallery_objects(manifest_hash);
             CREATE INDEX IF NOT EXISTS idx_gallery_objects_viewport
                 ON gallery_objects(latitude, longitude, media_type, captured_at_unix DESC, key ASC);
+            CREATE INDEX IF NOT EXISTS idx_gallery_changes_key_revision
+                ON gallery_changes(key, revision DESC);
             CREATE INDEX IF NOT EXISTS idx_manifest_summaries_content_fingerprint
                 ON manifest_summaries(content_fingerprint);
             ",
         )
         .await?;
+    add_gallery_projection_column(connection, "spatial_x", "REAL").await?;
+    add_gallery_projection_column(connection, "spatial_y", "REAL").await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial
+             ON gallery_objects(spatial_y, spatial_x, media_type, key)",
+            (),
+        )
+        .await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial_backfill
+             ON gallery_objects(key)
+             WHERE geotagged != 0
+               AND latitude IS NOT NULL
+               AND longitude IS NOT NULL
+               AND (spatial_x IS NULL OR spatial_y IS NULL)",
+            (),
+        )
+        .await?;
+    backfill_gallery_spatial_positions(connection).await?;
     super::add_column_if_missing(
         connection,
         "gallery_objects",
@@ -195,6 +226,82 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
         .execute_batch(&trigger_sql)
         .await
         .context("failed to initialize Turso gallery change log")
+}
+
+async fn add_gallery_projection_column(
+    connection: &turso::Connection,
+    column: &str,
+    column_type: &str,
+) -> Result<()> {
+    let sql = format!("ALTER TABLE gallery_objects ADD COLUMN {column} {column_type}");
+    if let Err(error) = connection.execute(&sql, ()).await
+        && !error.to_string().contains("duplicate column name")
+    {
+        return Err(error).with_context(|| format!("failed adding gallery_objects.{column}"));
+    }
+    Ok(())
+}
+
+async fn backfill_gallery_spatial_positions(connection: &turso::Connection) -> Result<()> {
+    let transaction =
+        Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
+    let result = async {
+        let mut cursor: Option<String> = None;
+        loop {
+            let cursor_value = cursor.clone().map(Value::from).unwrap_or(Value::Null);
+            let mut rows = transaction
+                .query(
+                    "SELECT key, latitude, longitude
+                     FROM gallery_objects
+                     WHERE geotagged != 0
+                       AND latitude IS NOT NULL
+                       AND longitude IS NOT NULL
+                       AND (spatial_x IS NULL OR spatial_y IS NULL)
+                       AND (?1 IS NULL OR key > ?1)
+                     ORDER BY key
+                     LIMIT ?2",
+                    params_from_iter([
+                        cursor_value,
+                        Value::from(GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS),
+                    ]),
+                )
+                .await?;
+            let mut positions = Vec::new();
+            while let Some(row) = rows.next().await? {
+                positions.push((
+                    row_string(&row, 0, "gallery_objects.key")?,
+                    row_f64(&row, 1, "gallery_objects.latitude")?,
+                    row_f64(&row, 2, "gallery_objects.longitude")?,
+                ));
+            }
+            drop(rows);
+            if positions.is_empty() {
+                break;
+            }
+            let next_cursor = positions.last().map(|(key, _, _)| key.clone());
+            let completed = positions.len() < GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS as usize;
+            for (key, latitude, longitude) in positions {
+                let Some((spatial_x, spatial_y)) =
+                    gallery_web_mercator_position(latitude, longitude)
+                else {
+                    continue;
+                };
+                transaction
+                    .execute(
+                        "UPDATE gallery_objects SET spatial_x = ?1, spatial_y = ?2 WHERE key = ?3",
+                        (spatial_x, spatial_y, key),
+                    )
+                    .await?;
+            }
+            cursor = next_cursor;
+            if completed {
+                break;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    finish_gallery_transaction(transaction, result).await
 }
 
 impl TursoMetadataStore {
@@ -505,13 +612,149 @@ impl TursoMetadataStore {
         &self,
         query: &GalleryIndexQuery,
     ) -> Result<GalleryIndexPage> {
-        let connection = self.gallery_read_connection().await;
+        let connection = self.gallery_read_connection().await?;
         let transaction =
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
         let result = async {
             let history_id = current_gallery_history_id(&transaction).await?;
             let revision = current_gallery_revision(&transaction).await?;
             query_gallery_index(&transaction, query, history_id, revision).await
+        }
+        .await;
+        finish_gallery_read_transaction(transaction, result).await
+    }
+
+    pub(super) async fn query_turso_gallery_map_clusters(
+        &self,
+        query: &GalleryMapClusterQuery,
+    ) -> Result<GalleryMapClusterPage> {
+        let (history_id, cache_revision, revision, resolution, visible_geotagged_count, clusters) = {
+            let connection = self.gallery_read_connection().await?;
+            let transaction =
+                Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
+            let result = async {
+                let history_id = current_gallery_history_id(&transaction).await?;
+                let cache_revision = current_gallery_revision(&transaction).await?;
+                let revision = current_gallery_scope_revision(
+                    &transaction,
+                    query.prefix.trim().trim_matches('/'),
+                    query.depth,
+                )
+                .await?;
+                let (resolution, visible_geotagged_count, clusters) =
+                    query_gallery_map_cluster_cells(&transaction, query).await?;
+                Ok((
+                    history_id,
+                    cache_revision,
+                    revision,
+                    resolution,
+                    visible_geotagged_count,
+                    clusters,
+                ))
+            }
+            .await;
+            finish_gallery_read_transaction(transaction, result).await?
+        };
+
+        let scope = GallerySummaryScope {
+            prefix: query.prefix.trim().trim_matches('/').to_string(),
+            depth: query.depth,
+            media_filter: query.media_filter,
+        };
+        let (total_entry_count, media_summary, summary_status) = self
+            .gallery_map_summary(scope, &history_id, cache_revision)
+            .await?;
+
+        Ok(GalleryMapClusterPage {
+            history_id,
+            revision,
+            total_entry_count,
+            media_summary,
+            visible_geotagged_count,
+            resolution,
+            clusters,
+            summary_status,
+        })
+    }
+
+    /// Returns the whole-scope gallery map summary for `scope`, serving a cached (possibly
+    /// stale) value immediately rather than blocking the caller on the underlying aggregate
+    /// query. See `SqliteMetadataStore::gallery_map_summary` for the same policy on the SQLite
+    /// backend.
+    async fn gallery_map_summary(
+        &self,
+        scope: GallerySummaryScope,
+        history_id: &str,
+        revision: u64,
+    ) -> Result<(usize, GalleryIndexMediaSummary, GallerySummaryRefreshStatus)> {
+        if let Some(cached) = self.gallery_map_summary_cache.cached(&scope) {
+            if cached.history_id == history_id && cached.revision == revision {
+                return Ok((
+                    cached.total_entry_count,
+                    cached.media_summary,
+                    GallerySummaryRefreshStatus::default(),
+                ));
+            }
+            if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
+                let connections = self.gallery_summary_read_connection_factory();
+                let cache = self.gallery_map_summary_cache.clone();
+                let refresh_scope = scope.clone();
+                let estimate = Some(cached.total_entry_count);
+                tokio::spawn(async move {
+                    let result = match connections.open().await {
+                        Ok(connection) => {
+                            let result = query_gallery_map_summary(
+                                &connection,
+                                &refresh_scope,
+                                estimate,
+                                Some(&progress),
+                            )
+                            .await;
+                            drop(connection);
+                            result
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(value) => cache.store(refresh_scope.clone(), value),
+                        Err(error) => {
+                            warn!(error = %error, "failed to refresh gallery map summary in background")
+                        }
+                    }
+                    cache.finish_refresh(&refresh_scope);
+                });
+            }
+            let status = self.gallery_map_summary_cache.status(&scope);
+            return Ok((cached.total_entry_count, cached.media_summary, status));
+        }
+
+        let connection = self.gallery_read_connection().await?;
+        let value = query_gallery_map_summary(&connection, &scope, None, None).await?;
+        drop(connection);
+        self.gallery_map_summary_cache.store(scope, value.clone());
+        Ok((
+            value.total_entry_count,
+            value.media_summary,
+            GallerySummaryRefreshStatus::default(),
+        ))
+    }
+
+    pub(super) async fn query_turso_gallery_map_cluster_entries(
+        &self,
+        query: &GalleryMapClusterEntriesQuery,
+    ) -> Result<GalleryIndexPage> {
+        let connection = self.gallery_read_connection().await?;
+        let transaction =
+            Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
+        let result = async {
+            let history_id = current_gallery_history_id(&transaction).await?;
+            let revision = current_gallery_scope_revision(
+                &transaction,
+                query.prefix.trim().trim_matches('/'),
+                query.depth,
+            )
+            .await?;
+            query_gallery_map_cluster_entries(&transaction, query, history_id, revision).await
         }
         .await;
         finish_gallery_read_transaction(transaction, result).await
@@ -524,7 +767,7 @@ impl TursoMetadataStore {
         limit: usize,
         scope: &GalleryDeltaScope,
     ) -> Result<std::result::Result<GalleryDeltaPage, GalleryDeltaCursorError>> {
-        let connection = self.gallery_read_connection().await;
+        let connection = self.gallery_read_connection().await?;
         let transaction =
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
         let result =
@@ -576,8 +819,9 @@ async fn upsert_gallery_object(
         .execute(
             "INSERT INTO gallery_objects (
                  key, manifest_hash, object_id, inferred_media_type, media_type,
-                 captured_at_unix, media_status, geotagged, latitude, longitude
-             ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL)
+                 captured_at_unix, media_status, geotagged, latitude, longitude,
+                 spatial_x, spatial_y
+             ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL)
              ON CONFLICT(key) DO UPDATE SET
                  manifest_hash = excluded.manifest_hash,
                  object_id = excluded.object_id,
@@ -587,7 +831,9 @@ async fn upsert_gallery_object(
                  media_status = NULL,
                  geotagged = 0,
                  latitude = NULL,
-                 longitude = NULL
+                 longitude = NULL,
+                 spatial_x = NULL,
+                 spatial_y = NULL
              WHERE gallery_objects.manifest_hash != excluded.manifest_hash
                 OR gallery_objects.object_id != excluded.object_id
                 OR gallery_objects.inferred_media_type IS NOT excluded.inferred_media_type",
@@ -634,6 +880,8 @@ async fn refresh_gallery_objects_for_manifest(
                 && gps.longitude.is_finite()
                 && (-180.0..=180.0).contains(&gps.longitude)
         });
+    let spatial_position =
+        gps.and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
     let mut rows = connection
         .query(
             "SELECT gallery_objects.key, version_indexes.index_json
@@ -672,8 +920,10 @@ async fn refresh_gallery_objects_for_manifest(
                      media_status = ?3,
                      geotagged = ?4,
                      latitude = ?5,
-                     longitude = ?6
-                 WHERE key = ?7",
+                     longitude = ?6,
+                     spatial_x = ?7,
+                     spatial_y = ?8
+                 WHERE key = ?9",
                 params_from_iter(vec![
                     optional_text_value(media_type),
                     Value::from(
@@ -684,6 +934,12 @@ async fn refresh_gallery_objects_for_manifest(
                     gps.map(|gps| Value::from(gps.latitude))
                         .unwrap_or(Value::Null),
                     gps.map(|gps| Value::from(gps.longitude))
+                        .unwrap_or(Value::Null),
+                    spatial_position
+                        .map(|position| Value::from(position.0))
+                        .unwrap_or(Value::Null),
+                    spatial_position
+                        .map(|position| Value::from(position.1))
                         .unwrap_or(Value::Null),
                     Value::from(key),
                 ]),
@@ -1038,6 +1294,516 @@ async fn query_gallery_index(
     })
 }
 
+const GALLERY_MAP_SCOPE_SQL: &str = "
+    (?1 = '' OR gallery_objects.key = ?1 OR gallery_objects.key LIKE ?2 ESCAPE '\\')
+    AND CASE
+        WHEN ?1 = '' THEN CASE
+            WHEN trim(gallery_objects.key, '/') = '' THEN 0
+            ELSE length(trim(gallery_objects.key, '/'))
+                 - length(replace(trim(gallery_objects.key, '/'), '/', '')) + 1
+        END
+        WHEN gallery_objects.key = ?1 THEN 0
+        ELSE length(substr(gallery_objects.key, length(?1) + 2))
+             - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
+    END <= ?3
+    AND gallery_objects.inferred_media_type IS NOT NULL
+    AND (?4 IS NULL OR gallery_objects.media_type = ?4)";
+
+const GALLERY_MAP_VIEWPORT_SQL: &str = "
+    gallery_objects.latitude BETWEEN ?5 AND ?6
+    AND (
+        (?7 <= ?8 AND gallery_objects.longitude BETWEEN ?7 AND ?8)
+        OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
+    )
+    AND gallery_objects.spatial_y BETWEEN ?9 AND ?10
+    AND (
+        (?11 <= ?12 AND gallery_objects.spatial_x BETWEEN ?11 AND ?12)
+        OR (?11 > ?12 AND (gallery_objects.spatial_x >= ?11 OR gallery_objects.spatial_x <= ?12))
+    )";
+
+fn turso_gallery_map_scope_values(
+    prefix: &str,
+    prefix_pattern: &str,
+    depth: usize,
+    media_filter: GalleryIndexMediaFilter,
+    viewport: GalleryViewportBounds,
+) -> Result<Vec<Value>> {
+    let (spatial_west, spatial_south) =
+        gallery_web_mercator_position(viewport.south, viewport.west)
+            .context("validated gallery map southwest bound should project")?;
+    let (spatial_east, spatial_north) =
+        gallery_web_mercator_position(viewport.north, viewport.east)
+            .context("validated gallery map northeast bound should project")?;
+    Ok(vec![
+        Value::from(prefix),
+        Value::from(prefix_pattern),
+        Value::from(i64::try_from(depth).context("gallery map depth overflow")?),
+        optional_text_value(media_filter.media_type()),
+        Value::from(viewport.south),
+        Value::from(viewport.north),
+        Value::from(viewport.west),
+        Value::from(viewport.east),
+        Value::from(spatial_north),
+        Value::from(spatial_south),
+        Value::from(spatial_west),
+        Value::from(spatial_east),
+    ])
+}
+
+async fn gallery_map_summary_query(
+    connection: &turso::Connection,
+    scope_values: &[Value],
+) -> Result<(usize, GalleryIndexMediaSummary)> {
+    let summary_sql = format!(
+        "SELECT
+             COUNT(*),
+             COALESCE(SUM(CASE WHEN media_status = 'ready' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_status IS NULL THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_status = 'incomplete' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_type = 'image' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(geotagged), 0)
+         FROM gallery_objects
+         WHERE {GALLERY_MAP_SCOPE_SQL}"
+    );
+    let mut summary_rows = connection
+        .query(summary_sql, params_from_iter(scope_values.iter().cloned()))
+        .await?;
+    let summary = summary_rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("gallery map summary query returned no row"))?;
+    let count = |index, label| -> Result<usize> {
+        usize::try_from(row_u64(&summary, index, label)?)
+            .with_context(|| format!("gallery map count overflow for {label}"))
+    };
+    let total_entry_count = count(0, "gallery map total")?;
+    let media_summary = GalleryIndexMediaSummary {
+        ready_count: count(1, "gallery map ready")?,
+        pending_count: count(2, "gallery map pending")?,
+        incomplete_count: count(3, "gallery map incomplete")?,
+        image_count: count(4, "gallery map images")?,
+        video_count: count(5, "gallery map videos")?,
+        geotagged_count: count(6, "gallery map geotagged")?,
+    };
+    drop(summary_rows);
+    Ok((total_entry_count, media_summary))
+}
+
+const GALLERY_MAP_SUMMARY_CHUNK_SQL: &str = "
+    SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
+           gallery_objects.geotagged
+    FROM gallery_objects
+    WHERE (?1 = '' OR gallery_objects.key = ?1 OR gallery_objects.key LIKE ?2 ESCAPE '\\')
+      AND CASE
+            WHEN ?1 = '' THEN CASE
+                WHEN trim(gallery_objects.key, '/') = '' THEN 0
+                ELSE length(trim(gallery_objects.key, '/'))
+                     - length(replace(trim(gallery_objects.key, '/'), '/', '')) + 1
+            END
+            WHEN gallery_objects.key = ?1 THEN 0
+            ELSE length(substr(gallery_objects.key, length(?1) + 2))
+                 - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
+        END <= ?3
+      AND gallery_objects.inferred_media_type IS NOT NULL
+      AND (?4 IS NULL OR gallery_objects.media_type = ?4)
+      AND (?5 IS NULL OR gallery_objects.key > ?5)
+    ORDER BY gallery_objects.key
+    LIMIT ?6";
+
+const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
+
+/// Same result as [`gallery_map_summary_query`], but computed in small ordered chunks so a
+/// caller can report coarse progress on a long-running background refresh instead of blocking on
+/// one unbounded aggregate query. `total_estimate` (typically the previous cached count for this
+/// scope) only turns "rows scanned so far" into a percentage; it does not affect the exact
+/// result.
+async fn gallery_map_summary_chunked_query(
+    connection: &turso::Connection,
+    scope_values: &[Value],
+    total_estimate: Option<usize>,
+    progress: &GallerySummaryProgress,
+) -> Result<(usize, GalleryIndexMediaSummary)> {
+    let mut cursor: Option<String> = None;
+    let mut total = 0usize;
+    let mut summary = GalleryIndexMediaSummary::default();
+    loop {
+        let mut values = scope_values.to_vec();
+        values.push(optional_text_value(cursor.as_deref()));
+        values.push(Value::from(GALLERY_MAP_SUMMARY_CHUNK_ROWS));
+        let mut rows = connection
+            .query(GALLERY_MAP_SUMMARY_CHUNK_SQL, params_from_iter(values))
+            .await?;
+        let mut chunk_len = 0usize;
+        let mut last_key = None;
+        while let Some(row) = rows.next().await? {
+            let key = row_string(&row, 0, "gallery_objects.key")?;
+            let media_status = row_opt_string(&row, 1, "gallery_objects.media_status")?;
+            let media_type = row_opt_string(&row, 2, "gallery_objects.media_type")?;
+            let geotagged = row_u64(&row, 3, "gallery_objects.geotagged")?;
+            chunk_len += 1;
+            total += 1;
+            match media_status.as_deref() {
+                Some("ready") => summary.ready_count += 1,
+                None => summary.pending_count += 1,
+                Some("incomplete") => summary.incomplete_count += 1,
+                _ => {}
+            }
+            match media_type.as_deref() {
+                Some("image") => summary.image_count += 1,
+                Some("video") => summary.video_count += 1,
+                _ => {}
+            }
+            if geotagged != 0 {
+                summary.geotagged_count += 1;
+            }
+            last_key = Some(key);
+        }
+        if let Some(estimate) = total_estimate.filter(|value| *value > 0) {
+            let percent = ((total as f64 / estimate as f64) * 100.0).min(99.0) as u8;
+            progress.report(percent);
+        }
+        if chunk_len < GALLERY_MAP_SUMMARY_CHUNK_ROWS as usize {
+            break;
+        }
+        cursor = last_key;
+    }
+    Ok((total, summary))
+}
+
+async fn gallery_map_cluster_cells_query(
+    connection: &turso::Connection,
+    base_values: &[Value],
+    requested_resolution: u32,
+    max_clusters: usize,
+) -> Result<(u32, Vec<GalleryMapCluster>)> {
+    let max_clusters = max_clusters.max(1);
+    let mut resolution = requested_resolution.max(1);
+    let clusters = loop {
+        let sql = format!(
+            "SELECT
+                 CAST(gallery_objects.spatial_x * ?13 AS INTEGER),
+                 CAST(gallery_objects.spatial_y * ?13 AS INTEGER),
+                 COUNT(*),
+                 AVG(gallery_objects.latitude),
+                 AVG(gallery_objects.longitude),
+                 MIN(gallery_objects.latitude),
+                 MAX(gallery_objects.latitude),
+                 MIN(gallery_objects.longitude),
+                 MAX(gallery_objects.longitude),
+                 MIN(gallery_objects.key),
+                 MIN(gallery_objects.manifest_hash),
+                 MIN(manifest_summaries.total_size_bytes),
+                 MIN(manifest_summaries.content_fingerprint),
+                 MIN(media_cache.metadata_json),
+                 MIN(version_indexes.index_json),
+                 MIN(gallery_objects.labels_json)
+             FROM gallery_objects
+             LEFT JOIN manifest_summaries
+               ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
+             LEFT JOIN media_cache
+               ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
+             LEFT JOIN version_indexes
+               ON version_indexes.object_id = gallery_objects.object_id
+             WHERE {GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
+             GROUP BY 1, 2
+             ORDER BY 2 ASC, 1 ASC
+             LIMIT ?14"
+        );
+        let mut values = base_values.to_vec();
+        values.push(Value::from(i64::from(resolution)));
+        values.push(Value::from(
+            i64::try_from(max_clusters.saturating_add(1))
+                .context("gallery map cluster limit overflow")?,
+        ));
+        let mut rows = connection.query(sql, params_from_iter(values)).await?;
+        let mut clusters = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let cell_x = u32::try_from(row_u64(&row, 0, "gallery map cell x")?)
+                .context("gallery map cell x overflow")?;
+            let cell_y = u32::try_from(row_u64(&row, 1, "gallery map cell y")?)
+                .context("gallery map cell y overflow")?;
+            let cluster_count = usize::try_from(row_u64(&row, 2, "gallery map cluster count")?)
+                .context("gallery map cluster count overflow")?;
+            let entry = if cluster_count == 1 {
+                Some(materialize_gallery_index_entry(
+                    row_string(&row, 9, "gallery_objects.key")?,
+                    row_string(&row, 10, "gallery_objects.manifest_hash")?,
+                    row_opt_i64(&row, 11, "manifest_summaries.total_size_bytes")?,
+                    row_opt_string(&row, 12, "manifest_summaries.content_fingerprint")?,
+                    row_opt_blob(&row, 13, "media_cache.metadata_json")?,
+                    row_opt_blob(&row, 14, "version_indexes.index_json")?,
+                    row_string(&row, 15, "gallery_objects.labels_json")?,
+                )?)
+            } else {
+                None
+            };
+            clusters.push(GalleryMapCluster {
+                cell_x,
+                cell_y,
+                count: cluster_count,
+                latitude: row_f64(&row, 3, "gallery map latitude")?,
+                longitude: row_f64(&row, 4, "gallery map longitude")?,
+                bounds: GalleryViewportBounds {
+                    south: row_f64(&row, 5, "gallery map south")?,
+                    north: row_f64(&row, 6, "gallery map north")?,
+                    west: row_f64(&row, 7, "gallery map west")?,
+                    east: row_f64(&row, 8, "gallery map east")?,
+                },
+                entry,
+            });
+        }
+        if clusters.len() <= max_clusters || resolution == 1 {
+            break clusters;
+        }
+        resolution = (resolution / 2).max(1);
+    };
+    Ok((resolution, clusters))
+}
+
+/// Computes viewport clusters and the whole-scope summary together in one shot. Production code
+/// no longer calls this directly (see `TursoMetadataStore::query_turso_gallery_map_clusters`,
+/// which serves the summary from `GallerySummaryCache` instead); it is kept as the ground-truth
+/// reference implementation exercised by the gallery map tests.
+#[cfg(test)]
+async fn query_gallery_map_clusters(
+    connection: &turso::Connection,
+    query: &GalleryMapClusterQuery,
+    history_id: String,
+    revision: u64,
+) -> Result<GalleryMapClusterPage> {
+    let prefix = query.prefix.trim().trim_matches('/').to_string();
+    let prefix_pattern = if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{prefix}/"))
+    };
+    let base_values = turso_gallery_map_scope_values(
+        &prefix,
+        &prefix_pattern,
+        query.depth,
+        query.media_filter,
+        query.viewport,
+    )?;
+    let (total_entry_count, media_summary) =
+        gallery_map_summary_query(connection, &base_values[..4]).await?;
+    let (resolution, clusters) = gallery_map_cluster_cells_query(
+        connection,
+        &base_values,
+        gallery_map_bounded_resolution(
+            query.requested_resolution,
+            query.viewport,
+            query.max_clusters,
+        ),
+        query.max_clusters,
+    )
+    .await?;
+    let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
+    Ok(GalleryMapClusterPage {
+        history_id,
+        revision,
+        total_entry_count,
+        media_summary,
+        visible_geotagged_count,
+        resolution,
+        clusters,
+        summary_status: GallerySummaryRefreshStatus::default(),
+    })
+}
+
+/// Like the (test-only) full [`query_gallery_map_clusters`], but skips the whole-scope summary
+/// aggregation entirely. Used on the hot request path, where the summary is served from
+/// `GallerySummaryCache` instead so a map pan/zoom never pays for an unbounded aggregate query.
+pub(super) async fn query_gallery_map_cluster_cells(
+    connection: &turso::Connection,
+    query: &GalleryMapClusterQuery,
+) -> Result<(u32, usize, Vec<GalleryMapCluster>)> {
+    let prefix = query.prefix.trim().trim_matches('/').to_string();
+    let prefix_pattern = if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{prefix}/"))
+    };
+    let base_values = turso_gallery_map_scope_values(
+        &prefix,
+        &prefix_pattern,
+        query.depth,
+        query.media_filter,
+        query.viewport,
+    )?;
+    let (resolution, clusters) = gallery_map_cluster_cells_query(
+        connection,
+        &base_values,
+        gallery_map_bounded_resolution(
+            query.requested_resolution,
+            query.viewport,
+            query.max_clusters,
+        ),
+        query.max_clusters,
+    )
+    .await?;
+    let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
+    Ok((resolution, visible_geotagged_count, clusters))
+}
+
+/// Computes the whole-scope summary for `scope`, either exactly (for the first, synchronous
+/// computation of a never-before-seen scope) or in progress-reporting chunks (for a background
+/// refresh of a scope that is already cached but stale). Manages its own transaction and reads
+/// `history_id`/`revision` alongside the summary so the cached value can be compared for
+/// staleness later.
+pub(super) async fn query_gallery_map_summary(
+    connection: &turso::Connection,
+    scope: &GallerySummaryScope,
+    total_estimate: Option<usize>,
+    progress: Option<&GallerySummaryProgress>,
+) -> Result<GallerySummaryCacheValue> {
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Deferred).await?;
+    let result = async {
+        let history_id = current_gallery_history_id(&transaction).await?;
+        let revision = current_gallery_revision(&transaction).await?;
+        let prefix_pattern = if scope.prefix.is_empty() {
+            "%".to_string()
+        } else {
+            sqlite_like_prefix_pattern(&format!("{}/", scope.prefix))
+        };
+        let depth = i64::try_from(scope.depth).context("gallery map summary depth overflow")?;
+        let scope_values = vec![
+            Value::from(scope.prefix.as_str()),
+            Value::from(prefix_pattern.as_str()),
+            Value::from(depth),
+            optional_text_value(scope.media_filter.media_type()),
+        ];
+        let (total_entry_count, media_summary) = match progress {
+            Some(progress) => {
+                gallery_map_summary_chunked_query(
+                    &transaction,
+                    &scope_values,
+                    total_estimate,
+                    progress,
+                )
+                .await?
+            }
+            None => gallery_map_summary_query(&transaction, &scope_values).await?,
+        };
+        Ok(GallerySummaryCacheValue {
+            history_id,
+            revision,
+            total_entry_count,
+            media_summary,
+        })
+    }
+    .await;
+    finish_gallery_read_transaction(transaction, result).await
+}
+
+async fn query_gallery_map_cluster_entries(
+    connection: &turso::Connection,
+    query: &GalleryMapClusterEntriesQuery,
+    history_id: String,
+    revision: u64,
+) -> Result<GalleryIndexPage> {
+    let prefix = query.prefix.trim().trim_matches('/').to_string();
+    let prefix_pattern = if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{prefix}/"))
+    };
+    let mut values = turso_gallery_map_scope_values(
+        &prefix,
+        &prefix_pattern,
+        query.depth,
+        query.media_filter,
+        query.viewport,
+    )?;
+    values.push(Value::from(i64::from(query.resolution.max(1))));
+    values.push(Value::from(i64::from(query.cell_x)));
+    values.push(Value::from(i64::from(query.cell_y)));
+    let cell_scope = format!(
+        "{GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
+         AND CAST(gallery_objects.spatial_x * ?13 AS INTEGER) = ?14
+         AND CAST(gallery_objects.spatial_y * ?13 AS INTEGER) = ?15"
+    );
+    let summary_sql = format!(
+        "SELECT
+             COUNT(*),
+             COALESCE(SUM(CASE WHEN media_status = 'ready' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_status IS NULL THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_status = 'incomplete' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_type = 'image' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
+             COUNT(*)
+         FROM gallery_objects
+         WHERE {cell_scope}"
+    );
+    let mut summary_rows = connection
+        .query(summary_sql, params_from_iter(values.iter().cloned()))
+        .await?;
+    let summary = summary_rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("gallery map cluster summary returned no row"))?;
+    let count = |index, label| -> Result<usize> {
+        usize::try_from(row_u64(&summary, index, label)?)
+            .with_context(|| format!("gallery cluster entry count overflow for {label}"))
+    };
+    let total_entry_count = count(0, "gallery cluster total")?;
+    let media_summary = GalleryIndexMediaSummary {
+        ready_count: count(1, "gallery cluster ready")?,
+        pending_count: count(2, "gallery cluster pending")?,
+        incomplete_count: count(3, "gallery cluster incomplete")?,
+        image_count: count(4, "gallery cluster images")?,
+        video_count: count(5, "gallery cluster videos")?,
+        geotagged_count: count(6, "gallery cluster geotagged")?,
+    };
+    drop(summary_rows);
+    let page_sql = format!(
+        "SELECT
+             gallery_objects.key,
+             gallery_objects.manifest_hash,
+             manifest_summaries.total_size_bytes,
+             manifest_summaries.content_fingerprint,
+             media_cache.metadata_json,
+             version_indexes.index_json,
+             gallery_objects.labels_json
+         FROM gallery_objects
+         LEFT JOIN manifest_summaries
+           ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
+         LEFT JOIN media_cache
+           ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
+         LEFT JOIN version_indexes
+           ON version_indexes.object_id = gallery_objects.object_id
+         WHERE {cell_scope}
+         ORDER BY gallery_objects.captured_at_unix DESC, gallery_objects.key ASC
+         LIMIT ?16 OFFSET ?17"
+    );
+    values.push(Value::from(
+        i64::try_from(query.limit.max(1)).context("gallery map entry limit overflow")?,
+    ));
+    values.push(Value::from(
+        i64::try_from(query.offset).context("gallery map entry offset overflow")?,
+    ));
+    let mut rows = connection.query(page_sql, params_from_iter(values)).await?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().await? {
+        entries.push(materialize_gallery_index_entry(
+            row_string(&row, 0, "gallery_objects.key")?,
+            row_string(&row, 1, "gallery_objects.manifest_hash")?,
+            row_opt_i64(&row, 2, "manifest_summaries.total_size_bytes")?,
+            row_opt_string(&row, 3, "manifest_summaries.content_fingerprint")?,
+            row_opt_blob(&row, 4, "media_cache.metadata_json")?,
+            row_opt_blob(&row, 5, "version_indexes.index_json")?,
+            row_string(&row, 6, "gallery_objects.labels_json")?,
+        )?);
+    }
+    Ok(GalleryIndexPage {
+        history_id,
+        revision,
+        total_entry_count,
+        media_summary,
+        entries,
+    })
+}
+
 async fn query_gallery_delta(
     connection: &turso::Connection,
     history_id: &str,
@@ -1339,6 +2105,49 @@ async fn current_gallery_revision(connection: &turso::Connection) -> Result<u64>
         .with_context(|| format!("invalid persisted Turso gallery revision: {raw}"))
 }
 
+/// Returns the most recent retained mutation that can affect a gallery map scope. Query tokens
+/// use this scoped revision rather than the library-wide revision so media ingestion elsewhere in
+/// a library does not repeatedly invalidate an open cluster or its pagination.
+async fn current_gallery_scope_revision(
+    connection: &turso::Connection,
+    prefix: &str,
+    depth: usize,
+) -> Result<u64> {
+    let prefix_pattern = if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{prefix}/"))
+    };
+    let depth = i64::try_from(depth).context("gallery map scope depth overflow")?;
+    let mut rows = connection
+        .query(
+            "SELECT COALESCE(MAX(revision), 0)
+             FROM gallery_changes
+             WHERE (?1 = '' OR gallery_changes.key = ?1 OR gallery_changes.key LIKE ?2 ESCAPE '\\')
+               AND CASE
+                   WHEN ?1 = '' THEN CASE
+                       WHEN trim(gallery_changes.key, '/') = '' THEN 0
+                       ELSE length(trim(gallery_changes.key, '/'))
+                            - length(replace(trim(gallery_changes.key, '/'), '/', '')) + 1
+                   END
+                   WHEN gallery_changes.key = ?1 THEN 0
+                   ELSE length(substr(gallery_changes.key, length(?1) + 2))
+                        - length(replace(substr(gallery_changes.key, length(?1) + 2), '/', '')) + 1
+               END <= ?3",
+            params_from_iter([
+                Value::from(prefix.to_string()),
+                Value::from(prefix_pattern),
+                Value::from(depth),
+            ]),
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("gallery map scope revision query returned no row"))?;
+    row_u64(&row, 0, "gallery map scope revision")
+}
+
 async fn current_gallery_history_id(connection: &turso::Connection) -> Result<String> {
     let mut rows = connection
         .query(
@@ -1407,6 +2216,10 @@ fn row_opt_f64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<f64>>
     }
 }
 
+fn row_f64(row: &turso::Row, idx: usize, label: &str) -> Result<f64> {
+    row_opt_f64(row, idx, label)?.ok_or_else(|| anyhow::anyhow!("missing real value for {label}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1422,12 +2235,16 @@ mod tests {
         latitude: Option<f64>,
         longitude: Option<f64>,
     ) {
+        let spatial_position = latitude
+            .zip(longitude)
+            .and_then(|(latitude, longitude)| gallery_web_mercator_position(latitude, longitude));
         connection
             .execute(
                 "INSERT INTO gallery_objects (
                      key, manifest_hash, object_id, inferred_media_type, media_type,
-                     captured_at_unix, media_status, geotagged, latitude, longitude
-                 ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, 'ready', ?6, ?7, ?8)",
+                     captured_at_unix, media_status, geotagged, latitude, longitude,
+                     spatial_x, spatial_y
+                 ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, 'ready', ?6, ?7, ?8, ?9, ?10)",
                 params_from_iter(vec![
                     Value::from(key),
                     Value::from(format!("manifest-{key}")),
@@ -1437,6 +2254,12 @@ mod tests {
                     Value::from(i64::from(latitude.is_some())),
                     latitude.map(Value::from).unwrap_or(Value::Null),
                     longitude.map(Value::from).unwrap_or(Value::Null),
+                    spatial_position
+                        .map(|position| Value::from(position.0))
+                        .unwrap_or(Value::Null),
+                    spatial_position
+                        .map(|position| Value::from(position.1))
+                        .unwrap_or(Value::Null),
                 ]),
             )
             .await
@@ -1452,6 +2275,397 @@ mod tests {
             viewport: None,
             label_filter: Default::default(),
         }
+    }
+
+    fn gallery_map_query(
+        viewport: GalleryViewportBounds,
+        requested_resolution: u32,
+        max_clusters: usize,
+    ) -> GalleryMapClusterQuery {
+        GalleryMapClusterQuery {
+            prefix: "gallery".to_string(),
+            depth: 64,
+            media_filter: GalleryIndexMediaFilter::Image,
+            viewport,
+            requested_resolution,
+            max_clusters,
+        }
+    }
+
+    #[tokio::test]
+    async fn gallery_map_clusters_are_bounded_in_turso() {
+        let metadata_db_path = turso_test_db_path("gallery-map-bounded");
+        let database = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+            .build()
+            .await
+            .expect("turso should open");
+        let connection = database.connect().expect("turso should connect");
+        super::super::init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should initialize");
+        insert_gallery_fixture(
+            &connection,
+            "gallery/zurich.jpg",
+            "image",
+            30,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+        insert_gallery_fixture(
+            &connection,
+            "gallery/new-york.jpg",
+            "image",
+            20,
+            Some(40.7),
+            Some(-74.0),
+        )
+        .await;
+        insert_gallery_fixture(
+            &connection,
+            "gallery/sydney.jpg",
+            "image",
+            10,
+            Some(-33.9),
+            Some(151.2),
+        )
+        .await;
+        insert_gallery_fixture(&connection, "gallery/no-gps.jpg", "image", 40, None, None).await;
+
+        let page = query_gallery_map_clusters(
+            &connection,
+            &gallery_map_query(
+                GalleryViewportBounds {
+                    south: -90.0,
+                    west: -180.0,
+                    north: 90.0,
+                    east: 180.0,
+                },
+                4096,
+                1,
+            ),
+            current_gallery_history_id(&connection).await.unwrap(),
+            current_gallery_revision(&connection).await.unwrap(),
+        )
+        .await
+        .expect("gallery clusters should load");
+
+        assert_eq!(page.total_entry_count, 4);
+        assert_eq!(page.media_summary.geotagged_count, 3);
+        assert_eq!(page.visible_geotagged_count, 3);
+        assert_eq!(page.clusters.len(), 1);
+        assert!(page.resolution < 4096);
+        assert_eq!(page.clusters[0].count, 3);
+
+        drop(connection);
+        drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_map_summary_cache_serves_stale_value_and_refreshes_in_background_turso() {
+        let metadata_db_path = turso_test_db_path("gallery-map-summary-cache");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        insert_gallery_fixture(
+            &store.connection,
+            "gallery/a.jpg",
+            "image",
+            1,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+
+        let viewport = GalleryViewportBounds {
+            south: -90.0,
+            west: -180.0,
+            north: 90.0,
+            east: 180.0,
+        };
+        let query = gallery_map_query(viewport, 1024, 512);
+
+        // Cold cache: computed synchronously, so the very first caller still gets a real answer.
+        let first = store
+            .query_gallery_map_clusters(&query)
+            .await
+            .unwrap()
+            .expect("gallery map clusters should be available");
+        assert_eq!(first.total_entry_count, 1);
+        assert!(!first.summary_status.refreshing);
+
+        insert_gallery_fixture(
+            &store.connection,
+            "gallery/b.jpg",
+            "image",
+            2,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+
+        // Warm but stale cache: the (now outdated) cached summary is served immediately rather
+        // than blocking this request on a recompute, while a background refresh is kicked off.
+        let second = store
+            .query_gallery_map_clusters(&query)
+            .await
+            .unwrap()
+            .expect("gallery map clusters should be available");
+        assert_eq!(second.total_entry_count, 1);
+        assert!(second.summary_status.refreshing);
+        // The viewport-bounded clusters themselves are never served from the summary cache.
+        assert_eq!(second.visible_geotagged_count, 2);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let refreshed = store
+                .query_gallery_map_clusters(&query)
+                .await
+                .unwrap()
+                .expect("gallery map clusters should be available");
+            if refreshed.total_entry_count == 2 && !refreshed.summary_status.refreshing {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background gallery map summary refresh did not complete in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_map_cluster_entries_are_paginated_in_turso() {
+        let metadata_db_path = turso_test_db_path("gallery-map-entry-pages");
+        let database = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+            .build()
+            .await
+            .expect("turso should open");
+        let connection = database.connect().expect("turso should connect");
+        super::super::init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should initialize");
+        insert_gallery_fixture(
+            &connection,
+            "gallery/older.jpg",
+            "image",
+            10,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+        insert_gallery_fixture(
+            &connection,
+            "gallery/newer.jpg",
+            "image",
+            20,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+        let viewport = GalleryViewportBounds {
+            south: 45.0,
+            west: 5.0,
+            north: 49.0,
+            east: 11.0,
+        };
+        let history_id = current_gallery_history_id(&connection).await.unwrap();
+        let revision = current_gallery_revision(&connection).await.unwrap();
+        let clusters = query_gallery_map_clusters(
+            &connection,
+            &gallery_map_query(viewport, 1024, 512),
+            history_id.clone(),
+            revision,
+        )
+        .await
+        .expect("gallery clusters should load");
+        assert_eq!(clusters.clusters.len(), 1);
+        let cluster = &clusters.clusters[0];
+        assert_eq!(cluster.count, 2);
+
+        let entries = query_gallery_map_cluster_entries(
+            &connection,
+            &GalleryMapClusterEntriesQuery {
+                prefix: "gallery".to_string(),
+                depth: 64,
+                media_filter: GalleryIndexMediaFilter::Image,
+                viewport,
+                resolution: clusters.resolution,
+                cell_x: cluster.cell_x,
+                cell_y: cluster.cell_y,
+                offset: 0,
+                limit: 1,
+            },
+            history_id,
+            revision,
+        )
+        .await
+        .expect("cluster entries should load");
+        assert_eq!(entries.total_entry_count, 2);
+        assert_eq!(entries.entries.len(), 1);
+        assert_eq!(entries.entries[0].key, "gallery/newer.jpg");
+
+        drop(connection);
+        drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_spatial_backfill_restores_missing_positions_in_turso() {
+        let metadata_db_path = turso_test_db_path("gallery-spatial-backfill");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        insert_gallery_fixture(
+            &store.connection,
+            "gallery/missing-position.jpg",
+            "image",
+            1,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+        store
+            .connection
+            .execute(
+                "UPDATE gallery_objects SET spatial_x = NULL, spatial_y = NULL WHERE key = ?1",
+                ("gallery/missing-position.jpg",),
+            )
+            .await
+            .expect("gallery fixture position should clear");
+
+        backfill_gallery_spatial_positions(&store.connection)
+            .await
+            .expect("spatial positions should backfill");
+        let mut rows = store
+            .connection
+            .query(
+                "SELECT spatial_x, spatial_y FROM gallery_objects WHERE key = ?1",
+                ("gallery/missing-position.jpg",),
+            )
+            .await
+            .expect("backfilled gallery fixture should query");
+        let row = rows
+            .next()
+            .await
+            .expect("backfilled gallery fixture should load")
+            .expect("backfilled gallery fixture should exist");
+        assert!(
+            row_opt_f64(&row, 0, "gallery_objects.spatial_x")
+                .expect("spatial x should decode")
+                .is_some()
+        );
+        assert!(
+            row_opt_f64(&row, 1, "gallery_objects.spatial_y")
+                .expect("spatial y should decode")
+                .is_some()
+        );
+
+        drop(rows);
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope_in_turso() {
+        let metadata_db_path = turso_test_db_path("gallery-map-token-scope");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        insert_gallery_fixture(
+            &store.connection,
+            "gallery/a.jpg",
+            "image",
+            10,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+        insert_gallery_fixture(
+            &store.connection,
+            "gallery/b.jpg",
+            "image",
+            20,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+
+        let viewport = GalleryViewportBounds {
+            south: 45.0,
+            west: 5.0,
+            north: 49.0,
+            east: 11.0,
+        };
+        let clusters = store
+            .query_gallery_map_clusters(&gallery_map_query(viewport, 1024, 512))
+            .await
+            .expect("gallery map clusters should load")
+            .expect("turso should support gallery map clusters");
+        let cluster = clusters
+            .clusters
+            .first()
+            .expect("fixture should produce one map cluster");
+
+        insert_gallery_fixture(
+            &store.connection,
+            "elsewhere/noise.jpg",
+            "image",
+            30,
+            Some(40.7),
+            Some(-74.0),
+        )
+        .await;
+
+        let page = store
+            .query_gallery_map_cluster_entries(&GalleryMapClusterEntriesQuery {
+                prefix: "gallery".to_string(),
+                depth: 64,
+                media_filter: GalleryIndexMediaFilter::Image,
+                viewport,
+                resolution: clusters.resolution,
+                cell_x: cluster.cell_x,
+                cell_y: cluster.cell_y,
+                offset: 0,
+                limit: 100,
+            })
+            .await
+            .expect("cluster page should load after unrelated ingest")
+            .expect("turso should support cluster pages");
+        assert_eq!(page.history_id, clusters.history_id);
+        assert_eq!(page.revision, clusters.revision);
+
+        store
+            .connection
+            .execute(
+                "UPDATE gallery_objects SET captured_at_unix = 40 WHERE key = 'gallery/a.jpg'",
+                (),
+            )
+            .await
+            .expect("in-scope fixture should update");
+        let changed_page = store
+            .query_gallery_map_cluster_entries(&GalleryMapClusterEntriesQuery {
+                prefix: "gallery".to_string(),
+                depth: 64,
+                media_filter: GalleryIndexMediaFilter::Image,
+                viewport,
+                resolution: clusters.resolution,
+                cell_x: cluster.cell_x,
+                cell_y: cluster.cell_y,
+                offset: 0,
+                limit: 100,
+            })
+            .await
+            .expect("cluster page should load after in-scope change")
+            .expect("turso should support cluster pages");
+        assert_ne!(changed_page.revision, clusters.revision);
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
     }
 
     #[tokio::test]
@@ -1748,15 +2962,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gallery_queries_use_pooled_turso_read_connections() {
+    async fn gallery_queries_use_dedicated_turso_read_connections() {
         let metadata_db_path = turso_test_db_path("gallery-read-connection-pool");
         let store = TursoMetadataStore::open(&metadata_db_path)
             .await
             .expect("turso metadata store should open");
-        assert_eq!(
-            store.gallery_readers.len(),
-            super::super::DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT
-        );
         store
             .connection
             .execute_batch("BEGIN")
@@ -1795,6 +3005,38 @@ mod tests {
             .execute_batch("ROLLBACK")
             .await
             .expect("primary Turso connection transaction should roll back");
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    /// Turso 0.6 connections break after a handful of `BEGIN`/`COMMIT` cycles ("cannot commit -
+    /// no transaction is active"), which is why gallery reads open a fresh connection per
+    /// transaction instead of reusing pooled ones. More iterations than the read concurrency
+    /// limit, so this also covers permits being released rather than leaked.
+    #[tokio::test]
+    async fn repeated_gallery_reads_survive_more_transactions_than_the_concurrency_limit() {
+        let metadata_db_path = turso_test_db_path("gallery-repeated-read-transactions");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let query = GalleryIndexQuery {
+            prefix: "gallery".to_string(),
+            depth: 64,
+            media_filter: GalleryIndexMediaFilter::All,
+            captured_sort: GalleryIndexCapturedSort::Desc,
+            offset: 0,
+            limit: 10,
+            viewport: None,
+            label_filter: Default::default(),
+        };
+        for iteration in 0..16 {
+            store
+                .query_turso_gallery_index(&query)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("gallery read {iteration} should succeed, got: {error}")
+                });
+        }
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }

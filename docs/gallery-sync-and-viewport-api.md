@@ -101,6 +101,96 @@ are excluded. Prefix/depth, media filter, captured ordering, offset, limit, and 
 applied by the same persistent gallery projection, so the server does not materialize the whole
 library.
 
+## Server-side map clustering
+
+The interactive map does not traverse the full gallery index. It requests a bounded set of
+server-side spatial clusters for the current camera:
+
+```text
+GET /api/v1/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1
+GET /api/v1/auth/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1
+```
+
+All four viewport bounds are required and use the same antimeridian rules as viewport index
+queries. `zoom` is clamped to `0..20`. The Gallery UI starts with the world viewport and the
+maximum supported UI depth (`64`), then issues a new request after each map movement. Map
+clustering is available for current data; selecting an immutable snapshot switches the Gallery to
+grid view.
+
+Each metadata backend persists normalized Web Mercator `x`/`y` values next to valid GPS metadata
+and maintains a B-tree spatial index. The cluster query restricts that index to the viewport and
+groups matching rows into a zoom-dependent Web Mercator grid. It initially uses cells equivalent
+to 64 screen pixels. If the requested grid would return more than 512 clusters, the server halves
+the effective grid resolution until the response is bounded. This makes response size independent
+of total library size while still allowing the client to refine the result by zooming or panning.
+Latitude/longitude bounds remain as an exact check around the indexed projected range.
+
+A response has this shape:
+
+```json
+{
+  "prefix": "",
+  "depth": 64,
+  "zoom": 1,
+  "resolution": 8,
+  "total_entry_count": 125000,
+  "visible_geotagged_count": 84231,
+  "media_summary": {
+    "ready_count": 120000,
+    "pending_count": 4500,
+    "incomplete_count": 500,
+    "image_count": 118000,
+    "video_count": 7000,
+    "geotagged_count": 84231
+  },
+  "query_token": "gm1_...",
+  "clusters": [
+    {
+      "cluster_id": "4_2",
+      "count": 731,
+      "latitude": 47.2,
+      "longitude": 8.4,
+      "bounds": {
+        "south": 46.8,
+        "west": 7.9,
+        "north": 47.7,
+        "east": 9.0
+      }
+    }
+  ]
+}
+```
+
+`total_entry_count` and `media_summary` describe the complete prefix/depth/media-filter scope;
+`visible_geotagged_count` describes the current viewport. A one-entry cluster additionally carries
+the complete store-index `entry`, so its marker can open without another list query. Multi-entry
+clusters carry a centroid and exact member bounds. Clients normally zoom to those bounds. When a
+cluster remains dense at high zoom or has identical coordinates, its members are available through
+the bounded leaf endpoint:
+
+```text
+GET /api/v1/store/map/cluster-entries?query_token=<query_token>&cluster_id=4_2&offset=0&limit=100
+GET /api/v1/auth/store/map/cluster-entries?query_token=<query_token>&cluster_id=4_2&offset=0&limit=100
+```
+
+The default leaf page size is 100 and the server caps it at 500. Entries are ordered by capture
+time descending and path ascending. The opaque map query token binds the persistent gallery
+history/revision, normalized scope, viewport, media filter, and effective grid resolution. Clients
+must not parse it. If the gallery revision changes before a leaf page is read, the server rejects
+the page with HTTP `409`:
+
+```json
+{
+  "code": "gallery_map_cluster_stale",
+  "reset": true,
+  "message": "the gallery changed; reload map clusters before opening this cluster"
+}
+```
+
+On that response the client reloads clusters for its current camera before attempting to open the
+cluster again. This prevents offset pagination from combining members from different spatial
+snapshots.
+
 ## User labels
 
 Media can carry user labels — for example `private` — without touching the media bytes
@@ -172,7 +262,7 @@ default. Recovery keeps the recorded backend because changing between `state/met
 toggle. Environment-only, unmanaged server-node startup continues to use
 `IRONMESH_METADATA_BACKEND` on each start.
 
-Both backends provide the same durable gallery projection, viewport index, and revision log. Both
-maintain changes as part of their metadata updates, and preserve the history identifier and revision
-across a restart. Gallery queries, viewport queries, and delta requests therefore have the same API
-contract on both backends.
+Both backends provide the same durable gallery projection, viewport and Web Mercator indexes,
+spatial clustering, and revision log. Both maintain changes as part of their metadata updates, and
+preserve the history identifier and revision across a restart. Gallery queries, viewport queries,
+map cluster queries, and delta requests therefore have the same API contract on both backends.

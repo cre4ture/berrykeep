@@ -1,5 +1,7 @@
 import {
   getClientGalleryMapConfiguration,
+  getGalleryMapClusterEntries,
+  getGalleryMapClusters,
   getBinaryObjectStreamUrl,
   getVersionGraph,
   listSnapshots,
@@ -51,6 +53,9 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
       loadSnapshots: () => listSnapshots(),
       loadEntries: (prefix, depth, snapshotId, options) =>
         listStoreEntries(prefix, depth, snapshotId, options),
+      loadMapClusters: (request) => getGalleryMapClusters(request),
+      loadMapClusterEntries: (queryToken, clusterId, offset, limit) =>
+        getGalleryMapClusterEntries(queryToken, clusterId, offset, limit),
       getMediaRequests: (entry, snapshotId, versionId) => {
         const thumbnailUrl = entry.media?.thumbnail?.url ?? null;
         const original = {
