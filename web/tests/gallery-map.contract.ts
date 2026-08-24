@@ -175,6 +175,30 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await expect(chooser).toHaveCount(0);
     await expect(clusterButtons).toHaveCount(0);
   });
+
+  test(`${target.name} gallery map contract drills in from a Ctrl-click context menu`, async ({
+    page
+  }) => {
+    await target.setupInitialOverviewScenario(page);
+    await target.openGallery(page);
+    await page.getByRole("button", { name: "Map" }).click();
+
+    const cluster = page.getByRole("button", { name: "Open map cluster with 2 items" }).first();
+    await expect(cluster).toBeVisible();
+    await cluster.evaluate((element) => {
+      element.dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          button: 2,
+          ctrlKey: true
+        })
+      );
+    });
+
+    await expect(page.getByRole("dialog", { name: "2 items in map cluster" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Open map cluster with 2 items" })).toHaveCount(0);
+  });
 }
 
 export function createInitialOverviewGalleryEntries() {

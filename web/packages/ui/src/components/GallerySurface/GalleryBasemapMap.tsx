@@ -996,8 +996,15 @@ function GalleryBasemapClusterMarker({
     <button
       type="button"
       aria-label={`Open map cluster with ${count} items`}
-      title={`${count} items in this server-side map cluster. Ctrl-click to zoom to the cluster bounds.`}
-      onClick={(event) => onClick(event.ctrlKey)}
+      title={`${count} items in this server-side map cluster. Ctrl- or Cmd-click to zoom to the cluster bounds.`}
+      onClick={(event) => onClick(event.ctrlKey || event.metaKey)}
+      onContextMenu={(event) => {
+        if (!event.ctrlKey) {
+          return;
+        }
+        event.preventDefault();
+        onClick(true);
+      }}
       style={{
         position: "absolute",
         left,
