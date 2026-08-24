@@ -63,6 +63,7 @@ internal object FolderSyncOutageRetryPolicy {
         nowEpochMs: Long,
     ): Boolean {
         return trigger == FolderSyncRetryTrigger.MANUAL_SYNC ||
+            trigger == FolderSyncRetryTrigger.CONFIGURATION_CHANGED ||
             state.nextRetryAtEpochMs <= nowEpochMs
     }
 }
