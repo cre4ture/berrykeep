@@ -495,6 +495,9 @@ class FolderSyncForegroundService : Service() {
     ): Boolean {
         if (!outageRetryStore.allowsAttempt(trigger)) {
             val state = outageRetryStore.state()
+            if (hasAllowedProfiles) {
+                schedulePersistedRetryWakeup(state)
+            }
             Log.i(
                 TAG,
                 "holding $trigger until outage backoff expires at ${state.nextRetryAtEpochMs}",
