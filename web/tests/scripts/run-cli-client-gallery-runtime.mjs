@@ -163,7 +163,7 @@ function galleryMapClustersResponse(url) {
     prefix,
     depth,
     zoom,
-    resolution: Math.ceil(8 * 2 ** zoom),
+    resolution: Math.ceil(4 * 2 ** zoom),
     total_entry_count: galleryEntries.length,
     visible_geotagged_count: galleryEntries.length,
     media_summary: {

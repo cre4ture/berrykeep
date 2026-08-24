@@ -9,9 +9,9 @@ use super::StoreIndexMediaFilter;
 
 const GALLERY_MAP_TOKEN_PREFIX: &str = "gm1_";
 const MAX_GALLERY_MAP_TOKEN_LENGTH: usize = 65_536;
-const MAX_GALLERY_MAP_RESOLUTION: u32 = 1 << 23;
+const MAX_GALLERY_MAP_RESOLUTION: u32 = 1 << 22;
 const MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX: f64 = 512.0;
-const GALLERY_MAP_CLUSTER_CELL_WIDTH_PX: f64 = 64.0;
+const GALLERY_MAP_CLUSTER_CELL_WIDTH_PX: f64 = 128.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn map_grid_resolution_tracks_fractional_zoom_without_oversizing_cells() {
+    fn map_grid_resolution_tracks_fractional_zoom_at_the_legacy_cell_width() {
         for zoom in [0.0, 0.25, 1.2, 3.75, 12.4, 20.0] {
             let world_size = MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX * 2.0_f64.powf(zoom);
             let resolution = f64::from(gallery_map_resolution_for_zoom(zoom));
@@ -183,6 +183,7 @@ mod tests {
             );
         }
 
+        assert_eq!(gallery_map_resolution_for_zoom(3.0), 1 << 5);
         assert_ne!(
             gallery_map_resolution_for_zoom(3.0),
             gallery_map_resolution_for_zoom(3.75)

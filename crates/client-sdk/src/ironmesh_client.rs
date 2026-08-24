@@ -3555,6 +3555,13 @@ pub struct GalleryMapClustersResponse {
     pub clusters: Vec<GalleryMapCluster>,
 }
 
+fn gallery_map_zoom_for_request(zoom: f64) -> Result<f64> {
+    if !zoom.is_finite() {
+        bail!("zoom must be a finite number");
+    }
+    Ok(zoom.clamp(0.0, 20.0))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GalleryMapClusterEntriesResponse {
     pub cluster_id: String,
@@ -5172,11 +5179,7 @@ impl IronMeshClient {
         &self,
         request: GalleryMapClustersRequest,
     ) -> Result<GalleryMapClustersResponse> {
-        let zoom = if request.zoom.is_finite() {
-            request.zoom.clamp(0.0, 20.0)
-        } else {
-            1.0
-        };
+        let zoom = gallery_map_zoom_for_request(request.zoom)?;
         let mut url = self.relative_url("/store/map/clusters")?;
         {
             let mut query = url.query_pairs_mut();

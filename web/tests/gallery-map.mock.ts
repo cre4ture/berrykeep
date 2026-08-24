@@ -32,7 +32,7 @@ export class GalleryMapMockSession<T extends GalleryMapMockEntry> {
     const zoom = Number.isFinite(requestedZoom)
       ? Math.max(0, Math.min(20, requestedZoom))
       : 1;
-    const resolution = Math.ceil(8 * 2 ** zoom);
+    const resolution = Math.ceil(4 * 2 ** zoom);
     const viewport = {
       south: Number(searchParams.get("south") ?? "-90"),
       west: Number(searchParams.get("west") ?? "-180"),
