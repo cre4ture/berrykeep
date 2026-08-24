@@ -6,6 +6,8 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use client_sdk::{
@@ -17,7 +19,7 @@ use futures_util::{Sink, Stream};
 use jni::{
     JNIEnv,
     objects::JClass,
-    sys::{jint, jstring},
+    sys::{jboolean, jint, jstring},
 };
 use serde::Serialize;
 use std::{
@@ -72,12 +74,24 @@ struct AndroidRendezvousRenewalScenario {
     remote_document_size_bytes: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidFolderSyncOutageScenario {
+    connection_bootstrap_json: String,
+    client_identity_json: String,
+    remote_document_path: String,
+    remote_document_size_bytes: usize,
+}
+
 #[derive(Clone)]
 struct AndroidRendezvousRenewalState {
     public_url: String,
     renewed_rendezvous_client_identity_pem: String,
     captured_paths: Arc<Mutex<Vec<String>>>,
     paired_session_count: Arc<AtomicUsize>,
+    available: Arc<std::sync::atomic::AtomicBool>,
+    direct_connection_attempt_count: Arc<AtomicUsize>,
+    rendezvous_contact_attempt_count: Arc<AtomicUsize>,
 }
 
 struct AndroidRendezvousRenewalServer {
@@ -126,6 +140,38 @@ fn android_test_connection_bootstrap(public_url: &str) -> Result<ConnectionBoots
     })
 }
 
+/// Builds the Android folder-sync outage bootstrap. It deliberately contains both a direct node
+/// route and a Rendezvous relay route, so the instrumentation test can make every configured
+/// route unavailable before exercising recovery through the same cached mobile client.
+fn android_folder_sync_outage_bootstrap(public_url: &str) -> Result<ConnectionBootstrap> {
+    Ok(ConnectionBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: android_test_cluster_id()?,
+        rendezvous_urls: vec![public_url.to_string()],
+        rendezvous_contact_list: None,
+        rendezvous_mtls_required: false,
+        direct_endpoints: vec![BootstrapEndpoint {
+            url: public_url.to_string(),
+            usage: Some(BootstrapEndpointUse::PublicApi),
+            node_id: Some(
+                "00000000-0000-0000-0000-000000000902"
+                    .parse()
+                    .context("failed to parse Android folder-sync outage node id")?,
+            ),
+        }],
+        relay_mode: RelayMode::Fallback,
+        trust_roots: BootstrapTrustRoots {
+            cluster_ca_pem: None,
+            public_api_ca_pem: None,
+            rendezvous_ca_pem: None,
+        },
+        pairing_token: None,
+        device_label: None,
+        device_id: None,
+        node_priority_overrides: Default::default(),
+    })
+}
+
 fn android_test_client_identity() -> Result<ClientIdentityMaterial> {
     let mut identity = ClientIdentityMaterial::generate(
         android_test_cluster_id()?,
@@ -135,6 +181,16 @@ fn android_test_client_identity() -> Result<ClientIdentityMaterial> {
     identity.credential_pem = Some("issued-credential".to_string());
     identity.rendezvous_client_identity_pem =
         Some(EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM.to_string());
+    Ok(identity)
+}
+
+fn android_folder_sync_outage_client_identity() -> Result<ClientIdentityMaterial> {
+    let mut identity = ClientIdentityMaterial::generate(
+        android_test_cluster_id()?,
+        None,
+        Some("android-folder-sync-outage-device".to_string()),
+    )?;
+    identity.credential_pem = Some("issued-credential".to_string());
     Ok(identity)
 }
 
@@ -277,9 +333,13 @@ async fn start_android_rendezvous_renewal_server(
         renewed_rendezvous_client_identity_pem,
         captured_paths: Arc::new(Mutex::new(Vec::new())),
         paired_session_count: Arc::new(AtomicUsize::new(0)),
+        available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        direct_connection_attempt_count: Arc::new(AtomicUsize::new(0)),
+        rendezvous_contact_attempt_count: Arc::new(AtomicUsize::new(0)),
     };
     let router = Router::new()
         .route("/transport/ws", get(android_direct_transport_ws))
+        .fallback(android_rendezvous_contact_request)
         .with_state(state.clone());
     let handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
@@ -295,16 +355,37 @@ async fn start_android_rendezvous_renewal_server(
 async fn android_direct_transport_ws(
     State(state): State<AndroidRendezvousRenewalState>,
     websocket: WebSocketUpgrade,
-) -> impl axum::response::IntoResponse {
-    websocket.on_upgrade(move |socket| async move {
-        state.paired_session_count.fetch_add(1, Ordering::SeqCst);
-        if let Err(err) = serve_android_multiplex_socket(state, socket).await {
-            tracing::warn!(
-                error = %err,
-                "android rendezvous renewal test websocket session failed"
-            );
-        }
-    })
+) -> Response {
+    state
+        .direct_connection_attempt_count
+        .fetch_add(1, Ordering::SeqCst);
+    if !state.available.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    websocket
+        .on_upgrade(move |socket| async move {
+            state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+            if let Err(err) = serve_android_multiplex_socket(state, socket).await {
+                tracing::warn!(
+                    error = %err,
+                    "android rendezvous renewal test websocket session failed"
+                );
+            }
+        })
+        .into_response()
+}
+
+async fn android_rendezvous_contact_request(
+    State(state): State<AndroidRendezvousRenewalState>,
+) -> Response {
+    state
+        .rendezvous_contact_attempt_count
+        .fetch_add(1, Ordering::SeqCst);
+    if state.available.load(Ordering::SeqCst) {
+        StatusCode::NOT_FOUND.into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -602,6 +683,27 @@ fn scenario_json() -> Result<String> {
         .context("failed to serialize android rendezvous renewal scenario")
 }
 
+fn folder_sync_outage_scenario_json() -> Result<String> {
+    stop_android_rendezvous_renewal_server()?;
+    let renewed_pem = renewed_rendezvous_client_identity_pem();
+    let server = runtime()?.block_on(start_android_rendezvous_renewal_server(renewed_pem))?;
+    let bootstrap_json = android_folder_sync_outage_bootstrap(&server.state.public_url)?
+        .to_json_pretty()
+        .context("failed to serialize Android folder-sync outage bootstrap")?;
+    let client_identity_json = android_folder_sync_outage_client_identity()?
+        .to_json_pretty()
+        .context("failed to serialize Android folder-sync outage client identity")?;
+    let scenario = AndroidFolderSyncOutageScenario {
+        connection_bootstrap_json: bootstrap_json,
+        client_identity_json,
+        remote_document_path: TEST_DOCUMENT_PATH.to_string(),
+        remote_document_size_bytes: TEST_DOCUMENT_SIZE_BYTES,
+    };
+    *lock_server_state()? = Some(server);
+    serde_json::to_string(&scenario)
+        .context("failed to serialize Android folder-sync outage scenario")
+}
+
 fn captured_request_paths_json() -> Result<String> {
     let paths = lock_server_state()?
         .as_ref()
@@ -622,6 +724,39 @@ fn paired_session_count() -> Result<usize> {
     Ok(lock_server_state()?
         .as_ref()
         .map(|server| server.state.paired_session_count.load(Ordering::SeqCst))
+        .unwrap_or(0))
+}
+
+fn set_folder_sync_outage_server_available(available: bool) -> Result<()> {
+    let state = lock_server_state()?;
+    let server = state
+        .as_ref()
+        .context("Android folder-sync outage scenario is not running")?;
+    server.state.available.store(available, Ordering::SeqCst);
+    Ok(())
+}
+
+fn direct_connection_attempt_count() -> Result<usize> {
+    Ok(lock_server_state()?
+        .as_ref()
+        .map(|server| {
+            server
+                .state
+                .direct_connection_attempt_count
+                .load(Ordering::SeqCst)
+        })
+        .unwrap_or(0))
+}
+
+fn rendezvous_contact_attempt_count() -> Result<usize> {
+    Ok(lock_server_state()?
+        .as_ref()
+        .map(|server| {
+            server
+                .state
+                .rendezvous_contact_attempt_count
+                .load(Ordering::SeqCst)
+        })
         .unwrap_or(0))
 }
 
@@ -680,6 +815,94 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge
                 format!("rust startRendezvousRenewalScenario failed: {err:#}"),
             );
             std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI during instrumentation tests.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_startFolderSyncOutageScenario(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    match folder_sync_outage_scenario_json() {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!(
+                        "rust startFolderSyncOutageScenario failed to create java string: {err:#}"
+                    ),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust startFolderSyncOutageScenario failed: {err:#}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI during instrumentation tests.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_setFolderSyncOutageScenarioAvailable(
+    mut env: JNIEnv,
+    _class: JClass,
+    available: jboolean,
+) {
+    if let Err(err) = set_folder_sync_outage_server_available(available != 0) {
+        throw_java_error(
+            &mut env,
+            format!("rust setFolderSyncOutageScenarioAvailable failed: {err:#}"),
+        );
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI during instrumentation tests.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_getFolderSyncOutageDirectConnectionAttemptCount(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    match direct_connection_attempt_count() {
+        Ok(count) => count.try_into().unwrap_or(jint::MAX),
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust getFolderSyncOutageDirectConnectionAttemptCount failed: {err:#}"),
+            );
+            0
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI during instrumentation tests.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_getFolderSyncOutageRendezvousContactAttemptCount(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    match rendezvous_contact_attempt_count() {
+        Ok(count) => count.try_into().unwrap_or(jint::MAX),
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust getFolderSyncOutageRendezvousContactAttemptCount failed: {err:#}"),
+            );
+            0
         }
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+@preconcurrency import FileProvider
 import XCTest
 @testable import AppleCore
 
@@ -153,6 +154,23 @@ final class AppleSyncProfilesTests: XCTestCase {
             ),
             .allowed
         )
+    }
+
+    func testOfflinePolicyMapsToRetryableFileProviderError() {
+        let profile = AppleSyncProfile(id: "offline", displayName: "Offline")
+        let decision = AppleSyncConstraintEvaluator.evaluate(
+            profile: profile,
+            environment: AppleSyncEnvironmentSnapshot(isConnected: false)
+        )
+
+        guard case .blocked(let reason) = decision else {
+            return XCTFail("expected the offline policy to block remote work")
+        }
+        let error = ironmeshConstraintError(reason)
+
+        XCTAssertEqual(error.domain, NSFileProviderErrorDomain)
+        XCTAssertEqual(error.code, NSFileProviderError.Code.serverUnreachable.rawValue)
+        XCTAssertEqual(error.localizedDescription, "No network connection is currently available.")
     }
 
     func testPausedProfileIsBlockedIndependentlyOfNetwork() {

@@ -1,4 +1,5 @@
 import Foundation
+@preconcurrency import FileProvider
 import XCTest
 @testable import AppleCore
 
@@ -67,6 +68,52 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(items[1].sizeBytes, 12)
         XCTAssertEqual(ffi.lastListPrefix, "docs/")
         XCTAssertEqual(ffi.lastListDepth, 1)
+    }
+
+    func testBridgePropagatesRetryableRemoteFailureAndRecoversAfterExplicitRetry() throws {
+        let ffi = MockFFI()
+        ffi.listError = retryableRemoteUnavailableError()
+        ffi.listResponseJSON = #"""
+        {
+          "entries": [
+            {
+              "path": "photos/recovered.jpg",
+              "item_id": "file:path:photos/recovered.jpg",
+              "kind": "file"
+            }
+          ]
+        }
+        """#
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
+
+        XCTAssertThrowsError(try bridge.list(path: "", depth: 1)) { error in
+            assertServerUnreachable(error)
+        }
+        XCTAssertEqual(ffi.listCallCount, 1)
+
+        ffi.listError = nil
+        let items = try bridge.list(path: "", depth: 1)
+
+        XCTAssertEqual(items.map(\.path), ["photos/recovered.jpg"])
+        XCTAssertEqual(ffi.listCallCount, 2)
+    }
+
+    func testBridgeRecoversAfterRetryableConnectionFailure() throws {
+        let ffi = MockFFI()
+        ffi.createHandleError = retryableRemoteUnavailableError()
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        let configuration = AppleConnectionConfiguration(connectionInput: #"{"version":1}"#)
+
+        XCTAssertThrowsError(try bridge.connect(configuration)) { error in
+            assertServerUnreachable(error)
+        }
+        XCTAssertEqual(ffi.createHandleCallCount, 1)
+
+        ffi.createHandleError = nil
+        _ = try bridge.connect(configuration)
+
+        XCTAssertEqual(ffi.createHandleCallCount, 2)
     }
 
     func testBridgeRejectsObjectIdentifierLookupsUntilRustSupportsThem() throws {
@@ -316,10 +363,31 @@ final class AppleCFacadeBridgeTests: XCTestCase {
     }
 }
 
+private func retryableRemoteUnavailableError() -> NSError {
+    NSError(
+        domain: NSFileProviderErrorDomain,
+        code: NSFileProviderError.Code.serverUnreachable.rawValue,
+        userInfo: [
+            NSLocalizedDescriptionKey:
+                "Neither the Rendezvous relay nor the server node is reachable.",
+        ]
+    )
+}
+
+private func assertServerUnreachable(_ error: Error) {
+    let nsError = error as NSError
+    XCTAssertEqual(nsError.domain, NSFileProviderErrorDomain)
+    XCTAssertEqual(nsError.code, NSFileProviderError.Code.serverUnreachable.rawValue)
+}
+
 private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var createdConnectionInput: String?
+    var createHandleError: Error?
+    var createHandleCallCount = 0
     var lastListPrefix: String?
     var lastListDepth: Int?
+    var listError: Error?
+    var listCallCount = 0
     var lastDeletePath: String?
     var lastDeleteExpectedRevision: String?
     var lastPutExpectedRevision: String?
@@ -365,6 +433,10 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = serverCAPem
         _ = clientIdentityJSON
         createdConnectionInput = connectionInput
+        createHandleCallCount += 1
+        if let createHandleError {
+            throw createHandleError
+        }
         return AppleRustHandle(bitPattern: 0x1)!
     }
 
@@ -390,6 +462,10 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = snapshot
         lastListPrefix = prefix
         lastListDepth = depth
+        listCallCount += 1
+        if let listError {
+            throw listError
+        }
         return listResponseJSON
     }
 

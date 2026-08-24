@@ -12,6 +12,18 @@ object RustClientTestBridge {
     external fun startRendezvousRenewalScenario(): String
 
     @JvmStatic
+    external fun startFolderSyncOutageScenario(): String
+
+    @JvmStatic
+    external fun setFolderSyncOutageScenarioAvailable(available: Boolean)
+
+    @JvmStatic
+    external fun getFolderSyncOutageDirectConnectionAttemptCount(): Int
+
+    @JvmStatic
+    external fun getFolderSyncOutageRendezvousContactAttemptCount(): Int
+
+    @JvmStatic
     external fun getCapturedRequestPaths(): String
 
     @JvmStatic
