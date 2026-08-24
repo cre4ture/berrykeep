@@ -4022,7 +4022,7 @@ mod tests {
             .local_addr()
             .expect("web listener should have an address");
         let app = router(WebUiConfig::from_client(
-            IronMeshClient::from_direct_base_url(&format!("http://{upstream_address}")),
+            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}")),
         ));
         let web = tokio::spawn(async move {
             let _ = axum::serve(web_listener, app).await;
