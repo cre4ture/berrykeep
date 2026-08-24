@@ -34,8 +34,8 @@ use super::{
     StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
     decode_gallery_labels, decompress_snapshot_json, effective_gallery_captured_at_unix,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_label_filter_matches_json, gallery_label_predicates, gallery_media_type_for_path,
-    gallery_web_mercator_position, metadata_db_logical_summary_query,
+    gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
+    gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload,
 };
@@ -43,6 +43,7 @@ use super::{
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SQLITE_READ_CONNECTION_COUNT: usize = 4;
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
+const GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS: i64 = 1_000;
 
 #[derive(Debug, PartialEq)]
 struct GalleryProjectionState {
@@ -59,6 +60,7 @@ pub(super) struct SqliteMetadataStore {
     metadata_db_path: PathBuf,
     writer: TokioConnection,
     readers: Vec<TokioConnection>,
+    gallery_summary_reader: TokioConnection,
     next_reader: AtomicUsize,
     gallery_map_summary_cache: Arc<GallerySummaryCache>,
 }
@@ -71,10 +73,12 @@ impl SqliteMetadataStore {
         for _ in 0..sqlite_read_connection_count() {
             readers.push(open_sqlite_reader_connection(&metadata_db_path).await?);
         }
+        let gallery_summary_reader = open_sqlite_reader_connection(&metadata_db_path).await?;
         let store = Self {
             metadata_db_path,
             writer,
             readers,
+            gallery_summary_reader,
             next_reader: AtomicUsize::new(0),
             gallery_map_summary_cache: Arc::new(GallerySummaryCache::new()),
         };
@@ -124,7 +128,7 @@ impl SqliteMetadataStore {
                 ));
             }
             if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
-                let reader = self.read_connection();
+                let reader = self.gallery_summary_reader.clone();
                 let cache = self.gallery_map_summary_cache.clone();
                 let refresh_scope = scope.clone();
                 let estimate = Some(cached.total_entry_count);
@@ -670,7 +674,11 @@ fn query_gallery_map_cluster_cells_from_db(
     let (resolution, clusters) = gallery_map_cluster_cells_from_db(
         &transaction,
         &base_values,
-        query.requested_resolution,
+        gallery_map_bounded_resolution(
+            query.requested_resolution,
+            query.viewport,
+            query.max_clusters,
+        ),
         query.max_clusters,
     )?;
     transaction.commit()?;
@@ -1245,7 +1253,11 @@ fn query_gallery_map_clusters_in_transaction(
     let (resolution, clusters) = gallery_map_cluster_cells_from_db(
         db,
         &base_values,
-        query.requested_resolution,
+        gallery_map_bounded_resolution(
+            query.requested_resolution,
+            query.viewport,
+            query.max_clusters,
+        ),
         query.max_clusters,
     )?;
     let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
@@ -4506,6 +4518,15 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         [],
     )?;
     db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial_backfill
+         ON gallery_objects(key)
+         WHERE geotagged != 0
+           AND latitude IS NOT NULL
+           AND longitude IS NOT NULL
+           AND (spatial_x IS NULL OR spatial_y IS NULL)",
+        [],
+    )?;
+    db.execute(
         "CREATE INDEX IF NOT EXISTS idx_gallery_changes_key_revision
          ON gallery_changes(key, revision DESC)",
         [],
@@ -4577,35 +4598,55 @@ fn add_sqlite_column_if_missing(
 }
 
 fn backfill_gallery_spatial_positions(db: &Connection) -> Result<()> {
-    let mut statement = db.prepare(
+    let transaction = db.unchecked_transaction()?;
+    let mut select = transaction.prepare_cached(
         "SELECT key, latitude, longitude
          FROM gallery_objects
          WHERE geotagged != 0
            AND latitude IS NOT NULL
            AND longitude IS NOT NULL
-           AND (spatial_x IS NULL OR spatial_y IS NULL)",
+           AND (spatial_x IS NULL OR spatial_y IS NULL)
+           AND (?1 IS NULL OR key > ?1)
+         ORDER BY key
+         LIMIT ?2",
     )?;
-    let positions = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, f64>(1)?,
-                row.get::<_, f64>(2)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    drop(statement);
-
-    for (key, latitude, longitude) in positions {
-        let Some((spatial_x, spatial_y)) = gallery_web_mercator_position(latitude, longitude)
-        else {
-            continue;
-        };
-        db.execute(
-            "UPDATE gallery_objects SET spatial_x = ?1, spatial_y = ?2 WHERE key = ?3",
-            params![spatial_x, spatial_y, key],
-        )?;
+    let mut update = transaction.prepare_cached(
+        "UPDATE gallery_objects SET spatial_x = ?1, spatial_y = ?2 WHERE key = ?3",
+    )?;
+    let mut cursor: Option<String> = None;
+    loop {
+        let positions = select
+            .query_map(
+                params![cursor.as_deref(), GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if positions.is_empty() {
+            break;
+        }
+        let next_cursor = positions.last().map(|(key, _, _)| key.clone());
+        let completed = positions.len() < GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS as usize;
+        for (key, latitude, longitude) in positions {
+            let Some((spatial_x, spatial_y)) = gallery_web_mercator_position(latitude, longitude)
+            else {
+                continue;
+            };
+            update.execute(params![spatial_x, spatial_y, key])?;
+        }
+        cursor = next_cursor;
+        if completed {
+            break;
+        }
     }
+    drop(update);
+    drop(select);
+    transaction.commit()?;
     Ok(())
 }
 

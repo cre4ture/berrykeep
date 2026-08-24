@@ -1885,7 +1885,9 @@ export function GallerySurface({
                 </Group>
               ) : null}
 
-              {mapClustersPayload !== null && activeMediaSummary.geotagged_count === 0 ? (
+              {mapClustersPayload !== null &&
+              mapClustersPayload.clusters.length === 0 &&
+              activeMediaSummary.geotagged_count === 0 ? (
                 <Card withBorder radius="md" padding="xl">
                   <Stack gap="xs" align="center">
                     <Text fw={700}>No geo-tagged media in view</Text>

@@ -80,6 +80,22 @@ fn sample_heic_bytes() -> Vec<u8> {
 }
 
 #[test]
+fn gallery_map_resolution_is_limited_for_a_world_sized_viewport() {
+    let resolution = gallery_map_bounded_resolution(
+        1 << 22,
+        GalleryViewportBounds {
+            south: -90.0,
+            west: -180.0,
+            north: 90.0,
+            east: 180.0,
+        },
+        512,
+    );
+
+    assert_eq!(resolution, 16);
+}
+
+#[test]
 fn chunk_path_for_hash_rejects_non_blake3_hex_lengths() {
     let chunks_dir = Path::new("chunks");
 

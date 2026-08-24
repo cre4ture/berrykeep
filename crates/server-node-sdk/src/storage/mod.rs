@@ -1063,6 +1063,52 @@ pub(crate) struct GalleryViewportBounds {
     pub(crate) east: f64,
 }
 
+/// Caps the requested map grid resolution to the number of cells the viewport can actually
+/// intersect. This keeps a malformed high-zoom, world-sized request from repeatedly executing
+/// the expensive cluster aggregation while it halves the resolution to fit the response limit.
+pub(crate) fn gallery_map_bounded_resolution(
+    requested_resolution: u32,
+    viewport: GalleryViewportBounds,
+    max_clusters: usize,
+) -> u32 {
+    let max_clusters = max_clusters.max(1) as f64;
+    let longitude_span = if viewport.west <= viewport.east {
+        viewport.east - viewport.west
+    } else {
+        180.0 - viewport.west + viewport.east + 180.0
+    }
+    .clamp(0.0, 360.0)
+        / 360.0;
+    let mercator_y = |latitude: f64| {
+        let latitude = latitude.clamp(-85.051_128_78, 85.051_128_78).to_radians();
+        0.5 - ((latitude.tan() + latitude.cos().recip()).ln() / (2.0 * std::f64::consts::PI))
+    };
+    let latitude_span = (mercator_y(viewport.north) - mercator_y(viewport.south))
+        .abs()
+        .clamp(0.0, 1.0);
+    let mut resolution = requested_resolution.max(1);
+    while gallery_map_viewport_cell_upper_bound(longitude_span, latitude_span, resolution)
+        > max_clusters
+        && resolution > 1
+    {
+        resolution /= 2;
+    }
+    resolution
+}
+
+fn gallery_map_viewport_cell_upper_bound(
+    longitude_span: f64,
+    latitude_span: f64,
+    resolution: u32,
+) -> f64 {
+    let resolution = f64::from(resolution);
+    // Both ends of an interval can occupy their own cell. A wrapped longitude range splits into
+    // two intervals, so reserve an additional boundary cell there as well.
+    let horizontal_cells = (longitude_span * resolution).ceil() + 2.0;
+    let vertical_cells = (latitude_span * resolution).ceil() + 1.0;
+    horizontal_cells * vertical_cells
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GalleryIndexMediaSummary {
     pub(crate) ready_count: usize,

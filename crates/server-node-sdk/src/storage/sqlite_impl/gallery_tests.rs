@@ -579,6 +579,31 @@ fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
     assert_eq!(first_page.revision, clusters.revision);
 }
 
+#[test]
+fn gallery_spatial_backfill_restores_missing_positions() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    db.execute(
+        "INSERT INTO gallery_objects(
+             key, manifest_hash, object_id, inferred_media_type, media_type,
+             captured_at_unix, media_status, geotagged, latitude, longitude
+         ) VALUES (?1, ?2, ?3, 'image', 'image', 1, 'ready', 1, 47.4, 8.5)",
+        params!["gallery/missing-position.jpg", "manifest", "object"],
+    )
+    .expect("gallery fixture should insert");
+
+    backfill_gallery_spatial_positions(&db).expect("spatial positions should backfill");
+    let (spatial_x, spatial_y) = db
+        .query_row(
+            "SELECT spatial_x, spatial_y FROM gallery_objects WHERE key = ?1",
+            ["gallery/missing-position.jpg"],
+            |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?)),
+        )
+        .expect("backfilled gallery fixture should load");
+    assert!(spatial_x.is_some());
+    assert!(spatial_y.is_some());
+}
+
 #[tokio::test]
 async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope() {
     let metadata_db_path = sqlite_test_db_path("gallery-map-token-scope");

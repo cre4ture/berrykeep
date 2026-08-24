@@ -17,8 +17,8 @@ use super::super::{
     GallerySummaryScope, GalleryViewportBounds, ManifestSummary, current_media_cache_metadata,
     decode_gallery_labels, effective_gallery_captured_at_unix, encode_gallery_labels,
     gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_label_filter_matches_json, gallery_label_predicates, gallery_media_type_for_path,
-    gallery_web_mercator_position, sqlite_like_prefix_pattern,
+    gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
+    gallery_media_type_for_path, gallery_web_mercator_position, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload,
 };
 #[cfg(test)]
@@ -26,6 +26,7 @@ use super::turso_test_db_path;
 use super::{TursoMetadataStore, row_string, row_u64};
 
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
+const GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS: i64 = 1_000;
 
 #[derive(Debug, PartialEq)]
 struct GalleryProjectionState {
@@ -88,6 +89,17 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
         .execute(
             "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial
              ON gallery_objects(spatial_y, spatial_x, media_type, key)",
+            (),
+        )
+        .await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial_backfill
+             ON gallery_objects(key)
+             WHERE geotagged != 0
+               AND latitude IS NOT NULL
+               AND longitude IS NOT NULL
+               AND (spatial_x IS NULL OR spatial_y IS NULL)",
             (),
         )
         .await?;
@@ -231,39 +243,65 @@ async fn add_gallery_projection_column(
 }
 
 async fn backfill_gallery_spatial_positions(connection: &turso::Connection) -> Result<()> {
-    let mut rows = connection
-        .query(
-            "SELECT key, latitude, longitude
-             FROM gallery_objects
-             WHERE geotagged != 0
-               AND latitude IS NOT NULL
-               AND longitude IS NOT NULL
-               AND (spatial_x IS NULL OR spatial_y IS NULL)",
-            (),
-        )
-        .await?;
-    let mut positions = Vec::new();
-    while let Some(row) = rows.next().await? {
-        positions.push((
-            row_string(&row, 0, "gallery_objects.key")?,
-            row_f64(&row, 1, "gallery_objects.latitude")?,
-            row_f64(&row, 2, "gallery_objects.longitude")?,
-        ));
+    let transaction =
+        Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
+    let result = async {
+        let mut cursor: Option<String> = None;
+        loop {
+            let cursor_value = cursor.clone().map(Value::from).unwrap_or(Value::Null);
+            let mut rows = transaction
+                .query(
+                    "SELECT key, latitude, longitude
+                     FROM gallery_objects
+                     WHERE geotagged != 0
+                       AND latitude IS NOT NULL
+                       AND longitude IS NOT NULL
+                       AND (spatial_x IS NULL OR spatial_y IS NULL)
+                       AND (?1 IS NULL OR key > ?1)
+                     ORDER BY key
+                     LIMIT ?2",
+                    params_from_iter([
+                        cursor_value,
+                        Value::from(GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS),
+                    ]),
+                )
+                .await?;
+            let mut positions = Vec::new();
+            while let Some(row) = rows.next().await? {
+                positions.push((
+                    row_string(&row, 0, "gallery_objects.key")?,
+                    row_f64(&row, 1, "gallery_objects.latitude")?,
+                    row_f64(&row, 2, "gallery_objects.longitude")?,
+                ));
+            }
+            drop(rows);
+            if positions.is_empty() {
+                break;
+            }
+            let next_cursor = positions.last().map(|(key, _, _)| key.clone());
+            let completed = positions.len() < GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS as usize;
+            for (key, latitude, longitude) in positions {
+                let Some((spatial_x, spatial_y)) =
+                    gallery_web_mercator_position(latitude, longitude)
+                else {
+                    continue;
+                };
+                transaction
+                    .execute(
+                        "UPDATE gallery_objects SET spatial_x = ?1, spatial_y = ?2 WHERE key = ?3",
+                        (spatial_x, spatial_y, key),
+                    )
+                    .await?;
+            }
+            cursor = next_cursor;
+            if completed {
+                break;
+            }
+        }
+        Ok(())
     }
-    drop(rows);
-    for (key, latitude, longitude) in positions {
-        let Some((spatial_x, spatial_y)) = gallery_web_mercator_position(latitude, longitude)
-        else {
-            continue;
-        };
-        connection
-            .execute(
-                "UPDATE gallery_objects SET spatial_x = ?1, spatial_y = ?2 WHERE key = ?3",
-                (spatial_x, spatial_y, key),
-            )
-            .await?;
-    }
-    Ok(())
+    .await;
+    finish_gallery_transaction(transaction, result).await
 }
 
 impl TursoMetadataStore {
@@ -1552,7 +1590,11 @@ async fn query_gallery_map_clusters(
     let (resolution, clusters) = gallery_map_cluster_cells_query(
         connection,
         &base_values,
-        query.requested_resolution,
+        gallery_map_bounded_resolution(
+            query.requested_resolution,
+            query.viewport,
+            query.max_clusters,
+        ),
         query.max_clusters,
     )
     .await?;
@@ -1592,7 +1634,11 @@ pub(super) async fn query_gallery_map_cluster_cells(
     let (resolution, clusters) = gallery_map_cluster_cells_query(
         connection,
         &base_values,
-        query.requested_resolution,
+        gallery_map_bounded_resolution(
+            query.requested_resolution,
+            query.viewport,
+            query.max_clusters,
+        ),
         query.max_clusters,
     )
     .await?;
@@ -2465,6 +2511,62 @@ mod tests {
 
         drop(connection);
         drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_spatial_backfill_restores_missing_positions_in_turso() {
+        let metadata_db_path = turso_test_db_path("gallery-spatial-backfill");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        insert_gallery_fixture(
+            &store.connection,
+            "gallery/missing-position.jpg",
+            "image",
+            1,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+        store
+            .connection
+            .execute(
+                "UPDATE gallery_objects SET spatial_x = NULL, spatial_y = NULL WHERE key = ?1",
+                ("gallery/missing-position.jpg",),
+            )
+            .await
+            .expect("gallery fixture position should clear");
+
+        backfill_gallery_spatial_positions(&store.connection)
+            .await
+            .expect("spatial positions should backfill");
+        let mut rows = store
+            .connection
+            .query(
+                "SELECT spatial_x, spatial_y FROM gallery_objects WHERE key = ?1",
+                ("gallery/missing-position.jpg",),
+            )
+            .await
+            .expect("backfilled gallery fixture should query");
+        let row = rows
+            .next()
+            .await
+            .expect("backfilled gallery fixture should load")
+            .expect("backfilled gallery fixture should exist");
+        assert!(
+            row_opt_f64(&row, 0, "gallery_objects.spatial_x")
+                .expect("spatial x should decode")
+                .is_some()
+        );
+        assert!(
+            row_opt_f64(&row, 1, "gallery_objects.spatial_y")
+                .expect("spatial y should decode")
+                .is_some()
+        );
+
+        drop(rows);
+        drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }
 
