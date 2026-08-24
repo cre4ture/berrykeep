@@ -442,6 +442,49 @@ fn first_background_probe_gets_startup_budget_but_retries_keep_short_budget() {
 }
 
 #[test]
+fn route_failure_backoff_grows_exponentially_and_caps() {
+    assert_eq!(endpoint_failure_backoff_ms(1), 1_500);
+    assert_eq!(endpoint_failure_backoff_ms(2), 3_000);
+    assert_eq!(endpoint_failure_backoff_ms(3), 6_000);
+    assert_eq!(endpoint_failure_backoff_ms(4), 12_000);
+    assert_eq!(endpoint_failure_backoff_ms(5), 24_000);
+    assert_eq!(endpoint_failure_backoff_ms(6), 30_000);
+    assert_eq!(endpoint_failure_backoff_ms(u32::MAX), 30_000);
+}
+
+#[test]
+fn mobile_background_policy_waits_for_circuit_and_probe_interval_before_retrying() {
+    let policy = ClientRouteMaintenancePolicy::mobile_background();
+    let initial_probe_at_unix_ms = 10_000;
+    let mut state = ClientEndpointState {
+        consecutive_failures: 1,
+        last_measurement_unix_ms: Some(initial_probe_at_unix_ms),
+        circuit: RouteCircuitState::OpenUntil(initial_probe_at_unix_ms),
+        ..ClientEndpointState::default()
+    };
+
+    assert!(background_probe_due(
+        &state,
+        initial_probe_at_unix_ms,
+        policy
+    ));
+
+    state.last_background_probe_unix_ms = Some(initial_probe_at_unix_ms);
+    let probe_interval_ms = duration_to_u64_ms(policy.background_probe_min_interval)
+        .expect("mobile background probe interval should fit into milliseconds");
+    assert!(!background_probe_due(
+        &state,
+        initial_probe_at_unix_ms + probe_interval_ms - 1,
+        policy
+    ));
+    assert!(background_probe_due(
+        &state,
+        initial_probe_at_unix_ms + probe_interval_ms,
+        policy
+    ));
+}
+
+#[test]
 fn mobile_background_policy_claims_one_candidate_per_batch() {
     let client = IronMeshClient::combine(vec![
         IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/"),
