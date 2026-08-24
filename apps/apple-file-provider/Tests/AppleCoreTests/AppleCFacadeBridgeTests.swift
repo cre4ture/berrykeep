@@ -1,5 +1,4 @@
 import Foundation
-@preconcurrency import FileProvider
 import XCTest
 @testable import AppleCore
 
@@ -70,9 +69,9 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(ffi.lastListDepth, 1)
     }
 
-    func testBridgePropagatesRetryableRemoteFailureAndRecoversAfterExplicitRetry() throws {
+    func testBridgePropagatesRemoteFailureAndRecoversAfterExplicitRetry() throws {
         let ffi = MockFFI()
-        ffi.listError = retryableRemoteUnavailableError()
+        ffi.listError = remoteUnavailableError()
         ffi.listResponseJSON = #"""
         {
           "entries": [
@@ -88,7 +87,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
 
         XCTAssertThrowsError(try bridge.list(path: "", depth: 1)) { error in
-            assertServerUnreachable(error)
+            assertRemoteUnavailable(error)
         }
         XCTAssertEqual(ffi.listCallCount, 1)
 
@@ -99,14 +98,14 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(ffi.listCallCount, 2)
     }
 
-    func testBridgeRecoversAfterRetryableConnectionFailure() throws {
+    func testBridgeRecoversAfterRemoteConnectionFailure() throws {
         let ffi = MockFFI()
-        ffi.createHandleError = retryableRemoteUnavailableError()
+        ffi.createHandleError = remoteUnavailableError()
         let bridge = AppleCFacadeBridge(ffi: ffi)
         let configuration = AppleConnectionConfiguration(connectionInput: #"{"version":1}"#)
 
         XCTAssertThrowsError(try bridge.connect(configuration)) { error in
-            assertServerUnreachable(error)
+            assertRemoteUnavailable(error)
         }
         XCTAssertEqual(ffi.createHandleCallCount, 1)
 
@@ -363,10 +362,10 @@ final class AppleCFacadeBridgeTests: XCTestCase {
     }
 }
 
-private func retryableRemoteUnavailableError() -> NSError {
+private func remoteUnavailableError() -> NSError {
     NSError(
-        domain: NSFileProviderErrorDomain,
-        code: NSFileProviderError.Code.serverUnreachable.rawValue,
+        domain: "dev.ironmesh.rust",
+        code: 1,
         userInfo: [
             NSLocalizedDescriptionKey:
                 "Neither the Rendezvous relay nor the server node is reachable.",
@@ -374,10 +373,14 @@ private func retryableRemoteUnavailableError() -> NSError {
     )
 }
 
-private func assertServerUnreachable(_ error: Error) {
+private func assertRemoteUnavailable(_ error: Error) {
     let nsError = error as NSError
-    XCTAssertEqual(nsError.domain, NSFileProviderErrorDomain)
-    XCTAssertEqual(nsError.code, NSFileProviderError.Code.serverUnreachable.rawValue)
+    XCTAssertEqual(nsError.domain, "dev.ironmesh.rust")
+    XCTAssertEqual(nsError.code, 1)
+    XCTAssertEqual(
+        nsError.localizedDescription,
+        "Neither the Rendezvous relay nor the server node is reachable."
+    )
 }
 
 private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
