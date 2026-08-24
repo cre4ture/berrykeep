@@ -75,6 +75,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                 ON gallery_objects(manifest_hash);
             CREATE INDEX IF NOT EXISTS idx_gallery_objects_viewport
                 ON gallery_objects(latitude, longitude, media_type, captured_at_unix DESC, key ASC);
+            CREATE INDEX IF NOT EXISTS idx_gallery_changes_key_revision
+                ON gallery_changes(key, revision DESC);
             CREATE INDEX IF NOT EXISTS idx_manifest_summaries_content_fingerprint
                 ON manifest_summaries(content_fingerprint);
             ",
@@ -588,17 +590,24 @@ impl TursoMetadataStore {
         &self,
         query: &GalleryMapClusterQuery,
     ) -> Result<GalleryMapClusterPage> {
-        let (history_id, revision, resolution, visible_geotagged_count, clusters) = {
+        let (history_id, cache_revision, revision, resolution, visible_geotagged_count, clusters) = {
             let connection = self.gallery_read_connection().await?;
             let transaction =
                 Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
             let result = async {
                 let history_id = current_gallery_history_id(&transaction).await?;
-                let revision = current_gallery_revision(&transaction).await?;
+                let cache_revision = current_gallery_revision(&transaction).await?;
+                let revision = current_gallery_scope_revision(
+                    &transaction,
+                    query.prefix.trim().trim_matches('/'),
+                    query.depth,
+                )
+                .await?;
                 let (resolution, visible_geotagged_count, clusters) =
                     query_gallery_map_cluster_cells(&transaction, query).await?;
                 Ok((
                     history_id,
+                    cache_revision,
                     revision,
                     resolution,
                     visible_geotagged_count,
@@ -615,7 +624,7 @@ impl TursoMetadataStore {
             media_filter: query.media_filter,
         };
         let (total_entry_count, media_summary, summary_status) = self
-            .gallery_map_summary(scope, &history_id, revision)
+            .gallery_map_summary(scope, &history_id, cache_revision)
             .await?;
 
         Ok(GalleryMapClusterPage {
@@ -701,7 +710,12 @@ impl TursoMetadataStore {
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
         let result = async {
             let history_id = current_gallery_history_id(&transaction).await?;
-            let revision = current_gallery_revision(&transaction).await?;
+            let revision = current_gallery_scope_revision(
+                &transaction,
+                query.prefix.trim().trim_matches('/'),
+                query.depth,
+            )
+            .await?;
             query_gallery_map_cluster_entries(&transaction, query, history_id, revision).await
         }
         .await;
@@ -2045,6 +2059,49 @@ async fn current_gallery_revision(connection: &turso::Connection) -> Result<u64>
         .with_context(|| format!("invalid persisted Turso gallery revision: {raw}"))
 }
 
+/// Returns the most recent retained mutation that can affect a gallery map scope. Query tokens
+/// use this scoped revision rather than the library-wide revision so media ingestion elsewhere in
+/// a library does not repeatedly invalidate an open cluster or its pagination.
+async fn current_gallery_scope_revision(
+    connection: &turso::Connection,
+    prefix: &str,
+    depth: usize,
+) -> Result<u64> {
+    let prefix_pattern = if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{prefix}/"))
+    };
+    let depth = i64::try_from(depth).context("gallery map scope depth overflow")?;
+    let mut rows = connection
+        .query(
+            "SELECT COALESCE(MAX(revision), 0)
+             FROM gallery_changes
+             WHERE (?1 = '' OR gallery_changes.key = ?1 OR gallery_changes.key LIKE ?2 ESCAPE '\\')
+               AND CASE
+                   WHEN ?1 = '' THEN CASE
+                       WHEN trim(gallery_changes.key, '/') = '' THEN 0
+                       ELSE length(trim(gallery_changes.key, '/'))
+                            - length(replace(trim(gallery_changes.key, '/'), '/', '')) + 1
+                   END
+                   WHEN gallery_changes.key = ?1 THEN 0
+                   ELSE length(substr(gallery_changes.key, length(?1) + 2))
+                        - length(replace(substr(gallery_changes.key, length(?1) + 2), '/', '')) + 1
+               END <= ?3",
+            params_from_iter([
+                Value::from(prefix.to_string()),
+                Value::from(prefix_pattern),
+                Value::from(depth),
+            ]),
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("gallery map scope revision query returned no row"))?;
+    row_u64(&row, 0, "gallery map scope revision")
+}
+
 async fn current_gallery_history_id(connection: &turso::Connection) -> Result<String> {
     let mut rows = connection
         .query(
@@ -2408,6 +2465,104 @@ mod tests {
 
         drop(connection);
         drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope_in_turso() {
+        let metadata_db_path = turso_test_db_path("gallery-map-token-scope");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        insert_gallery_fixture(
+            &store.connection,
+            "gallery/a.jpg",
+            "image",
+            10,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+        insert_gallery_fixture(
+            &store.connection,
+            "gallery/b.jpg",
+            "image",
+            20,
+            Some(47.4),
+            Some(8.5),
+        )
+        .await;
+
+        let viewport = GalleryViewportBounds {
+            south: 45.0,
+            west: 5.0,
+            north: 49.0,
+            east: 11.0,
+        };
+        let clusters = store
+            .query_gallery_map_clusters(&gallery_map_query(viewport, 1024, 512))
+            .await
+            .expect("gallery map clusters should load")
+            .expect("turso should support gallery map clusters");
+        let cluster = clusters
+            .clusters
+            .first()
+            .expect("fixture should produce one map cluster");
+
+        insert_gallery_fixture(
+            &store.connection,
+            "elsewhere/noise.jpg",
+            "image",
+            30,
+            Some(40.7),
+            Some(-74.0),
+        )
+        .await;
+
+        let page = store
+            .query_gallery_map_cluster_entries(&GalleryMapClusterEntriesQuery {
+                prefix: "gallery".to_string(),
+                depth: 64,
+                media_filter: GalleryIndexMediaFilter::Image,
+                viewport,
+                resolution: clusters.resolution,
+                cell_x: cluster.cell_x,
+                cell_y: cluster.cell_y,
+                offset: 0,
+                limit: 100,
+            })
+            .await
+            .expect("cluster page should load after unrelated ingest")
+            .expect("turso should support cluster pages");
+        assert_eq!(page.history_id, clusters.history_id);
+        assert_eq!(page.revision, clusters.revision);
+
+        store
+            .connection
+            .execute(
+                "UPDATE gallery_objects SET captured_at_unix = 40 WHERE key = 'gallery/a.jpg'",
+                (),
+            )
+            .await
+            .expect("in-scope fixture should update");
+        let changed_page = store
+            .query_gallery_map_cluster_entries(&GalleryMapClusterEntriesQuery {
+                prefix: "gallery".to_string(),
+                depth: 64,
+                media_filter: GalleryIndexMediaFilter::Image,
+                viewport,
+                resolution: clusters.resolution,
+                cell_x: cluster.cell_x,
+                cell_y: cluster.cell_y,
+                offset: 0,
+                limit: 100,
+            })
+            .await
+            .expect("cluster page should load after in-scope change")
+            .expect("turso should support cluster pages");
+        assert_ne!(changed_page.revision, clusters.revision);
+
+        drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }
 

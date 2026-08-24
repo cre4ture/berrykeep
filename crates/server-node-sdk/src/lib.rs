@@ -117,6 +117,7 @@ const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const STORE_INDEX_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_INDEX_PAGE_CACHE_MAX_SCOPES: usize = 2;
 const STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
+const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 512;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
 const GALLERY_MAP_CLUSTER_ENTRY_MAX_LIMIT: usize = 500;
@@ -15776,7 +15777,7 @@ async fn gallery_map_clusters_response(
         .trim()
         .trim_matches('/')
         .to_string();
-    let depth = query.depth.unwrap_or(1).max(1);
+    let depth = query.depth.unwrap_or(1).clamp(1, GALLERY_MAX_DEPTH);
     let media_filter = query.media_filter.unwrap_or(StoreIndexMediaFilter::All);
     let zoom = query.zoom.unwrap_or(1).min(20);
     let page = {

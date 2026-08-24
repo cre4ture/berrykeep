@@ -649,11 +649,12 @@ fn query_gallery_map_clusters_from_db(
 fn query_gallery_map_cluster_cells_from_db(
     db: &Connection,
     query: &GalleryMapClusterQuery,
-) -> Result<(String, u64, u32, usize, Vec<GalleryMapCluster>)> {
+) -> Result<(String, u64, u64, u32, usize, Vec<GalleryMapCluster>)> {
     let transaction = db.unchecked_transaction()?;
     let history_id = current_gallery_history_id_from_db(&transaction)?;
-    let revision = current_gallery_revision_from_db(&transaction)?;
+    let cache_revision = current_gallery_revision_from_db(&transaction)?;
     let prefix = query.prefix.trim().trim_matches('/').to_string();
+    let revision = current_gallery_scope_revision_from_db(&transaction, &prefix, query.depth)?;
     let prefix_pattern = if prefix.is_empty() {
         "%".to_string()
     } else {
@@ -676,6 +677,7 @@ fn query_gallery_map_cluster_cells_from_db(
     let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
     Ok((
         history_id,
+        cache_revision,
         revision,
         resolution,
         visible_geotagged_count,
@@ -736,7 +738,8 @@ fn query_gallery_map_cluster_entries_from_db(
 ) -> Result<GalleryIndexPage> {
     let transaction = db.unchecked_transaction()?;
     let history_id = current_gallery_history_id_from_db(&transaction)?;
-    let revision = current_gallery_revision_from_db(&transaction)?;
+    let prefix = query.prefix.trim().trim_matches('/');
+    let revision = current_gallery_scope_revision_from_db(&transaction, prefix, query.depth)?;
     let page = query_gallery_map_cluster_entries_in_transaction(
         &transaction,
         query,
@@ -1541,6 +1544,40 @@ fn current_gallery_revision_from_db(db: &Connection) -> Result<u64> {
         .with_context(|| format!("invalid persisted gallery revision: {raw}"))
 }
 
+/// Returns the most recent retained mutation that can affect a gallery map scope. Query tokens
+/// use this scoped revision rather than the library-wide revision so media ingestion elsewhere in
+/// a library does not repeatedly invalidate an open cluster or its pagination.
+fn current_gallery_scope_revision_from_db(
+    db: &Connection,
+    prefix: &str,
+    depth: usize,
+) -> Result<u64> {
+    let prefix_pattern = if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        sqlite_like_prefix_pattern(&format!("{prefix}/"))
+    };
+    let depth = i64::try_from(depth).context("gallery map scope depth overflow")?;
+    let revision = db.query_row(
+        "SELECT COALESCE(MAX(revision), 0)
+         FROM gallery_changes
+         WHERE (?1 = '' OR gallery_changes.key = ?1 OR gallery_changes.key LIKE ?2 ESCAPE '\\')
+           AND CASE
+               WHEN ?1 = '' THEN CASE
+                   WHEN trim(gallery_changes.key, '/') = '' THEN 0
+                   ELSE length(trim(gallery_changes.key, '/'))
+                        - length(replace(trim(gallery_changes.key, '/'), '/', '')) + 1
+               END
+               WHEN gallery_changes.key = ?1 THEN 0
+               ELSE length(substr(gallery_changes.key, length(?1) + 2))
+                    - length(replace(substr(gallery_changes.key, length(?1) + 2), '/', '')) + 1
+           END <= ?3",
+        params![prefix, prefix_pattern, depth],
+        |row| row.get::<_, i64>(0),
+    )?;
+    u64::try_from(revision).context("gallery map scope revision was negative")
+}
+
 fn current_gallery_history_id_from_db(db: &Connection) -> Result<String> {
     let history_id = db.query_row(
         "SELECT value FROM metadata_meta WHERE key = 'gallery_history_id'",
@@ -1838,9 +1875,9 @@ impl MetadataStore for SqliteMetadataStore {
         query: &GalleryMapClusterQuery,
     ) -> Result<Option<GalleryMapClusterPage>> {
         let cluster_query = query.clone();
-        let (history_id, revision, resolution, visible_geotagged_count, clusters) = self
-            .read(move |db| query_gallery_map_cluster_cells_from_db(db, &cluster_query))
-            .await?;
+        let (history_id, cache_revision, revision, resolution, visible_geotagged_count, clusters) =
+            self.read(move |db| query_gallery_map_cluster_cells_from_db(db, &cluster_query))
+                .await?;
 
         let scope = GallerySummaryScope {
             prefix: query.prefix.trim().trim_matches('/').to_string(),
@@ -1848,7 +1885,7 @@ impl MetadataStore for SqliteMetadataStore {
             media_filter: query.media_filter,
         };
         let (total_entry_count, media_summary, summary_status) = self
-            .gallery_map_summary(scope, &history_id, revision)
+            .gallery_map_summary(scope, &history_id, cache_revision)
             .await?;
 
         Ok(Some(GalleryMapClusterPage {
@@ -4466,6 +4503,11 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial
          ON gallery_objects(spatial_y, spatial_x, media_type, key)",
+        [],
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gallery_changes_key_revision
+         ON gallery_changes(key, revision DESC)",
         [],
     )?;
     backfill_gallery_spatial_positions(db)?;

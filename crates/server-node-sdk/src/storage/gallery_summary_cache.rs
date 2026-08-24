@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -70,24 +70,65 @@ impl GallerySummaryProgress {
 /// path. The very first request for a scope still pays for one synchronous computation, since
 /// there is nothing to serve from cache yet.
 pub(crate) struct GallerySummaryCache {
-    values: Mutex<HashMap<GallerySummaryScope, GallerySummaryCacheValue>>,
+    values: Mutex<GallerySummaryCacheValues>,
     trackers: Mutex<HashMap<GallerySummaryScope, Arc<GallerySummaryRefreshTracker>>>,
+}
+
+/// The gallery controls expose one scope at a time and only offer a small fixed set of media
+/// filters. This LRU prevents request parameters from growing the process memory without bound
+/// while retaining the scopes a user is most likely to revisit.
+const GALLERY_SUMMARY_CACHE_MAX_SCOPES: usize = 64;
+
+#[derive(Default)]
+struct GallerySummaryCacheValues {
+    entries: HashMap<GallerySummaryScope, GallerySummaryCacheValue>,
+    least_recently_used: VecDeque<GallerySummaryScope>,
+}
+
+impl GallerySummaryCacheValues {
+    fn touch(&mut self, scope: &GallerySummaryScope) {
+        if let Some(index) = self
+            .least_recently_used
+            .iter()
+            .position(|existing| existing == scope)
+        {
+            self.least_recently_used.remove(index);
+        }
+        self.least_recently_used.push_back(scope.clone());
+    }
+
+    fn evict_excess_entries(&mut self) {
+        while self.entries.len() > GALLERY_SUMMARY_CACHE_MAX_SCOPES {
+            let Some(scope) = self.least_recently_used.pop_front() else {
+                break;
+            };
+            self.entries.remove(&scope);
+        }
+    }
 }
 
 impl GallerySummaryCache {
     pub(crate) fn new() -> Self {
         Self {
-            values: Mutex::new(HashMap::new()),
+            values: Mutex::new(GallerySummaryCacheValues::default()),
             trackers: Mutex::new(HashMap::new()),
         }
     }
 
     pub(crate) fn cached(&self, scope: &GallerySummaryScope) -> Option<GallerySummaryCacheValue> {
-        self.values.lock().unwrap().get(scope).cloned()
+        let mut values = self.values.lock().unwrap();
+        let value = values.entries.get(scope).cloned();
+        if value.is_some() {
+            values.touch(scope);
+        }
+        value
     }
 
     pub(crate) fn store(&self, scope: GallerySummaryScope, value: GallerySummaryCacheValue) {
-        self.values.lock().unwrap().insert(scope, value);
+        let mut values = self.values.lock().unwrap();
+        values.entries.insert(scope.clone(), value);
+        values.touch(&scope);
+        values.evict_excess_entries();
     }
 
     pub(crate) fn status(&self, scope: &GallerySummaryScope) -> GallerySummaryRefreshStatus {
@@ -121,8 +162,60 @@ impl GallerySummaryCache {
     /// Marks a claimed refresh as finished, regardless of whether it succeeded. Must be called
     /// exactly once for every `try_start_refresh` that returned `Some`.
     pub(crate) fn finish_refresh(&self, scope: &GallerySummaryScope) {
-        if let Some(tracker) = self.trackers.lock().unwrap().get(scope) {
+        if let Some(tracker) = self.trackers.lock().unwrap().remove(scope) {
             tracker.running.store(false, Ordering::Release);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope(index: usize) -> GallerySummaryScope {
+        GallerySummaryScope {
+            prefix: format!("gallery/{index}"),
+            depth: 1,
+            media_filter: GalleryIndexMediaFilter::All,
+        }
+    }
+
+    fn value(index: usize) -> GallerySummaryCacheValue {
+        GallerySummaryCacheValue {
+            history_id: "history".to_string(),
+            revision: index as u64,
+            total_entry_count: index,
+            media_summary: GalleryIndexMediaSummary::default(),
+        }
+    }
+
+    #[test]
+    fn bounds_scopes_and_evicts_the_least_recently_used_value() {
+        let cache = GallerySummaryCache::new();
+        for index in 0..=GALLERY_SUMMARY_CACHE_MAX_SCOPES {
+            cache.store(scope(index), value(index));
+        }
+
+        assert!(cache.cached(&scope(0)).is_none());
+        assert_eq!(
+            cache
+                .cached(&scope(GALLERY_SUMMARY_CACHE_MAX_SCOPES))
+                .expect("newest scope should remain cached")
+                .revision,
+            GALLERY_SUMMARY_CACHE_MAX_SCOPES as u64
+        );
+    }
+
+    #[test]
+    fn retires_refresh_trackers_when_the_refresh_finishes() {
+        let cache = GallerySummaryCache::new();
+        let scope = scope(0);
+        assert!(cache.try_start_refresh(&scope).is_some());
+        assert!(cache.status(&scope).refreshing);
+
+        cache.finish_refresh(&scope);
+
+        assert!(!cache.status(&scope).refreshing);
+        assert!(cache.try_start_refresh(&scope).is_some());
     }
 }

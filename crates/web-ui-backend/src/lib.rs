@@ -13,11 +13,11 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use client_sdk::{
     ClientConnectionRouteSnapshot, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    ConnectionBootstrapDiagnosticTargets, GalleryMapClustersRequest, IronMeshClient,
-    LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult, RelayMode,
-    RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
-    RendezvousEndpointStatus, RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions,
-    StoreIndexSortOrder, StoreIndexView, StoreIndexViewport, UploadMode,
+    ConnectionBootstrapDiagnosticTargets, IronMeshClient, LatencyProbeComparison,
+    LatencyProbeConfig, LatencyProbeResult, RelayMode, RendezvousClientConfig,
+    RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
+    RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
+    StoreIndexView, StoreIndexViewport, UploadMode,
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     ironmesh_client::DownloadRangeRequest,
@@ -2945,24 +2945,45 @@ async fn web_gallery_map_clusters(
             );
         }
     };
-    let request = GalleryMapClustersRequest {
-        prefix: query.prefix,
-        depth: query.depth.unwrap_or(1).max(1),
-        media_filter,
-        viewport: StoreIndexViewport {
-            south: query.south,
-            west: query.west,
-            north: query.north,
-            east: query.east,
-        },
-        zoom: query.zoom.unwrap_or(1).min(20),
+    let media_filter_value = match media_filter {
+        StoreIndexMediaFilter::All => "all",
+        StoreIndexMediaFilter::Image => "image",
+        StoreIndexMediaFilter::Video => "video",
     };
-    match current_sdk(&state)
-        .await
-        .gallery_map_clusters(request)
-        .await
+    let mut request_url = Url::parse("http://web-ui.invalid/store/map/clusters")
+        .expect("the gallery map clusters path is a valid URL");
     {
-        Ok(value) => (StatusCode::OK, Json(serde_json::json!(value))).into_response(),
+        let mut params = request_url.query_pairs_mut();
+        if let Some(prefix) = query
+            .prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+        {
+            params.append_pair("prefix", prefix);
+        }
+        params
+            .append_pair("depth", &query.depth.unwrap_or(1).max(1).to_string())
+            .append_pair("media_filter", media_filter_value)
+            .append_pair("south", &query.south.to_string())
+            .append_pair("west", &query.west.to_string())
+            .append_pair("north", &query.north.to_string())
+            .append_pair("east", &query.east.to_string())
+            .append_pair("zoom", &query.zoom.unwrap_or(1).min(20).to_string());
+    }
+    let mut path = request_url.path().to_string();
+    if let Some(query) = request_url.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    match current_sdk(&state).await.get_relative_path(&path).await {
+        Ok(response) => {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+                headers.insert(CONTENT_TYPE, value);
+            }
+            (response.status, headers, response.body).into_response()
+        }
         Err(error) => logged_error_response(
             &state,
             StatusCode::BAD_GATEWAY,
@@ -2982,17 +3003,27 @@ async fn web_gallery_map_cluster_entries(
             "query_token and cluster_id are required",
         );
     }
-    match current_sdk(&state)
-        .await
-        .gallery_map_cluster_entries(
-            &query.query_token,
-            &query.cluster_id,
-            query.offset.unwrap_or(0),
-            query.limit.unwrap_or(100).max(1),
-        )
-        .await
-    {
-        Ok(value) => (StatusCode::OK, Json(serde_json::json!(value))).into_response(),
+    let mut request_url = Url::parse("http://web-ui.invalid/store/map/cluster-entries")
+        .expect("the gallery map cluster entries path is a valid URL");
+    request_url
+        .query_pairs_mut()
+        .append_pair("query_token", &query.query_token)
+        .append_pair("cluster_id", &query.cluster_id)
+        .append_pair("offset", &query.offset.unwrap_or(0).to_string())
+        .append_pair("limit", &query.limit.unwrap_or(100).max(1).to_string());
+    let mut path = request_url.path().to_string();
+    if let Some(query) = request_url.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    match current_sdk(&state).await.get_relative_path(&path).await {
+        Ok(response) => {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+                headers.insert(CONTENT_TYPE, value);
+            }
+            (response.status, headers, response.body).into_response()
+        }
         Err(error) => logged_error_response(
             &state,
             StatusCode::BAD_GATEWAY,
@@ -3958,6 +3989,61 @@ mod tests {
         });
 
         (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn gallery_map_cluster_entries_preserve_the_upstream_stale_reset() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream listener should have an address");
+        let upstream = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/v1/store/map/cluster-entries",
+                axum::routing::get(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        axum::Json(serde_json::json!({
+                            "code": "gallery_map_cluster_stale",
+                            "reset": true,
+                        })),
+                    )
+                }),
+            );
+            let _ = axum::serve(upstream_listener, app).await;
+        });
+
+        let web_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web listener should bind");
+        let web_address = web_listener
+            .local_addr()
+            .expect("web listener should have an address");
+        let app = router(WebUiConfig::from_client(
+            IronMeshClient::from_direct_base_url(&format!("http://{upstream_address}")),
+        ));
+        let web = tokio::spawn(async move {
+            let _ = axum::serve(web_listener, app).await;
+        });
+
+        let response = reqwest::get(format!(
+            "http://{web_address}/api/v1/store/map/cluster-entries?query_token=token&cluster_id=0_0"
+        ))
+        .await
+        .expect("web proxy request should complete");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response
+                .json::<serde_json::Value>()
+                .await
+                .expect("stale response should remain JSON"),
+            serde_json::json!({ "code": "gallery_map_cluster_stale", "reset": true })
+        );
+
+        web.abort();
+        upstream.abort();
     }
 
     #[test]

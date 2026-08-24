@@ -579,6 +579,102 @@ fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
     assert_eq!(first_page.revision, clusters.revision);
 }
 
+#[tokio::test]
+async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope() {
+    let metadata_db_path = sqlite_test_db_path("gallery-map-token-scope");
+    let store = SqliteMetadataStore::open(&metadata_db_path)
+        .await
+        .expect("sqlite metadata store should open");
+    store
+        .write_tx(|db| {
+            insert_gallery_fixture(db, "gallery/a.jpg", "image", 10, Some(47.4), Some(8.5));
+            insert_gallery_fixture(db, "gallery/b.jpg", "image", 20, Some(47.4), Some(8.5));
+            Ok(())
+        })
+        .await
+        .expect("gallery fixtures should persist");
+
+    let viewport = GalleryViewportBounds {
+        south: 45.0,
+        west: 5.0,
+        north: 49.0,
+        east: 11.0,
+    };
+    let clusters = store
+        .query_gallery_map_clusters(&gallery_map_query(viewport, 1024, 512))
+        .await
+        .expect("gallery map clusters should load")
+        .expect("sqlite should support gallery map clusters");
+    let cluster = clusters
+        .clusters
+        .first()
+        .expect("fixture should produce one map cluster");
+
+    store
+        .write_tx(|db| {
+            insert_gallery_fixture(
+                db,
+                "elsewhere/noise.jpg",
+                "image",
+                30,
+                Some(40.7),
+                Some(-74.0),
+            );
+            Ok(())
+        })
+        .await
+        .expect("out-of-scope fixture should persist");
+
+    let page = store
+        .query_gallery_map_cluster_entries(&GalleryMapClusterEntriesQuery {
+            prefix: "gallery".to_string(),
+            depth: 64,
+            media_filter: GalleryIndexMediaFilter::Image,
+            viewport,
+            resolution: clusters.resolution,
+            cell_x: cluster.cell_x,
+            cell_y: cluster.cell_y,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("cluster page should load after unrelated ingest")
+        .expect("sqlite should support cluster pages");
+
+    assert_eq!(page.history_id, clusters.history_id);
+    assert_eq!(page.revision, clusters.revision);
+
+    store
+        .write_tx(|db| {
+            db.execute(
+                "UPDATE gallery_objects SET captured_at_unix = 40 WHERE key = 'gallery/a.jpg'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("in-scope fixture should update");
+    let changed_page = store
+        .query_gallery_map_cluster_entries(&GalleryMapClusterEntriesQuery {
+            prefix: "gallery".to_string(),
+            depth: 64,
+            media_filter: GalleryIndexMediaFilter::Image,
+            viewport,
+            resolution: clusters.resolution,
+            cell_x: cluster.cell_x,
+            cell_y: cluster.cell_y,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("cluster page should load after in-scope change")
+        .expect("sqlite should support cluster pages");
+    assert_ne!(changed_page.revision, clusters.revision);
+
+    drop(store);
+    let _ = std::fs::remove_file(metadata_db_path);
+}
+
 #[test]
 fn gallery_map_clusters_filter_an_antimeridian_viewport() {
     let db = Connection::open_in_memory().expect("in-memory sqlite should open");
