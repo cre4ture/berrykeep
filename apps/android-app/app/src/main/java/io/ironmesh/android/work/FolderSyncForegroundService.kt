@@ -49,20 +49,21 @@ class FolderSyncForegroundService : Service() {
     private var networkCallbackRegistered = false
     private lateinit var outageRetryStore: FolderSyncOutageRetryStore
     private lateinit var networkChangeNotifier: ConflatedNetworkChangeNotifier
+    private lateinit var networkPolicyChangeNotifier: ConflatedNetworkChangeNotifier
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             notifyManagedClientNetworkAvailable()
         }
 
         override fun onLost(network: Network) {
-            Log.i(TAG, "network lost; retaining the current outage retry state")
+            notifyNetworkPolicyChanged("network lost")
         }
 
         override fun onCapabilitiesChanged(
             network: Network,
             networkCapabilities: NetworkCapabilities,
         ) {
-            Log.i(TAG, "network capabilities changed; no sync retry is triggered")
+            notifyNetworkPolicyChanged("network capabilities changed")
         }
     }
 
@@ -70,7 +71,7 @@ class FolderSyncForegroundService : Service() {
         super.onCreate()
         serviceRunning = true
         synchronized(localChangeLock) {
-            lastLocalChangeElapsedMs = null
+            lastLocalChangeElapsedMsByTreeUri.clear()
         }
         FolderSyncExecutionCoordinator.markContinuousServiceActive()
         outageRetryStore = FolderSyncOutageRetryStore(applicationContext)
@@ -81,6 +82,13 @@ class FolderSyncForegroundService : Service() {
             onNetworkChange = ::processManagedClientNetworkChange,
             onFailure = { reason, error ->
                 Log.w(TAG, "network change processing failed ($reason): ${error.message}")
+            },
+        )
+        networkPolicyChangeNotifier = ConflatedNetworkChangeNotifier(
+            scope = scope,
+            onNetworkChange = ::processNetworkPolicyChange,
+            onFailure = { reason, error ->
+                Log.w(TAG, "network policy processing failed ($reason): ${error.message}")
             },
         )
         startForeground(
@@ -139,6 +147,9 @@ class FolderSyncForegroundService : Service() {
         cancelRetryWakeup()
         if (::networkChangeNotifier.isInitialized) {
             networkChangeNotifier.close()
+        }
+        if (::networkPolicyChangeNotifier.isInitialized) {
+            networkPolicyChangeNotifier.close()
         }
         unregisterNetworkCallback()
         repository.stopAllContinuousFolderSync()
@@ -523,6 +534,12 @@ class FolderSyncForegroundService : Service() {
         }
     }
 
+    private fun notifyNetworkPolicyChanged(reason: String) {
+        if (::networkPolicyChangeNotifier.isInitialized) {
+            networkPolicyChangeNotifier.submit(reason)
+        }
+    }
+
     private suspend fun processManagedClientNetworkChange(reason: String) {
         try {
             withContext(Dispatchers.IO) {
@@ -546,6 +563,56 @@ class FolderSyncForegroundService : Service() {
             reason = reason,
             trigger = FolderSyncRetryTrigger.NETWORK_AVAILABLE,
         )
+    }
+
+    private suspend fun processNetworkPolicyChange(reason: String) {
+        val started = reconcileMutex.withLock {
+            enforceNetworkPolicyLocked()
+            reconcileRequestLocked(
+                reason = reason,
+                trigger = FolderSyncRetryTrigger.NETWORK_POLICY_CHANGED,
+            )
+        }
+        if (started) {
+            startStatusLoop()
+        }
+    }
+
+    /**
+     * Applies changed roaming, SSID, and transport permissions even when an endpoint circuit is
+     * cooling down. It stops only newly disallowed profiles and does not issue network traffic.
+     */
+    private suspend fun enforceNetworkPolicyLocked() {
+        withContext(Dispatchers.IO) {
+            val enabledProfiles = IronmeshPreferences
+                .getFolderSyncConfigs(applicationContext)
+                .filter { profile -> profile.enabled }
+            val evaluations = FolderSyncNetworkGate.evaluateProfiles(applicationContext, enabledProfiles)
+            val allowedProfiles = evaluations
+                .filter { evaluation -> evaluation.decision.allowed }
+                .map { evaluation -> evaluation.profile }
+            val blockedProfiles = evaluations.filterNot { evaluation -> evaluation.decision.allowed }
+
+            blockedProfiles.forEach { evaluation ->
+                repository.stopContinuousFolderSync(evaluation.profile.id)
+                Log.i(
+                    TAG,
+                    "stopped continuous sync profile=${evaluation.profile.id} after network policy change: ${evaluation.decision.reason}",
+                )
+            }
+
+            hasAllowedProfiles = allowedProfiles.isNotEmpty()
+            waitingSummary = blockedProfiles.firstOrNull()?.let { evaluation ->
+                buildWaitingSummary(
+                    blockedProfileCount = blockedProfiles.size,
+                    profileLabel = evaluation.profile.label,
+                    reason = evaluation.decision.reason,
+                )
+            }
+            if (allowedProfiles.isEmpty()) {
+                cancelRetryWakeup()
+            }
+        }
     }
 
     private fun registerNetworkCallback() {
@@ -650,7 +717,7 @@ class FolderSyncForegroundService : Service() {
         private val localChangeLock = Any()
         @Volatile
         private var serviceRunning = false
-        private var lastLocalChangeElapsedMs: Long? = null
+        private val lastLocalChangeElapsedMsByTreeUri = mutableMapOf<String, Long>()
 
         fun syncConfigChanged(context: Context) {
             startOwnedService(context, ACTION_REFRESH)
@@ -682,6 +749,17 @@ class FolderSyncForegroundService : Service() {
             if (!serviceRunning) {
                 return
             }
+            val elapsedMs = SystemClock.elapsedRealtime()
+            synchronized(localChangeLock) {
+                val previousElapsedMs = lastLocalChangeElapsedMsByTreeUri[treeUriString]
+                if (
+                    previousElapsedMs != null &&
+                    elapsedMs - previousElapsedMs < LOCAL_CHANGE_DEBOUNCE_MS
+                ) {
+                    return
+                }
+                lastLocalChangeElapsedMsByTreeUri[treeUriString] = elapsedMs
+            }
             val hasMatchingEnabledProfile = IronmeshPreferences
                 .getFolderSyncConfigs(context)
                 .any { profile ->
@@ -689,17 +767,6 @@ class FolderSyncForegroundService : Service() {
                 }
             if (!hasMatchingEnabledProfile) {
                 return
-            }
-            val elapsedMs = SystemClock.elapsedRealtime()
-            synchronized(localChangeLock) {
-                val previousElapsedMs = lastLocalChangeElapsedMs
-                if (
-                    previousElapsedMs != null &&
-                    elapsedMs - previousElapsedMs < LOCAL_CHANGE_DEBOUNCE_MS
-                ) {
-                    return
-                }
-                lastLocalChangeElapsedMs = elapsedMs
             }
             // This is delivered only to an already-running foreground service. It avoids trying
             // to start a foreground service from a background ContentObserver callback.

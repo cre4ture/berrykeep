@@ -48,6 +48,13 @@ class FolderSyncOutageRetryPolicyTest {
         assertFalse(
             FolderSyncOutageRetryPolicy.allowsAttempt(
                 state,
+                FolderSyncRetryTrigger.NETWORK_POLICY_CHANGED,
+                nowEpochMs = 999L,
+            ),
+        )
+        assertFalse(
+            FolderSyncOutageRetryPolicy.allowsAttempt(
+                state,
                 FolderSyncRetryTrigger.LOCAL_FOLDER_CHANGED,
                 nowEpochMs = 999L,
             ),
