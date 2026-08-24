@@ -219,9 +219,6 @@ export function GalleryBasemapMap({
   const viewportFrameRef = useRef<number | null>(null);
   const onViewportChangeRef = useRef(onViewportChange);
   const emitViewportRequestRef = useRef<() => void>(() => undefined);
-  // The basemap metadata may be local. Do not replace the already-loaded
-  // global overview with that local viewport before fitting its clusters.
-  const initialOverviewPendingRef = useRef(true);
   const appliedInitialOverviewRef = useRef<GalleryBasemapClustersPayload | null>(null);
   const fullscreenPortalTarget =
     isFullscreen && allowFullscreenPortal && typeof document !== "undefined" ? document.body : null;
@@ -331,9 +328,6 @@ export function GalleryBasemapMap({
         const markInteractionEnd = () => {
           setIsInteracting(false);
           bumpViewport();
-          if (initialOverviewPendingRef.current) {
-            return;
-          }
           emitViewportRequest();
         };
         emitViewportRequestRef.current = emitViewportRequest;
@@ -449,7 +443,6 @@ export function GalleryBasemapMap({
     }
 
     appliedInitialOverviewRef.current = initialOverviewPayload;
-    initialOverviewPendingRef.current = false;
     const bounds = boundsForClusters(initialOverviewPayload.clusters);
     if (!bounds) {
       emitViewportRequestRef.current();
