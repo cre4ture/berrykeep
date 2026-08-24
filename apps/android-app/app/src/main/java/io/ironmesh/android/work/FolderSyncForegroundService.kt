@@ -33,6 +33,13 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
+private data class FolderSyncStatusPollSnapshot(
+    val status: FolderSyncServiceStatus?,
+    val waitingMessage: String?,
+    val hasAllowedProfiles: Boolean,
+    val retryState: FolderSyncOutageRetryState,
+)
+
 class FolderSyncForegroundService : Service() {
 
     private val repository = IronmeshRepository()
@@ -124,7 +131,6 @@ class FolderSyncForegroundService : Service() {
                 return START_STICKY
             }
             ACTION_REFRESH -> {
-                clearRetryState()
                 requestReconcile(
                     reason = "sync configuration changed",
                     trigger = FolderSyncRetryTrigger.CONFIGURATION_CHANGED,
@@ -167,8 +173,6 @@ class FolderSyncForegroundService : Service() {
     }
 
     private fun syncNow() {
-        clearRetryState()
-        lastDesiredSignature = null
         requestReconcile(
             reason = "manual sync",
             trigger = FolderSyncRetryTrigger.MANUAL_SYNC,
@@ -352,30 +356,42 @@ class FolderSyncForegroundService : Service() {
 
         statusJob = scope.launch {
             while (isActive) {
-                val status = withContext(Dispatchers.IO) {
-                    runCatching { repository.getContinuousFolderSyncStatus() }.getOrNull()
+                val snapshot = reconcileMutex.withLock {
+                    val status = withContext(Dispatchers.IO) {
+                        runCatching { repository.getContinuousFolderSyncStatus() }.getOrNull()
+                    }
+                    val activeProfileCount = status?.activeProfileCount ?: 0L
+                    val waitingMessage = waitingSummary
+                    val profilesAreAllowed = hasAllowedProfiles
+                    when {
+                        !waitingMessage.isNullOrBlank() && !profilesAreAllowed && activeProfileCount == 0L -> {
+                            cancelRetryWakeup()
+                        }
+                        (status?.errorProfileCount ?: 0L) > 0L -> {
+                            armOutageRetry(currentErrorMessage(status))
+                        }
+                        activeProfileCount > 0L -> {
+                            clearRetryState()
+                        }
+                    }
+                    FolderSyncStatusPollSnapshot(
+                        status = status,
+                        waitingMessage = waitingMessage,
+                        hasAllowedProfiles = profilesAreAllowed,
+                        retryState = outageRetryStore.state(),
+                    )
                 }
+                val status = snapshot.status
+                val waitingMessage = snapshot.waitingMessage
                 val activeProfileCount = status?.activeProfileCount ?: 0L
-                val waitingMessage = waitingSummary
-                when {
-                    !waitingMessage.isNullOrBlank() && !hasAllowedProfiles && activeProfileCount == 0L -> {
-                        cancelRetryWakeup()
-                    }
-                    (status?.errorProfileCount ?: 0L) > 0L -> {
-                        armOutageRetry(currentErrorMessage(status))
-                    }
-                    activeProfileCount > 0L -> {
-                        clearRetryState()
-                    }
-                }
                 val (title, detail) = when {
-                    !waitingMessage.isNullOrBlank() && !hasAllowedProfiles && activeProfileCount == 0L -> {
+                    !waitingMessage.isNullOrBlank() && !snapshot.hasAllowedProfiles && activeProfileCount == 0L -> {
                         "Waiting for allowed network" to waitingMessage
                     }
                     (status?.errorProfileCount ?: 0L) > 0L -> {
                         "BerryKeep sync paused" to buildRetryMessage(
                             currentErrorMessage(status),
-                            outageRetryStore.state(),
+                            snapshot.retryState,
                         )
                     }
                     else -> {
@@ -417,12 +433,16 @@ class FolderSyncForegroundService : Service() {
     }
 
     private fun stopContinuousSyncAndSelf() {
-        scope.launch(Dispatchers.IO) {
-            repository.stopAllContinuousFolderSync()
-            waitingSummary = null
-            hasAllowedProfiles = false
-            lastDesiredSignature = null
-            clearRetryState()
+        scope.launch {
+            reconcileMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    repository.stopAllContinuousFolderSync()
+                    waitingSummary = null
+                    hasAllowedProfiles = false
+                    lastDesiredSignature = null
+                    clearRetryState()
+                }
+            }
             withContext(Dispatchers.Main) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -493,6 +513,13 @@ class FolderSyncForegroundService : Service() {
         reason: String,
         trigger: FolderSyncRetryTrigger,
     ): Boolean {
+        if (
+            trigger == FolderSyncRetryTrigger.MANUAL_SYNC ||
+            trigger == FolderSyncRetryTrigger.CONFIGURATION_CHANGED
+        ) {
+            clearRetryState()
+            lastDesiredSignature = null
+        }
         if (!outageRetryStore.allowsAttempt(trigger)) {
             val state = outageRetryStore.state()
             if (hasAllowedProfiles) {
