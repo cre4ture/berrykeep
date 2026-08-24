@@ -40,10 +40,10 @@ class FolderSyncOutageRecoveryInstrumentationTest {
     }
 
     /**
-     * The test bootstrap plans both a direct node route and a Rendezvous relay route. The local
-     * test server makes both routes return an unavailable response during the outage; it is not a
-     * complete Rendezvous implementation, but it exercises the Android client's real configured
-     * fallback route and confirms that all planned routes are unusable before recovery.
+     * The test bootstrap configures a direct node and a Rendezvous relay fallback. The initial
+     * route snapshot contains only the static direct route; the relay route is built dynamically
+     * after that route fails. The connection counters below verify that both paths are contacted
+     * during the outage before the cached client recovers.
      */
     @Test
     fun folderSync_skipsBlockedNetwork_doesNotRetryAutonomously_andRecoversThroughCachedClient() {
@@ -52,22 +52,6 @@ class FolderSyncOutageRecoveryInstrumentationTest {
         val clientIdentityJson = scenario.getString("clientIdentityJson")
         val remoteDocumentPath = scenario.getString("remoteDocumentPath")
         val expectedDocumentSize = scenario.getLong("remoteDocumentSizeBytes")
-
-        val routes = JSONObject(
-            RustClientBridge.getConnectionRouteSnapshot(
-                bootstrapJson,
-                null,
-                clientIdentityJson,
-                false,
-            ),
-        ).getJSONArray("endpoints")
-        val routeKinds = buildSet {
-            for (index in 0 until routes.length()) {
-                add(routes.getJSONObject(index).getString("path_kind"))
-            }
-        }
-        assertTrue("expected direct node route, got $routeKinds", routeKinds.contains("direct_https"))
-        assertTrue("expected Rendezvous relay route, got $routeKinds", routeKinds.contains("relay_tunnel"))
 
         val directAttemptsBeforeBlockedGate =
             RustClientTestBridge.getFolderSyncOutageDirectConnectionAttemptCount()
