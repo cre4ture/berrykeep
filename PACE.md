@@ -30,9 +30,6 @@ This file defines how changes should be delivered in this repository.
      - What was validated
      - What comes next
 
-7. **Do not auto-commit unless asked**
-   - Prepare clean change sets and wait for explicit commit instruction.
-
 ## Suggested commit granularity
 
 Use this pattern for future commits:
@@ -74,3 +71,5 @@ Example pre-commit checklist (add to PR description or commit message when appli
 - [ ] Unit tests added/updated for refactored components
 
 - Large files should be split into modules or crates to keep focus clear and reduce review and maintenance cost.
+
+- Suggest meaningful refactorings at the end of each larger task.
