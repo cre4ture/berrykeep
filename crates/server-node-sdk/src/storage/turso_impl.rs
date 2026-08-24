@@ -13,6 +13,7 @@ use crate::cluster::NodeDescriptor;
 mod gallery;
 
 const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
+const DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT: usize = 1;
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
@@ -35,6 +36,7 @@ pub(super) struct TursoMetadataStore {
     connection: turso::Connection,
     writer_lock: tokio::sync::Mutex<()>,
     gallery_read_permits: Arc<tokio::sync::Semaphore>,
+    gallery_summary_read_permits: Arc<tokio::sync::Semaphore>,
     metadata_path: PathBuf,
     gallery_map_summary_cache: Arc<GallerySummaryCache>,
 }
@@ -124,6 +126,9 @@ impl TursoMetadataStore {
             gallery_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT,
             )),
+            gallery_summary_read_permits: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT,
+            )),
             metadata_path: metadata_path.to_path_buf(),
             gallery_map_summary_cache: Arc::new(GallerySummaryCache::new()),
         };
@@ -144,14 +149,14 @@ impl TursoMetadataStore {
         .await
     }
 
-    /// Everything a `tokio::spawn`ed background gallery read needs to open its own connection
-    /// without borrowing `&self`. It takes a permit from the same semaphore as foreground reads,
-    /// so background work still counts against the gallery read concurrency limit.
-    fn gallery_read_connection_factory(&self) -> GalleryReadConnectionFactory {
+    /// Everything a `tokio::spawn`ed background gallery summary refresh needs to open its own
+    /// connection without borrowing `&self`. Its one-permit semaphore is intentionally separate
+    /// from foreground gallery reads, so a large refresh cannot exhaust their connection budget.
+    fn gallery_summary_read_connection_factory(&self) -> GalleryReadConnectionFactory {
         GalleryReadConnectionFactory {
             database: self.database.clone(),
             metadata_path: self.metadata_path.clone(),
-            permits: self.gallery_read_permits.clone(),
+            permits: self.gallery_summary_read_permits.clone(),
         }
     }
 

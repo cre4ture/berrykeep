@@ -696,7 +696,7 @@ impl TursoMetadataStore {
                 ));
             }
             if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
-                let connections = self.gallery_read_connection_factory();
+                let connections = self.gallery_summary_read_connection_factory();
                 let cache = self.gallery_map_summary_cache.clone();
                 let refresh_scope = scope.clone();
                 let estimate = Some(cached.total_entry_count);

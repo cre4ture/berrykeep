@@ -849,6 +849,8 @@ export function GallerySurface({
     }
 
     if (activeRequest.viewMode === "map") {
+      const { viewport, zoom } = lastMapViewportRequestRef.current;
+      void loadMapClustersForViewport(viewport, zoom, scope);
       return;
     }
 
@@ -1027,6 +1029,7 @@ export function GallerySurface({
     syncPrefixInput: boolean,
     targetViewMode: GalleryViewMode = viewMode
   ) {
+    const mapViewportRequest = lastMapViewportRequestRef.current;
     const requestVersion = galleryRequestVersionRef.current + 1;
     galleryRequestVersionRef.current = requestVersion;
     loadedScopeRef.current = null;
@@ -1037,10 +1040,6 @@ export function GallerySurface({
     setNavigationPayload(null);
     setMapClustersPayload(null);
     setMapSelectionEntries([]);
-    lastMapViewportRequestRef.current = {
-      viewport: GALLERY_MAP_INITIAL_VIEWPORT,
-      zoom: GALLERY_MAP_INITIAL_ZOOM
-    };
     mapClusterRequestVersionRef.current += 1;
     setGridCollection(null);
     gridPagesRef.current = {};
@@ -1061,8 +1060,8 @@ export function GallerySurface({
             prefix: targetScope.prefix,
             depth: targetScope.depth,
             mediaFilter: requestedServerMediaFilter,
-            viewport: GALLERY_MAP_INITIAL_VIEWPORT,
-            zoom: GALLERY_MAP_INITIAL_ZOOM
+            viewport: mapViewportRequest.viewport,
+            zoom: mapViewportRequest.zoom
           })
         ]);
 
