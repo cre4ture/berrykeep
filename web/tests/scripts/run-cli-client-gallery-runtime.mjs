@@ -78,8 +78,8 @@ const mapConfiguration = {
 };
 
 const galleryEntries = [
-  createGalleryEntry("runtime-new-york-a", 40.7128, -74.006),
-  createGalleryEntry("runtime-new-york-b", 40.7628, -74.056),
+  createGalleryEntry("runtime-map-a", 40.7128, -74.006),
+  createGalleryEntry("runtime-map-b", 40.7628, -74.056),
   createGalleryEntry("runtime-tokyo-a", 35.6762, 139.6503),
   createGalleryEntry("runtime-tokyo-b", 35.7262, 139.7003)
 ];
@@ -91,7 +91,7 @@ const galleryMapClusters = [
     latitude: 40.7378,
     longitude: -74.031,
     bounds: { south: 40.7128, west: -74.056, north: 40.7628, east: -74.006 },
-    paths: ["gallery/runtime-new-york-a.png", "gallery/runtime-new-york-b.png"]
+    paths: ["gallery/runtime-map-a.png", "gallery/runtime-map-b.png"]
   },
   {
     cluster_id: "runtime-tokyo",

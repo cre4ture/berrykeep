@@ -11,7 +11,7 @@ test("client-ui runtime fits the gallery overview through the client proxy", asy
 
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
-  await expect(page.getByText("gallery/runtime-new-york-a.png", { exact: true })).toBeVisible();
+  await expect(page.getByText("gallery/runtime-map-a.png", { exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "Map" }).click();
   const mapDisplay = page.getByRole("textbox", { name: "Map display", exact: true });
@@ -26,8 +26,8 @@ test("client-ui runtime fits the gallery overview through the client proxy", asy
   await clusters.first().click();
   const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
   await expect(chooser).toBeVisible();
-  await expect(chooser.getByRole("button", { name: "gallery/runtime-new-york-a.png" })).toBeVisible();
-  await expect(chooser.getByRole("button", { name: "gallery/runtime-new-york-b.png" })).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/runtime-map-a.png" })).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/runtime-map-b.png" })).toBeVisible();
   expect(pageErrors).toEqual([]);
 });
 
@@ -65,11 +65,11 @@ test("client-ui runtime keeps the map photo viewer visible in an embedded viewpo
 
   const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
   await expect(chooser).toBeVisible();
-  await expect(chooser.getByRole("button", { name: "gallery/runtime-new-york-a.png" })).toBeVisible();
-  await expect(chooser.getByRole("button", { name: "gallery/runtime-new-york-b.png" })).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/runtime-map-a.png" })).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/runtime-map-b.png" })).toBeVisible();
 
-  await chooser.getByRole("button", { name: "gallery/runtime-new-york-a.png" }).click();
-  const lightbox = page.getByRole("dialog", { name: "runtime-new-york-a.png (1 of 2)" });
+  await chooser.getByRole("button", { name: "gallery/runtime-map-a.png" }).click();
+  const lightbox = page.getByRole("dialog", { name: "runtime-map-a.png (1 of 2)" });
   await expect(lightbox).toBeVisible();
   await expect(
     lightbox
