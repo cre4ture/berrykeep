@@ -63,7 +63,7 @@ class FolderSyncOutageRecoveryInstrumentationTest {
         ).getJSONArray("endpoints")
         val routeKinds = buildSet {
             for (index in 0 until routes.length()) {
-                add(routes.getJSONObject(index).getString("pathKind"))
+                add(routes.getJSONObject(index).getString("path_kind"))
             }
         }
         assertTrue("expected direct node route, got $routeKinds", routeKinds.contains("direct_https"))
