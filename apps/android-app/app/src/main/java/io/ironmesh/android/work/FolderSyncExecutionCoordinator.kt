@@ -2,18 +2,6 @@ package io.ironmesh.android.work
 
 import kotlinx.coroutines.CompletableDeferred
 
-private const val SYNC_RETRY_BASE_DELAY_MS = 2_000L
-private const val SYNC_RETRY_MAX_DELAY_MS = 60_000L
-
-internal fun nextFolderSyncRetryDelayMs(attempt: Int): Long {
-    if (attempt <= 1) {
-        return SYNC_RETRY_BASE_DELAY_MS
-    }
-    val exponent = (attempt - 1).coerceAtMost(5)
-    val multiplier = 1L shl exponent
-    return (SYNC_RETRY_BASE_DELAY_MS * multiplier).coerceAtMost(SYNC_RETRY_MAX_DELAY_MS)
-}
-
 data class FolderSyncExecutionSnapshot(
     val continuousRequested: Boolean = false,
     val continuousServiceActive: Boolean = false,

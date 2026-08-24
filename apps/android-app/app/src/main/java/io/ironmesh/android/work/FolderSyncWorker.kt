@@ -20,6 +20,7 @@ class FolderSyncWorker(
 ) : CoroutineWorker(appContext, params) {
 
     private val repository = IronmeshRepository()
+    private val outageRetryStore = FolderSyncOutageRetryStore(appContext)
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val nativeContinuousActive = repository.hasContinuousFolderSyncActive()
@@ -44,6 +45,7 @@ class FolderSyncWorker(
                 .filter { it.enabled }
 
             if (profiles.isEmpty()) {
+                outageRetryStore.clear()
                 return@withContext Result.success()
             }
 
@@ -63,6 +65,16 @@ class FolderSyncWorker(
 
             if (eligibleProfiles.isEmpty()) {
                 Log.i(TAG, "one-shot sync skipped because no enabled profile matches the current network policy")
+                outageRetryStore.clear()
+                return@withContext Result.success()
+            }
+
+            if (!outageRetryStore.allowsAttempt(FolderSyncRetryTrigger.PERIODIC_WORK)) {
+                val retryState = outageRetryStore.state()
+                Log.i(
+                    TAG,
+                    "one-shot sync held by persisted endpoint backoff until ${retryState.nextRetryAtEpochMs}",
+                )
                 return@withContext Result.success()
             }
 
@@ -79,9 +91,17 @@ class FolderSyncWorker(
             }
 
             if (failures.isEmpty()) {
+                outageRetryStore.clear()
                 Result.success()
             } else {
-                Result.retry()
+                val retryState = outageRetryStore.recordFailure()
+                Log.i(
+                    TAG,
+                    "one-shot sync failure recorded; next eligible retry is after ${retryState.nextRetryAtEpochMs}",
+                )
+                // The foreground service and this periodic safety net share the persisted policy.
+                // Returning retry() would add an independent WorkManager exponential loop.
+                Result.success()
             }
         } finally {
             FolderSyncExecutionCoordinator.finishOneShot()

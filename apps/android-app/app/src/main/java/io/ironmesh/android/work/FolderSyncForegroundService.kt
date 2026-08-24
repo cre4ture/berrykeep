@@ -38,33 +38,37 @@ class FolderSyncForegroundService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val reconcileMutex = Mutex()
     private var statusJob: Job? = null
+    private var reconcileJob: Job? = null
     private var lastLoggedStatusLine: String? = null
     private var lastDesiredSignature: String? = null
     private var waitingSummary: String? = null
-    private var retryJob: Job? = null
-    private var syncRetryAttemptCount = 0L
+    @Volatile
+    private var hasAllowedProfiles = false
+    private var outageRetryArmed = false
     private var networkCallbackRegistered = false
+    private lateinit var outageRetryStore: FolderSyncOutageRetryStore
     private lateinit var networkChangeNotifier: ConflatedNetworkChangeNotifier
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            notifyManagedClientNetworkChanged("network available")
+            notifyManagedClientNetworkAvailable()
         }
 
         override fun onLost(network: Network) {
-            notifyManagedClientNetworkChanged("network lost")
+            Log.i(TAG, "network lost; retaining the current outage retry state")
         }
 
         override fun onCapabilitiesChanged(
             network: Network,
             networkCapabilities: NetworkCapabilities,
         ) {
-            notifyManagedClientNetworkChanged("network capabilities changed")
+            Log.i(TAG, "network capabilities changed; no sync retry is triggered")
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         FolderSyncExecutionCoordinator.markContinuousServiceActive()
+        outageRetryStore = FolderSyncOutageRetryStore(applicationContext)
         ensureNotificationChannel()
         networkChangeNotifier = ConflatedNetworkChangeNotifier(
             scope = scope,
@@ -91,8 +95,33 @@ class FolderSyncForegroundService : Service() {
                 syncNow()
                 return START_STICKY
             }
+            ACTION_APP_FOREGROUNDED -> {
+                requestReconcile(
+                    reason = "app foregrounded",
+                    trigger = FolderSyncRetryTrigger.APP_FOREGROUNDED,
+                )
+                return START_STICKY
+            }
+            ACTION_LOCAL_FOLDER_CHANGED -> {
+                requestReconcile(
+                    reason = "local folder changed",
+                    trigger = FolderSyncRetryTrigger.LOCAL_FOLDER_CHANGED,
+                )
+                return START_STICKY
+            }
+            ACTION_REFRESH -> {
+                clearRetryState()
+                requestReconcile(
+                    reason = "sync configuration changed",
+                    trigger = FolderSyncRetryTrigger.CONFIGURATION_CHANGED,
+                )
+                return START_STICKY
+            }
             else -> {
-                requestReconcile("service start")
+                requestReconcile(
+                    reason = "service start",
+                    trigger = FolderSyncRetryTrigger.SERVICE_START,
+                )
                 return START_STICKY
             }
         }
@@ -100,7 +129,7 @@ class FolderSyncForegroundService : Service() {
 
     override fun onDestroy() {
         statusJob?.cancel()
-        retryJob?.cancel()
+        reconcileJob?.cancel()
         if (::networkChangeNotifier.isInitialized) {
             networkChangeNotifier.close()
         }
@@ -113,38 +142,34 @@ class FolderSyncForegroundService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun clearRetryState(resetAttempts: Boolean = false) {
-        retryJob?.cancel()
-        retryJob = null
-        if (resetAttempts) {
-            syncRetryAttemptCount = 0L
-        }
+    private fun clearRetryState() {
+        outageRetryArmed = false
+        outageRetryStore.clear()
     }
 
     private fun syncNow() {
-        clearRetryState(resetAttempts = true)
+        clearRetryState()
         lastDesiredSignature = null
-        requestReconcile("manual sync")
+        requestReconcile(
+            reason = "manual sync",
+            trigger = FolderSyncRetryTrigger.MANUAL_SYNC,
+        )
     }
 
-    private fun scheduleRetry(reason: String) {
-        if (retryJob?.isActive == true) {
+    private fun armOutageRetry(reason: String) {
+        if (outageRetryArmed) {
             return
         }
 
-        syncRetryAttemptCount += 1L
-        val delayMs = nextFolderSyncRetryDelayMs(syncRetryAttemptCount.toInt())
-        updateNotification("Retrying sync soon", buildRetryMessage(reason, delayMs))
-        retryJob = scope.launch {
-            delay(delayMs)
-            retryJob = null
-            requestReconcile("retry attempt $syncRetryAttemptCount")
-        }
+        outageRetryArmed = true
+        val state = outageRetryStore.recordFailure()
+        updateNotification("BerryKeep sync paused", buildRetryMessage(reason, state))
     }
 
-    private fun buildRetryMessage(reason: String, delayMs: Long): String {
+    private fun buildRetryMessage(reason: String, state: FolderSyncOutageRetryState): String {
         val normalizedReason = summarizeReason(reason)
-        return "Retrying after ${formatRetryDelay(delayMs)} because $normalizedReason"
+        val retryAt = formatRetryAt(state.nextRetryAtEpochMs)
+        return "Retrying only after $retryAt and an allowed sync event because $normalizedReason"
     }
 
     private fun formatRetryDelay(delayMs: Long): String {
@@ -160,6 +185,11 @@ class FolderSyncForegroundService : Service() {
                 "${minutes}m ${seconds}s"
             }
         }
+    }
+
+    private fun formatRetryAt(nextRetryAtEpochMs: Long): String {
+        val remainingMs = (nextRetryAtEpochMs - System.currentTimeMillis()).coerceAtLeast(0L)
+        return "${formatRetryDelay(remainingMs)} backoff"
     }
 
     private fun currentErrorMessage(status: FolderSyncServiceStatus?): String {
@@ -201,8 +231,9 @@ class FolderSyncForegroundService : Service() {
                 if (profiles.isEmpty()) {
                     repository.stopAllContinuousFolderSync()
                     waitingSummary = null
+                    hasAllowedProfiles = false
                     lastDesiredSignature = null
-                    clearRetryState(resetAttempts = true)
+                    clearRetryState()
                     withContext(Dispatchers.Main) {
                         stopForeground(STOP_FOREGROUND_REMOVE)
                         stopSelf()
@@ -211,7 +242,8 @@ class FolderSyncForegroundService : Service() {
                 }
 
                 if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-                    clearRetryState(resetAttempts = true)
+                    clearRetryState()
+                    hasAllowedProfiles = false
                     applyDesiredState(
                         desiredSignature = "",
                         desiredProfiles = emptyList(),
@@ -245,6 +277,7 @@ class FolderSyncForegroundService : Service() {
                         reason = evaluation.decision.reason,
                     )
                 }
+                hasAllowedProfiles = allowedProfiles.isNotEmpty()
 
                 val desiredSignature = buildDesiredSignature(
                     connectionInput = connectionInput,
@@ -261,7 +294,7 @@ class FolderSyncForegroundService : Service() {
                 )
 
                 if (allowedProfiles.isEmpty()) {
-                    clearRetryState(resetAttempts = true)
+                    clearRetryState()
                     updateNotification(
                         "Waiting for allowed network",
                         waitingSummary ?: "No enabled sync profile is allowed on the current network",
@@ -286,35 +319,41 @@ class FolderSyncForegroundService : Service() {
                 val activeProfileCount = status?.activeProfileCount ?: 0L
                 val waitingMessage = waitingSummary
                 when {
-                    !waitingMessage.isNullOrBlank() && activeProfileCount == 0L -> {
-                        clearRetryState(resetAttempts = true)
+                    !waitingMessage.isNullOrBlank() && !hasAllowedProfiles && activeProfileCount == 0L -> {
+                        clearRetryState()
                     }
                     (status?.errorProfileCount ?: 0L) > 0L -> {
-                        scheduleRetry(currentErrorMessage(status))
+                        armOutageRetry(currentErrorMessage(status))
                     }
                     activeProfileCount > 0L -> {
-                        clearRetryState(resetAttempts = true)
-                    }
-                    else -> {
-                        clearRetryState(resetAttempts = true)
+                        clearRetryState()
                     }
                 }
-                val (title, detail) = if (!waitingMessage.isNullOrBlank() && activeProfileCount == 0L) {
-                    "Waiting for allowed network" to waitingMessage
-                } else {
-                    val contentText = status?.serviceMessage ?: "Continuous sync is starting"
-                    val notificationTitle = when (status?.serviceState) {
-                        "error" -> "BerryKeep sync issue"
-                        "syncing" -> "BerryKeep syncing ${status.syncingProfileCount}/${status.activeProfileCount}"
-                        "running" -> "BerryKeep sync active"
-                        else -> "BerryKeep sync idle"
+                val (title, detail) = when {
+                    !waitingMessage.isNullOrBlank() && !hasAllowedProfiles && activeProfileCount == 0L -> {
+                        "Waiting for allowed network" to waitingMessage
                     }
-                    val notificationDetail = status?.currentActivity
-                        ?.takeIf { it.isNotBlank() }
-                        ?: status?.activeSummary
+                    (status?.errorProfileCount ?: 0L) > 0L -> {
+                        "BerryKeep sync paused" to buildRetryMessage(
+                            currentErrorMessage(status),
+                            outageRetryStore.state(),
+                        )
+                    }
+                    else -> {
+                        val contentText = status?.serviceMessage ?: "Continuous sync is starting"
+                        val notificationTitle = when (status?.serviceState) {
+                            "error" -> "BerryKeep sync issue"
+                            "syncing" -> "BerryKeep syncing ${status.syncingProfileCount}/${status.activeProfileCount}"
+                            "running" -> "BerryKeep sync active"
+                            else -> "BerryKeep sync idle"
+                        }
+                        val notificationDetail = status?.currentActivity
                             ?.takeIf { it.isNotBlank() }
-                        ?: contentText
-                    notificationTitle to notificationDetail
+                            ?: status?.activeSummary
+                                ?.takeIf { it.isNotBlank() }
+                            ?: contentText
+                        notificationTitle to notificationDetail
+                    }
                 }
                 val logLine = status?.profiles
                     ?.takeIf { it.isNotEmpty() }
@@ -342,8 +381,9 @@ class FolderSyncForegroundService : Service() {
         scope.launch(Dispatchers.IO) {
             repository.stopAllContinuousFolderSync()
             waitingSummary = null
+            hasAllowedProfiles = false
             lastDesiredSignature = null
-            clearRetryState(resetAttempts = true)
+            clearRetryState()
             withContext(Dispatchers.Main) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -391,33 +431,46 @@ class FolderSyncForegroundService : Service() {
         lastDesiredSignature = desiredSignature
     }
 
-    private fun requestReconcile(reason: String) {
-        if (
-            reason.startsWith("retry attempt") ||
-            syncRetryAttemptCount > 0L
-        ) {
+    private fun requestReconcile(
+        reason: String,
+        trigger: FolderSyncRetryTrigger,
+    ) {
+        if (reconcileJob?.isActive == true) {
+            Log.i(TAG, "coalescing $trigger while a reconciliation is already running")
+            return
+        }
+        if (!outageRetryStore.allowsAttempt(trigger)) {
+            val state = outageRetryStore.state()
+            Log.i(
+                TAG,
+                "holding $trigger until outage backoff expires at ${state.nextRetryAtEpochMs}",
+            )
+            updateNotification(
+                "BerryKeep sync paused",
+                buildRetryMessage("previous connection error", state),
+            )
+            return
+        }
+
+        if (outageRetryStore.state().failureCount > 0) {
             lastDesiredSignature = null
         }
-        if (!reason.startsWith("retry attempt")) {
-            retryJob?.cancel()
-            retryJob = null
-        }
-        scope.launch {
+        outageRetryArmed = false
+        reconcileJob = scope.launch {
             val started = try {
-                Log.i(TAG, "reconciling continuous sync: $reason")
+                Log.i(TAG, "reconciling continuous sync: $reason ($trigger)")
                 reconcileProfiles()
             } catch (error: DeviceIdentityStorageException) {
                 val message = error.message
                     ?: "Protected device identity is unavailable; enroll again."
-                clearRetryState(resetAttempts = true)
+                clearRetryState()
                 repository.stopAllContinuousFolderSync()
                 waitingSummary = message
                 updateNotification("Ironmesh sync paused", message)
                 false
             } catch (error: Exception) {
                 val retryReason = error.message ?: "Failed to start sync"
-                scheduleRetry(retryReason)
-                updateNotification("BerryKeep sync issue", retryReason)
+                armOutageRetry(retryReason)
                 false
             }
             if (started) {
@@ -426,9 +479,9 @@ class FolderSyncForegroundService : Service() {
         }
     }
 
-    private fun notifyManagedClientNetworkChanged(reason: String) {
+    private fun notifyManagedClientNetworkAvailable() {
         if (::networkChangeNotifier.isInitialized) {
-            networkChangeNotifier.submit(reason)
+            networkChangeNotifier.submit("network available")
         }
     }
 
@@ -451,7 +504,10 @@ class FolderSyncForegroundService : Service() {
         } catch (error: Exception) {
             Log.w(TAG, "managed client network hint failed ($reason): ${error.message}")
         }
-        requestReconcile(reason)
+        requestReconcile(
+            reason = reason,
+            trigger = FolderSyncRetryTrigger.NETWORK_AVAILABLE,
+        )
     }
 
     private fun registerNetworkCallback() {
@@ -549,6 +605,8 @@ class FolderSyncForegroundService : Service() {
         private const val NOTIFICATION_ID = 4001
         private const val ACTION_REFRESH = "io.ironmesh.android.action.FOLDER_SYNC_REFRESH"
         private const val ACTION_SYNC_NOW = "io.ironmesh.android.action.FOLDER_SYNC_NOW"
+        private const val ACTION_APP_FOREGROUNDED = "io.ironmesh.android.action.FOLDER_SYNC_APP_FOREGROUNDED"
+        private const val ACTION_LOCAL_FOLDER_CHANGED = "io.ironmesh.android.action.FOLDER_SYNC_LOCAL_FOLDER_CHANGED"
         private const val ACTION_STOP = "io.ironmesh.android.action.FOLDER_SYNC_STOP"
 
         fun syncConfigChanged(context: Context) {
@@ -562,6 +620,31 @@ class FolderSyncForegroundService : Service() {
 
         fun syncNow(context: Context) {
             startOwnedService(context, ACTION_SYNC_NOW)
+        }
+
+        /** A visible app is an explicit, user-initiated opportunity to retry a due outage. */
+        fun appForegrounded(context: Context) {
+            if (IronmeshPreferences.getFolderSyncConfigs(context).none { profile -> profile.enabled }) {
+                return
+            }
+            startOwnedService(context, ACTION_APP_FOREGROUNDED)
+        }
+
+        /**
+         * A local folder mutation is an explicit opportunity to retry a due outage. It is still
+         * gated by the persisted circuit, so bursts of camera/SAF notifications cause no network
+         * work while an endpoint backoff is active.
+         */
+        fun localFolderChanged(context: Context, treeUriString: String) {
+            val hasMatchingEnabledProfile = IronmeshPreferences
+                .getFolderSyncConfigs(context)
+                .any { profile ->
+                    profile.enabled && profile.localFolderTreeUri == treeUriString
+                }
+            if (!hasMatchingEnabledProfile) {
+                return
+            }
+            startOwnedService(context, ACTION_LOCAL_FOLDER_CHANGED)
         }
 
         private fun startOwnedService(context: Context, action: String) {
