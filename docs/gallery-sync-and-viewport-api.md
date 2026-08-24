@@ -10,8 +10,9 @@ Request a current, paginated gallery view through `GET /api/v1/store/index` (or
 `GET /api/v1/auth/store/index`). Gallery fast-path responses backed by persistent metadata include an opaque
 `sync_token`. Store the response and token atomically on the client. The token is versioned but
 must not be parsed by clients. It binds the persistent server history and the normalized query
-membership (`prefix`, `depth`, media filter, captured sort, and optional viewport). Offset and
-limit are intentionally excluded, so pages from the same bootstrap have byte-identical tokens.
+membership (`prefix`, `depth`, media filter, captured sort, optional viewport, and optional label
+filter). Offset and limit are intentionally excluded, so pages from the same bootstrap have
+byte-identical tokens.
 
 When a full bootstrap needs multiple offset/limit pages, all pages must carry the same
 `sync_token`. If any page returns a different token, the underlying current projection changed
@@ -189,6 +190,63 @@ the page with HTTP `409`:
 On that response the client reloads clusters for its current camera before attempting to open the
 cluster again. This prevents offset pagination from combining members from different spatial
 snapshots.
+
+## User labels
+
+Media can carry user labels — for example `private` — without touching the media bytes
+themselves. Labels are stored in an XMP sidecar object next to the media, named by appending
+`.xmp` to the media's key (`album/photo.jpg` sidecar is `album/photo.jpg.xmp`). The sidecar is an
+ordinary object: it can be written by Ironmesh itself, or produced and synced by a third-party
+tool such as Lightroom or digiKam, and either path updates the gallery projection.
+
+Because labelling only rewrites the small sidecar object, it costs no new version, chunks, or
+manifest on the image itself. An existing sidecar is read-modify-written, so third-party XMP
+properties Ironmesh does not model survive a label change untouched. A sidecar that cannot be
+parsed is left in place rather than overwritten, to avoid destroying metadata Ironmesh cannot
+interpret.
+
+Set labels with:
+
+```text
+POST /api/v1/store/labels
+{ "path": "album/photo.jpg", "labels": ["private", "beach"] }
+```
+
+`path` must name the media object, not its sidecar. The full label set is replaced; there is no
+partial add/remove. Writing an unchanged set, or clearing labels on media that has no sidecar
+yet, is a no-op and creates no object version. `POST /api/v1/auth/store/labels` applies the same
+admin authorization as other admin store routes.
+If the resulting XMP sidecar would exceed 4 MiB, the request is rejected with `400` and any
+existing sidecar remains unchanged, matching the maximum sidecar size accepted during label
+ingest.
+
+`/store/rename` and `/store/copy` carry a media object's sidecar along automatically: renaming or
+copying `album/photo.jpg` also renames or copies `album/photo.jpg.xmp` when one exists, so a
+label survives the operation instead of staying orphaned at the old path.
+Deleting `album/photo.jpg` also deletes its sidecar, so a later unrelated upload at that path
+cannot inherit labels from deleted media.
+
+Gallery queries and viewport queries accept a label filter:
+
+```text
+require_labels=beach,vacation
+exclude_labels=private
+```
+
+Both accept a comma-separated label list. `require_labels` keeps only entries carrying every
+listed label; `exclude_labels` drops any entry carrying any listed label. The motivating case is
+`exclude_labels=private`, which is how a client keeps labelled-private media out of its default
+gallery view. Labels are matched exactly: excluding `private` does not affect `not-private` or
+`private-beach`. To bound the gallery query cost, at most 64 non-blank labels may be supplied
+across both parameters; requests over that limit receive `400`.
+
+The label filter is part of the query's normalized membership, exactly like prefix, depth, media
+filter, and viewport: it is captured in the `sync_token`, and the delta feed reconciles it the
+same way. Labelling media `private` while a client holds a token without `exclude_labels=private`
+has no effect on that client's feed; labelling media that already matches
+`exclude_labels=private` is delivered to that client as a removal, because the entry stops
+resolving against the token's scope. Tokens issued before labels existed have no label filter and
+therefore filter nothing, so they remain valid.
 
 ## Metadata backend capability
 

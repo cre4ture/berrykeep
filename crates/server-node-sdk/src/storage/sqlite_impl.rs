@@ -19,6 +19,7 @@ use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
     GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
     GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
     GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
@@ -31,8 +32,9 @@ use super::{
     S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
     SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
     StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
-    decompress_snapshot_json, effective_gallery_captured_at_unix, gallery_index_media_status,
-    gallery_index_media_type_from_metadata, gallery_media_type_for_path,
+    decode_gallery_labels, decompress_snapshot_json, effective_gallery_captured_at_unix,
+    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
+    gallery_label_filter_matches_json, gallery_label_predicates, gallery_media_type_for_path,
     gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload,
@@ -745,6 +747,29 @@ fn query_gallery_map_cluster_entries_from_db(
     Ok(page)
 }
 
+/// Binds the shared gallery scope parameters in the order `scope` expects them,
+/// so that label predicates can be appended with the placeholders that follow.
+fn gallery_scope_values(
+    prefix: &str,
+    prefix_pattern: &str,
+    depth: i64,
+    media_type: Option<&str>,
+    viewport: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+) -> Vec<Value> {
+    let (south, north, west, east) = viewport;
+    let real = |value: Option<f64>| value.map_or(Value::Null, Value::Real);
+    vec![
+        Value::Text(prefix.to_string()),
+        Value::Text(prefix_pattern.to_string()),
+        Value::Integer(depth),
+        media_type.map_or(Value::Null, |value| Value::Text(value.to_string())),
+        real(south),
+        real(north),
+        real(west),
+        real(east),
+    ]
+}
+
 fn query_gallery_index_in_transaction(
     db: &Connection,
     query: &GalleryIndexQuery,
@@ -794,6 +819,15 @@ fn query_gallery_index_in_transaction(
             )
         })
         .unwrap_or((None, None, None, None));
+    let scope_values = gallery_scope_values(
+        &prefix,
+        &prefix_pattern,
+        depth,
+        media_type,
+        (south, north, west, east),
+    );
+    let (summary_label_sql, summary_label_values) =
+        gallery_label_predicates(&query.label_filter, scope_values.len() + 1)?;
     let summary_sql = format!(
         "SELECT
              COUNT(*),
@@ -804,21 +838,12 @@ fn query_gallery_index_in_transaction(
              COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(geotagged), 0)
          FROM gallery_objects
-         WHERE {scope}"
+         WHERE {scope}{summary_label_sql}"
     );
-    let (total_entry_count, media_summary) = db.query_row(
-        &summary_sql,
-        params![
-            prefix,
-            prefix_pattern,
-            depth,
-            media_type,
-            south,
-            north,
-            west,
-            east
-        ],
-        |row| {
+    let mut summary_values = scope_values.clone();
+    summary_values.extend(summary_label_values.into_iter().map(Value::Text));
+    let (total_entry_count, media_summary) =
+        db.query_row(&summary_sql, params_from_iter(summary_values), |row| {
             let count = |index| {
                 row.get::<_, i64>(index).and_then(|value| {
                     usize::try_from(value).map_err(|error| {
@@ -841,12 +866,17 @@ fn query_gallery_index_in_transaction(
                     geotagged_count: count(6)?,
                 },
             ))
-        },
-    )?;
+        })?;
     let sort_direction = match query.captured_sort {
         GalleryIndexCapturedSort::Asc => "ASC",
         GalleryIndexCapturedSort::Desc => "DESC",
     };
+    let limit = i64::try_from(query.limit).context("gallery index limit overflow")?;
+    let offset = i64::try_from(query.offset).context("gallery index offset overflow")?;
+    // The page statement binds the scope, then LIMIT/OFFSET, so its label
+    // placeholders continue after those two.
+    let (page_label_sql, page_label_values) =
+        gallery_label_predicates(&query.label_filter, scope_values.len() + 3)?;
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
@@ -854,7 +884,8 @@ fn query_gallery_index_in_transaction(
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
-             version_indexes.index_json
+             version_indexes.index_json,
+             gallery_objects.labels_json
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -862,37 +893,26 @@ fn query_gallery_index_in_transaction(
            ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
          LEFT JOIN version_indexes
            ON version_indexes.object_id = gallery_objects.object_id
-         WHERE {scope}
+         WHERE {scope}{page_label_sql}
          ORDER BY gallery_objects.captured_at_unix {sort_direction}, gallery_objects.key ASC
          LIMIT ?9 OFFSET ?10"
     );
-    let limit = i64::try_from(query.limit).context("gallery index limit overflow")?;
-    let offset = i64::try_from(query.offset).context("gallery index offset overflow")?;
     let mut statement = db.prepare(&page_sql)?;
-    let rows = statement.query_map(
-        params![
-            prefix,
-            prefix_pattern,
-            depth,
-            media_type,
-            south,
-            north,
-            west,
-            east,
-            limit,
-            offset
-        ],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?,
-                row.get::<_, Option<Vec<u8>>>(5)?,
-            ))
-        },
-    )?;
+    let mut page_values = scope_values;
+    page_values.push(Value::Integer(limit));
+    page_values.push(Value::Integer(offset));
+    page_values.extend(page_label_values.into_iter().map(Value::Text));
+    let rows = statement.query_map(params_from_iter(page_values), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
     let mut entries = Vec::new();
     for row in rows {
         let (
@@ -902,6 +922,7 @@ fn query_gallery_index_in_transaction(
             content_fingerprint,
             metadata_payload,
             version_index_payload,
+            labels_json,
         ) = row?;
         entries.push(materialize_gallery_index_entry(
             key,
@@ -910,6 +931,7 @@ fn query_gallery_index_in_transaction(
             content_fingerprint,
             metadata_payload,
             version_index_payload,
+            labels_json,
         )?);
     }
     Ok(GalleryIndexPage {
@@ -1130,7 +1152,8 @@ fn gallery_map_cluster_cells_from_db(
                  MIN(manifest_summaries.total_size_bytes),
                  MIN(manifest_summaries.content_fingerprint),
                  MIN(media_cache.metadata_json),
-                 MIN(version_indexes.index_json)
+                 MIN(version_indexes.index_json),
+                 MIN(gallery_objects.labels_json)
              FROM gallery_objects
              LEFT JOIN manifest_summaries
                ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1167,6 +1190,7 @@ fn gallery_map_cluster_cells_from_db(
                     row.get(12)?,
                     row.get(13)?,
                     row.get(14)?,
+                    row.get(15)?,
                 )?)
             } else {
                 None
@@ -1305,7 +1329,8 @@ fn query_gallery_map_cluster_entries_in_transaction(
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
-             version_indexes.index_json
+             version_indexes.index_json,
+             gallery_objects.labels_json
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1332,11 +1357,12 @@ fn query_gallery_map_cluster_entries_in_transaction(
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<Vec<u8>>>(4)?,
             row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, String>(6)?,
         ))
     })?;
     let mut entries = Vec::new();
     for row in rows {
-        let (key, manifest_hash, size, fingerprint, metadata, version_index) = row?;
+        let (key, manifest_hash, size, fingerprint, metadata, version_index, labels_json) = row?;
         entries.push(materialize_gallery_index_entry(
             key,
             manifest_hash,
@@ -1344,6 +1370,7 @@ fn query_gallery_map_cluster_entries_in_transaction(
             fingerprint,
             metadata,
             version_index,
+            labels_json,
         )?);
     }
     Ok(GalleryIndexPage {
@@ -1362,6 +1389,7 @@ fn materialize_gallery_index_entry(
     content_fingerprint: Option<String>,
     metadata_payload: Option<Vec<u8>>,
     version_index_payload: Option<Vec<u8>>,
+    labels_json: String,
 ) -> Result<GalleryIndexEntry> {
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in sqlite"))
@@ -1371,6 +1399,7 @@ fn materialize_gallery_index_entry(
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
+    let labels = decode_gallery_labels(&labels_json)?;
     Ok(GalleryIndexEntry {
         key,
         manifest_hash,
@@ -1378,6 +1407,7 @@ fn materialize_gallery_index_entry(
         modified_at_unix,
         content_fingerprint,
         media_metadata,
+        labels,
     })
 }
 
@@ -1386,9 +1416,16 @@ fn query_gallery_entry_from_db(
     key: &str,
     scope: &GalleryDeltaScope,
 ) -> Result<Option<GalleryIndexEntry>> {
+    // Filtering here rather than against the change log is what makes labelling
+    // a photo `private` reach the client as a removal: the entry stops
+    // resolving, and the caller falls through to its removal branch.
+    let (label_sql, label_values) = gallery_label_predicates(&scope.label_filter, 2)?;
+    let mut values = vec![Value::Text(key.to_string())];
+    values.extend(label_values.into_iter().map(Value::Text));
     let row = db
         .query_row(
-            "SELECT
+            &format!(
+                "SELECT
                  gallery_objects.key,
                  gallery_objects.manifest_hash,
                  manifest_summaries.total_size_bytes,
@@ -1397,7 +1434,8 @@ fn query_gallery_entry_from_db(
                  version_indexes.index_json,
                  gallery_objects.media_type,
                  gallery_objects.latitude,
-                 gallery_objects.longitude
+                 gallery_objects.longitude,
+                 gallery_objects.labels_json
              FROM gallery_objects
              LEFT JOIN manifest_summaries
                ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1406,8 +1444,9 @@ fn query_gallery_entry_from_db(
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
              WHERE gallery_objects.key = ?1
-               AND gallery_objects.inferred_media_type IS NOT NULL",
-            params![key],
+               AND gallery_objects.inferred_media_type IS NOT NULL{label_sql}"
+            ),
+            params_from_iter(values),
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1419,15 +1458,16 @@ fn query_gallery_entry_from_db(
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<f64>>(7)?,
                     row.get::<_, Option<f64>>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             },
         )
         .optional()?;
-    row.filter(|(key, _, _, _, _, _, media_type, latitude, longitude)| {
+    row.filter(|(key, _, _, _, _, _, media_type, latitude, longitude, _)| {
         gallery_entry_matches_delta_scope(key, media_type.as_deref(), *latitude, *longitude, scope)
     })
     .map(
-        |(key, manifest_hash, size, fingerprint, metadata, versions, _, _, _)| {
+        |(key, manifest_hash, size, fingerprint, metadata, versions, _, _, _, labels_json)| {
             materialize_gallery_index_entry(
                 key,
                 manifest_hash,
@@ -1435,6 +1475,7 @@ fn query_gallery_entry_from_db(
                 fingerprint,
                 metadata,
                 versions,
+                labels_json,
             )
         },
     )
@@ -1567,7 +1608,8 @@ fn query_gallery_delta_in_transaction(
              previous_inferred_media_type,
              previous_media_type,
              previous_latitude,
-             previous_longitude
+             previous_longitude,
+             previous_labels_json
          FROM gallery_changes
          WHERE revision > ?1
          ORDER BY revision ASC
@@ -1581,6 +1623,7 @@ fn query_gallery_delta_in_transaction(
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<f64>>(4)?,
             row.get::<_, Option<f64>>(5)?,
+            row.get::<_, String>(6)?,
         ))
     })?;
     let mut raw_changes = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1598,6 +1641,7 @@ fn query_gallery_delta_in_transaction(
         previous_media_type,
         previous_latitude,
         previous_longitude,
+        previous_labels_json,
     ) in raw_changes
     {
         let entry = query_gallery_entry_from_db(db, &key, scope)?;
@@ -1615,6 +1659,7 @@ fn query_gallery_delta_in_transaction(
                 previous_longitude,
                 scope,
             )
+            && gallery_label_filter_matches_json(&previous_labels_json, &scope.label_filter)?
         {
             changes.push(GalleryDeltaChange {
                 key,
@@ -1690,6 +1735,32 @@ fn map_tokio_rusqlite_error(error: tokio_rusqlite::Error) -> anyhow::Error {
 
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
+    async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![GALLERY_SIDECAR_LABEL_BACKFILL_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_none())
+        })
+        .await
+    }
+
+    async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![GALLERY_SIDECAR_LABEL_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn load_current_state(&self) -> Result<CurrentState> {
         self.read(|db| load_current_state_from_db(db)).await
     }
@@ -1735,6 +1806,19 @@ impl MetadataStore for SqliteMetadataStore {
         self.write_tx(move |db| {
             db.execute("DELETE FROM current_objects WHERE key = ?1", params![key])?;
             db.execute("DELETE FROM gallery_objects WHERE key = ?1", params![key])?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()> {
+        let key = key.to_string();
+        let labels_json = encode_gallery_labels(labels)?;
+        self.write_tx(move |db| {
+            db.execute(
+                "UPDATE gallery_objects SET labels_json = ?2 WHERE key = ?1",
+                params![key, labels_json],
+            )?;
             Ok(())
         })
         .await
@@ -4118,7 +4202,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             latitude REAL,
             longitude REAL,
             spatial_x REAL,
-            spatial_y REAL
+            spatial_y REAL,
+            labels_json TEXT NOT NULL DEFAULT '[]'
         );
 
         CREATE TABLE IF NOT EXISTS gallery_changes (
@@ -4128,7 +4213,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             previous_inferred_media_type TEXT,
             previous_media_type TEXT,
             previous_latitude REAL,
-            previous_longitude REAL
+            previous_longitude REAL,
+            previous_labels_json TEXT NOT NULL DEFAULT '[]'
         );
 
         CREATE TABLE IF NOT EXISTS version_indexes (
@@ -4353,6 +4439,12 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     add_sqlite_column_if_missing(db, "gallery_objects", "spatial_y", "REAL")?;
     add_sqlite_column_if_missing(
         db,
+        "gallery_objects",
+        GALLERY_LABELS_COLUMN,
+        GALLERY_LABELS_COLUMN_DEFINITION,
+    )?;
+    add_sqlite_column_if_missing(
+        db,
         "gallery_changes",
         "previous_inferred_media_type",
         "TEXT",
@@ -4360,6 +4452,12 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_media_type", "TEXT")?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_longitude", "REAL")?;
+    add_sqlite_column_if_missing(
+        db,
+        "gallery_changes",
+        "previous_labels_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_gallery_objects_viewport
          ON gallery_objects(latitude, longitude, media_type, captured_at_unix DESC, key ASC)",
@@ -4511,6 +4609,7 @@ fn init_gallery_change_log(db: &Connection) -> Result<()> {
           OR OLD.geotagged IS NOT NEW.geotagged
           OR OLD.latitude IS NOT NEW.latitude
           OR OLD.longitude IS NOT NEW.longitude
+          OR OLD.labels_json IS NOT NEW.labels_json
         BEGIN
             UPDATE metadata_meta
                SET value = CAST(value AS INTEGER) + 1
@@ -4522,7 +4621,8 @@ fn init_gallery_change_log(db: &Connection) -> Result<()> {
                 previous_inferred_media_type,
                 previous_media_type,
                 previous_latitude,
-                previous_longitude
+                previous_longitude,
+                previous_labels_json
             )
             SELECT
                 CAST(value AS INTEGER),
@@ -4531,7 +4631,8 @@ fn init_gallery_change_log(db: &Connection) -> Result<()> {
                 OLD.inferred_media_type,
                 OLD.media_type,
                 OLD.latitude,
-                OLD.longitude
+                OLD.longitude,
+                OLD.labels_json
               FROM metadata_meta WHERE key = 'gallery_revision';
             DELETE FROM gallery_changes
              WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};
@@ -4550,7 +4651,8 @@ fn init_gallery_change_log(db: &Connection) -> Result<()> {
                 previous_inferred_media_type,
                 previous_media_type,
                 previous_latitude,
-                previous_longitude
+                previous_longitude,
+                previous_labels_json
             )
             SELECT
                 CAST(value AS INTEGER),
@@ -4559,7 +4661,8 @@ fn init_gallery_change_log(db: &Connection) -> Result<()> {
                 OLD.inferred_media_type,
                 OLD.media_type,
                 OLD.latitude,
-                OLD.longitude
+                OLD.longitude,
+                OLD.labels_json
               FROM metadata_meta WHERE key = 'gallery_revision';
             DELETE FROM gallery_changes
              WHERE revision <= CAST((SELECT value FROM metadata_meta WHERE key = 'gallery_revision') AS INTEGER) - {GALLERY_CHANGE_LOG_RETENTION};

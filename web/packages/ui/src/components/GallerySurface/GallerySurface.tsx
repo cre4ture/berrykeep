@@ -72,6 +72,9 @@ type GallerySortOrder = (typeof GALLERY_SORT_OPTIONS)[number]["value"];
 type GalleryMediaKind = "image" | "video";
 export type GalleryMediaFilter = "all" | GalleryMediaKind;
 type GalleryViewMode = "grid" | "map";
+type AndroidUiBridge = {
+  postMessage: (message: string) => void;
+};
 
 const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"];
 const videoExtensions = [".m4v", ".mkv", ".mov", ".mp4", ".ogv", ".webm"];
@@ -81,6 +84,8 @@ const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
 const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
 const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
 const GALLERY_MAP_FULLSCREEN_HISTORY_KEY = "ironmesh.gallery.map_fullscreen";
+const GALLERY_MAP_FULLSCREEN_MESSAGE_TYPE = "gallery-map-fullscreen";
+const GALLERY_MAP_FULLSCREEN_EXIT_EVENT = "ironmesh:gallery-map-exit-fullscreen";
 const GALLERY_MAX_DEPTH = 64;
 const GALLERY_MAP_INITIAL_VIEWPORT: GalleryMapViewport = {
   south: -90,
@@ -96,6 +101,28 @@ const GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS = 1;
 const GALLERY_VIRTUAL_PAGE_KEEP_RADIUS = 2;
 const GALLERY_VIRTUAL_PAGE_ROOT_MARGIN = "900px 0px";
 const GALLERY_GRID_PAGE_CACHE_MAX_ENTRY_COUNT = 2_048;
+
+function notifyAndroidGalleryMapFullscreen(fullscreen: boolean) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  const bridge = (window as Window & { IronmeshAndroidUi?: AndroidUiBridge }).IronmeshAndroidUi;
+  if (!bridge) {
+    return;
+  }
+
+  try {
+    bridge.postMessage(
+      JSON.stringify({
+        type: GALLERY_MAP_FULLSCREEN_MESSAGE_TYPE,
+        fullscreen
+      })
+    );
+  } catch {
+    // The native bridge is optional for browser and standalone-WebView clients.
+  }
+}
 
 const EMPTY_GALLERY_MEDIA_SUMMARY: GalleryMediaSummary = {
   ready_count: 0,
@@ -505,6 +532,9 @@ export function GallerySurface({
   const galleryNavigationIconSize = compactGalleryGrid ? 46 : 54;
   const galleryNavigationGlyphSize = compactGalleryGrid ? 24 : 28;
   const galleryVirtualPageSize = resolveGalleryVirtualPageSize(galleryGridColumns);
+  // Only grid pagination depends on the measured grid width. In map mode, a
+  // native fullscreen resize must not reload the current gallery scope.
+  const galleryReloadPageSize = viewMode === "grid" ? galleryVirtualPageSize : null;
   const enabledMediaKinds: GalleryMediaKind[] = allowedMediaKinds?.length
     ? [...allowedMediaKinds]
     : ["image"];
@@ -731,7 +761,7 @@ export function GallerySurface({
     }
 
     void reloadAppliedEntries();
-  }, [galleryVirtualPageSize, mediaFilter, sortOrder, viewMode]);
+  }, [galleryReloadPageSize, mediaFilter, sortOrder, viewMode]);
 
   async function refreshSnapshots(forceRevalidation = true) {
     if (forceRevalidation) {
@@ -2447,6 +2477,7 @@ function GalleryMapPanel({
       ? null
       : new URLSearchParams(window.location.search).get("embedded_client");
   const usesEmbeddedClient = embeddedClient === "android" || embeddedClient === "ios";
+  const usesAndroidFullscreenBridge = embeddedClient === "android";
   // Android WebView can resolve dynamic viewport units to zero while this
   // surface is fullscreen, whereas iOS WebView needs an explicit height for
   // fixed inset bounds to be reflected in its rendered accessibility frame.
@@ -2503,6 +2534,25 @@ function GalleryMapPanel({
       window.removeEventListener("popstate", handlePopState);
     };
   }, [isFullscreen, usesEmbeddedClient]);
+
+  useEffect(() => {
+    if (usesAndroidFullscreenBridge) {
+      notifyAndroidGalleryMapFullscreen(isFullscreen);
+    }
+  }, [isFullscreen, usesAndroidFullscreenBridge]);
+
+  useEffect(() => {
+    if (!usesAndroidFullscreenBridge || typeof window === "undefined") {
+      return;
+    }
+
+    const exitFullscreen = () => setIsFullscreen(false);
+    window.addEventListener(GALLERY_MAP_FULLSCREEN_EXIT_EVENT, exitFullscreen);
+    return () => {
+      window.removeEventListener(GALLERY_MAP_FULLSCREEN_EXIT_EVENT, exitFullscreen);
+      notifyAndroidGalleryMapFullscreen(false);
+    };
+  }, [usesAndroidFullscreenBridge]);
 
   if (!activeBasemap) {
     return (
@@ -2593,14 +2643,25 @@ function GalleryMapPanel({
             </Button>
           </Group>
         </Stack>
-        {isFullscreen && usesEmbeddedClient ? (
-          <Button variant="default" onClick={toggleFullscreen}>
-            Exit fullscreen map
-          </Button>
-        ) : null}
       </Group>
     </Card>
   );
+  const embeddedFullscreenExitControl =
+    isFullscreen && usesEmbeddedClient ? (
+      <div
+        data-gallery-map-fullscreen-exit="true"
+        style={{
+          position: "fixed",
+          top: "calc(env(safe-area-inset-top, 0px) + 12px)",
+          right: "calc(env(safe-area-inset-right, 0px) + 12px)",
+          zIndex: 153
+        }}
+      >
+        <Button variant="filled" color="dark" onClick={toggleFullscreen}>
+          Exit fullscreen map
+        </Button>
+      </div>
+    ) : null;
   const configurationNotice = basemapConfigurationError ? (
     <Alert color="yellow" title="Map styles could not be refreshed">
       <Stack gap="xs">
@@ -2624,22 +2685,23 @@ function GalleryMapPanel({
 
   return (
     <Stack gap="sm">
-      {fullscreenPortalTarget
-        ? createPortal(
-            <div
-              style={{
-                position: "fixed",
-                left: 12,
-                top: 12,
-                zIndex: 152,
-                width: "min(440px, calc(100vw - 24px))"
-              }}
-            >
-              {mapDisplayControls}
-            </div>,
-            fullscreenPortalTarget
-          )
-        : mapDisplayControls}
+      {embeddedFullscreenExitControl ??
+        (fullscreenPortalTarget
+          ? createPortal(
+              <div
+                style={{
+                  position: "fixed",
+                  left: 12,
+                  top: 12,
+                  zIndex: 152,
+                  width: "min(440px, calc(100vw - 24px))"
+                }}
+              >
+                {mapDisplayControls}
+              </div>,
+              fullscreenPortalTarget
+            )
+          : mapDisplayControls)}
 
       {configurationNotice}
       <div>{basemapMap}</div>

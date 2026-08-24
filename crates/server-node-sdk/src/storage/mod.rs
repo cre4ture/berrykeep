@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
+pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
 
 fn current_objects_cache_capacity() -> usize {
     std::env::var("IRONMESH_CURRENT_OBJECTS_CACHE_CAPACITY")
@@ -33,6 +34,7 @@ use bytes::{Bytes, BytesMut};
 use common::NodeId;
 use common::content_fingerprint::content_fingerprint_from_chunk_refs;
 use common::range_chunk_cache::RangeChunkCache;
+use common::xmp::{XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -43,6 +45,7 @@ use uuid::Uuid;
 
 pub(super) mod data_scrub;
 mod gallery_capture_time;
+mod gallery_labels;
 mod gallery_summary_cache;
 pub(super) mod manifest_reader;
 pub(super) mod media_cache;
@@ -74,6 +77,11 @@ pub(crate) use data_scrub::DataScrubber;
 pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTestHook};
 pub(crate) use gallery_capture_time::effective_gallery_captured_at_unix;
 pub(super) use gallery_capture_time::version_created_at_unix_from_payload;
+pub(super) use gallery_labels::{
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GalleryLabelFilter,
+    decode_gallery_labels, encode_gallery_labels, gallery_label_filter_matches_json,
+    gallery_label_predicates,
+};
 use media_cache::MediaCacheBuildConfig;
 #[cfg(test)]
 pub(crate) use media_cache::mobile_viewer_thumbnail_profile;
@@ -109,6 +117,30 @@ const STORAGE_POOL_CONFIG_ENV: &str = "IRONMESH_STORAGE_CONFIG";
 const STORAGE_POOL_CONFIG_FILE: &str = "storage-pool.json";
 const STORAGE_POOL_PATH_MARKER_FILE: &str = ".ironmesh-storage-path.json";
 const STORAGE_POOL_CONFIG_VERSION: u32 = 1;
+/// Largest XMP sidecar the label ingest reads into memory. Sidecars written by
+/// cameras and photo tools stay in the kilobyte range; the bound keeps an
+/// arbitrary object that merely carries the `.xmp` suffix from being assembled
+/// in full just to be parsed.
+const MAX_SIDECAR_INGEST_BYTES: usize = 256 * 1024;
+
+/// Returned when changing labels would produce a sidecar that label ingest
+/// would later refuse to read.
+#[derive(Debug)]
+pub(crate) struct SidecarWriteSizeLimitError {
+    actual_size_bytes: usize,
+}
+
+impl std::fmt::Display for SidecarWriteSizeLimitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "serialized XMP sidecar of {} bytes exceeds the ingest limit of {MAX_SIDECAR_INGEST_BYTES} bytes",
+            self.actual_size_bytes
+        )
+    }
+}
+
+impl std::error::Error for SidecarWriteSizeLimitError {}
 
 fn manifest_hash_looks_safe_filename(manifest_hash: &str) -> bool {
     manifest_hash.len() == blake3::OUT_LEN * 2
@@ -1020,6 +1052,7 @@ pub(crate) struct GalleryIndexQuery {
     pub(crate) offset: usize,
     pub(crate) limit: usize,
     pub(crate) viewport: Option<GalleryViewportBounds>,
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1048,6 +1081,9 @@ pub(crate) struct GalleryIndexEntry {
     pub(crate) modified_at_unix: Option<u64>,
     pub(crate) content_fingerprint: Option<String>,
     pub(crate) media_metadata: Option<CachedMediaMetadata>,
+    /// User labels of the object, materialized from the projection's label
+    /// column. Populated by the sidecar ingest; empty until then.
+    pub(crate) labels: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1115,6 +1151,7 @@ pub(crate) struct GalleryDeltaScope {
     pub(crate) media_filter: GalleryIndexMediaFilter,
     pub(crate) captured_sort: GalleryIndexCapturedSort,
     pub(crate) viewport: Option<GalleryViewportBounds>,
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1892,6 +1929,14 @@ pub struct PutOptions {
     pub explicit_version_id: Option<String>,
 }
 
+#[derive(Debug)]
+enum SidecarPathMutation {
+    Absent,
+    Ready { from: String, to: String },
+    ClearTarget { target: String },
+    TargetExists,
+}
+
 impl Default for PutOptions {
     fn default() -> Self {
         Self {
@@ -2359,10 +2404,20 @@ struct ArchivedTombstoneIndexRecord {
 
 #[async_trait]
 trait MetadataStore: Send + Sync {
+    /// Whether current XMP sidecars still need a one-time label projection
+    /// backfill after this feature was introduced.
+    async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool>;
+    /// Marks the sidecar label projection backfill complete only after every
+    /// current sidecar has been considered successfully.
+    async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()>;
     async fn load_current_state(&self) -> Result<CurrentState>;
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
     async fn remove_current_object(&self, key: &str) -> Result<()>;
+    /// Replaces the user labels of a projected object. This is the entry point
+    /// for the sidecar ingest, which resolves the labels of a media key from its
+    /// XMP sidecar.
+    async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()>;
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
@@ -3427,7 +3482,7 @@ impl PersistentStore {
             storage_stats_lock.clone(),
         );
 
-        Ok(Self {
+        let store = Self {
             root_dir,
             storage_pool,
             metadata_backend_kind: backend,
@@ -3444,7 +3499,43 @@ impl PersistentStore {
             media_tools: MediaToolPaths::default(),
             #[cfg(test)]
             data_scrub_run_test_hook: None,
-        })
+        };
+        store
+            .backfill_gallery_labels_from_current_sidecars()
+            .await?;
+        Ok(store)
+    }
+
+    /// Replays existing XMP sidecars into the gallery label projection once per
+    /// metadata database. New uploads are handled by the normal ingest hooks;
+    /// this covers sidecars that already existed when the label column was
+    /// introduced.
+    async fn backfill_gallery_labels_from_current_sidecars(&self) -> Result<()> {
+        if !self
+            .metadata_store
+            .gallery_sidecar_labels_backfill_needed()
+            .await?
+        {
+            return Ok(());
+        }
+
+        let current = self.metadata_store.load_current_state().await?;
+        for (sidecar_key, sidecar_manifest_hash) in &current.objects {
+            let Some(media_key) = media_key_for_sidecar(sidecar_key) else {
+                continue;
+            };
+            if gallery_media_type_for_path(&media_key).is_none()
+                || !current.objects.contains_key(&media_key)
+            {
+                continue;
+            }
+            self.apply_sidecar_labels(&media_key, sidecar_manifest_hash)
+                .await?;
+        }
+
+        self.metadata_store
+            .mark_gallery_sidecar_labels_backfill_complete()
+            .await
     }
 
     pub(crate) fn chunk_ingestor(&self) -> ChunkIngestor {
@@ -3639,6 +3730,20 @@ impl PersistentStore {
     ) -> Result<Option<GalleryIndexPage>> {
         self.metadata_store
             .query_gallery_map_cluster_entries(query)
+            .await
+    }
+
+    /// Replaces the user labels the gallery projection holds for `key`.
+    ///
+    /// The sidecar ingest calls this after resolving the labels of a media key
+    /// from its XMP sidecar; the projection itself never parses sidecar files.
+    pub(crate) async fn set_gallery_object_labels(
+        &self,
+        key: &str,
+        labels: &[String],
+    ) -> Result<()> {
+        self.metadata_store
+            .set_gallery_object_labels(key, labels)
             .await
     }
 
@@ -6956,7 +7061,7 @@ impl PersistentStore {
         per_path_options.create_snapshot = false;
         for target in targets {
             let version_id = self
-                .tombstone_object(&target, per_path_options.clone())
+                .tombstone_object_single(&target, per_path_options.clone())
                 .await?;
             results.push(TombstonePathResult {
                 path: target,
@@ -6975,6 +7080,47 @@ impl PersistentStore {
     }
 
     pub async fn tombstone_object(&mut self, key: &str, options: PutOptions) -> Result<String> {
+        self.tombstone_object_single(key, options).await
+    }
+
+    /// Tombstones an object and its XMP sidecar, returning every affected path.
+    ///
+    /// The additional result lets callers publish replication and data-change
+    /// events for the sidecar rather than hiding a namespace mutation behind a
+    /// media-only API result.
+    pub async fn tombstone_object_with_companions(
+        &mut self,
+        key: &str,
+        options: PutOptions,
+    ) -> Result<Vec<TombstonePathResult>> {
+        let version_id = self.tombstone_object_single(key, options.clone()).await?;
+        let mut deleted = vec![TombstonePathResult {
+            path: key.to_owned(),
+            version_id,
+        }];
+
+        if is_sidecar_key(key) {
+            return Ok(deleted);
+        }
+
+        let sidecar_key = sidecar_key_for_media(key);
+        if self.current_object_entry(&sidecar_key).await?.is_none() {
+            return Ok(deleted);
+        }
+
+        let mut sidecar_options = options;
+        sidecar_options.parent_version_ids.clear();
+        sidecar_options.explicit_version_id = None;
+        let sidecar_version_id =
+            Box::pin(self.tombstone_object_single(&sidecar_key, sidecar_options)).await?;
+        deleted.push(TombstonePathResult {
+            path: sidecar_key,
+            version_id: sidecar_version_id,
+        });
+        Ok(deleted)
+    }
+
+    async fn tombstone_object_single(&mut self, key: &str, options: PutOptions) -> Result<String> {
         let object_id = self
             .object_id_for_key(key)
             .await?
@@ -7116,6 +7262,13 @@ impl PersistentStore {
             return Ok(PathMutationResult::TargetExists);
         }
 
+        let sidecar_mutation = self
+            .prepare_sidecar_path_mutation(from_path, to_path, overwrite)
+            .await?;
+        if matches!(sidecar_mutation, SidecarPathMutation::TargetExists) {
+            return Ok(PathMutationResult::TargetExists);
+        }
+
         let Some(mut index) = self.load_version_index_by_object_id(&object_id).await? else {
             return Ok(PathMutationResult::SourceMissing);
         };
@@ -7200,6 +7353,38 @@ impl PersistentStore {
         self.persist_current_state_with_snapshot_batch(touched_paths, true, unix_ts())
             .await?;
 
+        // Labels live outside the media bytes in a sidecar keyed by path
+        // (`storage/gallery_labels.rs`), so renaming the media alone would
+        // silently drop them and leave the sidecar orphaned at the old path.
+        // The media object already landed at `to_path` above, so the sidecar's
+        // own ingest hook has a projection row to write into rather than
+        // no-op'ing against one that does not exist yet.
+        match sidecar_mutation {
+            SidecarPathMutation::Ready {
+                from: sidecar_from,
+                to: sidecar_to,
+            } => {
+                let result =
+                    Box::pin(self.rename_object_path(&sidecar_from, &sidecar_to, overwrite))
+                        .await?;
+                if result != PathMutationResult::Applied {
+                    bail!(
+                        "sidecar rename {sidecar_from} -> {sidecar_to} did not apply after its media moved: {result:?}"
+                    );
+                }
+            }
+            SidecarPathMutation::ClearTarget { target } => {
+                self.tombstone_object(&target, PutOptions::default())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed clearing the stale destination sidecar {target} after renaming {from_path} -> {to_path}"
+                        )
+                    })?;
+            }
+            SidecarPathMutation::Absent | SidecarPathMutation::TargetExists => {}
+        }
+
         Ok(PathMutationResult::Applied)
     }
 
@@ -7218,6 +7403,13 @@ impl PersistentStore {
         };
 
         if self.current_object_entry(to_path).await?.is_some() && !overwrite {
+            return Ok(PathMutationResult::TargetExists);
+        }
+
+        let sidecar_mutation = self
+            .prepare_sidecar_path_mutation(from_path, to_path, overwrite)
+            .await?;
+        if matches!(sidecar_mutation, SidecarPathMutation::TargetExists) {
             return Ok(PathMutationResult::TargetExists);
         }
 
@@ -7244,17 +7436,77 @@ impl PersistentStore {
         let copied_manifest_hash = self
             .clone_manifest_for_key(&source_head.manifest_hash, to_path)
             .await?;
-        self.persist_copied_version_to_target(
-            from_path,
-            to_path,
-            copied_manifest_hash,
-            Some(source_object_id),
-            Some(source_head.version_id.clone()),
-            source_head.state.clone(),
-            "copy",
-            true,
-        )
-        .await
+        let result = self
+            .persist_copied_version_to_target(
+                from_path,
+                to_path,
+                copied_manifest_hash,
+                Some(source_object_id),
+                Some(source_head.version_id.clone()),
+                source_head.state.clone(),
+                "copy",
+                true,
+            )
+            .await?;
+        if !matches!(result, PathMutationResult::Applied) {
+            return Ok(result);
+        }
+
+        // See the matching comment in `rename_object_path`: the sidecar has to
+        // be copied alongside the media so the label survives, and it has to
+        // happen after the media landed at `to_path` so the ingest hook has a
+        // projection row to write into.
+        match sidecar_mutation {
+            SidecarPathMutation::Ready {
+                from: sidecar_from,
+                to: sidecar_to,
+            } => {
+                let result =
+                    Box::pin(self.copy_object_path(&sidecar_from, &sidecar_to, overwrite)).await?;
+                if result != PathMutationResult::Applied {
+                    bail!(
+                        "sidecar copy {sidecar_from} -> {sidecar_to} did not apply after its media copied: {result:?}"
+                    );
+                }
+            }
+            SidecarPathMutation::ClearTarget { target } => {
+                self.tombstone_object(&target, PutOptions::default())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed clearing the stale destination sidecar {target} after copying {from_path} -> {to_path}"
+                        )
+                    })?;
+            }
+            SidecarPathMutation::Absent | SidecarPathMutation::TargetExists => {}
+        }
+
+        Ok(PathMutationResult::Applied)
+    }
+
+    /// Checks whether an existing XMP companion can follow a media path mutation.
+    ///
+    /// A predictable conflict must be found before the media mutation is
+    /// committed. An unexpected companion error after that point is still
+    /// returned so callers can reconcile the partial mutation rather than being
+    /// told a labelled media operation succeeded without its sidecar.
+    async fn prepare_sidecar_path_mutation(
+        &self,
+        from_path: &str,
+        to_path: &str,
+        overwrite: bool,
+    ) -> Result<SidecarPathMutation> {
+        let from = sidecar_key_for_media(from_path);
+        let to = sidecar_key_for_media(to_path);
+        let source_exists = self.current_object_entry(&from).await?.is_some();
+        let target_exists = self.current_object_entry(&to).await?.is_some();
+
+        match (source_exists, target_exists, overwrite) {
+            (false, true, true) => Ok(SidecarPathMutation::ClearTarget { target: to }),
+            (false, _, _) => Ok(SidecarPathMutation::Absent),
+            (true, true, false) => Ok(SidecarPathMutation::TargetExists),
+            (true, _, _) => Ok(SidecarPathMutation::Ready { from, to }),
+        }
     }
 
     pub async fn restore_snapshot_path(
@@ -8138,11 +8390,13 @@ impl PersistentStore {
         self.metadata_store
             .upsert_current_object(key, &entry)
             .await?;
+        let manifest_hash = entry.manifest_hash.clone();
         self.current_objects_cache
             .lock()
             .unwrap()
             .insert(key.to_string(), entry);
-        Ok(())
+        self.sync_sidecar_labels_after_upsert(key, &manifest_hash)
+            .await
     }
 
     async fn remove_current_object(&self, key: &str) -> Result<()> {
@@ -8151,7 +8405,204 @@ impl PersistentStore {
             .lock()
             .unwrap()
             .remove(&key.to_string());
-        Ok(())
+        self.sync_sidecar_labels_after_removal(key).await
+    }
+
+    /// Makes the XMP sidecar of `media_key` carry exactly `labels`.
+    ///
+    /// The sidecar object is the source of truth for user labels, so labelling
+    /// is an ordinary versioned write of `<media_key>.xmp`. Going through
+    /// [`PersistentStore::put_object_versioned`] keeps labels replicated,
+    /// snapshotted and undoable like any other object, and lets the ingest hook
+    /// refresh the gallery projection instead of duplicating that logic here.
+    ///
+    /// Returns `None` when the stored sidecar already carries these labels and
+    /// no write was necessary.
+    pub async fn set_media_labels(
+        &mut self,
+        media_key: &str,
+        labels: Vec<String>,
+    ) -> Result<Option<PutResult>> {
+        if is_sidecar_key(media_key) {
+            bail!("labels belong to a media object, not to the sidecar {media_key}");
+        }
+
+        let sidecar_key = sidecar_key_for_media(media_key);
+        let stored = self.load_stored_sidecar(&sidecar_key).await?;
+        if !Self::sidecar_write_required(stored.as_ref(), &labels) {
+            return Ok(None);
+        }
+
+        let mut sidecar = stored.unwrap_or_else(XmpSidecar::new_empty);
+        sidecar.set_keywords(labels);
+        let bytes = sidecar
+            .to_bytes()
+            .with_context(|| format!("failed to serialize the XMP sidecar {sidecar_key}"))?;
+        if bytes.len() > MAX_SIDECAR_INGEST_BYTES {
+            return Err(SidecarWriteSizeLimitError {
+                actual_size_bytes: bytes.len(),
+            }
+            .into());
+        }
+
+        self.put_object_versioned(&sidecar_key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .map(Some)
+    }
+
+    /// Whether `labels` differ from what the stored sidecar already holds.
+    ///
+    /// Rewriting an unchanged sidecar would spend an object version, new chunks
+    /// and replication work on a no-op, and media without a sidecar needs none
+    /// created just to record that it carries no labels.
+    fn sidecar_write_required(stored: Option<&XmpSidecar>, labels: &[String]) -> bool {
+        match stored {
+            Some(sidecar) => sidecar.keywords() != labels,
+            None => !labels.is_empty(),
+        }
+    }
+
+    /// Loads the sidecar currently stored at `sidecar_key`, or `None` when the
+    /// media object has none yet.
+    ///
+    /// A stored packet that cannot be parsed is reported rather than replaced:
+    /// it may hold third-party properties Ironmesh neither models nor can
+    /// reconstruct, so overwriting it would destroy user data. Ingest tolerates
+    /// such packets on purpose, because rejecting them there would fail an
+    /// upload whose bytes the client owns; refusing to write over them here
+    /// protects those same bytes.
+    async fn load_stored_sidecar(&self, sidecar_key: &str) -> Result<Option<XmpSidecar>> {
+        let Some(entry) = self.current_object_entry(sidecar_key).await? else {
+            return Ok(None);
+        };
+
+        let bytes = self
+            .read_sidecar_bytes(&entry.manifest_hash)
+            .await
+            .with_context(|| format!("failed to read the XMP sidecar {sidecar_key}"))?;
+        let sidecar = XmpSidecar::parse(&bytes).with_context(|| {
+            format!("refusing to overwrite the malformed XMP sidecar {sidecar_key}")
+        })?;
+        Ok(Some(sidecar))
+    }
+
+    /// Applies the label side effects of `key` becoming the current object.
+    ///
+    /// The XMP sidecar object is the source of truth for user labels; the
+    /// projection column only caches them. Both orders in which the two objects
+    /// can arrive are handled: a sidecar landing next to a media object updates
+    /// that object's labels, and a media object landing after its sidecar picks
+    /// the labels up from the sidecar that is already stored. Without the second
+    /// direction a sidecar uploaded ahead of its image would be dropped
+    /// silently, because the projection row it targets does not exist yet.
+    async fn sync_sidecar_labels_after_upsert(&self, key: &str, manifest_hash: &str) -> Result<()> {
+        match media_key_for_sidecar(key) {
+            Some(media_key) => self.apply_sidecar_labels(&media_key, manifest_hash).await,
+            None => self.apply_stored_sidecar_labels(key).await,
+        }
+    }
+
+    /// Clears the labels a removed sidecar contributed to its media object.
+    ///
+    /// Removing a media object needs no counterpart: its projection row, and
+    /// with it the label column, is deleted along with the object.
+    async fn sync_sidecar_labels_after_removal(&self, key: &str) -> Result<()> {
+        let Some(media_key) = media_key_for_sidecar(key) else {
+            return Ok(());
+        };
+        if gallery_media_type_for_path(&media_key).is_none() {
+            return Ok(());
+        }
+        self.set_gallery_object_labels(&media_key, &[]).await
+    }
+
+    /// Applies the labels of the sidecar already stored for `media_key`, if any.
+    ///
+    /// Only objects the gallery projects can surface labels, and the current
+    /// object cache does not retain misses. Gating on the media type therefore
+    /// keeps the common ingest of non-media files from paying a sidecar lookup
+    /// that can never resolve to a visible label.
+    async fn apply_stored_sidecar_labels(&self, media_key: &str) -> Result<()> {
+        if gallery_media_type_for_path(media_key).is_none() {
+            return Ok(());
+        }
+        let sidecar_key = sidecar_key_for_media(media_key);
+        let Some(sidecar) = self.current_object_entry(&sidecar_key).await? else {
+            return Ok(());
+        };
+        self.apply_sidecar_labels(media_key, &sidecar.manifest_hash)
+            .await
+    }
+
+    /// Stores the keywords of the given sidecar object on the projection row of
+    /// `media_key`.
+    async fn apply_sidecar_labels(&self, media_key: &str, manifest_hash: &str) -> Result<()> {
+        if gallery_media_type_for_path(media_key).is_none() {
+            return Ok(());
+        }
+        let Some(keywords) = self.read_sidecar_keywords(media_key, manifest_hash).await else {
+            return Ok(());
+        };
+        self.set_gallery_object_labels(media_key, &keywords).await
+    }
+
+    /// Reads the keywords of a sidecar object, or `None` when the sidecar cannot
+    /// be read or parsed.
+    ///
+    /// Sidecars are authored by third-party tools, so an unreadable packet is an
+    /// expected input rather than a storage fault: it is reported and the
+    /// projection is left untouched. Aborting here would fail the upload of a
+    /// file whose own bytes are perfectly fine.
+    async fn read_sidecar_keywords(
+        &self,
+        media_key: &str,
+        manifest_hash: &str,
+    ) -> Option<Vec<String>> {
+        let bytes = match self.read_sidecar_bytes(manifest_hash).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    media_key,
+                    manifest_hash,
+                    error = %err,
+                    "unreadable XMP sidecar, keeping the gallery labels unchanged"
+                );
+                return None;
+            }
+        };
+
+        match XmpSidecar::parse(&bytes) {
+            Ok(sidecar) => Some(sidecar.keywords().to_vec()),
+            Err(err) => {
+                warn!(
+                    media_key,
+                    manifest_hash,
+                    error = %err,
+                    "malformed XMP sidecar, keeping the gallery labels unchanged"
+                );
+                None
+            }
+        }
+    }
+
+    /// Reads a whole sidecar object, refusing packets that are too large to be
+    /// one.
+    ///
+    /// Real sidecars are a few kilobytes, so the size bound keeps an object that
+    /// merely carries the sidecar suffix from being assembled into memory.
+    async fn read_sidecar_bytes(&self, manifest_hash: &str) -> Result<Bytes> {
+        let manifest = self
+            .load_manifest_by_hash(manifest_hash)
+            .await?
+            .with_context(|| format!("manifest missing for hash={manifest_hash}"))?;
+        if manifest.total_size_bytes > MAX_SIDECAR_INGEST_BYTES {
+            bail!(
+                "sidecar of {} bytes exceeds the ingest limit of {MAX_SIDECAR_INGEST_BYTES} bytes",
+                manifest.total_size_bytes
+            );
+        }
+
+        Ok(self.read_object_by_manifest_hash(manifest_hash).await?)
     }
 
     async fn object_id_for_key(&self, key: &str) -> Result<Option<String>> {

@@ -218,6 +218,11 @@ export function GalleryBasemapMap({
   const onViewportChangeRef = useRef(onViewportChange);
   const fullscreenPortalTarget =
     isFullscreen && allowFullscreenPortal && typeof document !== "undefined" ? document.body : null;
+  // Embedded clients resize the existing map container in place. Recreating
+  // MapLibre while that resize is in flight can dismiss a marker cluster
+  // dialog before its selected media reaches the gallery lightbox. A browser
+  // fullscreen portal still needs a fresh map because its container moves.
+  const mapContainerUsesFullscreenPortal = isFullscreen && allowFullscreenPortal;
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
@@ -395,7 +400,7 @@ export function GalleryBasemapMap({
     basemap.kind === "hybrid" ? basemap.vectorMetadataUrl : null,
     basemap.kind === "hybrid" ? basemap.vectorTileUrlTemplate : null,
     basemap.kind === "hybrid" ? basemap.glyphsUrlTemplate : null,
-    isFullscreen,
+    mapContainerUsesFullscreenPortal,
     loadAttempt
   ]);
 
@@ -422,16 +427,24 @@ export function GalleryBasemapMap({
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || typeof window === "undefined") {
+    const container = containerRef.current;
+    if (!map || !container || typeof window === "undefined") {
       return;
     }
 
-    const frameId = window.requestAnimationFrame(() => {
+    const resizeMap = () => {
       map.resize();
-    });
+    };
+    const frameId = window.requestAnimationFrame(resizeMap);
+    const resizeObserver =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(resizeMap);
+    resizeObserver?.observe(container);
 
-    return () => window.cancelAnimationFrame(frameId);
-  }, [isFullscreen]);
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      resizeObserver?.disconnect();
+    };
+  }, [isFullscreen, mapReady]);
 
   const map = mapRef.current;
   const mapWidth = map?.getContainer().clientWidth ?? 0;

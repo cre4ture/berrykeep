@@ -17,17 +17,17 @@ const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GalleryDeltaCursorError, GalleryDeltaPage,
-    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, GalleryMapClusterEntriesQuery,
-    GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache,
-    METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
-    MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord,
-    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
-    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
-    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
-    compress_snapshot_json, decompress_snapshot_json, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs,
+    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
+    GalleryDeltaCursorError, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexPage,
+    GalleryIndexQuery, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
+    GalleryMapClusterQuery, GallerySummaryCache, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
+    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
+    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
+    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
+    StorageStatsSample, StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -171,6 +171,29 @@ impl TursoMetadataStore {
 
 #[async_trait]
 impl MetadataStore for TursoMetadataStore {
+    async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (GALLERY_SIDECAR_LABEL_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(rows.next().await?.is_none())
+    }
+
+    async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (GALLERY_SIDECAR_LABEL_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn load_current_state(&self) -> Result<CurrentState> {
         let mut rows = self
             .connection
@@ -224,6 +247,10 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn remove_current_object(&self, key: &str) -> Result<()> {
         self.remove_current_object_with_gallery(key).await
+    }
+
+    async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()> {
+        self.store_gallery_object_labels(key, labels).await
     }
 
     async fn query_gallery_index(
@@ -2305,6 +2332,28 @@ impl MetadataStore for TursoMetadataStore {
     }
 }
 
+/// Adds a column to an existing table, tolerating databases that already have it.
+///
+/// Turso has no `ADD COLUMN IF NOT EXISTS`, so the duplicate-column error is the
+/// only reliable signal that the migration already ran on this database.
+pub(super) async fn add_column_if_missing(
+    connection: &turso::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let statement = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    if let Err(err) = connection.execute(&statement, ()).await {
+        let duplicate_column = err
+            .to_string()
+            .contains(&format!("duplicate column name: {column}"));
+        if !duplicate_column {
+            return Err(err).with_context(|| format!("failed to migrate turso {table}.{column}"));
+        }
+    }
+    Ok(())
+}
+
 async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
     connection
         .execute_batch(
@@ -2531,20 +2580,13 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             ",
         )
         .await?;
-    if let Err(err) = connection
-        .execute(
-            "ALTER TABLE s3_access_keys ADD COLUMN allow_manage INTEGER NOT NULL DEFAULT 0",
-            (),
-        )
-        .await
-    {
-        let duplicate_column = err
-            .to_string()
-            .contains("duplicate column name: allow_manage");
-        if !duplicate_column {
-            return Err(err).context("failed to migrate turso s3_access_keys.allow_manage");
-        }
-    }
+    add_column_if_missing(
+        connection,
+        "s3_access_keys",
+        "allow_manage",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
     gallery::init_gallery_projection(connection).await?;
 
     let mut rows = connection

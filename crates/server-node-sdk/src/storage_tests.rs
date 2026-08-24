@@ -668,6 +668,42 @@ impl StorageTestBackend {
             Self::Turso => false,
         }
     }
+
+    /// Puts a current database in the state from immediately before the sidecar
+    /// label backfill existed, while retaining its real media and sidecar data.
+    async fn reset_gallery_sidecar_label_backfill(self, root: &Path) {
+        match self {
+            Self::Sqlite => {
+                let database = rusqlite::Connection::open(root.join("state/metadata.sqlite"))
+                    .expect("sqlite metadata database should open");
+                database
+                    .execute_batch(
+                        "UPDATE gallery_objects SET labels_json = '[]';
+                         DELETE FROM metadata_meta
+                          WHERE key = 'gallery_sidecar_labels_v1';",
+                    )
+                    .expect("legacy sqlite label projection should persist");
+            }
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => {
+                let database = turso::Builder::new_local(
+                    &root.join("state/metadata.turso.db").to_string_lossy(),
+                )
+                .build()
+                .await
+                .expect("turso metadata database should open");
+                let connection = database.connect().expect("turso metadata should connect");
+                connection
+                    .execute_batch(
+                        "UPDATE gallery_objects SET labels_json = '[]';
+                         DELETE FROM metadata_meta
+                          WHERE key = 'gallery_sidecar_labels_v1';",
+                    )
+                    .await
+                    .expect("legacy Turso label projection should persist");
+            }
+        }
+    }
 }
 
 macro_rules! run_on_all_metadata_backends {
@@ -3197,6 +3233,275 @@ run_on_all_metadata_backends!(
     rename_preserves_object_id_and_history_impl,
     rename_preserves_object_id_and_history,
     rename_preserves_object_id_and_history_turso
+);
+
+/// A label lives in a path-keyed sidecar object next to the media, not inside
+/// the media bytes. Renaming the media alone would silently drop the label and
+/// leave the sidecar orphaned at the old path -- worse, a photo labelled
+/// `private` would reappear in a client view built on `exclude_labels=private`.
+async fn rename_carries_the_sidecar_and_its_label_along_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("rename-carries-sidecar").await;
+
+    put_labelled_image(&mut store, "album/a.jpg", &["private"]).await;
+
+    let mutation = store
+        .rename_object_path("album/a.jpg", "album/b.jpg", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    assert!(
+        store
+            .get_object("album/a.jpg.xmp", None, None, ObjectReadMode::Preferred)
+            .await
+            .is_err(),
+        "the sidecar must not stay orphaned at the old path"
+    );
+    let moved_sidecar = store
+        .get_object("album/b.jpg.xmp", None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("the sidecar must have moved to the new path");
+    assert_eq!(
+        common::xmp::XmpSidecar::parse(&moved_sidecar)
+            .unwrap()
+            .keywords(),
+        ["private".to_string()]
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        Vec::<String>::new(),
+        "the renamed photo must still be excluded, not reappear unlabelled"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    rename_carries_the_sidecar_and_its_label_along_impl,
+    rename_carries_the_sidecar_and_its_label_along,
+    rename_carries_the_sidecar_and_its_label_along_turso
+);
+
+/// The copy counterpart of `rename_carries_the_sidecar_and_its_label_along`:
+/// copying a labelled photo must copy its sidecar too, and the original must
+/// keep its own label untouched.
+async fn copy_carries_the_sidecar_and_its_label_along_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("copy-carries-sidecar").await;
+
+    put_labelled_image(&mut store, "album/source.jpg", &["private"]).await;
+
+    let mutation = store
+        .copy_object_path("album/source.jpg", "album/copy.jpg", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    for key in ["album/source.jpg.xmp", "album/copy.jpg.xmp"] {
+        let sidecar = store
+            .get_object(key, None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap_or_else(|_| panic!("{key} should carry the copied label"));
+        assert_eq!(
+            common::xmp::XmpSidecar::parse(&sidecar).unwrap().keywords(),
+            ["private".to_string()]
+        );
+    }
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/copy.jpg".to_string(), "album/source.jpg".to_string()],
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    copy_carries_the_sidecar_and_its_label_along_impl,
+    copy_carries_the_sidecar_and_its_label_along,
+    copy_carries_the_sidecar_and_its_label_along_turso
+);
+
+/// A conflicting destination sidecar must reject the operation before the
+/// media mutation is persisted, otherwise callers receive a failure for a path
+/// that already moved or copied.
+async fn sidecar_target_conflicts_do_not_partially_apply_media_mutations_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("sidecar-target-conflict").await;
+
+    put_labelled_image(&mut store, "album/a.jpg", &["private"]).await;
+    store
+        .set_media_labels("album/b.jpg", vec!["stale".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .rename_object_path("album/a.jpg", "album/b.jpg", false)
+            .await
+            .unwrap(),
+        PathMutationResult::TargetExists,
+        "the sidecar conflict must be found before renaming the media"
+    );
+    assert_eq!(
+        store
+            .copy_object_path("album/a.jpg", "album/b.jpg", false)
+            .await
+            .unwrap(),
+        PathMutationResult::TargetExists,
+        "the sidecar conflict must be found before copying the media"
+    );
+
+    store
+        .get_object("album/a.jpg", None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("the source media must remain in place after both rejected operations");
+    assert!(
+        store
+            .get_object("album/b.jpg", None, None, ObjectReadMode::Preferred)
+            .await
+            .is_err(),
+        "neither rejected operation may create the destination media"
+    );
+    store
+        .get_object("album/a.jpg.xmp", None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("the source sidecar must remain in place");
+    store
+        .get_object("album/b.jpg.xmp", None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("the conflicting destination sidecar must remain in place");
+
+    assert_eq!(
+        store
+            .copy_object_path("album/a.jpg", "album/b.jpg", true)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied,
+        "copy with overwrite may replace a conflicting sidecar with the source label"
+    );
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/b.jpg").await,
+        vec!["private".to_string()],
+        "the copied media must not retain the destination sidecar's stale label"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    sidecar_target_conflicts_do_not_partially_apply_media_mutations_impl,
+    sidecar_target_conflicts_do_not_partially_apply_media_mutations,
+    sidecar_target_conflicts_do_not_partially_apply_media_mutations_turso
+);
+
+/// Overwriting with media that has no sidecar must not leave the destination's
+/// stale label sidecar attached to unrelated bytes.
+async fn overwrite_without_a_source_sidecar_clears_the_destination_sidecar_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("sidecar-overwrite-without-source").await;
+
+    store
+        .put_object_versioned(
+            "album/copy-source.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    put_labelled_image(&mut store, "album/copy-target.jpg", &["private"]).await;
+
+    assert_eq!(
+        store
+            .copy_object_path("album/copy-source.jpg", "album/copy-target.jpg", true)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    assert!(
+        store
+            .get_object(
+                "album/copy-target.jpg.xmp",
+                None,
+                None,
+                ObjectReadMode::Preferred,
+            )
+            .await
+            .is_err(),
+        "copy overwrite must delete a destination sidecar the source does not carry"
+    );
+    assert!(
+        gallery_labels_for_key(&store, "album/copy-target.jpg")
+            .await
+            .is_empty(),
+        "copied bytes must not retain labels that described the replaced destination"
+    );
+
+    store
+        .put_object_versioned(
+            "album/rename-source.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .set_media_labels("album/rename-target.jpg", vec!["private".to_string()])
+        .await
+        .unwrap()
+        .expect("the stale destination sidecar must exist before the rename");
+
+    assert_eq!(
+        store
+            .rename_object_path("album/rename-source.jpg", "album/rename-target.jpg", true)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    assert!(
+        store
+            .get_object(
+                "album/rename-target.jpg.xmp",
+                None,
+                None,
+                ObjectReadMode::Preferred,
+            )
+            .await
+            .is_err(),
+        "rename overwrite must delete a destination sidecar the source does not carry"
+    );
+    assert!(
+        gallery_labels_for_key(&store, "album/rename-target.jpg")
+            .await
+            .is_empty(),
+        "renamed bytes must not inherit labels from an orphaned destination sidecar"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    overwrite_without_a_source_sidecar_clears_the_destination_sidecar_impl,
+    overwrite_without_a_source_sidecar_clears_the_destination_sidecar,
+    overwrite_without_a_source_sidecar_clears_the_destination_sidecar_turso
 );
 
 async fn reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_impl(
@@ -7642,4 +7947,1100 @@ run_on_all_metadata_backends!(
     data_scrub_reports_chunk_size_mismatch_per_manifest_reference_impl,
     data_scrub_reports_chunk_size_mismatch_per_manifest_reference,
     data_scrub_reports_chunk_size_mismatch_per_manifest_reference_turso
+);
+
+/// Builds an XMP sidecar packet carrying the given `dc:subject` keywords.
+fn sample_xmp_sidecar_bytes(keywords: &[&str]) -> Bytes {
+    let mut sidecar = XmpSidecar::new_empty();
+    sidecar.set_keywords(
+        keywords
+            .iter()
+            .map(|keyword| (*keyword).to_string())
+            .collect(),
+    );
+    Bytes::from(sidecar.to_bytes().unwrap())
+}
+
+/// Reads the labels the gallery projection currently holds for `key`.
+async fn gallery_labels_for_key(store: &PersistentStore, key: &str) -> Vec<String> {
+    let page = store
+        .query_gallery_index(&GalleryIndexQuery {
+            prefix: String::new(),
+            depth: 8,
+            media_filter: GalleryIndexMediaFilter::All,
+            captured_sort: GalleryIndexCapturedSort::Desc,
+            offset: 0,
+            limit: 64,
+            viewport: None,
+            label_filter: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page");
+
+    page.entries
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .unwrap_or_else(|| panic!("missing gallery entry for {key}"))
+        .labels
+}
+
+/// Lists the gallery keys that survive `label_filter`, sorted for comparison.
+async fn gallery_keys_matching_labels(
+    store: &PersistentStore,
+    label_filter: GalleryLabelFilter,
+) -> Vec<String> {
+    let page = store
+        .query_gallery_index(&GalleryIndexQuery {
+            prefix: String::new(),
+            depth: 8,
+            media_filter: GalleryIndexMediaFilter::All,
+            captured_sort: GalleryIndexCapturedSort::Desc,
+            offset: 0,
+            limit: 64,
+            viewport: None,
+            label_filter,
+        })
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page");
+
+    let mut keys = page
+        .entries
+        .into_iter()
+        .map(|entry| entry.key)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+/// Stores `key` as an image carrying `labels`, so a filter has something to act on.
+async fn put_labelled_image(store: &mut PersistentStore, key: &str, labels: &[&str]) {
+    store
+        .put_object_versioned(
+            key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let labels = labels.iter().map(|label| label.to_string()).collect();
+    store.set_media_labels(key, labels).await.unwrap();
+}
+
+/// Hiding media labelled `private` is the motivating case for the filter, and
+/// asking for exactly those entries is its mirror image.
+async fn gallery_label_filter_selects_entries_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-label-filter").await;
+
+    put_labelled_image(&mut store, "album/plain.jpg", &[]).await;
+    put_labelled_image(&mut store, "album/secret.jpg", &["private"]).await;
+    put_labelled_image(&mut store, "album/both.jpg", &["private", "beach"]).await;
+
+    assert_eq!(
+        gallery_keys_matching_labels(&store, GalleryLabelFilter::default()).await,
+        vec![
+            "album/both.jpg".to_string(),
+            "album/plain.jpg".to_string(),
+            "album/secret.jpg".to_string(),
+        ],
+        "an empty filter must not hide anything"
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/plain.jpg".to_string()],
+        "excluding a label must hide every entry carrying it"
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/both.jpg".to_string(), "album/secret.jpg".to_string()],
+        "requiring a label must keep exactly the entries carrying it"
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string(), "beach".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/both.jpg".to_string()],
+        "every required label has to be present"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_label_filter_selects_entries_impl,
+    gallery_label_filter_selects_entries,
+    gallery_label_filter_selects_entries_turso
+);
+
+/// The filter matches a JSON array, so it has to match whole labels. Were it a
+/// plain substring match, hiding `private` would also hide `not-private` and
+/// `private-beach`.
+async fn gallery_label_filter_matches_whole_labels_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-label-substrings").await;
+
+    put_labelled_image(&mut store, "album/exact.jpg", &["private"]).await;
+    put_labelled_image(&mut store, "album/prefixed.jpg", &["not-private"]).await;
+    put_labelled_image(&mut store, "album/suffixed.jpg", &["private-beach"]).await;
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![
+            "album/prefixed.jpg".to_string(),
+            "album/suffixed.jpg".to_string(),
+        ],
+        "only the exact label may be excluded"
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/exact.jpg".to_string()],
+        "only the exact label may satisfy the requirement"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_label_filter_matches_whole_labels_impl,
+    gallery_label_filter_matches_whole_labels,
+    gallery_label_filter_matches_whole_labels_turso
+);
+
+/// `encode_gallery_labels` treats case as significant -- `"private"` and
+/// `"Private"` are distinct labels that can coexist. The filter has to agree,
+/// or a client hiding `private` media would silently also hide (or fail to
+/// hide) media labelled with a different case.
+async fn gallery_label_filter_is_case_sensitive_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-label-case").await;
+
+    put_labelled_image(&mut store, "album/lower.jpg", &["private"]).await;
+    put_labelled_image(&mut store, "album/upper.jpg", &["Private"]).await;
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/upper.jpg".to_string()],
+        "excluding \"private\" must not affect \"Private\""
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/lower.jpg".to_string()],
+        "requiring \"private\" must not match \"Private\""
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_label_filter_is_case_sensitive_impl,
+    gallery_label_filter_is_case_sensitive,
+    gallery_label_filter_is_case_sensitive_turso
+);
+
+/// JSON string escaping must not turn a quote inside one label into the
+/// delimiter of a different label while filtering the projection.
+async fn gallery_label_filter_does_not_match_inside_quoted_labels_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("gallery-label-quoted").await;
+
+    put_labelled_image(&mut store, "album/exact.jpg", &["private"]).await;
+    put_labelled_image(&mut store, "album/embedded.jpg", &["a\"private"]).await;
+    put_labelled_image(&mut store, "album/leading.jpg", &["\"private"]).await;
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![
+            "album/embedded.jpg".to_string(),
+            "album/leading.jpg".to_string(),
+        ],
+        "excluding a label must not match within another JSON string"
+    );
+
+    assert_eq!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                required: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await,
+        vec!["album/exact.jpg".to_string()],
+        "requiring a label must not match within another JSON string"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_label_filter_does_not_match_inside_quoted_labels_impl,
+    gallery_label_filter_does_not_match_inside_quoted_labels,
+    gallery_label_filter_does_not_match_inside_quoted_labels_turso
+);
+
+/// A sidecar uploaded by a third-party tool next to an existing image has to
+/// reach the projection, because that is where the gallery reads labels from.
+async fn gallery_labels_follow_a_sidecar_upload_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-upload").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        gallery_labels_for_key(&store, "album/photo.jpg")
+            .await
+            .is_empty(),
+        "an image without a sidecar must not carry labels"
+    );
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            sample_xmp_sidecar_bytes(&["beach", "vacation"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["beach".to_string(), "vacation".to_string()]
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_labels_follow_a_sidecar_upload_impl,
+    gallery_labels_follow_a_sidecar_upload,
+    gallery_labels_follow_a_sidecar_upload_turso
+);
+
+/// Existing XMP sidecars must populate the new projection column on upgrade;
+/// otherwise `exclude_labels=private` would disclose media until it was
+/// re-uploaded.
+async fn gallery_label_backfill_replays_existing_sidecars_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-label-backfill").await;
+    let media_key = "album/photo.jpg";
+
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            sample_xmp_sidecar_bytes(&["private"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    backend.reset_gallery_sidecar_label_backfill(&root).await;
+    let store = backend.open_store(root.clone()).await;
+
+    assert_eq!(
+        gallery_labels_for_key(&store, media_key).await,
+        vec!["private".to_string()],
+        "the one-time backfill must recover labels from a sidecar that predates the projection"
+    );
+    assert!(
+        gallery_keys_matching_labels(
+            &store,
+            GalleryLabelFilter {
+                excluded: vec!["private".to_string()],
+                ..Default::default()
+            }
+        )
+        .await
+        .is_empty(),
+        "backfilled private media must be excluded immediately after upgrade"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_label_backfill_replays_existing_sidecars_impl,
+    gallery_label_backfill_replays_existing_sidecars,
+    gallery_label_backfill_replays_existing_sidecars_turso
+);
+
+/// A delta only removes an entry when the caller could have held it before the
+/// change. In particular, a scope that excludes `private` must not disclose a
+/// private key merely because another label on it changes.
+async fn gallery_delta_does_not_disclose_previously_filtered_labelled_paths_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("gallery-delta-label-privacy").await;
+    let media_key = "family/private-scan.jpg";
+    put_labelled_image(&mut store, media_key, &["private"]).await;
+
+    let label_filter = GalleryLabelFilter {
+        excluded: vec!["private".to_string()],
+        ..Default::default()
+    };
+    let index = store
+        .query_gallery_index(&GalleryIndexQuery {
+            prefix: String::new(),
+            depth: 8,
+            media_filter: GalleryIndexMediaFilter::All,
+            captured_sort: GalleryIndexCapturedSort::Desc,
+            offset: 0,
+            limit: 64,
+            viewport: None,
+            label_filter: label_filter.clone(),
+        })
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page");
+    assert!(
+        index.entries.is_empty(),
+        "the private image must stay unseen"
+    );
+
+    store
+        .set_media_labels(
+            media_key,
+            vec!["private".to_string(), "refreshed".to_string()],
+        )
+        .await
+        .unwrap()
+        .expect("the changed sidecar must create a gallery change");
+
+    let delta = store
+        .query_gallery_delta(
+            &index.history_id,
+            index.revision,
+            64,
+            &GalleryDeltaScope {
+                prefix: String::new(),
+                depth: 8,
+                media_filter: GalleryIndexMediaFilter::All,
+                captured_sort: GalleryIndexCapturedSort::Desc,
+                viewport: None,
+                label_filter,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve deltas")
+        .expect("the delta cursor should remain valid");
+    assert!(
+        delta.changes.iter().all(|change| change.key != media_key),
+        "a private key absent from the original index must not be disclosed as a removal"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_delta_does_not_disclose_previously_filtered_labelled_paths_impl,
+    gallery_delta_does_not_disclose_previously_filtered_labelled_paths,
+    gallery_delta_does_not_disclose_previously_filtered_labelled_paths_turso
+);
+
+/// Sidecars are relevant only to gallery media. A non-media `.xmp` upload must
+/// not also update the row of its derived non-media key. The sidecar's own
+/// projection insertion and metadata refresh consume two revisions.
+async fn non_media_sidecars_do_not_mutate_derived_gallery_labels_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-non-media-sidecar").await;
+    let query = GalleryIndexQuery {
+        prefix: String::new(),
+        depth: 8,
+        media_filter: GalleryIndexMediaFilter::All,
+        captured_sort: GalleryIndexCapturedSort::Desc,
+        offset: 0,
+        limit: 64,
+        viewport: None,
+        label_filter: Default::default(),
+    };
+
+    store
+        .put_object_versioned(
+            "notes/report.txt",
+            Bytes::from_static(b"not gallery media"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let revision_before_sidecar = store
+        .query_gallery_index(&query)
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page")
+        .revision;
+
+    store
+        .put_object_versioned(
+            "notes/report.txt.xmp",
+            sample_xmp_sidecar_bytes(&["private"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let revision_after_sidecar = store
+        .query_gallery_index(&query)
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page")
+        .revision;
+    assert_eq!(
+        revision_after_sidecar,
+        revision_before_sidecar + 2,
+        "the sidecar must not also update the non-media derived key"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    non_media_sidecars_do_not_mutate_derived_gallery_labels_impl,
+    non_media_sidecars_do_not_mutate_derived_gallery_labels,
+    non_media_sidecars_do_not_mutate_derived_gallery_labels_turso
+);
+
+/// A sidecar synced ahead of its image cannot update a projection row that does
+/// not exist yet, so the image ingest has to pick the stored sidecar up.
+async fn gallery_labels_apply_when_the_sidecar_precedes_the_image_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-first").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            sample_xmp_sidecar_bytes(&["private"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["private".to_string()]
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_labels_apply_when_the_sidecar_precedes_the_image_impl,
+    gallery_labels_apply_when_the_sidecar_precedes_the_image,
+    gallery_labels_apply_when_the_sidecar_precedes_the_image_turso
+);
+
+/// Deleting the sidecar deletes the labels: the sidecar object is the source of
+/// truth, the projection column only caches it.
+async fn gallery_labels_are_cleared_when_the_sidecar_is_deleted_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-delete").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            sample_xmp_sidecar_bytes(&["private"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["private".to_string()]
+    );
+
+    store
+        .tombstone_object("album/photo.jpg.xmp", PutOptions::default())
+        .await
+        .unwrap();
+
+    assert!(
+        gallery_labels_for_key(&store, "album/photo.jpg")
+            .await
+            .is_empty(),
+        "removing the sidecar must clear the labels it contributed"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_labels_are_cleared_when_the_sidecar_is_deleted_impl,
+    gallery_labels_are_cleared_when_the_sidecar_is_deleted,
+    gallery_labels_are_cleared_when_the_sidecar_is_deleted_turso
+);
+
+/// Deleting media must delete its path-keyed sidecar too. Otherwise that stale
+/// metadata survives as an orphan and labels an unrelated future upload at the
+/// same path.
+async fn deleting_media_removes_its_sidecar_and_cannot_leak_labels_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("gallery-media-delete-sidecar").await;
+
+    put_labelled_image(&mut store, "album/photo.jpg", &["private"]).await;
+    let deleted = store
+        .tombstone_object_with_companions("album/photo.jpg", PutOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>(),
+        vec![
+            "album/photo.jpg".to_string(),
+            "album/photo.jpg.xmp".to_string()
+        ],
+        "callers must receive both paths so they can publish the complete delete"
+    );
+
+    assert!(
+        store
+            .get_object("album/photo.jpg.xmp", None, None, ObjectReadMode::Preferred,)
+            .await
+            .is_err(),
+        "deleting media must also remove its sidecar"
+    );
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        gallery_labels_for_key(&store, "album/photo.jpg")
+            .await
+            .is_empty(),
+        "a later upload must not inherit labels from deleted media"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    deleting_media_removes_its_sidecar_and_cannot_leak_labels_impl,
+    deleting_media_removes_its_sidecar_and_cannot_leak_labels,
+    deleting_media_removes_its_sidecar_and_cannot_leak_labels_turso
+);
+
+/// The single-object primitive intentionally keeps companions out of its
+/// result. Protocol frontends with separate sidecar version records (such as
+/// S3) use it to keep their own delete bookkeeping in sync.
+async fn single_object_tombstone_does_not_implicitly_delete_a_sidecar_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("single-object-tombstone-sidecar").await;
+
+    put_labelled_image(&mut store, "album/photo.jpg", &["private"]).await;
+    store
+        .tombstone_object("album/photo.jpg", PutOptions::default())
+        .await
+        .unwrap();
+
+    store
+        .get_object("album/photo.jpg.xmp", None, None, ObjectReadMode::Preferred)
+        .await
+        .expect("the single-object primitive must leave companion handling to its caller");
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    single_object_tombstone_does_not_implicitly_delete_a_sidecar_impl,
+    single_object_tombstone_does_not_implicitly_delete_a_sidecar,
+    single_object_tombstone_does_not_implicitly_delete_a_sidecar_turso
+);
+
+/// Sidecars come from foreign tools, so a broken packet is an expected input.
+/// It must neither fail the upload nor corrupt the labels already projected.
+async fn gallery_labels_survive_a_malformed_sidecar_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-malformed").await;
+    let malformed = Bytes::from_static(b"<rdf:RDF><unclosed>");
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            sample_xmp_sidecar_bytes(&["private"]),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            malformed.clone(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("a malformed sidecar must not fail the upload");
+    assert_eq!(
+        store
+            .get_object("album/photo.jpg.xmp", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap(),
+        malformed,
+        "the malformed sidecar must still be stored verbatim"
+    );
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["private".to_string()],
+        "a malformed sidecar must leave the projection untouched"
+    );
+
+    store
+        .put_object_versioned(
+            "album/other.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned("album/other.jpg.xmp", malformed, PutOptions::default())
+        .await
+        .expect("a malformed sidecar must not fail the upload");
+    assert!(
+        gallery_labels_for_key(&store, "album/other.jpg")
+            .await
+            .is_empty()
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_labels_survive_a_malformed_sidecar_impl,
+    gallery_labels_survive_a_malformed_sidecar,
+    gallery_labels_survive_a_malformed_sidecar_turso
+);
+
+/// A sidecar as an external editor writes it: keywords next to camera raw and
+/// Photoshop properties that Ironmesh neither models nor could reconstruct.
+const THIRD_PARTY_SIDECAR: &str = concat!(
+    "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
+    "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core\">\n",
+    " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
+    "  <rdf:Description rdf:about=\"\"\n",
+    "    xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n",
+    "    xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"\n",
+    "    xmlns:photoshop=\"http://ns.adobe.com/photoshop/1.0/\"\n",
+    "   crs:Exposure2012=\"+0.35\"\n",
+    "   photoshop:City=\"Zurich\">\n",
+    "   <dc:subject>\n",
+    "    <rdf:Bag>\n",
+    "     <rdf:li>lightroom</rdf:li>\n",
+    "    </rdf:Bag>\n",
+    "   </dc:subject>\n",
+    "  </rdf:Description>\n",
+    " </rdf:RDF>\n",
+    "</x:xmpmeta>\n",
+    "<?xpacket end=\"w\"?>\n",
+);
+
+/// Reads the raw sidecar object stored next to `media_key`.
+async fn stored_sidecar_text(store: &PersistentStore, media_key: &str) -> String {
+    let sidecar_key = sidecar_key_for_media(media_key);
+    let bytes = store
+        .get_object(&sidecar_key, None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap_or_else(|err| panic!("missing sidecar object for {media_key}: {err}"));
+    String::from_utf8(bytes.to_vec()).expect("a sidecar must be valid UTF-8")
+}
+
+/// Labelling media that has no sidecar yet has to create one, and that sidecar
+/// has to reach the gallery projection like any externally uploaded one.
+async fn media_labels_create_a_missing_sidecar_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-labels-create").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .set_media_labels("album/photo.jpg", vec!["beach".to_string()])
+        .await
+        .unwrap()
+        .expect("creating the first sidecar must write an object version");
+
+    let stored = stored_sidecar_text(&store, "album/photo.jpg").await;
+    let sidecar = XmpSidecar::parse(stored.as_bytes())
+        .expect("the generated sidecar must be a valid XMP packet");
+    assert_eq!(sidecar.keywords(), ["beach".to_string()]);
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["beach".to_string()],
+        "the sidecar write must reach the gallery projection"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_create_a_missing_sidecar_impl,
+    media_labels_create_a_missing_sidecar,
+    media_labels_create_a_missing_sidecar_turso
+);
+
+/// Labelling must edit an existing sidecar instead of replacing it: a rewritten
+/// packet would silently drop the develop settings and IPTC fields that the
+/// authoring tool owns.
+async fn media_labels_preserve_third_party_properties_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-labels-third-party").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            Bytes::from_static(THIRD_PARTY_SIDECAR.as_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .set_media_labels(
+            "album/photo.jpg",
+            vec!["beach".to_string(), "vacation".to_string()],
+        )
+        .await
+        .unwrap()
+        .expect("changed labels must write an object version");
+
+    let stored = stored_sidecar_text(&store, "album/photo.jpg").await;
+    assert!(
+        stored.contains("crs:Exposure2012=\"+0.35\""),
+        "camera raw settings must survive a label write: {stored}"
+    );
+    assert!(
+        stored.contains("photoshop:City=\"Zurich\""),
+        "Photoshop properties must survive a label write: {stored}"
+    );
+
+    let sidecar = XmpSidecar::parse(stored.as_bytes()).expect("the sidecar must stay parsable");
+    assert_eq!(
+        sidecar.keywords(),
+        ["beach".to_string(), "vacation".to_string()],
+        "the requested labels replace the previous keywords"
+    );
+    assert_eq!(
+        gallery_labels_for_key(&store, "album/photo.jpg").await,
+        vec!["beach".to_string(), "vacation".to_string()]
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_preserve_third_party_properties_impl,
+    media_labels_preserve_third_party_properties,
+    media_labels_preserve_third_party_properties_turso
+);
+
+/// A packet that cannot be parsed cannot be edited without losing its content,
+/// so the write is refused. Ingest deliberately tolerates such packets; refusing
+/// to write over them is the complementary half of that decision.
+async fn media_labels_refuse_to_overwrite_a_malformed_sidecar_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-labels-malformed").await;
+    let malformed = Bytes::from_static(b"<rdf:RDF><unclosed>");
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            malformed.clone(),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let error = store
+        .set_media_labels("album/photo.jpg", vec!["beach".to_string()])
+        .await
+        .expect_err("a malformed sidecar must not be overwritten");
+    assert!(
+        error.to_string().contains("malformed XMP sidecar"),
+        "the error has to name the refused sidecar: {error:#}"
+    );
+    assert_eq!(
+        store
+            .get_object("album/photo.jpg.xmp", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap(),
+        malformed,
+        "the refused write must leave the stored bytes untouched"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_refuse_to_overwrite_a_malformed_sidecar_impl,
+    media_labels_refuse_to_overwrite_a_malformed_sidecar,
+    media_labels_refuse_to_overwrite_a_malformed_sidecar_turso
+);
+
+/// A label update must never create a sidecar that later label reads reject.
+async fn media_labels_refuse_sidecars_larger_than_the_ingest_limit_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("media-labels-size-limit").await;
+    let media_key = "album/photo.jpg";
+
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .set_media_labels(media_key, vec!["kept".to_string()])
+        .await
+        .unwrap()
+        .expect("the initial sidecar must be stored");
+    let before = stored_sidecar_text(&store, media_key).await;
+
+    let error = store
+        .set_media_labels(media_key, vec!["x".repeat(MAX_SIDECAR_INGEST_BYTES)])
+        .await
+        .expect_err("an oversized serialized sidecar must be rejected");
+    assert!(
+        error.downcast_ref::<SidecarWriteSizeLimitError>().is_some(),
+        "the caller needs a distinct error to map this request to 400: {error:#}"
+    );
+    assert_eq!(
+        stored_sidecar_text(&store, media_key).await,
+        before,
+        "a rejected update must preserve the readable sidecar that was already stored"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_refuse_sidecars_larger_than_the_ingest_limit_impl,
+    media_labels_refuse_sidecars_larger_than_the_ingest_limit,
+    media_labels_refuse_sidecars_larger_than_the_ingest_limit_turso
+);
+
+/// Storing the labels a media object already has must not spend an object
+/// version, and media without labels must not gain an empty sidecar object.
+async fn media_labels_skip_writes_that_change_nothing_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-labels-noop").await;
+
+    store
+        .put_object_versioned(
+            "album/photo.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .set_media_labels("album/photo.jpg", Vec::new())
+            .await
+            .unwrap()
+            .is_none(),
+        "clearing labels of unlabelled media must not create a sidecar"
+    );
+    assert!(
+        store
+            .get_object("album/photo.jpg.xmp", None, None, ObjectReadMode::Preferred)
+            .await
+            .is_err(),
+        "no sidecar object may exist after a no-op label write"
+    );
+
+    let created = store
+        .set_media_labels("album/photo.jpg", vec!["beach".to_string()])
+        .await
+        .unwrap()
+        .expect("the first label write must create a sidecar");
+    let repeated = store
+        .set_media_labels("album/photo.jpg", vec!["beach".to_string()])
+        .await
+        .unwrap();
+    assert!(
+        repeated.is_none(),
+        "re-storing identical labels must not create a version"
+    );
+    assert_eq!(
+        store
+            .list_versions("album/photo.jpg.xmp")
+            .await
+            .unwrap()
+            .unwrap()
+            .preferred_head_version_id,
+        Some(created.version_id),
+        "the sidecar must still point at the version of the only real write"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_skip_writes_that_change_nothing_impl,
+    media_labels_skip_writes_that_change_nothing,
+    media_labels_skip_writes_that_change_nothing_turso
+);
+
+/// Sidecars describe media objects, so addressing one directly is a caller bug
+/// rather than a request to create `photo.jpg.xmp.xmp`.
+async fn media_labels_reject_a_sidecar_key_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-labels-sidecar-key").await;
+
+    let error = store
+        .set_media_labels("album/photo.jpg.xmp", vec!["beach".to_string()])
+        .await
+        .expect_err("a sidecar key must be rejected");
+    assert!(
+        error.to_string().contains("album/photo.jpg.xmp"),
+        "the error has to name the rejected key: {error:#}"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    media_labels_reject_a_sidecar_key_impl,
+    media_labels_reject_a_sidecar_key,
+    media_labels_reject_a_sidecar_key_turso
 );
