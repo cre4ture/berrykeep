@@ -76,6 +76,15 @@ internal object FolderSyncOutageRetryPolicy {
     }
 
     /**
+     * Automatic events re-check the network gate before deciding to hold for the persisted
+     * circuit. Gate inputs such as Wi-Fi location permission can change without a connectivity
+     * callback, so a cached allowed-profile result is not sufficient for this decision.
+     */
+    fun requiresNetworkPolicyRefresh(trigger: FolderSyncRetryTrigger): Boolean =
+        trigger != FolderSyncRetryTrigger.MANUAL_SYNC &&
+            trigger != FolderSyncRetryTrigger.CONFIGURATION_CHANGED
+
+    /**
      * The caller has already established that an attempt is allowed. A persisted outage may force
      * one continuous-sync restart, but subsequent app/network/content events must not interrupt
      * the recovery that restart began.

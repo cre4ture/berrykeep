@@ -90,6 +90,30 @@ class FolderSyncOutageRetryPolicyTest {
     }
 
     @Test
+    fun automaticTriggersRefreshNetworkPolicyBeforeTheirBackoffDecision() {
+        assertTrue(
+            FolderSyncOutageRetryPolicy.requiresNetworkPolicyRefresh(
+                FolderSyncRetryTrigger.APP_FOREGROUNDED,
+            ),
+        )
+        assertTrue(
+            FolderSyncOutageRetryPolicy.requiresNetworkPolicyRefresh(
+                FolderSyncRetryTrigger.BACKOFF_TIMER,
+            ),
+        )
+        assertFalse(
+            FolderSyncOutageRetryPolicy.requiresNetworkPolicyRefresh(
+                FolderSyncRetryTrigger.MANUAL_SYNC,
+            ),
+        )
+        assertFalse(
+            FolderSyncOutageRetryPolicy.requiresNetworkPolicyRefresh(
+                FolderSyncRetryTrigger.CONFIGURATION_CHANGED,
+            ),
+        )
+    }
+
+    @Test
     fun aLaterFailureBuildsOnPersistedStateRatherThanRestartingTheBackoff() {
         val initial = FolderSyncOutageRetryState()
         val first = FolderSyncOutageRetryPolicy.afterFailure(initial, nowEpochMs = 1_000L)

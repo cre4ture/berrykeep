@@ -546,6 +546,15 @@ class FolderSyncForegroundService : Service() {
             clearRetryState()
             lastDesiredSignature = null
         }
+
+        // Some policy inputs are not ConnectivityManager events: for example, granting Wi-Fi
+        // location permission can make an SSID-allowlisted profile eligible again. Refresh the
+        // gate before holding an automatic trigger so a previously cancelled outage wake-up is
+        // re-armed as soon as such a profile becomes allowed.
+        if (FolderSyncOutageRetryPolicy.requiresNetworkPolicyRefresh(trigger)) {
+            enforceNetworkPolicyLocked()
+        }
+
         val retryState = outageRetryStore.state()
         if (!FolderSyncOutageRetryPolicy.allowsAttempt(retryState, trigger, System.currentTimeMillis())) {
             val state = retryState
@@ -636,18 +645,13 @@ class FolderSyncForegroundService : Service() {
         )
     }
 
-    /**
-     * Refreshes the policy snapshot before handling an available-network event. A default-network
-     * callback is allowed to arrive without a separate capabilities callback, so using the stale
-     * offline value here could otherwise leave a persisted endpoint wake-up cancelled forever.
-     */
+    /** Serializes a network event with the policy evaluation in [reconcileRequestLocked]. */
     private suspend fun reconcileAfterNetworkPolicyEvaluation(
         reason: String,
         trigger: FolderSyncRetryTrigger,
     ) {
         FolderSyncExecutionCoordinator.awaitOneShotCompletion()
         val started = reconcileMutex.withLock {
-            enforceNetworkPolicyLocked()
             reconcileRequestLocked(
                 reason = reason,
                 trigger = trigger,
