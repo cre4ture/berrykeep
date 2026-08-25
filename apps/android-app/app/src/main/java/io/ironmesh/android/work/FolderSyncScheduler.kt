@@ -34,7 +34,10 @@ object FolderSyncScheduler {
         }
 
         if (resetOutageBackoff) {
-            workManager.cancelUniqueWork(UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK)
+            // Persist the reset before asking the service to reconcile. If Android delays or
+            // rejects that service start, a stale outage worker must still not survive a real
+            // configuration change.
+            clearOutageRetryCircuit(context)
             FolderSyncForegroundService.syncConfigChanged(context)
         } else {
             FolderSyncForegroundService.syncRuntimeRestored(context)
