@@ -383,6 +383,18 @@ class FolderSyncForegroundService : Service() {
                     val activeProfileCount = status?.activeProfileCount ?: 0L
                     val waitingMessage = waitingSummary
                     val profilesAreAllowed = hasAllowedProfiles
+                    val retryState = outageRetryStore.state()
+                    val successfulProfileIds = status
+                        ?.profiles
+                        .orEmpty()
+                        .asSequence()
+                        .filter { profile ->
+                            profile.profileId in lastDesiredProfileIds &&
+                                profile.lastSuccessUnixMs?.let { successUnixMs ->
+                                    successUnixMs >= retryState.lastFailureAtEpochMs
+                                } == true
+                        }
+                        .mapTo(linkedSetOf()) { profile -> profile.profileId }
                     when {
                         !waitingMessage.isNullOrBlank() && !profilesAreAllowed && activeProfileCount == 0L -> {
                             cancelRetryWakeup()
@@ -390,10 +402,12 @@ class FolderSyncForegroundService : Service() {
                         (status?.errorProfileCount ?: 0L) > 0L -> {
                             armOutageRetry(currentErrorMessage(status))
                         }
-                        FolderSyncOutageRetryPolicy.allDesiredProfilesRunning(
-                            desiredProfileCount = lastDesiredProfileIds.size,
+                        FolderSyncOutageRetryPolicy.allDesiredProfilesRecoveredSinceFailure(
+                            state = retryState,
+                            desiredProfileIds = lastDesiredProfileIds,
                             activeProfileCount = activeProfileCount,
-                            runningProfileCount = status?.runningProfileCount ?: 0L,
+                            errorProfileCount = status?.errorProfileCount ?: 0L,
+                            successfulProfileIds = successfulProfileIds,
                         ) -> {
                             clearRetryState()
                         }
@@ -852,6 +866,12 @@ class FolderSyncForegroundService : Service() {
          */
         fun localFolderChanged(context: Context, treeUriString: String) {
             if (!serviceRunning) {
+                return
+            }
+            // Native sync writes can also notify the observed SAF tree. A local change only needs
+            // to reach the service while an endpoint circuit is armed; otherwise continuous sync
+            // already owns the tree and reconciling it again would be self-triggered overhead.
+            if (FolderSyncOutageRetryStore(context).state().failureCount == 0) {
                 return
             }
             val elapsedMs = SystemClock.elapsedRealtime()
