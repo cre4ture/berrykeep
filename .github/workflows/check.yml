@@ -208,6 +208,9 @@ jobs:
           - name: client-ui
             label: ui
             command: pnpm test:e2e:client-ui
+          - name: client-ui-gallery-rust
+            label: ui-gallery-rs
+            command: pnpm test:e2e:client-ui-gallery-rust
           - name: server-admin
             label: adm
             command: pnpm test:e2e:server-admin

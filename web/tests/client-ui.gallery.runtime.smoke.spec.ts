@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("client-ui runtime loads configured gallery map styles through the client proxy", async ({ page }) => {
+test("client-ui runtime fits the gallery overview through the client proxy", async ({ page }) => {
   const pageErrors: string[] = [];
   page.on("pageerror", (error) => {
     pageErrors.push(error.message);
@@ -20,6 +20,14 @@ test("client-ui runtime loads configured gallery map styles through the client p
   await expect(page.getByRole("option", { name: "Natural Earth Globe + labels" })).toBeVisible();
   await expect(page.getByRole("option", { name: "OpenMapTiles Street" })).toBeVisible();
   await expect(page.getByText("Gallery map styles are unavailable")).toHaveCount(0);
+
+  const clusters = page.getByRole("button", { name: "Open map cluster with 2 items" });
+  await expect(clusters).toHaveCount(2);
+  await clusters.first().click();
+  const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
+  await expect(chooser).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/runtime-map-a.png" })).toBeVisible();
+  await expect(chooser.getByRole("button", { name: "gallery/runtime-map-b.png" })).toBeVisible();
   expect(pageErrors).toEqual([]);
 });
 
@@ -51,7 +59,7 @@ test("client-ui runtime keeps the map photo viewer visible in an embedded viewpo
   await page.getByRole("button", { name: "Fullscreen map" }).click();
   await expect(page.getByRole("button", { name: "Exit fullscreen map" })).toBeVisible();
 
-  const cluster = page.getByRole("button", { name: "Open map cluster with 2 items" });
+  const cluster = page.getByRole("button", { name: "Open map cluster with 2 items" }).first();
   await expect(cluster).toBeVisible();
   await cluster.click();
 
