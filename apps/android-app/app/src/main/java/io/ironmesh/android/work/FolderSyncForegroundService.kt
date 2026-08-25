@@ -916,12 +916,6 @@ class FolderSyncForegroundService : Service() {
             if (!serviceRunning) {
                 return
             }
-            // Native sync writes can also notify the observed SAF tree. A local change only needs
-            // to reach the service while an endpoint circuit is armed; otherwise continuous sync
-            // already owns the tree and reconciling it again would be self-triggered overhead.
-            if (FolderSyncOutageRetryStore(context).state().failureCount == 0) {
-                return
-            }
             val elapsedMs = SystemClock.elapsedRealtime()
             synchronized(localChangeLock) {
                 val previousElapsedMs = lastLocalChangeElapsedMsByTreeUri[treeUriString]
@@ -935,6 +929,11 @@ class FolderSyncForegroundService : Service() {
             }
             val appContext = context.applicationContext
             triggerScope.launch {
+                // Native sync writes can also notify the observed SAF tree. Keep this potentially
+                // disk-backed state lookup off the ContentObserver's main-thread callback.
+                if (FolderSyncOutageRetryStore(appContext).state().failureCount == 0) {
+                    return@launch
+                }
                 val hasMatchingEnabledProfile = IronmeshPreferences
                     .getFolderSyncConfigs(appContext)
                     .any { profile ->
