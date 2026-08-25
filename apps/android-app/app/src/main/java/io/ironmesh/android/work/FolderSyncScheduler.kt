@@ -34,6 +34,7 @@ object FolderSyncScheduler {
         }
 
         if (resetOutageBackoff) {
+            workManager.cancelUniqueWork(UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK)
             FolderSyncForegroundService.syncConfigChanged(context)
         } else {
             FolderSyncForegroundService.syncRuntimeRestored(context)
