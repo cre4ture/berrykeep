@@ -834,22 +834,28 @@ class FolderSyncForegroundService : Service() {
             }
         }
 
-        /** Invoked by the doze-aware one-time worker at a persisted outage deadline. */
-        fun triggerScheduledRetry(context: Context) {
-            val appContext = context.applicationContext
-            runCatching {
-                if (serviceRunning) {
-                    appContext.startService(
-                        Intent(appContext, FolderSyncForegroundService::class.java).apply {
-                            action = ACTION_BACKOFF_TIMER
-                        },
-                    )
-                } else {
-                    startOwnedService(appContext, ACTION_BACKOFF_TIMER)
-                }
-            }.onFailure { error ->
-                Log.w(TAG, "failed to wake sync service for outage retry: ${error.message}")
+        /**
+         * Delivers a due retry only to an already-running foreground service.
+         *
+         * Android 12+ can reject a foreground-service start from WorkManager while the app is in
+         * the background. When no service is alive, [FolderSyncOutageRetryWorker] instead queues
+         * a constrained [FolderSyncWorker], which is safe for background execution.
+         */
+        fun signalScheduledRetryIfRunning(context: Context): Boolean {
+            if (!serviceRunning) {
+                return false
             }
+            val appContext = context.applicationContext
+            return runCatching {
+                appContext.startService(
+                    Intent(appContext, FolderSyncForegroundService::class.java).apply {
+                        action = ACTION_BACKOFF_TIMER
+                    },
+                )
+                true
+            }.onFailure { error ->
+                Log.w(TAG, "failed to signal sync service for outage retry: ${error.message}")
+            }.getOrDefault(false)
         }
 
         private fun startOwnedService(context: Context, action: String) {

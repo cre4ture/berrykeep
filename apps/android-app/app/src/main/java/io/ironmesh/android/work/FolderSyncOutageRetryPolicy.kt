@@ -181,7 +181,9 @@ class FolderSyncOutageRetryWorker(
             return Result.success()
         }
 
-        FolderSyncForegroundService.triggerScheduledRetry(applicationContext)
+        if (!FolderSyncForegroundService.signalScheduledRetryIfRunning(applicationContext)) {
+            FolderSyncScheduler.enqueueOutageRetryAttempt(applicationContext)
+        }
         return Result.success()
     }
 }

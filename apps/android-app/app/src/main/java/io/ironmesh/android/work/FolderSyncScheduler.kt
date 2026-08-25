@@ -3,7 +3,9 @@ package io.ironmesh.android.work
 import android.content.Context
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import io.ironmesh.android.data.IronmeshPreferences
@@ -11,6 +13,7 @@ import java.util.concurrent.TimeUnit
 
 object FolderSyncScheduler {
     private const val UNIQUE_PERIODIC_WORK = "ironmesh-folder-sync-periodic"
+    private const val UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK = "ironmesh-folder-sync-outage-attempt"
     private const val PERIODIC_INTERVAL_MINUTES = 15L
 
     fun reschedule(
@@ -67,6 +70,35 @@ object FolderSyncScheduler {
         FolderSyncForegroundService.syncNow(context)
     }
 
+    /**
+     * Runs a due outage retry without starting a foreground service from a background worker.
+     * WorkManager holds this request until the most permissive enabled profile can use the
+     * current network; [FolderSyncWorker] applies the per-profile policy again before syncing.
+     */
+    internal fun enqueueOutageRetryAttempt(context: Context) {
+        val appContext = context.applicationContext
+        val enabledProfiles = IronmeshPreferences
+            .getFolderSyncConfigs(appContext)
+            .filter { it.enabled }
+        if (enabledProfiles.isEmpty()) {
+            clearOutageRetryCircuit(appContext)
+            return
+        }
+
+        val request = OneTimeWorkRequestBuilder<FolderSyncWorker>()
+            .setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(requiredNetworkType(enabledProfiles))
+                    .build(),
+            )
+            .build()
+        WorkManager.getInstance(appContext).enqueueUniqueWork(
+            UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK,
+            ExistingWorkPolicy.REPLACE,
+            request,
+        )
+    }
+
     private fun requiredNetworkType(enabledProfiles: List<io.ironmesh.android.data.FolderSyncConfig>): NetworkType {
         val mayUseMeteredNetwork = enabledProfiles.any { profile ->
             val policy = profile.networkPolicy.normalized()
@@ -84,7 +116,9 @@ object FolderSyncScheduler {
      * The foreground service may already have been killed, so its onDestroy cleanup is not enough.
      */
     internal fun clearOutageRetryCircuit(context: Context) {
-        FolderSyncOutageRetryScheduler.cancel(context)
-        FolderSyncOutageRetryStore(context).clear()
+        val appContext = context.applicationContext
+        WorkManager.getInstance(appContext).cancelUniqueWork(UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK)
+        FolderSyncOutageRetryScheduler.cancel(appContext)
+        FolderSyncOutageRetryStore(appContext).clear()
     }
 }
