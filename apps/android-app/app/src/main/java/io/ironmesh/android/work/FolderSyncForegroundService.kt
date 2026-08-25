@@ -613,19 +613,34 @@ class FolderSyncForegroundService : Service() {
         } catch (error: Exception) {
             Log.w(TAG, "managed client network hint failed ($reason): ${error.message}")
         }
-        requestReconcile(
+        reconcileAfterNetworkPolicyEvaluation(
             reason = reason,
             trigger = FolderSyncRetryTrigger.NETWORK_AVAILABLE,
         )
     }
 
     private suspend fun processNetworkPolicyChange(reason: String) {
+        reconcileAfterNetworkPolicyEvaluation(
+            reason = reason,
+            trigger = FolderSyncRetryTrigger.NETWORK_POLICY_CHANGED,
+        )
+    }
+
+    /**
+     * Refreshes the policy snapshot before handling an available-network event. A default-network
+     * callback is allowed to arrive without a separate capabilities callback, so using the stale
+     * offline value here could otherwise leave a persisted endpoint wake-up cancelled forever.
+     */
+    private suspend fun reconcileAfterNetworkPolicyEvaluation(
+        reason: String,
+        trigger: FolderSyncRetryTrigger,
+    ) {
         FolderSyncExecutionCoordinator.awaitOneShotCompletion()
         val started = reconcileMutex.withLock {
             enforceNetworkPolicyLocked()
             reconcileRequestLocked(
                 reason = reason,
-                trigger = FolderSyncRetryTrigger.NETWORK_POLICY_CHANGED,
+                trigger = trigger,
             )
         }
         if (started) {
