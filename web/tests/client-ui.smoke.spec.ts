@@ -1,7 +1,10 @@
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
-import { registerGalleryMapContractTests } from "./gallery-map.contract";
+import {
+  createInitialOverviewGalleryEntries,
+  registerGalleryMapContractTests
+} from "./gallery-map.contract";
 import { GalleryMapMockSession } from "./gallery-map.mock";
 import {
   filterMockStoreEntriesToPrefix,
@@ -20,6 +23,11 @@ registerGalleryMapContractTests({
     installClientUiMocks(page, {
       mapConfiguration: options.mapConfiguration,
       mapConfigurationStatus: options.mapConfigurationStatus
+    }),
+  setupInitialOverviewScenario: (page) =>
+    installClientUiMocks(page, {
+      storeEntries: createInitialOverviewGalleryEntries(),
+      mapMetadataCenter: [8.5417, 47.3769, 3]
     }),
   openGallery: async (page) => {
     await page.goto("/");
@@ -1402,6 +1410,7 @@ type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
   cacheScope?: string | null;
   mapMetadataStatus?: number;
+  mapMetadataCenter?: [number, number, number];
   mapConfigurationStatus?: number;
   mapConfiguration?: MockGalleryMapConfiguration;
   mapClusterRefreshDelayMs?: number;
@@ -1869,7 +1878,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
 
       return json(route, {
         attribution: "Made with Natural Earth.",
-        center: [0, 20, 1],
+        center: options?.mapMetadataCenter ?? [0, 20, 1],
         format: "png",
         minzoom: 0,
         maxzoom: 2
