@@ -36,7 +36,6 @@ class FolderSyncOutageRetryStoreInstrumentationTest {
         )
 
         assertEquals(recorded, recreatedStore.state())
-        assertEquals(now, recreatedStore.state().lastFailureAtEpochMs)
         assertFalse(recreatedStore.allowsAttempt(FolderSyncRetryTrigger.APP_FOREGROUNDED))
         assertTrue(recreatedStore.allowsAttempt(FolderSyncRetryTrigger.MANUAL_SYNC))
     }

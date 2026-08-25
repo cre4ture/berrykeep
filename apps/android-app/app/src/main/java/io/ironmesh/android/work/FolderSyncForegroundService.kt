@@ -49,6 +49,10 @@ class FolderSyncForegroundService : Service() {
     private var lastLoggedStatusLine: String? = null
     private var lastDesiredSignature: String? = null
     private var lastDesiredProfileIds = emptySet<String>()
+    private var latestStatus: FolderSyncServiceStatus? = null
+    private var recoveryRestartPending = false
+    private var recoveryProfileIds = emptySet<String>()
+    private var recoveryBaselineSuccessByProfile = emptyMap<String, Long?>()
     private var waitingSummary: String? = null
     @Volatile
     private var hasAllowedProfiles = false
@@ -184,10 +188,12 @@ class FolderSyncForegroundService : Service() {
 
     private fun clearRetryState() {
         val hasPersistedRetryState = outageRetryStore.state().failureCount > 0
-        if (!outageRetryArmed && !hasPersistedRetryState && !outageRetryWakeupScheduled) {
+        val hasRecoveryTracking = recoveryRestartPending || recoveryProfileIds.isNotEmpty()
+        if (!outageRetryArmed && !hasPersistedRetryState && !outageRetryWakeupScheduled && !hasRecoveryTracking) {
             return
         }
         outageRetryArmed = false
+        clearRecoveryTracking()
         if (hasPersistedRetryState) {
             outageRetryStore.clear()
         }
@@ -207,6 +213,7 @@ class FolderSyncForegroundService : Service() {
         }
 
         outageRetryArmed = true
+        clearRecoveryTracking()
         val state = outageRetryStore.recordFailure()
         schedulePersistedRetryWakeup(state)
         updateNotification("BerryKeep sync paused", buildRetryMessage(reason, state))
@@ -227,6 +234,43 @@ class FolderSyncForegroundService : Service() {
         }
         outageRetryWakeupScheduled = false
         FolderSyncOutageRetryScheduler.cancel(applicationContext)
+    }
+
+    private fun beginRecoveryRestart() {
+        recoveryRestartPending = true
+        recoveryProfileIds = emptySet()
+        recoveryBaselineSuccessByProfile = emptyMap()
+    }
+
+    private fun clearRecoveryTracking() {
+        recoveryRestartPending = false
+        recoveryProfileIds = emptySet()
+        recoveryBaselineSuccessByProfile = emptyMap()
+    }
+
+    /** Captures a recovery generation before restarting the current desired profile set. */
+    private fun trackRecoveryProfiles(desiredProfileIds: Set<String>) {
+        if (!recoveryRestartPending) {
+            return
+        }
+        val currentSuccessByProfile = latestStatus
+            ?.profiles
+            .orEmpty()
+            .associate { profile -> profile.profileId to profile.lastSuccessUnixMs }
+        val addedProfileIds = desiredProfileIds - recoveryProfileIds
+        recoveryBaselineSuccessByProfile = recoveryBaselineSuccessByProfile
+            .filterKeys { profileId -> profileId in desiredProfileIds }
+            .plus(addedProfileIds.associateWith { profileId -> currentSuccessByProfile[profileId] })
+        recoveryProfileIds = desiredProfileIds
+    }
+
+    private fun dropRecoveryProfiles(profileIds: Set<String>) {
+        if (profileIds.isEmpty()) {
+            return
+        }
+        recoveryProfileIds -= profileIds
+        recoveryBaselineSuccessByProfile = recoveryBaselineSuccessByProfile
+            .filterKeys { profileId -> profileId !in profileIds }
     }
 
     private fun buildRetryMessage(reason: String, state: FolderSyncOutageRetryState): String {
@@ -348,6 +392,9 @@ class FolderSyncForegroundService : Service() {
                 clientIdentityJson = clientIdentityJson,
                 profiles = allowedProfiles,
             )
+            val desiredProfileIds = allowedProfiles.mapTo(linkedSetOf()) { profile -> profile.id }
+            trackRecoveryProfiles(desiredProfileIds)
+            lastDesiredProfileIds = desiredProfileIds
             applyDesiredState(
                 desiredSignature = desiredSignature,
                 desiredProfiles = allowedProfiles,
@@ -355,7 +402,6 @@ class FolderSyncForegroundService : Service() {
                 serverCaPem = serverCaPem,
                 clientIdentityJson = clientIdentityJson,
             )
-            lastDesiredProfileIds = allowedProfiles.mapTo(linkedSetOf()) { profile -> profile.id }
 
             if (allowedProfiles.isEmpty()) {
                 cancelRetryWakeup()
@@ -383,16 +429,15 @@ class FolderSyncForegroundService : Service() {
                     val activeProfileCount = status?.activeProfileCount ?: 0L
                     val waitingMessage = waitingSummary
                     val profilesAreAllowed = hasAllowedProfiles
-                    val retryState = outageRetryStore.state()
+                    latestStatus = status
                     val successfulProfileIds = status
                         ?.profiles
                         .orEmpty()
                         .asSequence()
                         .filter { profile ->
-                            profile.profileId in lastDesiredProfileIds &&
-                                profile.lastSuccessUnixMs?.let { successUnixMs ->
-                                    successUnixMs >= retryState.lastFailureAtEpochMs
-                                } == true
+                            profile.profileId in recoveryProfileIds &&
+                                profile.lastSuccessUnixMs != null &&
+                                profile.lastSuccessUnixMs != recoveryBaselineSuccessByProfile[profile.profileId]
                         }
                         .mapTo(linkedSetOf()) { profile -> profile.profileId }
                     when {
@@ -402,9 +447,8 @@ class FolderSyncForegroundService : Service() {
                         (status?.errorProfileCount ?: 0L) > 0L -> {
                             armOutageRetry(currentErrorMessage(status))
                         }
-                        FolderSyncOutageRetryPolicy.allDesiredProfilesRecoveredSinceFailure(
-                            state = retryState,
-                            desiredProfileIds = lastDesiredProfileIds,
+                        FolderSyncOutageRetryPolicy.allRecoveryProfilesSucceededAfterRestart(
+                            recoveryProfileIds = recoveryProfileIds,
                             activeProfileCount = activeProfileCount,
                             errorProfileCount = status?.errorProfileCount ?: 0L,
                             successfulProfileIds = successfulProfileIds,
@@ -592,6 +636,7 @@ class FolderSyncForegroundService : Service() {
                 outageRetryArmed,
             )
         ) {
+            beginRecoveryRestart()
             lastDesiredSignature = null
         }
         outageRetryArmed = false
@@ -703,7 +748,10 @@ class FolderSyncForegroundService : Service() {
             }
             if (newlyBlockedProfiles.isNotEmpty()) {
                 lastDesiredSignature = null
-                lastDesiredProfileIds -= newlyBlockedProfiles.map { evaluation -> evaluation.profile.id }
+                val newlyBlockedProfileIds = newlyBlockedProfiles
+                    .mapTo(linkedSetOf()) { evaluation -> evaluation.profile.id }
+                lastDesiredProfileIds -= newlyBlockedProfileIds
+                dropRecoveryProfiles(newlyBlockedProfileIds)
             }
 
             hasAllowedProfiles = allowedProfiles.isNotEmpty()

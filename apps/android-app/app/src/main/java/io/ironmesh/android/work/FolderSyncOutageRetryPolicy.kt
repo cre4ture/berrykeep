@@ -19,7 +19,6 @@ import java.util.concurrent.TimeUnit
 internal data class FolderSyncOutageRetryState(
     val failureCount: Int = 0,
     val nextRetryAtEpochMs: Long = 0L,
-    val lastFailureAtEpochMs: Long = 0L,
 )
 
 internal enum class FolderSyncRetryTrigger {
@@ -63,7 +62,6 @@ internal object FolderSyncOutageRetryPolicy {
         return FolderSyncOutageRetryState(
             failureCount = failureCount,
             nextRetryAtEpochMs = nowEpochMs + delayForFailure(failureCount, jitterPermille),
-            lastFailureAtEpochMs = nowEpochMs,
         )
     }
 
@@ -97,21 +95,19 @@ internal object FolderSyncOutageRetryPolicy {
     ): Boolean = state.failureCount > 0 && outageRetryArmed
 
     /**
-     * A circuit is healthy only after every currently desired profile has completed a sync after
-     * the failure that armed it. This avoids both resetting while another profile is still
-     * recovering and retaining an old backoff rung while a long initial sync remains active.
+     * A circuit is healthy only after every profile restarted for recovery has completed a sync.
+     * The caller identifies post-restart successes by generation, rather than comparing wall-clock
+     * timestamps, so clock corrections cannot make an older success satisfy this condition.
      */
-    fun allDesiredProfilesRecoveredSinceFailure(
-        state: FolderSyncOutageRetryState,
-        desiredProfileIds: Set<String>,
+    fun allRecoveryProfilesSucceededAfterRestart(
+        recoveryProfileIds: Set<String>,
         activeProfileCount: Long,
         errorProfileCount: Long,
         successfulProfileIds: Set<String>,
-    ): Boolean = state.failureCount > 0 &&
-        desiredProfileIds.isNotEmpty() &&
-        activeProfileCount == desiredProfileIds.size.toLong() &&
+    ): Boolean = recoveryProfileIds.isNotEmpty() &&
+        activeProfileCount == recoveryProfileIds.size.toLong() &&
         errorProfileCount == 0L &&
-        successfulProfileIds.containsAll(desiredProfileIds)
+        successfulProfileIds.containsAll(recoveryProfileIds)
 }
 
 /**
@@ -134,9 +130,6 @@ internal class FolderSyncOutageRetryStore(
         val storedNextRetryAtEpochMs = preferences
             .getLong(KEY_NEXT_RETRY_AT_EPOCH_MS, 0L)
             .coerceAtLeast(0L)
-        val storedLastFailureAtEpochMs = preferences
-            .getLong(KEY_LAST_FAILURE_AT_EPOCH_MS, 0L)
-            .coerceAtLeast(0L)
         val nextRetryAtEpochMs = if (failureCount == 0) {
             0L
         } else {
@@ -147,26 +140,15 @@ internal class FolderSyncOutageRetryStore(
                 ),
             )
         }
-        val lastFailureAtEpochMs = if (failureCount == 0) {
-            0L
-        } else {
-            storedLastFailureAtEpochMs.coerceAtMost(now)
-        }
-        if (
-            nextRetryAtEpochMs != storedNextRetryAtEpochMs ||
-            lastFailureAtEpochMs != storedLastFailureAtEpochMs
-        ) {
+        if (nextRetryAtEpochMs != storedNextRetryAtEpochMs) {
             preferences.edit()
                 .putLong(KEY_NEXT_RETRY_AT_EPOCH_MS, nextRetryAtEpochMs)
-                .putLong(KEY_LAST_FAILURE_AT_EPOCH_MS, lastFailureAtEpochMs)
                 .apply()
         }
         return FolderSyncOutageRetryState(
             failureCount = failureCount,
             // Backwards wall-clock corrections cannot extend a circuit beyond its stored rung.
             nextRetryAtEpochMs = nextRetryAtEpochMs,
-            // A backwards wall-clock correction must not make a later successful sync invisible.
-            lastFailureAtEpochMs = lastFailureAtEpochMs,
         )
     }
 
@@ -183,7 +165,6 @@ internal class FolderSyncOutageRetryStore(
         preferences.edit()
             .putInt(KEY_FAILURE_COUNT, next.failureCount)
             .putLong(KEY_NEXT_RETRY_AT_EPOCH_MS, next.nextRetryAtEpochMs)
-            .putLong(KEY_LAST_FAILURE_AT_EPOCH_MS, next.lastFailureAtEpochMs)
             .apply()
         return next
     }
@@ -196,7 +177,6 @@ internal class FolderSyncOutageRetryStore(
         private const val PREFERENCES_NAME = "ironmesh-folder-sync-outage-retry"
         private const val KEY_FAILURE_COUNT = "failure_count"
         private const val KEY_NEXT_RETRY_AT_EPOCH_MS = "next_retry_at_epoch_ms"
-        private const val KEY_LAST_FAILURE_AT_EPOCH_MS = "last_failure_at_epoch_ms"
     }
 }
 

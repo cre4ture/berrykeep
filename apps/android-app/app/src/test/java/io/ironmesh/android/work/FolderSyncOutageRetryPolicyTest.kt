@@ -121,10 +121,8 @@ class FolderSyncOutageRetryPolicyTest {
 
         assertEquals(1, first.failureCount)
         assertEquals(31_000L, first.nextRetryAtEpochMs)
-        assertEquals(1_000L, first.lastFailureAtEpochMs)
         assertEquals(2, second.failureCount)
         assertEquals(91_000L, second.nextRetryAtEpochMs)
-        assertEquals(31_000L, second.lastFailureAtEpochMs)
     }
 
     @Test
@@ -172,48 +170,39 @@ class FolderSyncOutageRetryPolicyTest {
     }
 
     @Test
-    fun retryStateClearsOnlyAfterEveryDesiredProfileSucceedsAfterTheFailure() {
-        val state = FolderSyncOutageRetryState(
-            failureCount = 2,
-            nextRetryAtEpochMs = 60_000L,
-            lastFailureAtEpochMs = 10_000L,
-        )
-        val desiredProfileIds = setOf("photos", "documents")
+    fun retryStateClearsOnlyAfterEveryRecoveryProfileSucceedsAfterRestart() {
+        val recoveryProfileIds = setOf("photos", "documents")
 
         assertFalse(
-            FolderSyncOutageRetryPolicy.allDesiredProfilesRecoveredSinceFailure(
-                state = state,
-                desiredProfileIds = desiredProfileIds,
+            FolderSyncOutageRetryPolicy.allRecoveryProfilesSucceededAfterRestart(
+                recoveryProfileIds = recoveryProfileIds,
                 activeProfileCount = 2,
                 errorProfileCount = 0,
                 successfulProfileIds = setOf("photos"),
             ),
         )
         assertFalse(
-            FolderSyncOutageRetryPolicy.allDesiredProfilesRecoveredSinceFailure(
-                state = state,
-                desiredProfileIds = desiredProfileIds,
+            FolderSyncOutageRetryPolicy.allRecoveryProfilesSucceededAfterRestart(
+                recoveryProfileIds = recoveryProfileIds,
                 activeProfileCount = 1,
                 errorProfileCount = 0,
-                successfulProfileIds = desiredProfileIds,
+                successfulProfileIds = recoveryProfileIds,
             ),
         )
         assertFalse(
-            FolderSyncOutageRetryPolicy.allDesiredProfilesRecoveredSinceFailure(
-                state = state,
-                desiredProfileIds = desiredProfileIds,
+            FolderSyncOutageRetryPolicy.allRecoveryProfilesSucceededAfterRestart(
+                recoveryProfileIds = recoveryProfileIds,
                 activeProfileCount = 2,
                 errorProfileCount = 1,
-                successfulProfileIds = desiredProfileIds,
+                successfulProfileIds = recoveryProfileIds,
             ),
         )
         assertTrue(
-            FolderSyncOutageRetryPolicy.allDesiredProfilesRecoveredSinceFailure(
-                state = state,
-                desiredProfileIds = desiredProfileIds,
+            FolderSyncOutageRetryPolicy.allRecoveryProfilesSucceededAfterRestart(
+                recoveryProfileIds = recoveryProfileIds,
                 activeProfileCount = 2,
                 errorProfileCount = 0,
-                successfulProfileIds = desiredProfileIds,
+                successfulProfileIds = recoveryProfileIds,
             ),
         )
     }
