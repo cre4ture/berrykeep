@@ -25,6 +25,7 @@ object FolderSyncScheduler {
 
         if (!hasEnabledProfiles) {
             workManager.cancelUniqueWork(UNIQUE_PERIODIC_WORK)
+            clearOutageRetryCircuit(context)
             FolderSyncForegroundService.stop(context)
             return
         }
@@ -59,6 +60,7 @@ object FolderSyncScheduler {
             .filter { it.enabled }
         val hasEnabledProfiles = enabledProfiles.isNotEmpty()
         if (!hasEnabledProfiles) {
+            clearOutageRetryCircuit(context)
             FolderSyncForegroundService.stop(context)
             return
         }
@@ -75,5 +77,14 @@ object FolderSyncScheduler {
         } else {
             NetworkType.UNMETERED
         }
+    }
+
+    /**
+     * A profile removal must cancel both the doze-aware work request and its persisted deadline.
+     * The foreground service may already have been killed, so its onDestroy cleanup is not enough.
+     */
+    internal fun clearOutageRetryCircuit(context: Context) {
+        FolderSyncOutageRetryScheduler.cancel(context)
+        FolderSyncOutageRetryStore(context).clear()
     }
 }

@@ -61,4 +61,17 @@ class FolderSyncOutageRetryStoreInstrumentationTest {
             reader.state().nextRetryAtEpochMs,
         )
     }
+
+    @Test
+    fun clearingTheSchedulerCircuitAlsoRemovesPersistedRetryState() {
+        val store = FolderSyncOutageRetryStore(
+            context = context,
+            jitterPermille = { 0 },
+        )
+        store.recordFailure()
+
+        FolderSyncScheduler.clearOutageRetryCircuit(context)
+
+        assertEquals(FolderSyncOutageRetryState(), store.state())
+    }
 }
