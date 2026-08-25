@@ -41,7 +41,7 @@ class FolderSyncOutageRetryStoreInstrumentationTest {
     }
 
     @Test
-    fun staleWallClockDeadlineIsClampedToTheMaximumBackoff() {
+    fun staleWallClockDeadlineIsClampedToItsStoredBackoffRung() {
         val writer = FolderSyncOutageRetryStore(
             context = context,
             nowEpochMs = { 2 * 24 * 60 * 60_000L },
@@ -57,7 +57,7 @@ class FolderSyncOutageRetryStoreInstrumentationTest {
         )
 
         assertEquals(
-            FolderSyncOutageRetryPolicy.MAX_DELAY_MS,
+            33_000L,
             reader.state().nextRetryAtEpochMs,
         )
     }

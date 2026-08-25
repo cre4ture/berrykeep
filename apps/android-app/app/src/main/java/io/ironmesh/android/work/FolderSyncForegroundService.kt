@@ -48,6 +48,7 @@ class FolderSyncForegroundService : Service() {
     private var statusJob: Job? = null
     private var lastLoggedStatusLine: String? = null
     private var lastDesiredSignature: String? = null
+    private var lastDesiredProfileIds = emptySet<String>()
     private var waitingSummary: String? = null
     @Volatile
     private var hasAllowedProfiles = false
@@ -294,6 +295,7 @@ class FolderSyncForegroundService : Service() {
                 waitingSummary = null
                 hasAllowedProfiles = false
                 lastDesiredSignature = null
+                lastDesiredProfileIds = emptySet()
                 clearRetryState()
                 withContext(Dispatchers.Main) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -305,6 +307,7 @@ class FolderSyncForegroundService : Service() {
             if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
                 clearRetryState()
                 hasAllowedProfiles = false
+                lastDesiredProfileIds = emptySet()
                 applyDesiredState(
                     desiredSignature = "",
                     desiredProfiles = emptyList(),
@@ -353,6 +356,7 @@ class FolderSyncForegroundService : Service() {
                 serverCaPem = serverCaPem,
                 clientIdentityJson = clientIdentityJson,
             )
+            lastDesiredProfileIds = allowedProfiles.mapTo(linkedSetOf()) { profile -> profile.id }
 
             if (allowedProfiles.isEmpty()) {
                 cancelRetryWakeup()
@@ -387,7 +391,11 @@ class FolderSyncForegroundService : Service() {
                         (status?.errorProfileCount ?: 0L) > 0L -> {
                             armOutageRetry(currentErrorMessage(status))
                         }
-                        (status?.runningProfileCount ?: 0L) > 0L -> {
+                        FolderSyncOutageRetryPolicy.allDesiredProfilesRunning(
+                            desiredProfileCount = lastDesiredProfileIds.size,
+                            activeProfileCount = activeProfileCount,
+                            runningProfileCount = status?.runningProfileCount ?: 0L,
+                        ) -> {
                             clearRetryState()
                         }
                     }
@@ -457,6 +465,7 @@ class FolderSyncForegroundService : Service() {
                     waitingSummary = null
                     hasAllowedProfiles = false
                     lastDesiredSignature = null
+                    lastDesiredProfileIds = emptySet()
                     clearRetryState()
                 }
             }
@@ -663,12 +672,18 @@ class FolderSyncForegroundService : Service() {
                 .map { evaluation -> evaluation.profile }
             val blockedProfiles = evaluations.filterNot { evaluation -> evaluation.decision.allowed }
 
-            blockedProfiles.forEach { evaluation ->
+            val newlyBlockedProfiles = blockedProfiles.filter { evaluation ->
+                evaluation.profile.id in lastDesiredProfileIds
+            }
+            newlyBlockedProfiles.forEach { evaluation ->
                 repository.stopContinuousFolderSync(evaluation.profile.id)
                 Log.i(
                     TAG,
                     "stopped continuous sync profile=${evaluation.profile.id} after network policy change: ${evaluation.decision.reason}",
                 )
+            }
+            if (newlyBlockedProfiles.isNotEmpty()) {
+                lastDesiredSignature = null
             }
 
             hasAllowedProfiles = allowedProfiles.isNotEmpty()

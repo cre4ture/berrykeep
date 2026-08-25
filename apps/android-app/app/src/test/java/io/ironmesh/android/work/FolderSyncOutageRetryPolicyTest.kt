@@ -144,4 +144,29 @@ class FolderSyncOutageRetryPolicyTest {
             ),
         )
     }
+
+    @Test
+    fun retryStateClearsOnlyAfterTheEntireDesiredProfileSetIsRunning() {
+        assertFalse(
+            FolderSyncOutageRetryPolicy.allDesiredProfilesRunning(
+                desiredProfileCount = 2,
+                activeProfileCount = 2,
+                runningProfileCount = 1,
+            ),
+        )
+        assertFalse(
+            FolderSyncOutageRetryPolicy.allDesiredProfilesRunning(
+                desiredProfileCount = 2,
+                activeProfileCount = 1,
+                runningProfileCount = 1,
+            ),
+        )
+        assertTrue(
+            FolderSyncOutageRetryPolicy.allDesiredProfilesRunning(
+                desiredProfileCount = 2,
+                activeProfileCount = 2,
+                runningProfileCount = 2,
+            ),
+        )
+    }
 }

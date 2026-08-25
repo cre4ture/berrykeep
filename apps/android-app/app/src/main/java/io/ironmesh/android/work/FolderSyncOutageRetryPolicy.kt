@@ -84,6 +84,15 @@ internal object FolderSyncOutageRetryPolicy {
         state: FolderSyncOutageRetryState,
         outageRetryArmed: Boolean,
     ): Boolean = state.failureCount > 0 && outageRetryArmed
+
+    /** A retry is healthy only after every profile from its desired set is running again. */
+    fun allDesiredProfilesRunning(
+        desiredProfileCount: Int,
+        activeProfileCount: Long,
+        runningProfileCount: Long,
+    ): Boolean = desiredProfileCount > 0 &&
+        activeProfileCount == desiredProfileCount.toLong() &&
+        runningProfileCount == desiredProfileCount.toLong()
 }
 
 /**
@@ -102,20 +111,28 @@ internal class FolderSyncOutageRetryStore(
 
     fun state(): FolderSyncOutageRetryState {
         val now = nowEpochMs()
+        val failureCount = preferences.getInt(KEY_FAILURE_COUNT, 0).coerceAtLeast(0)
         val storedNextRetryAtEpochMs = preferences
             .getLong(KEY_NEXT_RETRY_AT_EPOCH_MS, 0L)
             .coerceAtLeast(0L)
-        val nextRetryAtEpochMs = storedNextRetryAtEpochMs.coerceAtMost(
-            now + FolderSyncOutageRetryPolicy.MAX_DELAY_MS,
-        )
+        val nextRetryAtEpochMs = if (failureCount == 0) {
+            0L
+        } else {
+            storedNextRetryAtEpochMs.coerceAtMost(
+                now + FolderSyncOutageRetryPolicy.delayForFailure(
+                    failureCount,
+                    jitterPermille = 100,
+                ),
+            )
+        }
         if (nextRetryAtEpochMs != storedNextRetryAtEpochMs) {
             preferences.edit()
                 .putLong(KEY_NEXT_RETRY_AT_EPOCH_MS, nextRetryAtEpochMs)
                 .apply()
         }
         return FolderSyncOutageRetryState(
-            failureCount = preferences.getInt(KEY_FAILURE_COUNT, 0).coerceAtLeast(0),
-            // Backwards wall-clock corrections must not strand the circuit beyond its maximum.
+            failureCount = failureCount,
+            // Backwards wall-clock corrections cannot extend a circuit beyond its stored rung.
             nextRetryAtEpochMs = nextRetryAtEpochMs,
         )
     }
