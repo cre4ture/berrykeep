@@ -167,7 +167,6 @@ class FolderSyncForegroundService : Service() {
     override fun onDestroy() {
         serviceRunning = false
         statusJob?.cancel()
-        cancelRetryWakeup()
         if (::networkChangeNotifier.isInitialized) {
             networkChangeNotifier.close()
         }
@@ -576,6 +575,8 @@ class FolderSyncForegroundService : Service() {
         return try {
             Log.i(TAG, "reconciling continuous sync: $reason ($trigger)")
             reconcileProfilesLocked()
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: DeviceIdentityStorageException) {
             val message = error.message
                 ?: "Protected device identity is unavailable; enroll again."
