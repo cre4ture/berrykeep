@@ -689,6 +689,7 @@ class FolderSyncForegroundService : Service() {
             }
             if (newlyBlockedProfiles.isNotEmpty()) {
                 lastDesiredSignature = null
+                lastDesiredProfileIds -= newlyBlockedProfiles.map { evaluation -> evaluation.profile.id }
             }
 
             hasAllowedProfiles = allowedProfiles.isNotEmpty()
@@ -872,11 +873,6 @@ class FolderSyncForegroundService : Service() {
                         profile.enabled && profile.localFolderTreeUri == treeUriString
                     }
                 if (!hasMatchingEnabledProfile || !serviceRunning) {
-                    synchronized(localChangeLock) {
-                        if (lastLocalChangeElapsedMsByTreeUri[treeUriString] == elapsedMs) {
-                            lastLocalChangeElapsedMsByTreeUri.remove(treeUriString)
-                        }
-                    }
                     return@launch
                 }
                 // This is delivered only to an already-running foreground service. It avoids
