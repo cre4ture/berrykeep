@@ -74,6 +74,16 @@ internal object FolderSyncOutageRetryPolicy {
             trigger == FolderSyncRetryTrigger.CONFIGURATION_CHANGED ||
             state.nextRetryAtEpochMs <= nowEpochMs
     }
+
+    /**
+     * The caller has already established that an attempt is allowed. A persisted outage may force
+     * one continuous-sync restart, but subsequent app/network/content events must not interrupt
+     * the recovery that restart began.
+     */
+    fun shouldForceReconcileAfterAllowedAttempt(
+        state: FolderSyncOutageRetryState,
+        outageRetryArmed: Boolean,
+    ): Boolean = state.failureCount > 0 && outageRetryArmed
 }
 
 /**

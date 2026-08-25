@@ -123,4 +123,25 @@ class FolderSyncOutageRetryPolicyTest {
             ),
         )
     }
+
+    @Test
+    fun aDueOutageForcesOnlyOneContinuousSyncRestart() {
+        val state = FolderSyncOutageRetryState(
+            failureCount = 2,
+            nextRetryAtEpochMs = 0L,
+        )
+
+        assertTrue(
+            FolderSyncOutageRetryPolicy.shouldForceReconcileAfterAllowedAttempt(
+                state,
+                outageRetryArmed = true,
+            ),
+        )
+        assertFalse(
+            FolderSyncOutageRetryPolicy.shouldForceReconcileAfterAllowedAttempt(
+                state,
+                outageRetryArmed = false,
+            ),
+        )
+    }
 }

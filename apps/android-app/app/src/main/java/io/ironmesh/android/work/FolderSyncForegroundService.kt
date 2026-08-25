@@ -52,6 +52,7 @@ class FolderSyncForegroundService : Service() {
     @Volatile
     private var hasAllowedProfiles = false
     private var outageRetryArmed = false
+    private var outageRetryWakeupScheduled = false
     private var networkCallbackRegistered = false
     private lateinit var outageRetryStore: FolderSyncOutageRetryStore
     private lateinit var networkChangeNotifier: ConflatedNetworkChangeNotifier
@@ -81,7 +82,9 @@ class FolderSyncForegroundService : Service() {
         }
         FolderSyncExecutionCoordinator.markContinuousServiceActive()
         outageRetryStore = FolderSyncOutageRetryStore(applicationContext)
-        schedulePersistedRetryWakeup(outageRetryStore.state())
+        val persistedRetryState = outageRetryStore.state()
+        outageRetryArmed = persistedRetryState.failureCount > 0
+        schedulePersistedRetryWakeup(persistedRetryState)
         ensureNotificationChannel()
         networkChangeNotifier = ConflatedNetworkChangeNotifier(
             scope = scope,
@@ -180,8 +183,14 @@ class FolderSyncForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun clearRetryState() {
+        val hasPersistedRetryState = outageRetryStore.state().failureCount > 0
+        if (!outageRetryArmed && !hasPersistedRetryState && !outageRetryWakeupScheduled) {
+            return
+        }
         outageRetryArmed = false
-        outageRetryStore.clear()
+        if (hasPersistedRetryState) {
+            outageRetryStore.clear()
+        }
         cancelRetryWakeup()
     }
 
@@ -204,10 +213,19 @@ class FolderSyncForegroundService : Service() {
     }
 
     private fun schedulePersistedRetryWakeup(state: FolderSyncOutageRetryState) {
+        if (state.failureCount == 0) {
+            cancelRetryWakeup(force = true)
+            return
+        }
         FolderSyncOutageRetryScheduler.schedule(applicationContext, state)
+        outageRetryWakeupScheduled = true
     }
 
-    private fun cancelRetryWakeup() {
+    private fun cancelRetryWakeup(force: Boolean = false) {
+        if (!force && !outageRetryWakeupScheduled) {
+            return
+        }
+        outageRetryWakeupScheduled = false
         FolderSyncOutageRetryScheduler.cancel(applicationContext)
     }
 
@@ -520,8 +538,9 @@ class FolderSyncForegroundService : Service() {
             clearRetryState()
             lastDesiredSignature = null
         }
-        if (!outageRetryStore.allowsAttempt(trigger)) {
-            val state = outageRetryStore.state()
+        val retryState = outageRetryStore.state()
+        if (!FolderSyncOutageRetryPolicy.allowsAttempt(retryState, trigger, System.currentTimeMillis())) {
+            val state = retryState
             if (hasAllowedProfiles) {
                 schedulePersistedRetryWakeup(state)
             }
@@ -536,7 +555,12 @@ class FolderSyncForegroundService : Service() {
             return false
         }
 
-        if (outageRetryStore.state().failureCount > 0) {
+        if (
+            FolderSyncOutageRetryPolicy.shouldForceReconcileAfterAllowedAttempt(
+                retryState,
+                outageRetryArmed,
+            )
+        ) {
             lastDesiredSignature = null
         }
         outageRetryArmed = false
