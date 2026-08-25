@@ -1,7 +1,6 @@
 package io.ironmesh.android.work
 
 import android.content.Context
-import android.os.SystemClock
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
@@ -91,11 +90,10 @@ class FolderSyncOutageRecoveryInstrumentationTest {
             rendezvousAttemptsAfterOutage > rendezvousAttemptsBeforeBlockedGate,
         )
 
-        // This is a one-shot sync entry point. After it returns, it must not leave an
-        // autonomous retry loop behind while the app is idle. A user-initiated foreground
-        // sync may select cooling routes again, so that behavior is deliberately not asserted
-        // here.
-        SystemClock.sleep(250L)
+        // This is a synchronous one-shot entry point. Its return is the deterministic completion
+        // boundary: it must not have scheduled or started a second route attempt. A
+        // user-initiated foreground sync may select cooling routes again, so that behavior is
+        // deliberately not asserted here.
         assertEquals(
             "a failed one-shot sync started an unexpected direct-route retry",
             directAttemptsAfterOutage,
