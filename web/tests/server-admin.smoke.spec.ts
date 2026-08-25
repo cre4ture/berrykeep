@@ -2,7 +2,10 @@ import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import type { GalleryMapConfiguration } from "@ironmesh/api";
 import { expect, test, type Page, type Route } from "@playwright/test";
-import { registerGalleryMapContractTests } from "./gallery-map.contract";
+import {
+  createInitialOverviewGalleryEntries,
+  registerGalleryMapContractTests
+} from "./gallery-map.contract";
 import { GalleryMapMockSession } from "./gallery-map.mock";
 import {
   filterMockStoreEntriesToPrefix,
@@ -28,6 +31,11 @@ registerGalleryMapContractTests({
     installServerAdminMocks(page, {
       mapConfiguration: options.mapConfiguration,
       mapConfigurationStatus: options.mapConfigurationStatus
+    }),
+  setupInitialOverviewScenario: (page) =>
+    installServerAdminMocks(page, {
+      galleryEntries: createInitialOverviewGalleryEntries(),
+      mapMetadataCenter: [8.5417, 47.3769, 3]
     }),
   openGallery: async (page) => {
     await page.goto("/");
@@ -1485,40 +1493,6 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
   ).toBeVisible();
 });
 
-test("server-admin gallery drills into geographically spread server clusters", async ({ page }) => {
-  await installServerAdminMocks(page, {
-    galleryEntries: createGeoSpreadClusteredAdminGalleryEntries(12)
-  });
-
-  await page.goto("/");
-
-  await page.getByRole("button", { name: "Admin Access" }).click();
-  await page.getByLabel("Admin password").fill("hunter2-harder");
-  await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
-  await page.keyboard.press("Escape");
-
-  await page.getByText("Gallery", { exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
-  await page.getByRole("button", { name: "Map" }).click();
-
-  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
-  await expect(page.getByText("12 markers", { exact: true })).toBeVisible();
-  await expect(page.getByText("1 server cluster", { exact: true })).toBeVisible();
-
-  const clusterButton = page.getByRole("button", {
-    name: "Open map cluster with 12 items"
-  });
-  const clusterDialogTitle = page
-    .getByRole("dialog")
-    .getByText("12 items in map cluster", { exact: true });
-
-  await expect(clusterButton).toBeVisible();
-  await clusterButton.click();
-  await expect(clusterDialogTitle).toHaveCount(0);
-  await expect(page.getByText("1 server cluster", { exact: true })).toHaveCount(0);
-});
-
 test("server-admin provisioning falls back to the full bootstrap bundle when claim issuance returns 502", async ({ page }) => {
   await installServerAdminMocks(page, { bootstrapClaimMode: "bad_gateway" });
 
@@ -1688,6 +1662,7 @@ async function installServerAdminMocks(
     protectDashboardAdminRoutesUntilSessionConfirmed?: boolean;
     galleryEntries?: AdminMockStoreEntry[];
     cockpitStatus?: "ready" | "optional";
+    mapMetadataCenter?: [number, number, number];
     mapConfiguration?: GalleryMapConfiguration;
     mapConfigurationStatus?: number;
   }
@@ -2289,7 +2264,7 @@ async function installServerAdminMocks(
     if (pathname === apiV1("/maps/mbtiles-metadata") && method === "GET") {
       return json(route, {
         attribution: "Made with Natural Earth.",
-        center: [0, 20, 1],
+        center: options?.mapMetadataCenter ?? [0, 20, 1],
         format: "png",
         minzoom: 0,
         maxzoom: 2
