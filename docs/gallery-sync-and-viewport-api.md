@@ -112,8 +112,8 @@ GET /api/v1/auth/gallery/map/clusters?prefix=&depth=64&media_filter=all&south=-9
 ```
 
 `/api/v1/store/map/*` and `/api/v1/auth/store/map/*` remain compatibility aliases. New
-clients must use the gallery-scoped routes so map projections cannot be confused with stored
-object keys by transport implementations.
+clients prefer the gallery-scoped routes so map projections cannot be confused with stored object
+keys by transport implementations, and fall back to the aliases when connected to an older node.
 
 All four viewport bounds are required and use the same antimeridian rules as viewport index
 queries. `zoom` remains an integral, legacy-compatible value clamped to `0..20`. New clients also

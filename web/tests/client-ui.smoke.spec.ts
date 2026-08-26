@@ -522,6 +522,24 @@ test("client-ui gallery loads bounded server-side map clusters", async ({ page }
   ).toBe(true);
 });
 
+test("client-ui gallery falls back to an older map API", async ({ page }) => {
+  const mapRequestPaths: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.includes("/map/clusters")) {
+      mapRequestPaths.push(url.pathname);
+    }
+  });
+  await installClientUiMocks(page, { legacyGalleryMapApiOnly: true });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect.poll(() => mapRequestPaths).toContain(apiV1("/gallery/map/clusters"));
+  await expect.poll(() => mapRequestPaths).toContain(apiV1("/store/map/clusters"));
+});
+
 test("client-ui keeps an open server cluster stable across viewport refreshes", async ({ page }) => {
   const storeEntries = createMockStoreEntries().map((entry) =>
     entry.path === "gallery/dog.jpg" && entry.media
@@ -1415,6 +1433,7 @@ type InstallClientUiMocksOptions = {
   mapConfiguration?: MockGalleryMapConfiguration;
   mapClusterRefreshDelayMs?: number;
   mapClusterEntriesDelayMs?: number;
+  legacyGalleryMapApiOnly?: boolean;
 };
 
 type MockGalleryMapConfiguration = {
@@ -1922,7 +1941,20 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       return;
     }
 
-    if (pathname === apiV1("/gallery/map/clusters") && method === "GET") {
+    if (
+      pathname === apiV1("/gallery/map/clusters") &&
+      method === "GET" &&
+      options?.legacyGalleryMapApiOnly
+    ) {
+      await route.fulfill({ status: 404, contentType: "application/json", body: "{}" });
+      return;
+    }
+
+    if (
+      method === "GET" &&
+      ((pathname === apiV1("/gallery/map/clusters") && !options?.legacyGalleryMapApiOnly) ||
+        (pathname === apiV1("/store/map/clusters") && options?.legacyGalleryMapApiOnly))
+    ) {
       galleryMapClusterRequestCount += 1;
       if (galleryMapClusterRequestCount > 1 && options?.mapClusterRefreshDelayMs) {
         await new Promise((resolve) => setTimeout(resolve, options.mapClusterRefreshDelayMs));
@@ -1930,7 +1962,20 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       return json(route, galleryMapMock.clusters(storeEntries, searchParams));
     }
 
-    if (pathname === apiV1("/gallery/map/cluster-entries") && method === "GET") {
+    if (
+      pathname === apiV1("/gallery/map/cluster-entries") &&
+      method === "GET" &&
+      options?.legacyGalleryMapApiOnly
+    ) {
+      await route.fulfill({ status: 404, contentType: "application/json", body: "{}" });
+      return;
+    }
+
+    if (
+      method === "GET" &&
+      ((pathname === apiV1("/gallery/map/cluster-entries") && !options?.legacyGalleryMapApiOnly) ||
+        (pathname === apiV1("/store/map/cluster-entries") && options?.legacyGalleryMapApiOnly))
+    ) {
       if (options?.mapClusterEntriesDelayMs) {
         await new Promise((resolve) => setTimeout(resolve, options.mapClusterEntriesDelayMs));
       }

@@ -3595,6 +3595,105 @@ async fn gallery_map_clusters_use_the_canonical_path_over_direct_http() {
 }
 
 #[tokio::test]
+async fn gallery_map_clients_fall_back_to_and_cache_legacy_paths() {
+    let canonical_clusters_hits = Arc::new(AtomicUsize::new(0));
+    let canonical_entries_hits = Arc::new(AtomicUsize::new(0));
+    let legacy_clusters_hits = Arc::new(AtomicUsize::new(0));
+    let legacy_entries_hits = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/api/v1/gallery/map/clusters",
+            get({
+                let hits = Arc::clone(&canonical_clusters_hits);
+                move || {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NOT_FOUND
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/v1/gallery/map/cluster-entries",
+            get({
+                let hits = Arc::clone(&canonical_entries_hits);
+                move || {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NOT_FOUND
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/v1/store/map/clusters",
+            get({
+                let hits = Arc::clone(&legacy_clusters_hits);
+                move || {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "prefix": "",
+                            "depth": 64,
+                            "zoom": 1,
+                            "resolution": 8,
+                            "total_entry_count": 0,
+                            "visible_geotagged_count": 0,
+                            "query_token": "gallery-map-query-token",
+                            "clusters": [],
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/v1/store/map/cluster-entries",
+            get({
+                let hits = Arc::clone(&legacy_entries_hits);
+                move || {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(gallery_map_cluster_entries_response())
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener address should be available");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let client = IronMeshClient::from_direct_base_url(format!("http://{address}"));
+
+    for _ in 0..2 {
+        client
+            .gallery_map_clusters(gallery_map_clusters_request())
+            .await
+            .expect("legacy gallery map clusters fallback should succeed");
+        client
+            .gallery_map_cluster_entries("gallery-map-query-token", "0_0", 0, 100)
+            .await
+            .expect("legacy gallery map cluster entries fallback should succeed");
+    }
+
+    assert_eq!(canonical_clusters_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(legacy_clusters_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(canonical_entries_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(legacy_entries_hits.load(Ordering::SeqCst), 2);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn gallery_map_clusters_use_the_canonical_path_over_relay_transport() {
     let response_body = gallery_map_clusters_response_body();
     let (relay_state, server) = spawn_relay_test_server(
