@@ -83,6 +83,7 @@ const GALLERY_SHOW_METADATA_STORAGE_KEY = "ironmesh.gallery.show_metadata";
 const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
 const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
 const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
+const GALLERY_SHOW_MAP_CLUSTER_GRID_STORAGE_KEY = "ironmesh.gallery.show_map_cluster_grid";
 const GALLERY_MAP_FULLSCREEN_HISTORY_KEY = "ironmesh.gallery.map_fullscreen";
 const GALLERY_MAP_FULLSCREEN_MESSAGE_TYPE = "gallery-map-fullscreen";
 const GALLERY_MAP_FULLSCREEN_EXIT_EVENT = "ironmesh:gallery-map-exit-fullscreen";
@@ -436,6 +437,7 @@ export function GallerySurface({
   const [viewMode, setViewMode] = useState(() => loadInitialViewMode(initialViewMode));
   const [activeBasemapId, setActiveBasemapId] = useState(loadStoredBasemapId);
   const [activeMapProjection, setActiveMapProjection] = useState(loadStoredMapProjection);
+  const [showMapClusterGrid, setShowMapClusterGrid] = useState(loadStoredShowMapClusterGrid);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<GallerySnapshot[]>([]);
   const [loadedScope, setLoadedScope] = useState<GalleryLoadedScope | null>(null);
@@ -524,6 +526,10 @@ export function GallerySurface({
   useEffect(() => {
     persistMapProjection(activeMapProjection);
   }, [activeMapProjection]);
+
+  useEffect(() => {
+    persistShowMapClusterGrid(showMapClusterGrid);
+  }, [showMapClusterGrid]);
 
   const switchToGridView = useCallback(() => {
     setViewMode("grid");
@@ -1928,6 +1934,8 @@ export function GallerySurface({
                   retryBasemapConfiguration={retryBasemapConfiguration}
                   activeProjection={activeMapProjection}
                   onSelectProjection={setActiveMapProjection}
+                  showClusterGrid={showMapClusterGrid}
+                  onShowClusterGridChange={setShowMapClusterGrid}
                   clustersPayload={mapClustersPayload}
                   initialOverviewPayload={mapInitialOverviewPayload}
                   hiddenOnMapCount={hiddenOnMapCount}
@@ -2464,6 +2472,8 @@ type GalleryMapPanelProps = {
   retryBasemapConfiguration?: () => void;
   activeProjection: GalleryMapProjection;
   onSelectProjection: (projection: GalleryMapProjection) => void;
+  showClusterGrid: boolean;
+  onShowClusterGridChange: (show: boolean) => void;
   clustersPayload: GalleryMapClustersPayload | null;
   initialOverviewPayload: GalleryMapClustersPayload | null;
   hiddenOnMapCount: number;
@@ -2484,6 +2494,8 @@ function GalleryMapPanel({
   retryBasemapConfiguration,
   activeProjection,
   onSelectProjection,
+  showClusterGrid,
+  onShowClusterGridChange,
   clustersPayload,
   initialOverviewPayload,
   hiddenOnMapCount,
@@ -2611,6 +2623,7 @@ function GalleryMapPanel({
       projection={activeProjection}
       clustersPayload={clustersPayload}
       initialOverviewPayload={initialOverviewPayload}
+      showClusterGrid={showClusterGrid}
       hiddenOnMapCount={hiddenOnMapCount}
       isFullscreen={isFullscreen}
       allowFullscreenPortal={!usesEmbeddedClient}
@@ -2669,6 +2682,13 @@ function GalleryMapPanel({
             </Button>
           </Group>
         </Stack>
+        <Switch
+          label="Show cluster cells (debug)"
+          description="Overlay the server's actual grouping cells."
+          checked={showClusterGrid}
+          onChange={(event) => onShowClusterGridChange(event.currentTarget.checked)}
+          style={{ flex: "1 1 240px" }}
+        />
       </Group>
     </Card>
   );
@@ -4316,6 +4336,14 @@ function loadStoredMapProjection(): GalleryMapProjection {
   return parseMapProjection(window.localStorage.getItem(GALLERY_MAP_PROJECTION_STORAGE_KEY));
 }
 
+function loadStoredShowMapClusterGrid(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  return window.localStorage.getItem(GALLERY_SHOW_MAP_CLUSTER_GRID_STORAGE_KEY) === "true";
+}
+
 function persistThumbnailsPerRow(value: number) {
   if (typeof window === "undefined") {
     return;
@@ -4368,6 +4396,14 @@ function persistMapProjection(value: GalleryMapProjection) {
     GALLERY_MAP_PROJECTION_STORAGE_KEY,
     parseMapProjection(value)
   );
+}
+
+function persistShowMapClusterGrid(value: boolean) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(GALLERY_SHOW_MAP_CLUSTER_GRID_STORAGE_KEY, String(value));
 }
 
 function parseThumbnailsPerRow(

@@ -124,6 +124,11 @@ Gallery UI starts with the world viewport and the maximum supported UI depth (`6
 a new request after each map movement. Map clustering is available for current data; selecting an
 immutable snapshot switches the Gallery to grid view.
 
+For cluster diagnostics, the Gallery map display controls offer **Show cluster cells (debug)**.
+It renders the occupied Web Mercator cells from the current server response using that response's
+effective `resolution`; this includes any resolution reduction applied to keep the cluster response
+within its limit.
+
 Each metadata backend persists normalized Web Mercator `x`/`y` values next to valid GPS metadata
 and maintains a B-tree spatial index. The cluster query restricts that index to the viewport and
 groups matching rows into a zoom-dependent Web Mercator grid. It initially uses cells equivalent

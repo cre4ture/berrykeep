@@ -122,6 +122,18 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     expect(firstMapClusterUrl.searchParams.has("limit")).toBe(false);
     const mapCanvas = page.locator(".maplibregl-canvas");
     await expect(mapCanvas).toBeVisible();
+    const clusterGridSwitch = page.getByLabel("Show cluster cells (debug)");
+    await expect(clusterGridSwitch).not.toBeChecked();
+    await expect(page.locator('[data-gallery-map-cluster-grid="true"]')).toHaveCount(0);
+    await page.getByText("Show cluster cells (debug)", { exact: true }).click();
+    await expect(clusterGridSwitch).toBeChecked();
+    await expect(page.locator('[data-gallery-map-cluster-grid="true"]')).toHaveAttribute(
+      "data-resolution",
+      /\d+/
+    );
+    await page.getByText("Show cluster cells (debug)", { exact: true }).click();
+    await expect(clusterGridSwitch).not.toBeChecked();
+    await expect(page.locator('[data-gallery-map-cluster-grid="true"]')).toHaveCount(0);
     const fractionalMapRequest = page.waitForRequest((request) => {
       const url = new URL(request.url());
       const zoom = Number(url.searchParams.get("zoom_precise"));
