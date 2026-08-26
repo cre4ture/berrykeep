@@ -286,11 +286,11 @@ function upstreamRequest(request, response) {
     json(response, 200, galleryIndexResponse(url));
     return;
   }
-  if (request.method === "GET" && url.pathname === "/api/v1/store/map/clusters") {
+  if (request.method === "GET" && url.pathname === "/api/v1/gallery/map/clusters") {
     json(response, 200, galleryMapClustersResponse(url));
     return;
   }
-  if (request.method === "GET" && url.pathname === "/api/v1/store/map/cluster-entries") {
+  if (request.method === "GET" && url.pathname === "/api/v1/gallery/map/cluster-entries") {
     json(response, 200, galleryMapClusterEntriesResponse(url));
     return;
   }

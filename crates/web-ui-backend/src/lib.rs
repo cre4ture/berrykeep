@@ -20,7 +20,7 @@ use client_sdk::{
     StoreIndexView, StoreIndexViewport, UploadMode,
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
-    ironmesh_client::DownloadRangeRequest,
+    ironmesh_client::{DownloadRangeRequest, RelativePathResponse},
 };
 use common::logging::{LogBuffer, LogBufferEntry};
 use reqwest::Url;
@@ -315,7 +315,42 @@ struct WebState {
     client_cache_scope: Option<String>,
     log_buffer: Arc<LogBuffer>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<mbtiles::LogicalMbtilesSource>>>>,
+    gallery_map_upstream_routes: Arc<RwLock<GalleryMapUpstreamRoutes>>,
     runtime: Arc<RwLock<WebRuntime>>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum GalleryMapUpstreamRoute {
+    #[default]
+    Canonical,
+    Legacy,
+}
+
+impl GalleryMapUpstreamRoute {
+    const fn path(self, endpoint: GalleryMapUpstreamEndpoint) -> &'static str {
+        match (self, endpoint) {
+            (Self::Canonical, GalleryMapUpstreamEndpoint::Clusters) => "/gallery/map/clusters",
+            (Self::Canonical, GalleryMapUpstreamEndpoint::ClusterEntries) => {
+                "/gallery/map/cluster-entries"
+            }
+            (Self::Legacy, GalleryMapUpstreamEndpoint::Clusters) => "/store/map/clusters",
+            (Self::Legacy, GalleryMapUpstreamEndpoint::ClusterEntries) => {
+                "/store/map/cluster-entries"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GalleryMapUpstreamEndpoint {
+    Clusters,
+    ClusterEntries,
+}
+
+#[derive(Default)]
+struct GalleryMapUpstreamRoutes {
+    clusters: GalleryMapUpstreamRoute,
+    cluster_entries: GalleryMapUpstreamRoute,
 }
 
 struct WebRuntime {
@@ -380,6 +415,7 @@ pub fn router(config: WebUiConfig) -> Router {
         client_cache_scope,
         log_buffer,
         mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
+        gallery_map_upstream_routes: Arc::new(RwLock::new(GalleryMapUpstreamRoutes::default())),
         runtime: Arc::new(RwLock::new(WebRuntime {
             sdk: sdk.clone(),
             client: ClientNode::with_client(sdk),
@@ -419,6 +455,12 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/cluster/replication/plan", get(web_replication_plan))
         .route("/store/list", get(web_store_list))
         .route("/store/index/delta", get(web_store_index_delta))
+        .route("/gallery/map/clusters", get(web_gallery_map_clusters))
+        .route(
+            "/gallery/map/cluster-entries",
+            get(web_gallery_map_cluster_entries),
+        )
+        // Keep the store-scoped map paths for embedded clients that have not yet migrated.
         .route("/store/map/clusters", get(web_gallery_map_clusters))
         .route(
             "/store/map/cluster-entries",
@@ -486,6 +528,12 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/cluster/replication/plan", get(web_replication_plan))
         .route("/api/store/list", get(web_store_list))
         .route("/api/store/index/delta", get(web_store_index_delta))
+        .route("/api/gallery/map/clusters", get(web_gallery_map_clusters))
+        .route(
+            "/api/gallery/map/cluster-entries",
+            get(web_gallery_map_cluster_entries),
+        )
+        // Keep the store-scoped map paths for embedded clients that have not yet migrated.
         .route("/api/store/map/clusters", get(web_gallery_map_clusters))
         .route(
             "/api/store/map/cluster-entries",
@@ -1083,6 +1131,64 @@ fn log_local_diagnostic_request(
 
 async fn current_sdk(state: &WebState) -> IronMeshClient {
     state.runtime.read().await.sdk.clone()
+}
+
+async fn gallery_map_upstream_route(
+    state: &WebState,
+    endpoint: GalleryMapUpstreamEndpoint,
+) -> GalleryMapUpstreamRoute {
+    let routes = state.gallery_map_upstream_routes.read().await;
+    match endpoint {
+        GalleryMapUpstreamEndpoint::Clusters => routes.clusters,
+        GalleryMapUpstreamEndpoint::ClusterEntries => routes.cluster_entries,
+    }
+}
+
+async fn remember_gallery_map_upstream_route(
+    state: &WebState,
+    endpoint: GalleryMapUpstreamEndpoint,
+    route: GalleryMapUpstreamRoute,
+) {
+    let mut routes = state.gallery_map_upstream_routes.write().await;
+    match endpoint {
+        GalleryMapUpstreamEndpoint::Clusters => routes.clusters = route,
+        GalleryMapUpstreamEndpoint::ClusterEntries => routes.cluster_entries = route,
+    }
+}
+
+fn gallery_map_upstream_path(
+    endpoint: GalleryMapUpstreamEndpoint,
+    route: GalleryMapUpstreamRoute,
+    canonical_path: &str,
+) -> String {
+    if route == GalleryMapUpstreamRoute::Canonical {
+        return canonical_path.to_string();
+    }
+    let query = canonical_path
+        .split_once('?')
+        .map(|(_, query)| format!("?{query}"))
+        .unwrap_or_default();
+    format!("{}{}", route.path(endpoint), query)
+}
+
+async fn proxy_gallery_map_request(
+    state: &WebState,
+    endpoint: GalleryMapUpstreamEndpoint,
+    canonical_path: &str,
+) -> Result<RelativePathResponse> {
+    let mut route = gallery_map_upstream_route(state, endpoint).await;
+    let client = current_sdk(state).await;
+    let mut response = client
+        .get_relative_path(&gallery_map_upstream_path(endpoint, route, canonical_path))
+        .await?;
+    if route == GalleryMapUpstreamRoute::Canonical && response.status == StatusCode::NOT_FOUND {
+        route = GalleryMapUpstreamRoute::Legacy;
+        remember_gallery_map_upstream_route(state, endpoint, route).await;
+        response = client
+            .get_relative_path(&gallery_map_upstream_path(endpoint, route, canonical_path))
+            .await?;
+    }
+    Ok(response)
 }
 
 async fn current_client(state: &WebState) -> ClientNode {
@@ -2964,7 +3070,7 @@ async fn web_gallery_map_clusters(
             );
         }
     };
-    let mut request_url = Url::parse("http://web-ui.invalid/store/map/clusters")
+    let mut request_url = Url::parse("http://web-ui.invalid/gallery/map/clusters")
         .expect("the gallery map clusters path is a valid URL");
     {
         let mut params = request_url.query_pairs_mut();
@@ -2993,7 +3099,7 @@ async fn web_gallery_map_clusters(
         path.push('?');
         path.push_str(query);
     }
-    match current_sdk(&state).await.get_relative_path(&path).await {
+    match proxy_gallery_map_request(&state, GalleryMapUpstreamEndpoint::Clusters, &path).await {
         Ok(response) => {
             let mut headers = HeaderMap::new();
             if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
@@ -3020,7 +3126,7 @@ async fn web_gallery_map_cluster_entries(
             "query_token and cluster_id are required",
         );
     }
-    let mut request_url = Url::parse("http://web-ui.invalid/store/map/cluster-entries")
+    let mut request_url = Url::parse("http://web-ui.invalid/gallery/map/cluster-entries")
         .expect("the gallery map cluster entries path is a valid URL");
     request_url
         .query_pairs_mut()
@@ -3033,7 +3139,8 @@ async fn web_gallery_map_cluster_entries(
         path.push('?');
         path.push_str(query);
     }
-    match current_sdk(&state).await.get_relative_path(&path).await {
+    match proxy_gallery_map_request(&state, GalleryMapUpstreamEndpoint::ClusterEntries, &path).await
+    {
         Ok(response) => {
             let mut headers = HeaderMap::new();
             if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
@@ -4018,7 +4125,7 @@ mod tests {
             .expect("upstream listener should have an address");
         let upstream = tokio::spawn(async move {
             let app = axum::Router::new().route(
-                "/api/v1/store/map/cluster-entries",
+                "/api/v1/gallery/map/cluster-entries",
                 axum::routing::get(|| async {
                     (
                         StatusCode::CONFLICT,
@@ -4046,7 +4153,7 @@ mod tests {
         });
 
         let response = reqwest::get(format!(
-            "http://{web_address}/api/v1/store/map/cluster-entries?query_token=token&cluster_id=0_0"
+            "http://{web_address}/api/v1/gallery/map/cluster-entries?query_token=token&cluster_id=0_0"
         ))
         .await
         .expect("web proxy request should complete");
@@ -4056,6 +4163,90 @@ mod tests {
                 .json::<serde_json::Value>()
                 .await
                 .expect("stale response should remain JSON"),
+            serde_json::json!({ "code": "gallery_map_cluster_stale", "reset": true })
+        );
+
+        web.abort();
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn gallery_map_proxy_falls_back_to_legacy_upstream_routes() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream listener should have an address");
+        let upstream = tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route(
+                    "/api/v1/gallery/map/clusters",
+                    axum::routing::get(|| async { StatusCode::NOT_FOUND }),
+                )
+                .route(
+                    "/api/v1/gallery/map/cluster-entries",
+                    axum::routing::get(|| async { StatusCode::NOT_FOUND }),
+                )
+                .route(
+                    "/api/v1/store/map/clusters",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({ "source": "legacy" }))
+                    }),
+                )
+                .route(
+                    "/api/v1/store/map/cluster-entries",
+                    axum::routing::get(|| async {
+                        (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "code": "gallery_map_cluster_stale",
+                                "reset": true,
+                            })),
+                        )
+                    }),
+                );
+            let _ = axum::serve(upstream_listener, app).await;
+        });
+
+        let web_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web listener should bind");
+        let web_address = web_listener
+            .local_addr()
+            .expect("web listener should have an address");
+        let app = router(WebUiConfig::from_client(
+            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}")),
+        ));
+        let web = tokio::spawn(async move {
+            let _ = axum::serve(web_listener, app).await;
+        });
+
+        let clusters = reqwest::get(format!(
+            "http://{web_address}/api/v1/gallery/map/clusters?depth=1&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1"
+        ))
+        .await
+        .expect("web proxy clusters request should complete");
+        assert_eq!(clusters.status(), StatusCode::OK);
+        assert_eq!(
+            clusters
+                .json::<serde_json::Value>()
+                .await
+                .expect("legacy cluster response should remain JSON"),
+            serde_json::json!({ "source": "legacy" })
+        );
+
+        let entries = reqwest::get(format!(
+            "http://{web_address}/api/v1/gallery/map/cluster-entries?query_token=token&cluster_id=0_0"
+        ))
+        .await
+        .expect("web proxy cluster entries request should complete");
+        assert_eq!(entries.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            entries
+                .json::<serde_json::Value>()
+                .await
+                .expect("legacy cluster entries response should remain JSON"),
             serde_json::json!({ "code": "gallery_map_cluster_stale", "reset": true })
         );
 

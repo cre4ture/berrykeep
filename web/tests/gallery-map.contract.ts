@@ -100,7 +100,7 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     const requestedPreciseMapZooms: number[] = [];
     page.on("request", (request) => {
       const url = new URL(request.url());
-      if (!url.pathname.endsWith("/store/map/clusters")) {
+      if (!url.pathname.endsWith("/gallery/map/clusters")) {
         return;
       }
       const zoom = Number(url.searchParams.get("zoom_precise"));
@@ -110,7 +110,7 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     });
     const firstMapClusterRequest = page.waitForRequest((request) => {
       const url = new URL(request.url());
-      return url.pathname.endsWith("/store/map/clusters");
+      return url.pathname.endsWith("/gallery/map/clusters");
     });
     await page.getByRole("button", { name: "Map" }).click();
     const firstMapClusterUrl = new URL((await firstMapClusterRequest).url());
@@ -126,7 +126,7 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
       const url = new URL(request.url());
       const zoom = Number(url.searchParams.get("zoom_precise"));
       return (
-        url.pathname.endsWith("/store/map/clusters") &&
+        url.pathname.endsWith("/gallery/map/clusters") &&
         Number.isFinite(zoom) &&
         !Number.isInteger(zoom)
       );
