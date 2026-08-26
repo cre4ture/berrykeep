@@ -850,6 +850,7 @@ mod tests {
         PresenceRegistration {
             cluster_id,
             identity,
+            hostname: None,
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: Some(peer_api_url.to_string()),

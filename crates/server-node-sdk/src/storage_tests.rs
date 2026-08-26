@@ -5254,6 +5254,7 @@ async fn persist_and_load_cluster_nodes_roundtrip_impl(backend: StorageTestBacke
     let remote_node_id = NodeId::new_v4();
     let nodes = vec![crate::cluster::NodeDescriptor {
         node_id: remote_node_id,
+        hostname: None,
         reachability: crate::cluster::NodeReachability {
             public_api_url: Some("https://remote.example".to_string()),
             public_direct_urls: vec!["https://remote.example".to_string()],

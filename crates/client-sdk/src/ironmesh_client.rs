@@ -507,6 +507,7 @@ struct ClientEndpointDescriptor {
     transport_path_kind: TransportPathKind,
     locator: String,
     bootstrap_rank: usize,
+    target_node_hostname: Option<String>,
     node_connection_priority: i16,
 }
 
@@ -673,6 +674,9 @@ pub struct ClientConnectionRouteEndpointSnapshot {
     pub bootstrap_rank: usize,
     #[serde(default)]
     pub target_node_id: Option<NodeId>,
+    /// Descriptive operating-system host name for `target_node_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_hostname: Option<String>,
     /// Effective server-node priority after applying an optional client override.
     #[serde(default)]
     pub node_connection_priority: i16,
@@ -1009,6 +1013,7 @@ impl ClientEndpoint {
                 transport_path_kind: transport.transport_path_kind(),
                 locator: transport.endpoint_locator(),
                 bootstrap_rank,
+                target_node_hostname: None,
                 node_connection_priority: 0,
             },
             transport,
@@ -1035,6 +1040,17 @@ impl ClientEndpoint {
         Self {
             descriptor: ClientEndpointDescriptor {
                 node_connection_priority,
+                ..self.descriptor.clone()
+            },
+            transport: self.transport.clone(),
+            state: self.state.clone(),
+        }
+    }
+
+    fn with_target_node_hostname(&self, target_node_hostname: Option<String>) -> Self {
+        Self {
+            descriptor: ClientEndpointDescriptor {
+                target_node_hostname,
                 ..self.descriptor.clone()
             },
             transport: self.transport.clone(),
@@ -1581,6 +1597,7 @@ impl ClientEndpointRouter {
                     locator: endpoint.descriptor.locator.clone(),
                     bootstrap_rank: endpoint.descriptor.bootstrap_rank,
                     target_node_id: endpoint.transport.target_node_id(),
+                    target_node_hostname: endpoint.descriptor.target_node_hostname.clone(),
                     node_connection_priority: endpoint.descriptor.node_connection_priority,
                     iroh_relay_urls: endpoint.transport.iroh_relay_urls(),
                     last_successful_iroh_relay_url: endpoint
@@ -1956,8 +1973,9 @@ impl ClientEndpointRouter {
                 next.push(
                     existing
                         .with_bootstrap_rank(endpoint.descriptor.bootstrap_rank)
-                        .with_node_connection_priority(
-                            endpoint.descriptor.node_connection_priority,
+                        .with_node_connection_priority(endpoint.descriptor.node_connection_priority)
+                        .with_target_node_hostname(
+                            endpoint.descriptor.target_node_hostname.clone(),
                         ),
                 );
             } else {
@@ -3798,6 +3816,20 @@ impl IronMeshClient {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for endpoint in endpoints.iter_mut() {
                 *endpoint = endpoint.with_node_connection_priority(node_connection_priority);
+            }
+        }
+        self
+    }
+
+    pub(crate) fn with_target_node_hostname(self, target_node_hostname: Option<String>) -> Self {
+        {
+            let mut endpoints = self
+                .transport_router
+                .endpoints
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for endpoint in endpoints.iter_mut() {
+                *endpoint = endpoint.with_target_node_hostname(target_node_hostname.clone());
             }
         }
         self

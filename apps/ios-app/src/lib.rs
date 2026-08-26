@@ -2303,6 +2303,7 @@ mod tests {
                 url: server_base_url,
                 usage: Some(client_sdk::BootstrapEndpointUse::PublicApi),
                 node_id: None,
+                node_hostname: None,
             }],
             relay_mode: client_sdk::RelayMode::Disabled,
             trust_roots: client_sdk::BootstrapTrustRoots {

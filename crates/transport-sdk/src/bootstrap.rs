@@ -34,6 +34,11 @@ pub struct BootstrapEndpoint {
     pub usage: Option<BootstrapEndpointUse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<NodeId>,
+    /// Descriptive operating-system host name for `node_id`. It is optional
+    /// for compatibility with existing bootstrap artifacts and must never be
+    /// used as a transport or security identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -619,6 +624,7 @@ mod tests {
                 url: "https://node-a.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(Uuid::now_v7()),
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Fallback,
             trust_roots: BootstrapTrustRoots {
@@ -685,6 +691,7 @@ mod tests {
                 url: "https://node-a.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(Uuid::now_v7()),
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Required,
             trust_roots: BootstrapTrustRoots {
@@ -912,6 +919,7 @@ mod tests {
                 url: "https://node-a.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(Uuid::nil()),
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Fallback,
             trust_roots: BootstrapTrustRoots {

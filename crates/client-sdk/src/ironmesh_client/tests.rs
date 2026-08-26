@@ -1001,6 +1001,7 @@ fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
         transport_path_kind: TransportPathKind::DirectHttps,
         locator: "https://direct.example".to_string(),
         bootstrap_rank: 0,
+        target_node_hostname: None,
         node_connection_priority: 0,
     };
     let relay = ClientEndpointDescriptor {
@@ -1009,6 +1010,7 @@ fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
         transport_path_kind: TransportPathKind::RelayTunnel,
         locator: "relay://node@example".to_string(),
         bootstrap_rank: 0,
+        target_node_hostname: None,
         node_connection_priority: 0,
     };
     let direct_quic = ClientEndpointDescriptor {
@@ -1017,6 +1019,7 @@ fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
         transport_path_kind: TransportPathKind::DirectQuic,
         locator: "iroh://direct-quic".to_string(),
         bootstrap_rank: 0,
+        target_node_hostname: None,
         node_connection_priority: 0,
     };
 
@@ -1037,6 +1040,7 @@ fn route_score_prefers_higher_priority_server_nodes() {
         transport_path_kind: TransportPathKind::DirectHttps,
         locator: "https://preferred.example".to_string(),
         bootstrap_rank: 0,
+        target_node_hostname: None,
         node_connection_priority: 5,
     };
     let neutral = ClientEndpointDescriptor {

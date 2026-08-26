@@ -76,6 +76,10 @@ pub struct NodeStorageStatsSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDescriptor {
     pub node_id: NodeId,
+    /// Descriptive operating-system host name. The UUID remains the node's
+    /// unique identity and is the only value used for cluster operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub reachability: NodeReachability,
     pub capabilities: NodeCapabilities,
     pub labels: HashMap<String, String>,
@@ -287,6 +291,7 @@ impl ClusterService {
         candidate: &NodeDescriptor,
     ) -> bool {
         existing.node_id != candidate.node_id
+            || existing.hostname != candidate.hostname
             || existing.reachability != candidate.reachability
             || existing.capabilities != candidate.capabilities
             || existing.labels != candidate.labels
@@ -963,6 +968,7 @@ mod tests {
 
         NodeDescriptor {
             node_id: id,
+            hostname: None,
             reachability: NodeReachability {
                 public_api_url: Some(format!("http://{id}")),
                 public_direct_urls: vec![format!("http://{id}")],
@@ -1358,6 +1364,7 @@ mod tests {
 
         svc.import_nodes(vec![NodeDescriptor {
             node_id: remote,
+            hostname: None,
             reachability: NodeReachability {
                 public_api_url: Some("https://remote.example".to_string()),
                 public_direct_urls: vec!["https://remote.example".to_string()],

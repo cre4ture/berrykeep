@@ -21,6 +21,8 @@ data class ConnectionRouteEndpointSnapshot(
     val bootstrapRank: Int,
     @Json(name = "target_node_id")
     val targetNodeId: String? = null,
+    @Json(name = "target_node_hostname")
+    val targetNodeHostname: String? = null,
     @Json(name = "node_connection_priority")
     val nodeConnectionPriority: Int = 0,
     @Json(name = "iroh_relay_urls")

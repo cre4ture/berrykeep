@@ -37,6 +37,7 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
               "locator": "node.example:4433",
               "bootstrap_rank": 1,
               "target_node_id": "018f7630-7b60-7000-8000-000000000001",
+              "target_node_hostname": "edge-quic",
               "score": 12.75,
               "ewma_latency_ms": 8.5,
               "ewma_throughput_bytes_per_sec": null,
@@ -90,7 +91,9 @@ final class AppleConnectionRouteSnapshotTests: XCTestCase {
         XCTAssertTrue(quic.isDirectQuicHolePunched)
         XCTAssertFalse(quic.usesRelayPath)
         XCTAssertEqual(quic.connectionDisplayName, "Direct via NAT (QUIC)")
-        XCTAssertEqual(quic.compactConnectionDisplayName, "QUIC NAT · 018f7630…0001")
+        XCTAssertEqual(quic.targetNodeDisplayName, "edge-quic")
+        XCTAssertEqual(quic.targetNodeDetail, "edge-quic\n018f7630-7b60-7000-8000-000000000001")
+        XCTAssertEqual(quic.compactConnectionDisplayName, "QUIC NAT · edge-quic")
         XCTAssertEqual(
             quic.connectionExplanation,
             "Rendezvous established this connection; data travels directly between this device and the cluster."

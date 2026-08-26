@@ -453,6 +453,14 @@ final class IronmeshBrowserModel: ObservableObject {
             .nodeConnectionPriority ?? 0
     }
 
+    func serverNodeHostname(for nodeID: String) -> String? {
+        let hostname = connectionRouteSnapshot?.endpoints
+            .first(where: { $0.targetNodeId == nodeID })?
+            .targetNodeHostname?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return hostname?.isEmpty == false ? hostname : nil
+    }
+
     func updateNodePriorityOverride(_ priority: Int?, for nodeID: String) {
         do {
             var updatedDraft = draft

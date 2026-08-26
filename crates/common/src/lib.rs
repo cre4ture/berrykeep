@@ -12,6 +12,42 @@ pub type NodeId = Uuid;
 pub type ClusterId = Uuid;
 pub type DeviceId = Uuid;
 
+/// Maximum UTF-8 byte length accepted for a host name shown in IronMesh user
+/// interfaces. This matches the DNS host name limit while deliberately not
+/// requiring the operating system's display value to be a DNS name.
+pub const MAX_NODE_HOSTNAME_BYTES: usize = 255;
+
+/// Normalizes an operating-system supplied node host name for display and
+/// distribution. Host names are descriptive metadata only, never an identity
+/// or routing input.
+pub fn normalize_node_hostname(value: impl AsRef<str>) -> Option<String> {
+    let value = value.as_ref();
+    let hostname = value.trim();
+    (!value.chars().any(char::is_control)
+        && !hostname.is_empty()
+        && hostname.len() <= MAX_NODE_HOSTNAME_BYTES)
+        .then(|| hostname.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_NODE_HOSTNAME_BYTES, normalize_node_hostname};
+
+    #[test]
+    fn normalizes_display_hostnames_without_accepting_invalid_values() {
+        assert_eq!(
+            normalize_node_hostname("  edge-a  ").as_deref(),
+            Some("edge-a")
+        );
+        assert_eq!(normalize_node_hostname("\nedge-a"), None);
+        assert_eq!(normalize_node_hostname("   "), None);
+        assert_eq!(
+            normalize_node_hostname("a".repeat(MAX_NODE_HOSTNAME_BYTES + 1)),
+            None
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageObjectMeta {
     pub key: String,

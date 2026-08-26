@@ -63,6 +63,7 @@ public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Se
     public var locator: String
     public var bootstrapRank: Int
     public var targetNodeId: String?
+    public var targetNodeHostname: String? = nil
     public var nodeConnectionPriority: Int? = nil
     public var irohRelayUrls: [String]? = nil
     public var lastSuccessfulIrohRelayUrl: String? = nil
@@ -90,6 +91,22 @@ public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Se
 
     public var isDirectQuicHolePunched: Bool {
         pathKind == .directQUIC && holePunchingMode == "direct"
+    }
+
+    public var targetNodeDisplayName: String? {
+        let hostname = targetNodeHostname?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return hostname?.isEmpty == false ? hostname : targetNodeId
+    }
+
+    public var targetNodeDetail: String? {
+        guard let targetNodeId else {
+            return nil
+        }
+        let hostname = targetNodeHostname?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let hostname, !hostname.isEmpty else {
+            return targetNodeId
+        }
+        return "\(hostname)\n\(targetNodeId)"
     }
 
     public var connectionDisplayName: String {
@@ -123,9 +140,9 @@ public struct AppleConnectionRouteEndpoint: Codable, Equatable, Identifiable, Se
         let destination: String?
         if pathKind == .relayTunnel {
             destination = compactRouteLocator(locator)
-                ?? targetNodeId.map(compactRouteIdentifier)
+                ?? targetNodeDisplayName.map(compactRouteIdentifier)
         } else {
-            destination = targetNodeId.map(compactRouteIdentifier)
+            destination = targetNodeDisplayName.map(compactRouteIdentifier)
                 ?? compactRouteLocator(locator)
         }
         return destination.map { "\(prefix) · \($0)" } ?? prefix
