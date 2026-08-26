@@ -2042,11 +2042,11 @@ async function installServerAdminMocks(
       return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
     }
 
-    if (pathname === apiV1("/auth/store/map/clusters") && method === "GET") {
+    if (pathname === apiV1("/auth/gallery/map/clusters") && method === "GET") {
       return json(route, galleryMapMock.clusters(galleryEntries, searchParams));
     }
 
-    if (pathname === apiV1("/auth/store/map/cluster-entries") && method === "GET") {
+    if (pathname === apiV1("/auth/gallery/map/cluster-entries") && method === "GET") {
       return json(route, galleryMapMock.clusterEntries(searchParams));
     }
 

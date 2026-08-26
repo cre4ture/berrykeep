@@ -419,6 +419,12 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/cluster/replication/plan", get(web_replication_plan))
         .route("/store/list", get(web_store_list))
         .route("/store/index/delta", get(web_store_index_delta))
+        .route("/gallery/map/clusters", get(web_gallery_map_clusters))
+        .route(
+            "/gallery/map/cluster-entries",
+            get(web_gallery_map_cluster_entries),
+        )
+        // Keep the store-scoped map paths for embedded clients that have not yet migrated.
         .route("/store/map/clusters", get(web_gallery_map_clusters))
         .route(
             "/store/map/cluster-entries",
@@ -486,6 +492,12 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/cluster/replication/plan", get(web_replication_plan))
         .route("/api/store/list", get(web_store_list))
         .route("/api/store/index/delta", get(web_store_index_delta))
+        .route("/api/gallery/map/clusters", get(web_gallery_map_clusters))
+        .route(
+            "/api/gallery/map/cluster-entries",
+            get(web_gallery_map_cluster_entries),
+        )
+        // Keep the store-scoped map paths for embedded clients that have not yet migrated.
         .route("/api/store/map/clusters", get(web_gallery_map_clusters))
         .route(
             "/api/store/map/cluster-entries",
@@ -2964,7 +2976,7 @@ async fn web_gallery_map_clusters(
             );
         }
     };
-    let mut request_url = Url::parse("http://web-ui.invalid/store/map/clusters")
+    let mut request_url = Url::parse("http://web-ui.invalid/gallery/map/clusters")
         .expect("the gallery map clusters path is a valid URL");
     {
         let mut params = request_url.query_pairs_mut();
@@ -3020,7 +3032,7 @@ async fn web_gallery_map_cluster_entries(
             "query_token and cluster_id are required",
         );
     }
-    let mut request_url = Url::parse("http://web-ui.invalid/store/map/cluster-entries")
+    let mut request_url = Url::parse("http://web-ui.invalid/gallery/map/cluster-entries")
         .expect("the gallery map cluster entries path is a valid URL");
     request_url
         .query_pairs_mut()
@@ -4018,7 +4030,7 @@ mod tests {
             .expect("upstream listener should have an address");
         let upstream = tokio::spawn(async move {
             let app = axum::Router::new().route(
-                "/api/v1/store/map/cluster-entries",
+                "/api/v1/gallery/map/cluster-entries",
                 axum::routing::get(|| async {
                     (
                         StatusCode::CONFLICT,
@@ -4046,7 +4058,7 @@ mod tests {
         });
 
         let response = reqwest::get(format!(
-            "http://{web_address}/api/v1/store/map/cluster-entries?query_token=token&cluster_id=0_0"
+            "http://{web_address}/api/v1/gallery/map/cluster-entries?query_token=token&cluster_id=0_0"
         ))
         .await
         .expect("web proxy request should complete");

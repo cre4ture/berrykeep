@@ -60,6 +60,30 @@ pub(super) fn normalize_public_api_v1_path_and_query(path_and_query: &str) -> Co
     }
 }
 
+fn is_reserved_store_api_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/store/index"
+            | "/store/index/delta"
+            | "/store/index/changes/wait"
+            | "/store/map/clusters"
+            | "/store/map/cluster-entries"
+    ) || path.starts_with("/store/uploads/")
+}
+
+pub(super) fn is_store_object_path(path_and_query: &str) -> bool {
+    let path_only = path_and_query
+        .trim()
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(path_and_query.trim());
+    let path_only = strip_public_api_v1_prefix(path_only);
+
+    path_only
+        .strip_prefix("/store/")
+        .is_some_and(|tail| !tail.is_empty() && !is_reserved_store_api_path(path_only))
+}
+
 pub(super) fn is_streamed_object_read_path(path_and_query: &str) -> bool {
     let path_only = path_and_query
         .trim()
@@ -70,14 +94,7 @@ pub(super) fn is_streamed_object_read_path(path_and_query: &str) -> bool {
     if s3_frontend::is_transport_path(path_only) {
         return true;
     }
-    let Some(tail) = path_only.strip_prefix("/store/") else {
-        return false;
-    };
-
-    !tail.is_empty()
-        && tail != "index"
-        && !tail.starts_with("index/")
-        && !tail.starts_with("uploads/")
+    is_store_object_path(path_only)
 }
 
 pub(super) async fn execute_buffered_transport_request(
@@ -298,7 +315,7 @@ async fn try_execute_direct_transport_request(
                     .into_response(),
             )
         }
-        ("GET", path) if path.starts_with("/store/") => {
+        ("GET", path) if is_store_object_path(path) => {
             if let Some(response) = authorize_direct_transport_fast_path(
                 state,
                 scope,
@@ -317,7 +334,7 @@ async fn try_execute_direct_transport_request(
             let key = decode_route_tail(path, "/store/")?;
             Some(get_object_response(state, &key, query, &headers, false).await)
         }
-        ("HEAD", path) if path.starts_with("/store/") => {
+        ("HEAD", path) if is_store_object_path(path) => {
             if let Some(response) = authorize_direct_transport_fast_path(
                 state,
                 scope,
@@ -534,6 +551,12 @@ fn build_public_transport_router(state: ServerState) -> Router {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/index/delta", get(get_store_index_delta))
+        .route("/gallery/map/clusters", get(list_gallery_map_clusters))
+        .route(
+            "/gallery/map/cluster-entries",
+            get(list_gallery_map_cluster_entries),
+        )
+        // Keep the store-scoped map paths for clients that have not yet migrated.
         .route("/store/map/clusters", get(list_gallery_map_clusters))
         .route(
             "/store/map/cluster-entries",
@@ -714,6 +737,12 @@ fn build_internal_transport_router(state: ServerState) -> Router {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/index/delta", get(get_store_index_delta))
+        .route("/gallery/map/clusters", get(list_gallery_map_clusters))
+        .route(
+            "/gallery/map/cluster-entries",
+            get(list_gallery_map_cluster_entries),
+        )
+        // Keep the store-scoped map paths for peers that have not yet migrated.
         .route("/store/map/clusters", get(list_gallery_map_clusters))
         .route(
             "/store/map/cluster-entries",
@@ -788,6 +817,10 @@ mod tests {
         assert!(!is_streamed_object_read_path("/store/index"));
         assert!(!is_streamed_object_read_path(
             "/store/index/changes/wait?since=1"
+        ));
+        assert!(!is_streamed_object_read_path("/store/map/clusters"));
+        assert!(!is_streamed_object_read_path(
+            "/api/v1/store/map/cluster-entries?query_token=token&cluster_id=0_0"
         ));
         assert!(is_streamed_object_read_path("/store/uploads"));
         assert!(!is_streamed_object_read_path("/store/uploads/session-1"));

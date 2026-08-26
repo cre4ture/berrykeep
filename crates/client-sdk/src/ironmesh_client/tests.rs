@@ -3491,6 +3491,185 @@ fn parse_range_header(range: &str, total_len: usize) -> (usize, usize) {
     (start, end)
 }
 
+fn gallery_map_clusters_request() -> GalleryMapClustersRequest {
+    GalleryMapClustersRequest {
+        prefix: None,
+        depth: 64,
+        media_filter: StoreIndexMediaFilter::All,
+        viewport: StoreIndexViewport {
+            south: -90.0,
+            west: -180.0,
+            north: 90.0,
+            east: 180.0,
+        },
+        zoom: 1.0,
+    }
+}
+
+fn gallery_map_clusters_response_body() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "prefix": "",
+        "depth": 64,
+        "zoom": 1,
+        "resolution": 8,
+        "total_entry_count": 0,
+        "visible_geotagged_count": 0,
+        "query_token": "gallery-map-query-token",
+        "clusters": [],
+    }))
+    .expect("gallery map response fixture should serialize")
+}
+
+fn gallery_map_clusters_response_headers(body: &[u8]) -> Vec<RelayHttpHeader> {
+    vec![
+        RelayHttpHeader {
+            name: "content-type".to_string(),
+            value: "application/json".to_string(),
+        },
+        RelayHttpHeader {
+            name: "content-length".to_string(),
+            value: body.len().to_string(),
+        },
+    ]
+}
+
+fn gallery_map_cluster_entries_response() -> serde_json::Value {
+    serde_json::json!({
+        "cluster_id": "0_0",
+        "entry_count": 0,
+        "total_entry_count": 0,
+        "offset": 0,
+        "limit": 100,
+        "has_more": false,
+        "query_token": "gallery-map-query-token",
+        "entries": [],
+    })
+}
+
+#[tokio::test]
+async fn gallery_map_clusters_use_the_canonical_path_over_direct_http() {
+    let app = Router::new()
+        .route(
+            "/api/v1/gallery/map/clusters",
+            get(|| async {
+                Json(serde_json::json!({
+                    "prefix": "",
+                    "depth": 64,
+                    "zoom": 1,
+                    "resolution": 8,
+                    "total_entry_count": 0,
+                    "visible_geotagged_count": 0,
+                    "query_token": "gallery-map-query-token",
+                    "clusters": [],
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/gallery/map/cluster-entries",
+            get(|| async { Json(gallery_map_cluster_entries_response()) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener address should be available");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let client = IronMeshClient::from_direct_base_url(format!("http://{address}"));
+    let response = client
+        .gallery_map_clusters(gallery_map_clusters_request())
+        .await
+        .expect("canonical gallery map request should succeed");
+    assert_eq!(response.query_token, "gallery-map-query-token");
+    let entries = client
+        .gallery_map_cluster_entries("gallery-map-query-token", "0_0", 0, 100)
+        .await
+        .expect("canonical gallery map entries request should succeed");
+    assert_eq!(entries.cluster_id, "0_0");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn gallery_map_clusters_use_the_canonical_path_over_relay_transport() {
+    let response_body = gallery_map_clusters_response_body();
+    let (relay_state, server) = spawn_relay_test_server(
+        200,
+        gallery_map_clusters_response_headers(&response_body),
+        response_body,
+    )
+    .await;
+    let client = relay_test_client(
+        &relay_state,
+        relay_test_identity(&relay_state.security, "relay-gallery-map-device"),
+    );
+
+    let response = client
+        .gallery_map_clusters(gallery_map_clusters_request())
+        .await
+        .expect("gallery map request over relay should succeed");
+    assert_eq!(response.query_token, "gallery-map-query-token");
+    let captured = relay_state
+        .captured_request
+        .lock()
+        .await
+        .clone()
+        .expect("relay request should be captured");
+    assert!(
+        captured
+            .path_and_query
+            .starts_with("/api/v1/gallery/map/clusters?")
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gallery_map_clusters_use_the_canonical_path_over_direct_quic() {
+    let response_body = gallery_map_clusters_response_body();
+    let target_node_id = NodeId::new_v4();
+    let (direct_state, server) = spawn_direct_quic_transport_test_server(
+        StatusCode::OK.as_u16(),
+        gallery_map_clusters_response_headers(&response_body),
+        response_body,
+        target_node_id,
+    )
+    .await;
+    let mut identity = ClientIdentityMaterial::generate(
+        uuid::Uuid::now_v7(),
+        None,
+        Some("direct-quic-gallery-map-device".to_string()),
+    )
+    .expect("identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+    let client = direct_quic_transport_test_client(&direct_state, identity, target_node_id);
+
+    let response = client
+        .gallery_map_clusters(gallery_map_clusters_request())
+        .await
+        .expect("gallery map request over direct QUIC should succeed");
+    assert_eq!(response.query_token, "gallery-map-query-token");
+    let captured = direct_state
+        .captured_request
+        .lock()
+        .await
+        .clone()
+        .expect("direct QUIC request should be captured");
+    assert!(
+        captured
+            .path_and_query
+            .starts_with("/api/v1/gallery/map/clusters?")
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
 #[tokio::test]
 async fn relay_transport_executes_store_index_request_with_signed_device_identity() {
     let (relay_state, server) = spawn_relay_test_server(

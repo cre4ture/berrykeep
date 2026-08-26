@@ -225,7 +225,7 @@ export async function getGalleryMapClusters(
 ): Promise<GalleryMapClustersResponse> {
   const query = galleryMapClusterQuery(request);
   return fetchJson<GalleryMapClustersResponse>(
-    `${apiV1("/store/map/clusters")}?${query.toString()}`
+    `${apiV1("/gallery/map/clusters")}?${query.toString()}`
   );
 }
 
@@ -242,7 +242,7 @@ export async function getGalleryMapClusterEntries(
     limit: String(Math.max(1, Math.floor(limit)))
   });
   return fetchJson<GalleryMapClusterEntriesResponse>(
-    `${apiV1("/store/map/cluster-entries")}?${query.toString()}`
+    `${apiV1("/gallery/map/cluster-entries")}?${query.toString()}`
   );
 }
 

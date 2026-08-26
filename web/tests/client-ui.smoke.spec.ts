@@ -485,7 +485,7 @@ test("client-ui gallery loads bounded server-side map clusters", async ({ page }
   const mapClusterRequests: URL[] = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
-    if (url.pathname === apiV1("/store/map/clusters")) {
+    if (url.pathname === apiV1("/gallery/map/clusters")) {
       mapClusterRequests.push(url);
     }
   });
@@ -540,7 +540,7 @@ test("client-ui keeps an open server cluster stable across viewport refreshes", 
   const mapClusterRequests: URL[] = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
-    if (url.pathname === apiV1("/store/map/clusters")) {
+    if (url.pathname === apiV1("/gallery/map/clusters")) {
       mapClusterRequests.push(url);
     }
   });
@@ -1922,7 +1922,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       return;
     }
 
-    if (pathname === apiV1("/store/map/clusters") && method === "GET") {
+    if (pathname === apiV1("/gallery/map/clusters") && method === "GET") {
       galleryMapClusterRequestCount += 1;
       if (galleryMapClusterRequestCount > 1 && options?.mapClusterRefreshDelayMs) {
         await new Promise((resolve) => setTimeout(resolve, options.mapClusterRefreshDelayMs));
@@ -1930,7 +1930,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       return json(route, galleryMapMock.clusters(storeEntries, searchParams));
     }
 
-    if (pathname === apiV1("/store/map/cluster-entries") && method === "GET") {
+    if (pathname === apiV1("/gallery/map/cluster-entries") && method === "GET") {
       if (options?.mapClusterEntriesDelayMs) {
         await new Promise((resolve) => setTimeout(resolve, options.mapClusterEntriesDelayMs));
       }

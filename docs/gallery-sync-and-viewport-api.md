@@ -107,9 +107,13 @@ The interactive map does not traverse the full gallery index. It requests a boun
 server-side spatial clusters for the current camera:
 
 ```text
-GET /api/v1/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1&zoom_precise=1
-GET /api/v1/auth/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1&zoom_precise=1
+GET /api/v1/gallery/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1&zoom_precise=1
+GET /api/v1/auth/gallery/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1&zoom_precise=1
 ```
+
+`/api/v1/store/map/*` and `/api/v1/auth/store/map/*` remain compatibility aliases. New
+clients must use the gallery-scoped routes so map projections cannot be confused with stored
+object keys by transport implementations.
 
 All four viewport bounds are required and use the same antimeridian rules as viewport index
 queries. `zoom` remains an integral, legacy-compatible value clamped to `0..20`. New clients also
@@ -172,8 +176,8 @@ cluster remains dense at high zoom or has identical coordinates, its members are
 the bounded leaf endpoint:
 
 ```text
-GET /api/v1/store/map/cluster-entries?query_token=<query_token>&cluster_id=4_2&offset=0&limit=100
-GET /api/v1/auth/store/map/cluster-entries?query_token=<query_token>&cluster_id=4_2&offset=0&limit=100
+GET /api/v1/gallery/map/cluster-entries?query_token=<query_token>&cluster_id=4_2&offset=0&limit=100
+GET /api/v1/auth/gallery/map/cluster-entries?query_token=<query_token>&cluster_id=4_2&offset=0&limit=100
 ```
 
 The default leaf page size is 100 and the server caps it at 500. Entries are ordered by capture

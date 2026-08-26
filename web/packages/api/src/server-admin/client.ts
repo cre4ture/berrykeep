@@ -222,7 +222,7 @@ export async function getAdminGalleryMapClusters(
     query.set("prefix", request.prefix.trim());
   }
   return fetchAdminJson<GalleryMapClustersResponse>(
-    `${apiV1("/auth/store/map/clusters")}?${query.toString()}`,
+    `${apiV1("/auth/gallery/map/clusters")}?${query.toString()}`,
     { adminTokenOverride }
   );
 }
@@ -241,7 +241,7 @@ export async function getAdminGalleryMapClusterEntries(
     limit: String(Math.max(1, Math.floor(limit)))
   });
   return fetchAdminJson<GalleryMapClusterEntriesResponse>(
-    `${apiV1("/auth/store/map/cluster-entries")}?${query.toString()}`,
+    `${apiV1("/auth/gallery/map/cluster-entries")}?${query.toString()}`,
     { adminTokenOverride }
   );
 }

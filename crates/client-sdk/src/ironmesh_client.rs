@@ -5182,7 +5182,7 @@ impl IronMeshClient {
     ) -> Result<GalleryMapClustersResponse> {
         let zoom_precise = gallery_map_zoom_for_request(request.zoom)?;
         let zoom = zoom_precise.floor() as u8;
-        let mut url = self.relative_url("/store/map/clusters")?;
+        let mut url = self.relative_url("/gallery/map/clusters")?;
         {
             let mut query = url.query_pairs_mut();
             if let Some(prefix) = request
@@ -5206,16 +5206,16 @@ impl IronMeshClient {
         let response = self
             .execute_buffered_request(Method::GET, url, Vec::new(), None)
             .await
-            .context("failed to request /store/map/clusters")?;
+            .context("failed to request /gallery/map/clusters")?;
         if !response.status.is_success() {
             bail!(
-                "/store/map/clusters returned non-success status: {} body={}",
+                "/gallery/map/clusters returned non-success status: {} body={}",
                 response.status,
                 String::from_utf8_lossy(&response.body)
             );
         }
         serde_json::from_slice(&response.body)
-            .context("failed to parse /store/map/clusters response")
+            .context("failed to parse /gallery/map/clusters response")
     }
 
     pub async fn gallery_map_cluster_entries(
@@ -5225,7 +5225,7 @@ impl IronMeshClient {
         offset: usize,
         limit: usize,
     ) -> Result<GalleryMapClusterEntriesResponse> {
-        let mut url = self.relative_url("/store/map/cluster-entries")?;
+        let mut url = self.relative_url("/gallery/map/cluster-entries")?;
         url.query_pairs_mut()
             .append_pair("query_token", query_token)
             .append_pair("cluster_id", cluster_id)
@@ -5234,16 +5234,16 @@ impl IronMeshClient {
         let response = self
             .execute_buffered_request(Method::GET, url, Vec::new(), None)
             .await
-            .context("failed to request /store/map/cluster-entries")?;
+            .context("failed to request /gallery/map/cluster-entries")?;
         if !response.status.is_success() {
             bail!(
-                "/store/map/cluster-entries returned non-success status: {} body={}",
+                "/gallery/map/cluster-entries returned non-success status: {} body={}",
                 response.status,
                 String::from_utf8_lossy(&response.body)
             );
         }
         serde_json::from_slice(&response.body)
-            .context("failed to parse /store/map/cluster-entries response")
+            .context("failed to parse /gallery/map/cluster-entries response")
     }
 
     pub async fn store_index_delta(
@@ -8487,6 +8487,7 @@ fn normalize_client_api_path(path: &str) -> Cow<'_, str> {
         || path_only.starts_with("/auth/")
         || path_only.starts_with("/storage/")
         || path_only.starts_with("/media/")
+        || path_only.starts_with("/gallery/")
         || path_only.starts_with("/maps/")
         || path_only.starts_with("/maintenance/")
     {
