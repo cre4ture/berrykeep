@@ -107,20 +107,23 @@ The interactive map does not traverse the full gallery index. It requests a boun
 server-side spatial clusters for the current camera:
 
 ```text
-GET /api/v1/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1
-GET /api/v1/auth/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1
+GET /api/v1/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1&zoom_precise=1
+GET /api/v1/auth/store/map/clusters?prefix=&depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1&zoom_precise=1
 ```
 
 All four viewport bounds are required and use the same antimeridian rules as viewport index
-queries. `zoom` is clamped to `0..20`. The Gallery UI starts with the world viewport and the
-maximum supported UI depth (`64`), then issues a new request after each map movement. Map
-clustering is available for current data; selecting an immutable snapshot switches the Gallery to
-grid view.
+queries. `zoom` remains an integral, legacy-compatible value clamped to `0..20`. New clients also
+send the optional fractional MapLibre camera level as `zoom_precise`; older nodes ignore that
+additive parameter. When present, the server derives the clustering grid from the precise value,
+quantized upward to half zoom levels so small camera movements preserve the same grid. The
+Gallery UI starts with the world viewport and the maximum supported UI depth (`64`), then issues
+a new request after each map movement. Map clustering is available for current data; selecting an
+immutable snapshot switches the Gallery to grid view.
 
 Each metadata backend persists normalized Web Mercator `x`/`y` values next to valid GPS metadata
 and maintains a B-tree spatial index. The cluster query restricts that index to the viewport and
 groups matching rows into a zoom-dependent Web Mercator grid. It initially uses cells equivalent
-to 64 screen pixels. If the requested grid would return more than 512 clusters, the server halves
+to 128 screen pixels. If the requested grid would return more than 512 clusters, the server halves
 the effective grid resolution until the response is bounded. This makes response size independent
 of total library size while still allowing the client to refine the result by zooming or panning.
 Latitude/longitude bounds remain as an exact check around the indexed projected range.

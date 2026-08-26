@@ -3505,7 +3505,7 @@ pub struct GalleryMapClustersRequest {
     pub depth: usize,
     pub media_filter: StoreIndexMediaFilter,
     pub viewport: StoreIndexViewport,
-    pub zoom: u8,
+    pub zoom: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -3539,6 +3539,7 @@ pub struct GallerySummaryStatus {
 pub struct GalleryMapClustersResponse {
     pub prefix: String,
     pub depth: usize,
+    /// Integral legacy wire field. The precise request zoom only affects resolution.
     pub zoom: u8,
     pub resolution: u32,
     pub total_entry_count: usize,
@@ -3553,6 +3554,13 @@ pub struct GalleryMapClustersResponse {
     pub query_token: String,
     #[serde(default)]
     pub clusters: Vec<GalleryMapCluster>,
+}
+
+fn gallery_map_zoom_for_request(zoom: f64) -> Result<f64> {
+    if !zoom.is_finite() {
+        bail!("zoom must be a finite number");
+    }
+    Ok(zoom.clamp(0.0, 20.0))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5172,6 +5180,8 @@ impl IronMeshClient {
         &self,
         request: GalleryMapClustersRequest,
     ) -> Result<GalleryMapClustersResponse> {
+        let zoom_precise = gallery_map_zoom_for_request(request.zoom)?;
+        let zoom = zoom_precise.floor() as u8;
         let mut url = self.relative_url("/store/map/clusters")?;
         {
             let mut query = url.query_pairs_mut();
@@ -5190,7 +5200,8 @@ impl IronMeshClient {
                 .append_pair("west", &request.viewport.west.to_string())
                 .append_pair("north", &request.viewport.north.to_string())
                 .append_pair("east", &request.viewport.east.to_string())
-                .append_pair("zoom", &request.zoom.min(20).to_string());
+                .append_pair("zoom", &zoom.to_string())
+                .append_pair("zoom_precise", &zoom_precise.to_string());
         }
         let response = self
             .execute_buffered_request(Method::GET, url, Vec::new(), None)

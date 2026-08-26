@@ -1,4 +1,5 @@
 import { fetchJson } from "../shared/http";
+import { galleryMapClusterZoomParameters } from "../shared/store-index";
 import type {
   GalleryMapClusterEntriesResponse,
   GalleryMapClustersRequest,
@@ -206,6 +207,7 @@ export async function getAdminGalleryMapClusters(
   request: GalleryMapClustersRequest,
   adminTokenOverride?: string
 ): Promise<GalleryMapClustersResponse> {
+  const { zoom, zoomPrecise } = galleryMapClusterZoomParameters(request.zoom);
   const query = new URLSearchParams({
     depth: String(Math.max(1, Math.floor(request.depth))),
     media_filter: request.mediaFilter,
@@ -213,7 +215,8 @@ export async function getAdminGalleryMapClusters(
     west: String(request.viewport.west),
     north: String(request.viewport.north),
     east: String(request.viewport.east),
-    zoom: String(Math.max(0, Math.min(20, Math.floor(request.zoom))))
+    zoom: String(zoom),
+    zoom_precise: String(zoomPrecise)
   });
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());

@@ -86,6 +86,14 @@ fn object_url_builder_escapes_segments() {
 }
 
 #[test]
+fn gallery_map_zoom_request_validation_preserves_fractional_zoom() {
+    assert_eq!(gallery_map_zoom_for_request(3.75).unwrap(), 3.75);
+    assert_eq!(gallery_map_zoom_for_request(-2.0).unwrap(), 0.0);
+    assert_eq!(gallery_map_zoom_for_request(25.0).unwrap(), 20.0);
+    assert!(gallery_map_zoom_for_request(f64::NAN).is_err());
+}
+
+#[test]
 fn client_clones_keep_the_same_connection_runtime_id() {
     let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
     let clone = client.clone();
