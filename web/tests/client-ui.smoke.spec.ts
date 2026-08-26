@@ -123,7 +123,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByText("Web services", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Web services" })).toBeVisible();
   await expect(page.getByText("Home NAS", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Open in browser" })).toBeVisible();
+  const popupPromise = page.waitForEvent("popup");
+  await page.getByRole("button", { name: "Open in browser" }).click();
+  const servicePopup = await popupPromise;
+  await expect.poll(() => servicePopup.url()).toBe("about:blank#home-nas");
+  await servicePopup.close();
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
   await expect(page.getByText("Recent client runtime logs", { exact: true })).toBeVisible();
@@ -1661,6 +1665,17 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
           nodeId: "0198e5b8-8bb4-7cc0-a6d7-8648251845b8"
         }
       ]);
+    }
+
+    if (
+      pathname ===
+        apiV1("/web-services/0198e5b8-8bb4-7cc0-a6d7-8648251845b8/home-nas/launch") &&
+      method === "POST"
+    ) {
+      return json(route, {
+        url: "about:blank#home-nas",
+        expiresInSeconds: 60
+      });
     }
 
     if (pathname === apiV1("/logs") && method === "GET") {

@@ -8944,6 +8944,7 @@ fn normalize_client_api_path(path: &str) -> Cow<'_, str> {
         || path_only.starts_with("/storage/")
         || path_only.starts_with("/media/")
         || path_only.starts_with("/gallery/")
+        || path_only.starts_with("/web-services")
         || path_only.starts_with("/maps/")
         || path_only.starts_with("/maintenance/")
     {

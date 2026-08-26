@@ -265,6 +265,13 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("Home NAS", { exact: true })).toBeVisible();
   await expect(page.getByText("certificate pin", { exact: true })).toBeVisible();
   await expect(page.getByText("https://nas.home.arpa:8443/", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Edit" }).click();
+  await page.getByLabel("Display name").fill("Home NAS updated");
+  await page.getByRole("button", { name: "Save changes" }).click();
+  await expect(page.getByText("Home NAS updated", { exact: true })).toBeVisible();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByText("No private web services are configured on this node.")).toBeVisible();
 
   await page.getByText("S3", { exact: true }).click();
   await expect(page.getByText("Listener and replication status", { exact: true })).toBeVisible();

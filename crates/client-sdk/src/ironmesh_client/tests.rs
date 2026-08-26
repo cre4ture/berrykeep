@@ -910,6 +910,10 @@ fn normalize_client_api_path_prefixes_known_public_routes() {
         normalize_client_api_path("/maps/config").as_ref(),
         "/api/v1/maps/config"
     );
+    assert_eq!(
+        normalize_client_api_path("/web-services").as_ref(),
+        "/api/v1/web-services"
+    );
 }
 
 #[test]
