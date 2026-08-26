@@ -92,6 +92,11 @@ page assets reuse authenticated proxy and upstream TLS connections. It retains
 at most four idle connections for 30 seconds, creates a fresh pool generation
 after 60 seconds, and revalidates the service metadata on every new connection.
 
+For a non-root configured `base_path`, that path is also a strict access
+boundary: a same-origin redirect that leaves it is rejected instead of being
+silently remapped to another resource. If a NAS redirects `/ui` to `/login` or
+`/`, configure the service with the upstream root URL rather than `/ui`.
+
 Nodes that predate this feature are treated as having no configured web
 services, so clients and nodes can be upgraded incrementally. Opening a service
 still requires the selected client and target node to support the proxy stream.
