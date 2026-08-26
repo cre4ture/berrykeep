@@ -344,7 +344,7 @@ async fn try_execute_direct_transport_request(
             let key = decode_route_tail(path, "/store/")?;
             Some(get_object_response(state, &key, query, &headers, false).await)
         }
-        ("HEAD", path) if is_store_object_path(path) => {
+        ("HEAD", path) if is_store_object_rpc_path(path) => {
             if let Some(response) = authorize_direct_transport_fast_path(
                 state,
                 scope,
