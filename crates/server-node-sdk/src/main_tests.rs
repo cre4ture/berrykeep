@@ -44,6 +44,16 @@ fn direct_quic_relay_urls_are_trimmed_and_deduplicated() {
 }
 
 #[test]
+fn reconciliation_object_paths_encode_store_keys_before_transport() {
+    let path = super::build_reconciliation_object_path("map/clusters", "version/1");
+
+    assert_eq!(path, "/store/map%2Fclusters?version=version%2F1");
+    assert!(super::transport_service::is_streamed_object_read_path(
+        &path
+    ));
+}
+
+#[test]
 fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
     let tickets = HashMap::from([
         (

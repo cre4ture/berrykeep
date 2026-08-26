@@ -63,12 +63,12 @@ pub(super) fn normalize_public_api_v1_path_and_query(path_and_query: &str) -> Co
 fn is_reserved_store_api_path(path: &str) -> bool {
     matches!(
         path,
-        "/store/index"
-            | "/store/index/delta"
-            | "/store/index/changes/wait"
-            | "/store/map/clusters"
-            | "/store/map/cluster-entries"
+        "/store/index" | "/store/index/delta" | "/store/index/changes/wait"
     ) || path.starts_with("/store/uploads/")
+}
+
+fn is_legacy_gallery_map_api_path(path: &str) -> bool {
+    matches!(path, "/store/map/clusters" | "/store/map/cluster-entries")
 }
 
 pub(super) fn is_store_object_path(path_and_query: &str) -> bool {
@@ -82,6 +82,16 @@ pub(super) fn is_store_object_path(path_and_query: &str) -> bool {
     path_only
         .strip_prefix("/store/")
         .is_some_and(|tail| !tail.is_empty() && !is_reserved_store_api_path(path_only))
+}
+
+fn is_store_object_rpc_path(path_and_query: &str) -> bool {
+    let path_only = path_and_query
+        .trim()
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(path_and_query.trim());
+    let path_only = strip_public_api_v1_prefix(path_only);
+    is_store_object_path(path_only) && !is_legacy_gallery_map_api_path(path_only)
 }
 
 pub(super) fn is_streamed_object_read_path(path_and_query: &str) -> bool {
@@ -315,7 +325,7 @@ async fn try_execute_direct_transport_request(
                     .into_response(),
             )
         }
-        ("GET", path) if is_store_object_path(path) => {
+        ("GET", path) if is_store_object_rpc_path(path) => {
             if let Some(response) = authorize_direct_transport_fast_path(
                 state,
                 scope,
@@ -818,8 +828,14 @@ mod tests {
         assert!(!is_streamed_object_read_path(
             "/store/index/changes/wait?since=1"
         ));
-        assert!(!is_streamed_object_read_path("/store/map/clusters"));
-        assert!(!is_streamed_object_read_path(
+        assert!(is_streamed_object_read_path(
+            "/store/map/clusters?version=test"
+        ));
+        assert!(is_streamed_object_read_path(
+            "/api/v1/store/map/cluster-entries?query_token=token&cluster_id=0_0"
+        ));
+        assert!(!is_store_object_rpc_path("/store/map/clusters"));
+        assert!(!is_store_object_rpc_path(
             "/api/v1/store/map/cluster-entries?query_token=token&cluster_id=0_0"
         ));
         assert!(is_streamed_object_read_path("/store/uploads"));

@@ -16184,6 +16184,13 @@ fn store_index_delta_reset_response(
         .into_response()
 }
 
+fn build_reconciliation_object_path(key: &str, version_id: &str) -> String {
+    let encoded_key = utf8_percent_encode(key, QUERY_COMPONENT_ENCODE_SET).to_string();
+    let encoded_version_id =
+        utf8_percent_encode(version_id, QUERY_COMPONENT_ENCODE_SET).to_string();
+    format!("/store/{encoded_key}?version={encoded_version_id}")
+}
+
 fn store_index_page_cache_key(
     query: &StoreIndexQuery,
     thumbnail_route: &str,
@@ -30387,7 +30394,7 @@ async fn reconcile_from_node(
             continue;
         }
 
-        let object_path = format!("/store/{}?version={}", entry.key, entry.version_id);
+        let object_path = build_reconciliation_object_path(&entry.key, &entry.version_id);
         let payload = match execute_peer_request(
             &state,
             &remote_node,
