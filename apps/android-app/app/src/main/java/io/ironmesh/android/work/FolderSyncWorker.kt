@@ -25,7 +25,9 @@ class FolderSyncWorker(
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val nativeContinuousActive = repository.hasContinuousFolderSyncActive()
         if (!FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive)) {
-            rearmOutageRetry()
+            // A stale continuous-start marker must not turn a due outage wake-up into a
+            // zero-delay WorkManager cycle while no foreground service is actually running.
+            rearmOutageRetry(deferDueAttempt = true)
             Log.i(TAG, "continuous folder sync is requested or active; skipping one-shot worker run")
             return@withContext Result.success()
         }
