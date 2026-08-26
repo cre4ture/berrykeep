@@ -72,7 +72,7 @@ pub use multiplex_transport::{
     read_transport_response_head, write_buffered_transport_request,
     write_buffered_transport_response, write_transport_request_head, write_transport_response_head,
 };
-pub use mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
+pub use mux::{MultiplexConfig, MultiplexMode, MultiplexStream, MultiplexedSession};
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};
 pub use relay::{
     RelayHttpHeader, RelayTicket, RelayTicketReleaseRequest, RelayTicketReleaseResponse,

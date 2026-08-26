@@ -3,7 +3,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, RANGE, RETRY_AFTER, SET_COOKIE,
+    CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, HOST, RANGE, RETRY_AFTER, SET_COOKIE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +58,7 @@ const EMBEDDED_WEB_UI_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 mod binary_stream_tests;
 mod bounded_body;
 mod mbtiles;
+mod web_service_gateway;
 
 #[derive(Clone, Default)]
 struct RequestCancellation {
@@ -316,6 +318,7 @@ struct WebState {
     log_buffer: Arc<LogBuffer>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<mbtiles::LogicalMbtilesSource>>>>,
     gallery_map_upstream_routes: Arc<RwLock<GalleryMapUpstreamRoutes>>,
+    web_service_gateway: web_service_gateway::WebServiceGateway,
     runtime: Arc<RwLock<WebRuntime>>,
 }
 
@@ -416,6 +419,7 @@ pub fn router(config: WebUiConfig) -> Router {
         log_buffer,
         mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
         gallery_map_upstream_routes: Arc::new(RwLock::new(GalleryMapUpstreamRoutes::default())),
+        web_service_gateway: web_service_gateway::WebServiceGateway::default(),
         runtime: Arc::new(RwLock::new(WebRuntime {
             sdk: sdk.clone(),
             client: ClientNode::with_client(sdk),
@@ -484,6 +488,11 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/store/stream-binary", get(web_store_stream_binary))
         .route("/store/put-binary", post(web_store_put_binary))
         .route("/connection-routes", get(web_connection_routes))
+        .route("/web-services", get(web_service_gateway::list_services))
+        .route(
+            "/web-services/{node_id}/{service_id}/launch",
+            post(web_service_gateway::launch_service),
+        )
         .route(
             "/connection-routes/refresh",
             post(web_refresh_connection_routes),
@@ -575,15 +584,20 @@ pub fn router(config: WebUiConfig) -> Router {
         .nest(WEB_API_V1_PREFIX, api_v1)
         .merge(legacy_api)
         .route("/{*path}", get(web_static_file))
-        .with_state(state);
+        .with_state(state.clone());
 
-    match embedded_session_authorization {
+    let app = match embedded_session_authorization {
         Some(authorization) => app.layer(middleware::from_fn_with_state(
             authorization,
             require_embedded_web_ui_session,
         )),
         None => app,
-    }
+    };
+    app.layer(middleware::from_fn(require_same_origin_web_ui_write))
+        .layer(middleware::from_fn_with_state(
+            state,
+            web_service_gateway::dispatch_service_origin,
+        ))
 }
 
 async fn require_embedded_web_ui_session(
@@ -596,10 +610,8 @@ async fn require_embedded_web_ui_session(
         .get(EMBEDDED_WEB_UI_SESSION_HEADER)
         .and_then(|value| value.to_str().ok());
     let authorized_by_header = authorization.accepts(supplied_header);
-    let authorized_by_cookie = authorization.accepts(cookie_value(
-        request.headers(),
-        EMBEDDED_WEB_UI_SESSION_COOKIE,
-    ));
+    let authorized_by_cookie = cookie_values(request.headers(), EMBEDDED_WEB_UI_SESSION_COOKIE)
+        .any(|value| authorization.accepts(Some(value)));
 
     if !authorized_by_header && !authorized_by_cookie {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -622,13 +634,60 @@ async fn require_embedded_web_ui_session(
     response
 }
 
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+async fn require_same_origin_web_ui_write(request: Request, next: Next) -> Response {
+    if is_safe_web_ui_method(request.method()) {
+        return next.run(request).await;
+    }
+    let local_origin = request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(trusted_loopback_origin);
+    if !local_origin.is_some_and(|origin| {
+        web_service_gateway::request_origin_allowed(request.headers(), &origin)
+    }) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "cross-origin writes to the local web UI are not allowed",
+        );
+    }
+    next.run(request).await
+}
+
+fn trusted_loopback_origin(authority: &str) -> Option<String> {
+    let origin = format!("http://{authority}");
+    let url = Url::parse(&origin).ok()?;
+    if url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    loopback.then_some(origin)
+}
+
+fn is_safe_web_ui_method(method: &Method) -> bool {
+    matches!(
+        method,
+        &Method::GET | &Method::HEAD | &Method::OPTIONS | &Method::TRACE
+    )
+}
+
+fn cookie_values<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Item = &'a str> {
     headers
-        .get(COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .find_map(|part| {
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(move |part| {
             let (candidate_name, value) = part.trim().split_once('=')?;
             (candidate_name == name).then_some(value)
         })
@@ -1723,6 +1782,8 @@ async fn apply_runtime_client(
     });
     runtime.last_rendezvous_probe_error = None;
     runtime.last_rendezvous_probe_statuses = Vec::new();
+    drop(runtime);
+    state.web_service_gateway.clear_service_clients().await;
     push_runtime_log(state, "INFO", "runtime client configuration updated");
     Ok(())
 }
@@ -4082,10 +4143,12 @@ mod tests {
     use super::{
         DIAGNOSTIC_CONTEXT_HEADER, EMBEDDED_WEB_UI_SESSION_COOKIE, EMBEDDED_WEB_UI_SESSION_HEADER,
         EmbeddedWebUiSessionAuthorization, ErrorResponseBody, WebUiConfig, client_cache_scope,
-        error_response, normalize_store_restore_path, router, web_latency_probe_timeout,
+        error_response, is_safe_web_ui_method, normalize_store_restore_path, router,
+        trusted_loopback_origin, web_latency_probe_timeout,
     };
     use axum::body::to_bytes;
-    use axum::http::StatusCode;
+    use axum::http::header::{HOST, ORIGIN};
+    use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
     use client_sdk::{ClientIdentityMaterial, IronMeshClient, LatencyProbeConfig};
     use common::logging::LogBuffer;
     use std::sync::Arc;
@@ -4113,6 +4176,95 @@ mod tests {
         });
 
         (format!("http://{address}"), task)
+    }
+
+    #[test]
+    fn web_ui_writes_require_their_own_browser_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("localhost:4100"));
+        assert!(super::web_service_gateway::request_origin_allowed(
+            &headers,
+            "http://localhost:4100"
+        ));
+
+        headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:4100"));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(super::web_service_gateway::request_origin_allowed(
+            &headers,
+            "http://localhost:4100"
+        ));
+
+        headers.insert(
+            ORIGIN,
+            HeaderValue::from_static("http://home-nas.localhost:4100"),
+        );
+        assert!(!super::web_service_gateway::request_origin_allowed(
+            &headers,
+            "http://localhost:4100"
+        ));
+        assert!(is_safe_web_ui_method(&Method::GET));
+        assert!(!is_safe_web_ui_method(&Method::POST));
+    }
+
+    #[test]
+    fn local_web_ui_origin_is_limited_to_loopback_authorities() {
+        assert_eq!(
+            trusted_loopback_origin("localhost:4100").as_deref(),
+            Some("http://localhost:4100")
+        );
+        assert_eq!(
+            trusted_loopback_origin("127.0.0.1:4100").as_deref(),
+            Some("http://127.0.0.1:4100")
+        );
+        assert_eq!(
+            trusted_loopback_origin("[::1]:4100").as_deref(),
+            Some("http://[::1]:4100")
+        );
+        assert!(trusted_loopback_origin("home-nas.localhost:4100").is_none());
+        assert!(trusted_loopback_origin("evil.example:4100").is_none());
+    }
+
+    #[tokio::test]
+    async fn cross_origin_binary_store_writes_are_rejected_before_reaching_the_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("web listener should have an address");
+        let server = tokio::spawn(async move {
+            let app = router(WebUiConfig::from_client(
+                IronMeshClient::from_direct_base_url("http://127.0.0.1:9"),
+            ));
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/api/v1/store/put-binary?key=cross-origin-write"
+            ))
+            .header(ORIGIN, "http://home-nas.localhost:4100")
+            .header("sec-fetch-site", "same-site")
+            .body("blocked")
+            .send()
+            .await
+            .expect("cross-origin request should receive an HTTP response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let rebinding_response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/api/v1/store/put-binary?key=dns-rebinding-write"
+            ))
+            .header(HOST, "evil.example")
+            .header(ORIGIN, "http://evil.example")
+            .header("sec-fetch-site", "same-origin")
+            .body("blocked")
+            .send()
+            .await
+            .expect("DNS-rebinding request should receive an HTTP response");
+        assert_eq!(rebinding_response.status(), StatusCode::FORBIDDEN);
+
+        server.abort();
     }
 
     #[tokio::test]

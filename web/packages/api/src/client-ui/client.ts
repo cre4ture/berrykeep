@@ -15,6 +15,8 @@ import type {
   ClientLatencyTestResponse,
   ClientRendezvousView,
   ClientUiPingResponse,
+  ClientWebService,
+  ClientWebServiceLaunchResponse,
   JsonObject,
   LogsResponse,
   SnapshotSummary,
@@ -120,6 +122,27 @@ export async function getClientClusterStatus(options?: ClientDiagnosticRequestOp
 
 export async function getClientConnectionRoutes(): Promise<ClientConnectionRouteSnapshot> {
   return fetchJson<ClientConnectionRouteSnapshot>(apiV1("/connection-routes"));
+}
+
+export async function listClientWebServices(): Promise<ClientWebService[]> {
+  return fetchJson<ClientWebService[]>(apiV1("/web-services"), {
+    credentials: "same-origin",
+    cache: "no-store"
+  });
+}
+
+export async function launchClientWebService(
+  nodeId: string,
+  serviceId: string
+): Promise<ClientWebServiceLaunchResponse> {
+  return fetchJson<ClientWebServiceLaunchResponse>(
+    apiV1(`/web-services/${encodeURIComponent(nodeId)}/${encodeURIComponent(serviceId)}/launch`),
+    {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store"
+    }
+  );
 }
 
 export async function refreshClientConnectionRoutes(): Promise<ClientConnectionRouteSnapshot> {

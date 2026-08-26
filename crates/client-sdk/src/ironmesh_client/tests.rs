@@ -910,6 +910,28 @@ fn normalize_client_api_path_prefixes_known_public_routes() {
         normalize_client_api_path("/maps/config").as_ref(),
         "/api/v1/maps/config"
     );
+    assert_eq!(
+        normalize_client_api_path("/web-services").as_ref(),
+        "/api/v1/web-services"
+    );
+}
+
+#[test]
+fn web_service_summary_accepts_node_and_legacy_wire_formats() {
+    let node_id = Uuid::now_v7();
+    for node_key in ["nodeId", "node_id"] {
+        let mut payload = serde_json::json!({
+            "id": "home-nas",
+            "name": "Home NAS",
+            "description": "Private storage",
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert(node_key.to_string(), serde_json::json!(node_id));
+        let summary: WebServiceSummary = serde_json::from_value(payload).unwrap();
+        assert_eq!(summary.node_id, node_id);
+    }
 }
 
 #[test]
