@@ -35,6 +35,18 @@ export type ClientUiRuntimeInfo = {
   service_name?: string;
 };
 
+export type ClientWebService = {
+  id: string;
+  name: string;
+  description?: string | null;
+  nodeId: string;
+};
+
+export type ClientWebServiceLaunchResponse = {
+  url: string;
+  expiresInSeconds: number;
+};
+
 export type ClientConnectionRouteEndpointSnapshot = {
   index: number;
   path_kind: "direct_https" | "direct_quic" | "relay_tunnel";

@@ -1,4 +1,4 @@
-import { IconActivity, IconArrowsTransferUp, IconCertificate, IconCloud, IconCpu, IconDashboard, IconDatabase, IconFileText, IconFolder, IconHistory, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
+import { IconActivity, IconArrowsTransferUp, IconCertificate, IconCloud, IconCpu, IconDashboard, IconDatabase, IconFileText, IconFolder, IconHistory, IconKey, IconPhoto, IconPlugConnected, IconServerCog, IconWorldWww } from "@tabler/icons-react";
 import { DashboardPage } from "../pages/DashboardPage";
 import { RepairPage } from "../pages/RepairPage";
 import { SetupPage } from "../pages/SetupPage";
@@ -15,6 +15,7 @@ import { GalleryPage } from "../pages/GalleryPage";
 import { ExplorerPage } from "../pages/ExplorerPage";
 import { MetadataPage } from "../pages/MetadataPage";
 import { S3ControlPlanePage } from "../pages/S3ControlPlanePage";
+import { WebServicesPage } from "../pages/WebServicesPage";
 
 export const serverAdminRoutes = [
   {
@@ -86,6 +87,13 @@ export const serverAdminRoutes = [
     description: "Review enrolled client credentials, recent bootstrap claims, and revoke access when needed.",
     icon: IconKey,
     element: <ClientCredentialsPage />
+  },
+  {
+    id: "web-services",
+    label: "Web Services",
+    description: "Expose fixed node-local HTTP(S) applications to selected devices through the authenticated IronMesh transport and isolated local browser origins.",
+    icon: IconWorldWww,
+    element: <WebServicesPage />
   },
   {
     id: "s3",

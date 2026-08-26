@@ -155,6 +155,7 @@ mod storage;
 mod transport_service;
 mod ui;
 mod web_maps;
+mod web_service_proxy;
 
 #[cfg(test)]
 use gallery_sync::GallerySyncScope;
@@ -306,6 +307,7 @@ struct ServerState {
     cluster: Arc<Mutex<ClusterService>>,
     storage: ServerStorageRuntime,
     access: ServerAccessRuntime,
+    web_services: web_service_proxy::WebServiceRegistry,
     s3: ServerS3Runtime,
     network: ServerNetworkRuntime,
     maintenance: ServerMaintenanceRuntime,
@@ -1805,13 +1807,21 @@ async fn require_internal_caller(
 
 async fn require_client_auth(
     State(state): State<ServerState>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
     if !state.access.client_auth_control.require_client_auth {
         return Ok(next.run(request).await);
     }
 
+    require_signed_client_auth(State(state), request, next).await
+}
+
+async fn require_signed_client_auth(
+    State(state): State<ServerState>,
+    mut request: Request,
+    next: Next,
+) -> std::result::Result<Response, StatusCode> {
     let request_headers = request.headers().clone();
     let request_path_and_query = request_auth_path_and_query(&request);
     let request_method = request.method().as_str().to_string();
@@ -7327,6 +7337,13 @@ async fn run_inner(
         );
     }
 
+    let web_services = match web_service_proxy::WebServiceRegistry::load(&config.data_dir).await {
+        Ok(registry) => registry,
+        Err(error) => {
+            bail!("failed loading web service proxy configuration: {error:#}");
+        }
+    };
+
     let state = ServerState {
         data_dir: config.data_dir.clone(),
         cluster_id: config.cluster_id,
@@ -7367,6 +7384,7 @@ async fn run_inner(
             client_auth_control,
             client_auth_replay_cache: Arc::new(Mutex::new(ClientAuthReplayCache::default())),
         },
+        web_services,
         s3: ServerS3Runtime {
             control_plane: Arc::new(Mutex::new(persisted_s3_control_plane)),
             sync_runtime: Arc::new(StdMutex::new(S3ControlPlaneSyncRuntime::default())),
@@ -7651,6 +7669,19 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             require_client_auth,
         ));
 
+    // Web service ACLs are device-specific, so this endpoint always requires
+    // signed client identity even on nodes that permit legacy unauthenticated
+    // access to other client APIs.
+    let web_service_client_api = Router::new()
+        .route(
+            "/web-services",
+            get(web_service_proxy::list_client_services),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_signed_client_auth,
+        ));
+
     let public_cluster_info_api = Router::new()
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
@@ -7770,6 +7801,16 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
                 .put(rendezvous_contact_config::admin_put_config),
         )
         .route("/auth/s3/status", get(get_s3_control_plane_status))
+        .route(
+            "/auth/web-services",
+            get(web_service_proxy::list_admin_services)
+                .post(web_service_proxy::create_admin_service),
+        )
+        .route(
+            "/auth/web-services/{service_id}",
+            put(web_service_proxy::update_admin_service)
+                .delete(web_service_proxy::delete_admin_service),
+        )
         .route(
             "/auth/s3/buckets",
             get(list_s3_buckets).post(create_s3_bucket),
@@ -7915,6 +7956,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .merge(public_maps_api.clone())
         .merge(public_admin_api.clone())
         .merge(public_cluster_info_api.clone())
+        .merge(web_service_client_api.clone())
         .merge(public_client_api.clone());
 
     let legacy_public_api = Router::new()
@@ -7983,6 +8025,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .merge(public_admin_api)
         .merge(public_cluster_info_api)
+        .merge(web_service_client_api)
         .merge(public_client_api);
 
     let public_logs_api =
@@ -10360,7 +10403,7 @@ async fn handle_multiplexed_relay_stream<S>(
     mut stream: S,
 ) -> Result<()>
 where
-    S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
+    S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Send + Unpin,
 {
     let request_head = read_transport_request_head(&mut stream)
         .await
@@ -10370,6 +10413,9 @@ where
     }
     if request_head.kind == TransportStreamKind::ObjectWrite {
         return handle_streamed_object_write_request(&state, request_head, &mut stream).await;
+    }
+    if request_head.kind == TransportStreamKind::WebServiceProxy {
+        return web_service_proxy::handle_proxy_stream(&state, request_head, &mut stream).await;
     }
     let request = read_buffered_transport_request_from_head(&mut stream, request_head)
         .await

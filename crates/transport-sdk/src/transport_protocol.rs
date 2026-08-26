@@ -31,6 +31,11 @@ pub enum TransportStreamKind {
     ObjectWrite,
     Subscription,
     Diagnostics,
+    /// Opens an authenticated byte stream to an administrator-defined web service.
+    ///
+    /// The node resolves the opaque service id from the request path and owns all
+    /// destination and TLS policy. Callers can never supply an arbitrary target.
+    WebServiceProxy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -253,5 +258,16 @@ mod tests {
         decoded
             .validate()
             .expect("decoded stream control message should validate");
+    }
+
+    #[test]
+    fn web_service_proxy_stream_kind_is_an_additive_wire_value() {
+        let encoded = serde_json::to_string(&TransportStreamKind::WebServiceProxy)
+            .expect("web service proxy stream kind should serialize");
+        assert_eq!(encoded, "\"web_service_proxy\"");
+        assert_eq!(
+            serde_json::from_str::<TransportStreamKind>(&encoded).unwrap(),
+            TransportStreamKind::WebServiceProxy
+        );
     }
 }

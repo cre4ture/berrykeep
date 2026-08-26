@@ -86,6 +86,7 @@ Current direction highlights:
 - Cluster-aware storage with deterministic placement, automatic replication and repair, and a no-loss version model for offline or concurrent edits.
 - Native access paths across the web UI, CLI, Android, Linux FUSE, and Windows CFAPI placeholder integration, with on-demand hydration where the platform supports it.
 - Secure onboarding and connectivity through guided zero-touch cluster setup, certificate-backed identities, and rendezvous/relay paths for harder network topologies.
+- [Device-scoped access to private node-local web applications](docs/private-web-services.md) through isolated loopback browser origins, with upstream CA trust or exact self-signed certificate pinning and no public home-network ingress.
 - Media-aware browsing with cached thumbnails and metadata designed to support gallery-style experiences without downloading original files first.
 - Hardware-health reporting that makes storage, runtime, and host reliability signals visible before a weak node becomes a bigger problem.
 
