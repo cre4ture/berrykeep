@@ -210,7 +210,13 @@ function galleryDataUpdate(
       ...(descriptor.offset === null ? {} : { offset: descriptor.offset }),
       ...(descriptor.limit === null ? {} : { limit: descriptor.limit }),
       ...(descriptor.sort === null ? {} : { sort: descriptor.sort }),
-      ...(descriptor.mediaFilter === null ? {} : { mediaFilter: descriptor.mediaFilter })
+      ...(descriptor.mediaFilter === null ? {} : { mediaFilter: descriptor.mediaFilter }),
+      ...(descriptor.requireLabels.length === 0
+        ? {}
+        : { requireLabels: descriptor.requireLabels }),
+      ...(descriptor.excludeLabels.length === 0
+        ? {}
+        : { excludeLabels: descriptor.excludeLabels })
     },
     payload
   };

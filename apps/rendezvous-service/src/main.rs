@@ -959,6 +959,7 @@ mod tests {
                     modified_at_unix: None,
                     content_fingerprint: None,
                     media: None,
+                    labels: Vec::new(),
                 }],
             })
             .expect("store index should serialize");
