@@ -84,6 +84,9 @@ const galleryEntries = [
   createGalleryEntry("runtime-tokyo-b", 35.7262, 139.7003)
 ];
 
+const MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX = 512;
+const GALLERY_MAP_CLUSTER_CELL_WIDTH_PX = 32;
+
 const galleryMapClusters = [
   {
     cluster_id: "runtime-new-york",
@@ -153,7 +156,10 @@ function galleryMapClustersResponse(url) {
     prefix,
     depth,
     zoom: Math.floor(zoom),
-    resolution: Math.ceil(4 * 2 ** (Math.ceil(zoom * 2) / 2)),
+    resolution: Math.ceil(
+      (MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX / GALLERY_MAP_CLUSTER_CELL_WIDTH_PX) *
+        2 ** (Math.ceil(zoom * 2) / 2)
+    ),
     total_entry_count: galleryEntries.length,
     visible_geotagged_count: visibleGeotaggedCount,
     media_summary: {

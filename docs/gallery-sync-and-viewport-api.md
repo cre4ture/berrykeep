@@ -132,7 +132,7 @@ within its limit.
 Each metadata backend persists normalized Web Mercator `x`/`y` values next to valid GPS metadata
 and maintains a B-tree spatial index. The cluster query restricts that index to the viewport and
 groups matching rows into a zoom-dependent Web Mercator grid. It initially uses cells equivalent
-to 128 screen pixels. If the requested grid would return more than 512 clusters, the server halves
+to 32 screen pixels. If the requested grid would return more than 2,048 clusters, the server halves
 the effective grid resolution until the response is bounded. This makes response size independent
 of total library size while still allowing the client to refine the result by zooming or panning.
 Latitude/longitude bounds remain as an exact check around the indexed projected range.

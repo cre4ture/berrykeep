@@ -9,9 +9,9 @@ use super::StoreIndexMediaFilter;
 
 const GALLERY_MAP_TOKEN_PREFIX: &str = "gm1_";
 const MAX_GALLERY_MAP_TOKEN_LENGTH: usize = 65_536;
-const MAX_GALLERY_MAP_RESOLUTION: u32 = 1 << 22;
+const MAX_GALLERY_MAP_RESOLUTION: u32 = 1 << 24;
 const MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX: f64 = 512.0;
-const GALLERY_MAP_CLUSTER_CELL_WIDTH_PX: f64 = 128.0;
+const GALLERY_MAP_CLUSTER_CELL_WIDTH_PX: f64 = 32.0;
 const GALLERY_MAP_CLUSTER_ZOOM_STEP: f64 = 0.5;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -80,7 +80,7 @@ pub(super) fn gallery_map_resolution_for_zoom(zoom: f64) -> u32 {
         0.0
     };
     // A continuous resolution moves every grid boundary at every camera update. Round upward
-    // to half zoom levels so cells remain at most 128 pixels wide while small zoom changes keep
+    // to half zoom levels so cells remain at most 32 pixels wide while small zoom changes keep
     // the same cluster grid.
     let grid_zoom = (zoom / GALLERY_MAP_CLUSTER_ZOOM_STEP).ceil() * GALLERY_MAP_CLUSTER_ZOOM_STEP;
     let resolution = (MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX * 2.0_f64.powf(grid_zoom)
@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn map_grid_resolution_quantizes_fractional_zoom_at_the_legacy_cell_width() {
+    fn map_grid_resolution_quantizes_fractional_zoom_at_the_configured_cell_width() {
         for zoom in [0.0, 0.25, 1.2, 3.75, 12.4, 20.0] {
             let world_size = MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX * 2.0_f64.powf(zoom);
             let resolution = f64::from(gallery_map_resolution_for_zoom(zoom));
@@ -188,7 +188,8 @@ mod tests {
             );
         }
 
-        assert_eq!(gallery_map_resolution_for_zoom(3.0), 1 << 5);
+        assert_eq!(gallery_map_resolution_for_zoom(1.0), 1 << 5);
+        assert_eq!(gallery_map_resolution_for_zoom(3.0), 1 << 7);
         assert_eq!(
             gallery_map_resolution_for_zoom(3.01),
             gallery_map_resolution_for_zoom(3.49)
