@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -770,7 +770,7 @@ where
 }
 
 async fn connect_upstream(service: &WebServiceConfig, url: &Url) -> Result<Box<dyn UpstreamIo>> {
-    let host = url.host_str().context("upstream_url is missing a host")?;
+    let host = upstream_connect_host(url)?;
     let port = url
         .port_or_known_default()
         .context("upstream_url is missing a port")?;
@@ -822,30 +822,43 @@ fn build_upstream_tls_config(service: &WebServiceConfig) -> Result<rustls::Clien
             .with_no_client_auth());
     }
 
-    let mut roots = RootCertStore::empty();
-    if let Some(ca_pem) = service.tls_ca_pem.as_deref() {
+    let roots = if let Some(ca_pem) = service.tls_ca_pem.as_deref() {
+        let mut roots = RootCertStore::empty();
         for certificate in parse_ca_certificates(ca_pem)? {
             roots
                 .add(certificate)
                 .context("failed adding configured upstream CA certificate")?;
         }
+        roots
     } else {
-        let native = rustls_native_certs::load_native_certs();
-        for certificate in native.certs {
-            roots
-                .add(certificate)
-                .context("failed adding native root certificate")?;
-        }
-        if !native.errors.is_empty() && roots.is_empty() {
-            bail!("failed loading native root certificates");
-        }
-    }
+        native_root_certificates()?
+    };
 
     Ok(rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .context("failed selecting upstream TLS protocol versions")?
         .with_root_certificates(roots)
         .with_no_client_auth())
+}
+
+fn native_root_certificates() -> Result<RootCertStore> {
+    static NATIVE_ROOTS: OnceLock<std::result::Result<RootCertStore, String>> = OnceLock::new();
+    NATIVE_ROOTS
+        .get_or_init(|| {
+            let native = rustls_native_certs::load_native_certs();
+            let mut roots = RootCertStore::empty();
+            for certificate in native.certs {
+                roots
+                    .add(certificate)
+                    .map_err(|error| format!("failed adding native root certificate: {error}"))?;
+            }
+            if !native.errors.is_empty() && roots.is_empty() {
+                return Err("failed loading native root certificates".to_string());
+            }
+            Ok(roots)
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
 }
 
 #[derive(Debug)]
@@ -898,7 +911,7 @@ impl ServerCertVerifier for PinnedServerCertificateVerifier {
 }
 
 fn upstream_authority(url: &Url) -> Result<String> {
-    let host = url.host_str().context("upstream_url is missing a host")?;
+    let host = upstream_connect_host(url)?;
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
@@ -908,6 +921,14 @@ fn upstream_authority(url: &Url) -> Result<String> {
         Some(port) => format!("{host}:{port}"),
         None => host,
     })
+}
+
+fn upstream_connect_host(url: &Url) -> Result<&str> {
+    let host = url.host_str().context("upstream_url is missing a host")?;
+    Ok(host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host))
 }
 
 fn normalized_base_path(url: &Url) -> String {
@@ -1060,5 +1081,13 @@ mod tests {
                 .verify_server_cert(&changed, &[], &server_name, &[], UnixTime::now())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn ipv6_upstream_authority_and_connect_host_are_normalized() {
+        let url = Url::parse("https://[::1]:8443/ui").unwrap();
+        assert_eq!(upstream_connect_host(&url).unwrap(), "::1");
+        assert_eq!(upstream_authority(&url).unwrap(), "[::1]:8443");
+        assert!(ServerName::try_from(upstream_connect_host(&url).unwrap()).is_ok());
     }
 }

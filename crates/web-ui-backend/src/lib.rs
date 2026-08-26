@@ -608,10 +608,8 @@ async fn require_embedded_web_ui_session(
         .get(EMBEDDED_WEB_UI_SESSION_HEADER)
         .and_then(|value| value.to_str().ok());
     let authorized_by_header = authorization.accepts(supplied_header);
-    let authorized_by_cookie = authorization.accepts(cookie_value(
-        request.headers(),
-        EMBEDDED_WEB_UI_SESSION_COOKIE,
-    ));
+    let authorized_by_cookie = cookie_values(request.headers(), EMBEDDED_WEB_UI_SESSION_COOKIE)
+        .any(|value| authorization.accepts(Some(value)));
 
     if !authorized_by_header && !authorized_by_cookie {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -634,13 +632,13 @@ async fn require_embedded_web_ui_session(
     response
 }
 
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+fn cookie_values<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Item = &'a str> {
     headers
-        .get(COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .find_map(|part| {
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(move |part| {
             let (candidate_name, value) = part.trim().split_once('=')?;
             (candidate_name == name).then_some(value)
         })

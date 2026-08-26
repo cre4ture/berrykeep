@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use uuid::Uuid;
 
-use super::{WebState, cookie_value, current_sdk, error_response};
+use super::{WebState, cookie_values, current_sdk, error_response};
 
 const SERVICE_HOST_SUFFIX: &str = ".berrykeep.localhost";
 const OPEN_PATH: &str = "/_ironmesh/open";
@@ -117,11 +117,16 @@ impl WebServiceGateway {
         Some(session_token)
     }
 
-    async fn session(&self, alias: &str, token: Option<&str>) -> Option<ServiceSession> {
+    async fn session(&self, alias: &str, tokens: &[&str]) -> Option<ServiceSession> {
         let mut state = self.state.lock().await;
         state.prune();
-        let session = state.sessions.get(token?).cloned()?;
-        (session.alias == alias).then_some(session)
+        tokens.iter().find_map(|token| {
+            state
+                .sessions
+                .get(*token)
+                .filter(|session| session.alias == alias)
+                .cloned()
+        })
     }
 }
 
@@ -214,12 +219,11 @@ pub(super) async fn dispatch_service_origin(
     if request.uri().path() == OPEN_PATH {
         return redeem_launch_request(&state, &alias, request.uri()).await;
     }
+    let session_tokens =
+        cookie_values(request.headers(), GATEWAY_SESSION_COOKIE).collect::<Vec<_>>();
     let session = state
         .web_service_gateway
-        .session(
-            &alias,
-            cookie_value(request.headers(), GATEWAY_SESSION_COOKIE),
-        )
+        .session(&alias, &session_tokens)
         .await;
     let Some(session) = session else {
         return service_error(
@@ -402,7 +406,7 @@ async fn proxy_request(
         &connection.base_path,
         &upstream_request_uri,
         upgraded,
-    );
+    )?;
     Ok(response)
 }
 
@@ -546,7 +550,7 @@ fn rewrite_response_headers(
     base_path: &str,
     upstream_request_uri: &Uri,
     websocket: bool,
-) {
+) -> Result<()> {
     remove_hop_by_hop_headers(headers, websocket);
     for name in [
         "strict-transport-security",
@@ -568,9 +572,10 @@ fn rewrite_response_headers(
             local_origin,
             base_path,
             upstream_request_uri,
-        )
-        && let Ok(value) = HeaderValue::from_str(&rewritten)
+        )?
     {
+        let value = HeaderValue::from_str(&rewritten)
+            .context("rewritten upstream redirect is not a valid header value")?;
         headers.insert(LOCATION, value);
     }
 
@@ -623,6 +628,7 @@ fn rewrite_response_headers(
             headers.insert("content-security-policy", value);
         }
     }
+    Ok(())
 }
 
 fn rewrite_location(
@@ -631,8 +637,9 @@ fn rewrite_location(
     local_origin: &str,
     base_path: &str,
     upstream_request_uri: &Uri,
-) -> Option<String> {
-    let upstream = reqwest::Url::parse(upstream_origin).ok()?;
+) -> Result<Option<String>> {
+    let upstream =
+        reqwest::Url::parse(upstream_origin).context("upstream origin is not a valid URL")?;
     let current = reqwest::Url::parse(&format!(
         "{upstream_origin}{}",
         upstream_request_uri
@@ -640,12 +647,19 @@ fn rewrite_location(
             .map(|value| value.as_str())
             .unwrap_or("/")
     ))
-    .ok()?;
-    let resolved = current.join(location).ok()?;
+    .context("upstream request URI could not be resolved against its origin")?;
+    let Ok(resolved) = current.join(location) else {
+        return Ok(None);
+    };
     if resolved.origin() != upstream.origin() {
-        return None;
+        return Ok(None);
     }
-    let local_path = strip_base_path(resolved.path(), base_path);
+    let local_path = strip_redirect_base_path(resolved.path(), base_path).with_context(|| {
+        format!(
+            "upstream redirect path {} escapes configured base path {base_path}",
+            resolved.path()
+        )
+    })?;
     let mut rewritten = format!("{local_origin}{local_path}");
     if let Some(query) = resolved.query() {
         rewritten.push('?');
@@ -655,7 +669,19 @@ fn rewrite_location(
         rewritten.push('#');
         rewritten.push_str(fragment);
     }
-    Some(rewritten)
+    Ok(Some(rewritten))
+}
+
+fn strip_redirect_base_path<'a>(path: &'a str, base_path: &str) -> Option<&'a str> {
+    let base = base_path.trim_end_matches('/');
+    if base.is_empty() || base == "/" {
+        return Some(path);
+    }
+    if path == base {
+        return Some("/");
+    }
+    path.strip_prefix(base)
+        .filter(|suffix| suffix.starts_with('/'))
 }
 
 fn strip_base_path<'a>(path: &'a str, base_path: &str) -> &'a str {
@@ -806,6 +832,7 @@ mod tests {
                 "/ui",
                 &upstream_request,
             )
+            .unwrap()
             .unwrap(),
             "http://home-nas.berrykeep.localhost:4100/dashboard"
         );
@@ -817,6 +844,7 @@ mod tests {
                 "/ui",
                 &upstream_request,
             )
+            .unwrap()
             .unwrap(),
             "http://home-nas.berrykeep.localhost:4100/next?tab=storage#quota"
         );
@@ -828,8 +856,18 @@ mod tests {
                 "/ui",
                 &upstream_request,
             )
+            .unwrap()
             .is_none()
         );
+        let error = rewrite_location(
+            "https://nas.home/login",
+            "https://nas.home",
+            "http://home-nas.berrykeep.localhost:4100",
+            "/ui",
+            &upstream_request,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("escapes configured base path"));
     }
 
     #[test]
@@ -906,13 +944,40 @@ mod tests {
             .into_owned();
         let session = gateway.redeem_launch(alias, &second_token).await.unwrap();
         assert!(gateway.redeem_launch(alias, &second_token).await.is_none());
-        assert!(gateway.session(alias, Some(&session)).await.is_some());
-        assert!(
-            gateway
-                .session("wrong-origin", Some(&session))
-                .await
-                .is_none()
+        assert!(gateway.session(alias, &[&session]).await.is_some());
+        assert!(gateway.session("wrong-origin", &[&session]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_shadow_cookie_cannot_hide_the_valid_service_session() {
+        let gateway = WebServiceGateway::default();
+        let node_id = Uuid::now_v7();
+        let launch = gateway.issue_launch(node_id, "home-nas", 4100).await;
+        let launch_url = reqwest::Url::parse(&launch.url).unwrap();
+        let alias = launch_url
+            .host_str()
+            .unwrap()
+            .strip_suffix(SERVICE_HOST_SUFFIX)
+            .unwrap();
+        let token = launch_url
+            .query_pairs()
+            .find(|(name, _)| name == "token")
+            .unwrap()
+            .1
+            .into_owned();
+        let session = gateway.redeem_launch(alias, &token).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!(
+                "{GATEWAY_SESSION_COOKIE}=sibling-service-shadow; \
+                 {GATEWAY_SESSION_COOKIE}={session}"
+            ))
+            .unwrap(),
         );
+        let tokens = cookie_values(&headers, GATEWAY_SESSION_COOKIE).collect::<Vec<_>>();
+
+        assert!(gateway.session(alias, &tokens).await.is_some());
     }
 
     #[tokio::test]
