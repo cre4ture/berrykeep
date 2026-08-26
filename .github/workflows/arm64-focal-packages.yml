@@ -1,7 +1,15 @@
 name: Focal A64
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
   workflow_dispatch:
 
 concurrency:
@@ -11,6 +19,9 @@ concurrency:
 jobs:
   build-focal-arm64-packages:
     name: Focal A64
+    # The full Focal package build is expensive. It runs on trusted main and
+    # manual invocations, while PRs opt in with the existing package label.
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:debian-packages') }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
 

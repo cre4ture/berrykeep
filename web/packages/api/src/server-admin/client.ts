@@ -17,6 +17,8 @@ import type {
   AdminStoreListResponse,
   AdminVersionGraphResponse,
   AdminSessionStatus,
+  AdminWebService,
+  AdminWebServiceUpsertRequest,
   BootstrapClaimIssueResponse,
   BootstrapBundle,
   ClientConnectionsResponse,
@@ -165,6 +167,50 @@ export async function getAdminSessionStatus(
   adminTokenOverride?: string
 ): Promise<AdminSessionStatus> {
   return fetchAdminJson<AdminSessionStatus>(apiV1("/auth/admin/session"), { adminTokenOverride });
+}
+
+export async function listAdminWebServices(
+  adminTokenOverride?: string
+): Promise<AdminWebService[]> {
+  return fetchAdminJson<AdminWebService[]>(apiV1("/auth/web-services"), {
+    adminTokenOverride
+  });
+}
+
+export async function createAdminWebService(
+  request: AdminWebServiceUpsertRequest,
+  adminTokenOverride?: string
+): Promise<AdminWebService> {
+  return fetchAdminJson<AdminWebService>(apiV1("/auth/web-services"), {
+    method: "POST",
+    body: request,
+    adminTokenOverride
+  });
+}
+
+export async function updateAdminWebService(
+  serviceId: string,
+  request: AdminWebServiceUpsertRequest,
+  adminTokenOverride?: string
+): Promise<AdminWebService> {
+  return fetchAdminJson<AdminWebService>(
+    apiV1(`/auth/web-services/${encodeURIComponent(serviceId)}`),
+    {
+      method: "PUT",
+      body: request,
+      adminTokenOverride
+    }
+  );
+}
+
+export async function deleteAdminWebService(
+  serviceId: string,
+  adminTokenOverride?: string
+): Promise<void> {
+  await fetchAdminJson<void>(apiV1(`/auth/web-services/${encodeURIComponent(serviceId)}`), {
+    method: "DELETE",
+    adminTokenOverride
+  });
 }
 
 export async function loginAdmin(password: string): Promise<{ status: string }> {

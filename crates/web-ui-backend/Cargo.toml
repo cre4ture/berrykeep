@@ -24,6 +24,11 @@ sqlite-vfs = "0.2.0"
 tokio.workspace = true
 tracing.workspace = true
 mime_guess = "2.0.5"
+futures-util = "0.3"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tower-service = "0.3"
 uuid.workspace = true
 
 [dev-dependencies]

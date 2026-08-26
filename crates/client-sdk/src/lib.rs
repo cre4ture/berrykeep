@@ -48,8 +48,8 @@ pub use ironmesh_client::{
     StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, StoreIndexViewport, UploadMode,
     UploadResult, UploadSessionChunkRef, UploadSessionChunkStatus, UploadSessionCompleteInfo,
     UploadSessionStatus, VersionConsistencyState, VersionGraphSummary, VersionRecordSummary,
-    normalize_server_base_url, set_connection_diagnostics_observer,
-    snapshot_from_store_index_entries,
+    WebServiceProxyConnection, WebServiceSummary, normalize_server_base_url,
+    set_connection_diagnostics_observer, snapshot_from_store_index_entries,
 };
 pub use latency_probe::{
     LatencyProbeAssessment, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,
