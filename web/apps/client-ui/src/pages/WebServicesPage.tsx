@@ -33,25 +33,23 @@ export function WebServicesPage() {
   async function openService(service: ClientWebService) {
     const launchKey = `${service.nodeId}:${service.id}`;
     const popup = window.open("about:blank", "_blank");
+    if (!popup) {
+      setError("The browser blocked the service popup. Allow popups and try again.");
+      return;
+    }
     setLaunching(launchKey);
     setError(null);
     try {
-      if (popup) {
-        popup.opener = null;
-        popup.document.title = `Opening ${service.name}…`;
-        if (!popup.document.body) {
-          throw new Error("The browser did not initialize the service popup.");
-        }
-        popup.document.body.textContent = `Opening ${service.name} through BerryKeep…`;
+      popup.opener = null;
+      popup.document.title = `Opening ${service.name}…`;
+      if (!popup.document.body) {
+        throw new Error("The browser did not initialize the service popup.");
       }
+      popup.document.body.textContent = `Opening ${service.name} through BerryKeep…`;
       const launch = await launchClientWebService(service.nodeId, service.id);
-      if (popup) {
-        popup.location.replace(launch.url);
-      } else {
-        window.location.assign(launch.url);
-      }
+      popup.location.replace(launch.url);
     } catch (nextError) {
-      popup?.close();
+      popup.close();
       setError(nextError instanceof Error ? nextError.message : String(nextError));
     } finally {
       setLaunching(null);

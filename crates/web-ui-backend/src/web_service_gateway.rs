@@ -973,10 +973,6 @@ fn rewrite_content_security_policy(
     let local_websocket_origin = local_origin
         .strip_prefix("http://")
         .map(|authority| format!("ws://{authority}"));
-    let mut policy = policy.replace(upstream_origin, local_origin);
-    if let (Some(upstream), Some(local)) = (upstream_websocket_origin, local_websocket_origin) {
-        policy = policy.replace(&upstream, &local);
-    }
     policy
         .split(';')
         .map(str::trim)
@@ -987,8 +983,55 @@ fn rewrite_content_security_policy(
                 && !lowercase.starts_with("report-uri ")
                 && !lowercase.starts_with("report-to ")
         })
+        .map(|directive| {
+            rewrite_content_security_policy_directive(
+                directive,
+                upstream_origin,
+                local_origin,
+                upstream_websocket_origin.as_deref(),
+                local_websocket_origin.as_deref(),
+            )
+        })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn rewrite_content_security_policy_directive(
+    directive: &str,
+    upstream_origin: &str,
+    local_origin: &str,
+    upstream_websocket_origin: Option<&str>,
+    local_websocket_origin: Option<&str>,
+) -> String {
+    directive
+        .split_whitespace()
+        .map(|source| {
+            rewrite_content_security_policy_source(source, upstream_origin, local_origin)
+                .or_else(|| {
+                    upstream_websocket_origin
+                        .zip(local_websocket_origin)
+                        .and_then(|(upstream, local)| {
+                            rewrite_content_security_policy_source(source, upstream, local)
+                        })
+                })
+                .unwrap_or_else(|| source.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn rewrite_content_security_policy_source(
+    source: &str,
+    upstream_origin: &str,
+    local_origin: &str,
+) -> Option<String> {
+    if source == upstream_origin {
+        return Some(local_origin.to_string());
+    }
+    source
+        .strip_prefix(upstream_origin)
+        .filter(|suffix| suffix.starts_with('/'))
+        .map(|suffix| format!("{local_origin}{suffix}"))
 }
 
 fn rewrite_location(
@@ -1450,6 +1493,18 @@ mod tests {
                 "default-src http://home-nas.localhost:4100",
                 "script-src http://home-nas.localhost:4100",
             ]
+        );
+    }
+
+    #[test]
+    fn content_security_policy_rewrites_only_complete_sources() {
+        assert_eq!(
+            rewrite_content_security_policy(
+                "default-src https://nas.home; img-src https://nas.homelab.example https://nas.home/images; connect-src wss://nas.home/socket",
+                "https://nas.home",
+                "http://home-nas.localhost:4100",
+            ),
+            "default-src http://home-nas.localhost:4100; img-src https://nas.homelab.example http://home-nas.localhost:4100/images; connect-src ws://home-nas.localhost:4100/socket",
         );
     }
 

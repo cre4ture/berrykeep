@@ -131,6 +131,23 @@ test("private service origins keep the launch cookie and sibling sites isolated"
   }
 });
 
+test("a blocked service popup leaves the client UI open", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.open = () => null;
+  });
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Web services", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Web services" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Open in browser" }).click();
+
+  await expect(
+    page.getByText("The browser blocked the service popup. Allow popups and try again.")
+  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Web services" })).toBeVisible();
+});
+
 async function dispatchCtrlWheel(locator: Locator, deltaY: number): Promise<void> {
   await locator.evaluate((element, wheelDelta) => {
     const rect = element.getBoundingClientRect();

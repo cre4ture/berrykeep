@@ -82,6 +82,12 @@ forwarding the BerryKeep gateway cookie upstream. It also rewrites same-origin
 redirects, cookie domains/base paths, Origin/Referer, and transport-only security
 headers that would incorrectly force local HTTP to HTTPS.
 
+Service origins use `*.localhost`, which is supported by Chromium and Firefox.
+Safari and WebKit/WKWebView (including the embedded iOS UI) resolve only the
+exact `localhost` hostname, so they cannot currently open these isolated service
+origins. When a browser blocks a popup, the client UI remains open and asks the
+user to allow popups before retrying.
+
 Applications that hard-code unrelated absolute public origins can still leave
 the proxy origin; configure the upstream application with root-relative URLs or
 its normal canonical base URL where possible. The integrated proxy deliberately
