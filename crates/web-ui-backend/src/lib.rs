@@ -1733,6 +1733,8 @@ async fn apply_runtime_client(
     });
     runtime.last_rendezvous_probe_error = None;
     runtime.last_rendezvous_probe_statuses = Vec::new();
+    drop(runtime);
+    state.web_service_gateway.clear_service_clients().await;
     push_runtime_log(state, "INFO", "runtime client configuration updated");
     Ok(())
 }

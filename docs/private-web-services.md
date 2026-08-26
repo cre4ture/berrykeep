@@ -86,7 +86,9 @@ Applications that hard-code unrelated absolute public origins can still leave
 the proxy origin; configure the upstream application with root-relative URLs or
 its normal canonical base URL where possible. The integrated proxy deliberately
 does not rewrite HTML or JavaScript bodies. The upstream must accept HTTP/1.1;
-browser-facing HTTP/2 is not required for streaming or WebSocket support.
+browser-facing HTTP/2 is not required for streaming or WebSocket support. The
+gateway keeps a small, short-lived HTTP/1.1 connection pool per node and service
+so page assets reuse authenticated proxy and upstream TLS connections.
 
 Nodes that predate this feature are treated as having no configured web
 services, so clients and nodes can be upgraded incrementally. Opening a service

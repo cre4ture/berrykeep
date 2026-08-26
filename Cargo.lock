@@ -7334,6 +7334,7 @@ dependencies = [
  "sqlite-vfs",
  "tokio",
  "tokio-util",
+ "tower-service",
  "tracing",
  "uuid",
 ]

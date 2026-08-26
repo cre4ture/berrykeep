@@ -1,4 +1,9 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -12,13 +17,17 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use common::NodeId;
-use hyper_util::rt::TokioIo;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::{Connect, Connected, Connection};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use serde::Serialize;
-use tokio::sync::Mutex;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tower_service::Service;
 use uuid::Uuid;
 
-use super::{WebState, cookie_values, current_sdk, error_response};
+use super::{WebRuntime, WebState, cookie_values, current_sdk, error_response};
 
 const SERVICE_HOST_SUFFIX: &str = ".localhost";
 const OPEN_PATH: &str = "/_ironmesh/open";
@@ -27,6 +36,11 @@ const LAUNCH_TOKEN_TTL: Duration = Duration::from_secs(60);
 const SERVICE_SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_PENDING_LAUNCHES: usize = 1_024;
 const MAX_SERVICE_SESSIONS: usize = 2_048;
+const MAX_POOLED_SERVICE_CLIENTS: usize = 256;
+const MAX_IDLE_CONNECTIONS_PER_SERVICE: usize = 4;
+const MAX_CONCURRENT_CONNECTS_PER_SERVICE: usize = 4;
+const SERVICE_CLIENT_TTL: Duration = Duration::from_secs(60);
+const SERVICE_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const LAUNCH_TRANSITION_HTML: &str = concat!(
     "<!doctype html><html><head><meta charset=\"utf-8\">",
     "<meta http-equiv=\"refresh\" content=\"0;url=/\">",
@@ -43,6 +57,7 @@ pub(super) struct WebServiceGateway {
 struct GatewayState {
     launches: HashMap<String, PendingLaunch>,
     sessions: HashMap<String, ServiceSession>,
+    clients: HashMap<(NodeId, String), PooledServiceClient>,
 }
 
 struct PendingLaunch {
@@ -58,6 +73,197 @@ struct ServiceSession {
     node_id: NodeId,
     service_id: String,
     expires_at: Instant,
+}
+
+type ServiceHttpClient = Client<WebServiceConnector, Body>;
+
+#[derive(Clone)]
+struct PooledServiceClient {
+    client: ServiceHttpClient,
+    metadata: ServiceConnectionMetadata,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServiceConnectionMetadata {
+    authority: String,
+    base_path: String,
+    upstream_scheme: String,
+}
+
+#[derive(Clone)]
+struct WebServiceConnector {
+    runtime: Arc<RwLock<WebRuntime>>,
+    node_id: NodeId,
+    service_id: String,
+    metadata: ServiceConnectionMetadata,
+    initial_connection: Arc<Mutex<Option<client_sdk::ironmesh_client::WebServiceProxyConnection>>>,
+    connect_permits: Arc<Semaphore>,
+}
+
+trait ServiceStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> ServiceStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+struct PooledServiceStream {
+    inner: Box<dyn ServiceStream>,
+}
+
+impl ServiceConnectionMetadata {
+    fn from_connection(
+        connection: &client_sdk::ironmesh_client::WebServiceProxyConnection,
+    ) -> Self {
+        Self {
+            authority: connection.authority.clone(),
+            base_path: connection.base_path.clone(),
+            upstream_scheme: connection.upstream_scheme.clone(),
+        }
+    }
+
+    fn absolute_uri(&self, path: &Uri) -> Result<Uri> {
+        let path = path
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        format!("{}://{}{}", self.upstream_scheme, self.authority, path)
+            .parse()
+            .context("failed constructing pooled service request URI")
+    }
+}
+
+impl PooledServiceClient {
+    fn new(
+        runtime: Arc<RwLock<WebRuntime>>,
+        connection: client_sdk::ironmesh_client::WebServiceProxyConnection,
+    ) -> Self {
+        let metadata = ServiceConnectionMetadata::from_connection(&connection);
+        let connector = WebServiceConnector {
+            runtime,
+            node_id: connection.node_id,
+            service_id: connection.service_id.clone(),
+            metadata: metadata.clone(),
+            initial_connection: Arc::new(Mutex::new(Some(connection))),
+            connect_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS_PER_SERVICE)),
+        };
+        Self {
+            client: build_service_http_client(connector),
+            metadata,
+            expires_at: Instant::now() + SERVICE_CLIENT_TTL,
+        }
+    }
+}
+
+fn build_service_http_client<C>(connector: C) -> Client<C, Body>
+where
+    C: Connect + Clone,
+{
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder
+        .pool_timer(TokioTimer::new())
+        .pool_idle_timeout(SERVICE_CONNECTION_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_SERVICE);
+    builder.build(connector)
+}
+
+impl WebServiceConnector {
+    async fn open_connection(
+        &self,
+    ) -> io::Result<client_sdk::ironmesh_client::WebServiceProxyConnection> {
+        if let Some(connection) = self.initial_connection.lock().await.take() {
+            return Ok(connection);
+        }
+        let sdk = self.runtime.read().await.sdk.clone();
+        sdk.open_web_service_proxy(self.node_id, &self.service_id)
+            .await
+            .map_err(|error| io::Error::other(format!("{error:#}")))
+    }
+}
+
+impl Service<Uri> for WebServiceConnector {
+    type Response = TokioIo<PooledServiceStream>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, destination: Uri) -> Self::Future {
+        let connector = self.clone();
+        Box::pin(async move {
+            if destination.scheme_str() != Some(connector.metadata.upstream_scheme.as_str())
+                || destination.authority().map(|value| value.as_str())
+                    != Some(connector.metadata.authority.as_str())
+            {
+                return Err(io::Error::other(
+                    "pooled service connector received an unexpected destination",
+                ));
+            }
+            let permit = Arc::clone(&connector.connect_permits)
+                .acquire_owned()
+                .await
+                .map_err(|_| io::Error::other("pooled service connector was closed"))?;
+            let connection = connector.open_connection().await?;
+            if connection.node_id != connector.node_id
+                || connection.service_id != connector.service_id
+                || ServiceConnectionMetadata::from_connection(&connection) != connector.metadata
+            {
+                return Err(io::Error::other(
+                    "web service configuration changed while opening a pooled connection",
+                ));
+            }
+            drop(permit);
+            Ok(TokioIo::new(PooledServiceStream {
+                inner: Box::new(connection.stream.compat()),
+            }))
+        })
+    }
+}
+
+impl Connection for PooledServiceStream {
+    fn connected(&self) -> Connected {
+        Connected::new()
+    }
+}
+
+impl AsyncRead for PooledServiceStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for PooledServiceStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.inner).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.inner).poll_write_vectored(cx, buffers)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +334,38 @@ impl WebServiceGateway {
                 .cloned()
         })
     }
+
+    async fn service_client(
+        &self,
+        runtime: &Arc<RwLock<WebRuntime>>,
+        node_id: NodeId,
+        service_id: &str,
+    ) -> Result<PooledServiceClient> {
+        let key = (node_id, service_id.to_string());
+        {
+            let mut state = self.state.lock().await;
+            state.prune();
+            if let Some(client) = state.clients.get(&key) {
+                return Ok(client.clone());
+            }
+        }
+
+        let sdk = runtime.read().await.sdk.clone();
+        let connection = sdk.open_web_service_proxy(node_id, service_id).await?;
+        let candidate = PooledServiceClient::new(Arc::clone(runtime), connection);
+        let mut state = self.state.lock().await;
+        state.prune();
+        if let Some(client) = state.clients.get(&key) {
+            return Ok(client.clone());
+        }
+        state.evict_earliest_client_if_full();
+        state.clients.insert(key, candidate.clone());
+        Ok(candidate)
+    }
+
+    pub(super) async fn clear_service_clients(&self) {
+        self.state.lock().await.clients.clear();
+    }
 }
 
 impl GatewayState {
@@ -135,6 +373,7 @@ impl GatewayState {
         let now = Instant::now();
         self.launches.retain(|_, launch| launch.expires_at > now);
         self.sessions.retain(|_, session| session.expires_at > now);
+        self.clients.retain(|_, client| client.expires_at > now);
     }
 
     fn evict_earliest_launch_if_full(&mut self) {
@@ -162,6 +401,20 @@ impl GatewayState {
             .map(|(token, _)| token.clone())
         {
             self.sessions.remove(&token);
+        }
+    }
+
+    fn evict_earliest_client_if_full(&mut self) {
+        if self.clients.len() < MAX_POOLED_SERVICE_CLIENTS {
+            return;
+        }
+        if let Some(key) = self
+            .clients
+            .iter()
+            .min_by_key(|(_, client)| client.expires_at)
+            .map(|(key, _)| key.clone())
+        {
+            self.clients.remove(&key);
         }
     }
 }
@@ -364,40 +617,32 @@ async fn proxy_request(
     local_authority: &str,
     request: &mut Request,
 ) -> Result<Response> {
-    let sdk = current_sdk(state).await;
-    let connection = sdk
-        .open_web_service_proxy(session.node_id, &session.service_id)
+    let service_client = state
+        .web_service_gateway
+        .service_client(&state.runtime, session.node_id, &session.service_id)
         .await?;
-    let upstream_origin = format!("{}://{}", connection.upstream_scheme, connection.authority);
+    let metadata = &service_client.metadata;
+    let upstream_origin = format!("{}://{}", metadata.upstream_scheme, metadata.authority);
     let local_origin = format!("http://{local_authority}");
-    let upstream_path = map_local_path(request.uri(), &connection.base_path)?;
+    let upstream_path = map_local_path(request.uri(), &metadata.base_path)?;
     let upstream_request_uri = upstream_path.clone();
     let websocket = is_websocket_upgrade(request.headers());
     let browser_upgrade = websocket.then(|| hyper::upgrade::on(&mut *request));
 
-    let io = TokioIo::new(connection.stream.compat());
-    let (mut sender, transport) = hyper::client::conn::http1::handshake(io)
-        .await
-        .context("failed starting upstream HTTP connection")?;
-    tokio::spawn(async move {
-        if let Err(error) = transport.with_upgrades().await {
-            tracing::debug!(%error, "web service upstream HTTP connection ended with an error");
-        }
-    });
-
     let (mut parts, body) = std::mem::replace(request, Request::new(Body::empty())).into_parts();
-    parts.uri = upstream_path;
+    parts.uri = metadata.absolute_uri(&upstream_path)?;
     parts.version = axum::http::Version::HTTP_11;
     rewrite_request_headers(
         &mut parts.headers,
-        &connection.authority,
+        &metadata.authority,
         &upstream_origin,
         &local_origin,
         websocket,
     )?;
     let upstream_request = http_request_from_parts(parts, body);
-    let mut upstream_response = sender
-        .send_request(upstream_request)
+    let mut upstream_response = service_client
+        .client
+        .request(upstream_request)
         .await
         .context("configured upstream rejected the HTTP connection")?;
     let status = upstream_response.status();
@@ -431,7 +676,7 @@ async fn proxy_request(
         response.headers_mut(),
         &upstream_origin,
         &local_origin,
-        &connection.base_path,
+        &metadata.base_path,
         &upstream_request_uri,
         upgraded,
     )?;
@@ -855,7 +1100,64 @@ fn apply_service_security_headers(response: &mut Response) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::BodyExt as _;
+    use http_body_util::{BodyExt as _, Full};
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct CountingConnector {
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl Service<Uri> for CountingConnector {
+        type Response = TokioIo<PooledServiceStream>;
+        type Error = io::Error;
+        type Future = std::future::Ready<io::Result<Self::Response>>;
+
+        fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _destination: Uri) -> Self::Future {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(|_request| async {
+                    Ok::<_, Infallible>(hyper::Response::new(Full::new(
+                        hyper::body::Bytes::from_static(b"pooled"),
+                    )))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(server), service)
+                    .await;
+            });
+            std::future::ready(Ok(TokioIo::new(PooledServiceStream {
+                inner: Box::new(client),
+            })))
+        }
+    }
+
+    #[tokio::test]
+    async fn service_http_client_reuses_an_idle_connection() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let client = build_service_http_client(CountingConnector {
+            opens: Arc::clone(&opens),
+        });
+
+        for path in ["one", "two"] {
+            let request = hyper::Request::builder()
+                .uri(format!("http://service.localhost/{path}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "pooled"
+            );
+        }
+
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn gateway_cookie_is_never_forwarded_upstream() {
