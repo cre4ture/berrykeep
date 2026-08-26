@@ -23,6 +23,20 @@ export type AdminSessionStatus = {
   token_override_enabled: boolean;
 };
 
+export type AdminWebService = {
+  id: string;
+  name: string;
+  description?: string | null;
+  upstream_url: string;
+  allowed_device_ids: string[];
+  enabled: boolean;
+  tls_ca_pem?: string | null;
+  tls_certificate_sha256?: string | null;
+  tls_server_name?: string | null;
+};
+
+export type AdminWebServiceUpsertRequest = AdminWebService;
+
 export type AdminSnapshotSummary = {
   id: string;
 } & Record<string, unknown>;

@@ -28,7 +28,8 @@ import {
   IconPhoto,
   IconRefresh,
   IconServer,
-  IconSettings
+  IconSettings,
+  IconWorldWww
 } from "@tabler/icons-react";
 import {
   ColorSchemeControl,
@@ -78,6 +79,7 @@ import { GalleryPage } from "../pages/GalleryPage";
 import { LogsPage } from "../pages/LogsPage";
 import { RequestTimingsPage } from "../pages/RequestTimingsPage";
 import { SettingsPage } from "../pages/SettingsPage";
+import { WebServicesPage } from "../pages/WebServicesPage";
 
 type PageId =
   | "overview"
@@ -85,6 +87,7 @@ type PageId =
   | "rendezvous"
   | "latency"
   | "requestTimings"
+  | "webServices"
   | "store"
   | "explorer"
   | "gallery"
@@ -186,6 +189,12 @@ const pages = [
     label: "Request timings",
     icon: IconActivity,
     description: "Inspect real request time split across server processing, transport, session setup, and relay pairing."
+  },
+  {
+    id: "webServices" as const,
+    label: "Web services",
+    icon: IconWorldWww,
+    description: "Open private node-local web applications through isolated localhost origins."
   },
   {
     id: "store" as const,
@@ -315,6 +324,8 @@ export function ClientShell() {
 
       {activePageId === "requestTimings" ? <RequestTimingsPage /> : null}
 
+      {activePageId === "webServices" ? <WebServicesPage /> : null}
+
       {activePageId === "store" ? <StorePage binaryUpload={binaryUpload} /> : null}
 
       {activePageId === "explorer" ? (
@@ -374,6 +385,7 @@ function parsePageId(value: string | null): PageId | null {
     case "rendezvous":
     case "latency":
     case "requestTimings":
+    case "webServices":
     case "store":
     case "explorer":
     case "gallery":

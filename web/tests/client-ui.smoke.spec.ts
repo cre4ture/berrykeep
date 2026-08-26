@@ -120,6 +120,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Relay via rendezvous-b.local:9443 to node-alpha", { exact: true })).toBeVisible();
   await expect(page.getByText("Hole punching", { exact: true })).toBeVisible();
   await expect(page.getByText("direct path", { exact: true }).first()).toBeVisible();
+  await page.getByText("Web services", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Web services" })).toBeVisible();
+  await expect(page.getByText("Home NAS", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open in browser" })).toBeVisible();
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
   await expect(page.getByText("Recent client runtime logs", { exact: true })).toBeVisible();
@@ -1646,6 +1650,17 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       (pathname === apiV1("/connection-routes/refresh") && method === "POST")
     ) {
       return json(route, connectionRoutesPayload);
+    }
+
+    if (pathname === apiV1("/web-services") && method === "GET") {
+      return json(route, [
+        {
+          id: "home-nas",
+          name: "Home NAS",
+          description: "Private storage administration",
+          nodeId: "0198e5b8-8bb4-7cc0-a6d7-8648251845b8"
+        }
+      ]);
     }
 
     if (pathname === apiV1("/logs") && method === "GET") {

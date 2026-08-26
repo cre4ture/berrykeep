@@ -260,6 +260,12 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByRole("button", { name: "Revoke credential" }).click();
   await expect(page.getByText("manual smoke revocation")).toBeVisible();
 
+  await page.getByText("Web Services", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Web Services" })).toBeVisible();
+  await expect(page.getByText("Home NAS", { exact: true })).toBeVisible();
+  await expect(page.getByText("certificate pin", { exact: true })).toBeVisible();
+  await expect(page.getByText("https://nas.home.arpa:8443/", { exact: true })).toBeVisible();
+
   await page.getByText("S3", { exact: true }).click();
   await expect(page.getByText("Listener and replication status", { exact: true })).toBeVisible();
   await expect(page.getByText("Bucket mappings", { exact: true })).toBeVisible();
@@ -1735,6 +1741,19 @@ async function installServerAdminMocks(
     }
   ];
   let nextS3AccessKeySuffix = 2;
+  const webServices = [
+    {
+      id: "home-nas",
+      name: "Home NAS",
+      description: "Private storage administration",
+      upstream_url: "https://nas.home.arpa:8443/",
+      allowed_device_ids: ["client-credential-b"],
+      enabled: true,
+      tls_ca_pem: null,
+      tls_certificate_sha256: "11".repeat(32),
+      tls_server_name: "nas.home.arpa"
+    }
+  ];
   const bootstrapBundle = {
     cluster_id: "cluster-alpha",
     relay_mode: "relay-preferred",
@@ -2979,6 +2998,36 @@ async function installServerAdminMocks(
 
     if (pathname === apiV1("/auth/client-credentials") && method === "GET") {
       return json(route, buildCredentialList(revokedDeviceIds));
+    }
+
+    if (pathname === apiV1("/auth/web-services") && method === "GET") {
+      return json(route, webServices);
+    }
+
+    if (pathname === apiV1("/auth/web-services") && method === "POST") {
+      const service = route.request().postDataJSON() as (typeof webServices)[number];
+      webServices.push(service);
+      return json(route, service);
+    }
+
+    if (pathname.startsWith(`${apiV1("/auth/web-services")}/`) && method === "PUT") {
+      const service = route.request().postDataJSON() as (typeof webServices)[number];
+      const serviceId = decodeURIComponent(pathname.split("/").pop() ?? "");
+      const index = webServices.findIndex((entry) => entry.id === serviceId);
+      if (index >= 0) {
+        webServices[index] = service;
+      }
+      return json(route, service);
+    }
+
+    if (pathname.startsWith(`${apiV1("/auth/web-services")}/`) && method === "DELETE") {
+      const serviceId = decodeURIComponent(pathname.split("/").pop() ?? "");
+      const index = webServices.findIndex((entry) => entry.id === serviceId);
+      if (index >= 0) {
+        webServices.splice(index, 1);
+      }
+      await route.fulfill({ status: 204, body: "" });
+      return;
     }
 
     if (pathname === apiV1("/auth/bootstrap-claims") && method === "GET") {
