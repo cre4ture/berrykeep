@@ -177,12 +177,13 @@ Focal container receives that already verified executable through
 `build-local-debs.sh --prebuilt-server-node`; only the client and rendezvous
 components are compiled in the distribution container.
 
-On pull requests, add the `ci:debian-packages` label to exercise the AMD64
-binary-package handoff too. The `Linux binaries` job builds the non-server
-bundle, and `Debian packages` combines it with the static Server Node. Both
-package workflows produce `ironmesh-server-node`, the optional
-`ironmesh-server-node-map-tools`, `ironmesh-client`, and
-`ironmesh-rendezvous-service`.
+On pull requests, add the `ci:debian-packages` label to run the full Debian
+package validation on both published architectures. It enables the native
+Focal ARM64 package build as well as the AMD64 binary-package handoff: the
+`Linux binaries` job builds the non-server bundle, and `Debian packages`
+combines it with the static Server Node. Both package workflows produce
+`ironmesh-server-node`, the optional `ironmesh-server-node-map-tools`,
+`ironmesh-client`, and `ironmesh-rendezvous-service`.
 
 For a local static build, install the web workspace dependencies and ELF tools,
 then run:
