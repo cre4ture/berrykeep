@@ -12,6 +12,21 @@ type GalleryMapClusterGridPayload = {
   }>;
 };
 
+type GalleryMapClusterGridData = {
+  type: "FeatureCollection";
+  features: Array<{
+    type: "Feature";
+    properties: {
+      clusterId: string;
+      count: number;
+    };
+    geometry: {
+      type: "Polygon";
+      coordinates: number[][][];
+    };
+  }>;
+};
+
 export function updateGalleryMapClusterGrid(
   map: maplibregl.Map,
   payload: GalleryMapClusterGridPayload | null
@@ -22,6 +37,7 @@ export function updateGalleryMapClusterGrid(
   }
 
   const gridData = galleryMapClusterGridData(payload);
+  updateGalleryMapClusterGridDiagnostics(map, gridData);
   const source = map.getSource(GALLERY_MAP_CLUSTER_GRID_SOURCE_ID) as GeoJSONSource | undefined;
   if (source) {
     source.setData(gridData);
@@ -55,7 +71,7 @@ export function updateGalleryMapClusterGrid(
 
 function galleryMapClusterGridData(
   payload: GalleryMapClusterGridPayload
-): Parameters<GeoJSONSource["setData"]>[0] {
+): GalleryMapClusterGridData {
   const resolution = Math.floor(payload.resolution);
   if (!Number.isFinite(resolution) || resolution < 1) {
     return { type: "FeatureCollection", features: [] };
@@ -91,6 +107,25 @@ function galleryMapClusterGridData(
   };
 }
 
+function updateGalleryMapClusterGridDiagnostics(
+  map: maplibregl.Map,
+  gridData: GalleryMapClusterGridData
+) {
+  const container = map.getContainer();
+  container.dataset.galleryMapClusterGridCells = String(gridData.features.length);
+
+  const firstCell = gridData.features[0];
+  if (!firstCell) {
+    delete container.dataset.galleryMapClusterGridFirstCell;
+    delete container.dataset.galleryMapClusterGridFirstClusterId;
+    return;
+  }
+
+  const [[west, south], [east], [, north]] = firstCell.geometry.coordinates[0];
+  container.dataset.galleryMapClusterGridFirstCell = [west, south, east, north].join(",");
+  container.dataset.galleryMapClusterGridFirstClusterId = firstCell.properties.clusterId;
+}
+
 function galleryMapClusterGridCell(clusterId: string, resolution: number) {
   const [cellX, cellY, ...extraParts] = clusterId.split("_");
   if (extraParts.length > 0) {
@@ -123,6 +158,11 @@ function webMercatorLatitudeForGridY(y: number): number {
 }
 
 function removeGalleryMapClusterGrid(map: maplibregl.Map) {
+  const container = map.getContainer();
+  delete container.dataset.galleryMapClusterGridCells;
+  delete container.dataset.galleryMapClusterGridFirstCell;
+  delete container.dataset.galleryMapClusterGridFirstClusterId;
+
   if (map.getLayer(GALLERY_MAP_CLUSTER_GRID_LINE_LAYER_ID)) {
     map.removeLayer(GALLERY_MAP_CLUSTER_GRID_LINE_LAYER_ID);
   }

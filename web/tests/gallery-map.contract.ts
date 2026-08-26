@@ -127,13 +127,34 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await expect(page.locator('[data-gallery-map-cluster-grid="true"]')).toHaveCount(0);
     await page.getByText("Show cluster cells (debug)", { exact: true }).click();
     await expect(clusterGridSwitch).toBeChecked();
-    await expect(page.locator('[data-gallery-map-cluster-grid="true"]')).toHaveAttribute(
+    const clusterGridBadge = page.locator('[data-gallery-map-cluster-grid="true"]');
+    await expect(clusterGridBadge).toHaveAttribute(
       "data-resolution",
       /\d+/
     );
+    const clusterGrid = page.locator("[data-gallery-map-cluster-grid-cells]");
+    await expect(clusterGrid).toHaveAttribute("data-gallery-map-cluster-grid-cells", /[1-9]\d*/);
+    const resolution = Number(await clusterGridBadge.getAttribute("data-resolution"));
+    const firstClusterId = await clusterGrid.getAttribute(
+      "data-gallery-map-cluster-grid-first-cluster-id"
+    );
+    const firstCell = (await clusterGrid.getAttribute("data-gallery-map-cluster-grid-first-cell"))
+      ?.split(",")
+      .map(Number);
+    expect(Number.isInteger(resolution)).toBe(true);
+    expect(firstClusterId).toMatch(/^\d+_\d+$/);
+    expect(firstCell).toHaveLength(4);
+    const [cellX, cellY] = firstClusterId!.split("_").map(Number);
+    expect(firstCell).toEqual([
+      (cellX / resolution) * 360 - 180,
+      webMercatorLatitudeForGridY((cellY + 1) / resolution),
+      ((cellX + 1) / resolution) * 360 - 180,
+      webMercatorLatitudeForGridY(cellY / resolution)
+    ]);
     await page.getByText("Show cluster cells (debug)", { exact: true }).click();
     await expect(clusterGridSwitch).not.toBeChecked();
     await expect(page.locator('[data-gallery-map-cluster-grid="true"]')).toHaveCount(0);
+    await expect(page.locator("[data-gallery-map-cluster-grid-cells]")).toHaveCount(0);
     const fractionalMapRequest = page.waitForRequest((request) => {
       const url = new URL(request.url());
       const zoom = Number(url.searchParams.get("zoom_precise"));
@@ -238,6 +259,10 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await expect(page.getByRole("dialog", { name: "2 items in map cluster" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Open map cluster with 2 items" })).toHaveCount(0);
   });
+}
+
+function webMercatorLatitudeForGridY(y: number): number {
+  return (Math.atan(Math.sinh(Math.PI * (1 - 2 * y))) * 180) / Math.PI;
 }
 
 export function createInitialOverviewGalleryEntries() {
