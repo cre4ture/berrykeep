@@ -44,6 +44,16 @@ fn direct_quic_relay_urls_are_trimmed_and_deduplicated() {
 }
 
 #[test]
+fn reconciliation_object_paths_encode_store_keys_before_transport() {
+    let path = super::build_reconciliation_object_path("map/clusters", "version/1");
+
+    assert_eq!(path, "/store/map%2Fclusters?version=version%2F1");
+    assert!(super::transport_service::is_streamed_object_read_path(
+        &path
+    ));
+}
+
+#[test]
 fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
     let tickets = HashMap::from([
         (
@@ -2007,7 +2017,8 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
             west: Some(-180.0),
             north: Some(90.0),
             east: Some(180.0),
-            zoom: Some(20),
+            zoom: Some(3),
+            zoom_precise: Some(3.75),
         },
         super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
     )
@@ -2017,6 +2028,7 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
         serde_json::from_slice(&to_bytes(clusters.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(clusters_payload["total_entry_count"], 2);
     assert_eq!(clusters_payload["visible_geotagged_count"], 2);
+    assert_eq!(clusters_payload["zoom"].as_u64(), Some(3));
     assert_eq!(clusters_payload["clusters"].as_array().unwrap().len(), 1);
     assert_eq!(clusters_payload["clusters"][0]["count"], 2);
     let query_token = clusters_payload["query_token"].as_str().unwrap();
@@ -12093,6 +12105,115 @@ run_on_main_metadata_backends!(
     multiplex_transport_map_config_routes_to_authenticated_client_api_impl,
     multiplex_transport_map_config_routes_to_authenticated_client_api,
     multiplex_transport_map_config_routes_to_authenticated_client_api_turso
+);
+
+async fn gallery_map_routes_match_over_public_and_multiplex_transport_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let query = "?depth=64&media_filter=all&south=-90&west=-180&north=90&east=180&zoom=1";
+    let paths = [
+        format!("/api/v1/gallery/map/clusters{query}"),
+        format!("/api/v1/store/map/clusters{query}"),
+    ];
+    let app = super::build_server_apps(&state).public_app;
+    let mut public_payloads = Vec::new();
+    let mut transport_payloads = Vec::new();
+
+    for path in paths {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "public path {path}");
+        public_payloads.push(
+            serde_json::from_slice::<serde_json::Value>(
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            )
+            .expect("public gallery map response should be JSON"),
+        );
+
+        let request = transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "GET",
+            path,
+            Vec::new(),
+            Vec::new(),
+        );
+        let response = super::transport_service::execute_buffered_transport_request(
+            &state,
+            &super::transport_service::TransportExecutionScope::Public,
+            &request,
+        )
+        .await
+        .expect("multiplex gallery map request should execute");
+        assert_eq!(response.status, StatusCode::OK.as_u16());
+        transport_payloads.push(
+            serde_json::from_slice::<serde_json::Value>(&response.body)
+                .expect("multiplex gallery map response should be JSON"),
+        );
+    }
+
+    assert_eq!(public_payloads[0], public_payloads[1]);
+    assert_eq!(transport_payloads[0], transport_payloads[1]);
+    assert_eq!(public_payloads[0], transport_payloads[0]);
+
+    for path in [
+        "/api/v1/gallery/map/cluster-entries?query_token=malformed&cluster_id=0_0",
+        "/api/v1/store/map/cluster-entries?query_token=malformed&cluster_id=0_0",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "public cluster entries path {path} must reach its handler"
+        );
+
+        let request = transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "GET",
+            path,
+            Vec::new(),
+            Vec::new(),
+        );
+        let response = super::transport_service::execute_buffered_transport_request(
+            &state,
+            &super::transport_service::TransportExecutionScope::Public,
+            &request,
+        )
+        .await
+        .expect("multiplex cluster entries request should execute");
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST.as_u16(),
+            "multiplex cluster entries path {path} must reach its handler"
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    gallery_map_routes_match_over_public_and_multiplex_transport_impl,
+    gallery_map_routes_match_over_public_and_multiplex_transport,
+    gallery_map_routes_match_over_public_and_multiplex_transport_turso
 );
 
 async fn rendezvous_contact_configuration_is_versioned_and_available_over_authenticated_transport_impl(

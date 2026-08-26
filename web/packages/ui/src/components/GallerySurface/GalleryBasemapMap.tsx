@@ -322,7 +322,7 @@ export function GalleryBasemapMap({
           }
           const viewport = galleryViewportForMap(map);
           if (viewport) {
-            onViewportChangeRef.current(viewport, Math.floor(map.getZoom()));
+            onViewportChangeRef.current(viewport, map.getZoom());
           }
         };
         const markInteractionEnd = () => {
@@ -442,18 +442,32 @@ export function GalleryBasemapMap({
       return;
     }
 
-    appliedInitialOverviewRef.current = initialOverviewPayload;
-    const bounds = boundsForClusters(initialOverviewPayload.clusters);
-    if (!bounds) {
-      emitViewportRequestRef.current();
+    const applyInitialOverview = () => {
+      // `load` can occur before a newly visible map has its final dimensions.
+      // Resize before fitting so the initial cluster bounds are calculated for
+      // the rendered viewport rather than the previous zero-sized canvas.
+      map.resize();
+      appliedInitialOverviewRef.current = initialOverviewPayload;
+      const bounds = boundsForClusters(initialOverviewPayload.clusters);
+      if (!bounds) {
+        emitViewportRequestRef.current();
+        return;
+      }
+
+      map.fitBounds(bounds, {
+        padding: 72,
+        maxZoom: 11,
+        duration: 0
+      });
+    };
+
+    if (typeof window === "undefined") {
+      applyInitialOverview();
       return;
     }
 
-    map.fitBounds(bounds, {
-      padding: 72,
-      maxZoom: 11,
-      duration: 0
-    });
+    const frameId = window.requestAnimationFrame(applyInitialOverview);
+    return () => window.cancelAnimationFrame(frameId);
   }, [initialOverviewPayload, mapReady]);
 
   useEffect(() => {

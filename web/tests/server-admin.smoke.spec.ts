@@ -1493,6 +1493,31 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("server-admin gallery falls back to an older map API", async ({ page }) => {
+  const mapRequestPaths: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.includes("/map/clusters")) {
+      mapRequestPaths.push(url.pathname);
+    }
+  });
+  await installServerAdminMocks(page, {
+    galleryEntries: createClusteredAdminGalleryEntries(12),
+    legacyGalleryMapApiOnly: true
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.keyboard.press("Escape");
+  await page.getByText("Gallery", { exact: true }).click();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect.poll(() => mapRequestPaths).toContain(apiV1("/auth/gallery/map/clusters"));
+  await expect.poll(() => mapRequestPaths).toContain(apiV1("/auth/store/map/clusters"));
+});
+
 test("server-admin provisioning falls back to the full bootstrap bundle when claim issuance returns 502", async ({ page }) => {
   await installServerAdminMocks(page, { bootstrapClaimMode: "bad_gateway" });
 
@@ -1665,6 +1690,7 @@ async function installServerAdminMocks(
     mapMetadataCenter?: [number, number, number];
     mapConfiguration?: GalleryMapConfiguration;
     mapConfigurationStatus?: number;
+    legacyGalleryMapApiOnly?: boolean;
   }
 ) {
   const imageBody = tinyPngBuffer();
@@ -2042,11 +2068,38 @@ async function installServerAdminMocks(
       return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
     }
 
-    if (pathname === apiV1("/auth/store/map/clusters") && method === "GET") {
+    if (
+      pathname === apiV1("/auth/gallery/map/clusters") &&
+      method === "GET" &&
+      options?.legacyGalleryMapApiOnly
+    ) {
+      await route.fulfill({ status: 404, contentType: "application/json", body: "{}" });
+      return;
+    }
+
+    if (
+      method === "GET" &&
+      ((pathname === apiV1("/auth/gallery/map/clusters") && !options?.legacyGalleryMapApiOnly) ||
+        (pathname === apiV1("/auth/store/map/clusters") && options?.legacyGalleryMapApiOnly))
+    ) {
       return json(route, galleryMapMock.clusters(galleryEntries, searchParams));
     }
 
-    if (pathname === apiV1("/auth/store/map/cluster-entries") && method === "GET") {
+    if (
+      pathname === apiV1("/auth/gallery/map/cluster-entries") &&
+      method === "GET" &&
+      options?.legacyGalleryMapApiOnly
+    ) {
+      await route.fulfill({ status: 404, contentType: "application/json", body: "{}" });
+      return;
+    }
+
+    if (
+      method === "GET" &&
+      ((pathname === apiV1("/auth/gallery/map/cluster-entries") &&
+        !options?.legacyGalleryMapApiOnly) ||
+        (pathname === apiV1("/auth/store/map/cluster-entries") && options?.legacyGalleryMapApiOnly))
+    ) {
       return json(route, galleryMapMock.clusterEntries(searchParams));
     }
 

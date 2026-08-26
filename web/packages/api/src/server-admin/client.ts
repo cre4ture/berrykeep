@@ -1,4 +1,5 @@
-import { fetchJson } from "../shared/http";
+import { fetchJson, isHttpErrorStatus } from "../shared/http";
+import { galleryMapClusterZoomParameters } from "../shared/store-index";
 import type {
   GalleryMapClusterEntriesResponse,
   GalleryMapClustersRequest,
@@ -91,6 +92,20 @@ type AdminRequestOptions = {
 };
 
 const API_V1_PREFIX = "/api/v1";
+type GalleryMapEndpoint = "clusters" | "clusterEntries";
+
+const galleryMapEndpointPaths = {
+  clusters: {
+    canonical: "/auth/gallery/map/clusters",
+    legacy: "/auth/store/map/clusters"
+  },
+  clusterEntries: {
+    canonical: "/auth/gallery/map/cluster-entries",
+    legacy: "/auth/store/map/cluster-entries"
+  }
+} as const;
+
+const galleryMapEndpointRoutes = new Map<GalleryMapEndpoint, "canonical" | "legacy">();
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
@@ -121,6 +136,29 @@ async function fetchAdminJson<T>(
     ),
     body: options?.body === undefined ? undefined : JSON.stringify(options.body)
   });
+}
+
+async function fetchAdminGalleryMapJson<T>(
+  endpoint: GalleryMapEndpoint,
+  query: URLSearchParams,
+  adminTokenOverride?: string
+): Promise<T> {
+  const paths = galleryMapEndpointPaths[endpoint];
+  let route = galleryMapEndpointRoutes.get(endpoint) ?? "canonical";
+  try {
+    return await fetchAdminJson<T>(`${apiV1(paths[route])}?${query.toString()}`, {
+      adminTokenOverride
+    });
+  } catch (error) {
+    if (route !== "canonical" || !isHttpErrorStatus(error, 404)) {
+      throw error;
+    }
+    route = "legacy";
+    galleryMapEndpointRoutes.set(endpoint, route);
+    return fetchAdminJson<T>(`${apiV1(paths[route])}?${query.toString()}`, {
+      adminTokenOverride
+    });
+  }
 }
 
 export async function getAdminSessionStatus(
@@ -206,6 +244,7 @@ export async function getAdminGalleryMapClusters(
   request: GalleryMapClustersRequest,
   adminTokenOverride?: string
 ): Promise<GalleryMapClustersResponse> {
+  const { zoom, zoomPrecise } = galleryMapClusterZoomParameters(request.zoom);
   const query = new URLSearchParams({
     depth: String(Math.max(1, Math.floor(request.depth))),
     media_filter: request.mediaFilter,
@@ -213,14 +252,16 @@ export async function getAdminGalleryMapClusters(
     west: String(request.viewport.west),
     north: String(request.viewport.north),
     east: String(request.viewport.east),
-    zoom: String(Math.max(0, Math.min(20, Math.floor(request.zoom))))
+    zoom: String(zoom),
+    zoom_precise: String(zoomPrecise)
   });
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());
   }
-  return fetchAdminJson<GalleryMapClustersResponse>(
-    `${apiV1("/auth/store/map/clusters")}?${query.toString()}`,
-    { adminTokenOverride }
+  return fetchAdminGalleryMapJson<GalleryMapClustersResponse>(
+    "clusters",
+    query,
+    adminTokenOverride
   );
 }
 
@@ -237,9 +278,10 @@ export async function getAdminGalleryMapClusterEntries(
     offset: String(Math.max(0, Math.floor(offset))),
     limit: String(Math.max(1, Math.floor(limit)))
   });
-  return fetchAdminJson<GalleryMapClusterEntriesResponse>(
-    `${apiV1("/auth/store/map/cluster-entries")}?${query.toString()}`,
-    { adminTokenOverride }
+  return fetchAdminGalleryMapJson<GalleryMapClusterEntriesResponse>(
+    "clusterEntries",
+    query,
+    adminTokenOverride
   );
 }
 

@@ -85,6 +85,10 @@ const STORE_INDEX_WAIT_DEFAULT_TIMEOUT_MS: u64 = 25_000;
 const STORE_INDEX_WAIT_MIN_TIMEOUT_MS: u64 = 250;
 const STORE_INDEX_WAIT_MAX_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
+const GALLERY_MAP_CLUSTERS_PATH: &str = "/gallery/map/clusters";
+const GALLERY_MAP_CLUSTER_ENTRIES_PATH: &str = "/gallery/map/cluster-entries";
+const LEGACY_GALLERY_MAP_CLUSTERS_PATH: &str = "/store/map/clusters";
+const LEGACY_GALLERY_MAP_CLUSTER_ENTRIES_PATH: &str = "/store/map/cluster-entries";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestedRange {
@@ -187,6 +191,41 @@ pub struct IronMeshClient {
     connection_name: Option<String>,
     connection_diagnostic_impact: ClientConnectionDiagnosticImpact,
     upload_session_affinities: Arc<Mutex<HashMap<String, NodeRouteAffinity>>>,
+    gallery_map_api_routes: Arc<RwLock<GalleryMapApiRoutes>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum GalleryMapApiRoute {
+    #[default]
+    Canonical,
+    Legacy,
+}
+
+impl GalleryMapApiRoute {
+    const fn path(self, endpoint: GalleryMapApiEndpoint) -> &'static str {
+        match (self, endpoint) {
+            (Self::Canonical, GalleryMapApiEndpoint::Clusters) => GALLERY_MAP_CLUSTERS_PATH,
+            (Self::Canonical, GalleryMapApiEndpoint::ClusterEntries) => {
+                GALLERY_MAP_CLUSTER_ENTRIES_PATH
+            }
+            (Self::Legacy, GalleryMapApiEndpoint::Clusters) => LEGACY_GALLERY_MAP_CLUSTERS_PATH,
+            (Self::Legacy, GalleryMapApiEndpoint::ClusterEntries) => {
+                LEGACY_GALLERY_MAP_CLUSTER_ENTRIES_PATH
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GalleryMapApiEndpoint {
+    Clusters,
+    ClusterEntries,
+}
+
+#[derive(Debug, Default)]
+struct GalleryMapApiRoutes {
+    clusters: GalleryMapApiRoute,
+    cluster_entries: GalleryMapApiRoute,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -3505,7 +3544,7 @@ pub struct GalleryMapClustersRequest {
     pub depth: usize,
     pub media_filter: StoreIndexMediaFilter,
     pub viewport: StoreIndexViewport,
-    pub zoom: u8,
+    pub zoom: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -3539,6 +3578,7 @@ pub struct GallerySummaryStatus {
 pub struct GalleryMapClustersResponse {
     pub prefix: String,
     pub depth: usize,
+    /// Integral legacy wire field. The precise request zoom only affects resolution.
     pub zoom: u8,
     pub resolution: u32,
     pub total_entry_count: usize,
@@ -3553,6 +3593,13 @@ pub struct GalleryMapClustersResponse {
     pub query_token: String,
     #[serde(default)]
     pub clusters: Vec<GalleryMapCluster>,
+}
+
+fn gallery_map_zoom_for_request(zoom: f64) -> Result<f64> {
+    if !zoom.is_finite() {
+        bail!("zoom must be a finite number");
+    }
+    Ok(zoom.clamp(0.0, 20.0))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3781,6 +3828,7 @@ impl IronMeshClient {
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
+            gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
         }
     }
 
@@ -3836,6 +3884,7 @@ impl IronMeshClient {
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
+            gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
         }
     }
 
@@ -3863,6 +3912,7 @@ impl IronMeshClient {
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
+            gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
         }
     }
 
@@ -3914,6 +3964,7 @@ impl IronMeshClient {
             connection_name: None,
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
+            gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
         })
     }
 
@@ -5168,43 +5219,124 @@ impl IronMeshClient {
         runtime.block_on(self.wait_for_store_index_change(since, timeout_ms))
     }
 
+    fn gallery_map_api_route(&self, endpoint: GalleryMapApiEndpoint) -> GalleryMapApiRoute {
+        let routes = self
+            .gallery_map_api_routes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match endpoint {
+            GalleryMapApiEndpoint::Clusters => routes.clusters,
+            GalleryMapApiEndpoint::ClusterEntries => routes.cluster_entries,
+        }
+    }
+
+    fn remember_gallery_map_api_route(
+        &self,
+        endpoint: GalleryMapApiEndpoint,
+        route: GalleryMapApiRoute,
+    ) {
+        let mut routes = self
+            .gallery_map_api_routes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match endpoint {
+            GalleryMapApiEndpoint::Clusters => routes.clusters = route,
+            GalleryMapApiEndpoint::ClusterEntries => routes.cluster_entries = route,
+        }
+    }
+
+    fn gallery_map_clusters_url(
+        &self,
+        path: &str,
+        request: &GalleryMapClustersRequest,
+        zoom: u8,
+        zoom_precise: f64,
+    ) -> Result<Url> {
+        let mut url = self.relative_url(path)?;
+        let mut query = url.query_pairs_mut();
+        if let Some(prefix) = request
+            .prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            query.append_pair("prefix", prefix);
+        }
+        query
+            .append_pair("depth", &request.depth.max(1).to_string())
+            .append_pair("media_filter", request.media_filter.as_query_value())
+            .append_pair("south", &request.viewport.south.to_string())
+            .append_pair("west", &request.viewport.west.to_string())
+            .append_pair("north", &request.viewport.north.to_string())
+            .append_pair("east", &request.viewport.east.to_string())
+            .append_pair("zoom", &zoom.to_string())
+            .append_pair("zoom_precise", &zoom_precise.to_string());
+        drop(query);
+        Ok(url)
+    }
+
+    fn gallery_map_cluster_entries_url(
+        &self,
+        path: &str,
+        query_token: &str,
+        cluster_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Url> {
+        let mut url = self.relative_url(path)?;
+        url.query_pairs_mut()
+            .append_pair("query_token", query_token)
+            .append_pair("cluster_id", cluster_id)
+            .append_pair("offset", &offset.to_string())
+            .append_pair("limit", &limit.max(1).to_string());
+        Ok(url)
+    }
+
     pub async fn gallery_map_clusters(
         &self,
         request: GalleryMapClustersRequest,
     ) -> Result<GalleryMapClustersResponse> {
-        let mut url = self.relative_url("/store/map/clusters")?;
-        {
-            let mut query = url.query_pairs_mut();
-            if let Some(prefix) = request
-                .prefix
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                query.append_pair("prefix", prefix);
-            }
-            query
-                .append_pair("depth", &request.depth.max(1).to_string())
-                .append_pair("media_filter", request.media_filter.as_query_value())
-                .append_pair("south", &request.viewport.south.to_string())
-                .append_pair("west", &request.viewport.west.to_string())
-                .append_pair("north", &request.viewport.north.to_string())
-                .append_pair("east", &request.viewport.east.to_string())
-                .append_pair("zoom", &request.zoom.min(20).to_string());
-        }
-        let response = self
-            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+        let zoom_precise = gallery_map_zoom_for_request(request.zoom)?;
+        let zoom = zoom_precise.floor() as u8;
+        let endpoint = GalleryMapApiEndpoint::Clusters;
+        let mut route = self.gallery_map_api_route(endpoint);
+        let mut response = self
+            .execute_buffered_request(
+                Method::GET,
+                self.gallery_map_clusters_url(route.path(endpoint), &request, zoom, zoom_precise)?,
+                Vec::new(),
+                None,
+            )
             .await
-            .context("failed to request /store/map/clusters")?;
+            .with_context(|| format!("failed to request {}", route.path(endpoint)))?;
+        if route == GalleryMapApiRoute::Canonical && response.status == StatusCode::NOT_FOUND {
+            route = GalleryMapApiRoute::Legacy;
+            self.remember_gallery_map_api_route(endpoint, route);
+            response = self
+                .execute_buffered_request(
+                    Method::GET,
+                    self.gallery_map_clusters_url(
+                        route.path(endpoint),
+                        &request,
+                        zoom,
+                        zoom_precise,
+                    )?,
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .with_context(|| format!("failed to request {}", route.path(endpoint)))?;
+        }
         if !response.status.is_success() {
             bail!(
-                "/store/map/clusters returned non-success status: {} body={}",
+                "{} returned non-success status: {} body={}",
+                route.path(endpoint),
                 response.status,
                 String::from_utf8_lossy(&response.body)
             );
         }
         serde_json::from_slice(&response.body)
-            .context("failed to parse /store/map/clusters response")
+            .with_context(|| format!("failed to parse {} response", route.path(endpoint)))
     }
 
     pub async fn gallery_map_cluster_entries(
@@ -5214,25 +5346,52 @@ impl IronMeshClient {
         offset: usize,
         limit: usize,
     ) -> Result<GalleryMapClusterEntriesResponse> {
-        let mut url = self.relative_url("/store/map/cluster-entries")?;
-        url.query_pairs_mut()
-            .append_pair("query_token", query_token)
-            .append_pair("cluster_id", cluster_id)
-            .append_pair("offset", &offset.to_string())
-            .append_pair("limit", &limit.max(1).to_string());
-        let response = self
-            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+        let endpoint = GalleryMapApiEndpoint::ClusterEntries;
+        let mut route = self.gallery_map_api_route(endpoint);
+        let mut response = self
+            .execute_buffered_request(
+                Method::GET,
+                self.gallery_map_cluster_entries_url(
+                    route.path(endpoint),
+                    query_token,
+                    cluster_id,
+                    offset,
+                    limit,
+                )?,
+                Vec::new(),
+                None,
+            )
             .await
-            .context("failed to request /store/map/cluster-entries")?;
+            .with_context(|| format!("failed to request {}", route.path(endpoint)))?;
+        if route == GalleryMapApiRoute::Canonical && response.status == StatusCode::NOT_FOUND {
+            route = GalleryMapApiRoute::Legacy;
+            self.remember_gallery_map_api_route(endpoint, route);
+            response = self
+                .execute_buffered_request(
+                    Method::GET,
+                    self.gallery_map_cluster_entries_url(
+                        route.path(endpoint),
+                        query_token,
+                        cluster_id,
+                        offset,
+                        limit,
+                    )?,
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .with_context(|| format!("failed to request {}", route.path(endpoint)))?;
+        }
         if !response.status.is_success() {
             bail!(
-                "/store/map/cluster-entries returned non-success status: {} body={}",
+                "{} returned non-success status: {} body={}",
+                route.path(endpoint),
                 response.status,
                 String::from_utf8_lossy(&response.body)
             );
         }
         serde_json::from_slice(&response.body)
-            .context("failed to parse /store/map/cluster-entries response")
+            .with_context(|| format!("failed to parse {} response", route.path(endpoint)))
     }
 
     pub async fn store_index_delta(
@@ -8476,6 +8635,7 @@ fn normalize_client_api_path(path: &str) -> Cow<'_, str> {
         || path_only.starts_with("/auth/")
         || path_only.starts_with("/storage/")
         || path_only.starts_with("/media/")
+        || path_only.starts_with("/gallery/")
         || path_only.starts_with("/maps/")
         || path_only.starts_with("/maintenance/")
     {

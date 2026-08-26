@@ -1,5 +1,6 @@
-import { fetchJson } from "../shared/http";
+import { fetchJson, isHttpErrorStatus } from "../shared/http";
 import type { GalleryMapConfigurationResponse } from "../shared/map-config";
+import { galleryMapClusterZoomParameters } from "../shared/store-index";
 import type {
   GalleryMapClusterEntriesResponse,
   GalleryMapClustersRequest,
@@ -49,6 +50,20 @@ export type BinaryUploadOptions = {
 
 const API_V1_PREFIX = "/api/v1";
 const DIAGNOSTIC_CONTEXT_HEADER = "x-ironmesh-diagnostic-context";
+type GalleryMapEndpoint = "clusters" | "clusterEntries";
+
+const galleryMapEndpointPaths = {
+  clusters: {
+    canonical: "/gallery/map/clusters",
+    legacy: "/store/map/clusters"
+  },
+  clusterEntries: {
+    canonical: "/gallery/map/cluster-entries",
+    legacy: "/store/map/cluster-entries"
+  }
+} as const;
+
+const galleryMapEndpointRoutes = new Map<GalleryMapEndpoint, "canonical" | "legacy">();
 
 export type ClientDiagnosticRequestOptions = {
   diagnosticContext?: string;
@@ -56,6 +71,24 @@ export type ClientDiagnosticRequestOptions = {
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
+}
+
+async function fetchGalleryMapJson<T>(
+  endpoint: GalleryMapEndpoint,
+  query: URLSearchParams
+): Promise<T> {
+  const paths = galleryMapEndpointPaths[endpoint];
+  let route = galleryMapEndpointRoutes.get(endpoint) ?? "canonical";
+  try {
+    return await fetchJson<T>(`${apiV1(paths[route])}?${query.toString()}`);
+  } catch (error) {
+    if (route !== "canonical" || !isHttpErrorStatus(error, 404)) {
+      throw error;
+    }
+    route = "legacy";
+    galleryMapEndpointRoutes.set(endpoint, route);
+    return fetchJson<T>(`${apiV1(paths[route])}?${query.toString()}`);
+  }
 }
 
 export async function getClientPing(
@@ -223,9 +256,7 @@ export async function getGalleryMapClusters(
   request: GalleryMapClustersRequest
 ): Promise<GalleryMapClustersResponse> {
   const query = galleryMapClusterQuery(request);
-  return fetchJson<GalleryMapClustersResponse>(
-    `${apiV1("/store/map/clusters")}?${query.toString()}`
-  );
+  return fetchGalleryMapJson<GalleryMapClustersResponse>("clusters", query);
 }
 
 export async function getGalleryMapClusterEntries(
@@ -240,12 +271,11 @@ export async function getGalleryMapClusterEntries(
     offset: String(Math.max(0, Math.floor(offset))),
     limit: String(Math.max(1, Math.floor(limit)))
   });
-  return fetchJson<GalleryMapClusterEntriesResponse>(
-    `${apiV1("/store/map/cluster-entries")}?${query.toString()}`
-  );
+  return fetchGalleryMapJson<GalleryMapClusterEntriesResponse>("clusterEntries", query);
 }
 
 function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchParams {
+  const { zoom, zoomPrecise } = galleryMapClusterZoomParameters(request.zoom);
   const query = new URLSearchParams({
     depth: String(Math.max(1, Math.floor(request.depth))),
     media_filter: request.mediaFilter,
@@ -253,7 +283,8 @@ function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchPa
     west: String(request.viewport.west),
     north: String(request.viewport.north),
     east: String(request.viewport.east),
-    zoom: String(Math.max(0, Math.min(20, Math.floor(request.zoom))))
+    zoom: String(zoom),
+    zoom_precise: String(zoomPrecise)
   });
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());

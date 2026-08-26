@@ -28,8 +28,14 @@ export class GalleryMapMockSession<T extends GalleryMapMockEntry> {
     const prefix = searchParams.get("prefix") ?? "";
     const depth = Math.max(1, Number(searchParams.get("depth") ?? "1") || 1);
     const mediaFilter = searchParams.get("media_filter") ?? "all";
-    const zoom = Math.max(0, Math.min(20, Number(searchParams.get("zoom") ?? "1") || 0));
-    const resolution = 2 ** (Math.floor(zoom) + 2);
+    const requestedZoom = Number(
+      searchParams.get("zoom_precise") ?? searchParams.get("zoom") ?? "1"
+    );
+    const zoom = Number.isFinite(requestedZoom)
+      ? Math.max(0, Math.min(20, requestedZoom))
+      : 1;
+    const gridZoom = Math.ceil(zoom * 2) / 2;
+    const resolution = Math.ceil(4 * 2 ** gridZoom);
     const viewport = {
       south: Number(searchParams.get("south") ?? "-90"),
       west: Number(searchParams.get("west") ?? "-180"),
@@ -81,7 +87,7 @@ export class GalleryMapMockSession<T extends GalleryMapMockEntry> {
     return {
       prefix,
       depth,
-      zoom,
+      zoom: Math.floor(zoom),
       resolution,
       total_entry_count: scopedEntries.length,
       visible_geotagged_count: [...entriesByCluster.values()].reduce(

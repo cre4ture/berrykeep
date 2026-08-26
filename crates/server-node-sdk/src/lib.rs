@@ -7589,6 +7589,12 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/index/delta", get(get_store_index_delta))
+        .route("/gallery/map/clusters", get(list_gallery_map_clusters))
+        .route(
+            "/gallery/map/cluster-entries",
+            get(list_gallery_map_cluster_entries),
+        )
+        // Keep the store-scoped map paths for clients that have not yet migrated.
         .route("/store/map/clusters", get(list_gallery_map_clusters))
         .route(
             "/store/map/cluster-entries",
@@ -7681,6 +7687,15 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
         .route("/auth/store/index/delta", get(get_store_index_delta_admin))
+        .route(
+            "/auth/gallery/map/clusters",
+            get(list_gallery_map_clusters_admin),
+        )
+        .route(
+            "/auth/gallery/map/cluster-entries",
+            get(list_gallery_map_cluster_entries_admin),
+        )
+        // Keep the store-scoped map paths for admin clients that have not yet migrated.
         .route(
             "/auth/store/map/clusters",
             get(list_gallery_map_clusters_admin),
@@ -8022,6 +8037,12 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/index/delta", get(get_store_index_delta))
+        .route("/gallery/map/clusters", get(list_gallery_map_clusters))
+        .route(
+            "/gallery/map/cluster-entries",
+            get(list_gallery_map_cluster_entries),
+        )
+        // Keep the store-scoped map paths for peers that have not yet migrated.
         .route("/store/map/clusters", get(list_gallery_map_clusters))
         .route(
             "/store/map/cluster-entries",
@@ -10482,7 +10503,7 @@ where
                 .context("failed writing object read header error");
         }
     };
-    let response = if path_only.starts_with("/store/") {
+    let response = if transport_service::is_store_object_path(path_only) {
         let query = match transport_service::parse_query::<ObjectGetQuery>(&normalized_raw_path) {
             Ok(query) => query,
             Err(err) => {
@@ -13203,7 +13224,10 @@ struct GalleryMapClustersQuery {
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
+    /// Integral legacy wire field. Keep it for nodes and SDKs that predate fractional zoom.
     zoom: Option<u8>,
+    /// Optional fractional MapLibre camera zoom. Older nodes ignore this additive field.
+    zoom_precise: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -15780,6 +15804,17 @@ async fn gallery_map_clusters_response(
     let depth = query.depth.unwrap_or(1).clamp(1, GALLERY_MAX_DEPTH);
     let media_filter = query.media_filter.unwrap_or(StoreIndexMediaFilter::All);
     let zoom = query.zoom.unwrap_or(1).min(20);
+    let precise_zoom = match query.zoom_precise {
+        Some(zoom) if zoom.is_finite() => zoom.clamp(0.0, 20.0),
+        None => f64::from(zoom),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "zoom_precise must be a finite number" })),
+            )
+                .into_response();
+        }
+    };
     let page = {
         let store = read_store(state, "gallery_map.clusters").await;
         store
@@ -15788,7 +15823,7 @@ async fn gallery_map_clusters_response(
                 depth,
                 media_filter: gallery_map::storage_media_filter(media_filter),
                 viewport: gallery_map::storage_viewport(viewport),
-                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(zoom),
+                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(precise_zoom),
                 max_clusters: GALLERY_MAP_MAX_CLUSTERS,
             })
             .await
@@ -16147,6 +16182,13 @@ fn store_index_delta_reset_response(
         }),
     )
         .into_response()
+}
+
+fn build_reconciliation_object_path(key: &str, version_id: &str) -> String {
+    let encoded_key = utf8_percent_encode(key, QUERY_COMPONENT_ENCODE_SET).to_string();
+    let encoded_version_id =
+        utf8_percent_encode(version_id, QUERY_COMPONENT_ENCODE_SET).to_string();
+    format!("/store/{encoded_key}?version={encoded_version_id}")
 }
 
 fn store_index_page_cache_key(
@@ -30352,7 +30394,7 @@ async fn reconcile_from_node(
             continue;
         }
 
-        let object_path = format!("/store/{}?version={}", entry.key, entry.version_id);
+        let object_path = build_reconciliation_object_path(&entry.key, &entry.version_id);
         let payload = match execute_peer_request(
             &state,
             &remote_node,
