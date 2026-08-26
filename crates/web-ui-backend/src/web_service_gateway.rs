@@ -22,7 +22,7 @@ use hyper_util::client::legacy::connect::{Connect, Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tower_service::Service;
 use uuid::Uuid;
@@ -58,6 +58,7 @@ struct GatewayState {
     launches: HashMap<String, PendingLaunch>,
     sessions: HashMap<String, ServiceSession>,
     clients: HashMap<(NodeId, String), PooledServiceClient>,
+    pending_clients: HashMap<(NodeId, String), Arc<OnceCell<()>>>,
 }
 
 struct PendingLaunch {
@@ -342,29 +343,66 @@ impl WebServiceGateway {
         service_id: &str,
     ) -> Result<PooledServiceClient> {
         let key = (node_id, service_id.to_string());
-        {
+        loop {
+            let initializer = {
+                let mut state = self.state.lock().await;
+                state.prune();
+                if let Some(client) = state.clients.get_mut(&key) {
+                    client.expires_at = Instant::now() + SERVICE_CLIENT_TTL;
+                    return Ok(client.clone());
+                }
+                state.pending_client(&key)
+            };
+
+            let state_for_open = Arc::clone(&self.state);
+            let runtime_for_open = Arc::clone(runtime);
+            let key_for_open = key.clone();
+            let initializer_for_open = Arc::clone(&initializer);
+            let initialized = initializer
+                .get_or_try_init(|| {
+                    let state = Arc::clone(&state_for_open);
+                    let runtime = Arc::clone(&runtime_for_open);
+                    let key = key_for_open.clone();
+                    let initializer = Arc::clone(&initializer_for_open);
+                    let service_id = service_id.to_string();
+                    async move {
+                        let sdk = runtime.read().await.sdk.clone();
+                        let connection = sdk.open_web_service_proxy(node_id, &service_id).await?;
+                        let candidate = PooledServiceClient::new(runtime, connection);
+                        let mut state = state.lock().await;
+                        state.prune();
+                        if state.pending_client_matches(&key, &initializer) {
+                            if let Some(client) = state.clients.get_mut(&key) {
+                                client.expires_at = Instant::now() + SERVICE_CLIENT_TTL;
+                            } else {
+                                state.evict_earliest_client_if_full();
+                                state.clients.insert(key.clone(), candidate);
+                            }
+                            state.pending_clients.remove(&key);
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    }
+                })
+                .await;
+            if let Err(error) = initialized {
+                let mut state = self.state.lock().await;
+                state.remove_pending_client_if_unused(&key, &initializer);
+                return Err(error);
+            }
+
             let mut state = self.state.lock().await;
             state.prune();
-            if let Some(client) = state.clients.get(&key) {
+            if let Some(client) = state.clients.get_mut(&key) {
+                client.expires_at = Instant::now() + SERVICE_CLIENT_TTL;
                 return Ok(client.clone());
             }
         }
-
-        let sdk = runtime.read().await.sdk.clone();
-        let connection = sdk.open_web_service_proxy(node_id, service_id).await?;
-        let candidate = PooledServiceClient::new(Arc::clone(runtime), connection);
-        let mut state = self.state.lock().await;
-        state.prune();
-        if let Some(client) = state.clients.get(&key) {
-            return Ok(client.clone());
-        }
-        state.evict_earliest_client_if_full();
-        state.clients.insert(key, candidate.clone());
-        Ok(candidate)
     }
 
     pub(super) async fn clear_service_clients(&self) {
-        self.state.lock().await.clients.clear();
+        let mut state = self.state.lock().await;
+        state.clients.clear();
+        state.pending_clients.clear();
     }
 }
 
@@ -374,6 +412,33 @@ impl GatewayState {
         self.launches.retain(|_, launch| launch.expires_at > now);
         self.sessions.retain(|_, session| session.expires_at > now);
         self.clients.retain(|_, client| client.expires_at > now);
+    }
+
+    fn pending_client(&mut self, key: &(NodeId, String)) -> Arc<OnceCell<()>> {
+        self.pending_clients
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
+    }
+
+    fn pending_client_matches(
+        &self,
+        key: &(NodeId, String),
+        initializer: &Arc<OnceCell<()>>,
+    ) -> bool {
+        self.pending_clients
+            .get(key)
+            .is_some_and(|pending| Arc::ptr_eq(pending, initializer))
+    }
+
+    fn remove_pending_client_if_unused(
+        &mut self,
+        key: &(NodeId, String),
+        initializer: &Arc<OnceCell<()>>,
+    ) {
+        if self.pending_client_matches(key, initializer) && Arc::strong_count(initializer) == 2 {
+            self.pending_clients.remove(key);
+        }
     }
 
     fn evict_earliest_launch_if_full(&mut self) {
@@ -717,6 +782,12 @@ fn reject_dot_segments(path: &str) -> Result<()> {
     loop {
         if decoded
             .split(|byte| matches!(*byte, b'/' | b'\\'))
+            .map(|segment| {
+                segment
+                    .split(|byte| *byte == b';')
+                    .next()
+                    .unwrap_or_default()
+            })
             .any(|segment| segment == b"." || segment == b"..")
         {
             anyhow::bail!("local service path must not contain dot segments");
@@ -1103,6 +1174,8 @@ mod tests {
     use http_body_util::{BodyExt as _, Full};
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{Barrier, Notify};
+    use tokio::task::JoinSet;
 
     #[derive(Clone)]
     struct CountingConnector {
@@ -1157,6 +1230,53 @@ mod tests {
         }
 
         assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_service_client_initializers_share_one_pending_open() {
+        const REQUESTS: usize = 8;
+
+        let state = Arc::new(Mutex::new(GatewayState::default()));
+        let key = (Uuid::now_v7(), "home-nas".to_string());
+        let expected_initializer = state.lock().await.pending_client(&key);
+        let barrier = Arc::new(Barrier::new(REQUESTS));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opening_started = Arc::new(Notify::new());
+        let release_open = Arc::new(Notify::new());
+        let mut tasks = JoinSet::new();
+
+        for _ in 0..REQUESTS {
+            let state = Arc::clone(&state);
+            let key = key.clone();
+            let barrier = Arc::clone(&barrier);
+            let opened = Arc::clone(&opened);
+            let opening_started = Arc::clone(&opening_started);
+            let release_open = Arc::clone(&release_open);
+            tasks.spawn(async move {
+                let initializer = state.lock().await.pending_client(&key);
+                barrier.wait().await;
+                initializer
+                    .get_or_try_init(|| async move {
+                        opened.fetch_add(1, Ordering::SeqCst);
+                        opening_started.notify_one();
+                        release_open.notified().await;
+                        Ok::<_, Infallible>(())
+                    })
+                    .await
+                    .unwrap();
+            });
+        }
+
+        opening_started.notified().await;
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        release_open.notify_waiters();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        assert!(Arc::ptr_eq(
+            &expected_initializer,
+            &state.lock().await.pending_client(&key)
+        ));
     }
 
     #[test]
@@ -1285,6 +1405,9 @@ mod tests {
             "/..%2fadmin",
             "/%2E%2e%5cadmin",
             "/%252e%252e%252fadmin",
+            "/..;/admin",
+            "/.;jsessionid=abc/admin",
+            "/%2e%2e%3bjsessionid=abc/admin",
         ] {
             let uri: Uri = path.parse().unwrap();
             assert!(map_local_path(&uri, "/ui").is_err(), "accepted {path}");
