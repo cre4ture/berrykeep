@@ -69,6 +69,26 @@ internal object FolderSyncOutageRetryPolicy {
         )
     }
 
+    /**
+     * Defers a retry that was due but could not reach the sync runtime because of local policy.
+     * It preserves the failure rung: a blocked network is not another endpoint failure.
+     */
+    fun deferDueAttempt(
+        state: FolderSyncOutageRetryState,
+        nowEpochMs: Long,
+        jitterPermille: Int = 0,
+    ): FolderSyncOutageRetryState {
+        if (state.failureCount == 0 || state.nextRetryAtEpochMs > nowEpochMs) {
+            return state
+        }
+        return state.copy(
+            nextRetryAtEpochMs = nowEpochMs + delayForFailure(
+                state.failureCount,
+                jitterPermille,
+            ),
+        )
+    }
+
     fun allowsAttempt(
         state: FolderSyncOutageRetryState,
         trigger: FolderSyncRetryTrigger,
@@ -171,6 +191,27 @@ internal class FolderSyncOutageRetryStore(
             .putLong(KEY_NEXT_RETRY_AT_EPOCH_MS, next.nextRetryAtEpochMs)
             .apply()
         return next
+    }
+
+    /**
+     * Keeps a due outage circuit armed when platform policy prevents a network attempt before it
+     * reaches the sync runtime. This retains the current failure rung without treating a blocked
+     * network as another endpoint failure, and avoids immediately re-enqueuing the same worker.
+     */
+    fun deferDueAttempt(): FolderSyncOutageRetryState {
+        val current = state()
+        val deferred = FolderSyncOutageRetryPolicy.deferDueAttempt(
+            state = current,
+            nowEpochMs = nowEpochMs(),
+            jitterPermille = jitterPermille(),
+        )
+        if (deferred == current) {
+            return current
+        }
+        preferences.edit()
+            .putLong(KEY_NEXT_RETRY_AT_EPOCH_MS, deferred.nextRetryAtEpochMs)
+            .apply()
+        return deferred
     }
 
     fun clear() {

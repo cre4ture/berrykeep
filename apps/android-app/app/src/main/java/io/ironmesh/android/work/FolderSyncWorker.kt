@@ -25,6 +25,7 @@ class FolderSyncWorker(
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val nativeContinuousActive = repository.hasContinuousFolderSyncActive()
         if (!FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive)) {
+            rearmOutageRetry()
             Log.i(TAG, "continuous folder sync is requested or active; skipping one-shot worker run")
             return@withContext Result.success()
         }
@@ -64,12 +65,17 @@ class FolderSyncWorker(
             }
 
             if (eligibleProfiles.isEmpty()) {
+                // A WorkManager network constraint cannot express all per-profile policy (for
+                // example, disallowing roaming). Keep the persisted circuit armed without
+                // immediately running the same blocked attempt again.
+                rearmOutageRetry(deferDueAttempt = true)
                 Log.i(TAG, "one-shot sync skipped because no enabled profile matches the current network policy")
                 return@withContext Result.success()
             }
 
             if (!outageRetryStore.allowsAttempt(FolderSyncRetryTrigger.PERIODIC_WORK)) {
                 val retryState = outageRetryStore.state()
+                rearmOutageRetry(retryState)
                 Log.i(
                     TAG,
                     "one-shot sync held by persisted endpoint backoff until ${retryState.nextRetryAtEpochMs}",
@@ -141,6 +147,17 @@ class FolderSyncWorker(
     private fun clearOutageRetry() {
         outageRetryStore.clear()
         FolderSyncOutageRetryScheduler.cancel(applicationContext)
+    }
+
+    /** Preserves the durable outage wake-up when this worker deliberately skips an attempt. */
+    private fun rearmOutageRetry(
+        state: FolderSyncOutageRetryState = outageRetryStore.state(),
+        deferDueAttempt: Boolean = false,
+    ) {
+        val scheduledState = if (deferDueAttempt) outageRetryStore.deferDueAttempt() else state
+        if (scheduledState.failureCount > 0) {
+            FolderSyncOutageRetryScheduler.schedule(applicationContext, scheduledState)
+        }
     }
 
     private companion object {

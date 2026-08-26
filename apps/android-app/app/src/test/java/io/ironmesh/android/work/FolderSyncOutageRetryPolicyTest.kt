@@ -150,6 +150,29 @@ class FolderSyncOutageRetryPolicyTest {
     }
 
     @Test
+    fun policyBlockedDueAttemptIsDeferredWithoutIncreasingFailureRung() {
+        val dueState = FolderSyncOutageRetryState(
+            failureCount = 3,
+            nextRetryAtEpochMs = 1_000L,
+        )
+
+        val deferred = FolderSyncOutageRetryPolicy.deferDueAttempt(
+            state = dueState,
+            nowEpochMs = 2_000L,
+        )
+
+        assertEquals(3, deferred.failureCount)
+        assertEquals(122_000L, deferred.nextRetryAtEpochMs)
+        assertEquals(
+            dueState,
+            FolderSyncOutageRetryPolicy.deferDueAttempt(
+                state = dueState,
+                nowEpochMs = 999L,
+            ),
+        )
+    }
+
+    @Test
     fun aDueOutageForcesOnlyOneContinuousSyncRestart() {
         val state = FolderSyncOutageRetryState(
             failureCount = 2,

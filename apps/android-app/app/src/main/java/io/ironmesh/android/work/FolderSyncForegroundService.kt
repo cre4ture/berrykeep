@@ -21,6 +21,7 @@ import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -60,6 +61,7 @@ class FolderSyncForegroundService : Service() {
     private var outageRetryWakeupScheduled = false
     private var networkCallbackRegistered = false
     private lateinit var outageRetryStore: FolderSyncOutageRetryStore
+    private val outageRetryStoreReady = CompletableDeferred<Unit>()
     private lateinit var networkChangeNotifier: ConflatedNetworkChangeNotifier
     private lateinit var networkPolicyChangeNotifier: ConflatedNetworkChangeNotifier
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -86,10 +88,6 @@ class FolderSyncForegroundService : Service() {
             lastLocalChangeElapsedMsByTreeUri.clear()
         }
         FolderSyncExecutionCoordinator.markContinuousServiceActive()
-        outageRetryStore = FolderSyncOutageRetryStore(applicationContext)
-        val persistedRetryState = outageRetryStore.state()
-        outageRetryArmed = persistedRetryState.failureCount > 0
-        schedulePersistedRetryWakeup(persistedRetryState)
         ensureNotificationChannel()
         networkChangeNotifier = ConflatedNetworkChangeNotifier(
             scope = scope,
@@ -109,7 +107,17 @@ class FolderSyncForegroundService : Service() {
             NOTIFICATION_ID,
             buildNotification("Starting continuous sync", "Preparing folder sync runtime"),
         )
-        registerNetworkCallback()
+        scope.launch {
+            val (retryStore, persistedRetryState) = withContext(Dispatchers.IO) {
+                val store = FolderSyncOutageRetryStore(applicationContext)
+                store to store.state()
+            }
+            outageRetryStore = retryStore
+            outageRetryArmed = persistedRetryState.failureCount > 0
+            schedulePersistedRetryWakeup(persistedRetryState)
+            outageRetryStoreReady.complete(Unit)
+            registerNetworkCallback()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -186,8 +194,10 @@ class FolderSyncForegroundService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun clearRetryState() {
-        val hasPersistedRetryState = outageRetryStore.state().failureCount > 0
+    private suspend fun clearRetryState() {
+        val hasPersistedRetryState = withContext(Dispatchers.IO) {
+            outageRetryStore.state().failureCount > 0
+        }
         val hasRecoveryTracking = recoveryRestartPending || recoveryProfileIds.isNotEmpty()
         if (!outageRetryArmed && !hasPersistedRetryState && !outageRetryWakeupScheduled && !hasRecoveryTracking) {
             return
@@ -195,7 +205,9 @@ class FolderSyncForegroundService : Service() {
         outageRetryArmed = false
         clearRecoveryTracking()
         if (hasPersistedRetryState) {
-            outageRetryStore.clear()
+            withContext(Dispatchers.IO) {
+                outageRetryStore.clear()
+            }
         }
         cancelRetryWakeup()
     }
@@ -207,14 +219,16 @@ class FolderSyncForegroundService : Service() {
         )
     }
 
-    private fun armOutageRetry(reason: String) {
+    private suspend fun armOutageRetry(reason: String) {
         if (outageRetryArmed) {
             return
         }
 
         outageRetryArmed = true
         clearRecoveryTracking()
-        val state = outageRetryStore.recordFailure()
+        val state = withContext(Dispatchers.IO) {
+            outageRetryStore.recordFailure()
+        }
         schedulePersistedRetryWakeup(state)
         updateNotification("BerryKeep sync paused", buildRetryMessage(reason, state))
     }
@@ -460,7 +474,7 @@ class FolderSyncForegroundService : Service() {
                         status = status,
                         waitingMessage = waitingMessage,
                         hasAllowedProfiles = profilesAreAllowed,
-                        retryState = outageRetryStore.state(),
+                        retryState = withContext(Dispatchers.IO) { outageRetryStore.state() },
                     )
                 }
                 val status = snapshot.status
@@ -578,6 +592,7 @@ class FolderSyncForegroundService : Service() {
         trigger: FolderSyncRetryTrigger,
     ) {
         scope.launch {
+            outageRetryStoreReady.await()
             FolderSyncExecutionCoordinator.awaitOneShotCompletion()
             val started = reconcileMutex.withLock {
                 reconcileRequestLocked(reason, trigger)
@@ -613,7 +628,7 @@ class FolderSyncForegroundService : Service() {
             enforceNetworkPolicyLocked()
         }
 
-        val retryState = outageRetryStore.state()
+        val retryState = withContext(Dispatchers.IO) { outageRetryStore.state() }
         if (!FolderSyncOutageRetryPolicy.allowsAttempt(retryState, trigger, System.currentTimeMillis())) {
             val state = retryState
             if (hasAllowedProfiles) {
@@ -673,7 +688,7 @@ class FolderSyncForegroundService : Service() {
     }
 
     private suspend fun processManagedClientNetworkChange(reason: String) {
-        val retryState = outageRetryStore.state()
+        val retryState = withContext(Dispatchers.IO) { outageRetryStore.state() }
         if (
             FolderSyncOutageRetryPolicy.allowsAttempt(
                 retryState,
