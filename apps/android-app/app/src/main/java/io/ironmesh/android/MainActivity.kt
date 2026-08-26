@@ -38,6 +38,7 @@ import com.journeyapps.barcodescanner.ScanOptions
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import io.ironmesh.android.data.EmbeddedWebUiSession
+import io.ironmesh.android.work.FolderSyncForegroundService
 import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainViewModel
 import io.ironmesh.android.ui.LibraryScreenActions
@@ -71,6 +72,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         refreshSystemAccessState()
+        FolderSyncForegroundService.appForegrounded(this)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

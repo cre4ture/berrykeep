@@ -15,6 +15,7 @@ import android.provider.MediaStore
 import io.ironmesh.android.data.AndroidDiagnosticLog as Log
 import android.webkit.MimeTypeMap
 import androidx.core.content.ContextCompat
+import io.ironmesh.android.work.FolderSyncForegroundService
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.InputStream
@@ -818,6 +819,12 @@ object RustSafBridge {
             invalidateTreeCache(treeUriString)
             runCatching { notifyTreeChanged(treeUriString) }
                 .onFailure { error -> Log.w(TAG, "Failed forwarding SAF tree change", error) }
+            appContext?.let { context ->
+                runCatching { FolderSyncForegroundService.localFolderChanged(context, treeUriString) }
+                    .onFailure { error ->
+                        Log.w(TAG, "Failed forwarding local folder change to sync service", error)
+                    }
+            }
         }
 
         fun close() {

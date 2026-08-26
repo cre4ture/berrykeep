@@ -20,10 +20,14 @@ class FolderSyncWorker(
 ) : CoroutineWorker(appContext, params) {
 
     private val repository = IronmeshRepository()
+    private val outageRetryStore = FolderSyncOutageRetryStore(appContext)
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val nativeContinuousActive = repository.hasContinuousFolderSyncActive()
         if (!FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive)) {
+            // A stale continuous-start marker must not turn a due outage wake-up into a
+            // zero-delay WorkManager cycle while no foreground service is actually running.
+            rearmOutageRetry(deferDueAttempt = true)
             Log.i(TAG, "continuous folder sync is requested or active; skipping one-shot worker run")
             return@withContext Result.success()
         }
@@ -44,6 +48,7 @@ class FolderSyncWorker(
                 .filter { it.enabled }
 
             if (profiles.isEmpty()) {
+                clearOutageRetry()
                 return@withContext Result.success()
             }
 
@@ -62,7 +67,21 @@ class FolderSyncWorker(
             }
 
             if (eligibleProfiles.isEmpty()) {
+                // A WorkManager network constraint cannot express all per-profile policy (for
+                // example, disallowing roaming). Keep the persisted circuit armed without
+                // immediately running the same blocked attempt again.
+                rearmOutageRetry(deferDueAttempt = true)
                 Log.i(TAG, "one-shot sync skipped because no enabled profile matches the current network policy")
+                return@withContext Result.success()
+            }
+
+            if (!outageRetryStore.allowsAttempt(FolderSyncRetryTrigger.PERIODIC_WORK)) {
+                val retryState = outageRetryStore.state()
+                rearmOutageRetry(retryState)
+                Log.i(
+                    TAG,
+                    "one-shot sync held by persisted endpoint backoff until ${retryState.nextRetryAtEpochMs}",
+                )
                 return@withContext Result.success()
             }
 
@@ -79,9 +98,18 @@ class FolderSyncWorker(
             }
 
             if (failures.isEmpty()) {
+                clearOutageRetry()
                 Result.success()
             } else {
-                Result.retry()
+                val retryState = outageRetryStore.recordFailure()
+                FolderSyncOutageRetryScheduler.schedule(applicationContext, retryState)
+                Log.i(
+                    TAG,
+                    "one-shot sync failure recorded; next eligible retry is after ${retryState.nextRetryAtEpochMs}",
+                )
+                // The foreground service and this periodic safety net share the persisted policy.
+                // Returning retry() would add an independent WorkManager exponential loop.
+                Result.success()
             }
         } finally {
             FolderSyncExecutionCoordinator.finishOneShot()
@@ -116,6 +144,22 @@ class FolderSyncWorker(
         )
 
         Log.i(TAG, "synced profile=${profile.id} via rust runtime")
+    }
+
+    private fun clearOutageRetry() {
+        outageRetryStore.clear()
+        FolderSyncOutageRetryScheduler.cancel(applicationContext)
+    }
+
+    /** Preserves the durable outage wake-up when this worker deliberately skips an attempt. */
+    private fun rearmOutageRetry(
+        state: FolderSyncOutageRetryState = outageRetryStore.state(),
+        deferDueAttempt: Boolean = false,
+    ) {
+        val scheduledState = if (deferDueAttempt) outageRetryStore.deferDueAttempt() else state
+        if (scheduledState.failureCount > 0) {
+            FolderSyncOutageRetryScheduler.schedule(applicationContext, scheduledState)
+        }
     }
 
     private companion object {

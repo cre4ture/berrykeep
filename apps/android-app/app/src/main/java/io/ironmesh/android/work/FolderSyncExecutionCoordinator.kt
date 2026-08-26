@@ -2,18 +2,6 @@ package io.ironmesh.android.work
 
 import kotlinx.coroutines.CompletableDeferred
 
-private const val SYNC_RETRY_BASE_DELAY_MS = 2_000L
-private const val SYNC_RETRY_MAX_DELAY_MS = 60_000L
-
-internal fun nextFolderSyncRetryDelayMs(attempt: Int): Long {
-    if (attempt <= 1) {
-        return SYNC_RETRY_BASE_DELAY_MS
-    }
-    val exponent = (attempt - 1).coerceAtMost(5)
-    val multiplier = 1L shl exponent
-    return (SYNC_RETRY_BASE_DELAY_MS * multiplier).coerceAtMost(SYNC_RETRY_MAX_DELAY_MS)
-}
-
 data class FolderSyncExecutionSnapshot(
     val continuousRequested: Boolean = false,
     val continuousServiceActive: Boolean = false,
@@ -29,34 +17,40 @@ data class FolderSyncExecutionSnapshot(
  */
 object FolderSyncExecutionCoordinator {
     private val lock = Any()
-    private var continuousStartRequested = false
+    private var continuousStartRequestCount = 0
     private var continuousServiceActive = false
     private var oneShotCompletion: CompletableDeferred<Unit>? = null
     private var oneShotProfileLabel: String? = null
 
     fun requestContinuousStart() {
         synchronized(lock) {
-            continuousStartRequested = true
+            continuousStartRequestCount += 1
         }
     }
 
     fun markContinuousServiceActive() {
         synchronized(lock) {
             continuousServiceActive = true
-            continuousStartRequested = false
+            continuousStartRequestCount = 0
         }
     }
 
     fun cancelContinuousStartRequest() {
         synchronized(lock) {
-            continuousStartRequested = false
+            continuousStartRequestCount = (continuousStartRequestCount - 1).coerceAtLeast(0)
+        }
+    }
+
+    fun cancelAllContinuousStartRequests() {
+        synchronized(lock) {
+            continuousStartRequestCount = 0
         }
     }
 
     fun releaseContinuousService() {
         synchronized(lock) {
             continuousServiceActive = false
-            continuousStartRequested = false
+            continuousStartRequestCount = 0
         }
     }
 
@@ -64,7 +58,7 @@ object FolderSyncExecutionCoordinator {
         synchronized(lock) {
             if (
                 nativeContinuousActive ||
-                continuousStartRequested ||
+                continuousStartRequestCount > 0 ||
                 continuousServiceActive ||
                 oneShotCompletion != null
             ) {
@@ -102,7 +96,7 @@ object FolderSyncExecutionCoordinator {
     fun snapshot(): FolderSyncExecutionSnapshot {
         return synchronized(lock) {
             FolderSyncExecutionSnapshot(
-                continuousRequested = continuousStartRequested || continuousServiceActive,
+                continuousRequested = continuousStartRequestCount > 0 || continuousServiceActive,
                 continuousServiceActive = continuousServiceActive,
                 oneShotRunning = oneShotCompletion != null,
                 oneShotProfileLabel = oneShotProfileLabel,
@@ -113,7 +107,7 @@ object FolderSyncExecutionCoordinator {
     internal fun resetForTest() {
         val completion = synchronized(lock) {
             val activeCompletion = oneShotCompletion
-            continuousStartRequested = false
+            continuousStartRequestCount = 0
             continuousServiceActive = false
             oneShotCompletion = null
             oneShotProfileLabel = null

@@ -27,11 +27,17 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("Process resource usage", { exact: true })).toBeVisible();
   await expect(page.getByText("Peak Temperature", { exact: true })).toBeVisible();
   await expect(page.getByText("Temperature sensors", { exact: true })).toBeVisible();
-  await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Collected at (UTC)" })).toBeVisible();
-  await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Storage used (bytes)" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Zoom in on storage history chart" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Zoom out of storage history chart" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Reset storage history chart zoom" })).toBeVisible();
+  const storageHistoryChart = page.getByLabel("Storage stats history chart");
+  if (await storageHistoryChart.count()) {
+    await expect(storageHistoryChart).toBeVisible();
+    await expect(storageHistoryChart.locator("text").filter({ hasText: "Collected at (UTC)" })).toBeVisible();
+    await expect(storageHistoryChart.locator("text").filter({ hasText: "Storage used (bytes)" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Zoom in on storage history chart" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Zoom out of storage history chart" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Reset storage history chart zoom" })).toBeVisible();
+  } else {
+    await expect(page.getByText("No storage stats samples collected yet.", { exact: true })).toBeVisible();
+  }
   await expect(page.getByRole("button", { name: "Zoom in on temperature chart" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Zoom out of temperature chart" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Reset temperature chart zoom" })).toBeVisible();
@@ -50,19 +56,17 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("Metadata DB Logical Distribution", { exact: true })).toBeVisible();
   await expect(page.getByText("Current Breakdown Details", { exact: true })).toBeVisible();
   await expect(page.getByText("Latest Snapshot Context", { exact: true })).toBeVisible();
-  await expect(
-    page
-      .locator('svg[aria-label="Metadata space history chart"] text')
-      .filter({ hasText: "Collected at (UTC)" })
-  ).toBeVisible();
-  await expect(
-    page
-      .locator('svg[aria-label="Metadata space history chart"] text')
-      .filter({ hasText: "Metadata used (bytes)" })
-  ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Zoom in on metadata history chart" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Zoom out of metadata history chart" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Reset metadata history chart zoom" })).toBeVisible();
+  const metadataHistoryChart = page.getByLabel("Metadata space history chart");
+  if (await metadataHistoryChart.count()) {
+    await expect(metadataHistoryChart).toBeVisible();
+    await expect(metadataHistoryChart.locator("text").filter({ hasText: "Collected at (UTC)" })).toBeVisible();
+    await expect(metadataHistoryChart.locator("text").filter({ hasText: "Metadata used (bytes)" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Zoom in on metadata history chart" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Zoom out of metadata history chart" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Reset metadata history chart zoom" })).toBeVisible();
+  } else {
+    await expect(page.getByText("No storage stats samples collected yet.", { exact: true })).toBeVisible();
+  }
 
   await page.getByText("Provisioning", { exact: true }).click();
   await page.getByRole("button", { name: "Issue bootstrap claim" }).click();

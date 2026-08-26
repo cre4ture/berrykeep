@@ -1745,10 +1745,19 @@ mod tests {
             device_label: None,
             device_id: None,
         };
+        // Keep the fallback cold until the foreground request actually needs it. Without this,
+        // the supervisor can race the outage setup by validating the just-started fallback after
+        // the first primary request; a faster fallback would then be selected before the stopped
+        // primary is attempted. That makes the outage phase depend on local scheduling rather
+        // than exercising its circuit breaker.
         let client = build_http_client_from_planned_targets(&[
             direct_target(primary_url.clone()),
             direct_target(fallback_url.clone()),
-        ])?;
+        ])?
+        .with_route_maintenance_policy(ClientRouteMaintenancePolicy {
+            desired_validated_backups: 0,
+            ..ClientRouteMaintenancePolicy::default()
+        });
         // Start the fallback only after the builder's startup measurement. This keeps the primary
         // deterministically first for the initial foreground request, independent of localhost
         // scheduling jitter.
@@ -1789,7 +1798,7 @@ mod tests {
                 .clone();
             assert_eq!(
                 primary_before_recovery.total_failures, 2,
-                "expected exactly one foreground failure and one maintenance probe while the primary is down"
+                "expected exactly one foreground failure and one maintenance probe while the primary is down: {outage_diagnostics:#?}"
             );
             assert!(
                 primary_before_recovery

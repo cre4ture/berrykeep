@@ -11,12 +11,6 @@ import org.junit.Before
 import org.junit.Test
 
 class FolderSyncExecutionCoordinatorTest {
-    @Test
-    fun syncRetryDelayUsesBoundedExponentialBackoff() {
-        assertEquals(2_000L, nextFolderSyncRetryDelayMs(1))
-        assertEquals(60_000L, nextFolderSyncRetryDelayMs(8))
-    }
-
     @Before
     fun setUp() {
         FolderSyncExecutionCoordinator.resetForTest()
@@ -60,6 +54,16 @@ class FolderSyncExecutionCoordinatorTest {
         FolderSyncExecutionCoordinator.cancelContinuousStartRequest()
 
         assertTrue(FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive = false))
+    }
+
+    @Test
+    fun oneFailedStartDoesNotReleaseAnotherPendingContinuousStart() {
+        FolderSyncExecutionCoordinator.requestContinuousStart()
+        FolderSyncExecutionCoordinator.requestContinuousStart()
+
+        FolderSyncExecutionCoordinator.cancelContinuousStartRequest()
+
+        assertFalse(FolderSyncExecutionCoordinator.tryBeginOneShot(nativeContinuousActive = false))
     }
 
     @Test

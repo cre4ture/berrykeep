@@ -1,0 +1,148 @@
+package io.ironmesh.android.work
+
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import io.ironmesh.android.data.FolderSyncNetworkPolicy
+import io.ironmesh.android.data.RustClientBridge
+import io.ironmesh.android.data.RustClientTestBridge
+import io.ironmesh.android.data.RustPreferencesBridge
+import org.json.JSONObject
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import java.io.File
+import java.util.UUID
+
+@RunWith(AndroidJUnit4::class)
+class FolderSyncOutageRecoveryInstrumentationTest {
+    private val context = ApplicationProvider.getApplicationContext<Context>()
+    private lateinit var localFolder: File
+
+    @Before
+    fun setUp() {
+        RustClientBridge.initialize(context)
+        RustPreferencesBridge.initialize(context)
+        RustClientTestBridge.stopRendezvousRenewalScenario()
+        localFolder = File(context.cacheDir, "folder-sync-outage-${UUID.randomUUID()}")
+    }
+
+    @After
+    fun tearDown() {
+        RustClientTestBridge.stopRendezvousRenewalScenario()
+        localFolder.deleteRecursively()
+    }
+
+    /**
+     * The test bootstrap configures a direct node and a Rendezvous relay fallback. The initial
+     * route snapshot contains only the static direct route; the relay route is built dynamically
+     * after that route fails. The connection counters below verify that both paths are contacted
+     * during the outage before the cached client recovers.
+     */
+    @Test
+    fun folderSync_skipsBlockedNetwork_doesNotRetryAutonomously_andRecoversThroughCachedClient() {
+        val scenario = JSONObject(RustClientTestBridge.startFolderSyncOutageScenario())
+        val bootstrapJson = scenario.getString("connectionBootstrapJson")
+        val clientIdentityJson = scenario.getString("clientIdentityJson")
+        val remoteDocumentPath = scenario.getString("remoteDocumentPath")
+        val expectedDocumentSize = scenario.getLong("remoteDocumentSizeBytes")
+
+        val directAttemptsBeforeBlockedGate =
+            RustClientTestBridge.getFolderSyncOutageDirectConnectionAttemptCount()
+        val rendezvousAttemptsBeforeBlockedGate =
+            RustClientTestBridge.getFolderSyncOutageRendezvousContactAttemptCount()
+        val blocked = FolderSyncNetworkGate.evaluate(
+            policy = FolderSyncNetworkPolicy(),
+            snapshot = FolderSyncNetworkSnapshot(connected = false),
+        )
+
+        assertFalse(blocked.allowed)
+        assertEquals("No active internet connection", blocked.reason)
+        // The production Worker and foreground service use this decision before JNI sync startup.
+        // This assertion intentionally verifies the gate only; it does not start either component.
+        assertEquals(
+            directAttemptsBeforeBlockedGate,
+            RustClientTestBridge.getFolderSyncOutageDirectConnectionAttemptCount(),
+        )
+        assertEquals(
+            rendezvousAttemptsBeforeBlockedGate,
+            RustClientTestBridge.getFolderSyncOutageRendezvousContactAttemptCount(),
+        )
+
+        RustClientTestBridge.setFolderSyncOutageScenarioAvailable(false)
+        assertFolderSyncFails(bootstrapJson, clientIdentityJson)
+
+        val directAttemptsAfterOutage =
+            RustClientTestBridge.getFolderSyncOutageDirectConnectionAttemptCount()
+        val rendezvousAttemptsAfterOutage =
+            RustClientTestBridge.getFolderSyncOutageRendezvousContactAttemptCount()
+        assertTrue(
+            "the unavailable direct node route was not attempted",
+            directAttemptsAfterOutage > directAttemptsBeforeBlockedGate,
+        )
+        assertTrue(
+            "the unavailable Rendezvous relay route was not attempted",
+            rendezvousAttemptsAfterOutage > rendezvousAttemptsBeforeBlockedGate,
+        )
+
+        // This is a synchronous one-shot entry point. Its return is the deterministic completion
+        // boundary: it must not have scheduled or started a second route attempt. A
+        // user-initiated foreground sync may select cooling routes again, so that behavior is
+        // deliberately not asserted here.
+        assertEquals(
+            "a failed one-shot sync started an unexpected direct-route retry",
+            directAttemptsAfterOutage,
+            RustClientTestBridge.getFolderSyncOutageDirectConnectionAttemptCount(),
+        )
+        assertEquals(
+            "a failed one-shot sync started an unexpected Rendezvous retry",
+            rendezvousAttemptsAfterOutage,
+            RustClientTestBridge.getFolderSyncOutageRendezvousContactAttemptCount(),
+        )
+
+        RustClientTestBridge.setFolderSyncOutageScenarioAvailable(true)
+        RustClientBridge.notifyNetworkChanged(bootstrapJson, null, clientIdentityJson)
+
+        // An explicit foreground sync may select a cooling route when every configured route
+        // is cooling. Do not wait for a circuit timeout here: recovery must not depend on a
+        // timing margin around the adaptive backoff window.
+        RustClientBridge.runFolderSyncOnce(
+            bootstrapJson,
+            localFolder.absolutePath,
+            null,
+            null,
+            8,
+            null,
+            clientIdentityJson,
+        )
+
+        val synchronizedDocument = File(localFolder, remoteDocumentPath)
+        assertTrue(
+            "folder sync did not recover the remote document after route availability returned",
+            synchronizedDocument.isFile,
+        )
+        assertEquals(expectedDocumentSize, synchronizedDocument.length())
+    }
+
+    private fun assertFolderSyncFails(
+        bootstrapJson: String,
+        clientIdentityJson: String,
+    ) {
+        assertThrows(RuntimeException::class.java) {
+            RustClientBridge.runFolderSyncOnce(
+                bootstrapJson,
+                localFolder.absolutePath,
+                null,
+                null,
+                8,
+                null,
+                clientIdentityJson,
+            )
+        }
+    }
+}
