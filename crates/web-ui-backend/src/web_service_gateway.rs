@@ -538,7 +538,7 @@ pub(super) async fn dispatch_service_origin(
         return redeem_launch_request(&state, &alias, request.uri()).await;
     }
     let local_origin = format!("http://{local_authority}");
-    if !service_request_origin_allowed(request.headers(), &local_origin) {
+    if !request_origin_allowed(request.headers(), &local_origin) {
         return service_error(
             StatusCode::FORBIDDEN,
             "cross-origin private service requests are not allowed",
@@ -610,7 +610,7 @@ fn service_alias(node_id: NodeId, service_id: &str) -> String {
     )
 }
 
-fn service_request_origin_allowed(headers: &HeaderMap, local_origin: &str) -> bool {
+pub(super) fn request_origin_allowed(headers: &HeaderMap, local_origin: &str) -> bool {
     let Ok(local_origin) = reqwest::Url::parse(local_origin) else {
         return false;
     };
@@ -924,11 +924,17 @@ fn rewrite_response_headers(
     }
 
     let cookies = headers.get_all(SET_COOKIE).iter().filter_map(|value| {
-        value
-            .to_str()
-            .ok()
-            .and_then(|value| rewrite_set_cookie(value, base_path))
-            .and_then(|value| HeaderValue::from_str(&value).ok())
+        if is_gateway_session_cookie(value) {
+            return None;
+        }
+        Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| rewrite_set_cookie(value, base_path))
+                .and_then(|value| HeaderValue::from_str(&value).ok())
+                .unwrap_or_else(|| value.clone()),
+        )
     });
     let cookies = cookies.collect::<Vec<_>>();
     headers.remove(SET_COOKIE);
@@ -1099,6 +1105,17 @@ fn rewrite_set_cookie(value: &str, base_path: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join("; "),
     )
+}
+
+fn is_gateway_session_cookie(value: &HeaderValue) -> bool {
+    let pair = value
+        .as_bytes()
+        .split(|byte| *byte == b';')
+        .next()
+        .unwrap_or_default();
+    let pair = pair.trim_ascii_start();
+    pair.strip_prefix(GATEWAY_SESSION_COOKIE.as_bytes())
+        .is_some_and(|suffix| suffix.first() == Some(&b'='))
 }
 
 fn remove_hop_by_hop_headers(headers: &mut HeaderMap, preserve_upgrade: bool) {
@@ -1339,26 +1356,52 @@ mod tests {
     }
 
     #[test]
-    fn service_origin_rejects_sibling_browser_requests() {
+    fn origin_guard_rejects_sibling_browser_requests() {
         let local_origin = "http://home-nas.localhost:4100";
         let mut headers = HeaderMap::new();
-        assert!(service_request_origin_allowed(&headers, local_origin));
+        assert!(request_origin_allowed(&headers, local_origin));
 
         headers.insert(ORIGIN, HeaderValue::from_static(local_origin));
         headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
-        assert!(service_request_origin_allowed(&headers, local_origin));
+        assert!(request_origin_allowed(&headers, local_origin));
 
         headers.insert(
             ORIGIN,
             HeaderValue::from_static("http://other-service.localhost:4100"),
         );
-        assert!(!service_request_origin_allowed(&headers, local_origin));
+        assert!(!request_origin_allowed(&headers, local_origin));
 
         headers.remove(ORIGIN);
         headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
-        assert!(!service_request_origin_allowed(&headers, local_origin));
+        assert!(!request_origin_allowed(&headers, local_origin));
         headers.insert("sec-fetch-site", HeaderValue::from_static("same-site"));
-        assert!(!service_request_origin_allowed(&headers, local_origin));
+        assert!(!request_origin_allowed(&headers, local_origin));
+    }
+
+    #[test]
+    fn unparseable_upstream_cookies_are_preserved_but_gateway_cookies_are_suppressed() {
+        let mut headers = HeaderMap::new();
+        let raw_cookie = HeaderValue::from_bytes(b"legacy=\xff; Path=/ui").unwrap();
+        let malformed_cookie = HeaderValue::from_static("malformed-cookie");
+        headers.append(SET_COOKIE, raw_cookie.clone());
+        headers.append(SET_COOKIE, malformed_cookie.clone());
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("ironmesh_service_gateway_session=attempt; Path=/"),
+        );
+
+        rewrite_response_headers(
+            &mut headers,
+            "https://nas.home",
+            "http://home-nas.localhost:4100",
+            "/ui",
+            &"/ui/".parse().unwrap(),
+            false,
+        )
+        .unwrap();
+
+        let cookies = headers.get_all(SET_COOKIE).iter().collect::<Vec<_>>();
+        assert_eq!(cookies, vec![&raw_cookie, &malformed_cookie]);
     }
 
     #[test]

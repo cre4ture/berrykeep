@@ -3,7 +3,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, RANGE, RETRY_AFTER, SET_COOKIE,
+    CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, HOST, RANGE, RETRY_AFTER, SET_COOKIE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -592,10 +592,11 @@ pub fn router(config: WebUiConfig) -> Router {
         )),
         None => app,
     };
-    app.layer(middleware::from_fn_with_state(
-        state,
-        web_service_gateway::dispatch_service_origin,
-    ))
+    app.layer(middleware::from_fn(require_same_origin_web_ui_write))
+        .layer(middleware::from_fn_with_state(
+            state,
+            web_service_gateway::dispatch_service_origin,
+        ))
 }
 
 async fn require_embedded_web_ui_session(
@@ -630,6 +631,33 @@ async fn require_embedded_web_ui_session(
         response.headers_mut().append(SET_COOKIE, cookie);
     }
     response
+}
+
+async fn require_same_origin_web_ui_write(request: Request, next: Next) -> Response {
+    if is_safe_web_ui_method(request.method()) {
+        return next.run(request).await;
+    }
+    let local_origin = request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(|authority| format!("http://{authority}"));
+    if !local_origin.is_some_and(|origin| {
+        web_service_gateway::request_origin_allowed(request.headers(), &origin)
+    }) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "cross-origin writes to the local web UI are not allowed",
+        );
+    }
+    next.run(request).await
+}
+
+fn is_safe_web_ui_method(method: &Method) -> bool {
+    matches!(
+        method,
+        &Method::GET | &Method::HEAD | &Method::OPTIONS | &Method::TRACE
+    )
 }
 
 fn cookie_values<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Item = &'a str> {
@@ -4094,10 +4122,12 @@ mod tests {
     use super::{
         DIAGNOSTIC_CONTEXT_HEADER, EMBEDDED_WEB_UI_SESSION_COOKIE, EMBEDDED_WEB_UI_SESSION_HEADER,
         EmbeddedWebUiSessionAuthorization, ErrorResponseBody, WebUiConfig, client_cache_scope,
-        error_response, normalize_store_restore_path, router, web_latency_probe_timeout,
+        error_response, is_safe_web_ui_method, normalize_store_restore_path, router,
+        web_latency_probe_timeout,
     };
     use axum::body::to_bytes;
-    use axum::http::StatusCode;
+    use axum::http::header::{HOST, ORIGIN};
+    use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
     use client_sdk::{ClientIdentityMaterial, IronMeshClient, LatencyProbeConfig};
     use common::logging::LogBuffer;
     use std::sync::Arc;
@@ -4125,6 +4155,64 @@ mod tests {
         });
 
         (format!("http://{address}"), task)
+    }
+
+    #[test]
+    fn web_ui_writes_require_their_own_browser_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("localhost:4100"));
+        assert!(super::web_service_gateway::request_origin_allowed(
+            &headers,
+            "http://localhost:4100"
+        ));
+
+        headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:4100"));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(super::web_service_gateway::request_origin_allowed(
+            &headers,
+            "http://localhost:4100"
+        ));
+
+        headers.insert(
+            ORIGIN,
+            HeaderValue::from_static("http://home-nas.localhost:4100"),
+        );
+        assert!(!super::web_service_gateway::request_origin_allowed(
+            &headers,
+            "http://localhost:4100"
+        ));
+        assert!(is_safe_web_ui_method(&Method::GET));
+        assert!(!is_safe_web_ui_method(&Method::POST));
+    }
+
+    #[tokio::test]
+    async fn cross_origin_binary_store_writes_are_rejected_before_reaching_the_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("web listener should have an address");
+        let server = tokio::spawn(async move {
+            let app = router(WebUiConfig::from_client(
+                IronMeshClient::from_direct_base_url("http://127.0.0.1:9"),
+            ));
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/api/v1/store/put-binary?key=cross-origin-write"
+            ))
+            .header(ORIGIN, "http://home-nas.localhost:4100")
+            .header("sec-fetch-site", "same-site")
+            .body("blocked")
+            .send()
+            .await
+            .expect("cross-origin request should receive an HTTP response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        server.abort();
     }
 
     #[tokio::test]
