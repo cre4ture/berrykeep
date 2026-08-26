@@ -197,13 +197,15 @@ macro_rules! run_on_main_metadata_backends {
     ($body:ident, $sqlite_test:ident, $turso_test:ident) => {
         #[tokio::test]
         async fn $sqlite_test() {
-            $body(MainTestBackend::Sqlite).await;
+            // Keep large backend futures off coverage-instrumented worker stacks.
+            Box::pin($body(MainTestBackend::Sqlite)).await;
         }
 
         #[cfg(feature = "turso-metadata")]
         #[tokio::test]
         async fn $turso_test() {
-            $body(MainTestBackend::Turso).await;
+            // Keep large backend futures off coverage-instrumented worker stacks.
+            Box::pin($body(MainTestBackend::Turso)).await;
         }
     };
 }
