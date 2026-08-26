@@ -240,6 +240,7 @@ const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
 const METADATA_BACKEND_ENV: &str = "IRONMESH_METADATA_BACKEND";
 const TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV: &str =
     "IRONMESH_TEST_SEED_PROCESS_TEMPERATURE_STATS";
+const TEST_SEED_STORAGE_STATS_ENV: &str = "IRONMESH_TEST_SEED_STORAGE_STATS";
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const CLIENT_CREDENTIAL_EXPORT_PATH: &str = "/cluster/client-credentials/export";
@@ -2540,6 +2541,48 @@ fn seed_process_temperature_stats_for_tests(state: &ServerState) {
             logical_cpu_count,
         );
     }
+}
+
+async fn seed_storage_stats_for_tests(state: &ServerState) {
+    if !env_flag_is_truthy(TEST_SEED_STORAGE_STATS_ENV) {
+        return;
+    }
+
+    let sample = StorageStatsSample {
+        collected_at_unix: unix_ts(),
+        latest_snapshot_id: None,
+        latest_snapshot_created_at_unix: None,
+        latest_snapshot_object_count: 0,
+        chunk_store_bytes: 0,
+        manifest_store_bytes: 0,
+        metadata_db_bytes: 0,
+        media_cache_bytes: 0,
+        latest_snapshot_logical_bytes: 0,
+        latest_snapshot_unique_chunk_bytes: 0,
+        storage_paths: Vec::new(),
+    };
+    let storage_stats_collector = {
+        let store = read_store(state, "storage_stats.seed_for_tests").await;
+        store.storage_stats_collector()
+    };
+
+    if let Err(err) = storage_stats_collector
+        .persist_storage_stats_sample(&sample)
+        .await
+    {
+        warn!(error = %err, "failed to seed storage stats for test runtime");
+        return;
+    }
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        let _ = cluster.update_node_storage_stats(state.node_id, summarize_storage_stats(&sample));
+    }
+    let mut runtime = state.storage.storage_stats_runtime.lock().await;
+    runtime.collecting = false;
+    runtime.last_attempt_unix = Some(sample.collected_at_unix);
+    runtime.last_success_unix = Some(sample.collected_at_unix);
+    runtime.last_error = None;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -7456,6 +7499,7 @@ async fn run_inner(
         )),
     };
     seed_process_temperature_stats_for_tests(&state);
+    seed_storage_stats_for_tests(&state).await;
 
     start_background_runtimes(&state, &config, startup_phase_anchor).await;
 
