@@ -234,6 +234,7 @@ pub struct WebServiceSummary {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    #[serde(alias = "node_id")]
     pub node_id: NodeId,
 }
 

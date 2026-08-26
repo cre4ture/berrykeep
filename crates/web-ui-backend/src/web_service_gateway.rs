@@ -6,7 +6,7 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::header::{
-    CONNECTION, COOKIE, HOST, LOCATION, ORIGIN, REFERER, SET_COOKIE, UPGRADE,
+    CONNECTION, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN, REFERER, SET_COOKIE, UPGRADE,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::middleware::Next;
@@ -27,6 +27,12 @@ const LAUNCH_TOKEN_TTL: Duration = Duration::from_secs(60);
 const SERVICE_SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_PENDING_LAUNCHES: usize = 1_024;
 const MAX_SERVICE_SESSIONS: usize = 2_048;
+const LAUNCH_TRANSITION_HTML: &str = concat!(
+    "<!doctype html><html><head><meta charset=\"utf-8\">",
+    "<meta http-equiv=\"refresh\" content=\"0;url=/\">",
+    "<title>Opening private service</title></head>",
+    "<body>Opening private service. <a href=\"/\">Continue</a>.</body></html>",
+);
 
 #[derive(Clone, Default)]
 pub(super) struct WebServiceGateway {
@@ -293,17 +299,29 @@ async fn redeem_launch_request(state: &WebState, alias: &str, uri: &Uri) -> Resp
             "launch link is invalid or expired",
         );
     };
+    launch_transition_response(&session_token)
+}
+
+fn launch_transition_response(session_token: &str) -> Response {
     let cookie = format!(
         "{GATEWAY_SESSION_COOKIE}={session_token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
         SERVICE_SESSION_TTL.as_secs()
     );
-    let mut response = StatusCode::SEE_OTHER.into_response();
-    response
-        .headers_mut()
-        .insert(LOCATION, HeaderValue::from_static("/"));
+    let mut response = (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/html; charset=utf-8")],
+        LAUNCH_TRANSITION_HTML,
+    )
+        .into_response();
     if let Ok(cookie) = HeaderValue::from_str(&cookie) {
         response.headers_mut().append(SET_COOKIE, cookie);
     }
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        ),
+    );
     apply_service_security_headers(&mut response);
     response
 }
@@ -393,6 +411,7 @@ fn http_request_from_parts(parts: axum::http::request::Parts, body: Body) -> hyp
 }
 
 fn map_local_path(uri: &Uri, base_path: &str) -> Result<Uri> {
+    reject_dot_segments(uri.path())?;
     let local = uri
         .path_and_query()
         .map(|value| value.as_str())
@@ -414,6 +433,50 @@ fn map_local_path(uri: &Uri, base_path: &str) -> Result<Uri> {
         None => mapped,
     };
     mapped.parse().context("failed mapping local service URI")
+}
+
+fn reject_dot_segments(path: &str) -> Result<()> {
+    let mut decoded = path.as_bytes().to_vec();
+    loop {
+        if decoded
+            .split(|byte| matches!(*byte, b'/' | b'\\'))
+            .any(|segment| segment == b"." || segment == b"..")
+        {
+            anyhow::bail!("local service path must not contain dot segments");
+        }
+        let next = percent_decode_once(&decoded);
+        if next == decoded {
+            return Ok(());
+        }
+        decoded = next;
+    }
+}
+
+fn percent_decode_once(value: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        if value[index] == b'%'
+            && let Some(high) = value.get(index + 1).copied().and_then(hex_value)
+            && let Some(low) = value.get(index + 2).copied().and_then(hex_value)
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(value[index]);
+            index += 1;
+        }
+    }
+    decoded
+}
+
+const fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn rewrite_request_headers(
@@ -720,6 +783,7 @@ fn apply_service_security_headers(response: &mut Response) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt as _;
 
     #[test]
     fn gateway_cookie_is_never_forwarded_upstream() {
@@ -765,6 +829,27 @@ mod tests {
                 &upstream_request,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn upstream_path_mapping_rejects_encoded_and_nested_dot_segments() {
+        for path in [
+            "/../admin",
+            "/./admin",
+            "/%2e%2e/admin",
+            "/..%2fadmin",
+            "/%2E%2e%5cadmin",
+            "/%252e%252e%252fadmin",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert!(map_local_path(&uri, "/ui").is_err(), "accepted {path}");
+        }
+
+        let safe: Uri = "/files/report%2Epdf?next=../admin".parse().unwrap();
+        assert_eq!(
+            map_local_path(&safe, "/ui").unwrap(),
+            "/ui/files/report%2Epdf?next=../admin"
         );
     }
 
@@ -828,5 +913,28 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn launch_transition_keeps_strict_cookie_on_a_same_origin_page() {
+        let response = launch_transition_response("session-secret");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(!response.headers().contains_key(LOCATION));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("http-equiv=\"refresh\""));
+        assert!(body.contains("content=\"0;url=/\""));
     }
 }

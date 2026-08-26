@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import {
@@ -33,6 +34,75 @@ registerGalleryMapContractTests({
     await page.goto("/");
     await page.getByText("Gallery", { exact: true }).click();
     await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  }
+});
+
+test("private service launch sends its Strict cookie on the first landing request", async ({
+  page
+}) => {
+  const server = createServer((request, response) => {
+    const host = String(request.headers.host ?? "");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      response.writeHead(500).end("listener address is unavailable");
+      return;
+    }
+    if (host.startsWith("localhost:") && request.url === "/start") {
+      response.setHeader("content-type", "text/html; charset=utf-8");
+      response.end(
+        `<a id="launch" href="http://strict-check.berrykeep.localhost:${address.port}/_ironmesh/open">Open</a>`
+      );
+      return;
+    }
+    if (
+      host.startsWith("strict-check.berrykeep.localhost:") &&
+      request.url === "/_ironmesh/open"
+    ) {
+      response.setHeader(
+        "set-cookie",
+        "ironmesh_service_gateway_session=session-secret; HttpOnly; SameSite=Strict; Path=/"
+      );
+      response.setHeader("content-type", "text/html; charset=utf-8");
+      response.setHeader(
+        "content-security-policy",
+        "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+      );
+      response.end(
+        '<!doctype html><meta http-equiv="refresh" content="0;url=/"><a href="/">Continue</a>'
+      );
+      return;
+    }
+    if (host.startsWith("strict-check.berrykeep.localhost:") && request.url === "/") {
+      const authenticated = String(request.headers.cookie ?? "").includes(
+        "ironmesh_service_gateway_session=session-secret"
+      );
+      response.writeHead(authenticated ? 200 : 401).end(
+        authenticated ? "authenticated-first-landing" : "missing-cookie"
+      );
+      return;
+    }
+    response.writeHead(404).end("not-found");
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("listener address is unavailable");
+    }
+    await page.goto(`http://localhost:${address.port}/start`);
+    await page.locator("#launch").click();
+    await page.waitForURL(
+      (url) => url.hostname === "strict-check.berrykeep.localhost" && url.pathname === "/"
+    );
+    await expect(page.locator("body")).toHaveText("authenticated-first-landing");
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
   }
 });
 

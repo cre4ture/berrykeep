@@ -69,6 +69,7 @@ pub(crate) struct WebServiceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct WebServiceSummary {
     pub id: String,
     pub name: String,
@@ -891,6 +892,19 @@ mod tests {
     #[test]
     fn accepts_fixed_https_service_with_certificate_pin() {
         validate_service(&valid_service()).expect("valid service should be accepted");
+    }
+
+    #[test]
+    fn client_service_summary_uses_camel_case_node_id() {
+        let summary = WebServiceSummary {
+            id: "home-nas".to_string(),
+            name: "Home NAS".to_string(),
+            description: None,
+            node_id: uuid::Uuid::now_v7().to_string(),
+        };
+        let json = serde_json::to_value(summary).unwrap();
+        assert!(json.get("nodeId").is_some());
+        assert!(json.get("node_id").is_none());
     }
 
     #[test]
