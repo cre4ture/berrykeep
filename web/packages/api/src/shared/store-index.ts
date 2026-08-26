@@ -140,6 +140,18 @@ export function clampGalleryMapZoom(zoom: number): number {
   return Number.isFinite(zoom) ? Math.max(0, Math.min(20, zoom)) : 1;
 }
 
+/**
+ * Sends the established integral field alongside the additive fractional zoom.
+ * Older nodes ignore `zoom_precise` and retain their previous clustering behavior.
+ */
+export function galleryMapClusterZoomParameters(zoom: number): {
+  zoom: number;
+  zoomPrecise: number;
+} {
+  const zoomPrecise = clampGalleryMapZoom(zoom);
+  return { zoom: Math.floor(zoomPrecise), zoomPrecise };
+}
+
 export type StoreListView = "raw" | "tree";
 
 export type StoreListSortOrder =

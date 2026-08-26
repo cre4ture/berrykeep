@@ -137,7 +137,10 @@ function galleryIndexResponse(url) {
 function galleryMapClustersResponse(url) {
   const prefix = url.searchParams.get("prefix") ?? "";
   const depth = Math.max(1, Number(url.searchParams.get("depth") ?? "1") || 1);
-  const zoom = Math.max(0, Math.min(20, Number(url.searchParams.get("zoom") ?? "1") || 0));
+  const zoom = Math.max(
+    0,
+    Math.min(20, Number(url.searchParams.get("zoom_precise") ?? url.searchParams.get("zoom") ?? "1") || 0)
+  );
   const viewport = {
     south: Number(url.searchParams.get("south")),
     west: Number(url.searchParams.get("west")),
@@ -149,8 +152,8 @@ function galleryMapClustersResponse(url) {
   return {
     prefix,
     depth,
-    zoom,
-    resolution: Math.ceil(4 * 2 ** zoom),
+    zoom: Math.floor(zoom),
+    resolution: Math.ceil(4 * 2 ** (Math.ceil(zoom * 2) / 2)),
     total_entry_count: galleryEntries.length,
     visible_geotagged_count: visibleGeotaggedCount,
     media_summary: {

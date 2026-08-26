@@ -97,15 +97,15 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await target.setup(page, { mapConfiguration: configuredMapVariants });
     await target.openGallery(page);
     await expect(page.getByLabel("Depth")).toHaveValue("64");
-    const requestedMapZooms: number[] = [];
+    const requestedPreciseMapZooms: number[] = [];
     page.on("request", (request) => {
       const url = new URL(request.url());
       if (!url.pathname.endsWith("/store/map/clusters")) {
         return;
       }
-      const zoom = Number(url.searchParams.get("zoom"));
+      const zoom = Number(url.searchParams.get("zoom_precise"));
       if (Number.isFinite(zoom)) {
-        requestedMapZooms.push(zoom);
+        requestedPreciseMapZooms.push(zoom);
       }
     });
     const firstMapClusterRequest = page.waitForRequest((request) => {
@@ -117,13 +117,14 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     expect(firstMapClusterUrl.searchParams.get("depth")).toBe("64");
     expect(firstMapClusterUrl.searchParams.get("media_filter")).toBe("all");
     expect(firstMapClusterUrl.searchParams.get("zoom")).toBe("1");
+    expect(firstMapClusterUrl.searchParams.get("zoom_precise")).toBe("1");
     expect(firstMapClusterUrl.searchParams.has("offset")).toBe(false);
     expect(firstMapClusterUrl.searchParams.has("limit")).toBe(false);
     const mapCanvas = page.locator(".maplibregl-canvas");
     await expect(mapCanvas).toBeVisible();
     const fractionalMapRequest = page.waitForRequest((request) => {
       const url = new URL(request.url());
-      const zoom = Number(url.searchParams.get("zoom"));
+      const zoom = Number(url.searchParams.get("zoom_precise"));
       return (
         url.pathname.endsWith("/store/map/clusters") &&
         Number.isFinite(zoom) &&
@@ -133,7 +134,7 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await mapCanvas.hover();
     await page.mouse.wheel(0, -120);
     await fractionalMapRequest;
-    expect(requestedMapZooms.some((zoom) => !Number.isInteger(zoom))).toBe(true);
+    expect(requestedPreciseMapZooms.some((zoom) => !Number.isInteger(zoom))).toBe(true);
 
     await expect(page.getByText("Map styles could not be refreshed")).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Retry map styles" })).toHaveCount(0);

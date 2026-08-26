@@ -1,6 +1,6 @@
 import { fetchJson } from "../shared/http";
 import type { GalleryMapConfigurationResponse } from "../shared/map-config";
-import { clampGalleryMapZoom } from "../shared/store-index";
+import { galleryMapClusterZoomParameters } from "../shared/store-index";
 import type {
   GalleryMapClusterEntriesResponse,
   GalleryMapClustersRequest,
@@ -247,6 +247,7 @@ export async function getGalleryMapClusterEntries(
 }
 
 function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchParams {
+  const { zoom, zoomPrecise } = galleryMapClusterZoomParameters(request.zoom);
   const query = new URLSearchParams({
     depth: String(Math.max(1, Math.floor(request.depth))),
     media_filter: request.mediaFilter,
@@ -254,7 +255,8 @@ function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchPa
     west: String(request.viewport.west),
     north: String(request.viewport.north),
     east: String(request.viewport.east),
-    zoom: String(clampGalleryMapZoom(request.zoom))
+    zoom: String(zoom),
+    zoom_precise: String(zoomPrecise)
   });
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());

@@ -13203,7 +13203,10 @@ struct GalleryMapClustersQuery {
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
-    zoom: Option<f64>,
+    /// Integral legacy wire field. Keep it for nodes and SDKs that predate fractional zoom.
+    zoom: Option<u8>,
+    /// Optional fractional MapLibre camera zoom. Older nodes ignore this additive field.
+    zoom_precise: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -13422,7 +13425,7 @@ impl From<storage::GallerySummaryRefreshStatus> for GallerySummaryStatusResponse
 struct GalleryMapClustersResponse {
     prefix: String,
     depth: usize,
-    zoom: f64,
+    zoom: u8,
     resolution: u32,
     total_entry_count: usize,
     visible_geotagged_count: usize,
@@ -15779,12 +15782,14 @@ async fn gallery_map_clusters_response(
         .to_string();
     let depth = query.depth.unwrap_or(1).clamp(1, GALLERY_MAX_DEPTH);
     let media_filter = query.media_filter.unwrap_or(StoreIndexMediaFilter::All);
-    let zoom = match query.zoom.unwrap_or(1.0) {
-        zoom if zoom.is_finite() => zoom.clamp(0.0, 20.0),
+    let zoom = query.zoom.unwrap_or(1).min(20);
+    let precise_zoom = match query.zoom_precise {
+        Some(zoom) if zoom.is_finite() => zoom.clamp(0.0, 20.0),
+        None => f64::from(zoom),
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "zoom must be a finite number" })),
+                Json(json!({ "error": "zoom_precise must be a finite number" })),
             )
                 .into_response();
         }
@@ -15797,7 +15802,7 @@ async fn gallery_map_clusters_response(
                 depth,
                 media_filter: gallery_map::storage_media_filter(media_filter),
                 viewport: gallery_map::storage_viewport(viewport),
-                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(zoom),
+                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(precise_zoom),
                 max_clusters: GALLERY_MAP_MAX_CLUSTERS,
             })
             .await

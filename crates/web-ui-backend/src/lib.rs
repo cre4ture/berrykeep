@@ -660,7 +660,10 @@ struct WebGalleryMapClustersQuery {
     west: f64,
     north: f64,
     east: f64,
-    zoom: Option<f64>,
+    /// Integral legacy wire field accepted by all deployed nodes.
+    zoom: Option<u8>,
+    /// Additive fractional camera zoom, ignored by nodes that predate it.
+    zoom_precise: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2950,9 +2953,16 @@ async fn web_gallery_map_clusters(
         StoreIndexMediaFilter::Image => "image",
         StoreIndexMediaFilter::Video => "video",
     };
-    let zoom = match query.zoom.unwrap_or(1.0) {
-        zoom if zoom.is_finite() => zoom.clamp(0.0, 20.0),
-        _ => return error_response(StatusCode::BAD_REQUEST, "zoom must be a finite number"),
+    let zoom = query.zoom.unwrap_or(1).min(20);
+    let zoom_precise = match query.zoom_precise {
+        Some(zoom) if zoom.is_finite() => Some(zoom.clamp(0.0, 20.0)),
+        None => None,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "zoom_precise must be a finite number",
+            );
+        }
     };
     let mut request_url = Url::parse("http://web-ui.invalid/store/map/clusters")
         .expect("the gallery map clusters path is a valid URL");
@@ -2974,6 +2984,9 @@ async fn web_gallery_map_clusters(
             .append_pair("north", &query.north.to_string())
             .append_pair("east", &query.east.to_string())
             .append_pair("zoom", &zoom.to_string());
+        if let Some(zoom_precise) = zoom_precise {
+            params.append_pair("zoom_precise", &zoom_precise.to_string());
+        }
     }
     let mut path = request_url.path().to_string();
     if let Some(query) = request_url.query() {
