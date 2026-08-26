@@ -347,8 +347,7 @@ impl WebServiceGateway {
             let initializer = {
                 let mut state = self.state.lock().await;
                 state.prune();
-                if let Some(client) = state.clients.get_mut(&key) {
-                    client.expires_at = Instant::now() + SERVICE_CLIENT_TTL;
+                if let Some(client) = state.clients.get(&key) {
                     return Ok(client.clone());
                 }
                 state.pending_client(&key)
@@ -372,9 +371,7 @@ impl WebServiceGateway {
                         let mut state = state.lock().await;
                         state.prune();
                         if state.pending_client_matches(&key, &initializer) {
-                            if let Some(client) = state.clients.get_mut(&key) {
-                                client.expires_at = Instant::now() + SERVICE_CLIENT_TTL;
-                            } else {
+                            if !state.clients.contains_key(&key) {
                                 state.evict_earliest_client_if_full();
                                 state.clients.insert(key.clone(), candidate);
                             }
@@ -392,8 +389,7 @@ impl WebServiceGateway {
 
             let mut state = self.state.lock().await;
             state.prune();
-            if let Some(client) = state.clients.get_mut(&key) {
-                client.expires_at = Instant::now() + SERVICE_CLIENT_TTL;
+            if let Some(client) = state.clients.get(&key) {
                 return Ok(client.clone());
             }
         }
@@ -923,19 +919,10 @@ fn rewrite_response_headers(
         headers.insert(LOCATION, value);
     }
 
-    let cookies = headers.get_all(SET_COOKIE).iter().filter_map(|value| {
-        if is_gateway_session_cookie(value) {
-            return None;
-        }
-        Some(
-            value
-                .to_str()
-                .ok()
-                .and_then(|value| rewrite_set_cookie(value, base_path))
-                .and_then(|value| HeaderValue::from_str(&value).ok())
-                .unwrap_or_else(|| value.clone()),
-        )
-    });
+    let cookies = headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| rewrite_response_cookie(value, base_path));
     let cookies = cookies.collect::<Vec<_>>();
     headers.remove(SET_COOKIE);
     for cookie in cookies {
@@ -1107,15 +1094,16 @@ fn rewrite_set_cookie(value: &str, base_path: &str) -> Option<String> {
     )
 }
 
-fn is_gateway_session_cookie(value: &HeaderValue) -> bool {
-    let pair = value
-        .as_bytes()
-        .split(|byte| *byte == b';')
-        .next()
-        .unwrap_or_default();
-    let pair = pair.trim_ascii_start();
-    pair.strip_prefix(GATEWAY_SESSION_COOKIE.as_bytes())
-        .is_some_and(|suffix| suffix.first() == Some(&b'='))
+fn rewrite_response_cookie(value: &HeaderValue, base_path: &str) -> Option<HeaderValue> {
+    let rewritten = value
+        .to_str()
+        .ok()
+        .and_then(|value| rewrite_set_cookie(value, base_path))
+        .and_then(|value| HeaderValue::from_str(&value).ok());
+    if rewritten.is_none() {
+        tracing::debug!("dropping an upstream Set-Cookie header that cannot be safely rewritten");
+    }
+    rewritten
 }
 
 fn remove_hop_by_hop_headers(headers: &mut HeaderMap, preserve_upgrade: bool) {
@@ -1379,15 +1367,20 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_upstream_cookies_are_preserved_but_gateway_cookies_are_suppressed() {
+    fn unparseable_upstream_cookies_and_gateway_cookies_are_suppressed() {
         let mut headers = HeaderMap::new();
         let raw_cookie = HeaderValue::from_bytes(b"legacy=\xff; Path=/ui").unwrap();
         let malformed_cookie = HeaderValue::from_static("malformed-cookie");
+        let rewritten_cookie = HeaderValue::from_static("sid=valid; Path=/");
         headers.append(SET_COOKIE, raw_cookie.clone());
         headers.append(SET_COOKIE, malformed_cookie.clone());
         headers.append(
             SET_COOKIE,
-            HeaderValue::from_static("ironmesh_service_gateway_session=attempt; Path=/"),
+            HeaderValue::from_static("ironmesh_service_gateway_session =attempt; Path=/"),
+        );
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("sid=valid; Domain=nas.home; Path=/ui"),
         );
 
         rewrite_response_headers(
@@ -1401,7 +1394,7 @@ mod tests {
         .unwrap();
 
         let cookies = headers.get_all(SET_COOKIE).iter().collect::<Vec<_>>();
-        assert_eq!(cookies, vec![&raw_cookie, &malformed_cookie]);
+        assert_eq!(cookies, vec![&rewritten_cookie]);
     }
 
     #[test]
