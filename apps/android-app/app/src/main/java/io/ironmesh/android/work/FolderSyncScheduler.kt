@@ -1,6 +1,7 @@
 package io.ironmesh.android.work
 
 import android.content.Context
+import android.util.Log
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
@@ -12,6 +13,7 @@ import io.ironmesh.android.data.IronmeshPreferences
 import java.util.concurrent.TimeUnit
 
 object FolderSyncScheduler {
+    private const val TAG = "FolderSyncScheduler"
     private const val UNIQUE_PERIODIC_WORK = "ironmesh-folder-sync-periodic"
     private const val UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK = "ironmesh-folder-sync-outage-attempt"
     private const val PERIODIC_INTERVAL_MINUTES = 15L
@@ -38,9 +40,6 @@ object FolderSyncScheduler {
             // rejects that service start, a stale outage worker must still not survive a real
             // configuration change.
             clearOutageRetryCircuit(context)
-            FolderSyncForegroundService.syncConfigChanged(context)
-        } else {
-            FolderSyncForegroundService.syncRuntimeRestored(context)
         }
 
         val constraints = Constraints.Builder()
@@ -59,6 +58,18 @@ object FolderSyncScheduler {
             ExistingPeriodicWorkPolicy.UPDATE,
             request,
         )
+
+        runCatching {
+            if (resetOutageBackoff) {
+                FolderSyncForegroundService.syncConfigChanged(context)
+            } else {
+                FolderSyncForegroundService.syncRuntimeRestored(context)
+            }
+        }.onFailure { error ->
+            // Android can reject foreground-service starts while the app is backgrounded. The
+            // periodic work above is deliberately already registered as the durable fallback.
+            Log.w(TAG, "failed to start folder sync foreground service: ${error.message}")
+        }
     }
 
     fun runNow(context: Context) {
