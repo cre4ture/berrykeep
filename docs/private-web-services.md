@@ -16,7 +16,7 @@ does not require an inbound connection to the home network.
    or relay route. The server resolves the service ID and connects to the fixed
    upstream. Clients cannot submit a destination host or port.
 5. The local client Web UI issues a one-minute, single-use launch link. The
-   browser redeems it on a service-specific `*.berrykeep.localhost` origin and
+   browser redeems it on a service-specific `*.localhost` origin and
    receives a host-only gateway session cookie.
 6. Browser HTTP, streaming uploads/downloads, and WebSocket upgrades are carried
    over authenticated proxy streams. HTTPS is terminated and verified on the
@@ -25,6 +25,10 @@ does not require an inbound connection to the home network.
 The local listener must remain bound to loopback. Separate service hostnames are
 intentional: browser cookies, storage, service workers, and same-origin policy
 are isolated from the BerryKeep client UI and from other configured services.
+Every alias is a direct child of `.localhost`, so sibling services are distinct
+browser sites rather than subdomains of a shared registrable parent. The gateway
+also rejects browser requests whose Origin or Fetch Metadata identifies another
+site.
 
 ## Configure a service
 

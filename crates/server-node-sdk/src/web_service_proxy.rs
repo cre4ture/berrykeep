@@ -842,23 +842,19 @@ fn build_upstream_tls_config(service: &WebServiceConfig) -> Result<rustls::Clien
 }
 
 fn native_root_certificates() -> Result<RootCertStore> {
-    static NATIVE_ROOTS: OnceLock<std::result::Result<RootCertStore, String>> = OnceLock::new();
-    NATIVE_ROOTS
-        .get_or_init(|| {
-            let native = rustls_native_certs::load_native_certs();
-            let mut roots = RootCertStore::empty();
-            for certificate in native.certs {
-                roots
-                    .add(certificate)
-                    .map_err(|error| format!("failed adding native root certificate: {error}"))?;
-            }
-            if !native.errors.is_empty() && roots.is_empty() {
-                return Err("failed loading native root certificates".to_string());
-            }
-            Ok(roots)
-        })
-        .clone()
-        .map_err(anyhow::Error::msg)
+    static NATIVE_ROOTS: OnceLock<RootCertStore> = OnceLock::new();
+    if let Some(roots) = NATIVE_ROOTS.get() {
+        return Ok(roots.clone());
+    }
+
+    let native = rustls_native_certs::load_native_certs();
+    let mut roots = RootCertStore::empty();
+    let (added, _) = roots.add_parsable_certificates(native.certs);
+    if added == 0 {
+        bail!("failed loading native root certificates");
+    }
+    let _ = NATIVE_ROOTS.set(roots.clone());
+    Ok(NATIVE_ROOTS.get().cloned().unwrap_or(roots))
 }
 
 #[derive(Debug)]

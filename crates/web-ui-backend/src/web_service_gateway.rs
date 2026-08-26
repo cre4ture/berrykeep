@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use super::{WebState, cookie_values, current_sdk, error_response};
 
-const SERVICE_HOST_SUFFIX: &str = ".berrykeep.localhost";
+const SERVICE_HOST_SUFFIX: &str = ".localhost";
 const OPEN_PATH: &str = "/_ironmesh/open";
 const GATEWAY_SESSION_COOKIE: &str = "ironmesh_service_gateway_session";
 const LAUNCH_TOKEN_TTL: Duration = Duration::from_secs(60);
@@ -219,6 +219,13 @@ pub(super) async fn dispatch_service_origin(
     if request.uri().path() == OPEN_PATH {
         return redeem_launch_request(&state, &alias, request.uri()).await;
     }
+    let local_origin = format!("http://{local_authority}");
+    if !service_request_origin_allowed(request.headers(), &local_origin) {
+        return service_error(
+            StatusCode::FORBIDDEN,
+            "cross-origin private service requests are not allowed",
+        );
+    }
     let session_tokens =
         cookie_values(request.headers(), GATEWAY_SESSION_COOKIE).collect::<Vec<_>>();
     let session = state
@@ -283,6 +290,27 @@ fn service_alias(node_id: NodeId, service_id: &str) -> String {
         &service_hash[..12],
         &node[..12]
     )
+}
+
+fn service_request_origin_allowed(headers: &HeaderMap, local_origin: &str) -> bool {
+    let Ok(local_origin) = reqwest::Url::parse(local_origin) else {
+        return false;
+    };
+    if headers.get_all(ORIGIN).iter().any(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(|value| reqwest::Url::parse(value).ok())
+            .map(|origin| origin.origin() != local_origin.origin())
+            .unwrap_or(true)
+    }) {
+        return false;
+    }
+    headers.get_all("sec-fetch-site").iter().all(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.eq_ignore_ascii_case("same-origin") || value.eq_ignore_ascii_case("none")
+        })
+    })
 }
 
 async fn redeem_launch_request(state: &WebState, alias: &str, uri: &Uri) -> Response {
@@ -592,43 +620,61 @@ fn rewrite_response_headers(
         headers.append(SET_COOKIE, cookie);
     }
 
-    if let Some(csp) = headers
-        .get("content-security-policy")
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string)
-    {
-        let upstream_websocket_origin = upstream_origin
-            .strip_prefix("https://")
-            .map(|authority| format!("wss://{authority}"))
-            .or_else(|| {
-                upstream_origin
-                    .strip_prefix("http://")
-                    .map(|authority| format!("ws://{authority}"))
-            });
-        let local_websocket_origin = local_origin
-            .strip_prefix("http://")
-            .map(|authority| format!("ws://{authority}"));
-        let mut csp = csp.replace(upstream_origin, local_origin);
-        if let (Some(upstream), Some(local)) = (upstream_websocket_origin, local_websocket_origin) {
-            csp = csp.replace(&upstream, &local);
-        }
-        let csp = csp
-            .split(';')
-            .map(str::trim)
-            .filter(|directive| {
-                let lowercase = directive.to_ascii_lowercase();
-                lowercase != "upgrade-insecure-requests"
-                    && lowercase != "block-all-mixed-content"
-                    && !lowercase.starts_with("report-uri ")
-                    && !lowercase.starts_with("report-to ")
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        if let Ok(value) = HeaderValue::from_str(&csp) {
-            headers.insert("content-security-policy", value);
+    let policies = headers
+        .get_all("content-security-policy")
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .map(|policy| {
+                    rewrite_content_security_policy(policy, upstream_origin, local_origin)
+                })
+                .and_then(|policy| HeaderValue::from_str(&policy).ok())
+                .unwrap_or_else(|| value.clone())
+        })
+        .collect::<Vec<_>>();
+    if !policies.is_empty() {
+        headers.remove("content-security-policy");
+        for policy in policies {
+            headers.append("content-security-policy", policy);
         }
     }
     Ok(())
+}
+
+fn rewrite_content_security_policy(
+    policy: &str,
+    upstream_origin: &str,
+    local_origin: &str,
+) -> String {
+    let upstream_websocket_origin = upstream_origin
+        .strip_prefix("https://")
+        .map(|authority| format!("wss://{authority}"))
+        .or_else(|| {
+            upstream_origin
+                .strip_prefix("http://")
+                .map(|authority| format!("ws://{authority}"))
+        });
+    let local_websocket_origin = local_origin
+        .strip_prefix("http://")
+        .map(|authority| format!("ws://{authority}"));
+    let mut policy = policy.replace(upstream_origin, local_origin);
+    if let (Some(upstream), Some(local)) = (upstream_websocket_origin, local_websocket_origin) {
+        policy = policy.replace(&upstream, &local);
+    }
+    policy
+        .split(';')
+        .map(str::trim)
+        .filter(|directive| {
+            let lowercase = directive.to_ascii_lowercase();
+            lowercase != "upgrade-insecure-requests"
+                && lowercase != "block-all-mixed-content"
+                && !lowercase.starts_with("report-uri ")
+                && !lowercase.starts_with("report-to ")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn rewrite_location(
@@ -828,31 +874,31 @@ mod tests {
             rewrite_location(
                 "https://nas.home/ui/dashboard",
                 "https://nas.home",
-                "http://home-nas.berrykeep.localhost:4100",
+                "http://home-nas.localhost:4100",
                 "/ui",
                 &upstream_request,
             )
             .unwrap()
             .unwrap(),
-            "http://home-nas.berrykeep.localhost:4100/dashboard"
+            "http://home-nas.localhost:4100/dashboard"
         );
         assert_eq!(
             rewrite_location(
                 "next?tab=storage#quota",
                 "https://nas.home",
-                "http://home-nas.berrykeep.localhost:4100",
+                "http://home-nas.localhost:4100",
                 "/ui",
                 &upstream_request,
             )
             .unwrap()
             .unwrap(),
-            "http://home-nas.berrykeep.localhost:4100/next?tab=storage#quota"
+            "http://home-nas.localhost:4100/next?tab=storage#quota"
         );
         assert!(
             rewrite_location(
                 "https://other.example/",
                 "https://nas.home",
-                "http://home-nas.berrykeep.localhost:4100",
+                "http://home-nas.localhost:4100",
                 "/ui",
                 &upstream_request,
             )
@@ -862,12 +908,70 @@ mod tests {
         let error = rewrite_location(
             "https://nas.home/login",
             "https://nas.home",
-            "http://home-nas.berrykeep.localhost:4100",
+            "http://home-nas.localhost:4100",
             "/ui",
             &upstream_request,
         )
         .unwrap_err();
         assert!(error.to_string().contains("escapes configured base path"));
+    }
+
+    #[test]
+    fn service_origin_rejects_sibling_browser_requests() {
+        let local_origin = "http://home-nas.localhost:4100";
+        let mut headers = HeaderMap::new();
+        assert!(service_request_origin_allowed(&headers, local_origin));
+
+        headers.insert(ORIGIN, HeaderValue::from_static(local_origin));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(service_request_origin_allowed(&headers, local_origin));
+
+        headers.insert(
+            ORIGIN,
+            HeaderValue::from_static("http://other-service.localhost:4100"),
+        );
+        assert!(!service_request_origin_allowed(&headers, local_origin));
+
+        headers.remove(ORIGIN);
+        headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(!service_request_origin_allowed(&headers, local_origin));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-site"));
+        assert!(!service_request_origin_allowed(&headers, local_origin));
+    }
+
+    #[test]
+    fn every_upstream_content_security_policy_is_preserved() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "content-security-policy",
+            HeaderValue::from_static("default-src https://nas.home"),
+        );
+        headers.append(
+            "content-security-policy",
+            HeaderValue::from_static("script-src https://nas.home; upgrade-insecure-requests"),
+        );
+        rewrite_response_headers(
+            &mut headers,
+            "https://nas.home",
+            "http://home-nas.localhost:4100",
+            "/ui",
+            &"/ui/".parse().unwrap(),
+            false,
+        )
+        .unwrap();
+
+        let policies = headers
+            .get_all("content-security-policy")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            policies,
+            vec![
+                "default-src http://home-nas.localhost:4100",
+                "script-src http://home-nas.localhost:4100",
+            ]
+        );
     }
 
     #[test]
@@ -916,6 +1020,7 @@ mod tests {
         let node_id = Uuid::now_v7();
         let launch = gateway.issue_launch(node_id, "home-nas", 4100).await;
         let launch_url = reqwest::Url::parse(&launch.url).unwrap();
+        assert_eq!(launch_url.host_str().unwrap().split('.').count(), 2);
         let token = launch_url
             .query_pairs()
             .find(|(name, _)| name == "token")

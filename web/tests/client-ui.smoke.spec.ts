@@ -37,7 +37,7 @@ registerGalleryMapContractTests({
   }
 });
 
-test("private service launch sends its Strict cookie on the first landing request", async ({
+test("private service origins keep the launch cookie and sibling sites isolated", async ({
   page
 }) => {
   const server = createServer((request, response) => {
@@ -50,12 +50,12 @@ test("private service launch sends its Strict cookie on the first landing reques
     if (host.startsWith("localhost:") && request.url === "/start") {
       response.setHeader("content-type", "text/html; charset=utf-8");
       response.end(
-        `<a id="launch" href="http://strict-check.berrykeep.localhost:${address.port}/_ironmesh/open">Open</a>`
+        `<a id="launch" href="http://strict-check.localhost:${address.port}/_ironmesh/open">Open</a>`
       );
       return;
     }
     if (
-      host.startsWith("strict-check.berrykeep.localhost:") &&
+      host.startsWith("strict-check.localhost:") &&
       request.url === "/_ironmesh/open"
     ) {
       response.setHeader(
@@ -72,13 +72,31 @@ test("private service launch sends its Strict cookie on the first landing reques
       );
       return;
     }
-    if (host.startsWith("strict-check.berrykeep.localhost:") && request.url === "/") {
-      const authenticated = String(request.headers.cookie ?? "").includes(
+    if (host.startsWith("sibling.localhost:") && request.url === "/attack") {
+      response.setHeader("content-type", "text/html; charset=utf-8");
+      response.end(
+        `<script>
+          document.cookie = "ironmesh_service_gateway_session=shadow; Domain=localhost; Path=/";
+          document.cookie = "sid=sibling-injected; Domain=localhost; Path=/";
+        </script>
+        <a id="cross-service" href="http://strict-check.localhost:${address.port}/">Open sibling</a>`
+      );
+      return;
+    }
+    if (host.startsWith("strict-check.localhost:") && request.url === "/") {
+      const cookies = String(request.headers.cookie ?? "");
+      const authenticated = cookies.includes(
         "ironmesh_service_gateway_session=session-secret"
       );
-      response.writeHead(authenticated ? 200 : 401).end(
-        authenticated ? "authenticated-first-landing" : "missing-cookie"
-      );
+      const siblingCookieLeaked =
+        cookies.includes("ironmesh_service_gateway_session=shadow") ||
+        cookies.includes("sid=sibling-injected");
+      const body = siblingCookieLeaked
+        ? "sibling-cookie-leaked"
+        : authenticated
+          ? "authenticated-first-landing"
+          : "unauthenticated-cross-site";
+      response.writeHead(authenticated ? 200 : 401).end(body);
       return;
     }
     response.writeHead(404).end("not-found");
@@ -96,9 +114,16 @@ test("private service launch sends its Strict cookie on the first landing reques
     await page.goto(`http://localhost:${address.port}/start`);
     await page.locator("#launch").click();
     await page.waitForURL(
-      (url) => url.hostname === "strict-check.berrykeep.localhost" && url.pathname === "/"
+      (url) => url.hostname === "strict-check.localhost" && url.pathname === "/"
     );
     await expect(page.locator("body")).toHaveText("authenticated-first-landing");
+
+    await page.goto(`http://sibling.localhost:${address.port}/attack`);
+    await page.locator("#cross-service").click();
+    await page.waitForURL(
+      (url) => url.hostname === "strict-check.localhost" && url.pathname === "/"
+    );
+    await expect(page.locator("body")).toHaveText("unauthenticated-cross-site");
   } finally {
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
