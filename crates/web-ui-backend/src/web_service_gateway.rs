@@ -353,34 +353,37 @@ impl WebServiceGateway {
                 state.pending_client(&key)
             };
 
-            let state_for_open = Arc::clone(&self.state);
-            let runtime_for_open = Arc::clone(runtime);
-            let key_for_open = key.clone();
-            let initializer_for_open = Arc::clone(&initializer);
-            let initialized = initializer
-                .get_or_try_init(|| {
-                    let state = Arc::clone(&state_for_open);
-                    let runtime = Arc::clone(&runtime_for_open);
-                    let key = key_for_open.clone();
-                    let initializer = Arc::clone(&initializer_for_open);
-                    let service_id = service_id.to_string();
-                    async move {
-                        let sdk = runtime.read().await.sdk.clone();
-                        let connection = sdk.open_web_service_proxy(node_id, &service_id).await?;
-                        let candidate = PooledServiceClient::new(runtime, connection);
-                        let mut state = state.lock().await;
-                        state.prune();
-                        if state.pending_client_matches(&key, &initializer) {
-                            if !state.clients.contains_key(&key) {
-                                state.evict_earliest_client_if_full();
-                                state.clients.insert(key.clone(), candidate);
+            let initialized = {
+                let state_for_open = Arc::clone(&self.state);
+                let runtime_for_open = Arc::clone(runtime);
+                let key_for_open = key.clone();
+                let initializer_for_open = Arc::clone(&initializer);
+                initializer
+                    .get_or_try_init(|| {
+                        let state = Arc::clone(&state_for_open);
+                        let runtime = Arc::clone(&runtime_for_open);
+                        let key = key_for_open.clone();
+                        let initializer = Arc::clone(&initializer_for_open);
+                        let service_id = service_id.to_string();
+                        async move {
+                            let sdk = runtime.read().await.sdk.clone();
+                            let connection =
+                                sdk.open_web_service_proxy(node_id, &service_id).await?;
+                            let candidate = PooledServiceClient::new(runtime, connection);
+                            let mut state = state.lock().await;
+                            state.prune();
+                            if state.pending_client_matches(&key, &initializer) {
+                                if !state.clients.contains_key(&key) {
+                                    state.evict_earliest_client_if_full();
+                                    state.clients.insert(key.clone(), candidate);
+                                }
+                                state.pending_clients.remove(&key);
                             }
-                            state.pending_clients.remove(&key);
+                            Ok::<_, anyhow::Error>(())
                         }
-                        Ok::<_, anyhow::Error>(())
-                    }
-                })
-                .await;
+                    })
+                    .await
+            };
             if let Err(error) = initialized {
                 let mut state = self.state.lock().await;
                 state.remove_pending_client_if_unused(&key, &initializer);
@@ -432,6 +435,8 @@ impl GatewayState {
         key: &(NodeId, String),
         initializer: &Arc<OnceCell<()>>,
     ) {
+        // The map and this caller each hold one reference. Further references mean another
+        // caller is still waiting on, or retrying through, this initializer.
         if self.pending_client_matches(key, initializer) && Arc::strong_count(initializer) == 2 {
             self.pending_clients.remove(key);
         }
@@ -1282,6 +1287,22 @@ mod tests {
             &expected_initializer,
             &state.lock().await.pending_client(&key)
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_service_client_initializer_is_removed_when_unused() {
+        let mut state = GatewayState::default();
+        let key = (Uuid::now_v7(), "home-nas".to_string());
+        let initializer = state.pending_client(&key);
+
+        let result = initializer
+            .get_or_try_init(|| async { Err::<(), _>(anyhow::anyhow!("service is offline")) })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(Arc::strong_count(&initializer), 2);
+
+        state.remove_pending_client_if_unused(&key, &initializer);
+        assert!(!state.pending_clients.contains_key(&key));
     }
 
     #[test]

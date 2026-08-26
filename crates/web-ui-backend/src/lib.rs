@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -641,7 +642,7 @@ async fn require_same_origin_web_ui_write(request: Request, next: Next) -> Respo
         .headers()
         .get(HOST)
         .and_then(|value| value.to_str().ok())
-        .map(|authority| format!("http://{authority}"));
+        .and_then(trusted_loopback_origin);
     if !local_origin.is_some_and(|origin| {
         web_service_gateway::request_origin_allowed(request.headers(), &origin)
     }) {
@@ -651,6 +652,26 @@ async fn require_same_origin_web_ui_write(request: Request, next: Next) -> Respo
         );
     }
     next.run(request).await
+}
+
+fn trusted_loopback_origin(authority: &str) -> Option<String> {
+    let origin = format!("http://{authority}");
+    let url = Url::parse(&origin).ok()?;
+    if url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    loopback.then_some(origin)
 }
 
 fn is_safe_web_ui_method(method: &Method) -> bool {
@@ -4123,7 +4144,7 @@ mod tests {
         DIAGNOSTIC_CONTEXT_HEADER, EMBEDDED_WEB_UI_SESSION_COOKIE, EMBEDDED_WEB_UI_SESSION_HEADER,
         EmbeddedWebUiSessionAuthorization, ErrorResponseBody, WebUiConfig, client_cache_scope,
         error_response, is_safe_web_ui_method, normalize_store_restore_path, router,
-        web_latency_probe_timeout,
+        trusted_loopback_origin, web_latency_probe_timeout,
     };
     use axum::body::to_bytes;
     use axum::http::header::{HOST, ORIGIN};
@@ -4185,6 +4206,24 @@ mod tests {
         assert!(!is_safe_web_ui_method(&Method::POST));
     }
 
+    #[test]
+    fn local_web_ui_origin_is_limited_to_loopback_authorities() {
+        assert_eq!(
+            trusted_loopback_origin("localhost:4100").as_deref(),
+            Some("http://localhost:4100")
+        );
+        assert_eq!(
+            trusted_loopback_origin("127.0.0.1:4100").as_deref(),
+            Some("http://127.0.0.1:4100")
+        );
+        assert_eq!(
+            trusted_loopback_origin("[::1]:4100").as_deref(),
+            Some("http://[::1]:4100")
+        );
+        assert!(trusted_loopback_origin("home-nas.localhost:4100").is_none());
+        assert!(trusted_loopback_origin("evil.example:4100").is_none());
+    }
+
     #[tokio::test]
     async fn cross_origin_binary_store_writes_are_rejected_before_reaching_the_client() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4211,6 +4250,19 @@ mod tests {
             .await
             .expect("cross-origin request should receive an HTTP response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let rebinding_response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/api/v1/store/put-binary?key=dns-rebinding-write"
+            ))
+            .header(HOST, "evil.example")
+            .header(ORIGIN, "http://evil.example")
+            .header("sec-fetch-site", "same-origin")
+            .body("blocked")
+            .send()
+            .await
+            .expect("DNS-rebinding request should receive an HTTP response");
+        assert_eq!(rebinding_response.status(), StatusCode::FORBIDDEN);
 
         server.abort();
     }
