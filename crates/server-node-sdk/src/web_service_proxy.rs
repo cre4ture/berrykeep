@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +9,8 @@ use axum::Json;
 use axum::extract::{Extension, Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use futures_util::io::{AsyncRead, AsyncWrite};
 use reqwest::Url;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -28,11 +30,13 @@ use transport_sdk::{TransportHeader, TransportRequestHead, TransportResponseHead
 
 use super::{
     AuthenticatedClientIdentity, ServerState, append_admin_audit, authorize_admin_request,
-    transport_service, validate_client_auth_request, write_json_atomic,
-    write_transport_response_head,
+    ensure_non_traversing_path, normalize_non_traversing_path, transport_service,
+    validate_client_auth_request, write_transport_response_head,
 };
 
 const WEB_SERVICES_STATE_VERSION: u32 = 1;
+const WEB_SERVICES_STATE_DIRECTORY: &str = "state";
+const WEB_SERVICES_STATE_FILE: &str = "web_services.json";
 const WEB_SERVICE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WEB_SERVICES: usize = 256;
 const MAX_UPSTREAM_URL_BYTES: usize = 2_048;
@@ -45,7 +49,7 @@ pub(crate) const HEADER_UPSTREAM_SCHEME: &str = "x-ironmesh-web-service-scheme";
 
 #[derive(Clone)]
 pub(crate) struct WebServiceRegistry {
-    path: PathBuf,
+    state_dir: Arc<Dir>,
     services: Arc<RwLock<Vec<WebServiceConfig>>>,
 }
 
@@ -111,44 +115,41 @@ fn default_enabled() -> bool {
 
 impl WebServiceRegistry {
     pub(crate) async fn load(data_dir: &Path) -> Result<Self> {
-        let path = data_dir.join("state").join("web_services.json");
-        let services = match tokio::fs::read(&path).await {
-            Ok(payload) => {
+        let data_dir = data_dir.to_path_buf();
+        let (state_dir, payload) = tokio::task::spawn_blocking(move || {
+            let state_dir = Arc::new(open_state_directory(&data_dir)?);
+            let payload = match state_dir.read(WEB_SERVICES_STATE_FILE) {
+                Ok(payload) => Some(payload),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error).context("failed reading web services state"),
+            };
+            Ok::<_, anyhow::Error>((state_dir, payload))
+        })
+        .await
+        .context("web service state initialization task failed")??;
+        let services = match payload {
+            Some(payload) => {
                 let file: WebServicesFile = serde_json::from_slice(&payload)
-                    .with_context(|| format!("failed parsing {}", path.display()))?;
+                    .context("failed parsing web services state")?;
                 if file.version != WEB_SERVICES_STATE_VERSION {
-                    bail!(
-                        "unsupported web services state version {} in {}",
-                        file.version,
-                        path.display()
-                    );
+                    bail!("unsupported web services state version {}", file.version);
                 }
                 if file.services.len() > MAX_WEB_SERVICES {
-                    bail!(
-                        "web services state contains more than {MAX_WEB_SERVICES} services in {}",
-                        path.display()
-                    );
+                    bail!("web services state contains more than {MAX_WEB_SERVICES} services");
                 }
                 let mut service_ids = HashSet::new();
                 for service in &file.services {
                     validate_service(service)?;
                     if !service_ids.insert(service.id.as_str()) {
-                        bail!(
-                            "duplicate web service id {} in {}",
-                            service.id,
-                            path.display()
-                        );
+                        bail!("duplicate web service id {}", service.id);
                     }
                 }
                 file.services
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed reading {}", path.display()));
-            }
+            None => Vec::new(),
         };
         Ok(Self {
-            path,
+            state_dir,
             services: Arc::new(RwLock::new(services)),
         })
     }
@@ -156,7 +157,10 @@ impl WebServiceRegistry {
     #[cfg(test)]
     pub(crate) fn empty(data_dir: &Path) -> Self {
         Self {
-            path: data_dir.join("state").join("web_services.json"),
+            state_dir: Arc::new(
+                open_state_directory(data_dir)
+                    .expect("test web service state directory should open"),
+            ),
             services: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -194,7 +198,7 @@ impl WebServiceRegistry {
         }
         let mut updated = services.clone();
         updated.push(service);
-        persist_services(&self.path, &updated).await?;
+        persist_services(&self.state_dir, &updated).await?;
         *services = updated;
         Ok(true)
     }
@@ -210,7 +214,7 @@ impl WebServiceRegistry {
         };
         let mut updated = services.clone();
         updated[index] = service;
-        persist_services(&self.path, &updated).await?;
+        persist_services(&self.state_dir, &updated).await?;
         *services = updated;
         Ok(true)
     }
@@ -231,7 +235,7 @@ impl WebServiceRegistry {
         updated.retain(|service| service.id != service_id);
         let deleted = updated.len() != previous_len;
         if deleted {
-            persist_services(&self.path, &updated).await?;
+            persist_services(&self.state_dir, &updated).await?;
             *services = updated;
         }
         Ok(deleted)
@@ -264,13 +268,57 @@ fn trimmed_option(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn persist_services(path: &Path, services: &[WebServiceConfig]) -> Result<()> {
+fn open_state_directory(data_dir: &Path) -> Result<Dir> {
+    ensure_non_traversing_path(data_dir, "data directory")?;
+    let data_dir = normalize_non_traversing_path(data_dir);
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("failed creating data directory {}", data_dir.display()))?;
+    let root = Dir::open_ambient_dir(&data_dir, ambient_authority())
+        .with_context(|| format!("failed opening data directory {}", data_dir.display()))?;
+    match root.symlink_metadata(WEB_SERVICES_STATE_DIRECTORY) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("web service state directory must not be a symbolic link");
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            bail!("web service state path must be a directory");
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => root
+            .create_dir(WEB_SERVICES_STATE_DIRECTORY)
+            .context("failed creating web service state directory")?,
+        Err(error) => {
+            return Err(error).context("failed inspecting web service state directory");
+        }
+    }
+    root.open_dir(WEB_SERVICES_STATE_DIRECTORY)
+        .context("failed opening web service state directory")
+}
+
+async fn persist_services(state_dir: &Arc<Dir>, services: &[WebServiceConfig]) -> Result<()> {
     let payload = serde_json::to_vec_pretty(&WebServicesFile {
         version: WEB_SERVICES_STATE_VERSION,
         services: services.to_vec(),
     })
     .context("failed serializing web services state")?;
-    write_json_atomic(path, &payload).await
+    let state_dir = Arc::clone(state_dir);
+    tokio::task::spawn_blocking(move || write_state_file_atomic(&state_dir, &payload))
+        .await
+        .context("web service state persistence task failed")?
+}
+
+fn write_state_file_atomic(state_dir: &Dir, payload: &[u8]) -> Result<()> {
+    let temporary_file = format!(
+        ".{WEB_SERVICES_STATE_FILE}.tmp-{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    state_dir
+        .write(&temporary_file, payload)
+        .context("failed writing temporary web services state")?;
+    if let Err(error) = state_dir.rename(&temporary_file, state_dir, WEB_SERVICES_STATE_FILE) {
+        let _ = state_dir.remove_file(&temporary_file);
+        return Err(error).context("failed replacing web services state");
+    }
+    Ok(())
 }
 
 fn validate_service(service: &WebServiceConfig) -> Result<()> {
@@ -967,6 +1015,28 @@ mod tests {
         assert!(reloaded.delete(&service.id).await.unwrap());
         assert!(reloaded.all().await.is_empty());
         tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_rejects_state_directory_symlink_escape() {
+        let root = std::env::temp_dir().join(format!(
+            "ironmesh-web-services-symlink-test-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "ironmesh-web-services-outside-test-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(WEB_SERVICES_STATE_DIRECTORY)).unwrap();
+
+        let error = WebServiceRegistry::load(&root).await.err().unwrap();
+        assert!(error.to_string().contains("must not be a symbolic link"));
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]

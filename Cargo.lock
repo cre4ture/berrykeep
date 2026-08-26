@@ -5615,6 +5615,7 @@ dependencies = [
  "berry-thumbnailer",
  "blake3",
  "bytes",
+ "cap-std",
  "client-sdk",
  "common",
  "fs2",

@@ -21,6 +21,7 @@ base64 = "0.22"
 berry-thumbnailer = { git = "https://github.com/cre4ture/berry-thumbnailer.git", rev = "79ffd45d4a280e55747164d85d9095e42d8a7281" }
 blake3.workspace = true
 bytes.workspace = true
+cap-std = "4"
 common = { path = "../common" }
 exif = { package = "kamadak-exif", version = "0.6" }
 fs2 = "0.4"

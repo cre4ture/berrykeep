@@ -6009,6 +6009,7 @@ dependencies = [
  "berry-thumbnailer",
  "blake3",
  "bytes",
+ "cap-std",
  "common",
  "fs2",
  "futures-core",
