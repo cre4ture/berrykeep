@@ -40,14 +40,18 @@ internal object FolderSyncOutageRetryPolicy {
     private const val MAX_JITTER_PERMILLE = 100
 
     /**
-     * 30 seconds, 1, 2, 4, 8, 16 and then 30 minutes. Jitter is additive only, so a retry is
-     * never earlier than the documented delay and the maximum remains bounded at 30 minutes.
+     * 30 seconds, 1, 2, 4, 8, 16 and then 27 to 30 minutes. Jitter is additive only. The final
+     * rung reserves the jitter window below the 30-minute ceiling so long outages do not make all
+     * devices retry at the same moment.
      */
     fun delayForFailure(failureCount: Int, jitterPermille: Int = 0): Long {
         val normalizedFailureCount = failureCount.coerceIn(1, MAX_FAILURE_COUNT)
         val exponent = normalizedFailureCount - 1
-        val unjitteredDelay = (BASE_DELAY_MS * (1L shl exponent)).coerceAtMost(MAX_DELAY_MS)
         val normalizedJitter = jitterPermille.coerceIn(0, MAX_JITTER_PERMILLE)
+        val maximumUnjitteredDelay =
+            MAX_DELAY_MS - (MAX_DELAY_MS * MAX_JITTER_PERMILLE / 1_000L)
+        val unjitteredDelay = (BASE_DELAY_MS * (1L shl exponent))
+            .coerceAtMost(maximumUnjitteredDelay)
         val jitteredDelay = unjitteredDelay +
             (unjitteredDelay * normalizedJitter / 1_000L)
         return jitteredDelay.coerceAtMost(MAX_DELAY_MS)

@@ -14,14 +14,15 @@ class FolderSyncOutageRetryPolicyTest {
         assertEquals(240_000L, FolderSyncOutageRetryPolicy.delayForFailure(4))
         assertEquals(480_000L, FolderSyncOutageRetryPolicy.delayForFailure(5))
         assertEquals(960_000L, FolderSyncOutageRetryPolicy.delayForFailure(6))
-        assertEquals(1_800_000L, FolderSyncOutageRetryPolicy.delayForFailure(7))
-        assertEquals(1_800_000L, FolderSyncOutageRetryPolicy.delayForFailure(99))
+        assertEquals(1_620_000L, FolderSyncOutageRetryPolicy.delayForFailure(7))
+        assertEquals(1_620_000L, FolderSyncOutageRetryPolicy.delayForFailure(99))
     }
 
     @Test
     fun jitterNeverMakesRetryEarlierOrLongerThanMaximum() {
         assertEquals(33_000L, FolderSyncOutageRetryPolicy.delayForFailure(1, jitterPermille = 100))
-        assertEquals(1_800_000L, FolderSyncOutageRetryPolicy.delayForFailure(7, jitterPermille = 100))
+        assertEquals(1_782_000L, FolderSyncOutageRetryPolicy.delayForFailure(7, jitterPermille = 100))
+        assertEquals(1_701_000L, FolderSyncOutageRetryPolicy.delayForFailure(7, jitterPermille = 50))
     }
 
     @Test

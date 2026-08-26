@@ -673,23 +673,37 @@ class FolderSyncForegroundService : Service() {
     }
 
     private suspend fun processManagedClientNetworkChange(reason: String) {
-        try {
-            withContext(Dispatchers.IO) {
-                val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
-                val connectionInput = deviceAuth.connectionBootstrapJson()
-                val clientIdentityJson = deviceAuth.toClientIdentityJson()
-                if (connectionInput.isNotBlank() && !clientIdentityJson.isNullOrBlank()) {
-                    repository.notifyNetworkChanged(
-                        connectionInput = connectionInput,
-                        serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() },
-                        clientIdentityJson = clientIdentityJson,
-                    )
+        val retryState = outageRetryStore.state()
+        if (
+            FolderSyncOutageRetryPolicy.allowsAttempt(
+                retryState,
+                FolderSyncRetryTrigger.NETWORK_AVAILABLE,
+                System.currentTimeMillis(),
+            )
+        ) {
+            try {
+                withContext(Dispatchers.IO) {
+                    val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
+                    val connectionInput = deviceAuth.connectionBootstrapJson()
+                    val clientIdentityJson = deviceAuth.toClientIdentityJson()
+                    if (connectionInput.isNotBlank() && !clientIdentityJson.isNullOrBlank()) {
+                        repository.notifyNetworkChanged(
+                            connectionInput = connectionInput,
+                            serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() },
+                            clientIdentityJson = clientIdentityJson,
+                        )
+                    }
                 }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.w(TAG, "managed client network hint failed ($reason): ${error.message}")
             }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Exception) {
-            Log.w(TAG, "managed client network hint failed ($reason): ${error.message}")
+        } else {
+            Log.i(
+                TAG,
+                "managed client network hint held until outage backoff expires at ${retryState.nextRetryAtEpochMs}",
+            )
         }
         reconcileAfterNetworkPolicyEvaluation(
             reason = reason,
