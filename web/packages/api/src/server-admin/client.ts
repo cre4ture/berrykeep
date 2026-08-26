@@ -235,7 +235,29 @@ export async function listAdminStoreEntries(
     query.set("north", String(options.viewport.north));
     query.set("east", String(options.viewport.east));
   }
+  for (const label of options.requireLabels ?? []) {
+    if (label.trim()) {
+      query.append("require_labels", label.trim());
+    }
+  }
+  for (const label of options.excludeLabels ?? []) {
+    if (label.trim()) {
+      query.append("exclude_labels", label.trim());
+    }
+  }
   return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
+    adminTokenOverride
+  });
+}
+
+export async function setAdminStoreMediaLabels(
+  path: string,
+  labels: string[],
+  adminTokenOverride?: string
+): Promise<void> {
+  await fetchAdminJson<unknown>(apiV1("/auth/store/labels"), {
+    method: "POST",
+    body: { path, labels },
     adminTokenOverride
   });
 }

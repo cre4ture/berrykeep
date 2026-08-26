@@ -139,6 +139,7 @@ class MainActivity : ComponentActivity() {
                     refresh = vm::refreshGallery,
                     updateViewMode = vm::updateGalleryViewMode,
                     updateSort = vm::updateGallerySort,
+                    updateShowSensitiveContent = vm::updateGalleryShowSensitiveContent,
                     navigateToRoot = vm::navigateGalleryToRoot,
                     navigateUp = vm::navigateGalleryUp,
                     navigateToBreadcrumb = vm::navigateGalleryToBreadcrumb,
@@ -147,6 +148,7 @@ class MainActivity : ComponentActivity() {
                     itemAt = vm::galleryItemAt,
                     ensureItemLoaded = vm::ensureGalleryItemLoaded,
                     pinItem = vm::pinGalleryItem,
+                    toggleMediaLabel = vm::toggleGalleryMediaLabel,
                 )
             }
             IronmeshTheme(accentColorHex = state.themeAccentColorHex) {

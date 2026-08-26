@@ -7,12 +7,14 @@ struct IronmeshGalleryView: View {
     @StateObject private var galleryModel = IronmeshGalleryModel()
     @State private var mode: AppleGalleryMode = .allImages
     @State private var sort: AppleGallerySort = .newest
+    @AppStorage("ironmesh.gallery.show_sensitive_content") private var showSensitiveContent = false
     @State private var selection: IronmeshGallerySelection?
 
     private var loadID: IronmeshGalleryLoadID {
         IronmeshGalleryLoadID(
             mode: mode,
             sort: sort,
+            showSensitiveContent: showSensitiveContent,
             currentPath: mode == .currentFolder ? browserModel.currentPath : "",
             configuration: browserModel.draft.connectionConfiguration
         )
@@ -37,7 +39,8 @@ struct IronmeshGalleryView: View {
                 mode: mode,
                 sort: sort,
                 currentPath: browserModel.currentPath,
-                configuration: browserModel.draft.connectionConfiguration
+                configuration: browserModel.draft.connectionConfiguration,
+                showSensitiveContent: showSensitiveContent
             )
         }
         .onChange(of: loadID) { _ in
@@ -84,6 +87,9 @@ struct IronmeshGalleryView: View {
                 Text("Name").tag(AppleGallerySort.path)
             }
             .pickerStyle(.segmented)
+
+            Toggle("Show private / NSFW media", isOn: $showSensitiveContent)
+                .font(.subheadline)
         }
         .padding(14)
         .background(.background, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -182,6 +188,7 @@ struct IronmeshGalleryView: View {
 private struct IronmeshGalleryLoadID: Equatable {
     let mode: AppleGalleryMode
     let sort: AppleGallerySort
+    let showSensitiveContent: Bool
     let currentPath: String
     let configuration: AppleConnectionConfiguration?
 }
@@ -241,6 +248,12 @@ private struct IronmeshGalleryThumbnailCell: View {
                 Text(Date(timeIntervalSince1970: TimeInterval(takenAtUnix)), style: .date)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            }
+            if let labels = entry.labels, !labels.isEmpty {
+                Text(labels.joined(separator: " · "))
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
             }
         }
         .task(id: "\(entry.path)-\(retryGeneration)") {
@@ -336,8 +349,22 @@ private struct IronmeshGalleryViewer: View {
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") {
-                        dismiss()
+                    HStack {
+                        if let entry = galleryModel.entries.first(where: { $0.path == selectedPath }) {
+                            Menu {
+                                ForEach(["private", "nsfw"], id: \.self) { label in
+                                    let enabled = (entry.labels ?? []).contains(label)
+                                    Button(enabled ? "Remove \(label)" : "Mark \(label)") {
+                                        galleryModel.toggleSensitiveLabel(for: entry, label: label)
+                                    }
+                                }
+                            } label: {
+                                Label("Labels", systemImage: "tag")
+                            }
+                        }
+                        Button("Done") {
+                            dismiss()
+                        }
                     }
                 }
             }

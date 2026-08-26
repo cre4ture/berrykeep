@@ -28,6 +28,19 @@ public protocol AppleManualCBridgeFFI: Sendable {
         sort: String?,
         mediaFilter: String?
     ) throws -> String
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?,
+        excludeLabels: String?
+    ) throws -> String
+    func setMediaLabels(handle: AppleRustHandle, key: String, labelsJSON: String) throws
     func metadataJSON(handle: AppleRustHandle, key: String) throws -> String
     func fetchBytes(handle: AppleRustHandle, key: String) throws -> Data
     func objectSize(
@@ -82,6 +95,39 @@ public protocol AppleManualCBridgeFFI: Sendable {
 }
 
 public extension AppleManualCBridgeFFI {
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?,
+        excludeLabels: String?
+    ) throws -> String {
+        _ = excludeLabels
+        return try storeIndexJSON(
+            handle: handle,
+            prefix: prefix,
+            depth: depth,
+            snapshot: snapshot,
+            view: view,
+            offset: offset,
+            limit: limit,
+            sort: sort,
+            mediaFilter: mediaFilter
+        )
+    }
+
+    func setMediaLabels(handle: AppleRustHandle, key: String, labelsJSON: String) throws {
+        _ = handle
+        _ = key
+        _ = labelsJSON
+        throw AppleManualCBridgeError.invalidResponse("Media-label editing is unavailable")
+    }
+
     func objectSize(
         handle: AppleRustHandle,
         key: String,
@@ -288,9 +334,22 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
                 offset: request.options.offset,
                 limit: request.options.limit,
                 sort: request.options.sort?.rawValue,
-                mediaFilter: request.options.mediaFilter?.rawValue
+                mediaFilter: request.options.mediaFilter?.rawValue,
+                excludeLabels: request.options.excludeLabels.isEmpty
+                    ? nil
+                    : request.options.excludeLabels.joined(separator: ",")
             )
             return try decode(AppleStoreIndexResponse.self, from: responseJSON)
+        }
+    }
+
+    public func setMediaLabels(path: String, labels: [String]) throws {
+        let labelsData = try JSONEncoder().encode(labels)
+        guard let labelsJSON = String(data: labelsData, encoding: .utf8) else {
+            throw AppleManualCBridgeError.invalidResponse("Could not encode media labels.")
+        }
+        try withHandle { handle in
+            try ffi.setMediaLabels(handle: handle, key: normalizedPath(path), labelsJSON: labelsJSON)
         }
     }
 

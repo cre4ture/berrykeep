@@ -468,6 +468,7 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/store/get", get(web_store_get))
         .route("/store/put", post(web_store_put))
+        .route("/store/labels", post(web_store_labels))
         .route("/store/rename", post(web_store_rename))
         .route("/store/delete", delete(web_store_delete))
         .route("/store/restore", post(web_store_restore))
@@ -541,6 +542,7 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/api/store/get", get(web_store_get))
         .route("/api/store/put", post(web_store_put))
+        .route("/api/store/labels", post(web_store_labels))
         .route("/api/store/rename", post(web_store_rename))
         .route("/api/store/delete", delete(web_store_delete))
         .route("/api/store/restore", post(web_store_restore))
@@ -687,6 +689,10 @@ struct WebStoreListQuery {
     limit: Option<usize>,
     sort: Option<String>,
     media_filter: Option<String>,
+    #[serde(default)]
+    require_labels: Vec<String>,
+    #[serde(default)]
+    exclude_labels: Vec<String>,
     south: Option<f64>,
     west: Option<f64>,
     north: Option<f64>,
@@ -734,6 +740,12 @@ struct WebStoreGetQuery {
 struct WebStorePutRequest {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreLabelsRequest {
+    path: String,
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3020,6 +3032,8 @@ async fn web_store_list(
                 sort,
                 media_filter,
                 viewport,
+                require_labels: query.require_labels,
+                exclude_labels: query.exclude_labels,
                 synthesize_missing_folder_markers: matches!(view, Some(StoreIndexView::Tree))
                     && query.offset.is_none()
                     && query.limit.is_none()
@@ -3276,6 +3290,30 @@ async fn web_store_put(
             &state,
             StatusCode::BAD_GATEWAY,
             "store put request failed",
+            err.to_string(),
+        ),
+    }
+}
+
+async fn web_store_labels(
+    State(state): State<WebState>,
+    Json(request): Json<WebStoreLabelsRequest>,
+) -> impl IntoResponse {
+    let path = request.path.trim();
+    if path.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "path must not be empty");
+    }
+
+    match current_sdk(&state)
+        .await
+        .set_media_labels(path, request.labels)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store labels request failed",
             err.to_string(),
         ),
     }

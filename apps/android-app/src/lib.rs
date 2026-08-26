@@ -2965,6 +2965,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
     limit: jint,
     sort: jstring,
     media_filter: jstring,
+    exclude_labels: jstring,
     server_ca_pem: jstring,
     client_identity_json: jstring,
 ) -> jstring {
@@ -2975,6 +2976,16 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
         let view = optional_jstring(&mut env, view)?;
         let sort = optional_jstring(&mut env, sort)?;
         let media_filter = optional_jstring(&mut env, media_filter)?;
+        let exclude_labels = optional_jstring(&mut env, exclude_labels)?
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
@@ -2985,6 +2996,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
             limit: usize::try_from(limit).ok(),
             sort: parse_store_index_sort_order(sort.as_deref())?,
             media_filter: parse_store_index_media_filter(media_filter.as_deref())?,
+            exclude_labels,
             ..StoreIndexRequestOptions::default()
         };
         let response = sdk.store_index_with_options_blocking(
@@ -3014,6 +3026,42 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
                 format!("rust storeIndexWithOptions failed: {err:#}"),
             );
             std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_setMediaLabels(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    key: JString,
+    labels_json: JString,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+) -> jint {
+    let result = (|| -> Result<jint> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let key: String = env.get_string(&key)?.into();
+        let labels_json: String = env.get_string(&labels_json)?.into();
+        let labels = serde_json::from_str::<Vec<String>>(&labels_json)
+            .context("failed to parse media label JSON")?;
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let sdk = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        sdk.set_media_labels_blocking(key, labels)?;
+        Ok(204)
+    })();
+
+    match result {
+        Ok(status) => status,
+        Err(err) => {
+            throw_java_error(&mut env, format!("rust setMediaLabels failed: {err:#}"));
+            0
         }
     }
 }

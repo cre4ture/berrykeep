@@ -77,6 +77,7 @@ private data class PersistedMainUiState(
     val deviceAuthResult: Result<DeviceAuthState>,
     val appConnectionStatus: AppConnectionStatus,
     val galleryViewMode: GalleryViewMode,
+    val galleryShowSensitiveContent: Boolean,
     val titleLatencyMonitorSettings: TitleLatencyMonitorSettings,
     val themeAccentColorHex: String,
 )
@@ -278,6 +279,7 @@ class MainViewModel(
                             .filterNotNull()
                             .first(),
                         galleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication()),
+                        galleryShowSensitiveContent = IronmeshPreferences.getGalleryShowSensitiveContent(getApplication()),
                         titleLatencyMonitorSettings =
                             IronmeshPreferences.getTitleLatencyMonitorSettings(getApplication()),
                         themeAccentColorHex = IronmeshPreferences.getThemeAccentColor(getApplication()),
@@ -302,6 +304,7 @@ class MainViewModel(
                 deviceLabelInput = deviceAuth.label.orEmpty(),
                 appConnectionStatus = persisted.appConnectionStatus,
                 galleryMode = persisted.galleryViewMode,
+                galleryShowSensitiveContent = persisted.galleryShowSensitiveContent,
                 titleLatencyMonitorSettings = persisted.titleLatencyMonitorSettings,
                 themeAccentColorHex = persisted.themeAccentColorHex,
                 status = persisted.deviceAuthResult.exceptionOrNull()?.let { error ->
@@ -761,6 +764,49 @@ class MainViewModel(
             galleryPages = emptyMap(),
         )
         refreshGallery()
+    }
+
+    fun updateGalleryShowSensitiveContent(showSensitiveContent: Boolean) {
+        if (uiState.value.galleryShowSensitiveContent == showSensitiveContent) {
+            return
+        }
+        uiState.value = uiState.value.copy(
+            galleryShowSensitiveContent = showSensitiveContent,
+            galleryCollection = null,
+            galleryPages = emptyMap(),
+        )
+        persistPreference {
+            IronmeshPreferences.setGalleryShowSensitiveContent(getApplication(), showSensitiveContent)
+        }
+        refreshGallery()
+    }
+
+    fun toggleGalleryMediaLabel(item: GalleryImageItem, label: String) {
+        val nextLabels = if (item.labels.contains(label)) {
+            item.labels.filterNot { it == label }
+        } else {
+            item.labels + label
+        }
+        viewModelScope.launch {
+            runCatching {
+                val deviceAuth = refreshPersistedDeviceAuthState()
+                withContext(Dispatchers.IO) {
+                    repository.setMediaLabels(
+                        connectionInput = deviceAuth.connectionBootstrapJson(),
+                        key = item.remotePath,
+                        labels = nextLabels,
+                        serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                        clientIdentityJson = deviceAuth.toClientIdentityJson(),
+                    )
+                }
+            }.onSuccess {
+                refreshGallery()
+            }.onFailure { error ->
+                uiState.value = uiState.value.copy(
+                    status = "Failed to update labels: ${error.message}",
+                )
+            }
+        }
     }
 
     fun updateGalleryViewMode(mode: GalleryViewMode) {
@@ -1661,6 +1707,7 @@ class MainViewModel(
         val currentDirectoryPath: String,
         val breadcrumbs: List<GalleryBreadcrumbItem>,
         val sort: GallerySortOption,
+        val showSensitiveContent: Boolean,
         val pageSize: Int,
     )
 
@@ -1682,6 +1729,7 @@ class MainViewModel(
             currentDirectoryPath = current.galleryCurrentDirectoryPath,
             breadcrumbs = current.galleryBreadcrumbs,
             sort = current.gallerySort,
+            showSensitiveContent = current.galleryShowSensitiveContent,
             pageSize = pageSize.coerceAtLeast(1),
         )
     }
@@ -1709,6 +1757,7 @@ class MainViewModel(
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
             clientIdentityJson = deviceAuth.toClientIdentityJson(),
         )
@@ -1751,6 +1800,7 @@ class MainViewModel(
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = serverCaPem,
             clientIdentityJson = clientIdentityJson,
         )
@@ -1796,6 +1846,7 @@ class MainViewModel(
             offset = offset,
             limit = pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
             clientIdentityJson = deviceAuth.toClientIdentityJson(),
         )
@@ -2164,6 +2215,7 @@ class MainViewModel(
             width = entry.media?.width,
             height = entry.media?.height,
             thumbnailStatus = entry.media?.status,
+            labels = entry.labels,
         )
     }
 

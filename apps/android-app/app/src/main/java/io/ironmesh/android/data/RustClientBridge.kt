@@ -63,9 +63,19 @@ object RustClientBridge {
         limit: Int,
         sort: String?,
         mediaFilter: String?,
+        excludeLabels: String?,
         serverCaPem: String?,
         clientIdentityJson: String?,
     ): String
+
+    @JvmStatic
+    external fun setMediaLabels(
+        connectionInput: String,
+        key: String,
+        labelsJson: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    ): Int
 
     @JvmStatic
     external fun streamPutObject(

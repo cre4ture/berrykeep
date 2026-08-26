@@ -1066,6 +1066,7 @@ fn snapshot_conversion_maps_prefix_and_keys() {
         StoreIndexEntry {
             path: "docs/".to_string(),
             entry_type: "prefix".to_string(),
+            labels: Vec::new(),
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -1076,6 +1077,7 @@ fn snapshot_conversion_maps_prefix_and_keys() {
         StoreIndexEntry {
             path: "docs/readme.txt".to_string(),
             entry_type: "key".to_string(),
+            labels: Vec::new(),
             version: None,
             content_hash: None,
             size_bytes: Some(42),
@@ -1154,6 +1156,7 @@ fn ensure_missing_folder_markers_adds_nested_parents() {
     let mut entries = vec![StoreIndexEntry {
         path: "a/b/c.txt".to_string(),
         entry_type: "key".to_string(),
+        labels: Vec::new(),
         version: None,
         content_hash: None,
         size_bytes: Some(7),
@@ -1177,6 +1180,7 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
         StoreIndexEntry {
             path: "docs/".to_string(),
             entry_type: "prefix".to_string(),
+            labels: Vec::new(),
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -1187,6 +1191,7 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
         StoreIndexEntry {
             path: "docs/guides/readme.md".to_string(),
             entry_type: "key".to_string(),
+            labels: Vec::new(),
             version: None,
             content_hash: None,
             size_bytes: Some(11),
@@ -1213,6 +1218,7 @@ fn ensure_missing_folder_markers_stays_within_the_requested_prefix() {
     let mut entries = vec![StoreIndexEntry {
         path: "devices/Oppo-uli/Fotos/image.jpg".to_string(),
         entry_type: "key".to_string(),
+        labels: Vec::new(),
         version: None,
         content_hash: None,
         size_bytes: Some(7),
@@ -1332,6 +1338,7 @@ fn store_index_test_entry(path: &str) -> StoreIndexEntry {
     StoreIndexEntry {
         path: path.to_string(),
         entry_type: "key".to_string(),
+        labels: Vec::new(),
         version: None,
         content_hash: None,
         size_bytes: None,
@@ -1729,6 +1736,7 @@ fn snapshot_index_response_body(path: &str) -> Vec<u8> {
         entries: vec![StoreIndexEntry {
             path: path.to_string(),
             entry_type: "key".to_string(),
+            labels: Vec::new(),
             version: Some("v1".to_string()),
             content_hash: Some("hash-1".to_string()),
             size_bytes: Some(42),
@@ -3795,6 +3803,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
                         entry_type: "key".to_string(),
+                        labels: Vec::new(),
                         version: Some("v1".to_string()),
                         content_hash: Some("hash-1".to_string()),
                         size_bytes: Some(42),
@@ -3823,6 +3832,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
+                labels: Vec::new(),
                 version: Some("v1".to_string()),
                 content_hash: Some("hash-1".to_string()),
                 size_bytes: Some(42),
@@ -5101,6 +5111,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
                         entry_type: "key".to_string(),
+                        labels: Vec::new(),
                         version: Some("v1".to_string()),
                         content_hash: Some("hash-1".to_string()),
                         size_bytes: Some(42),
@@ -5129,6 +5140,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
+                labels: Vec::new(),
                 version: Some("v1".to_string()),
                 content_hash: Some("hash-1".to_string()),
                 size_bytes: Some(42),

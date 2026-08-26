@@ -218,6 +218,21 @@ fun LibraryScreen(
                         onClick = { actions.updateSort(GallerySortOption.NAME) },
                         label = { Text("Name") },
                     )
+                    FilterChip(
+                        selected = state.showSensitiveContent,
+                        onClick = {
+                            actions.updateShowSensitiveContent(!state.showSensitiveContent)
+                        },
+                        label = {
+                            Text(
+                                if (state.showSensitiveContent) {
+                                    "Private / NSFW visible"
+                                } else {
+                                    "Show private / NSFW"
+                                },
+                            )
+                        },
+                    )
                 }
             }
 
@@ -340,6 +355,7 @@ fun LibraryScreen(
             itemAt = actions.itemAt,
             onRequestIndex = actions.ensureItemLoaded,
             onFocusIndex = actions.pinItem,
+            onToggleLabel = actions.toggleMediaLabel,
             onDismiss = { fullscreenIndex = null },
         )
     }
@@ -549,6 +565,7 @@ private fun GalleryFullscreenViewer(
     itemAt: (Int) -> GalleryImageItem?,
     onRequestIndex: (Int) -> Unit,
     onFocusIndex: (Int?) -> Unit,
+    onToggleLabel: (GalleryImageItem, String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val zoomedPages = remember { mutableStateMapOf<Int, Boolean>() }
@@ -677,6 +694,22 @@ private fun GalleryFullscreenViewer(
                                     color = Color.White.copy(alpha = 0.8f),
                                     style = MaterialTheme.typography.bodySmall,
                                 )
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                listOf("private", "nsfw").forEach { label ->
+                                    val enabled = item.labels.contains(label)
+                                    OutlinedButton(
+                                        onClick = { onToggleLabel(item, label) },
+                                    ) {
+                                        Text(
+                                            if (enabled) {
+                                                "Remove $label"
+                                            } else {
+                                                "Mark $label"
+                                            },
+                                        )
+                                    }
+                                }
                             }
                         }
                     }

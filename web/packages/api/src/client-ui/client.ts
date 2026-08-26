@@ -249,7 +249,25 @@ export async function listStoreEntries(
     query.set("north", String(options.viewport.north));
     query.set("east", String(options.viewport.east));
   }
+  for (const label of options.requireLabels ?? []) {
+    if (label.trim()) {
+      query.append("require_labels", label.trim());
+    }
+  }
+  for (const label of options.excludeLabels ?? []) {
+    if (label.trim()) {
+      query.append("exclude_labels", label.trim());
+    }
+  }
   return fetchJson<StoreListResponse>(`${apiV1("/store/list")}?${query.toString()}`);
+}
+
+export async function setStoreMediaLabels(path: string, labels: string[]): Promise<void> {
+  await fetchJson<unknown>(apiV1("/store/labels"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, labels })
+  });
 }
 
 export async function getGalleryMapClusters(

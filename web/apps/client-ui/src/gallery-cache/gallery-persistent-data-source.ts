@@ -28,6 +28,8 @@ type ResourceDescriptor =
       limit: number | null;
       sort: GalleryLoadEntriesOptions["sort"] | null;
       mediaFilter: GalleryLoadEntriesOptions["mediaFilter"] | null;
+      requireLabels: string[];
+      excludeLabels: string[];
     };
 
 type ResourceConfig<T> = {
@@ -247,7 +249,9 @@ function entryDescriptor(
         ? Math.max(1, Math.floor(options.limit))
         : null,
     sort: options.sort ?? null,
-    mediaFilter: options.mediaFilter ?? null
+    mediaFilter: options.mediaFilter ?? null,
+    requireLabels: options.requireLabels ?? [],
+    excludeLabels: options.excludeLabels ?? []
   };
 }
 

@@ -16,6 +16,7 @@ object IronmeshPreferences {
     private const val APP_PREFS_NAME = "ironmesh_app_prefs"
     private const val PREF_SYNC_CONFIGS = "folder_sync_configs"
     private const val PREF_GALLERY_VIEW_MODE = "gallery_view_mode"
+    private const val PREF_GALLERY_SHOW_SENSITIVE_CONTENT = "gallery_show_sensitive_content"
     private const val PREF_APP_CONNECTION_STATUS = "app_connection_status"
     private const val PREF_THEME_ACCENT_COLOR = "theme_accent_color"
     private const val PREF_TITLE_LATENCY_MONITOR_SETTINGS = "title_latency_monitor_settings"
@@ -121,6 +122,13 @@ object IronmeshPreferences {
 
     fun setGalleryViewMode(context: Context, mode: GalleryViewMode) {
         writeAppPreference(context, PREF_GALLERY_VIEW_MODE, mode.name)
+    }
+
+    fun getGalleryShowSensitiveContent(context: Context): Boolean =
+        readAppPreference(context, PREF_GALLERY_SHOW_SENSITIVE_CONTENT)?.toBoolean() ?: false
+
+    fun setGalleryShowSensitiveContent(context: Context, show: Boolean) {
+        writeAppPreference(context, PREF_GALLERY_SHOW_SENSITIVE_CONTENT, show.toString())
     }
 
     fun getAppConnectionStatus(context: Context): AppConnectionStatus {

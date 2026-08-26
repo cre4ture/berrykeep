@@ -38,6 +38,7 @@ export type StoreIndexMediaSummary = {
 export type StoreIndexEntry = {
   path: string;
   entry_type: string;
+  labels?: string[];
   version?: string | null;
   content_hash?: string | null;
   size_bytes?: number | null;
@@ -175,4 +176,6 @@ export type StoreListRequestOptions = {
   sort?: StoreListSortOrder;
   mediaFilter?: StoreListMediaFilter;
   viewport?: StoreIndexViewport;
+  requireLabels?: string[];
+  excludeLabels?: string[];
 };

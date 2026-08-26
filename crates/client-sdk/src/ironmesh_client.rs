@@ -3339,6 +3339,8 @@ struct ResumableDownloadFileState {
 pub struct StoreIndexEntry {
     pub path: String,
     pub entry_type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -3511,6 +3513,10 @@ pub struct StoreIndexRequestOptions {
     pub sort: Option<StoreIndexSortOrder>,
     pub media_filter: Option<StoreIndexMediaFilter>,
     pub viewport: Option<StoreIndexViewport>,
+    /// Labels that must all be present on an entry.
+    pub require_labels: Vec<String>,
+    /// Labels that must not be present on an entry.
+    pub exclude_labels: Vec<String>,
     pub synthesize_missing_folder_markers: bool,
 }
 
@@ -3525,6 +3531,8 @@ impl Default for StoreIndexRequestOptions {
             sort: None,
             media_filter: None,
             viewport: None,
+            require_labels: Vec::new(),
+            exclude_labels: Vec::new(),
             synthesize_missing_folder_markers: true,
         }
     }
@@ -3731,6 +3739,12 @@ struct SnapshotRestoreRequest {
 struct VersionRestoreRequest {
     to_path: String,
     overwrite: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MediaLabelsRequest {
+    path: String,
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5121,6 +5135,18 @@ impl IronMeshClient {
                 .append_pair("north", &viewport.north.to_string())
                 .append_pair("east", &viewport.east.to_string());
         }
+        for label in &options.require_labels {
+            let label = label.trim();
+            if !label.is_empty() {
+                url.query_pairs_mut().append_pair("require_labels", label);
+            }
+        }
+        for label in &options.exclude_labels {
+            let label = label.trim();
+            if !label.is_empty() {
+                url.query_pairs_mut().append_pair("exclude_labels", label);
+            }
+        }
 
         let response = self
             .execute_buffered_request(Method::GET, url, Vec::new(), None)
@@ -5184,6 +5210,47 @@ impl IronMeshClient {
     ) -> Result<StoreIndexResponse> {
         let runtime = blocking_runtime()?;
         runtime.block_on(self.store_index_with_options(prefix, depth, snapshot, options))
+    }
+
+    /// Replaces the XMP sidecar labels attached to a media object.
+    pub async fn set_media_labels(
+        &self,
+        key: impl Into<String>,
+        labels: Vec<String>,
+    ) -> Result<()> {
+        let key = key.into();
+        let payload = serde_json::to_vec(&MediaLabelsRequest {
+            path: key.clone(),
+            labels,
+        })
+        .context("failed to encode media labels request")?;
+        let response = self
+            .execute_buffered_request(
+                Method::POST,
+                self.store_labels_url()?,
+                vec![json_content_type_header()],
+                Some(payload),
+            )
+            .await
+            .with_context(|| format!("failed to update media labels for {key}"))?;
+
+        if response.status == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            bail!(
+                "updating media labels for {key} returned non-success status: {}",
+                response.status
+            )
+        }
+    }
+
+    pub fn set_media_labels_blocking(
+        &self,
+        key: impl Into<String>,
+        labels: Vec<String>,
+    ) -> Result<()> {
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.set_media_labels(key, labels))
     }
 
     pub async fn wait_for_store_index_change(
@@ -7090,6 +7157,20 @@ impl IronMeshClient {
         Ok(url)
     }
 
+    fn store_labels_url(&self) -> Result<Url> {
+        let mut url = self.client_api_base_url()?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("labels");
+        }
+
+        Ok(url)
+    }
+
     fn store_versions_url(&self, key: &str) -> Result<Url> {
         let mut url = self.client_api_base_url()?;
 
@@ -8559,6 +8640,7 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>, scope_prefi
             entries.push(StoreIndexEntry {
                 path: marker,
                 entry_type: "prefix".to_string(),
+                labels: Vec::new(),
                 version: None,
                 content_hash: None,
                 size_bytes: None,

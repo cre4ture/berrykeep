@@ -60,8 +60,14 @@ int ironmesh_ios_facade_store_index_with_options_json(void *handle,
                                                       intptr_t limit,
                                                       const char *sort,
                                                       const char *media_filter,
+                                                      const char *exclude_labels,
                                                       char **out_json,
                                                       char **out_error);
+
+int ironmesh_ios_facade_set_media_labels_json(void *handle,
+                                              const char *key,
+                                              const char *labels_json,
+                                              char **out_error);
 
 int ironmesh_ios_facade_connection_diagnostics_json(void *handle,
                                                     char **out_json,
