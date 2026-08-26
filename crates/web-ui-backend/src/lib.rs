@@ -57,6 +57,7 @@ const EMBEDDED_WEB_UI_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 mod binary_stream_tests;
 mod bounded_body;
 mod mbtiles;
+mod web_service_gateway;
 
 #[derive(Clone, Default)]
 struct RequestCancellation {
@@ -316,6 +317,7 @@ struct WebState {
     log_buffer: Arc<LogBuffer>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<mbtiles::LogicalMbtilesSource>>>>,
     gallery_map_upstream_routes: Arc<RwLock<GalleryMapUpstreamRoutes>>,
+    web_service_gateway: web_service_gateway::WebServiceGateway,
     runtime: Arc<RwLock<WebRuntime>>,
 }
 
@@ -416,6 +418,7 @@ pub fn router(config: WebUiConfig) -> Router {
         log_buffer,
         mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
         gallery_map_upstream_routes: Arc::new(RwLock::new(GalleryMapUpstreamRoutes::default())),
+        web_service_gateway: web_service_gateway::WebServiceGateway::default(),
         runtime: Arc::new(RwLock::new(WebRuntime {
             sdk: sdk.clone(),
             client: ClientNode::with_client(sdk),
@@ -484,6 +487,11 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/store/stream-binary", get(web_store_stream_binary))
         .route("/store/put-binary", post(web_store_put_binary))
         .route("/connection-routes", get(web_connection_routes))
+        .route("/web-services", get(web_service_gateway::list_services))
+        .route(
+            "/web-services/{node_id}/{service_id}/launch",
+            post(web_service_gateway::launch_service),
+        )
         .route(
             "/connection-routes/refresh",
             post(web_refresh_connection_routes),
@@ -575,15 +583,19 @@ pub fn router(config: WebUiConfig) -> Router {
         .nest(WEB_API_V1_PREFIX, api_v1)
         .merge(legacy_api)
         .route("/{*path}", get(web_static_file))
-        .with_state(state);
+        .with_state(state.clone());
 
-    match embedded_session_authorization {
+    let app = match embedded_session_authorization {
         Some(authorization) => app.layer(middleware::from_fn_with_state(
             authorization,
             require_embedded_web_ui_session,
         )),
         None => app,
-    }
+    };
+    app.layer(middleware::from_fn_with_state(
+        state,
+        web_service_gateway::dispatch_service_origin,
+    ))
 }
 
 async fn require_embedded_web_ui_session(

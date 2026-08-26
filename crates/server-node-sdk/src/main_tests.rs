@@ -116,7 +116,9 @@ use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use bytes::Bytes;
-use futures_util::io::AsyncReadExt as FuturesAsyncReadExt;
+use futures_util::io::{
+    AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
+};
 use futures_util::{Sink, Stream};
 use hmac::{Hmac, Mac};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -128,6 +130,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::task::{Context, Poll};
 use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 use tower::{Service, ServiceExt};
 use uuid::Uuid;
 use x509_parser::prelude::FromDer;
@@ -11599,6 +11602,165 @@ run_on_main_metadata_backends!(
     client_auth_middleware_rejects_replayed_nonce_turso
 );
 
+#[tokio::test]
+async fn web_service_listing_requires_identity_even_when_legacy_client_auth_is_optional() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.client_auth_control.require_client_auth = false;
+    let app = super::build_server_apps(&state).public_app;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/web-services")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn authenticated_web_service_stream_reaches_only_the_configured_upstream() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.client_auth_control.require_client_auth = true;
+    let mut identity =
+        transport_sdk::ClientIdentityMaterial::generate(state.cluster_id, None, None).unwrap();
+    let credential_pem = super::generate_client_credential_pem(
+        state.cluster_id,
+        &identity.device_id.to_string(),
+        &identity.public_key_pem,
+        super::unix_ts(),
+        None,
+    );
+    identity.credential_pem = Some(credential_pem.clone());
+    state
+        .access
+        .client_credentials
+        .lock()
+        .await
+        .credentials
+        .push(super::ClientCredentialRecord {
+            device_id: identity.device_id.to_string(),
+            label: Some("Web proxy test client".to_string()),
+            public_key_pem: Some(identity.public_key_pem.clone()),
+            public_key_fingerprint: None,
+            issued_credential_pem: Some(credential_pem),
+            credential_fingerprint: None,
+            created_at_unix: super::unix_ts(),
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
+            revoked_at_unix: None,
+        });
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream_listener.local_addr().unwrap();
+    state
+        .web_services
+        .upsert(super::web_service_proxy::WebServiceConfig {
+            id: "home-nas".to_string(),
+            name: "Home NAS".to_string(),
+            description: None,
+            upstream_url: format!("http://{upstream_address}"),
+            allowed_device_ids: vec![identity.device_id.to_string()],
+            enabled: true,
+            tls_ca_pem: None,
+            tls_certificate_sha256: None,
+            tls_server_name: None,
+        })
+        .await
+        .unwrap();
+
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = upstream_listener.accept().await.unwrap();
+        let mut request = vec![0_u8; 4096];
+        let bytes_read = tokio::io::AsyncReadExt::read(&mut socket, &mut request)
+            .await
+            .unwrap();
+        let request = String::from_utf8_lossy(&request[..bytes_read]);
+        assert!(request.starts_with("GET /status HTTP/1.1\r\n"));
+        tokio::io::AsyncWriteExt::write_all(
+            &mut socket,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnas-ready",
+        )
+        .await
+        .unwrap();
+    });
+
+    let path = "/api/v1/web-services/home-nas/connect";
+    let signed = transport_sdk::build_signed_request_headers(
+        &identity,
+        "CONNECT",
+        path,
+        super::unix_ts(),
+        Some("web-service-stream-test".to_string()),
+    )
+    .unwrap();
+    let request = transport_sdk::TransportRequestHead {
+        request_id: "web-service-request".to_string(),
+        kind: transport_sdk::TransportStreamKind::WebServiceProxy,
+        method: "CONNECT".to_string(),
+        path: path.to_string(),
+        headers: vec![
+            transport_sdk::TransportHeader {
+                name: transport_sdk::HEADER_CLUSTER_ID.to_string(),
+                value: signed.cluster_id.to_string(),
+            },
+            transport_sdk::TransportHeader {
+                name: transport_sdk::HEADER_DEVICE_ID.to_string(),
+                value: signed.device_id,
+            },
+            transport_sdk::TransportHeader {
+                name: transport_sdk::HEADER_CREDENTIAL_FINGERPRINT.to_string(),
+                value: signed.credential_fingerprint,
+            },
+            transport_sdk::TransportHeader {
+                name: transport_sdk::HEADER_AUTH_TIMESTAMP.to_string(),
+                value: signed.timestamp_unix.to_string(),
+            },
+            transport_sdk::TransportHeader {
+                name: transport_sdk::HEADER_AUTH_NONCE.to_string(),
+                value: signed.nonce,
+            },
+            transport_sdk::TransportHeader {
+                name: transport_sdk::HEADER_AUTH_SIGNATURE.to_string(),
+                value: signed.signature_base64,
+            },
+        ],
+        end_of_stream: false,
+    };
+    let (client_io, server_io) = tokio::io::duplex(32 * 1024);
+    let mut client_io = client_io.compat();
+    let mut server_io = server_io.compat();
+    let server_state = state.clone();
+    let server = tokio::spawn(async move {
+        super::web_service_proxy::handle_proxy_stream(&server_state, request, &mut server_io)
+            .await
+            .unwrap();
+    });
+
+    let response = transport_sdk::read_transport_response_head(&mut client_io)
+        .await
+        .unwrap();
+    assert_eq!(response.status, StatusCode::OK.as_u16());
+    client_io
+        .write_all(b"GET /status HTTP/1.1\r\nHost: nas.test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    client_io.close().await.unwrap();
+    let mut response_bytes = Vec::new();
+    client_io.read_to_end(&mut response_bytes).await.unwrap();
+    let response = String::from_utf8(response_bytes).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with("nas-ready"));
+
+    upstream.await.unwrap();
+    server.await.unwrap();
+    cleanup_test_state(&state).await;
+}
+
 async fn cluster_info_middleware_accepts_admin_auth_and_rejects_anonymous_impl(
     backend: MainTestBackend,
 ) {
@@ -17432,6 +17594,7 @@ async fn build_test_state(
             client_auth_control: super::ClientAuthControl::default(),
             client_auth_replay_cache: Arc::new(Mutex::new(super::ClientAuthReplayCache::default())),
         },
+        web_services: super::web_service_proxy::WebServiceRegistry::empty(&root),
         s3: super::ServerS3Runtime {
             control_plane: Arc::new(Mutex::new(super::S3ControlPlaneState::default())),
             sync_runtime: Arc::new(std::sync::Mutex::new(

@@ -41,6 +41,7 @@ rcgen = { version = "0.14", features = ["crypto", "pem", "ring", "x509-parser"] 
 rendezvous-server = { path = "../rendezvous-server" }
 rusqlite.workspace = true
 rustls = { version = "0.23", features = ["ring"] }
+rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1.9", features = ["std"] }
 webpki = { package = "rustls-webpki", version = "0.103.9", features = ["ring", "std"] }
 serde.workspace = true
@@ -52,6 +53,7 @@ sysinfo = { version = "0.38.4", default-features = false, features = ["component
 tokio.workspace = true
 tokio-rusqlite = "0.6"
 tokio-rustls = "0.26"
+tokio-util = { version = "0.7", features = ["compat"] }
 time = { version = "0.3", features = ["parsing"] }
 transport-sdk = { path = "../transport-sdk" }
 turso = { version = "0.6.0-pre.2", optional = true }

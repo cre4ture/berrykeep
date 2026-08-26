@@ -34,7 +34,7 @@ use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
     ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity,
     HEADER_SERVER_PROCESSING_DURATION_US, HEADER_SERVER_RECEIVED_UNIX_MS,
-    HEADER_SERVER_RESPONDED_UNIX_MS, PeerIdentity, RelayHttpHeader,
+    HEADER_SERVER_RESPONDED_UNIX_MS, MultiplexStream, PeerIdentity, RelayHttpHeader,
     RelayTunnelSourceSecurityConfig, RendezvousControlClient, TransportHeader, TransportPathKind,
     TransportRequestHead, TransportStreamKind, build_signed_request_headers,
     read_buffered_transport_response, read_transport_response_head,
@@ -226,6 +226,29 @@ enum GalleryMapApiEndpoint {
 struct GalleryMapApiRoutes {
     clusters: GalleryMapApiRoute,
     cluster_entries: GalleryMapApiRoute,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebServiceSummary {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub node_id: NodeId,
+}
+
+/// A clear-text HTTP connection to one fixed node-side web service.
+///
+/// The bytes remain protected by the selected IronMesh transport. For HTTPS
+/// services TLS is terminated and verified by the target node before this stream
+/// is acknowledged, so local browsers never need to trust the upstream certificate.
+pub struct WebServiceProxyConnection {
+    pub stream: MultiplexStream,
+    pub authority: String,
+    pub base_path: String,
+    pub upstream_scheme: String,
+    pub node_id: NodeId,
+    pub service_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -4291,6 +4314,18 @@ impl IronMeshClient {
             .and_then(|endpoint| endpoint.transport.relay_target_node_id())
     }
 
+    pub fn target_node_ids(&self) -> Vec<NodeId> {
+        let mut node_ids = self
+            .connection_diagnostics()
+            .endpoints
+            .into_iter()
+            .filter_map(|endpoint| endpoint.target_node_id)
+            .collect::<Vec<_>>();
+        node_ids.sort_unstable();
+        node_ids.dedup();
+        node_ids
+    }
+
     pub fn direct_server_base_url(&self) -> Option<String> {
         self.transport_router
             .current_endpoint()
@@ -4385,6 +4420,32 @@ impl IronMeshClient {
             bail!("no client transport route targets snapshot owner node {target_node_id}");
         }
         Ok(matching)
+    }
+
+    fn route_ids_for_web_service_node(&self, target_node_id: NodeId) -> Result<Vec<RouteId>> {
+        if let Ok(routes) = self.route_ids_for_target_node(target_node_id) {
+            return Ok(routes);
+        }
+        // Older direct-only bootstrap inputs did not carry their target node id.
+        // A single unbound route is still unambiguous after the authenticated
+        // service listing returned the node id. Never guess between multiple
+        // anonymous routes.
+        let unbound = self
+            .transport_router
+            .foreground_route_ids()
+            .into_iter()
+            .filter(|route_id| {
+                self.transport_router
+                    .endpoint_by_id(route_id)
+                    .map(|(_, endpoint)| endpoint.transport.target_node_id().is_none())
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if unbound.len() == 1 {
+            Ok(unbound)
+        } else {
+            bail!("no unambiguous client route targets web service node {target_node_id}")
+        }
     }
 
     fn upload_session_affinity(&self, upload_id: &str) -> Option<NodeRouteAffinity> {
@@ -5444,6 +5505,170 @@ impl IronMeshClient {
             headers: response.headers,
             body: response.body,
         })
+    }
+
+    pub async fn list_web_services_on_node(
+        &self,
+        target_node_id: NodeId,
+    ) -> Result<Vec<WebServiceSummary>> {
+        let path = "/web-services";
+        let url = self.relative_url(path)?;
+        let route_ids = self.route_ids_for_web_service_node(target_node_id)?;
+        let response = self
+            .execute_buffered_request_on_routes(Method::GET, url, Vec::new(), None, &route_ids)
+            .await
+            .with_context(|| format!("failed to request {path} on node {target_node_id}"))?
+            .response;
+        if response.status == StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if !response.status.is_success() {
+            bail!(
+                "web service listing on node {target_node_id} returned {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            );
+        }
+        let services: Vec<WebServiceSummary> = serde_json::from_slice(&response.body)
+            .with_context(|| format!("failed parsing web services from node {target_node_id}"))?;
+        if services
+            .iter()
+            .any(|service| service.node_id != target_node_id)
+        {
+            bail!("node {target_node_id} returned a web service descriptor for another node");
+        }
+        Ok(services)
+    }
+
+    pub async fn list_web_services(&self) -> Result<Vec<WebServiceSummary>> {
+        let node_ids = self.target_node_ids();
+        if node_ids.is_empty() {
+            let response = self
+                .request_relative_path(Method::GET, "/web-services", Vec::new(), None)
+                .await?;
+            if response.status == StatusCode::NOT_FOUND {
+                return Ok(Vec::new());
+            }
+            if !response.status.is_success() {
+                bail!("web service listing returned {}", response.status);
+            }
+            return serde_json::from_slice(&response.body)
+                .context("failed parsing web services from the direct node");
+        }
+        let results = join_all(
+            node_ids
+                .into_iter()
+                .map(|node_id| self.list_web_services_on_node(node_id)),
+        )
+        .await;
+        let mut services = Vec::new();
+        let mut errors = Vec::new();
+        let mut successful_nodes = 0_usize;
+        for result in results {
+            match result {
+                Ok(mut node_services) => {
+                    successful_nodes += 1;
+                    services.append(&mut node_services);
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        if successful_nodes == 0 && !errors.is_empty() {
+            return Err(errors.remove(0)).context("failed listing node web services");
+        }
+        services.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.node_id.cmp(&right.node_id))
+                .then(left.id.cmp(&right.id))
+        });
+        Ok(services)
+    }
+
+    pub async fn open_web_service_proxy(
+        &self,
+        target_node_id: NodeId,
+        service_id: &str,
+    ) -> Result<WebServiceProxyConnection> {
+        validate_web_service_id(service_id)?;
+        let path = format!("/api/v1/web-services/{service_id}/connect");
+        let url = self.relative_url(&path)?;
+        let method = Method::CONNECT;
+        let auth = self.auth_snapshot();
+        let ClientRequestAuth::SignedIdentity(identity) = &auth else {
+            bail!("web service proxy requires signed client identity material");
+        };
+        let route_ids = self.route_ids_for_web_service_node(target_node_id)?;
+        let mut last_error = None;
+        for route_id in route_ids {
+            let Some((_index, endpoint)) = self.transport_router.endpoint_by_id(&route_id) else {
+                continue;
+            };
+            let headers = request_headers_for_attempt(
+                &auth,
+                &method,
+                &url,
+                self.connection_name.as_deref(),
+                &[],
+            )?;
+            match open_web_service_proxy_stream(
+                &endpoint.transport,
+                identity,
+                self.connection_name.as_deref(),
+                &path,
+                &headers,
+            )
+            .await
+            {
+                Ok((stream, response_headers)) => {
+                    let authority = required_transport_header(
+                        &response_headers,
+                        "x-ironmesh-web-service-authority",
+                    )?;
+                    let base_path = required_transport_header(
+                        &response_headers,
+                        "x-ironmesh-web-service-base-path",
+                    )?;
+                    let upstream_scheme = required_transport_header(
+                        &response_headers,
+                        "x-ironmesh-web-service-scheme",
+                    )?;
+                    if !matches!(upstream_scheme.as_str(), "http" | "https") {
+                        bail!("node returned an invalid web service upstream scheme");
+                    }
+                    if !base_path.starts_with('/')
+                        || base_path.contains('?')
+                        || base_path.contains('#')
+                    {
+                        bail!("node returned an invalid web service base path");
+                    }
+                    let origin = Url::parse(&format!("{upstream_scheme}://{authority}/"))
+                        .context("node returned an invalid web service authority")?;
+                    if origin.host_str().is_none()
+                        || !origin.username().is_empty()
+                        || origin.password().is_some()
+                        || origin.path() != "/"
+                        || origin.query().is_some()
+                        || origin.fragment().is_some()
+                    {
+                        bail!("node returned an invalid web service authority");
+                    }
+                    return Ok(WebServiceProxyConnection {
+                        stream,
+                        authority,
+                        base_path,
+                        upstream_scheme,
+                        node_id: target_node_id,
+                        service_id: service_id.to_string(),
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("no route accepted the web service proxy")))
+            .with_context(|| {
+                format!("failed opening web service {service_id} on node {target_node_id}")
+            })
     }
 
     pub async fn request_relative_path_streaming_response(
@@ -7411,6 +7636,89 @@ fn transport_stream_kind_for_path(path: &str) -> TransportStreamKind {
     } else {
         TransportStreamKind::Rpc
     }
+}
+
+fn validate_web_service_id(service_id: &str) -> Result<()> {
+    if service_id.is_empty()
+        || service_id.len() > 63
+        || !service_id
+            .bytes()
+            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || value == b'-')
+        || service_id.starts_with('-')
+        || service_id.ends_with('-')
+    {
+        bail!("web service id must be a lowercase DNS label");
+    }
+    Ok(())
+}
+
+fn required_transport_header(headers: &[TransportHeader], name: &str) -> Result<String> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| header.value.clone())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("web service proxy response omitted {name}"))
+}
+
+async fn open_web_service_proxy_stream(
+    transport: &ClientTransport,
+    identity: &ClientIdentityMaterial,
+    connection_name: Option<&str>,
+    path: &str,
+    headers: &[RelayHttpHeader],
+) -> Result<(MultiplexStream, Vec<TransportHeader>)> {
+    let session = match transport {
+        ClientTransport::DirectHttp { session_pool, .. }
+        | ClientTransport::DirectQuic { session_pool, .. } => session_pool
+            .ensure_direct_session(
+                identity,
+                connection_name,
+                DirectQuicSetupWaiter::SessionConsumer,
+            )
+            .await
+            .context("failed ensuring direct web service transport session")?,
+        ClientTransport::Relay(relay) => relay
+            .session_pool
+            .ensure_relay_session(PeerIdentity::Device(identity.device_id), connection_name)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed ensuring relay web service transport session to node {}",
+                    relay.target_node_id
+                )
+            })?,
+    };
+    let mut stream = session
+        .open_stream()
+        .await
+        .context("failed opening web service transport stream")?;
+    write_transport_request_head(
+        &mut stream,
+        &TransportRequestHead {
+            request_id: Uuid::now_v7().to_string(),
+            kind: TransportStreamKind::WebServiceProxy,
+            method: Method::CONNECT.as_str().to_string(),
+            path: path.to_string(),
+            headers: transport_headers_from_relay_headers(headers),
+            end_of_stream: false,
+        },
+    )
+    .await
+    .context("failed writing web service CONNECT head")?;
+    let response = read_transport_response_head(&mut stream)
+        .await
+        .context("failed reading web service CONNECT response")?;
+    if response.status != StatusCode::OK.as_u16() {
+        let error = response
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("x-ironmesh-error"))
+            .map(|header| header.value.as_str())
+            .unwrap_or("node rejected the web service proxy");
+        bail!("web service proxy returned {}: {error}", response.status);
+    }
+    Ok((stream, response.headers))
 }
 
 async fn execute_multiplex_streaming_read_request(
