@@ -62,6 +62,7 @@ class FolderSyncForegroundService : Service() {
     private var networkCallbackRegistered = false
     private lateinit var outageRetryStore: FolderSyncOutageRetryStore
     private val outageRetryStoreReady = CompletableDeferred<Unit>()
+    private var outageRetryStoreAvailable = false
     private lateinit var networkChangeNotifier: ConflatedNetworkChangeNotifier
     private lateinit var networkPolicyChangeNotifier: ConflatedNetworkChangeNotifier
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -108,15 +109,31 @@ class FolderSyncForegroundService : Service() {
             buildNotification("Starting continuous sync", "Preparing folder sync runtime"),
         )
         scope.launch {
-            val (retryStore, persistedRetryState) = withContext(Dispatchers.IO) {
-                val store = FolderSyncOutageRetryStore(applicationContext)
-                store to store.state()
+            try {
+                val (retryStore, persistedRetryState) = withContext(Dispatchers.IO) {
+                    val store = FolderSyncOutageRetryStore(applicationContext)
+                    store to store.state()
+                }
+                outageRetryStore = retryStore
+                outageRetryArmed = persistedRetryState.failureCount > 0
+                schedulePersistedRetryWakeup(persistedRetryState)
+                outageRetryStoreAvailable = true
+                outageRetryStoreReady.complete(Unit)
+                registerNetworkCallback()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                // Never strand callers at the readiness gate. The next explicit service start can
+                // retry the transient storage failure; this instance has not started sync work.
+                Log.e(TAG, "failed to initialize folder sync retry state", error)
+                outageRetryStoreReady.complete(Unit)
+                updateNotification(
+                    "BerryKeep sync paused",
+                    "Unable to load retry state. Try syncing again.",
+                )
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
-            outageRetryStore = retryStore
-            outageRetryArmed = persistedRetryState.failureCount > 0
-            schedulePersistedRetryWakeup(persistedRetryState)
-            outageRetryStoreReady.complete(Unit)
-            registerNetworkCallback()
         }
     }
 
@@ -593,6 +610,10 @@ class FolderSyncForegroundService : Service() {
     ) {
         scope.launch {
             outageRetryStoreReady.await()
+            if (!outageRetryStoreAvailable) {
+                Log.w(TAG, "ignoring sync reconcile because retry-state initialization failed")
+                return@launch
+            }
             FolderSyncExecutionCoordinator.awaitOneShotCompletion()
             val started = reconcileMutex.withLock {
                 reconcileRequestLocked(reason, trigger)
