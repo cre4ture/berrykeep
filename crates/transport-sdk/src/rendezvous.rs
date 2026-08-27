@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use common::{ClusterId, NodeId, normalize_node_hostname};
+use common::{ClusterId, NodeId};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::{Certificate, Client, StatusCode, Url};
 use rustls_pki_types::CertificateDer;
@@ -335,6 +335,8 @@ pub struct PresenceRegistration {
     pub cluster_id: ClusterId,
     pub identity: PeerIdentity,
     /// Descriptive operating-system host name for a server-node presence.
+    /// This is best-effort metadata; receivers discard values that are unsafe
+    /// to display without rejecting the presence registration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     #[serde(default)]
@@ -470,14 +472,6 @@ impl PresenceRegistration {
     pub fn validate(&self) -> Result<()> {
         if self.cluster_id.is_nil() {
             bail!("presence registration must include a non-nil cluster_id");
-        }
-        if let Some(hostname) = self.hostname.as_deref() {
-            let Some(normalized) = normalize_node_hostname(hostname) else {
-                bail!("presence registration hostname is not a valid display host name");
-            };
-            if normalized != hostname {
-                bail!("presence registration hostname must be a normalized display host name");
-            }
         }
         validate_optional_url("public_api_url", self.public_api_url.as_deref())?;
         validate_url_list("public_direct_urls", &self.public_direct_urls)?;
@@ -1794,7 +1788,7 @@ mod tests {
     }
 
     #[test]
-    fn presence_registration_rejects_unsafe_or_noncanonical_hostname() {
+    fn presence_registration_treats_hostname_as_best_effort_metadata() {
         let mut registration = PresenceRegistration {
             cluster_id: ClusterId::now_v7(),
             identity: PeerIdentity::Node(NodeId::now_v7()),
@@ -1813,14 +1807,13 @@ mod tests {
 
         registration
             .validate()
-            .expect("canonical display hostname should be accepted");
+            .expect("hostname should be accepted");
 
         for hostname in ["edge-\u{202e}a", " edge-a "] {
             registration.hostname = Some(hostname.to_string());
-            assert!(
-                registration.validate().is_err(),
-                "hostname {hostname:?} should fail"
-            );
+            registration
+                .validate()
+                .expect("hostname {hostname:?} must not reject presence registration");
         }
     }
 

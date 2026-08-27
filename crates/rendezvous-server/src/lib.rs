@@ -2550,7 +2550,7 @@ mod tests {
         let registration = PresenceRegistration {
             cluster_id,
             identity: PeerIdentity::Node(NodeId::now_v7()),
-            hostname: None,
+            hostname: Some("edge-\u{202e}a".to_string()),
             public_api_url: Some("https://public.example:9443".to_string()),
             public_direct_urls: Vec::new(),
             peer_api_url: Some("https://node.internal:7443".to_string()),
@@ -2567,6 +2567,7 @@ mod tests {
             .register_presence(&registration)
             .await
             .expect("presence registration should succeed");
+        assert_eq!(response.entry.registration.hostname, None);
         assert_eq!(
             response.entry.observed_source_addr.map(|addr| addr.ip()),
             Some("127.0.0.1".parse().expect("loopback ip"))

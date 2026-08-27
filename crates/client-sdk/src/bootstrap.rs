@@ -1648,6 +1648,17 @@ impl ConnectionBootstrap {
         discovery: &DynamicDiscoveryState,
     ) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
         let static_direct_targets = self.direct_https_targets()?;
+        let static_hostnames_by_node =
+            static_direct_targets
+                .iter()
+                .fold(BTreeMap::new(), |mut hostnames, target| {
+                    if let (Some(node_id), Some(hostname)) =
+                        (target.target_node_id, target.target_node_hostname.as_ref())
+                    {
+                        hostnames.entry(node_id).or_insert_with(|| hostname.clone());
+                    }
+                    hostnames
+                });
         let mut direct_targets = Vec::new();
         let mut seen_direct_targets = BTreeSet::new();
 
@@ -1680,7 +1691,11 @@ impl ConnectionBootstrap {
                     direct_candidate: Some(candidate.clone()),
                     server_base_url: planned_target_server_base_url_for_candidate(candidate)?,
                     target_node_id: Some(*node_id),
-                    target_node_hostname: discovery.hostnames_by_node.get(node_id).cloned(),
+                    target_node_hostname: discovery
+                        .hostnames_by_node
+                        .get(node_id)
+                        .cloned()
+                        .or_else(|| static_hostnames_by_node.get(node_id).cloned()),
                     node_connection_priority,
                     server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
                     cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
@@ -2804,6 +2819,42 @@ mod tests {
             merge_node_hostname_advertisement(None, Some("edge-a".to_string())).as_deref(),
             Some("edge-a")
         );
+    }
+
+    #[test]
+    fn refreshed_direct_target_keeps_bootstrap_hostname_when_discovery_omits_it() {
+        let cluster_id = ClusterId::now_v7();
+        let node_id = NodeId::now_v7();
+        let mut bootstrap = refreshable_bootstrap(
+            cluster_id,
+            "https://rendezvous.example".to_string(),
+            node_id,
+        );
+        bootstrap.direct_endpoints[0].node_hostname = Some("edge-a".to_string());
+        let discovery = DynamicDiscoveryState {
+            rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            direct_candidates_by_node: BTreeMap::from([(
+                node_id,
+                vec![ConnectionCandidate {
+                    kind: CandidateKind::DirectHttps,
+                    endpoint: "https://public.example".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }],
+            )]),
+            relay_capable_nodes: BTreeSet::new(),
+            advertised_priorities_by_node: BTreeMap::new(),
+            hostnames_by_node: BTreeMap::new(),
+        };
+
+        let target = bootstrap
+            .build_refreshed_targets(&discovery)
+            .expect("refreshed targets should build")
+            .into_iter()
+            .find(|target| target.direct_candidate.is_some())
+            .expect("discovered candidate should produce a direct target");
+
+        assert_eq!(target.target_node_hostname.as_deref(), Some("edge-a"));
     }
 
     #[test]

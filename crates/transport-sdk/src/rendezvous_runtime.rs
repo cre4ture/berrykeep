@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
-use common::{ClusterId, NodeId};
+use common::{ClusterId, NodeId, normalize_node_hostname};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use uuid::Uuid;
@@ -36,9 +36,13 @@ impl PresenceRegistry {
 
     pub fn register(
         &self,
-        registration: PresenceRegistration,
+        mut registration: PresenceRegistration,
         observed_source_addr: Option<std::net::SocketAddr>,
     ) -> PresenceEntry {
+        registration.hostname = registration
+            .hostname
+            .as_deref()
+            .and_then(normalize_node_hostname);
         let entry = PresenceEntry {
             updated_at_unix: registration.connected_at_unix,
             registration,
@@ -894,6 +898,31 @@ mod tests {
         assert!(registry.contains_identity(cluster_a, &identity));
         assert!(registry.contains_identity(cluster_b, &identity));
         assert_eq!(registry.only_cluster_id(), None);
+    }
+
+    #[test]
+    fn presence_registry_sanitizes_best_effort_hostname_metadata() {
+        let registry = PresenceRegistry::new();
+        let cluster_id = ClusterId::now_v7();
+        let identity = PeerIdentity::Node(NodeId::now_v7());
+        let mut registration =
+            presence_registration(cluster_id, identity, "https://node.example:7443");
+
+        registration.hostname = Some(" edge-a ".to_string());
+        assert_eq!(
+            registry
+                .register(registration.clone(), None)
+                .registration
+                .hostname
+                .as_deref(),
+            Some("edge-a")
+        );
+
+        registration.hostname = Some("edge-\u{202e}a".to_string());
+        assert_eq!(
+            registry.register(registration, None).registration.hostname,
+            None
+        );
     }
 
     #[tokio::test]
