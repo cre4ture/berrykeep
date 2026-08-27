@@ -1209,6 +1209,7 @@ mod tests {
                 url: "http://127.0.0.1:9".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: None,
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Disabled,
             trust_roots: BootstrapTrustRoots {
@@ -1310,6 +1311,7 @@ mod tests {
                                     transport_hints: None,
                                 }]),
                                 node_relay_capable: false,
+                                node_hostname: Some("fast-node".to_string()),
                                 node_connection_priority: 0,
                             });
                         }
@@ -1320,6 +1322,7 @@ mod tests {
                             rendezvous_peers: Vec::new(),
                             node_candidates: None,
                             node_relay_capable: false,
+                            node_hostname: None,
                             node_connection_priority: 0,
                         })
                     }
@@ -1351,11 +1354,13 @@ mod tests {
                     url: route_url.clone(),
                     usage: Some(BootstrapEndpointUse::PublicApi),
                     node_id: Some(fast_node_id),
+                    node_hostname: None,
                 },
                 BootstrapEndpoint {
                     url: route_url,
                     usage: Some(BootstrapEndpointUse::PublicApi),
                     node_id: Some(stalled_node_id),
+                    node_hostname: None,
                 },
             ],
             relay_mode: RelayMode::Disabled,
@@ -1425,6 +1430,7 @@ mod tests {
                 url: "http://127.0.0.1:9".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: None,
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Disabled,
             trust_roots: BootstrapTrustRoots {

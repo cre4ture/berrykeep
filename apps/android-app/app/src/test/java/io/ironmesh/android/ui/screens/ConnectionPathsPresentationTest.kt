@@ -67,6 +67,18 @@ class ConnectionPathsPresentationTest {
     }
 
     @Test
+    fun prefersHostnameWhileKeepingTheNodeIdentifierAvailableForDetails() {
+        val direct = endpoint(
+            index = 2,
+            targetNodeId = "7314c3bb-2e1d-4508-a4d1-d274d985f059",
+            targetNodeHostname = "edge-a",
+        )
+
+        assertEquals("edge-a", direct.targetNodeDisplayName())
+        assertEquals("HTTPS · edge-a", compactRouteDisplayLabel(direct))
+    }
+
+    @Test
     fun reportsDirectQuicHolePunchingAsItsOwnDirectConnectionState() {
         val directQuic = endpoint(
             index = 5,
@@ -249,6 +261,7 @@ class ConnectionPathsPresentationTest {
         holePunchingMode: String? = null,
         locator: String = "https://node.example",
         targetNodeId: String? = null,
+        targetNodeHostname: String? = null,
         lastUsedUnixMs: Long? = null,
         score: Double = 0.0,
         ewmaLatencyMs: Double? = null,
@@ -265,6 +278,7 @@ class ConnectionPathsPresentationTest {
             locator = locator,
             bootstrapRank = index,
             targetNodeId = targetNodeId,
+            targetNodeHostname = targetNodeHostname,
             lastUsedUnixMs = lastUsedUnixMs,
             score = score,
             ewmaLatencyMs = ewmaLatencyMs,

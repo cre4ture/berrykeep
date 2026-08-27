@@ -193,7 +193,7 @@ internal fun routeDisplayLabel(endpoint: ConnectionRouteEndpointSnapshot): Strin
         }
         else -> "Direct HTTPS"
     }
-    return endpoint.targetNodeId?.let { "$prefix to $it" } ?: prefix
+    return endpoint.targetNodeDisplayName()?.let { "$prefix to $it" } ?: prefix
 }
 
 internal fun compactRouteDisplayLabel(endpoint: ConnectionRouteEndpointSnapshot): String {
@@ -208,15 +208,19 @@ internal fun compactRouteDisplayLabel(endpoint: ConnectionRouteEndpointSnapshot)
     }
     val destination = when (endpoint.pathKind) {
         RELAY_TUNNEL_PATH_KIND -> summarizeRelayLocator(endpoint.locator)
-            ?: endpoint.targetNodeId?.let(::compactRouteIdentifier)
+            ?: endpoint.targetNodeDisplayName()?.let(::compactRouteIdentifier)
             ?: compactRouteLocator(endpoint.locator)
-        else -> endpoint.targetNodeId?.let(::compactRouteIdentifier)
+        else -> endpoint.targetNodeDisplayName()?.let(::compactRouteIdentifier)
             ?: compactRouteLocator(endpoint.locator)
     }
     return destination
         ?.takeIf { it.isNotBlank() }
         ?.let { "$prefix · $it" }
         ?: prefix
+}
+
+internal fun ConnectionRouteEndpointSnapshot.targetNodeDisplayName(): String? {
+    return targetNodeHostname?.trim()?.takeIf(String::isNotEmpty) ?: targetNodeId
 }
 
 private fun compactRouteIdentifier(value: String): String {

@@ -575,6 +575,7 @@ mod tests {
                 url: base_url.to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: None,
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Disabled,
             trust_roots: BootstrapTrustRoots {

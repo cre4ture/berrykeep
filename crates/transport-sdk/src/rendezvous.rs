@@ -334,6 +334,11 @@ pub struct RendezvousClientConfig {
 pub struct PresenceRegistration {
     pub cluster_id: ClusterId,
     pub identity: PeerIdentity,
+    /// Descriptive operating-system host name for a server-node presence.
+    /// This is best-effort metadata; receivers discard values that are unsafe
+    /// to display without rejecting the presence registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     #[serde(default)]
     pub public_api_url: Option<String>,
     #[serde(default)]
@@ -388,6 +393,10 @@ pub struct DiscoveryResponse {
     pub node_candidates: Option<Vec<ConnectionCandidate>>,
     #[serde(default)]
     pub node_relay_capable: bool,
+    /// Descriptive host name for the requested server node. It is intentionally
+    /// separate from the node UUID, which remains the transport identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_hostname: Option<String>,
     /// Server-advertised preference for the requested node. Older rendezvous
     /// services omit this field and therefore retain the neutral priority.
     #[serde(default)]
@@ -1756,6 +1765,7 @@ mod tests {
         let registration = PresenceRegistration {
             cluster_id: ClusterId::now_v7(),
             identity: PeerIdentity::Node(NodeId::now_v7()),
+            hostname: None,
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: None,
@@ -1775,6 +1785,36 @@ mod tests {
             .validate()
             .expect("malformed optional metadata must not reject node presence");
         assert!(node_connection_priority_from_labels(&registration.labels).is_err());
+    }
+
+    #[test]
+    fn presence_registration_treats_hostname_as_best_effort_metadata() {
+        let mut registration = PresenceRegistration {
+            cluster_id: ClusterId::now_v7(),
+            identity: PeerIdentity::Node(NodeId::now_v7()),
+            hostname: Some("edge-a".to_string()),
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: None,
+            direct_candidates: Vec::new(),
+            labels: HashMap::new(),
+            capacity_bytes: None,
+            free_bytes: None,
+            capabilities: Vec::new(),
+            relay_mode: RelayMode::Disabled,
+            connected_at_unix: 1,
+        };
+
+        registration
+            .validate()
+            .expect("hostname should be accepted");
+
+        for hostname in ["edge-\u{202e}a", " edge-a "] {
+            registration.hostname = Some(hostname.to_string());
+            registration
+                .validate()
+                .expect("hostname {hostname:?} must not reject presence registration");
+        }
     }
 
     fn rendezvous_identity_pem_with_cluster_san(cluster_id: ClusterId) -> String {
@@ -2683,6 +2723,7 @@ mod tests {
                             transport_hints: None,
                         }]),
                         node_relay_capable: true,
+                        node_hostname: Some("node-a".to_string()),
                         node_connection_priority: 6,
                     })
                 },
@@ -2748,6 +2789,7 @@ mod tests {
                         rendezvous_peers: Vec::new(),
                         node_candidates: None,
                         node_relay_capable: false,
+                        node_hostname: None,
                         node_connection_priority: 0,
                     })
                 },

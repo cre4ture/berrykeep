@@ -1,6 +1,9 @@
 import { fetchJson, isHttpErrorStatus } from "../shared/http";
 import type { GalleryMapConfigurationResponse } from "../shared/map-config";
-import { galleryMapClusterZoomParameters } from "../shared/store-index";
+import {
+  galleryMapClusterCellSizeParameter,
+  galleryMapClusterZoomParameters
+} from "../shared/store-index";
 import type {
   GalleryMapClusterEntriesResponse,
   GalleryMapClustersRequest,
@@ -17,6 +20,8 @@ import type {
   ClientUiPingResponse,
   ClientWebService,
   ClientWebServiceLaunchResponse,
+  ClientWebServiceNodeListResponse,
+  ClientWebServiceNodeResponse,
   JsonObject,
   LogsResponse,
   SnapshotSummary,
@@ -47,6 +52,10 @@ export type BinaryUploadProgress = {
 };
 
 export type BinaryUploadOptions = {
+  signal?: AbortSignal;
+};
+
+export type ClientWebServiceRequestOptions = {
   signal?: AbortSignal;
 };
 
@@ -124,11 +133,38 @@ export async function getClientConnectionRoutes(): Promise<ClientConnectionRoute
   return fetchJson<ClientConnectionRouteSnapshot>(apiV1("/connection-routes"));
 }
 
-export async function listClientWebServices(): Promise<ClientWebService[]> {
+export async function listClientWebServices(
+  options?: ClientWebServiceRequestOptions
+): Promise<ClientWebService[]> {
   return fetchJson<ClientWebService[]>(apiV1("/web-services"), {
     credentials: "same-origin",
-    cache: "no-store"
+    cache: "no-store",
+    signal: options?.signal
   });
+}
+
+export async function listClientWebServiceNodes(
+  options?: ClientWebServiceRequestOptions
+): Promise<ClientWebServiceNodeListResponse> {
+  return fetchJson<ClientWebServiceNodeListResponse>(apiV1("/web-services/nodes"), {
+    credentials: "same-origin",
+    cache: "no-store",
+    signal: options?.signal
+  });
+}
+
+export async function listClientWebServicesOnNode(
+  nodeId: string,
+  options?: ClientWebServiceRequestOptions
+): Promise<ClientWebServiceNodeResponse> {
+  return fetchJson<ClientWebServiceNodeResponse>(
+    apiV1(`/web-services/nodes/${encodeURIComponent(nodeId)}`),
+    {
+      credentials: "same-origin",
+      cache: "no-store",
+      signal: options?.signal
+    }
+  );
 }
 
 export async function launchClientWebService(
@@ -317,6 +353,7 @@ export async function getGalleryMapClusterEntries(
 
 function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchParams {
   const { zoom, zoomPrecise } = galleryMapClusterZoomParameters(request.zoom);
+  const cellSizePx = galleryMapClusterCellSizeParameter(request.clusterCellSizePx);
   const query = new URLSearchParams({
     depth: String(Math.max(1, Math.floor(request.depth))),
     media_filter: request.mediaFilter,
@@ -329,6 +366,9 @@ function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchPa
   });
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());
+  }
+  if (cellSizePx !== null) {
+    query.set("cluster_cell_size_px", String(cellSizePx));
   }
   return query;
 }

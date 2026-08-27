@@ -134,6 +134,8 @@ export type GalleryMapClustersRequest = {
   mediaFilter: StoreListMediaFilter;
   viewport: StoreIndexViewport;
   zoom: number;
+  /** Desired cluster-cell width in CSS pixels; the server bounds and quantizes it. */
+  clusterCellSizePx?: number;
 };
 
 /** Keeps fractional MapLibre zoom while constraining requests to supported map levels. */
@@ -151,6 +153,11 @@ export function galleryMapClusterZoomParameters(zoom: number): {
 } {
   const zoomPrecise = clampGalleryMapZoom(zoom);
   return { zoom: Math.floor(zoomPrecise), zoomPrecise };
+}
+
+/** Omits invalid optional client hints so server defaults remain available to all callers. */
+export function galleryMapClusterCellSizeParameter(cellSizePx: number | undefined): number | null {
+  return typeof cellSizePx === "number" && Number.isFinite(cellSizePx) ? cellSizePx : null;
 }
 
 export type StoreListView = "raw" | "tree";

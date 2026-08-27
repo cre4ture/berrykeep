@@ -491,6 +491,14 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/connection-routes", get(web_connection_routes))
         .route("/web-services", get(web_service_gateway::list_services))
         .route(
+            "/web-services/nodes",
+            get(web_service_gateway::list_service_nodes),
+        )
+        .route(
+            "/web-services/nodes/{node_id}",
+            get(web_service_gateway::list_services_on_node),
+        )
+        .route(
             "/web-services/{node_id}/{service_id}/launch",
             post(web_service_gateway::launch_service),
         )

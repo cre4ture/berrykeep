@@ -204,6 +204,7 @@ mod tests {
         let initial_registration = transport_sdk::PresenceRegistration {
             cluster_id,
             identity: transport_sdk::PeerIdentity::Node(node_id),
+            hostname: None,
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: None,
@@ -1085,6 +1086,7 @@ mod tests {
                 url: "https://unreachable.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(target_node_id),
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Required,
             trust_roots: BootstrapTrustRoots {
@@ -1213,6 +1215,7 @@ mod tests {
                 url: "https://unreachable.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(target_node_id),
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Required,
             trust_roots: BootstrapTrustRoots {
@@ -1228,6 +1231,7 @@ mod tests {
             .register_presence(&transport_sdk::PresenceRegistration {
                 cluster_id,
                 identity: transport_sdk::PeerIdentity::Node(target_node_id),
+                hostname: None,
                 public_api_url: None,
                 peer_api_url: None,
                 public_direct_urls: Vec::new(),

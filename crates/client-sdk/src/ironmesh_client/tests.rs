@@ -1001,6 +1001,7 @@ fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
         transport_path_kind: TransportPathKind::DirectHttps,
         locator: "https://direct.example".to_string(),
         bootstrap_rank: 0,
+        target_node_hostname: None,
         node_connection_priority: 0,
     };
     let relay = ClientEndpointDescriptor {
@@ -1009,6 +1010,7 @@ fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
         transport_path_kind: TransportPathKind::RelayTunnel,
         locator: "relay://node@example".to_string(),
         bootstrap_rank: 0,
+        target_node_hostname: None,
         node_connection_priority: 0,
     };
     let direct_quic = ClientEndpointDescriptor {
@@ -1017,6 +1019,7 @@ fn route_score_strongly_prefers_direct_over_relay_without_last_used_credit() {
         transport_path_kind: TransportPathKind::DirectQuic,
         locator: "iroh://direct-quic".to_string(),
         bootstrap_rank: 0,
+        target_node_hostname: None,
         node_connection_priority: 0,
     };
 
@@ -1037,6 +1040,7 @@ fn route_score_prefers_higher_priority_server_nodes() {
         transport_path_kind: TransportPathKind::DirectHttps,
         locator: "https://preferred.example".to_string(),
         bootstrap_rank: 0,
+        target_node_hostname: None,
         node_connection_priority: 5,
     };
     let neutral = ClientEndpointDescriptor {
@@ -4812,7 +4816,8 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
         .expect("identity should generate");
         identity.credential_pem = Some("issued-credential".to_string());
 
-        let client = direct_quic_transport_test_client(&direct_state, identity, target_node_id);
+        let client = direct_quic_transport_test_client(&direct_state, identity, target_node_id)
+            .with_target_node_hostname(Some("direct-quic-node".to_string()));
         let response = client
             .get_json_path("/cluster/status")
             .await
@@ -4825,6 +4830,10 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
         assert_eq!(
             diagnostics.endpoints[0].target_node_id,
             Some(target_node_id)
+        );
+        assert_eq!(
+            diagnostics.endpoints[0].target_node_hostname.as_deref(),
+            Some("direct-quic-node")
         );
         assert_eq!(
             diagnostics.endpoints[0].transport_path_kind.as_deref(),
@@ -4843,6 +4852,10 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
         assert_eq!(
             route_snapshot.endpoints[0].path_kind,
             transport_sdk::TransportPathKind::DirectQuic
+        );
+        assert_eq!(
+            route_snapshot.endpoints[0].target_node_hostname.as_deref(),
+            Some("direct-quic-node")
         );
         assert_eq!(
             route_snapshot.endpoints[0].hole_punching_mode.as_deref(),

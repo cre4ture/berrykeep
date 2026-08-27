@@ -42,6 +42,16 @@ export type ClientWebService = {
   nodeId: string;
 };
 
+export type ClientWebServiceNodeListResponse = {
+  nodeIds: string[];
+};
+
+export type ClientWebServiceNodeResponse = {
+  nodeId: string;
+  available: boolean;
+  services: ClientWebService[];
+};
+
 export type ClientWebServiceLaunchResponse = {
   url: string;
   expiresInSeconds: number;

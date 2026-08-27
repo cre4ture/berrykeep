@@ -151,7 +151,11 @@ private fun ConnectionRouteDetails(
     endpoint.targetNodeId?.let { targetNodeId ->
         ConnectionDetail(
             label = stringResource(R.string.connection_paths_target_server_node),
-            value = targetNodeId,
+            value = endpoint.targetNodeHostname
+                ?.trim()
+                ?.takeIf(String::isNotEmpty)
+                ?.let { hostname -> "$hostname\n$targetNodeId" }
+                ?: targetNodeId,
             selectable = true,
         )
     }

@@ -126,6 +126,7 @@ fn android_test_connection_bootstrap(public_url: &str) -> Result<ConnectionBoots
             url: public_url.to_string(),
             usage: Some(BootstrapEndpointUse::PublicApi),
             node_id: None,
+            node_hostname: None,
         }],
         relay_mode: RelayMode::Disabled,
         trust_roots: BootstrapTrustRoots {
@@ -158,6 +159,7 @@ fn android_folder_sync_outage_bootstrap(public_url: &str) -> Result<ConnectionBo
                     .parse()
                     .context("failed to parse Android folder-sync outage node id")?,
             ),
+            node_hostname: None,
         }],
         relay_mode: RelayMode::Fallback,
         trust_roots: BootstrapTrustRoots {

@@ -86,6 +86,7 @@ pub fn resolve_connection_config(
             url: base_url.to_string(),
             usage: Some(BootstrapEndpointUse::PublicApi),
             node_id: None,
+            node_hostname: None,
         }],
         relay_mode: RelayMode::Fallback,
         trust_roots: BootstrapTrustRoots {
@@ -239,6 +240,7 @@ mod tests {
                 url: "https://public.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(Uuid::new_v4()),
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Required,
             trust_roots: BootstrapTrustRoots {
@@ -300,6 +302,7 @@ mod tests {
                 url: "https://public.invalid".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(Uuid::new_v4()),
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Required,
             trust_roots: BootstrapTrustRoots {
@@ -357,6 +360,7 @@ mod tests {
                 url: "https://public.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(Uuid::new_v4()),
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Fallback,
             trust_roots: BootstrapTrustRoots {
@@ -412,6 +416,7 @@ mod tests {
                 url: "https://public.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(Uuid::new_v4()),
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Fallback,
             trust_roots: BootstrapTrustRoots {

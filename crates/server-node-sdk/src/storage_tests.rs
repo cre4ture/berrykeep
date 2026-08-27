@@ -89,10 +89,10 @@ fn gallery_map_resolution_is_limited_for_a_world_sized_viewport() {
             north: 90.0,
             east: 180.0,
         },
-        512,
+        2_048,
     );
 
-    assert_eq!(resolution, 16);
+    assert_eq!(resolution, 32);
 }
 
 #[test]
@@ -5254,6 +5254,7 @@ async fn persist_and_load_cluster_nodes_roundtrip_impl(backend: StorageTestBacke
     let remote_node_id = NodeId::new_v4();
     let nodes = vec![crate::cluster::NodeDescriptor {
         node_id: remote_node_id,
+        hostname: None,
         reachability: crate::cluster::NodeReachability {
             public_api_url: Some("https://remote.example".to_string()),
             public_direct_urls: vec!["https://remote.example".to_string()],

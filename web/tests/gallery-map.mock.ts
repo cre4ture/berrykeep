@@ -1,5 +1,9 @@
 import { filterMockStoreEntriesToPrefix } from "./store-index.mock";
 
+const MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX = 512;
+const DEFAULT_GALLERY_MAP_CLUSTER_CELL_WIDTH_PX = 32;
+const GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX = [16, 24, 32, 48, 64];
+
 type GalleryMapMockEntry = {
   path: string;
   entry_type: "prefix" | "key";
@@ -35,7 +39,24 @@ export class GalleryMapMockSession<T extends GalleryMapMockEntry> {
       ? Math.max(0, Math.min(20, requestedZoom))
       : 1;
     const gridZoom = Math.ceil(zoom * 2) / 2;
-    const resolution = Math.ceil(4 * 2 ** gridZoom);
+    const requestedCellWidthPx = searchParams.get("cluster_cell_size_px");
+    const boundedCellWidthPx =
+      requestedCellWidthPx !== null && Number.isFinite(Number(requestedCellWidthPx))
+      ? Math.max(
+          GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX[0],
+          Math.min(GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX.at(-1)!, Number(requestedCellWidthPx))
+        )
+      : DEFAULT_GALLERY_MAP_CLUSTER_CELL_WIDTH_PX;
+    const cellWidthPx = GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX.reduce(
+      (closestCellWidthPx, candidateCellWidthPx) =>
+        Math.abs(candidateCellWidthPx - boundedCellWidthPx) <
+        Math.abs(closestCellWidthPx - boundedCellWidthPx)
+          ? candidateCellWidthPx
+          : closestCellWidthPx
+    );
+    const resolution = Math.ceil(
+      (MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX / cellWidthPx) * 2 ** gridZoom
+    );
     const viewport = {
       south: Number(searchParams.get("south") ?? "-90"),
       west: Number(searchParams.get("west") ?? "-180"),
