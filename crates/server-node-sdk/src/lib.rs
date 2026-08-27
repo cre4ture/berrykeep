@@ -15914,6 +15914,16 @@ async fn gallery_map_clusters_response(
                     .into_response();
             }
         };
+    let requested_resolution =
+        gallery_map::gallery_map_resolution_for_zoom(precise_zoom, cluster_cell_size_px);
+    let storage_viewport = gallery_map::storage_viewport(viewport);
+    let storage_resolution_viewport = gallery_map::storage_viewport(resolution_viewport);
+    let max_clusters = storage::gallery_map_prefetch_max_clusters(
+        GALLERY_MAP_MAX_CLUSTERS,
+        requested_resolution,
+        storage_resolution_viewport,
+        storage_viewport,
+    );
     let page = {
         let store = read_store(state, "gallery_map.clusters").await;
         store
@@ -15921,13 +15931,10 @@ async fn gallery_map_clusters_response(
                 prefix: prefix.clone(),
                 depth,
                 media_filter: gallery_map::storage_media_filter(media_filter),
-                viewport: gallery_map::storage_viewport(viewport),
-                resolution_viewport: gallery_map::storage_viewport(resolution_viewport),
-                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(
-                    precise_zoom,
-                    cluster_cell_size_px,
-                ),
-                max_clusters: GALLERY_MAP_MAX_CLUSTERS,
+                viewport: storage_viewport,
+                resolution_viewport: storage_resolution_viewport,
+                requested_resolution,
+                max_clusters,
             })
             .await
     };
@@ -16142,8 +16149,10 @@ fn gallery_map_resolution_viewport_from_query(
     if !gallery_map::gallery_map_viewport_is_valid(viewport) {
         return Err("gallery map resolution viewport bounds are invalid");
     }
-    if !gallery_map::gallery_map_viewport_contains(fallback, viewport) {
-        return Err("gallery map resolution viewport must be contained in the query viewport");
+    if !gallery_map::gallery_map_viewport_is_prefetch_envelope(fallback, viewport) {
+        return Err(
+            "gallery map resolution viewport must be contained in a query viewport no more than twice as wide or high",
+        );
     }
     Ok(viewport)
 }

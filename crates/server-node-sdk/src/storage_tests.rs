@@ -119,6 +119,15 @@ fn gallery_map_prefetch_uses_the_visible_viewport_to_preserve_grid_density() {
         gallery_map_bounded_resolution(requested_resolution, prefetched_viewport, 2_048),
         requested_resolution / 2
     );
+    assert_eq!(
+        gallery_map_prefetch_max_clusters(
+            2_048,
+            requested_resolution,
+            visible_viewport,
+            prefetched_viewport,
+        ),
+        8_192
+    );
 }
 
 #[test]

@@ -17,6 +17,8 @@ export type ScreenPointCluster<T> = {
 };
 
 type MutableScreenPointCluster<T> = {
+  gridCellX: number;
+  gridCellY: number;
   xTotal: number;
   yTotal: number;
   minX: number;
@@ -71,6 +73,8 @@ export function clusterScreenPoints<T>(
 
     if (!bestCluster) {
       const nextCluster: MutableScreenPointCluster<T> = {
+        gridCellX: cellX,
+        gridCellY: cellY,
         xTotal: point.x,
         yTotal: point.y,
         minX: point.x,
@@ -80,10 +84,7 @@ export function clusterScreenPoints<T>(
         points: [point]
       };
       clusters.push(nextCluster);
-      const key = clusterGridKey(cellX, cellY);
-      const cellClusters = grid.get(key) ?? [];
-      cellClusters.push(nextCluster);
-      grid.set(key, cellClusters);
+      addClusterToGrid(grid, nextCluster);
       continue;
     }
 
@@ -94,6 +95,7 @@ export function clusterScreenPoints<T>(
     bestCluster.maxX = Math.max(bestCluster.maxX, point.x);
     bestCluster.minY = Math.min(bestCluster.minY, point.y);
     bestCluster.maxY = Math.max(bestCluster.maxY, point.y);
+    moveClusterInGrid(grid, bestCluster, safeRadius);
   }
 
   return clusters.map((cluster) => {
@@ -113,6 +115,44 @@ export function clusterScreenPoints<T>(
       points: cluster.points
     };
   });
+}
+
+function addClusterToGrid<T>(
+  grid: Map<string, MutableScreenPointCluster<T>[]>,
+  cluster: MutableScreenPointCluster<T>
+): void {
+  const key = clusterGridKey(cluster.gridCellX, cluster.gridCellY);
+  const cellClusters = grid.get(key) ?? [];
+  cellClusters.push(cluster);
+  grid.set(key, cellClusters);
+}
+
+function moveClusterInGrid<T>(
+  grid: Map<string, MutableScreenPointCluster<T>[]>,
+  cluster: MutableScreenPointCluster<T>,
+  radius: number
+): void {
+  const centroidX = cluster.xTotal / cluster.points.length;
+  const centroidY = cluster.yTotal / cluster.points.length;
+  const nextCellX = Math.floor(centroidX / radius);
+  const nextCellY = Math.floor(centroidY / radius);
+  if (nextCellX === cluster.gridCellX && nextCellY === cluster.gridCellY) {
+    return;
+  }
+
+  const previousKey = clusterGridKey(cluster.gridCellX, cluster.gridCellY);
+  const previousCellClusters = grid.get(previousKey) ?? [];
+  const clusterIndex = previousCellClusters.indexOf(cluster);
+  if (clusterIndex >= 0) {
+    previousCellClusters.splice(clusterIndex, 1);
+  }
+  if (previousCellClusters.length === 0) {
+    grid.delete(previousKey);
+  }
+
+  cluster.gridCellX = nextCellX;
+  cluster.gridCellY = nextCellY;
+  addClusterToGrid(grid, cluster);
 }
 
 function clusterGridKey(cellX: number, cellY: number): string {

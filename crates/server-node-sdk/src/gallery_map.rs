@@ -84,6 +84,25 @@ pub(super) fn gallery_map_viewport_contains(
         && gallery_map_longitude_interval_contains(outer, inner)
 }
 
+/// Validates the bounded 2× prefetch envelope used by Gallery map clients. Keeping this
+/// relationship server-enforced prevents a tiny resolution viewport from weakening the query
+/// resolution bound for an arbitrarily large data viewport.
+pub(super) fn gallery_map_viewport_is_prefetch_envelope(
+    viewport: GalleryMapViewport,
+    resolution_viewport: GalleryMapViewport,
+) -> bool {
+    const PREFETCH_ENVELOPE_FACTOR: f64 = 2.0;
+    const FLOATING_POINT_MARGIN: f64 = 1e-9;
+
+    gallery_map_viewport_contains(viewport, resolution_viewport)
+        && viewport.north - viewport.south
+            <= (resolution_viewport.north - resolution_viewport.south) * PREFETCH_ENVELOPE_FACTOR
+                + FLOATING_POINT_MARGIN
+        && gallery_map_longitude_span(viewport)
+            <= gallery_map_longitude_span(resolution_viewport) * PREFETCH_ENVELOPE_FACTOR
+                + FLOATING_POINT_MARGIN
+}
+
 fn gallery_map_longitude_interval_contains(
     outer: GalleryMapViewport,
     inner: GalleryMapViewport,
@@ -282,6 +301,14 @@ mod tests {
         assert!(!gallery_map_viewport_contains(
             prefetched_antimeridian_viewport,
             outside_viewport
+        ));
+        assert!(gallery_map_viewport_is_prefetch_envelope(
+            prefetched_antimeridian_viewport,
+            visible_antimeridian_viewport
+        ));
+        assert!(!gallery_map_viewport_is_prefetch_envelope(
+            world,
+            visible_antimeridian_viewport
         ));
     }
 
