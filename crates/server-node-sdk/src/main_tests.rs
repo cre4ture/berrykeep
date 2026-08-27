@@ -2024,6 +2024,10 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
             west: Some(-180.0),
             north: Some(90.0),
             east: Some(180.0),
+            resolution_south: Some(47.0),
+            resolution_west: Some(8.0),
+            resolution_north: Some(48.0),
+            resolution_east: Some(9.0),
             zoom: Some(3),
             zoom_precise: Some(3.75),
             cluster_cell_size_px: Some(16.0),
@@ -2037,6 +2041,7 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
     assert_eq!(clusters_payload["total_entry_count"], 2);
     assert_eq!(clusters_payload["visible_geotagged_count"], 2);
     assert_eq!(clusters_payload["zoom"].as_u64(), Some(3));
+    assert_eq!(clusters_payload["resolution"].as_u64(), Some(512));
     assert_eq!(clusters_payload["clusters"].as_array().unwrap().len(), 1);
     assert_eq!(clusters_payload["clusters"][0]["count"], 2);
     let query_token = clusters_payload["query_token"].as_str().unwrap();

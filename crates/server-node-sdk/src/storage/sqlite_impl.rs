@@ -676,7 +676,7 @@ fn query_gallery_map_cluster_cells_from_db(
         &base_values,
         gallery_map_bounded_resolution(
             query.requested_resolution,
-            query.viewport,
+            query.resolution_viewport,
             query.max_clusters,
         ),
         query.max_clusters,
@@ -1255,7 +1255,7 @@ fn query_gallery_map_clusters_in_transaction(
         &base_values,
         gallery_map_bounded_resolution(
             query.requested_resolution,
-            query.viewport,
+            query.resolution_viewport,
             query.max_clusters,
         ),
         query.max_clusters,

@@ -384,6 +384,7 @@ fn gallery_map_query(
         prefix: "gallery".to_string(),
         depth: 64,
         media_filter: GalleryIndexMediaFilter::Image,
+        resolution_viewport: viewport,
         viewport,
         requested_resolution,
         max_clusters,

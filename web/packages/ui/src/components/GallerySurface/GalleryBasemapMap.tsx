@@ -140,7 +140,8 @@ type GalleryBasemapMapProps = {
   onViewportChange: (
     viewport: GalleryBasemapMapViewport,
     zoom: number,
-    clusterCellSizePx: number
+    clusterCellSizePx: number,
+    resolutionViewport: GalleryBasemapMapViewport
   ) => void;
   loadClusterEntries: (
     queryToken: string,
@@ -344,7 +345,8 @@ export function GalleryBasemapMap({
             onViewportChangeRef.current(
               prefetchViewport,
               map.getZoom(),
-              galleryMapClusterCellSizeForViewport(container.clientWidth, container.clientHeight)
+              galleryMapClusterCellSizeForViewport(container.clientWidth, container.clientHeight),
+              viewport
             );
           }
         };
@@ -619,7 +621,12 @@ export function GalleryBasemapMap({
   function zoomToClusters(serverClusters: GalleryBasemapMapCluster[]): boolean {
     const currentMap = mapRef.current;
     const bounds = boundsForClusters(serverClusters);
-    if (!currentMap || !bounds) {
+    if (
+      !currentMap ||
+      !bounds ||
+      currentMap.getZoom() >= BASEMAP_CLUSTER_LEAF_ZOOM_THRESHOLD ||
+      !boundsHaveGeoSpread(bounds)
+    ) {
       return false;
     }
 
@@ -801,22 +808,25 @@ export function GalleryBasemapMap({
                 if (cluster.points.length === 1 && count === 1) {
                   const point = cluster.points[0];
                   const serverCluster = point?.item;
-                  if (!point || !serverCluster?.entry) {
-                    return null;
+                  if (point && serverCluster?.entry) {
+                    return (
+                      <GalleryBasemapMarker
+                        key={cluster.id}
+                        entry={serverCluster.entry}
+                        request={
+                          !suppressMarkerThumbnails || selected
+                            ? getMarkerRequest(serverCluster.entry)
+                            : null
+                        }
+                        left={cluster.x}
+                        top={cluster.y}
+                        selected={selected}
+                        onClick={() =>
+                          onSelectPath(serverCluster.entry!.path, visibleSelectionEntries)
+                        }
+                      />
+                    );
                   }
-                  return (
-                    <GalleryBasemapMarker
-                      key={cluster.id}
-                      entry={serverCluster.entry}
-                      request={
-                        !suppressMarkerThumbnails || selected ? getMarkerRequest(serverCluster.entry) : null
-                      }
-                      left={cluster.x}
-                      top={cluster.y}
-                      selected={selected}
-                      onClick={() => onSelectPath(serverCluster.entry!.path, visibleSelectionEntries)}
-                    />
-                  );
                 }
 
                 return (
@@ -1192,6 +1202,13 @@ function basemapClusterHasGeoSpread(cluster: GalleryBasemapMapCluster): boolean 
   return (
     cluster.bounds.north - cluster.bounds.south > BASEMAP_CLUSTER_GEO_EPSILON ||
     cluster.bounds.east - cluster.bounds.west > BASEMAP_CLUSTER_GEO_EPSILON
+  );
+}
+
+function boundsHaveGeoSpread(bounds: maplibregl.LngLatBounds): boolean {
+  return (
+    bounds.getNorth() - bounds.getSouth() > BASEMAP_CLUSTER_GEO_EPSILON ||
+    bounds.getEast() - bounds.getWest() > BASEMAP_CLUSTER_GEO_EPSILON
   );
 }
 

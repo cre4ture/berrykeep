@@ -13301,6 +13301,12 @@ struct GalleryMapClustersQuery {
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
+    /// Optional visible camera bounds used to cap grid resolution independently from a prefetch
+    /// viewport. Older nodes ignore these additive fields.
+    resolution_south: Option<f64>,
+    resolution_west: Option<f64>,
+    resolution_north: Option<f64>,
+    resolution_east: Option<f64>,
     /// Integral legacy wire field. Keep it for nodes and SDKs that predate fractional zoom.
     zoom: Option<u8>,
     /// Optional fractional MapLibre camera zoom. Older nodes ignore this additive field.
@@ -15874,6 +15880,12 @@ async fn gallery_map_clusters_response(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
         }
     };
+    let resolution_viewport = match gallery_map_resolution_viewport_from_query(&query, viewport) {
+        Ok(viewport) => viewport,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
     let prefix = query
         .prefix
         .unwrap_or_default()
@@ -15910,6 +15922,7 @@ async fn gallery_map_clusters_response(
                 depth,
                 media_filter: gallery_map::storage_media_filter(media_filter),
                 viewport: gallery_map::storage_viewport(viewport),
+                resolution_viewport: gallery_map::storage_viewport(resolution_viewport),
                 requested_resolution: gallery_map::gallery_map_resolution_for_zoom(
                     precise_zoom,
                     cluster_cell_size_px,
@@ -16098,6 +16111,36 @@ fn gallery_map_viewport_from_query(
     };
     if !gallery_map::gallery_map_viewport_is_valid(viewport) {
         return Err("gallery map viewport bounds are invalid");
+    }
+    Ok(viewport)
+}
+
+fn gallery_map_resolution_viewport_from_query(
+    query: &GalleryMapClustersQuery,
+    fallback: gallery_map::GalleryMapViewport,
+) -> std::result::Result<gallery_map::GalleryMapViewport, &'static str> {
+    let bounds = (
+        query.resolution_south,
+        query.resolution_west,
+        query.resolution_north,
+        query.resolution_east,
+    );
+    if bounds == (None, None, None, None) {
+        return Ok(fallback);
+    }
+    let (Some(south), Some(west), Some(north), Some(east)) = bounds else {
+        return Err(
+            "resolution_south, resolution_west, resolution_north, and resolution_east must be supplied together",
+        );
+    };
+    let viewport = gallery_map::GalleryMapViewport {
+        south,
+        west,
+        north,
+        east,
+    };
+    if !gallery_map::gallery_map_viewport_is_valid(viewport) {
+        return Err("gallery map resolution viewport bounds are invalid");
     }
     Ok(viewport)
 }

@@ -142,6 +142,14 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     const prefetchViewport = galleryMapViewportFromDiagnostic(
       await mapViewportDiagnostics.getAttribute("data-gallery-map-prefetch-viewport")
     );
+    const resolutionViewport = {
+      south: Number(responsiveClusterUrl.searchParams.get("resolution_south")),
+      west: Number(responsiveClusterUrl.searchParams.get("resolution_west")),
+      north: Number(responsiveClusterUrl.searchParams.get("resolution_north")),
+      east: Number(responsiveClusterUrl.searchParams.get("resolution_east"))
+    };
+    expect(Object.values(resolutionViewport).every(Number.isFinite)).toBe(true);
+    expect(resolutionViewport.south).toBeLessThanOrEqual(resolutionViewport.north);
     expect(galleryMapLatitudeSpan(prefetchViewport)).toBeCloseTo(
       Math.min(180, galleryMapLatitudeSpan(visibleViewport) * 2),
       6

@@ -96,6 +96,32 @@ fn gallery_map_resolution_is_limited_for_a_world_sized_viewport() {
 }
 
 #[test]
+fn gallery_map_prefetch_uses_the_visible_viewport_to_preserve_grid_density() {
+    let visible_viewport = GalleryViewportBounds {
+        south: -4.2,
+        west: 0.0,
+        north: 4.2,
+        east: 11.25,
+    };
+    let prefetched_viewport = GalleryViewportBounds {
+        south: -8.4,
+        west: -5.625,
+        north: 8.4,
+        east: 16.875,
+    };
+    let requested_resolution = 1 << 10;
+
+    assert_eq!(
+        gallery_map_bounded_resolution(requested_resolution, visible_viewport, 2_048),
+        requested_resolution
+    );
+    assert_eq!(
+        gallery_map_bounded_resolution(requested_resolution, prefetched_viewport, 2_048),
+        requested_resolution / 2
+    );
+}
+
+#[test]
 fn chunk_path_for_hash_rejects_non_blake3_hex_lengths() {
     let chunks_dir = Path::new("chunks");
 

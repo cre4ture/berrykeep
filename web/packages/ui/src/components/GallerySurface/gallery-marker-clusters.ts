@@ -100,7 +100,10 @@ export function clusterScreenPoints<T>(
     const x = cluster.xTotal / cluster.points.length;
     const y = cluster.yTotal / cluster.points.length;
     return {
-      id: `${cluster.points[0]?.id ?? "cluster"}:${cluster.points.length}:${Math.round(x)}:${Math.round(y)}`,
+      id: cluster.points
+        .map((point) => point.id)
+        .sort()
+        .join("|"),
       x,
       y,
       minX: cluster.minX,
