@@ -13,9 +13,26 @@ import {
 } from "./store-index.mock";
 
 const API_V1_PREFIX = "/api/v1";
+const HOME_NAS_NODE_ID = "0198e5b8-8bb4-7cc0-a6d7-8648251845b8";
+const EMPTY_WEB_SERVICE_NODE_ID = "0198e5b8-8bb4-7cc0-a6d7-8648251845b9";
+const CONCURRENT_WEB_SERVICE_NODE_IDS = [
+  "0198e5b8-8bb4-7cc0-a6d7-8648251845c0",
+  "0198e5b8-8bb4-7cc0-a6d7-8648251845c1",
+  "0198e5b8-8bb4-7cc0-a6d7-8648251845c2",
+  "0198e5b8-8bb4-7cc0-a6d7-8648251845c3",
+  "0198e5b8-8bb4-7cc0-a6d7-8648251845c4"
+];
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
+}
+
+function createDeferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolvePromise!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = () => resolve();
+  });
+  return { promise, resolve: resolvePromise };
 }
 
 registerGalleryMapContractTests({
@@ -146,6 +163,148 @@ test("a blocked service popup leaves the client UI open", async ({ page }) => {
     page.getByText("The browser blocked the service popup. Allow popups and try again.")
   ).toBeVisible();
   await expect(page.getByRole("heading", { name: "Web services" })).toBeVisible();
+});
+
+test("web service results appear while another node is still checking", async ({ page }) => {
+  const slowNodeStarted = createDeferred();
+  const releaseSlowNode = createDeferred();
+  await installClientUiMocks(page);
+  await page.route(
+    `**${apiV1(`/web-services/nodes/${EMPTY_WEB_SERVICE_NODE_ID}`)}`,
+    async (route) => {
+      slowNodeStarted.resolve();
+      await releaseSlowNode.promise;
+      await json(route, {
+        nodeId: EMPTY_WEB_SERVICE_NODE_ID,
+        available: true,
+        services: []
+      });
+    }
+  );
+
+  await page.goto("/");
+  await page.getByText("Web services", { exact: true }).click();
+  await slowNodeStarted.promise;
+
+  await expect(page.getByText("Home NAS", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 node is still checking.", { exact: true })).toBeVisible();
+
+  releaseSlowNode.resolve();
+  await expect(page.getByText("Checked 2 of 2 nodes", { exact: true })).toBeVisible();
+  await expect(page.getByText("No services for this device", { exact: true })).toBeVisible();
+});
+
+test("web service discovery acknowledges an empty response before all nodes finish", async ({ page }) => {
+  const slowNodeStarted = createDeferred();
+  const releaseSlowNode = createDeferred();
+  await installClientUiMocks(page);
+  await page.route(
+    `**${apiV1(`/web-services/nodes/${HOME_NAS_NODE_ID}`)}`,
+    (route) =>
+      json(route, {
+        nodeId: HOME_NAS_NODE_ID,
+        available: true,
+        services: []
+      })
+  );
+  await page.route(
+    `**${apiV1(`/web-services/nodes/${EMPTY_WEB_SERVICE_NODE_ID}`)}`,
+    async (route) => {
+      slowNodeStarted.resolve();
+      await releaseSlowNode.promise;
+      await json(route, {
+        nodeId: EMPTY_WEB_SERVICE_NODE_ID,
+        available: true,
+        services: []
+      });
+    }
+  );
+
+  await page.goto("/");
+  await page.getByText("Web services", { exact: true }).click();
+  await slowNodeStarted.promise;
+
+  await expect(page.getByText("No services returned yet", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 node is still checking.", { exact: true })).toBeVisible();
+
+  releaseSlowNode.resolve();
+  await expect(
+    page.getByText("No services available to this device", { exact: true })
+  ).toBeVisible();
+});
+
+test("web service discovery distinguishes unreachable nodes from empty service lists", async ({
+  page
+}) => {
+  await installClientUiMocks(page);
+  await page.route(
+    `**${apiV1(`/web-services/nodes/${HOME_NAS_NODE_ID}`)}`,
+    (route) =>
+      json(route, {
+        nodeId: HOME_NAS_NODE_ID,
+        available: false,
+        services: []
+      })
+  );
+  await page.route(
+    `**${apiV1(`/web-services/nodes/${EMPTY_WEB_SERVICE_NODE_ID}`)}`,
+    (route) =>
+      json(route, {
+        nodeId: EMPTY_WEB_SERVICE_NODE_ID,
+        available: false,
+        services: []
+      })
+  );
+
+  await page.goto("/");
+  await page.getByText("Web services", { exact: true }).click();
+
+  await expect(page.getByText("No node could be reached", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText(
+      "No node has returned an available web-service list yet. Check the connection to the listed nodes and retry.",
+      { exact: true }
+    )
+  ).toBeVisible();
+});
+
+test("web service discovery limits concurrent node requests", async ({ page }) => {
+  const releaseResponses = createDeferred();
+  let activeRequests = 0;
+  let maxConcurrentRequests = 0;
+  await installClientUiMocks(page);
+  await page.route(`**${apiV1("/web-services/nodes")}`, (route) =>
+    json(route, { nodeIds: CONCURRENT_WEB_SERVICE_NODE_IDS })
+  );
+  await page.route(`**${apiV1("/web-services/nodes/")}*`, async (route) => {
+    activeRequests += 1;
+    maxConcurrentRequests = Math.max(maxConcurrentRequests, activeRequests);
+    await releaseResponses.promise;
+    activeRequests -= 1;
+    const nodeId = route.request().url().split("/").pop()!;
+    await json(route, { nodeId, available: true, services: [] });
+  });
+
+  await page.goto("/");
+  await page.getByText("Web services", { exact: true }).click();
+
+  await expect.poll(() => activeRequests).toBe(4);
+  releaseResponses.resolve();
+  await expect(page.getByText("Checked 5 of 5 nodes", { exact: true })).toBeVisible();
+  expect(maxConcurrentRequests).toBe(4);
+});
+
+test("web service discovery falls back when node discovery is unavailable", async ({ page }) => {
+  await installClientUiMocks(page);
+  await page.route(`**${apiV1("/web-services/nodes")}`, (route) =>
+    route.fulfill({ status: 404 })
+  );
+
+  await page.goto("/");
+  await page.getByText("Web services", { exact: true }).click();
+
+  await expect(page.getByText("Home NAS", { exact: true })).toBeVisible();
+  await expect(page.getByText("Web service request failed", { exact: true })).not.toBeVisible();
 });
 
 async function dispatchCtrlWheel(locator: Locator, deltaY: number): Promise<void> {
@@ -1768,20 +1927,55 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       return json(route, connectionRoutesPayload);
     }
 
+    if (pathname === apiV1("/web-services/nodes") && method === "GET") {
+      return json(route, {
+        nodeIds: [HOME_NAS_NODE_ID, EMPTY_WEB_SERVICE_NODE_ID]
+      });
+    }
+
+    if (
+      pathname === apiV1(`/web-services/nodes/${HOME_NAS_NODE_ID}`) &&
+      method === "GET"
+    ) {
+      return json(route, {
+        nodeId: HOME_NAS_NODE_ID,
+        available: true,
+        services: [
+          {
+            id: "home-nas",
+            name: "Home NAS",
+            description: "Private storage administration",
+            nodeId: HOME_NAS_NODE_ID
+          }
+        ]
+      });
+    }
+
+    if (
+      pathname === apiV1(`/web-services/nodes/${EMPTY_WEB_SERVICE_NODE_ID}`) &&
+      method === "GET"
+    ) {
+      return json(route, {
+        nodeId: EMPTY_WEB_SERVICE_NODE_ID,
+        available: true,
+        services: []
+      });
+    }
+
     if (pathname === apiV1("/web-services") && method === "GET") {
       return json(route, [
         {
           id: "home-nas",
           name: "Home NAS",
           description: "Private storage administration",
-          nodeId: "0198e5b8-8bb4-7cc0-a6d7-8648251845b8"
+          nodeId: HOME_NAS_NODE_ID
         }
       ]);
     }
 
     if (
       pathname ===
-        apiV1("/web-services/0198e5b8-8bb4-7cc0-a6d7-8648251845b8/home-nas/launch") &&
+        apiV1(`/web-services/${HOME_NAS_NODE_ID}/home-nas/launch`) &&
       method === "POST"
     ) {
       return json(route, {
