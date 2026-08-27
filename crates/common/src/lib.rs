@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use unicode_general_category::{GeneralCategory, get_general_category};
 use uuid::Uuid;
 
 pub mod content_fingerprint;
@@ -23,10 +24,23 @@ pub const MAX_NODE_HOSTNAME_BYTES: usize = 255;
 pub fn normalize_node_hostname(value: impl AsRef<str>) -> Option<String> {
     let value = value.as_ref();
     let hostname = value.trim();
-    (!value.chars().any(char::is_control)
+    (!value.chars().any(is_disallowed_hostname_character)
         && !hostname.is_empty()
         && hostname.len() <= MAX_NODE_HOSTNAME_BYTES)
         .then(|| hostname.to_string())
+}
+
+fn is_disallowed_hostname_character(character: char) -> bool {
+    matches!(
+        get_general_category(character),
+        GeneralCategory::Control
+            | GeneralCategory::Format
+            | GeneralCategory::LineSeparator
+            | GeneralCategory::ParagraphSeparator
+            | GeneralCategory::PrivateUse
+            | GeneralCategory::Surrogate
+            | GeneralCategory::Unassigned
+    )
 }
 
 #[cfg(test)]
@@ -40,6 +54,8 @@ mod tests {
             Some("edge-a")
         );
         assert_eq!(normalize_node_hostname("\nedge-a"), None);
+        assert_eq!(normalize_node_hostname("edge-\u{202e}a"), None);
+        assert_eq!(normalize_node_hostname("edge-\u{200b}a"), None);
         assert_eq!(normalize_node_hostname("   "), None);
         assert_eq!(
             normalize_node_hostname("a".repeat(MAX_NODE_HOSTNAME_BYTES + 1)),
