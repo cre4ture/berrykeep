@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use common::{ClusterId, NodeId};
+use common::{ClusterId, NodeId, normalize_node_hostname};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::{Certificate, Client, StatusCode, Url};
 use rustls_pki_types::CertificateDer;
@@ -470,6 +470,14 @@ impl PresenceRegistration {
     pub fn validate(&self) -> Result<()> {
         if self.cluster_id.is_nil() {
             bail!("presence registration must include a non-nil cluster_id");
+        }
+        if let Some(hostname) = self.hostname.as_deref() {
+            let Some(normalized) = normalize_node_hostname(hostname) else {
+                bail!("presence registration hostname is not a valid display host name");
+            };
+            if normalized != hostname {
+                bail!("presence registration hostname must be a normalized display host name");
+            }
         }
         validate_optional_url("public_api_url", self.public_api_url.as_deref())?;
         validate_url_list("public_direct_urls", &self.public_direct_urls)?;
@@ -1783,6 +1791,37 @@ mod tests {
             .validate()
             .expect("malformed optional metadata must not reject node presence");
         assert!(node_connection_priority_from_labels(&registration.labels).is_err());
+    }
+
+    #[test]
+    fn presence_registration_rejects_unsafe_or_noncanonical_hostname() {
+        let mut registration = PresenceRegistration {
+            cluster_id: ClusterId::now_v7(),
+            identity: PeerIdentity::Node(NodeId::now_v7()),
+            hostname: Some("edge-a".to_string()),
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: None,
+            direct_candidates: Vec::new(),
+            labels: HashMap::new(),
+            capacity_bytes: None,
+            free_bytes: None,
+            capabilities: Vec::new(),
+            relay_mode: RelayMode::Disabled,
+            connected_at_unix: 1,
+        };
+
+        registration
+            .validate()
+            .expect("canonical display hostname should be accepted");
+
+        for hostname in ["edge-\u{202e}a", " edge-a "] {
+            registration.hostname = Some(hostname.to_string());
+            assert!(
+                registration.validate().is_err(),
+                "hostname {hostname:?} should fail"
+            );
+        }
     }
 
     fn rendezvous_identity_pem_with_cluster_san(cluster_id: ClusterId) -> String {

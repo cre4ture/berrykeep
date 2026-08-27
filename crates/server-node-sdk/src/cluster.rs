@@ -425,6 +425,10 @@ impl ClusterService {
         nodes
     }
 
+    pub fn node(&self, node_id: NodeId) -> Option<&NodeDescriptor> {
+        self.nodes.get(&node_id)
+    }
+
     pub fn export_nodes(&self) -> Vec<NodeDescriptor> {
         self.list_nodes()
     }

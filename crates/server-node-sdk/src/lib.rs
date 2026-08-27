@@ -9140,10 +9140,8 @@ async fn apply_rendezvous_presence_entries(
             };
             if descriptor.hostname.is_none() {
                 descriptor.hostname = cluster
-                    .list_nodes()
-                    .into_iter()
-                    .find(|node| node.node_id == descriptor.node_id)
-                    .and_then(|node| node.hostname);
+                    .node(descriptor.node_id)
+                    .and_then(|node| node.hostname.clone());
             }
 
             if cluster.register_node(descriptor) {
@@ -28271,10 +28269,8 @@ async fn register_node(
         let mut cluster = state.cluster.lock().await;
         let hostname = requested_hostname.or_else(|| {
             cluster
-                .list_nodes()
-                .into_iter()
-                .find(|existing| existing.node_id == node_id)
-                .and_then(|existing| existing.hostname)
+                .node(node_id)
+                .and_then(|existing| existing.hostname.clone())
         });
         cluster.register_node(NodeDescriptor {
             node_id,
