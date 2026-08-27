@@ -1229,7 +1229,7 @@ pub extern "C" fn ironmesh_ios_facade_store_index_with_options_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_set_media_labels_json(
+pub unsafe extern "C" fn ironmesh_ios_facade_set_media_labels_json(
     handle: *mut c_void,
     key: *const c_char,
     labels_json: *const c_char,
