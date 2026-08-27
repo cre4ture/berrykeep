@@ -151,11 +151,12 @@ function galleryMapClustersResponse(url) {
     north: Number(url.searchParams.get("north")),
     east: Number(url.searchParams.get("east"))
   };
-  const requestedCellWidthPx = Number(url.searchParams.get("cluster_cell_size_px"));
-  const boundedCellWidthPx = Number.isFinite(requestedCellWidthPx)
+  const requestedCellWidthPx = url.searchParams.get("cluster_cell_size_px");
+  const boundedCellWidthPx =
+    requestedCellWidthPx !== null && Number.isFinite(Number(requestedCellWidthPx))
     ? Math.max(
         GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX[0],
-        Math.min(GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX.at(-1), requestedCellWidthPx)
+        Math.min(GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX.at(-1), Number(requestedCellWidthPx))
       )
     : DEFAULT_GALLERY_MAP_CLUSTER_CELL_WIDTH_PX;
   const cellWidthPx = GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX.reduce(

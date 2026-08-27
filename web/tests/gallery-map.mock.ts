@@ -39,11 +39,12 @@ export class GalleryMapMockSession<T extends GalleryMapMockEntry> {
       ? Math.max(0, Math.min(20, requestedZoom))
       : 1;
     const gridZoom = Math.ceil(zoom * 2) / 2;
-    const requestedCellWidthPx = Number(searchParams.get("cluster_cell_size_px"));
-    const boundedCellWidthPx = Number.isFinite(requestedCellWidthPx)
+    const requestedCellWidthPx = searchParams.get("cluster_cell_size_px");
+    const boundedCellWidthPx =
+      requestedCellWidthPx !== null && Number.isFinite(Number(requestedCellWidthPx))
       ? Math.max(
           GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX[0],
-          Math.min(GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX.at(-1)!, requestedCellWidthPx)
+          Math.min(GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX.at(-1)!, Number(requestedCellWidthPx))
         )
       : DEFAULT_GALLERY_MAP_CLUSTER_CELL_WIDTH_PX;
     const cellWidthPx = GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX.reduce(
