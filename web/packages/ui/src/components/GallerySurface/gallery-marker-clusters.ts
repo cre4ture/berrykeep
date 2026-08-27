@@ -9,10 +9,6 @@ export type ScreenPointCluster<T> = {
   id: string;
   x: number;
   y: number;
-  minX: number;
-  maxX: number;
-  minY: number;
-  maxY: number;
   points: ClusterableScreenPoint<T>[];
 };
 
@@ -21,10 +17,6 @@ type MutableScreenPointCluster<T> = {
   gridCellY: number;
   xTotal: number;
   yTotal: number;
-  minX: number;
-  maxX: number;
-  minY: number;
-  maxY: number;
   points: ClusterableScreenPoint<T>[];
 };
 
@@ -77,10 +69,6 @@ export function clusterScreenPoints<T>(
         gridCellY: cellY,
         xTotal: point.x,
         yTotal: point.y,
-        minX: point.x,
-        maxX: point.x,
-        minY: point.y,
-        maxY: point.y,
         points: [point]
       };
       clusters.push(nextCluster);
@@ -91,10 +79,6 @@ export function clusterScreenPoints<T>(
     bestCluster.points.push(point);
     bestCluster.xTotal += point.x;
     bestCluster.yTotal += point.y;
-    bestCluster.minX = Math.min(bestCluster.minX, point.x);
-    bestCluster.maxX = Math.max(bestCluster.maxX, point.x);
-    bestCluster.minY = Math.min(bestCluster.minY, point.y);
-    bestCluster.maxY = Math.max(bestCluster.maxY, point.y);
     moveClusterInGrid(grid, bestCluster, safeRadius);
   }
 
@@ -108,10 +92,6 @@ export function clusterScreenPoints<T>(
         .join("|"),
       x,
       y,
-      minX: cluster.minX,
-      maxX: cluster.maxX,
-      minY: cluster.minY,
-      maxY: cluster.maxY,
       points: cluster.points
     };
   });

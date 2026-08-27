@@ -255,6 +255,7 @@ export function GalleryBasemapMap({
   } | null>(null);
   const [clientClusterDialog, setClientClusterDialog] = useState<{
     clusters: GalleryBasemapMapCluster[];
+    queryToken: string;
     totalEntryCount: number;
   } | null>(null);
   const serverRasterBasemap = isServerRasterBasemap(basemap) ? basemap : null;
@@ -574,7 +575,11 @@ export function GalleryBasemapMap({
   ).length;
   const visibleMarkerCount = visibleMarkerPoints.reduce((count, point) => count + point.item.count, 0);
 
-  async function handleServerClusterClick(cluster: GalleryBasemapMapCluster, allowAutoZoom: boolean) {
+  async function handleServerClusterClick(
+    cluster: GalleryBasemapMapCluster,
+    allowAutoZoom: boolean,
+    queryToken?: string
+  ) {
     if (cluster.count === 1 && cluster.entry) {
       onSelectPath(cluster.entry.path, visibleSelectionEntries);
       return;
@@ -592,7 +597,7 @@ export function GalleryBasemapMap({
       }
     }
 
-    await loadClusterDialogPage(cluster, false);
+    await loadClusterDialogPage(cluster, false, queryToken);
   }
 
   async function handleVisibleClusterClick(
@@ -612,8 +617,13 @@ export function GalleryBasemapMap({
       return;
     }
 
+    const queryToken = clustersPayload?.query_token;
+    if (!queryToken) {
+      return;
+    }
     setClientClusterDialog({
       clusters: serverClusters,
+      queryToken,
       totalEntryCount: serverClusters.reduce((count, serverCluster) => count + serverCluster.count, 0)
     });
   }
@@ -638,8 +648,14 @@ export function GalleryBasemapMap({
     return true;
   }
 
-  async function loadClusterDialogPage(cluster: GalleryBasemapMapCluster, append: boolean) {
-    const queryToken = append ? clusterDialog?.queryToken : clustersPayload?.query_token;
+  async function loadClusterDialogPage(
+    cluster: GalleryBasemapMapCluster,
+    append: boolean,
+    initialQueryToken?: string
+  ) {
+    const queryToken = append
+      ? clusterDialog?.queryToken
+      : initialQueryToken ?? clustersPayload?.query_token;
     if (!queryToken) {
       return;
     }
@@ -1022,7 +1038,7 @@ export function GalleryBasemapMap({
                 fullWidth
                 onClick={() => {
                   setClientClusterDialog(null);
-                  void handleServerClusterClick(serverCluster, false);
+                  void handleServerClusterClick(serverCluster, false, clientClusterDialog.queryToken);
                 }}
               >
                 Server cluster {index + 1}: {formatClusterCount(serverCluster.count)} item
