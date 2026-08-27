@@ -84,6 +84,10 @@ const galleryEntries = [
   createGalleryEntry("runtime-tokyo-b", 35.7262, 139.7003)
 ];
 
+const MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX = 512;
+const DEFAULT_GALLERY_MAP_CLUSTER_CELL_WIDTH_PX = 32;
+const GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX = [16, 24, 32, 48, 64];
+
 const galleryMapClusters = [
   {
     cluster_id: "runtime-new-york",
@@ -147,13 +151,31 @@ function galleryMapClustersResponse(url) {
     north: Number(url.searchParams.get("north")),
     east: Number(url.searchParams.get("east"))
   };
+  const requestedCellWidthPx = url.searchParams.get("cluster_cell_size_px");
+  const boundedCellWidthPx =
+    requestedCellWidthPx !== null && Number.isFinite(Number(requestedCellWidthPx))
+    ? Math.max(
+        GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX[0],
+        Math.min(GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX.at(-1), Number(requestedCellWidthPx))
+      )
+    : DEFAULT_GALLERY_MAP_CLUSTER_CELL_WIDTH_PX;
+  const cellWidthPx = GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX.reduce(
+    (closestCellWidthPx, candidateCellWidthPx) =>
+      Math.abs(candidateCellWidthPx - boundedCellWidthPx) <
+      Math.abs(closestCellWidthPx - boundedCellWidthPx)
+        ? candidateCellWidthPx
+        : closestCellWidthPx
+  );
   const clusters = galleryMapClusters.filter((cluster) => clusterIsVisible(cluster, viewport));
   const visibleGeotaggedCount = clusters.reduce((total, cluster) => total + cluster.count, 0);
   return {
     prefix,
     depth,
     zoom: Math.floor(zoom),
-    resolution: Math.ceil(4 * 2 ** (Math.ceil(zoom * 2) / 2)),
+    resolution: Math.ceil(
+      (MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX / cellWidthPx) *
+        2 ** (Math.ceil(zoom * 2) / 2)
+    ),
     total_entry_count: galleryEntries.length,
     visible_geotagged_count: visibleGeotaggedCount,
     media_summary: {

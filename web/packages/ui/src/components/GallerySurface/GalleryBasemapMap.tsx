@@ -6,6 +6,8 @@ import { createDbWorker, type WorkerHttpvfs } from "sql.js-httpvfs";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
+import { updateGalleryMapClusterGrid } from "./gallery-map-cluster-grid";
+import { galleryMapClusterCellSizeForViewport } from "./gallery-map-cluster-density";
 
 const MBTILES_PROTOCOL = "ironmesh-mbtiles";
 const SQLJS_WORKER_URL = new URL(
@@ -65,6 +67,7 @@ type GalleryBasemapMapCluster = {
 
 type GalleryBasemapClustersPayload = {
   query_token: string;
+  resolution: number;
   total_entry_count: number;
   visible_geotagged_count: number;
   clusters: GalleryBasemapMapCluster[];
@@ -124,6 +127,7 @@ type GalleryBasemapMapProps = {
   projection: GalleryMapProjection;
   clustersPayload: GalleryBasemapClustersPayload | null;
   initialOverviewPayload: GalleryBasemapClustersPayload | null;
+  showClusterGrid: boolean;
   hiddenOnMapCount: number;
   isFullscreen: boolean;
   allowFullscreenPortal: boolean;
@@ -131,7 +135,11 @@ type GalleryBasemapMapProps = {
   fullscreenViewportHeight?: "100dvh";
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest | null;
-  onViewportChange: (viewport: GalleryBasemapMapViewport, zoom: number) => void;
+  onViewportChange: (
+    viewport: GalleryBasemapMapViewport,
+    zoom: number,
+    clusterCellSizePx: number
+  ) => void;
   loadClusterEntries: (
     queryToken: string,
     clusterId: string,
@@ -199,6 +207,7 @@ export function GalleryBasemapMap({
   projection,
   clustersPayload,
   initialOverviewPayload,
+  showClusterGrid,
   hiddenOnMapCount,
   isFullscreen,
   allowFullscreenPortal,
@@ -249,6 +258,7 @@ export function GalleryBasemapMap({
     ? sourceIdForLogicalFile(localRasterBasemap.logicalFileUrl)
     : null;
   const clusters = clustersPayload?.clusters ?? [];
+  const clusterGridPayload = showClusterGrid ? clustersPayload : null;
 
   useEffect(() => {
     onViewportChangeRef.current = onViewportChange;
@@ -322,7 +332,12 @@ export function GalleryBasemapMap({
           }
           const viewport = galleryViewportForMap(map);
           if (viewport) {
-            onViewportChangeRef.current(viewport, map.getZoom());
+            const container = map.getContainer();
+            onViewportChangeRef.current(
+              viewport,
+              map.getZoom(),
+              galleryMapClusterCellSizeForViewport(container.clientWidth, container.clientHeight)
+            );
           }
         };
         const markInteractionEnd = () => {
@@ -352,7 +367,10 @@ export function GalleryBasemapMap({
         map.on("movestart", markInteractionStart);
         map.on("move", bumpViewport);
         map.on("moveend", markInteractionEnd);
-        map.on("resize", bumpViewport);
+        map.on("resize", () => {
+          bumpViewport();
+          emitViewportRequest();
+        });
         map.on("projectiontransition", bumpViewport);
         mapRef.current = map;
         if (map.isStyleLoaded()) {
@@ -469,6 +487,15 @@ export function GalleryBasemapMap({
     const frameId = window.requestAnimationFrame(applyInitialOverview);
     return () => window.cancelAnimationFrame(frameId);
   }, [initialOverviewPayload, mapReady]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!mapReady || !map) {
+      return;
+    }
+
+    updateGalleryMapClusterGrid(map, clusterGridPayload);
+  }, [clusterGridPayload, mapReady]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -773,6 +800,16 @@ export function GalleryBasemapMap({
           <Badge color="grape" variant="filled">
             {clustersPayload?.visible_geotagged_count ?? 0} markers
           </Badge>
+          {showClusterGrid && clustersPayload ? (
+            <Badge
+              color="cyan"
+              variant="filled"
+              data-gallery-map-cluster-grid="true"
+              data-resolution={clustersPayload.resolution}
+            >
+              Debug grid: {clustersPayload.resolution} × {clustersPayload.resolution}
+            </Badge>
+          ) : null}
           {hiddenOnMapCount > 0 ? (
             <Badge color="dark" variant="filled">
               {hiddenOnMapCount} without GPS

@@ -89,10 +89,10 @@ fn gallery_map_resolution_is_limited_for_a_world_sized_viewport() {
             north: 90.0,
             east: 180.0,
         },
-        512,
+        2_048,
     );
 
-    assert_eq!(resolution, 16);
+    assert_eq!(resolution, 32);
 }
 
 #[test]

@@ -1,6 +1,9 @@
 import { fetchJson, isHttpErrorStatus } from "../shared/http";
 import type { GalleryMapConfigurationResponse } from "../shared/map-config";
-import { galleryMapClusterZoomParameters } from "../shared/store-index";
+import {
+  galleryMapClusterCellSizeParameter,
+  galleryMapClusterZoomParameters
+} from "../shared/store-index";
 import type {
   GalleryMapClusterEntriesResponse,
   GalleryMapClustersRequest,
@@ -299,6 +302,7 @@ export async function getGalleryMapClusterEntries(
 
 function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchParams {
   const { zoom, zoomPrecise } = galleryMapClusterZoomParameters(request.zoom);
+  const cellSizePx = galleryMapClusterCellSizeParameter(request.clusterCellSizePx);
   const query = new URLSearchParams({
     depth: String(Math.max(1, Math.floor(request.depth))),
     media_filter: request.mediaFilter,
@@ -311,6 +315,9 @@ function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchPa
   });
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());
+  }
+  if (cellSizePx !== null) {
+    query.set("cluster_cell_size_px", String(cellSizePx));
   }
   return query;
 }

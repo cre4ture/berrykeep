@@ -112,6 +112,13 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
       const url = new URL(request.url());
       return url.pathname.endsWith("/gallery/map/clusters");
     });
+    const responsiveClusterRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return (
+        url.pathname.endsWith("/gallery/map/clusters") &&
+        ["16", "24", "32", "48", "64"].includes(url.searchParams.get("cluster_cell_size_px") ?? "")
+      );
+    });
     await page.getByRole("button", { name: "Map" }).click();
     const firstMapClusterUrl = new URL((await firstMapClusterRequest).url());
     expect(firstMapClusterUrl.searchParams.get("depth")).toBe("64");
@@ -122,6 +129,43 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     expect(firstMapClusterUrl.searchParams.has("limit")).toBe(false);
     const mapCanvas = page.locator(".maplibregl-canvas");
     await expect(mapCanvas).toBeVisible();
+    const responsiveClusterUrl = new URL((await responsiveClusterRequest).url());
+    expect(responsiveClusterUrl.searchParams.get("cluster_cell_size_px")).toMatch(
+      /^(16|24|32|48|64)$/
+    );
+    const clusterGridSwitch = page.getByLabel("Show cluster cells (debug)");
+    await expect(clusterGridSwitch).not.toBeChecked();
+    await expect(page.locator('[data-gallery-map-cluster-grid="true"]')).toHaveCount(0);
+    await page.getByText("Show cluster cells (debug)", { exact: true }).click();
+    await expect(clusterGridSwitch).toBeChecked();
+    const clusterGridBadge = page.locator('[data-gallery-map-cluster-grid="true"]');
+    await expect(clusterGridBadge).toHaveAttribute(
+      "data-resolution",
+      /\d+/
+    );
+    const clusterGrid = page.locator("[data-gallery-map-cluster-grid-cells]");
+    await expect(clusterGrid).toHaveAttribute("data-gallery-map-cluster-grid-cells", /[1-9]\d*/);
+    const resolution = Number(await clusterGridBadge.getAttribute("data-resolution"));
+    const firstClusterId = await clusterGrid.getAttribute(
+      "data-gallery-map-cluster-grid-first-cluster-id"
+    );
+    const firstCell = (await clusterGrid.getAttribute("data-gallery-map-cluster-grid-first-cell"))
+      ?.split(",")
+      .map(Number);
+    expect(Number.isInteger(resolution)).toBe(true);
+    expect(firstClusterId).toMatch(/^\d+_\d+$/);
+    expect(firstCell).toHaveLength(4);
+    const [cellX, cellY] = firstClusterId!.split("_").map(Number);
+    expect(firstCell).toEqual([
+      (cellX / resolution) * 360 - 180,
+      webMercatorLatitudeForGridY((cellY + 1) / resolution),
+      ((cellX + 1) / resolution) * 360 - 180,
+      webMercatorLatitudeForGridY(cellY / resolution)
+    ]);
+    await page.getByText("Show cluster cells (debug)", { exact: true }).click();
+    await expect(clusterGridSwitch).not.toBeChecked();
+    await expect(page.locator('[data-gallery-map-cluster-grid="true"]')).toHaveCount(0);
+    await expect(page.locator("[data-gallery-map-cluster-grid-cells]")).toHaveCount(0);
     const fractionalMapRequest = page.waitForRequest((request) => {
       const url = new URL(request.url());
       const zoom = Number(url.searchParams.get("zoom_precise"));
@@ -212,6 +256,13 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
 
     const cluster = page.getByRole("button", { name: "Open map cluster with 2 items" }).first();
     await expect(cluster).toBeVisible();
+    const zoomedClusterResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return (
+        url.pathname.endsWith("/gallery/map/clusters") &&
+        Number(url.searchParams.get("zoom_precise")) > 11
+      );
+    });
     await cluster.evaluate((element) => {
       element.dispatchEvent(
         new MouseEvent("contextmenu", {
@@ -223,9 +274,14 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
       );
     });
 
+    await zoomedClusterResponse;
     await expect(page.getByRole("dialog", { name: "2 items in map cluster" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Open map cluster with 2 items" })).toHaveCount(0);
   });
+}
+
+function webMercatorLatitudeForGridY(y: number): number {
+  return (Math.atan(Math.sinh(Math.PI * (1 - 2 * y))) * 180) / Math.PI;
 }
 
 export function createInitialOverviewGalleryEntries() {
