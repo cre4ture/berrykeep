@@ -16142,6 +16142,9 @@ fn gallery_map_resolution_viewport_from_query(
     if !gallery_map::gallery_map_viewport_is_valid(viewport) {
         return Err("gallery map resolution viewport bounds are invalid");
     }
+    if !gallery_map::gallery_map_viewport_contains(fallback, viewport) {
+        return Err("gallery map resolution viewport must be contained in the query viewport");
+    }
     Ok(viewport)
 }
 

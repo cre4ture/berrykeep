@@ -130,8 +130,9 @@ prefetch envelope twice as wide and twice as high as the visible viewport (bound
 the full world, and preserving antimeridian wrapping). The regular bounds filter that prefetch
 envelope; the additive `resolution_south`, `resolution_west`, `resolution_north`, and
 `resolution_east` parameters carry the unbuffered visible bounds. They must be supplied together
-when present. The server uses the visible bounds only to enforce its 2,048-cell response cap, so
-prefetching does not reduce the requested on-screen grid density. Small pans therefore already have
+when present and must be fully contained in the query viewport. The server uses the visible bounds
+only to enforce its 2,048-cell response cap, so prefetching does not reduce the requested on-screen
+grid density. Small pans therefore already have
 server clusters to render before the next request completes. The client additionally groups nearby
 server-cluster bubbles in screen space on every camera update, so their display reacts smoothly to
 live pans and fractional zoom changes. A client-merged bubble retains the underlying server clusters
