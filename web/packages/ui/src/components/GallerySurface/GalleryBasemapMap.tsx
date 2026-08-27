@@ -7,6 +7,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
 import { updateGalleryMapClusterGrid } from "./gallery-map-cluster-grid";
+import { galleryMapClusterCellSizeForViewport } from "./gallery-map-cluster-density";
 
 const MBTILES_PROTOCOL = "ironmesh-mbtiles";
 const SQLJS_WORKER_URL = new URL(
@@ -134,7 +135,11 @@ type GalleryBasemapMapProps = {
   fullscreenViewportHeight?: "100dvh";
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest | null;
-  onViewportChange: (viewport: GalleryBasemapMapViewport, zoom: number) => void;
+  onViewportChange: (
+    viewport: GalleryBasemapMapViewport,
+    zoom: number,
+    clusterCellSizePx: number
+  ) => void;
   loadClusterEntries: (
     queryToken: string,
     clusterId: string,
@@ -327,7 +332,12 @@ export function GalleryBasemapMap({
           }
           const viewport = galleryViewportForMap(map);
           if (viewport) {
-            onViewportChangeRef.current(viewport, map.getZoom());
+            const container = map.getContainer();
+            onViewportChangeRef.current(
+              viewport,
+              map.getZoom(),
+              galleryMapClusterCellSizeForViewport(container.clientWidth, container.clientHeight)
+            );
           }
         };
         const markInteractionEnd = () => {
@@ -357,7 +367,10 @@ export function GalleryBasemapMap({
         map.on("movestart", markInteractionStart);
         map.on("move", bumpViewport);
         map.on("moveend", markInteractionEnd);
-        map.on("resize", bumpViewport);
+        map.on("resize", () => {
+          bumpViewport();
+          emitViewportRequest();
+        });
         map.on("projectiontransition", bumpViewport);
         mapRef.current = map;
         if (map.isStyleLoaded()) {

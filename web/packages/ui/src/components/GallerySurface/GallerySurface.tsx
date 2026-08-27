@@ -365,6 +365,7 @@ export type GalleryDataSource = {
     mediaFilter: GalleryMediaFilter;
     viewport: GalleryMapViewport;
     zoom: number;
+    clusterCellSizePx?: number;
   }) => Promise<GalleryMapClustersPayload>;
   loadMapClusterEntries: (
     queryToken: string,
@@ -475,7 +476,8 @@ export function GallerySurface({
   const initialMapOverviewRequestPendingRef = useRef(true);
   const lastMapViewportRequestRef = useRef({
     viewport: GALLERY_MAP_INITIAL_VIEWPORT,
-    zoom: GALLERY_MAP_INITIAL_ZOOM
+    zoom: GALLERY_MAP_INITIAL_ZOOM,
+    clusterCellSizePx: undefined as number | undefined
   });
   const galleryRequestVersionRef = useRef(0);
   const activeGalleryRequestRef = useRef({
@@ -867,8 +869,8 @@ export function GallerySurface({
     }
 
     if (activeRequest.viewMode === "map") {
-      const { viewport, zoom } = lastMapViewportRequestRef.current;
-      void loadMapClustersForViewport(viewport, zoom, scope);
+      const { viewport, zoom, clusterCellSizePx } = lastMapViewportRequestRef.current;
+      void loadMapClustersForViewport(viewport, zoom, clusterCellSizePx, scope);
       return;
     }
 
@@ -993,12 +995,13 @@ export function GallerySurface({
   async function loadMapClustersForViewport(
     viewport: GalleryMapViewport,
     zoom: number,
+    clusterCellSizePx?: number,
     targetScope = loadedScopeRef.current
   ): Promise<GalleryMapClustersPayload | null> {
     if (!targetScope || targetScope.snapshotId) {
       return null;
     }
-    lastMapViewportRequestRef.current = { viewport, zoom };
+    lastMapViewportRequestRef.current = { viewport, zoom, clusterCellSizePx };
     const requestVersion = mapClusterRequestVersionRef.current + 1;
     mapClusterRequestVersionRef.current = requestVersion;
     try {
@@ -1007,7 +1010,8 @@ export function GallerySurface({
         depth: targetScope.depth,
         mediaFilter: requestedServerMediaFilter,
         viewport,
-        zoom
+        zoom,
+        clusterCellSizePx
       });
       if (requestVersion !== mapClusterRequestVersionRef.current) {
         return null;
@@ -1036,8 +1040,8 @@ export function GallerySurface({
       if (!isGalleryMapClusterStaleError(clusterError)) {
         throw clusterError;
       }
-      const { viewport, zoom } = lastMapViewportRequestRef.current;
-      await loadMapClustersForViewport(viewport, zoom);
+      const { viewport, zoom, clusterCellSizePx } = lastMapViewportRequestRef.current;
+      await loadMapClustersForViewport(viewport, zoom, clusterCellSizePx);
       throw new Error("The gallery changed. Map clusters were refreshed; select the cluster again.");
     }
   }
@@ -1087,7 +1091,8 @@ export function GallerySurface({
             depth: targetScope.depth,
             mediaFilter: requestedServerMediaFilter,
             viewport: mapViewportRequest.viewport,
-            zoom: mapViewportRequest.zoom
+            zoom: mapViewportRequest.zoom,
+            clusterCellSizePx: mapViewportRequest.clusterCellSizePx
           })
         ]);
 
@@ -1941,8 +1946,8 @@ export function GallerySurface({
                   hiddenOnMapCount={hiddenOnMapCount}
                   selectedPath={selection?.path ?? null}
                   getMarkerRequest={(entry) => getMediaRequests(entry, activeSnapshotId).thumbnail ?? null}
-                  onViewportChange={(viewport, zoom) =>
-                    void loadMapClustersForViewport(viewport, zoom)
+                  onViewportChange={(viewport, zoom, clusterCellSizePx) =>
+                    void loadMapClustersForViewport(viewport, zoom, clusterCellSizePx)
                   }
                   loadClusterEntries={loadMapClusterEntriesWithRecovery}
                   onSwitchToGrid={switchToGridView}
@@ -2480,7 +2485,11 @@ type GalleryMapPanelProps = {
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
   onSwitchToGrid: () => void;
-  onViewportChange: (viewport: GalleryMapViewport, zoom: number) => void;
+  onViewportChange: (
+    viewport: GalleryMapViewport,
+    zoom: number,
+    clusterCellSizePx: number
+  ) => void;
   loadClusterEntries: GalleryDataSource["loadMapClusterEntries"];
   onSelectPath: (path: string, visibleEntries: GalleryEntry[]) => void;
 };

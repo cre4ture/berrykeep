@@ -112,6 +112,13 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
       const url = new URL(request.url());
       return url.pathname.endsWith("/gallery/map/clusters");
     });
+    const responsiveClusterRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return (
+        url.pathname.endsWith("/gallery/map/clusters") &&
+        ["16", "24", "32", "48", "64"].includes(url.searchParams.get("cluster_cell_size_px") ?? "")
+      );
+    });
     await page.getByRole("button", { name: "Map" }).click();
     const firstMapClusterUrl = new URL((await firstMapClusterRequest).url());
     expect(firstMapClusterUrl.searchParams.get("depth")).toBe("64");
@@ -122,6 +129,10 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     expect(firstMapClusterUrl.searchParams.has("limit")).toBe(false);
     const mapCanvas = page.locator(".maplibregl-canvas");
     await expect(mapCanvas).toBeVisible();
+    const responsiveClusterUrl = new URL((await responsiveClusterRequest).url());
+    expect(responsiveClusterUrl.searchParams.get("cluster_cell_size_px")).toMatch(
+      /^(16|24|32|48|64)$/
+    );
     const clusterGridSwitch = page.getByLabel("Show cluster cells (debug)");
     await expect(clusterGridSwitch).not.toBeChecked();
     await expect(page.locator('[data-gallery-map-cluster-grid="true"]')).toHaveCount(0);
@@ -245,6 +256,13 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
 
     const cluster = page.getByRole("button", { name: "Open map cluster with 2 items" }).first();
     await expect(cluster).toBeVisible();
+    const zoomedClusterResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return (
+        url.pathname.endsWith("/gallery/map/clusters") &&
+        Number(url.searchParams.get("zoom_precise")) > 11
+      );
+    });
     await cluster.evaluate((element) => {
       element.dispatchEvent(
         new MouseEvent("contextmenu", {
@@ -256,6 +274,7 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
       );
     });
 
+    await zoomedClusterResponse;
     await expect(page.getByRole("dialog", { name: "2 items in map cluster" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Open map cluster with 2 items" })).toHaveCount(0);
   });

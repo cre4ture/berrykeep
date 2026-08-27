@@ -13274,6 +13274,8 @@ struct GalleryMapClustersQuery {
     zoom: Option<u8>,
     /// Optional fractional MapLibre camera zoom. Older nodes ignore this additive field.
     zoom_precise: Option<f64>,
+    /// Optional desired cluster cell width in CSS pixels. Older nodes ignore this additive field.
+    cluster_cell_size_px: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -15861,6 +15863,14 @@ async fn gallery_map_clusters_response(
                 .into_response();
         }
     };
+    let cluster_cell_size_px =
+        match gallery_map::gallery_map_cluster_cell_width_px(query.cluster_cell_size_px) {
+            Ok(cell_width_px) => cell_width_px,
+            Err(message) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": message })))
+                    .into_response();
+            }
+        };
     let page = {
         let store = read_store(state, "gallery_map.clusters").await;
         store
@@ -15869,7 +15879,10 @@ async fn gallery_map_clusters_response(
                 depth,
                 media_filter: gallery_map::storage_media_filter(media_filter),
                 viewport: gallery_map::storage_viewport(viewport),
-                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(precise_zoom),
+                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(
+                    precise_zoom,
+                    cluster_cell_size_px,
+                ),
                 max_clusters: GALLERY_MAP_MAX_CLUSTERS,
             })
             .await

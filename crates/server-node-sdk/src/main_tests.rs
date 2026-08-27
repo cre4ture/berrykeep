@@ -2024,6 +2024,7 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
             east: Some(180.0),
             zoom: Some(3),
             zoom_precise: Some(3.75),
+            cluster_cell_size_px: Some(16.0),
         },
         super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
     )

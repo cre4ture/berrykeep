@@ -9,9 +9,10 @@ use super::StoreIndexMediaFilter;
 
 const GALLERY_MAP_TOKEN_PREFIX: &str = "gm1_";
 const MAX_GALLERY_MAP_TOKEN_LENGTH: usize = 65_536;
-const MAX_GALLERY_MAP_RESOLUTION: u32 = 1 << 24;
+const MAX_GALLERY_MAP_RESOLUTION: u32 = 1 << 25;
 const MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX: f64 = 512.0;
-const GALLERY_MAP_CLUSTER_CELL_WIDTH_PX: f64 = 32.0;
+const DEFAULT_GALLERY_MAP_CLUSTER_CELL_WIDTH_PX: f64 = 32.0;
+const GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX: [f64; 5] = [16.0, 24.0, 32.0, 48.0, 64.0];
 const GALLERY_MAP_CLUSTER_ZOOM_STEP: f64 = 0.5;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -73,19 +74,42 @@ pub(super) fn gallery_map_viewport_is_valid(viewport: GalleryMapViewport) -> boo
         && (-180.0..=180.0).contains(&viewport.east)
 }
 
-pub(super) fn gallery_map_resolution_for_zoom(zoom: f64) -> u32 {
+pub(super) fn gallery_map_cluster_cell_width_px(
+    requested_cell_width_px: Option<f64>,
+) -> Result<f64, &'static str> {
+    let Some(requested_cell_width_px) = requested_cell_width_px else {
+        return Ok(DEFAULT_GALLERY_MAP_CLUSTER_CELL_WIDTH_PX);
+    };
+    if !requested_cell_width_px.is_finite() {
+        return Err("cluster_cell_size_px must be a finite number");
+    }
+
+    let min_cell_width_px = GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX[0];
+    let max_cell_width_px = *GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX
+        .last()
+        .expect("gallery map cluster cell width options must not be empty");
+    let bounded_cell_width_px = requested_cell_width_px.clamp(min_cell_width_px, max_cell_width_px);
+    Ok(*GALLERY_MAP_CLUSTER_CELL_WIDTH_OPTIONS_PX
+        .iter()
+        .min_by(|left, right| {
+            (f64::abs(**left - bounded_cell_width_px))
+                .total_cmp(&f64::abs(**right - bounded_cell_width_px))
+        })
+        .expect("gallery map cluster cell width options must not be empty"))
+}
+
+pub(super) fn gallery_map_resolution_for_zoom(zoom: f64, cell_width_px: f64) -> u32 {
     let zoom = if zoom.is_finite() {
         zoom.clamp(0.0, 20.0)
     } else {
         0.0
     };
     // A continuous resolution moves every grid boundary at every camera update. Round upward
-    // to half zoom levels so cells remain at most 32 pixels wide while small zoom changes keep
-    // the same cluster grid.
+    // to half zoom levels so cells remain no wider than the client-selected CSS-pixel target
+    // while small zoom changes keep the same cluster grid.
     let grid_zoom = (zoom / GALLERY_MAP_CLUSTER_ZOOM_STEP).ceil() * GALLERY_MAP_CLUSTER_ZOOM_STEP;
-    let resolution = (MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX * 2.0_f64.powf(grid_zoom)
-        / GALLERY_MAP_CLUSTER_CELL_WIDTH_PX)
-        .ceil();
+    let resolution =
+        (MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX * 2.0_f64.powf(grid_zoom) / cell_width_px).ceil();
 
     resolution.clamp(1.0, f64::from(MAX_GALLERY_MAP_RESOLUTION)) as u32
 }
@@ -177,26 +201,68 @@ mod tests {
     }
 
     #[test]
-    fn map_grid_resolution_quantizes_fractional_zoom_at_the_configured_cell_width() {
+    fn map_grid_resolution_quantizes_fractional_zoom_at_the_client_cell_width() {
+        let cell_width_px = gallery_map_cluster_cell_width_px(None).unwrap();
         for zoom in [0.0, 0.25, 1.2, 3.75, 12.4, 20.0] {
             let world_size = MAPLIBRE_WORLD_SIZE_AT_ZOOM_ZERO_PX * 2.0_f64.powf(zoom);
-            let resolution = f64::from(gallery_map_resolution_for_zoom(zoom));
+            let resolution = f64::from(gallery_map_resolution_for_zoom(zoom, cell_width_px));
 
             assert!(
-                world_size / resolution <= GALLERY_MAP_CLUSTER_CELL_WIDTH_PX,
+                world_size / resolution <= cell_width_px,
                 "zoom level {zoom} has an oversized cluster cell"
             );
         }
 
-        assert_eq!(gallery_map_resolution_for_zoom(1.0), 1 << 5);
-        assert_eq!(gallery_map_resolution_for_zoom(3.0), 1 << 7);
+        assert_eq!(gallery_map_resolution_for_zoom(1.0, cell_width_px), 1 << 5);
+        assert_eq!(gallery_map_resolution_for_zoom(3.0, cell_width_px), 1 << 7);
         assert_eq!(
-            gallery_map_resolution_for_zoom(3.01),
-            gallery_map_resolution_for_zoom(3.49)
+            gallery_map_resolution_for_zoom(3.01, cell_width_px),
+            gallery_map_resolution_for_zoom(3.49, cell_width_px)
         );
         assert_ne!(
-            gallery_map_resolution_for_zoom(3.49),
-            gallery_map_resolution_for_zoom(3.51)
+            gallery_map_resolution_for_zoom(3.49, cell_width_px),
+            gallery_map_resolution_for_zoom(3.51, cell_width_px)
+        );
+    }
+
+    #[test]
+    fn map_cluster_cell_width_is_bounded_and_quantized() {
+        assert_eq!(
+            gallery_map_cluster_cell_width_px(None),
+            Ok(DEFAULT_GALLERY_MAP_CLUSTER_CELL_WIDTH_PX)
+        );
+        assert_eq!(gallery_map_cluster_cell_width_px(Some(8.0)), Ok(16.0));
+        assert_eq!(gallery_map_cluster_cell_width_px(Some(28.0)), Ok(24.0));
+        assert_eq!(gallery_map_cluster_cell_width_px(Some(49.0)), Ok(48.0));
+        assert_eq!(gallery_map_cluster_cell_width_px(Some(128.0)), Ok(64.0));
+        assert_eq!(
+            gallery_map_cluster_cell_width_px(Some(f64::NAN)),
+            Err("cluster_cell_size_px must be a finite number")
+        );
+    }
+
+    #[test]
+    fn map_grid_resolution_reflects_the_client_cell_width() {
+        assert_eq!(
+            gallery_map_resolution_for_zoom(
+                1.0,
+                gallery_map_cluster_cell_width_px(Some(16.0)).unwrap()
+            ),
+            1 << 6
+        );
+        assert_eq!(
+            gallery_map_resolution_for_zoom(
+                1.0,
+                gallery_map_cluster_cell_width_px(Some(64.0)).unwrap()
+            ),
+            1 << 4
+        );
+        assert_eq!(
+            gallery_map_resolution_for_zoom(
+                20.0,
+                gallery_map_cluster_cell_width_px(Some(16.0)).unwrap()
+            ),
+            1 << 25
         );
     }
 }
