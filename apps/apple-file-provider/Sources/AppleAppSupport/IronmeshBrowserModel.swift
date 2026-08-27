@@ -80,6 +80,7 @@ struct IronmeshConnectionAttemptStatus: Codable, Equatable, Identifiable, Sendab
 struct IronmeshConnectionEndpointStatus: Codable, Equatable, Identifiable, Sendable {
     var pathKind: String
     var targetNodeId: String?
+    var targetNodeHostname: String? = nil
     var irohRelayUrls: [String]? = nil
     var lastSuccessfulIrohRelayUrl: String? = nil
     var locator: String
@@ -96,6 +97,17 @@ struct IronmeshConnectionEndpointStatus: Codable, Equatable, Identifiable, Senda
 
     var id: String {
         "\(pathKind)-\(locator)-\(requestBaseUrl)"
+    }
+
+    var targetNodeDetail: String? {
+        guard let targetNodeId else {
+            return nil
+        }
+        let hostname = targetNodeHostname?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let hostname, !hostname.isEmpty else {
+            return targetNodeId
+        }
+        return "\(hostname)\n\(targetNodeId)"
     }
 }
 

@@ -322,6 +322,9 @@ pub struct ClientEndpointDiagnostics {
     pub transport_path_kind: Option<String>,
     #[serde(default)]
     pub target_node_id: Option<NodeId>,
+    /// Descriptive operating-system host name for `target_node_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_hostname: Option<String>,
     /// Iroh relay URLs currently configured for this Direct QUIC endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_relay_urls: Option<Vec<String>>,
@@ -1905,6 +1908,7 @@ impl ClientEndpointRouter {
                             .to_string(),
                     ),
                     target_node_id: endpoint.transport.target_node_id(),
+                    target_node_hostname: endpoint.descriptor.target_node_hostname.clone(),
                     iroh_relay_urls: endpoint.transport.iroh_relay_urls(),
                     last_successful_iroh_relay_url: endpoint
                         .transport
