@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use common::{ClusterId, NodeId};
+use common::{ClusterId, NodeId, normalize_node_hostname};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,10 @@ pub struct PlannedConnectionBootstrapTarget {
     pub server_base_url: Option<String>,
     #[serde(default)]
     pub target_node_id: Option<NodeId>,
+    /// Descriptive operating-system host name for the target node. This is
+    /// presentation metadata and never changes route selection or identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_hostname: Option<String>,
     /// Effective server-node priority after applying a client-local override.
     #[serde(default)]
     pub node_connection_priority: i16,
@@ -301,13 +305,13 @@ fn normalized_unique_rendezvous_urls(rendezvous_urls: &[String]) -> Result<Vec<S
 fn relay_targets_for_node_ids(
     bootstrap: &ConnectionBootstrap,
     rendezvous_urls: &[String],
-    target_node_ids: impl IntoIterator<Item = NodeId>,
+    target_nodes: impl IntoIterator<Item = (NodeId, Option<String>)>,
 ) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
     let rendezvous_urls = normalized_unique_rendezvous_urls(rendezvous_urls)?;
     let mut relay_targets = Vec::new();
     let mut seen_node_ids = BTreeSet::new();
 
-    for target_node_id in target_node_ids {
+    for (target_node_id, target_node_hostname) in target_nodes {
         if !seen_node_ids.insert(target_node_id.to_string()) {
             continue;
         }
@@ -322,6 +326,7 @@ fn relay_targets_for_node_ids(
                 direct_candidate: None,
                 server_base_url: None,
                 target_node_id: Some(target_node_id),
+                target_node_hostname: target_node_hostname.clone(),
                 node_connection_priority: bootstrap
                     .effective_node_connection_priority(target_node_id, 0),
                 server_ca_pem: bootstrap.trust_roots.public_api_ca_pem.clone(),
@@ -475,6 +480,10 @@ impl ConnectionBootstrap {
                     url: url.to_string(),
                     usage: endpoint.usage,
                     node_id: endpoint.node_id,
+                    node_hostname: endpoint
+                        .node_hostname
+                        .as_deref()
+                        .and_then(normalize_node_hostname),
                 });
             }
         }
@@ -500,9 +509,11 @@ impl ConnectionBootstrap {
                 let relay_targets = relay_targets_for_node_ids(
                     self,
                     &rendezvous_urls,
-                    direct_targets
-                        .iter()
-                        .filter_map(|target| target.target_node_id),
+                    direct_targets.iter().filter_map(|target| {
+                        target
+                            .target_node_id
+                            .map(|node_id| (node_id, target.target_node_hostname.clone()))
+                    }),
                 )?;
                 if relay_targets.is_empty() && self.relay_mode == RelayMode::Required {
                     bail!(
@@ -554,6 +565,10 @@ impl ConnectionBootstrap {
                 direct_candidate: None,
                 server_base_url: Some(endpoint.url),
                 target_node_id: endpoint.node_id,
+                target_node_hostname: endpoint
+                    .node_hostname
+                    .as_deref()
+                    .and_then(normalize_node_hostname),
                 node_connection_priority: endpoint
                     .node_id
                     .map(|node_id| self.effective_node_connection_priority(node_id, 0))
@@ -791,6 +806,10 @@ impl ConnectionBootstrap {
                     relay: Vec::new(),
                 });
             };
+            let target_node_hostname = direct
+                .iter()
+                .find(|target| target.target_node_id == Some(resolved_target_node_id))
+                .and_then(|target| target.target_node_hostname.clone());
 
             let normalized_selected_url = rendezvous_url
                 .map(|url| url.trim().trim_end_matches('/').to_string())
@@ -828,6 +847,7 @@ impl ConnectionBootstrap {
                         direct_candidate: None,
                         server_base_url: None,
                         target_node_id: Some(resolved_target_node_id),
+                        target_node_hostname: target_node_hostname.clone(),
                         node_connection_priority: self
                             .effective_node_connection_priority(resolved_target_node_id, 0),
                         server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
@@ -1218,6 +1238,7 @@ impl ConnectionBootstrap {
             direct_candidates_by_node: BTreeMap::new(),
             relay_capable_nodes: BTreeSet::new(),
             advertised_priorities_by_node: BTreeMap::new(),
+            hostnames_by_node: BTreeMap::new(),
         };
         let base_rendezvous_urls = discovery.rendezvous_urls.clone();
         let base_rendezvous_url_set = base_rendezvous_urls
@@ -1266,6 +1287,12 @@ impl ConnectionBootstrap {
             discovery
                 .advertised_priorities_by_node
                 .insert(node_id, node_discovery.node_connection_priority);
+            if let Some(hostname) = node_discovery.node_hostname {
+                discovery
+                    .hostnames_by_node
+                    .entry(node_id)
+                    .or_insert(hostname);
+            }
             if discovered_candidate_count > 0 {
                 discovery.rendezvous_urls = merge_parallel_rendezvous_url_results(
                     &base_rendezvous_urls,
@@ -1370,6 +1397,7 @@ impl ConnectionBootstrap {
         let mut candidates = Vec::new();
         let mut relay_capable = false;
         let mut node_connection_priority = None;
+        let mut node_hostname = None;
         let mut seen_candidates = BTreeSet::new();
         let mut first_usable_endpoint = None;
         let mut success_grace_deadline = None;
@@ -1393,6 +1421,8 @@ impl ConnectionBootstrap {
                         node_connection_priority,
                         response.node_connection_priority,
                     );
+                    node_hostname =
+                        merge_node_hostname_advertisement(node_hostname, response.node_hostname);
                     rendezvous_urls = merge_connected_rendezvous_urls(
                         &rendezvous_urls,
                         &response.rendezvous_peers,
@@ -1439,6 +1469,7 @@ impl ConnectionBootstrap {
                             rendezvous_urls,
                             candidates: transport_sdk::rank_candidates(&candidates),
                             relay_capable,
+                            node_hostname,
                             node_connection_priority: node_connection_priority.unwrap_or_default(),
                         });
                     }
@@ -1479,6 +1510,7 @@ impl ConnectionBootstrap {
             rendezvous_urls,
             candidates: transport_sdk::rank_candidates(&candidates),
             relay_capable,
+            node_hostname,
             node_connection_priority: node_connection_priority.unwrap_or_default(),
         })
     }
@@ -1616,6 +1648,17 @@ impl ConnectionBootstrap {
         discovery: &DynamicDiscoveryState,
     ) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
         let static_direct_targets = self.direct_https_targets()?;
+        let static_hostnames_by_node =
+            static_direct_targets
+                .iter()
+                .fold(BTreeMap::new(), |mut hostnames, target| {
+                    if let (Some(node_id), Some(hostname)) =
+                        (target.target_node_id, target.target_node_hostname.as_ref())
+                    {
+                        hostnames.entry(node_id).or_insert_with(|| hostname.clone());
+                    }
+                    hostnames
+                });
         let mut direct_targets = Vec::new();
         let mut seen_direct_targets = BTreeSet::new();
 
@@ -1648,6 +1691,11 @@ impl ConnectionBootstrap {
                     direct_candidate: Some(candidate.clone()),
                     server_base_url: planned_target_server_base_url_for_candidate(candidate)?,
                     target_node_id: Some(*node_id),
+                    target_node_hostname: discovery
+                        .hostnames_by_node
+                        .get(node_id)
+                        .cloned()
+                        .or_else(|| static_hostnames_by_node.get(node_id).cloned()),
                     node_connection_priority,
                     server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
                     cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
@@ -1672,6 +1720,9 @@ impl ConnectionBootstrap {
                         .unwrap_or_default();
                     target.node_connection_priority =
                         self.effective_node_connection_priority(node_id, advertised_priority);
+                    if let Some(hostname) = discovery.hostnames_by_node.get(&node_id) {
+                        target.target_node_hostname = Some(hostname.clone());
+                    }
                 }
                 direct_targets.push(target);
             }
@@ -1682,6 +1733,7 @@ impl ConnectionBootstrap {
             &static_direct_targets,
             &discovery.rendezvous_urls,
             &discovery.relay_capable_nodes,
+            &discovery.hostnames_by_node,
         )?;
         for target in &mut relay_targets {
             let Some(node_id) = target.target_node_id else {
@@ -1734,12 +1786,25 @@ fn merge_node_connection_priority_advertisement(
     Some(current.map_or(advertised, |current| current.min(advertised)))
 }
 
+fn merge_node_hostname_advertisement(
+    current: Option<String>,
+    advertised: Option<String>,
+) -> Option<String> {
+    let advertised = advertised.as_deref().and_then(normalize_node_hostname);
+    // Discovery responses carry no hostname revision. Keep the first valid
+    // observation from this refresh instead of selecting an arbitrary value
+    // based on alphabetical order. Subsequent refreshes begin without this
+    // state and therefore naturally converge on a renamed node.
+    current.or(advertised)
+}
+
 #[derive(Debug, Clone)]
 struct DynamicDiscoveryState {
     rendezvous_urls: Vec<String>,
     direct_candidates_by_node: BTreeMap<NodeId, Vec<ConnectionCandidate>>,
     relay_capable_nodes: BTreeSet<NodeId>,
     advertised_priorities_by_node: BTreeMap<NodeId, i16>,
+    hostnames_by_node: BTreeMap<NodeId, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1747,6 +1812,7 @@ struct NodeDynamicDiscoveryState {
     rendezvous_urls: Vec<String>,
     candidates: Vec<ConnectionCandidate>,
     relay_capable: bool,
+    node_hostname: Option<String>,
     node_connection_priority: i16,
 }
 
@@ -1935,6 +2001,7 @@ fn refreshed_relay_targets(
     static_direct_targets: &[PlannedConnectionBootstrapTarget],
     rendezvous_urls: &[String],
     relay_capable_nodes: &BTreeSet<NodeId>,
+    hostnames_by_node: &BTreeMap<NodeId, String>,
 ) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
     if bootstrap.relay_mode == RelayMode::Disabled {
         return Ok(Vec::new());
@@ -1945,9 +2012,13 @@ fn refreshed_relay_targets(
         rendezvous_urls,
         static_direct_targets.iter().filter_map(|target| {
             let target_node_id = target.target_node_id?;
-            relay_capable_nodes
-                .contains(&target_node_id)
-                .then_some(target_node_id)
+            relay_capable_nodes.contains(&target_node_id).then_some((
+                target_node_id,
+                hostnames_by_node
+                    .get(&target_node_id)
+                    .cloned()
+                    .or_else(|| target.target_node_hostname.clone()),
+            ))
         }),
     )?;
 
@@ -2313,6 +2384,7 @@ mod tests {
                 url: url.to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: None,
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Disabled,
             trust_roots: BootstrapTrustRoots {
@@ -2363,16 +2435,19 @@ mod tests {
                     url: "https://peer.example".to_string(),
                     usage: Some(BootstrapEndpointUse::PeerApi),
                     node_id: Some(NodeId::new_v4()),
+                    node_hostname: None,
                 },
                 BootstrapEndpoint {
                     url: "https://public.example".to_string(),
                     usage: Some(BootstrapEndpointUse::PublicApi),
                     node_id: Some(NodeId::new_v4()),
+                    node_hostname: None,
                 },
                 BootstrapEndpoint {
                     url: "https://rendezvous.example".to_string(),
                     usage: Some(BootstrapEndpointUse::Rendezvous),
                     node_id: None,
+                    node_hostname: None,
                 },
             ],
             relay_mode: RelayMode::Fallback,
@@ -2467,6 +2542,7 @@ mod tests {
                 url: "https://public.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(target_node_id),
+                node_hostname: None,
             }],
             relay_mode: RelayMode::Fallback,
             trust_roots: BootstrapTrustRoots {
@@ -2659,6 +2735,7 @@ mod tests {
             url: "https://public.example".to_string(),
             usage: Some(BootstrapEndpointUse::PublicApi),
             node_id: Some(NodeId::new_v4()),
+            node_hostname: None,
         }];
 
         let label = bootstrap
@@ -2680,11 +2757,13 @@ mod tests {
                 url: "https://node-a.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(NodeId::new_v4()),
+                node_hostname: None,
             },
             BootstrapEndpoint {
                 url: "https://node-b.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(NodeId::new_v4()),
+                node_hostname: None,
             },
         ];
         bootstrap
@@ -2716,6 +2795,66 @@ mod tests {
             merge(&[8, transport_sdk::MAX_NODE_CONNECTION_PRIORITY + 1]),
             Some(8)
         );
+    }
+
+    #[test]
+    fn rendezvous_hostname_merge_keeps_the_first_valid_advertisement() {
+        assert_eq!(
+            merge_node_hostname_advertisement(
+                Some("renamed-node".to_string()),
+                Some("old-node".to_string()),
+            )
+            .as_deref(),
+            Some("renamed-node")
+        );
+        assert_eq!(
+            merge_node_hostname_advertisement(
+                Some("renamed-node".to_string()),
+                Some("edge-\u{202e}a".to_string()),
+            )
+            .as_deref(),
+            Some("renamed-node")
+        );
+        assert_eq!(
+            merge_node_hostname_advertisement(None, Some("edge-a".to_string())).as_deref(),
+            Some("edge-a")
+        );
+    }
+
+    #[test]
+    fn refreshed_direct_target_keeps_bootstrap_hostname_when_discovery_omits_it() {
+        let cluster_id = ClusterId::now_v7();
+        let node_id = NodeId::now_v7();
+        let mut bootstrap = refreshable_bootstrap(
+            cluster_id,
+            "https://rendezvous.example".to_string(),
+            node_id,
+        );
+        bootstrap.direct_endpoints[0].node_hostname = Some("edge-a".to_string());
+        let discovery = DynamicDiscoveryState {
+            rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            direct_candidates_by_node: BTreeMap::from([(
+                node_id,
+                vec![ConnectionCandidate {
+                    kind: CandidateKind::DirectHttps,
+                    endpoint: "https://public.example".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }],
+            )]),
+            relay_capable_nodes: BTreeSet::new(),
+            advertised_priorities_by_node: BTreeMap::new(),
+            hostnames_by_node: BTreeMap::new(),
+        };
+
+        let target = bootstrap
+            .build_refreshed_targets(&discovery)
+            .expect("refreshed targets should build")
+            .into_iter()
+            .find(|target| target.direct_candidate.is_some())
+            .expect("discovered candidate should produce a direct target");
+
+        assert_eq!(target.target_node_hostname.as_deref(), Some("edge-a"));
     }
 
     #[test]
@@ -2973,6 +3112,7 @@ mod tests {
                                 },
                             ]),
                             node_relay_capable: true,
+                            node_hostname: Some("dynamic-node".to_string()),
                             node_connection_priority: 0,
                         }
                     } else {
@@ -2980,6 +3120,7 @@ mod tests {
                             rendezvous_peers: Vec::new(),
                             node_candidates: None,
                             node_relay_capable: false,
+                            node_hostname: None,
                             node_connection_priority: 0,
                         }
                     };
@@ -3024,6 +3165,7 @@ mod tests {
                             }],
                             node_candidates: None,
                             node_relay_capable: false,
+                            node_hostname: None,
                             node_connection_priority: 0,
                         }
                     } else {
@@ -3031,6 +3173,7 @@ mod tests {
                             rendezvous_peers: Vec::new(),
                             node_candidates: None,
                             node_relay_capable: false,
+                            node_hostname: None,
                             node_connection_priority: 0,
                         }
                     };
@@ -3096,6 +3239,10 @@ mod tests {
             Some("https://relay-quic.example")
         );
         assert_eq!(targets[0].target_node_id, Some(target_node_id));
+        assert_eq!(
+            targets[0].target_node_hostname.as_deref(),
+            Some("dynamic-node")
+        );
 
         assert_eq!(targets.len(), 5);
 
@@ -3105,6 +3252,10 @@ mod tests {
             Some("https://public.example/")
         );
         assert_eq!(targets[1].target_node_id, Some(target_node_id));
+        assert_eq!(
+            targets[1].target_node_hostname.as_deref(),
+            Some("dynamic-node")
+        );
 
         assert_eq!(targets[2].path_kind, TransportPathKind::DirectHttps);
         assert_eq!(
@@ -3115,6 +3266,10 @@ mod tests {
 
         assert_eq!(targets[3].path_kind, TransportPathKind::RelayTunnel);
         assert_eq!(targets[3].target_node_id, Some(target_node_id));
+        assert_eq!(
+            targets[3].target_node_hostname.as_deref(),
+            Some("dynamic-node")
+        );
         assert_eq!(
             targets[3].rendezvous_urls,
             vec![format!("http://{peer_addr}/")]
@@ -3174,6 +3329,7 @@ mod tests {
                                 transport_hints: None,
                             }]),
                             node_relay_capable: false,
+                            node_hostname: None,
                             node_connection_priority: 0,
                         })
                     } else {
@@ -3181,6 +3337,7 @@ mod tests {
                             rendezvous_peers: Vec::new(),
                             node_candidates: None,
                             node_relay_capable: false,
+                            node_hostname: None,
                             node_connection_priority: 0,
                         })
                     }
@@ -3204,6 +3361,7 @@ mod tests {
             url: "https://second-static.example".to_string(),
             usage: Some(BootstrapEndpointUse::PublicApi),
             node_id: Some(second_node_id),
+            node_hostname: None,
         });
 
         let targets = tokio::time::timeout(
@@ -3263,6 +3421,7 @@ mod tests {
                     rendezvous_peers: Vec::new(),
                     node_candidates: None,
                     node_relay_capable: false,
+                    node_hostname: None,
                     node_connection_priority: 0,
                 })
             }),
@@ -3293,6 +3452,7 @@ mod tests {
                         }]
                     }),
                     node_relay_capable: false,
+                    node_hostname: None,
                     node_connection_priority: 0,
                 })
             }),
@@ -3495,11 +3655,13 @@ mod tests {
                 url: slow_url.clone(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(NodeId::new_v4()),
+                node_hostname: None,
             },
             BootstrapEndpoint {
                 url: fast_url.clone(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: Some(NodeId::new_v4()),
+                node_hostname: None,
             },
         ];
 

@@ -80,6 +80,7 @@ struct IronmeshConnectionAttemptStatus: Codable, Equatable, Identifiable, Sendab
 struct IronmeshConnectionEndpointStatus: Codable, Equatable, Identifiable, Sendable {
     var pathKind: String
     var targetNodeId: String?
+    var targetNodeHostname: String? = nil
     var irohRelayUrls: [String]? = nil
     var lastSuccessfulIrohRelayUrl: String? = nil
     var locator: String
@@ -96,6 +97,17 @@ struct IronmeshConnectionEndpointStatus: Codable, Equatable, Identifiable, Senda
 
     var id: String {
         "\(pathKind)-\(locator)-\(requestBaseUrl)"
+    }
+
+    var targetNodeDetail: String? {
+        guard let targetNodeId else {
+            return nil
+        }
+        let hostname = targetNodeHostname?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let hostname, !hostname.isEmpty else {
+            return targetNodeId
+        }
+        return "\(hostname)\n\(targetNodeId)"
     }
 }
 
@@ -451,6 +463,14 @@ final class IronmeshBrowserModel: ObservableObject {
         return connectionRouteSnapshot?.endpoints
             .first(where: { $0.targetNodeId == nodeID })?
             .nodeConnectionPriority ?? 0
+    }
+
+    func serverNodeHostname(for nodeID: String) -> String? {
+        let hostname = connectionRouteSnapshot?.endpoints
+            .first(where: { $0.targetNodeId == nodeID })?
+            .targetNodeHostname?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return hostname?.isEmpty == false ? hostname : nil
     }
 
     func updateNodePriorityOverride(_ priority: Int?, for nodeID: String) {

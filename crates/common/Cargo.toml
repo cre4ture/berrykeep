@@ -14,6 +14,7 @@ time = { version = "0.3", features = ["formatting"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+unicode-general-category.workspace = true
 uuid.workspace = true
 
 [lints]

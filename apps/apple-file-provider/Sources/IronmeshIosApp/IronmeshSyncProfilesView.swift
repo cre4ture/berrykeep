@@ -123,8 +123,8 @@ struct IronmeshFilesView: View {
                                 .font(.caption)
                                 .foregroundStyle(wasRecentlyUsed ? .green : .secondary)
                         }
-                        if let targetNodeId = endpoint.targetNodeId {
-                            IronmeshKeyValueRow(label: "Target server node", value: targetNodeId)
+                        if let targetNodeDetail = endpoint.targetNodeDetail {
+                            IronmeshKeyValueRow(label: "Target server node", value: targetNodeDetail)
                         }
                         if let relayUrls = endpoint.irohRelayUrls, !relayUrls.isEmpty {
                             IronmeshKeyValueRow(

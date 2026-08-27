@@ -754,6 +754,7 @@ async fn register_cluster_node(
     let mut cluster = state.cluster.lock().await;
     cluster.register_node(super::cluster::NodeDescriptor {
         node_id,
+        hostname: None,
         reachability: test_node_reachability(public_api_url, peer_api_url, false),
         capabilities: super::cluster::NodeCapabilities {
             public_api: public_api_url.is_some(),
@@ -803,6 +804,7 @@ async fn register_direct_quic_cluster_node(
 ) -> cluster::NodeDescriptor {
     let descriptor = cluster::NodeDescriptor {
         node_id,
+        hostname: None,
         reachability: cluster::NodeReachability {
             public_api_url: None,
             public_direct_urls: Vec::new(),
@@ -7574,6 +7576,7 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
         let mut cluster = source.cluster.lock().await;
         cluster.register_node(cluster::NodeDescriptor {
             node_id: source.node_id,
+            hostname: None,
             reachability: cluster::NodeReachability {
                 public_api_url: Some("https://127.0.0.1:9".to_string()),
                 public_direct_urls: vec!["https://127.0.0.1:9".to_string()],
@@ -7601,6 +7604,7 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
         });
         cluster.register_node(cluster::NodeDescriptor {
             node_id: target.node_id,
+            hostname: None,
             reachability: cluster::NodeReachability {
                 public_api_url: Some(public_url.clone()),
                 public_direct_urls: vec![public_url.clone()],
@@ -8686,11 +8690,13 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
                 url: "https://node-b.example".to_string(),
                 usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
                 node_id: Some(node_id),
+                node_hostname: None,
             },
             transport_sdk::BootstrapEndpoint {
                 url: "https://10.0.0.12:38080".to_string(),
                 usage: Some(transport_sdk::BootstrapEndpointUse::PeerApi),
                 node_id: Some(node_id),
+                node_hostname: None,
             },
         ],
         relay_mode: transport_sdk::RelayMode::Required,
@@ -9871,6 +9877,7 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
             url: public_url.clone(),
             usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
             node_id: Some(NodeId::new_v4()),
+            node_hostname: None,
         }],
         relay_mode: transport_sdk::RelayMode::Fallback,
         trust_roots: transport_sdk::BootstrapTrustRoots {
@@ -11077,6 +11084,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     let registration = transport_sdk::PresenceRegistration {
         cluster_id: state.cluster_id,
         identity: transport_sdk::PeerIdentity::Node(state.node_id),
+        hostname: None,
         public_api_url: None,
         public_direct_urls: Vec::new(),
         peer_api_url: Some(format!("https://{internal_bind_addr}")),
@@ -11220,6 +11228,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
     let registration = transport_sdk::PresenceRegistration {
         cluster_id: state.cluster_id,
         identity: transport_sdk::PeerIdentity::Node(state.node_id),
+        hostname: None,
         public_api_url: None,
         public_direct_urls: Vec::new(),
         peer_api_url: None,
@@ -16283,6 +16292,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
         let mut cluster = target.cluster.lock().await;
         cluster.register_node(super::cluster::NodeDescriptor {
             node_id: source.node_id,
+            hostname: None,
             reachability: test_node_reachability(
                 Some(peer_base_url.as_str()),
                 Some(peer_base_url.as_str()),
@@ -16445,6 +16455,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
         let mut cluster = target.cluster.lock().await;
         cluster.register_node(super::cluster::NodeDescriptor {
             node_id: source.node_id,
+            hostname: None,
             reachability: test_node_reachability(
                 Some(peer_base_url.as_str()),
                 Some(peer_base_url.as_str()),
@@ -17500,6 +17511,7 @@ async fn build_test_state(
 
     service.register_node(cluster::NodeDescriptor {
         node_id: local_node_id,
+        hostname: None,
         reachability: test_node_reachability(
             Some("http://127.0.0.1:39080"),
             Some("https://127.0.0.1:49080"),
@@ -17521,6 +17533,7 @@ async fn build_test_state(
     if replication_factor > 1 {
         service.register_node(cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
+            hostname: None,
             reachability: test_node_reachability(
                 Some("http://127.0.0.1:9"),
                 Some("https://127.0.0.1:10009"),
@@ -17545,6 +17558,7 @@ async fn build_test_state(
         data_dir: root.clone(),
         cluster_id: uuid::Uuid::now_v7(),
         node_id: local_node_id,
+        node_hostname: None,
         store: store.clone(),
         cluster: Arc::new(Mutex::new(service)),
         storage: super::ServerStorageRuntime {
@@ -18294,6 +18308,7 @@ async fn register_online_source_node(
     let mut cluster = target.cluster.lock().await;
     cluster.register_node(super::cluster::NodeDescriptor {
         node_id: source.node_id,
+        hostname: None,
         reachability: test_node_reachability(Some(peer_base_url), Some(peer_base_url), false),
         capabilities: super::cluster::NodeCapabilities {
             public_api: true,
@@ -18907,6 +18922,7 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
         registration: transport_sdk::PresenceRegistration {
             cluster_id: uuid::Uuid::now_v7(),
             identity: transport_sdk::PeerIdentity::Node(NodeId::new_v4()),
+            hostname: Some("edge-a".to_string()),
             public_api_url: Some("https://public.example/".to_string()),
             public_direct_urls: vec!["https://public.example/".to_string()],
             peer_api_url: Some("https://internal.example/".to_string()),
@@ -18939,6 +18955,7 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
     );
     assert_eq!(descriptor.public_api_url(), Some("https://public.example"));
     assert_eq!(descriptor.peer_api_url(), Some("https://internal.example"));
+    assert_eq!(descriptor.hostname.as_deref(), Some("edge-a"));
     assert_eq!(descriptor.public_api_urls(), vec!["https://public.example"]);
     assert_eq!(descriptor.peer_api_urls(), vec!["https://internal.example"]);
     assert!(descriptor.capabilities.public_api);
@@ -18961,6 +18978,7 @@ async fn rendezvous_presence_entry_projects_direct_quic_only_node_descriptor() {
         registration: transport_sdk::PresenceRegistration {
             cluster_id: uuid::Uuid::now_v7(),
             identity: transport_sdk::PeerIdentity::Node(node_id),
+            hostname: None,
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: None,
@@ -19016,6 +19034,7 @@ async fn backfill_cluster_nodes_from_replica_rows_preserves_existing_descriptors
     let remote_b = NodeId::new_v4();
     let existing = cluster::NodeDescriptor {
         node_id: remote_a,
+        hostname: None,
         reachability: test_node_reachability(
             Some("https://public.example"),
             Some("https://internal.example"),
@@ -19070,6 +19089,7 @@ async fn register_node_uses_structured_reachability_payload() {
             headers,
             Path(node_id.to_string()),
             Json(super::RegisterNodeRequest {
+                hostname: Some("edge-a".to_string()),
                 reachability: test_node_reachability(
                     Some("https://public.example"),
                     Some("https://internal.example"),
@@ -19102,6 +19122,7 @@ async fn register_node_uses_structured_reachability_payload() {
 
     assert_eq!(node.public_api_url(), Some("https://public.example"));
     assert_eq!(node.peer_api_url(), Some("https://internal.example"));
+    assert_eq!(node.hostname.as_deref(), Some("edge-a"));
     assert!(node.relay_required());
     assert!(node.relay_capable());
     assert_eq!(node.capacity_bytes, 100);
@@ -19117,6 +19138,7 @@ async fn register_node_uses_structured_reachability_payload() {
         .expect("registered node should be persisted");
     assert_eq!(persisted.public_api_url(), Some("https://public.example"));
     assert_eq!(persisted.peer_api_url(), Some("https://internal.example"));
+    assert_eq!(persisted.hostname.as_deref(), Some("edge-a"));
     assert!(persisted.relay_required());
 
     cleanup_test_state(&state).await;
@@ -19129,6 +19151,7 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
         registration: transport_sdk::PresenceRegistration {
             cluster_id: uuid::Uuid::now_v7(),
             identity: transport_sdk::PeerIdentity::Node(node_id),
+            hostname: None,
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: None,
@@ -19157,10 +19180,11 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
 async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let node_id = NodeId::new_v4();
-    let entry = transport_sdk::PresenceEntry {
+    let mut entry = transport_sdk::PresenceEntry {
         registration: transport_sdk::PresenceRegistration {
             cluster_id: state.cluster_id,
             identity: transport_sdk::PeerIdentity::Node(node_id),
+            hostname: Some("edge-a".to_string()),
             public_api_url: Some("https://public.example".to_string()),
             public_direct_urls: vec!["https://public.example".to_string()],
             peer_api_url: Some("https://internal.example".to_string()),
@@ -19181,7 +19205,8 @@ async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
         observed_source_addr: None,
     };
 
-    let discovered = super::apply_rendezvous_presence_entries(&state, &[entry]).await;
+    let discovered =
+        super::apply_rendezvous_presence_entries(&state, std::slice::from_ref(&entry)).await;
     assert_eq!(discovered, 1);
 
     let persisted_nodes = {
@@ -19194,6 +19219,26 @@ async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
         .expect("discovered node should be persisted");
     assert_eq!(persisted.public_api_url(), Some("https://public.example"));
     assert_eq!(persisted.peer_api_url(), Some("https://internal.example"));
+    assert_eq!(persisted.hostname.as_deref(), Some("edge-a"));
+
+    entry.registration.hostname = None;
+    assert_eq!(
+        super::apply_rendezvous_presence_entries(&state, std::slice::from_ref(&entry)).await,
+        0,
+        "an older peer without hostname support must not erase known display metadata"
+    );
+    let persisted_nodes = {
+        let store = read_store(&state, "tests.load_cluster_nodes_after_legacy_discovery").await;
+        store.load_cluster_nodes().await.unwrap()
+    };
+    assert_eq!(
+        persisted_nodes
+            .into_iter()
+            .find(|node| node.node_id == node_id)
+            .and_then(|node| node.hostname)
+            .as_deref(),
+        Some("edge-a")
+    );
 
     cleanup_test_state(&state).await;
 }
@@ -19210,6 +19255,7 @@ async fn remove_node_persists_forget_to_cluster_state() {
         let mut cluster = state.cluster.lock().await;
         let _ = cluster.register_node(cluster::NodeDescriptor {
             node_id,
+            hostname: None,
             reachability: test_node_reachability(
                 Some("https://public.example"),
                 Some("https://internal.example"),
@@ -19266,6 +19312,7 @@ async fn resolve_peer_base_url_prefers_internal_url() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
+        hostname: None,
         reachability: test_node_reachability(
             Some("https://public.example"),
             Some("https://internal.example"),
@@ -19297,6 +19344,7 @@ async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
     state.network.relay_mode = super::RelayMode::Disabled;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
+        hostname: None,
         reachability: cluster::NodeReachability::default(),
         capabilities: cluster::NodeCapabilities::default(),
         labels: HashMap::new(),
@@ -19324,6 +19372,7 @@ async fn resolve_peer_base_url_rejects_public_api_only_candidate() {
     state.network.relay_mode = super::RelayMode::Disabled;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
+        hostname: None,
         reachability: test_node_reachability(Some("https://public.example"), None, false),
         capabilities: cluster::NodeCapabilities {
             public_api: true,
@@ -19793,6 +19842,7 @@ async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() 
     state.network.relay_mode = super::RelayMode::Fallback;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
+        hostname: None,
         reachability: cluster::NodeReachability::default(),
         capabilities: cluster::NodeCapabilities {
             public_api: false,
@@ -19827,6 +19877,7 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
     state.network.relay_mode = super::RelayMode::Required;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
+        hostname: None,
         reachability: test_node_reachability(
             Some("https://public.example"),
             Some("https://internal.example"),
@@ -19865,6 +19916,7 @@ async fn plan_peer_transport_prefers_direct_quic_when_runtime_is_active() {
     let remote_candidate = install_direct_quic_runtime(&mut state).await;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
+        hostname: None,
         reachability: cluster::NodeReachability {
             public_api_url: None,
             public_direct_urls: Vec::new(),
@@ -19923,6 +19975,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
         } else {
             let node = cluster::NodeDescriptor {
                 node_id: NodeId::new_v4(),
+                hostname: None,
                 reachability: test_node_reachability(
                     Some("https://relay-cleanup-remote.example"),
                     Some("https://relay-cleanup-remote-internal.example"),
@@ -20165,6 +20218,7 @@ async fn execute_peer_request_reuses_warm_relay_session() {
         let mut cluster = state.cluster.lock().await;
         let node = cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
+            hostname: None,
             reachability: test_node_reachability(
                 Some("https://relay-reuse-remote.example"),
                 Some("https://relay-reuse-remote-internal.example"),
@@ -20253,6 +20307,7 @@ async fn execute_peer_request_reconnects_after_relay_session_closes() {
         let mut cluster = state.cluster.lock().await;
         let node = cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
+            hostname: None,
             reachability: test_node_reachability(
                 Some("https://relay-reconnect-remote.example"),
                 Some("https://relay-reconnect-remote-internal.example"),
@@ -21040,6 +21095,7 @@ async fn execute_peer_request_streams_object_reads_over_relay() {
         let mut cluster = state.cluster.lock().await;
         let node = cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
+            hostname: None,
             reachability: cluster::NodeReachability {
                 public_api_url: Some("https://relay-object-read-remote.example".to_string()),
                 public_direct_urls: Vec::new(),

@@ -831,8 +831,8 @@ private struct IronmeshConnectionPathRow: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    if let targetNodeId = endpoint.targetNodeId {
-                        IronmeshKeyValueRow(label: "Target server node", value: targetNodeId)
+                    if let targetNodeDetail = endpoint.targetNodeDetail {
+                        IronmeshKeyValueRow(label: "Target server node", value: targetNodeDetail)
                     }
                     if let relayUrls = endpoint.irohRelayUrls, !relayUrls.isEmpty {
                         IronmeshKeyValueRow(
@@ -1195,9 +1195,17 @@ private struct IronmeshSettingsView: View {
 
                             ForEach(model.knownServerNodeIDs, id: \.self) { nodeID in
                                 VStack(alignment: .leading, spacing: 8) {
-                                    Text(nodeID)
-                                        .font(.caption.monospaced())
-                                        .textSelection(.enabled)
+                                    if let hostname = model.serverNodeHostname(for: nodeID) {
+                                        Text(hostname)
+                                        Text(nodeID)
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.secondary)
+                                            .textSelection(.enabled)
+                                    } else {
+                                        Text(nodeID)
+                                            .font(.caption.monospaced())
+                                            .textSelection(.enabled)
+                                    }
                                     Toggle(
                                         "Manual override",
                                         isOn: Binding(

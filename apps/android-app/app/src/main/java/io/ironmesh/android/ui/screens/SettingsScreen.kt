@@ -210,12 +210,21 @@ private fun ExperimentalNodePrioritiesEditor(
 ) {
     var expanded by rememberSaveable { mutableStateOf(false) }
     val overrides = state.nodePriorityOverrides
-    val routePriorities = state.connectionRoutes
+    val routeNodes = state.connectionRoutes
         ?.endpoints
         .orEmpty()
         .mapNotNull { endpoint ->
-            endpoint.targetNodeId?.let { nodeId -> nodeId to endpoint.nodeConnectionPriority }
+            endpoint.targetNodeId?.let { nodeId ->
+                NodePriorityRoute(
+                    nodeId = nodeId,
+                    hostname = endpoint.targetNodeHostname?.trim()?.takeIf(String::isNotEmpty),
+                    priority = endpoint.nodeConnectionPriority,
+                )
+            }
         }
+    val routePriorities = routeNodes.associate { route -> route.nodeId to route.priority }
+    val routeHostnames = routeNodes
+        .mapNotNull { route -> route.hostname?.let { hostname -> route.nodeId to hostname } }
         .toMap()
     val nodeIds = (routePriorities.keys + overrides.keys).sorted()
 
@@ -250,6 +259,7 @@ private fun ExperimentalNodePrioritiesEditor(
             nodeIds.forEach { nodeId ->
                 NodePriorityOverrideRow(
                     nodeId = nodeId,
+                    hostname = routeHostnames[nodeId],
                     automaticPriority = routePriorities[nodeId] ?: 0,
                     overridePriority = overrides[nodeId],
                     onPriorityOverrideChange = onPriorityOverrideChange,
@@ -262,6 +272,7 @@ private fun ExperimentalNodePrioritiesEditor(
 @Composable
 private fun NodePriorityOverrideRow(
     nodeId: String,
+    hostname: String?,
     automaticPriority: Int,
     overridePriority: Int?,
     onPriorityOverrideChange: (String, Int?) -> Unit,
@@ -278,7 +289,14 @@ private fun NodePriorityOverrideRow(
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text(text = nodeId, style = MaterialTheme.typography.labelSmall)
+        Text(text = hostname ?: nodeId, style = MaterialTheme.typography.labelSmall)
+        if (hostname != null) {
+            Text(
+                text = nodeId,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -312,6 +330,12 @@ private fun NodePriorityOverrideRow(
         }
     }
 }
+
+private data class NodePriorityRoute(
+    val nodeId: String,
+    val hostname: String?,
+    val priority: Int,
+)
 
 @Composable
 private fun TitleLatencyMonitorSettingsEditor(

@@ -1737,6 +1737,7 @@ mod tests {
             direct_candidate: None,
             server_base_url: Some(server_base_url),
             target_node_id: None,
+            target_node_hostname: None,
             node_connection_priority: 0,
             server_ca_pem: None,
             cluster_ca_pem: None,

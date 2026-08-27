@@ -39,7 +39,7 @@ use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
 use common::xmp::{is_sidecar_key, sidecar_key_for_media};
-use common::{ClusterId, DeviceId, HealthStatus, NodeId};
+use common::{ClusterId, DeviceId, HealthStatus, NodeId, normalize_node_hostname};
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
 };
@@ -303,6 +303,7 @@ struct ServerState {
     data_dir: PathBuf,
     cluster_id: ClusterId,
     node_id: NodeId,
+    node_hostname: Option<String>,
     store: Arc<TracedRwLock<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
     storage: ServerStorageRuntime,
@@ -593,6 +594,7 @@ fn new_store_rwlock(store: PersistentStore) -> Arc<TracedRwLock<PersistentStore>
 fn placeholder_cluster_node_descriptor(node_id: NodeId) -> NodeDescriptor {
     NodeDescriptor {
         node_id,
+        hostname: None,
         reachability: NodeReachability::default(),
         capabilities: NodeCapabilities::default(),
         labels: HashMap::new(),
@@ -602,6 +604,10 @@ fn placeholder_cluster_node_descriptor(node_id: NodeId) -> NodeDescriptor {
         last_heartbeat_unix: 0,
         status: cluster::NodeStatus::Offline,
     }
+}
+
+fn current_system_node_hostname() -> Option<String> {
+    sysinfo::System::host_name().and_then(normalize_node_hostname)
 }
 
 fn backfill_cluster_nodes_from_replica_rows(
@@ -4102,6 +4108,7 @@ fn local_node_enrollment_issuer_descriptor(
 
     Some(cluster::NodeDescriptor {
         node_id: state.node_id,
+        hostname: state.node_hostname.clone(),
         reachability,
         capabilities: NodeCapabilities {
             public_api: true,
@@ -4855,6 +4862,7 @@ fn normalize_advertised_direct_endpoints(
                 url: canonical,
                 usage: Some(usage),
                 node_id: Some(node_id),
+                node_hostname: None,
             });
         }
     }
@@ -4878,6 +4886,7 @@ fn effective_direct_endpoints(
             url: canonicalize_direct_endpoint_url(public_url)?,
             usage: Some(BootstrapEndpointUse::PublicApi),
             node_id: Some(node_id),
+            node_hostname: None,
         });
     }
 
@@ -4889,6 +4898,7 @@ fn effective_direct_endpoints(
             url: canonicalize_direct_endpoint_url(peer_url)?,
             usage: Some(BootstrapEndpointUse::PeerApi),
             node_id: Some(node_id),
+            node_hostname: None,
         });
     }
 
@@ -6939,6 +6949,7 @@ async fn run_inner(
         &config.advertised_direct_endpoints,
         config.node_id,
     )?;
+    let mut node_hostname = current_system_node_hostname();
     let direct_quic_runtime = try_start_direct_quic_runtime(&config).await;
     let local_reachability = node_reachability_from_direct_endpoints(
         &advertised_direct_endpoints,
@@ -7034,9 +7045,17 @@ async fn run_inner(
         &persisted_cluster_replicas,
     );
     cluster.import_nodes(persisted_cluster_nodes);
+    if node_hostname.is_none() {
+        node_hostname = cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == config.node_id)
+            .and_then(|node| node.hostname);
+    }
 
     let _ = cluster.register_node(NodeDescriptor {
         node_id: config.node_id,
+        hostname: node_hostname.clone(),
         reachability: local_reachability.clone(),
         capabilities: NodeCapabilities {
             public_api: !local_reachability.public_api_urls().is_empty(),
@@ -7348,6 +7367,7 @@ async fn run_inner(
         data_dir: config.data_dir.clone(),
         cluster_id: config.cluster_id,
         node_id: config.node_id,
+        node_hostname,
         store,
         cluster: Arc::new(Mutex::new(cluster)),
         storage: ServerStorageRuntime {
@@ -9018,6 +9038,7 @@ fn build_rendezvous_presence_registration(
     PresenceRegistration {
         cluster_id: state.cluster_id,
         identity: PeerIdentity::Node(state.node_id),
+        hostname: state.node_hostname.clone(),
         public_api_url,
         public_direct_urls,
         peer_api_url,
@@ -9110,13 +9131,18 @@ async fn apply_rendezvous_presence_entries(
                 continue;
             }
 
-            let Some(descriptor) = node_descriptor_from_presence_entry(entry) else {
+            let Some(mut descriptor) = node_descriptor_from_presence_entry(entry) else {
                 tracing::debug!(
                     node_id = %node_id,
                     "skipping rendezvous peer without a usable transport path"
                 );
                 continue;
             };
+            if descriptor.hostname.is_none() {
+                descriptor.hostname = cluster
+                    .node(descriptor.node_id)
+                    .and_then(|node| node.hostname.clone());
+            }
 
             if cluster.register_node(descriptor) {
                 discovered += 1;
@@ -9230,6 +9256,11 @@ fn node_descriptor_from_presence_entry(
 
     Some(NodeDescriptor {
         node_id: *node_id,
+        hostname: entry
+            .registration
+            .hostname
+            .as_deref()
+            .and_then(normalize_node_hostname),
         reachability: NodeReachability {
             public_api_url: public_api_url.clone(),
             public_direct_urls,
@@ -19725,6 +19756,8 @@ async fn commit_version_inner(state: ServerState, key: String, version_id: Strin
 struct RegisterNodeRequest {
     reachability: NodeReachability,
     #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default)]
     capabilities: Option<NodeCapabilities>,
     labels: HashMap<String, String>,
     capacity_bytes: Option<u64>,
@@ -21509,12 +21542,14 @@ async fn issue_client_bootstrap_impl(
             .into_iter()
             .flat_map(|node| {
                 let node_id = node.node_id;
+                let node_hostname = node.hostname.clone();
                 node.public_api_urls()
                     .into_iter()
                     .map(|url| BootstrapEndpoint {
                         url: url.to_string(),
                         usage: Some(BootstrapEndpointUse::PublicApi),
                         node_id: Some(node_id),
+                        node_hostname: node_hostname.clone(),
                     })
                     .collect::<Vec<_>>()
             })
@@ -25222,11 +25257,13 @@ fn build_effective_operator_direct_endpoints(
         url: url.clone(),
         usage: Some(BootstrapEndpointUse::PublicApi),
         node_id: Some(state.node_id),
+        node_hostname: None,
     }));
     editable_endpoints.extend(peer_urls.iter().map(|url| BootstrapEndpoint {
         url: url.clone(),
         usage: Some(BootstrapEndpointUse::PeerApi),
         node_id: Some(state.node_id),
+        node_hostname: None,
     }));
 
     effective_direct_endpoints(
@@ -25282,6 +25319,7 @@ async fn refresh_local_node_reachability(state: &ServerState) -> Result<()> {
             .unwrap_or(cluster::NodeStatus::Online);
         cluster.register_node(NodeDescriptor {
             node_id: state.node_id,
+            hostname: state.node_hostname.clone(),
             reachability: reachability.clone(),
             capabilities: NodeCapabilities {
                 public_api: !reachability.public_api_urls().is_empty(),
@@ -28156,6 +28194,13 @@ async fn register_node(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
+    let requested_hostname = match request.hostname {
+        Some(hostname) => match normalize_node_hostname(&hostname) {
+            Some(hostname) => Some(hostname),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
+    };
 
     let public_api_url = request
         .reachability
@@ -28222,8 +28267,14 @@ async fn register_node(
 
     let changed = {
         let mut cluster = state.cluster.lock().await;
+        let hostname = requested_hostname.or_else(|| {
+            cluster
+                .node(node_id)
+                .and_then(|existing| existing.hostname.clone())
+        });
         cluster.register_node(NodeDescriptor {
             node_id,
+            hostname,
             reachability,
             capabilities,
             labels: request.labels,

@@ -1010,30 +1010,32 @@ fn discovery_response(
         .unwrap_or_else(empty_rendezvous_runtime_state)
         .endpoint_statuses;
 
-    let (mut node_candidates, node_relay_capable, node_connection_priority) = cluster_id
-        .zip(node_id)
-        .and_then(|(cluster_id, node_id)| {
-            state
-                .presence
-                .entry_for_identity(cluster_id, &PeerIdentity::Node(node_id))
-                .map(response_presence_entry)
-        })
-        .map(|entry| {
-            let relay_capable = entry
-                .registration
-                .capabilities
-                .contains(&transport_sdk::TransportCapability::RelayTunnel)
-                || entry.registration.relay_mode != transport_sdk::RelayMode::Disabled;
-            let node_connection_priority =
-                transport_sdk::node_connection_priority_from_labels(&entry.registration.labels)
-                    .unwrap_or_default();
-            (
-                Some(entry.registration.direct_candidates),
-                relay_capable,
-                node_connection_priority,
-            )
-        })
-        .unwrap_or((None, false, 0));
+    let (mut node_candidates, node_relay_capable, node_hostname, node_connection_priority) =
+        cluster_id
+            .zip(node_id)
+            .and_then(|(cluster_id, node_id)| {
+                state
+                    .presence
+                    .entry_for_identity(cluster_id, &PeerIdentity::Node(node_id))
+                    .map(response_presence_entry)
+            })
+            .map(|entry| {
+                let relay_capable = entry
+                    .registration
+                    .capabilities
+                    .contains(&transport_sdk::TransportCapability::RelayTunnel)
+                    || entry.registration.relay_mode != transport_sdk::RelayMode::Disabled;
+                let node_connection_priority =
+                    transport_sdk::node_connection_priority_from_labels(&entry.registration.labels)
+                        .unwrap_or_default();
+                (
+                    Some(entry.registration.direct_candidates),
+                    relay_capable,
+                    entry.registration.hostname,
+                    node_connection_priority,
+                )
+            })
+            .unwrap_or((None, false, None, 0));
     if let (Some(candidates), Some(relay)) =
         (node_candidates.as_mut(), iroh_relay_advertisement(state))
     {
@@ -1044,6 +1046,7 @@ fn discovery_response(
         rendezvous_peers,
         node_candidates,
         node_relay_capable,
+        node_hostname,
         node_connection_priority,
     }
 }
@@ -1969,6 +1972,7 @@ mod tests {
         PresenceRegistration {
             cluster_id,
             identity,
+            hostname: None,
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: None,
@@ -2309,14 +2313,13 @@ mod tests {
         let node_b = NodeId::now_v7();
         let state = mtls_test_state();
 
-        state.presence.register(
-            presence_registration(
-                cluster_a,
-                PeerIdentity::Node(node_a),
-                "https://node-a.example:7443",
-            ),
-            None,
+        let mut node_a_registration = presence_registration(
+            cluster_a,
+            PeerIdentity::Node(node_a),
+            "https://node-a.example:7443",
         );
+        node_a_registration.hostname = Some("edge-a".to_string());
+        state.presence.register(node_a_registration, None);
         state.presence.register(
             presence_registration(
                 cluster_b,
@@ -2359,6 +2362,7 @@ mod tests {
                 transport_hints: None,
             }])
         );
+        assert_eq!(own_discovery.node_hostname.as_deref(), Some("edge-a"));
 
         let foreign_discovery = discovery(
             State(state.clone()),
@@ -2459,6 +2463,7 @@ mod tests {
             registration: PresenceRegistration {
                 cluster_id: ClusterId::now_v7(),
                 identity: PeerIdentity::Node(NodeId::now_v7()),
+                hostname: None,
                 public_api_url: Some("https://public.example:9443".to_string()),
                 public_direct_urls: Vec::new(),
                 peer_api_url: Some("https://node.internal:7443".to_string()),
@@ -2486,6 +2491,7 @@ mod tests {
             registration: PresenceRegistration {
                 cluster_id: ClusterId::now_v7(),
                 identity: PeerIdentity::Node(NodeId::now_v7()),
+                hostname: None,
                 public_api_url: Some("https://public.example".to_string()),
                 public_direct_urls: Vec::new(),
                 peer_api_url: Some("https://node.internal".to_string()),
@@ -2544,6 +2550,7 @@ mod tests {
         let registration = PresenceRegistration {
             cluster_id,
             identity: PeerIdentity::Node(NodeId::now_v7()),
+            hostname: Some("edge-\u{202e}a".to_string()),
             public_api_url: Some("https://public.example:9443".to_string()),
             public_direct_urls: Vec::new(),
             peer_api_url: Some("https://node.internal:7443".to_string()),
@@ -2560,6 +2567,7 @@ mod tests {
             .register_presence(&registration)
             .await
             .expect("presence registration should succeed");
+        assert_eq!(response.entry.registration.hostname, None);
         assert_eq!(
             response.entry.observed_source_addr.map(|addr| addr.ip()),
             Some("127.0.0.1".parse().expect("loopback ip"))
@@ -2981,6 +2989,7 @@ mod tests {
             PresenceRegistration {
                 cluster_id,
                 identity: PeerIdentity::Node(node_id),
+                hostname: None,
                 public_api_url: None,
                 public_direct_urls: Vec::new(),
                 peer_api_url: Some("https://node.internal:7443".to_string()),

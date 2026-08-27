@@ -301,7 +301,11 @@ fn build_http_client_with_identity_from_planned_target_unkeyed(
                 target.target_node_id,
                 Some(target.cluster_id),
             )
-            .map(|client| client.with_node_connection_priority(target.node_connection_priority));
+            .map(|client| {
+                client
+                    .with_node_connection_priority(target.node_connection_priority)
+                    .with_target_node_hostname(target.target_node_hostname.clone())
+            });
         }
         TransportPathKind::DirectQuic => {
             let candidate = planned_target_direct_quic_candidate(target)?;
@@ -325,7 +329,8 @@ fn build_http_client_with_identity_from_planned_target_unkeyed(
                     lease_budget,
                 )
                 .with_client_identity(identity.clone())
-                .with_node_connection_priority(target.node_connection_priority),
+                .with_node_connection_priority(target.node_connection_priority)
+                .with_target_node_hostname(target.target_node_hostname.clone()),
             );
         }
         TransportPathKind::RelayTunnel => {}
@@ -367,7 +372,8 @@ fn build_http_client_with_identity_from_planned_target_unkeyed(
         relay_security,
     )
     .with_client_identity(identity.clone())
-    .with_node_connection_priority(target.node_connection_priority))
+    .with_node_connection_priority(target.node_connection_priority)
+    .with_target_node_hostname(target.target_node_hostname.clone()))
 }
 
 fn candidate_uses_rendezvous_relay(
@@ -672,7 +678,8 @@ pub fn build_client_with_optional_identity_from_planned_target(
                     target.target_node_id,
                     Some(target.cluster_id),
                 )?
-                .with_node_connection_priority(target.node_connection_priority);
+                .with_node_connection_priority(target.node_connection_priority)
+                .with_target_node_hostname(target.target_node_hostname.clone());
                 client.set_single_transport_route_key(planned_route_key(target, None)?)?;
                 return Ok(client);
             }
@@ -1143,6 +1150,7 @@ mod tests {
             }),
             server_base_url: None,
             target_node_id: Some(target_node_id),
+            target_node_hostname: None,
             server_ca_pem: None,
             cluster_ca_pem: Some("cluster-ca".to_string()),
             rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
@@ -1337,6 +1345,7 @@ mod tests {
             direct_candidate: None,
             server_base_url: Some("https://node.example/".to_string()),
             target_node_id: Some(NodeId::new_v4()),
+            target_node_hostname: None,
             server_ca_pem: Some("server-ca".to_string()),
             cluster_ca_pem: Some("unused-cluster-ca".to_string()),
             rendezvous_ca_pem: None,
@@ -1420,6 +1429,7 @@ mod tests {
             direct_candidate: None,
             server_base_url: Some(format!("http://127.0.0.1:{port}")),
             target_node_id: None,
+            target_node_hostname: None,
             server_ca_pem: None,
             cluster_ca_pem: None,
             rendezvous_ca_pem: None,
@@ -1577,6 +1587,7 @@ mod tests {
                 direct_candidate: None,
                 server_base_url: Some("https://node-a.example".to_string()),
                 target_node_id: Some(NodeId::new_v4()),
+                target_node_hostname: None,
                 server_ca_pem: None,
                 cluster_ca_pem: None,
                 rendezvous_ca_pem: None,
@@ -1606,6 +1617,7 @@ mod tests {
                 direct_candidate: None,
                 server_base_url: None,
                 target_node_id: None,
+                target_node_hostname: None,
                 server_ca_pem: None,
                 cluster_ca_pem: None,
                 rendezvous_ca_pem: None,
@@ -1642,6 +1654,7 @@ mod tests {
                 direct_candidate: None,
                 server_base_url: None,
                 target_node_id: Some(NodeId::new_v4()),
+                target_node_hostname: None,
                 server_ca_pem: None,
                 cluster_ca_pem: None,
                 rendezvous_ca_pem: None,
@@ -1677,6 +1690,7 @@ mod tests {
                 direct_candidate: None,
                 server_base_url: None,
                 target_node_id: Some(NodeId::new_v4()),
+                target_node_hostname: None,
                 server_ca_pem: None,
                 cluster_ca_pem: Some("cluster-ca".to_string()),
                 rendezvous_ca_pem: None,
@@ -1723,6 +1737,7 @@ mod tests {
                 }),
                 server_base_url: None,
                 target_node_id: Some(NodeId::new_v4()),
+                target_node_hostname: None,
                 server_ca_pem: None,
                 cluster_ca_pem: None,
                 rendezvous_ca_pem: None,
@@ -1783,6 +1798,7 @@ mod tests {
                 }),
                 server_base_url: None,
                 target_node_id: Some(NodeId::new_v4()),
+                target_node_hostname: None,
                 server_ca_pem: None,
                 cluster_ca_pem: None,
                 rendezvous_ca_pem: None,
@@ -1819,6 +1835,7 @@ mod tests {
                 }),
                 server_base_url: None,
                 target_node_id: Some(NodeId::new_v4()),
+                target_node_hostname: None,
                 server_ca_pem: None,
                 cluster_ca_pem: None,
                 rendezvous_ca_pem: None,
