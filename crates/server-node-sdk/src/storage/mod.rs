@@ -1166,9 +1166,6 @@ pub(crate) struct GalleryMapClusterQuery {
     pub(crate) prefix: String,
     pub(crate) depth: usize,
     pub(crate) media_filter: GalleryIndexMediaFilter,
-    /// The visible viewport used to enforce the response-cell cap. This can be smaller than the
-    /// query viewport when the caller prefetches neighboring map clusters.
-    pub(crate) resolution_viewport: GalleryViewportBounds,
     pub(crate) viewport: GalleryViewportBounds,
     pub(crate) requested_resolution: u32,
     pub(crate) max_clusters: usize,

@@ -1592,7 +1592,7 @@ async fn query_gallery_map_clusters(
         &base_values,
         gallery_map_bounded_resolution(
             query.requested_resolution,
-            query.resolution_viewport,
+            query.viewport,
             query.max_clusters,
         ),
         query.max_clusters,
@@ -1636,7 +1636,7 @@ pub(super) async fn query_gallery_map_cluster_cells(
         &base_values,
         gallery_map_bounded_resolution(
             query.requested_resolution,
-            query.resolution_viewport,
+            query.viewport,
             query.max_clusters,
         ),
         query.max_clusters,
@@ -2286,7 +2286,6 @@ mod tests {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
-            resolution_viewport: viewport,
             viewport,
             requested_resolution,
             max_clusters,

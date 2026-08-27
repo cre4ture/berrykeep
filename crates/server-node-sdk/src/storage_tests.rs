@@ -96,7 +96,7 @@ fn gallery_map_resolution_is_limited_for_a_world_sized_viewport() {
 }
 
 #[test]
-fn gallery_map_prefetch_uses_the_visible_viewport_to_preserve_grid_density() {
+fn gallery_map_prefetch_preserves_visible_grid_density() {
     let visible_viewport = GalleryViewportBounds {
         south: -4.2,
         west: 0.0,
@@ -119,14 +119,48 @@ fn gallery_map_prefetch_uses_the_visible_viewport_to_preserve_grid_density() {
         gallery_map_bounded_resolution(requested_resolution, prefetched_viewport, 2_048),
         requested_resolution / 2
     );
+    let prefetched_max_clusters = gallery_map_prefetch_max_clusters(
+        2_048,
+        requested_resolution,
+        visible_viewport,
+        prefetched_viewport,
+    );
+    assert_eq!(prefetched_max_clusters, 8_192);
     assert_eq!(
-        gallery_map_prefetch_max_clusters(
-            2_048,
+        gallery_map_bounded_resolution(
             requested_resolution,
-            visible_viewport,
             prefetched_viewport,
+            prefetched_max_clusters,
         ),
-        8_192
+        gallery_map_bounded_resolution(requested_resolution, visible_viewport, 2_048)
+    );
+
+    let constrained_visible_viewport = GalleryViewportBounds {
+        south: -8.9,
+        west: -9.0,
+        north: 8.9,
+        east: 9.0,
+    };
+    let constrained_prefetched_viewport = GalleryViewportBounds {
+        south: -17.8,
+        west: -18.0,
+        north: 17.8,
+        east: 18.0,
+    };
+    let constrained_prefetched_max_clusters = gallery_map_prefetch_max_clusters(
+        2_048,
+        requested_resolution,
+        constrained_visible_viewport,
+        constrained_prefetched_viewport,
+    );
+    assert_eq!(constrained_prefetched_max_clusters, 8_192);
+    assert_eq!(
+        gallery_map_bounded_resolution(
+            requested_resolution,
+            constrained_prefetched_viewport,
+            constrained_prefetched_max_clusters,
+        ),
+        gallery_map_bounded_resolution(requested_resolution, constrained_visible_viewport, 2_048,)
     );
 }
 

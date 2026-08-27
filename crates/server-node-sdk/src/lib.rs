@@ -15932,7 +15932,6 @@ async fn gallery_map_clusters_response(
                 depth,
                 media_filter: gallery_map::storage_media_filter(media_filter),
                 viewport: storage_viewport,
-                resolution_viewport: storage_resolution_viewport,
                 requested_resolution,
                 max_clusters,
             })
