@@ -1291,11 +1291,6 @@ impl ConnectionBootstrap {
                 discovery
                     .hostnames_by_node
                     .entry(node_id)
-                    .and_modify(|current| {
-                        if hostname < *current {
-                            *current = hostname.clone();
-                        }
-                    })
                     .or_insert(hostname);
             }
             if discovered_candidate_count > 0 {
@@ -1781,11 +1776,11 @@ fn merge_node_hostname_advertisement(
     advertised: Option<String>,
 ) -> Option<String> {
     let advertised = advertised.as_deref().and_then(normalize_node_hostname);
-    match (current, advertised) {
-        (Some(current), Some(advertised)) => Some(current.min(advertised)),
-        (Some(current), None) => Some(current),
-        (None, advertised) => advertised,
-    }
+    // Discovery responses carry no hostname revision. Keep the first valid
+    // observation from this refresh instead of selecting an arbitrary value
+    // based on alphabetical order. Subsequent refreshes begin without this
+    // state and therefore naturally converge on a renamed node.
+    current.or(advertised)
 }
 
 #[derive(Debug, Clone)]
@@ -2784,6 +2779,30 @@ mod tests {
         assert_eq!(
             merge(&[8, transport_sdk::MAX_NODE_CONNECTION_PRIORITY + 1]),
             Some(8)
+        );
+    }
+
+    #[test]
+    fn rendezvous_hostname_merge_keeps_the_first_valid_advertisement() {
+        assert_eq!(
+            merge_node_hostname_advertisement(
+                Some("renamed-node".to_string()),
+                Some("old-node".to_string()),
+            )
+            .as_deref(),
+            Some("renamed-node")
+        );
+        assert_eq!(
+            merge_node_hostname_advertisement(
+                Some("renamed-node".to_string()),
+                Some("edge-\u{202e}a".to_string()),
+            )
+            .as_deref(),
+            Some("renamed-node")
+        );
+        assert_eq!(
+            merge_node_hostname_advertisement(None, Some("edge-a".to_string())).as_deref(),
+            Some("edge-a")
         );
     }
 
