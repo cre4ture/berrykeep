@@ -20,6 +20,8 @@ import type {
   ClientUiPingResponse,
   ClientWebService,
   ClientWebServiceLaunchResponse,
+  ClientWebServiceNodeListResponse,
+  ClientWebServiceNodeResponse,
   JsonObject,
   LogsResponse,
   SnapshotSummary,
@@ -50,6 +52,10 @@ export type BinaryUploadProgress = {
 };
 
 export type BinaryUploadOptions = {
+  signal?: AbortSignal;
+};
+
+export type ClientWebServiceRequestOptions = {
   signal?: AbortSignal;
 };
 
@@ -127,11 +133,38 @@ export async function getClientConnectionRoutes(): Promise<ClientConnectionRoute
   return fetchJson<ClientConnectionRouteSnapshot>(apiV1("/connection-routes"));
 }
 
-export async function listClientWebServices(): Promise<ClientWebService[]> {
+export async function listClientWebServices(
+  options?: ClientWebServiceRequestOptions
+): Promise<ClientWebService[]> {
   return fetchJson<ClientWebService[]>(apiV1("/web-services"), {
     credentials: "same-origin",
-    cache: "no-store"
+    cache: "no-store",
+    signal: options?.signal
   });
+}
+
+export async function listClientWebServiceNodes(
+  options?: ClientWebServiceRequestOptions
+): Promise<ClientWebServiceNodeListResponse> {
+  return fetchJson<ClientWebServiceNodeListResponse>(apiV1("/web-services/nodes"), {
+    credentials: "same-origin",
+    cache: "no-store",
+    signal: options?.signal
+  });
+}
+
+export async function listClientWebServicesOnNode(
+  nodeId: string,
+  options?: ClientWebServiceRequestOptions
+): Promise<ClientWebServiceNodeResponse> {
+  return fetchJson<ClientWebServiceNodeResponse>(
+    apiV1(`/web-services/nodes/${encodeURIComponent(nodeId)}`),
+    {
+      credentials: "same-origin",
+      cache: "no-store",
+      signal: options?.signal
+    }
+  );
 }
 
 export async function launchClientWebService(

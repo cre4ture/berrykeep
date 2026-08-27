@@ -274,6 +274,20 @@ pub(super) struct LaunchResponse {
     expires_in_seconds: u64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebServiceNodeListResponse {
+    node_ids: Vec<NodeId>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebServiceNodeResponse {
+    node_id: NodeId,
+    available: bool,
+    services: Vec<client_sdk::ironmesh_client::WebServiceSummary>,
+}
+
 impl WebServiceGateway {
     async fn issue_launch(
         &self,
@@ -493,6 +507,45 @@ pub(super) async fn list_services(State(state): State<WebState>) -> Response {
             StatusCode::BAD_GATEWAY,
             format!("failed listing web services: {error:#}"),
         ),
+    }
+}
+
+pub(super) async fn list_service_nodes(State(state): State<WebState>) -> Response {
+    let sdk = current_sdk(&state).await;
+    Json(WebServiceNodeListResponse {
+        node_ids: sdk.target_node_ids(),
+    })
+    .into_response()
+}
+
+pub(super) async fn list_services_on_node(
+    State(state): State<WebState>,
+    Path(node_id): Path<NodeId>,
+) -> Response {
+    let sdk = current_sdk(&state).await;
+    let response = match sdk.list_web_services_on_node(node_id).await {
+        Ok(services) => web_service_node_response(node_id, true, services),
+        Err(error) => {
+            tracing::warn!(
+                %node_id,
+                error = format!("{error:#}"),
+                "failed listing web services on node"
+            );
+            web_service_node_response(node_id, false, Vec::new())
+        }
+    };
+    Json(response).into_response()
+}
+
+fn web_service_node_response(
+    node_id: NodeId,
+    available: bool,
+    services: Vec<client_sdk::ironmesh_client::WebServiceSummary>,
+) -> WebServiceNodeResponse {
+    WebServiceNodeResponse {
+        node_id,
+        available,
+        services,
     }
 }
 
@@ -1261,6 +1314,22 @@ mod tests {
                 inner: Box::new(client),
             })))
         }
+    }
+
+    #[test]
+    fn unavailable_node_result_has_a_safe_client_contract() {
+        let node_id = Uuid::now_v7();
+        let response = web_service_node_response(node_id, false, Vec::new());
+
+        let payload = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "nodeId": node_id.to_string(),
+                "available": false,
+                "services": [],
+            })
+        );
     }
 
     #[tokio::test]
