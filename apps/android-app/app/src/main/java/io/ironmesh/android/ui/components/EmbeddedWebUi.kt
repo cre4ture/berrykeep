@@ -285,6 +285,13 @@ private class EmbeddedWebUiClient(
             openPrivateService(view, privateServiceLaunch)
             return true
         }
+        if (isPotentialPrivateWebServiceLaunchUrl(candidateUrl)) {
+            reportPrivateServiceLaunchFailure(
+                view,
+                candidateUrl,
+                "Private-service launch URL did not match this embedded listener",
+            )
+        }
         return !isSameEmbeddedWebUiOrigin(initialUrl, candidateUrl)
     }
 

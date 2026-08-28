@@ -1,7 +1,9 @@
 package io.ironmesh.android.ui.components
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PrivateWebServiceLaunchTest {
@@ -44,5 +46,20 @@ class PrivateWebServiceLaunchTest {
         invalidCandidates.forEach { candidate ->
             assertNull(candidate, parsePrivateWebServiceLaunch(clientUrl, candidate))
         }
+    }
+
+    @Test
+    fun identifiesRejectedPrivateServiceCandidatesForVisibleDiagnostics() {
+        assertTrue(
+            isPotentialPrivateWebServiceLaunchUrl(
+                "http://home-nas-a1b2.localhost:43180/_ironmesh/open?token=signed-token",
+            ),
+        )
+        assertTrue(
+            isPotentialPrivateWebServiceLaunchUrl(
+                "http://bad.alias.localhost:43179/_ironmesh/open/extra?token=signed-token",
+            ),
+        )
+        assertFalse(isPotentialPrivateWebServiceLaunchUrl("http://home-nas-a1b2.localhost:43179/"))
     }
 }

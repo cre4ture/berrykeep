@@ -2,7 +2,6 @@ package io.ironmesh.android
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.os.Build
@@ -18,13 +17,7 @@ class PrivateWebServiceBrowserService : Service() {
         startForeground(NOTIFICATION_ID, notification())
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-        }
-        return START_NOT_STICKY
-    }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
 
     override fun onDestroy() {
         PrivateWebServiceBrowserSession.serviceStopped()
@@ -37,19 +30,9 @@ class PrivateWebServiceBrowserService : Service() {
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("BerryKeep private service active")
-            .setContentText("Keeping the local private-service proxy available for your browser.")
+            .setContentText("Keeping the local private-service proxy available until you return to BerryKeep.")
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "Stop",
-                PendingIntent.getService(
-                    this,
-                    0,
-                    Intent(this, PrivateWebServiceBrowserService::class.java).setAction(ACTION_STOP),
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-                ),
-            )
             .build()
 
     private fun ensureNotificationChannel() {
@@ -71,6 +54,5 @@ class PrivateWebServiceBrowserService : Service() {
     private companion object {
         const val CHANNEL_ID = "ironmesh-private-web-service"
         const val NOTIFICATION_ID = 4002
-        const val ACTION_STOP = "io.ironmesh.android.action.PRIVATE_WEB_SERVICE_STOP"
     }
 }

@@ -54,6 +54,14 @@ internal fun parsePrivateWebServiceLaunch(
 internal fun isPrivateWebServiceLaunchUrl(url: String): Boolean =
     parseUri(url)?.let(::isPrivateWebServiceLaunchUri) == true
 
+/** Identifies a rejected local launch candidate so the embedded client can explain the refusal. */
+internal fun isPotentialPrivateWebServiceLaunchUrl(url: String): Boolean =
+    parseUri(url)?.let { uri ->
+        uri.scheme.equals("http", ignoreCase = true) &&
+            uri.host?.lowercase(Locale.ROOT)?.endsWith(SERVICE_HOST_SUFFIX) == true &&
+            (uri.path == SERVICE_OPEN_PATH || uri.path.startsWith("$SERVICE_OPEN_PATH/"))
+    } == true
+
 private fun parseUri(value: String): URI? =
     runCatching { URI(value) }
         .getOrNull()
