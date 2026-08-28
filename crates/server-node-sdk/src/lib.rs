@@ -17107,7 +17107,14 @@ async fn list_store_index_response_attempt(
     if label_filter_requested {
         entries.retain(|entry| {
             entry.entry_type != "key"
-                || storage::gallery_label_filter_matches(&entry.labels, &label_filter)
+                // The current gallery projection is the only label source
+                // available to this generic path. Non-media keys and missing
+                // projection rows therefore remain unresolved and must stay
+                // hidden whenever a caller requested a label filter.
+                || (looks_like_media_path(&entry.path)
+                    && labels_by_key.get(&entry.path).is_some_and(|labels| {
+                        storage::gallery_label_filter_matches(labels, &label_filter)
+                    }))
         });
     }
     let filter_ms = filter_started_at.elapsed().as_millis();

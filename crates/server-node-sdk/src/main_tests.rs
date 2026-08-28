@@ -14394,6 +14394,22 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
             .contains("/media/thumbnail?key=gallery%2Fcat.png")
     );
 
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/private.txt",
+                bytes::Bytes::from_static(b"private notes"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        locked
+            .set_media_labels("gallery/private.txt", vec!["private".to_string()])
+            .await
+            .unwrap();
+    }
+
     // Path sorting takes the generic listing route rather than the captured
     // gallery projection. It must still apply labels before pagination so the
     // default UI filter cannot display this private thumbnail.
@@ -14426,6 +14442,49 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
         serde_json::from_slice(&to_bytes(filtered.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(filtered_payload["total_entry_count"], 0);
     assert_eq!(filtered_payload["entries"], serde_json::json!([]));
+
+    // Labels are valid on non-media objects too. The generic path must resolve
+    // those labels whenever it filters, instead of treating an unpopulated
+    // `labels` field as an unlabelled object.
+    let filtered_non_media = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(100),
+                sort: Some(super::StoreIndexSortOrder::PathAsc),
+                media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
+                require_labels: None,
+                exclude_labels: Some("private".to_string()),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(filtered_non_media.status(), axum::http::StatusCode::OK);
+    let filtered_non_media_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(filtered_non_media.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        filtered_non_media_payload["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["path"].as_str() != Some("gallery/private.txt")),
+        "a private non-media entry must be excluded by the generic label filter"
+    );
 
     cleanup_test_state(&state).await;
 }
