@@ -15,6 +15,7 @@ use common::StorageObjectMeta;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::{Builder, Runtime};
@@ -717,6 +718,7 @@ fn start_embedded_web_ui(
     bootstrap_json: String,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
+    cache_root: PathBuf,
 ) -> Result<EmbeddedWebUiLaunch> {
     init_ios_tracing();
     let runtime = web_ui_runtime()?;
@@ -746,7 +748,8 @@ fn start_embedded_web_ui(
         Some("ios-web-ui".to_string()),
     )?;
     let mut web_ui_config = web_ui_backend::WebUiConfig::from_client(configured.sdk.clone())
-        .with_service_name("ironmesh-ios");
+        .with_service_name("ironmesh-ios")
+        .with_map_chunk_cache_root(cache_root);
     let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
         .context("failed to parse iOS bootstrap for embedded web ui")?;
     if let Some(server_ca_pem) = server_ca_pem.as_ref() {
@@ -1598,6 +1601,7 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui(
     connection_input: *const c_char,
     server_ca_pem: *const c_char,
     client_identity_json: *const c_char,
+    cache_root: *const c_char,
     out_url: *mut *mut c_char,
     out_error: *mut *mut c_char,
 ) -> c_int {
@@ -1608,6 +1612,7 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui(
             required_c_string(connection_input, "connection_input")?,
             optional_c_string(server_ca_pem)?,
             optional_c_string(client_identity_json)?,
+            PathBuf::from(required_c_string(cache_root, "cache_root")?),
         )?)
         .context("failed to serialize embedded web ui launch")
     })

@@ -458,6 +458,10 @@ class IronmeshRepository {
         RustClientBridge.stopWebUi()
     }
 
+    fun clearCachedData() {
+        RustClientBridge.clearCachedData()
+    }
+
     fun configureTitleLatencyMonitor(
         connectionInput: String,
         serverCaPem: String? = null,

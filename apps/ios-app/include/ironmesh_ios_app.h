@@ -169,6 +169,7 @@ int ironmesh_ios_facade_move_path_with_expected_revision(void *handle,
 int ironmesh_ios_facade_start_web_ui(const char *connection_input,
                                      const char *server_ca_pem,
                                      const char *client_identity_json,
+                                     const char *cache_root,
                                      char **out_url,
                                      char **out_error);
 

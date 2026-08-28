@@ -68,16 +68,20 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
     ) throws -> String {
         var urlPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
+        let cacheDirectory = ironmeshCachesDirectory().path
         let status = withOptionalCString(connectionInput) { connectionPointer in
             withOptionalCString(serverCAPem) { serverPointer in
                 withOptionalCString(clientIdentityJSON) { identityPointer in
-                    ironmesh_ios_facade_start_web_ui(
-                        connectionPointer,
-                        serverPointer,
-                        identityPointer,
-                        &urlPointer,
-                        &errorPointer
-                    )
+                    cacheDirectory.withCString { cacheDirectoryPointer in
+                        ironmesh_ios_facade_start_web_ui(
+                            connectionPointer,
+                            serverPointer,
+                            identityPointer,
+                            cacheDirectoryPointer,
+                            &urlPointer,
+                            &errorPointer
+                        )
+                    }
                 }
             }
         }
@@ -500,16 +504,20 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
     ) throws -> String {
         var urlPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
+        let cacheDirectory = ironmeshCachesDirectory().path
         let status = withOptionalCString(connectionInput) { connectionPointer in
             withOptionalCString(serverCAPem) { serverPointer in
                 withOptionalCString(clientIdentityJSON) { identityPointer in
-                    ironmesh_ios_facade_start_web_ui(
-                        connectionPointer,
-                        serverPointer,
-                        identityPointer,
-                        &urlPointer,
-                        &errorPointer
-                    )
+                    cacheDirectory.withCString { cacheDirectoryPointer in
+                        ironmesh_ios_facade_start_web_ui(
+                            connectionPointer,
+                            serverPointer,
+                            identityPointer,
+                            cacheDirectoryPointer,
+                            &urlPointer,
+                            &errorPointer
+                        )
+                    }
                 }
             }
         }
@@ -593,4 +601,12 @@ private func normalizedOptionalString(_ value: String?) -> String? {
         return nil
     }
     return value
+}
+
+private func ironmeshCachesDirectory() -> URL {
+    let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        ?? FileManager.default.temporaryDirectory
+    let directory = root.appendingPathComponent("IronMesh", isDirectory: true)
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
 }

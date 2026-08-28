@@ -147,6 +147,10 @@ object RustClientBridge {
     @JvmStatic
     external fun stopWebUi()
 
+    /** Clears the app's discardable cache files and stops a currently hosted local Web UI. */
+    @JvmStatic
+    external fun clearCachedData()
+
     @JvmStatic
     external fun configureTitleLatencyMonitor(
         connectionInput: String,
