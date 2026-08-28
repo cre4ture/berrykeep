@@ -17015,7 +17015,7 @@ async fn list_store_index_response_attempt(
     let label_lookup_started_at = Instant::now();
     let label_keys = entries
         .iter()
-        .filter(|entry| entry.entry_type == "key")
+        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
         .map(|entry| entry.path.clone())
         .collect::<Vec<_>>();
     let labels_by_key = {
@@ -17449,7 +17449,7 @@ async fn list_store_index_response_cursor_mode(
 
     let label_keys = entries
         .iter()
-        .filter(|entry| entry.entry_type == "key")
+        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
         .map(|entry| entry.path.clone())
         .collect::<Vec<_>>();
     let labels_by_key = {
