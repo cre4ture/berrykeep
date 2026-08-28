@@ -373,6 +373,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("banner").getByText("cli-client-web", { exact: true })).toBeVisible();
   await expect(page.getByText("Transport-aware", { exact: true })).toBeVisible();
   await expect(page.getByText("Version info", { exact: true })).toBeVisible();
+  await expect(page.getByText("Device identity", { exact: true })).toBeVisible();
+  await expect(page.getByText("dashboard-device", { exact: true })).toBeVisible();
+  await expect(page.getByText("device-dashboard-001", { exact: true })).toBeVisible();
+  await expect(page.getByText("Rendezvous mTLS available", { exact: true })).toBeVisible();
   await expect(page.getByText(/UI build:\s*\S+\s+\(.+\)/)).toBeVisible();
   await expect(page.getByText("Backend build: 0.1.0 (v0.1.0-3-gmocked)")).toBeVisible();
   await expect(page.getByText("Active route")).toBeVisible();
@@ -381,7 +385,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("https://node-alpha.local", { exact: true })).toBeVisible();
   expect(uploadMetrics.diagnosticContexts()).toHaveLength(1);
   expect(uploadMetrics.diagnosticContexts()[0]).toMatch(/^overview-refresh-\d+-\d+$/);
-  expect(uploadMetrics.diagnosticContextRequestCount()).toBe(4);
+  expect(uploadMetrics.diagnosticContextRequestCount()).toBe(5);
   await page.getByText("Connection paths", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Connection Paths" })).toBeVisible();
   await expect(page.getByText("Overall search state")).toBeVisible();
@@ -1901,6 +1905,20 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       return json(route, {
         schema_version: 1,
         scope: cacheScope
+      });
+    }
+
+    if (pathname === apiV1("/device-identity") && method === "GET") {
+      return json(route, {
+        available: true,
+        cluster_id: "cluster-dashboard-001",
+        device_id: "device-dashboard-001",
+        label: "dashboard-device",
+        public_key_fingerprint: "public-key-dashboard-fingerprint",
+        credential_fingerprint: "credential-dashboard-fingerprint",
+        issued_at_unix: 1_700_000_000,
+        expires_at_unix: 1_800_000_000,
+        rendezvous_mtls_identity_available: true
       });
     }
 

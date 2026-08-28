@@ -21,6 +21,7 @@ use client_sdk::{
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     ironmesh_client::{DownloadRangeRequest, RelativePathResponse},
+    public_key_fingerprint,
 };
 use common::logging::{LogBuffer, LogBufferEntry};
 use reqwest::Url;
@@ -992,11 +993,7 @@ impl WebClientDeviceIdentityView {
             cluster_id: Some(identity.cluster_id.to_string()),
             device_id: Some(identity.device_id.to_string()),
             label: identity.label.clone(),
-            public_key_fingerprint: Some(
-                blake3::hash(identity.public_key_pem.trim().as_bytes())
-                    .to_hex()
-                    .to_string(),
-            ),
+            public_key_fingerprint: public_key_fingerprint(&identity.public_key_pem).ok(),
             credential_fingerprint: identity.credential_fingerprint().ok().flatten(),
             issued_at_unix: identity.issued_at_unix,
             expires_at_unix: identity.expires_at_unix,

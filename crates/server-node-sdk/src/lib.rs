@@ -98,7 +98,7 @@ use transport_sdk::{
     TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
     TransportSessionRole, TransportStreamKind, credential_fingerprint, endpoint_id_from_candidate,
     load_or_create_secret_key, perform_transport_client_handshake,
-    perform_transport_server_handshake, read_buffered_transport_response,
+    perform_transport_server_handshake, public_key_fingerprint, read_buffered_transport_response,
     read_transport_request_head, read_transport_response_head, verify_signed_request_headers,
     write_buffered_transport_request, write_buffered_transport_response,
     write_transport_response_head,
@@ -20728,16 +20728,18 @@ fn client_credential_replication_record(
         return Ok(None);
     };
 
+    let public_key_fingerprint = record
+        .public_key_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or(public_key_fingerprint(&public_key_pem)?);
+
     Ok(Some(ClientCredentialReplicationRecord {
         device_id: record.device_id.trim().to_string(),
         label: record.label.clone(),
-        public_key_fingerprint: record
-            .public_key_fingerprint
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .or_else(|| Some(text_fingerprint(&public_key_pem))),
+        public_key_fingerprint: Some(public_key_fingerprint),
         public_key_pem,
         credential_fingerprint,
         created_at_unix: record.created_at_unix,
@@ -20789,11 +20791,18 @@ fn imported_client_credential_record(
         ));
     }
 
+    let public_key_fingerprint =
+        match normalize_optional_replication_text(record.public_key_fingerprint) {
+            Some(fingerprint) => fingerprint,
+            None => public_key_fingerprint(&public_key_pem).map_err(|error| {
+                format!("failed to fingerprint replicated client public key: {error}")
+            })?,
+        };
+
     Ok(ClientCredentialRecord {
         device_id,
         label: normalize_optional_replication_text(record.label),
-        public_key_fingerprint: normalize_optional_replication_text(record.public_key_fingerprint)
-            .or_else(|| Some(text_fingerprint(&public_key_pem))),
+        public_key_fingerprint: Some(public_key_fingerprint),
         public_key_pem: Some(public_key_pem),
         issued_credential_pem: None,
         credential_fingerprint: Some(credential_fingerprint),
@@ -24171,7 +24180,15 @@ async fn enroll_client_device_impl(
         pairing_auth.consumed_by_device_id = Some(device_id.clone());
 
         let final_label = label.or_else(|| pairing_auth.label.clone());
-        let public_key_fingerprint = text_fingerprint(public_key_pem);
+        let public_key_fingerprint = match public_key_fingerprint(public_key_pem) {
+            Ok(fingerprint) => fingerprint,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to fingerprint client public key: {err}"),
+                ));
+            }
+        };
         let credential_fingerprint = match credential_fingerprint(&credential_pem) {
             Ok(fingerprint) => fingerprint,
             Err(err) => {
@@ -24622,10 +24639,12 @@ async fn list_client_credentials(
             .map(|credential| ClientCredentialView {
                 device_id: credential.device_id.clone(),
                 label: credential.label.clone(),
-                public_key_fingerprint: credential
-                    .public_key_fingerprint
-                    .clone()
-                    .or_else(|| credential.public_key_pem.as_deref().map(text_fingerprint)),
+                public_key_fingerprint: credential.public_key_fingerprint.clone().or_else(|| {
+                    credential
+                        .public_key_pem
+                        .as_deref()
+                        .and_then(|pem| public_key_fingerprint(pem).ok())
+                }),
                 credential_fingerprint: credential.credential_fingerprint.clone().or_else(|| {
                     credential
                         .issued_credential_pem

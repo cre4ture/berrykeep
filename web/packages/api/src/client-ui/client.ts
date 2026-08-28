@@ -116,11 +116,18 @@ export async function getClientCacheContext(): Promise<ClientCacheContextRespons
   });
 }
 
-export async function getClientDeviceIdentity(): Promise<ClientDeviceIdentityView> {
-  return fetchJson<ClientDeviceIdentityView>(apiV1("/device-identity"), {
+export async function getClientDeviceIdentity(
+  options?: ClientDiagnosticRequestOptions
+): Promise<ClientDeviceIdentityView> {
+  const identity = await fetchJson<ClientDeviceIdentityView | null>(apiV1("/device-identity"), {
     cache: "no-store",
-    credentials: "same-origin"
+    credentials: "same-origin",
+    ...diagnosticRequestInit(options)
   });
+  if (identity === null) {
+    throw new Error("Device identity response did not contain JSON");
+  }
+  return identity;
 }
 
 export async function getClientGalleryMapConfiguration(): Promise<GalleryMapConfigurationResponse> {

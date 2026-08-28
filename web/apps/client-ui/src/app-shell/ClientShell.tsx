@@ -267,7 +267,7 @@ export function ClientShell() {
         getClientHealth({ diagnosticContext }),
         getClientClusterStatus({ diagnosticContext }),
         getClientRendezvous({ diagnosticContext }),
-        getClientDeviceIdentity()
+        getClientDeviceIdentity({ diagnosticContext })
       ]);
       setPing(nextPing);
       setHealth(nextHealth);
@@ -868,11 +868,7 @@ function OverviewPage({
           <Card withBorder radius="md" padding="lg">
             <Stack gap="sm">
               <Text fw={700}>Device identity</Text>
-              {deviceIdentity === null ? (
-                <Text c="dimmed" size="sm">
-                  Loading identity metadata...
-                </Text>
-              ) : deviceIdentity.available ? (
+              {deviceIdentity?.available ? (
                 <>
                   <Text size="sm">
                     Device: <Code>{deviceIdentity.label ?? "Unnamed device"}</Code>
@@ -908,6 +904,14 @@ function OverviewPage({
                     Identity metadata used to authenticate this client. Secret key and certificate material stay local.
                   </Text>
                 </>
+              ) : loading ? (
+                <Text c="dimmed" size="sm">
+                  Loading identity metadata...
+                </Text>
+              ) : deviceIdentity === null ? (
+                <Text c="red" size="sm">
+                  Identity metadata could not be loaded. Refresh the dashboard to try again.
+                </Text>
               ) : (
                 <Text c="dimmed" size="sm">
                   This client is not configured with a device identity.
