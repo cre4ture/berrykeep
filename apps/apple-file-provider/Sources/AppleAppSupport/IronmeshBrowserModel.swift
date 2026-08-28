@@ -2,6 +2,7 @@ import AppleCore
 import Combine
 import FileProvider
 import Foundation
+import WebKit
 
 extension IronmeshConnectionDraft {
     init(bundleConfiguration: IronmeshBundleConfiguration) {
@@ -1260,6 +1261,36 @@ final class IronmeshBrowserModel: ObservableObject {
         }
     }
 
+    /// Removes discardable local data without touching enrollment, connection settings, or files.
+    /// A running embedded Web UI is stopped first so no open SQLite VFS handle can retain chunks.
+    func clearCachedData() {
+        let remoteSession = remoteSession
+        beginOperation()
+        Task {
+            defer { endOperation() }
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try remoteSession.stopWebUI()
+                    try clearIronmeshCachedFiles()
+                }.value
+                URLCache.shared.removeAllCachedResponses()
+                await WKWebsiteDataStore.default().removeData(
+                    ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+                    modifiedSince: .distantPast
+                )
+                webUIPresentation = nil
+                galleryMapPresentation = nil
+                lastErrorMessage = nil
+                statusText = "Cached data cleared. Reopen the Web UI to fetch fresh map data."
+                addAction("Cleared cached data", detail: "Removed local map and Web UI cache data.")
+            } catch {
+                lastErrorMessage = error.localizedDescription
+                statusText = "Failed to clear cached data: \(error.localizedDescription)"
+                addAction("Cache clear failed", detail: error.localizedDescription)
+            }
+        }
+    }
+
     func loadPreview(for item: AppleBridgeItem) async -> IronmeshFilePreviewResult {
         guard draft.isConfigured else {
             return IronmeshFilePreviewResult(
@@ -1535,6 +1566,24 @@ final class IronmeshBrowserModel: ObservableObject {
     private func endOperation() {
         pendingOperations = max(0, pendingOperations - 1)
         isBusy = pendingOperations > 0
+    }
+}
+
+private func clearIronmeshCachedFiles() throws {
+    let fileManager = FileManager.default
+    let directories = [
+        fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first,
+        fileManager.temporaryDirectory,
+    ].compactMap { $0 }
+    for directory in directories {
+        let contents = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        for item in contents {
+            try fileManager.removeItem(at: item)
+        }
     }
 }
 

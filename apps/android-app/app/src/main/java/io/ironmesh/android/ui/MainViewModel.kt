@@ -490,6 +490,30 @@ class MainViewModel(
         }
     }
 
+    fun clearCachedData() {
+        webUiSessionBackgroundGrace.cancel()
+        uiState.value = uiState.value.copy(status = "Clearing cached data…")
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    repository.clearCachedData()
+                }
+            }
+            result.onSuccess {
+                ThumbnailBitmapCache.clear()
+                EmbeddedWebUiSessionRegistry.clear()
+                uiState.value = uiState.value.copy(
+                    webUiSession = null,
+                    status = "Cached data cleared. Reopen the Web UI to fetch fresh map data.",
+                )
+            }.onFailure { error ->
+                uiState.value = uiState.value.copy(
+                    status = "Failed to clear cached data: ${error.message}",
+                )
+            }
+        }
+    }
+
     fun setStatus(message: String) {
         Log.i("MainViewModel", "status: $message")
         uiState.value = uiState.value.copy(status = message)

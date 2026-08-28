@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -196,6 +196,7 @@ pub struct WebUiConfig {
     pub transport_client: Option<IronMeshClient>,
     pub log_buffer: Option<Arc<LogBuffer>>,
     pub map_glyphs_root: Option<PathBuf>,
+    pub map_chunk_cache_root: Option<PathBuf>,
     embedded_session_authorization: Option<EmbeddedWebUiSessionAuthorization>,
 }
 
@@ -239,6 +240,7 @@ impl WebUiConfig {
             transport_client: None,
             log_buffer: None,
             map_glyphs_root: None,
+            map_chunk_cache_root: None,
             embedded_session_authorization: None,
         }
     }
@@ -254,6 +256,7 @@ impl WebUiConfig {
             transport_client: Some(client),
             log_buffer: None,
             map_glyphs_root: None,
+            map_chunk_cache_root: None,
             embedded_session_authorization: None,
         }
     }
@@ -301,6 +304,14 @@ impl WebUiConfig {
         self
     }
 
+    /// Enables the mobile persistent MBTiles cache below the supplied app cache directory.
+    ///
+    /// Callers own this directory and can clear it without touching connection or user data.
+    pub fn with_map_chunk_cache_root(mut self, map_chunk_cache_root: impl Into<PathBuf>) -> Self {
+        self.map_chunk_cache_root = Some(map_chunk_cache_root.into());
+        self
+    }
+
     pub fn with_embedded_session_authorization(
         mut self,
         authorization: EmbeddedWebUiSessionAuthorization,
@@ -314,6 +325,7 @@ impl WebUiConfig {
 struct WebState {
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
+    mbtiles_chunk_cache_config: mbtiles::MbtilesChunkCacheConfig,
     service_name: String,
     client_cache_scope: Option<String>,
     client_device_identity: WebClientDeviceIdentityView,
@@ -415,9 +427,24 @@ pub fn router(config: WebUiConfig) -> Router {
     let log_buffer = config
         .log_buffer
         .unwrap_or_else(|| Arc::new(LogBuffer::new(LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY)));
+    let mbtiles_chunk_cache_config = config
+        .map_chunk_cache_root
+        .map(|root| match mbtiles::MbtilesChunkCacheConfig::mobile_persistent(root.clone()) {
+            Ok(cache_config) => cache_config,
+            Err(error) => {
+                warn!(
+                    cache_root = %root.display(),
+                    error = %error,
+                    "persistent mobile MBTiles cache is unavailable; using the in-memory fallback"
+                );
+                mbtiles::MbtilesChunkCacheConfig::default()
+            }
+        })
+        .unwrap_or_default();
     let state = WebState {
         map_perf_logging_enabled,
         map_glyphs_root: resolve_map_glyphs_root(config.map_glyphs_root),
+        mbtiles_chunk_cache_config,
         service_name: config.service_name,
         client_cache_scope,
         client_device_identity,
@@ -2111,12 +2138,14 @@ async fn get_or_create_mbtiles_source(
     let sdk = current_sdk(state).await;
     let manifest_key_owned = manifest_key.to_string();
     let perf_logging_enabled = state.map_perf_logging_enabled;
+    let cache_config = state.mbtiles_chunk_cache_config.clone();
     let source = tokio::task::spawn_blocking(move || {
         mbtiles::LogicalMbtilesSource::new(
             manifest_key_owned,
             sdk,
             loaded_manifest,
             perf_logging_enabled,
+            cache_config,
         )
     })
     .await

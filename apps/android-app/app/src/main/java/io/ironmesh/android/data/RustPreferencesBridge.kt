@@ -1,6 +1,7 @@
 package io.ironmesh.android.data
 
 import android.content.Context
+import android.webkit.WebStorage
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.CoroutineScope
@@ -231,6 +232,16 @@ object RustPreferencesBridge {
     fun cacheDirPath(): String {
         val context = appContext ?: error("RustPreferencesBridge is not initialized")
         return context.cacheDir.absolutePath
+    }
+
+    /** Removes only discardable app cache files; enrollment and user settings live elsewhere. */
+    @JvmStatic
+    fun clearCacheDirectory() {
+        val context = appContext ?: error("RustPreferencesBridge is not initialized")
+        context.cacheDir.listFiles()?.forEach { file ->
+            file.deleteRecursively()
+        }
+        WebStorage.getInstance().deleteAllData()
     }
 
     @JvmStatic

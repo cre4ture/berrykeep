@@ -431,6 +431,7 @@ class MainActivity : ComponentActivity() {
                                         vm.selectSection(MainSection.REQUEST_TIMINGS)
                                     },
                                     onOpenWebConsole = onOpenWebConsole,
+                                    onClearCachedData = vm::clearCachedData,
                                     onThemeAccentColorChange = vm::updateThemeAccentColor,
                                     onTitleLatencyMonitorEnabledChange = vm::updateTitleLatencyMonitorEnabled,
                                     onTitleLatencyMonitorPeriodSecondsChange =

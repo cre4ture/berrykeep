@@ -1257,6 +1257,31 @@ fn android_no_backup_files_dir() -> Result<PathBuf> {
     })
 }
 
+fn android_cache_dir() -> Result<PathBuf> {
+    with_android_preferences_env(|env, class| {
+        let value = env
+            .call_static_method(&class, "cacheDirPath", "()Ljava/lang/String;", &[])
+            .context("failed to query Android cache dir path")?
+            .l()
+            .context("Android cache dir path returned invalid value")?;
+        let value = JString::from(value);
+        let value: String = env
+            .get_string(&value)
+            .context("failed to decode Android cache dir path")?
+            .into();
+        Ok(PathBuf::from(value))
+    })
+}
+
+fn clear_android_cached_data() -> Result<()> {
+    stop_embedded_web_ui()?;
+    with_android_preferences_env(|env, class| {
+        env.call_static_method(&class, "clearCacheDirectory", "()V", &[])
+            .context("failed to clear Android cache directory")?;
+        Ok(())
+    })
+}
+
 fn android_download_stage_root(category: &str, scope: &str) -> Result<PathBuf> {
     let state_dir = android_no_backup_files_dir()?;
     let scope = scope.trim();
@@ -1792,8 +1817,9 @@ fn start_embedded_web_ui(
         client_identity_json.clone(),
     )?;
     let client = configured.client.with_connection_name("android web ui");
-    let mut web_ui_config =
-        web_ui_backend::WebUiConfig::from_client(client).with_service_name("ironmesh-android");
+    let mut web_ui_config = web_ui_backend::WebUiConfig::from_client(client)
+        .with_service_name("ironmesh-android")
+        .with_map_chunk_cache_root(android_cache_dir()?.join("ironmesh-client"));
     let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
         .context("failed to parse android bootstrap for embedded web ui")?;
     if let Some(server_ca_pem) = server_ca_pem.as_ref() {
@@ -2407,6 +2433,23 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 ) {
     if let Err(err) = stop_embedded_web_ui() {
         throw_java_error(&mut env, format!("rust stopWebUi failed: {err:#}"));
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_clearCachedData(
+    mut env: JNIEnv,
+    _class: JClass,
+) {
+    let result = (|| {
+        initialize_android_preferences_bridge(&mut env)?;
+        clear_android_cached_data()
+    })();
+    if let Err(err) = result {
+        throw_java_error(&mut env, format!("rust clearCachedData failed: {err:#}"));
     }
 }
 
