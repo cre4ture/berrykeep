@@ -49,7 +49,8 @@ pub use ironmesh_client::{
     UploadResult, UploadSessionChunkRef, UploadSessionChunkStatus, UploadSessionCompleteInfo,
     UploadSessionStatus, VersionConsistencyState, VersionGraphSummary, VersionRecordSummary,
     WebServiceProxyConnection, WebServiceSummary, normalize_server_base_url,
-    set_connection_diagnostics_observer, snapshot_from_store_index_entries,
+    parse_comma_separated_labels, set_connection_diagnostics_observer,
+    snapshot_from_store_index_entries,
 };
 pub use latency_probe::{
     LatencyProbeAssessment, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,

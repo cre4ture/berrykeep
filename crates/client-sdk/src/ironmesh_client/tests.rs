@@ -3582,6 +3582,21 @@ fn label_filter_wire_format_escapes_commas_and_backslashes() {
     );
 }
 
+#[test]
+fn label_filter_wire_format_decodes_commas_and_backslashes() {
+    assert_eq!(
+        parse_comma_separated_labels(Some(r"family\, close,travel\\journal")),
+        Ok(vec![
+            "family, close".to_string(),
+            "travel\\journal".to_string()
+        ])
+    );
+    assert_eq!(
+        parse_comma_separated_labels(Some(r"invalid\q")),
+        Err("label filters may only escape commas and backslashes")
+    );
+}
+
 fn gallery_map_clusters_response_body() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "prefix": "",

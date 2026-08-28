@@ -13258,53 +13258,6 @@ struct StoreIndexQuery {
     exclude_labels: Option<String>,
 }
 
-/// Splits a comma-separated label parameter into the labels it names.
-///
-/// A backslash escapes a comma or another backslash, allowing an XMP keyword
-/// containing either character to remain an exact-match filter value. Blank
-/// entries are dropped, so a trailing comma or an empty parameter does not
-/// become a filter on the empty label.
-fn store_index_labels(raw: Option<&str>) -> std::result::Result<Vec<String>, &'static str> {
-    let Some(raw) = raw else {
-        return Ok(Vec::new());
-    };
-
-    let mut labels = Vec::new();
-    let mut label = String::new();
-    let mut escaped = false;
-    for character in raw.chars() {
-        if escaped {
-            if !matches!(character, ',' | '\\') {
-                return Err("label filters may only escape commas and backslashes");
-            }
-            label.push(character);
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' => escaped = true,
-            ',' => {
-                let trimmed_label = label.trim();
-                if !trimmed_label.is_empty() {
-                    labels.push(trimmed_label.to_string());
-                }
-                label.clear();
-            }
-            _ => label.push(character),
-        }
-    }
-    if escaped {
-        return Err("label filters must not end with an escape character");
-    }
-    let label = label.trim();
-    if !label.is_empty() {
-        labels.push(label.to_string());
-    }
-    labels.sort_unstable();
-    labels.dedup();
-    Ok(labels)
-}
-
 fn store_index_label_filter(
     query: &StoreIndexQuery,
 ) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
@@ -13318,8 +13271,8 @@ fn label_filter_from_query_values(
     required: Option<&str>,
     excluded: Option<&str>,
 ) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
-    let required = store_index_labels(required)?;
-    let excluded = store_index_labels(excluded)?;
+    let required = client_sdk::parse_comma_separated_labels(required)?;
+    let excluded = client_sdk::parse_comma_separated_labels(excluded)?;
     let label_filter = storage::GalleryLabelFilter { required, excluded };
     if !gallery_label_filter_is_within_limit(&label_filter) {
         return Err("at most 64 labels may be specified across require_labels and exclude_labels");
@@ -16623,7 +16576,35 @@ fn with_store_index_response_headers(
     response
 }
 
-fn cached_store_index_page_response(
+async fn store_index_media_labels_by_key(
+    state: &ServerState,
+    entries: &[StoreIndexEntry],
+    operation: &'static str,
+) -> Result<HashMap<String, Vec<String>>> {
+    let keys = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let store = read_store(state, operation).await;
+    store.gallery_object_labels_by_key(&keys).await
+}
+
+fn populate_store_index_entry_labels(
+    entries: &mut [StoreIndexEntry],
+    labels_by_key: &HashMap<String, Vec<String>>,
+) {
+    for entry in entries {
+        if let Some(labels) = labels_by_key.get(&entry.path) {
+            entry.labels = labels.clone();
+        }
+    }
+}
+
+async fn cached_store_index_page_response(
     state: &ServerState,
     namespace_change_sequence: u64,
     query: &StoreIndexQuery,
@@ -16637,7 +16618,16 @@ fn cached_store_index_page_response(
         .map(|value| offset.saturating_add(value).min(cached.total_entry_count))
         .unwrap_or(cached.total_entry_count);
     let has_more = end < cached.total_entry_count;
-    let (entries, materialized_entry_count) = cached.page(offset, end);
+    let (mut entries, materialized_entry_count) = cached.page(offset, end);
+    let label_lookup_started_at = Instant::now();
+    match store_index_media_labels_by_key(state, &entries, "store_index.cached_labels").await {
+        Ok(labels_by_key) => populate_store_index_entry_labels(&mut entries, &labels_by_key),
+        Err(error) => tracing::warn!(
+            error = %error,
+            "failed to load optional labels for cached generic store index"
+        ),
+    }
+    let label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
     if state
         .storage
         .namespace_change_sequence
@@ -16669,7 +16659,9 @@ fn cached_store_index_page_response(
         namespace_change_sequence,
         request_id,
         response,
-        format!("store-index-page-cache;desc=hit, total;dur={total_ms}"),
+        format!(
+            "store-index-page-cache;desc=hit, label-lookup;dur={label_lookup_ms}, total;dur={total_ms}"
+        ),
         cached.matching_key_count,
         cached.visible_file_count,
         materialized_entry_count,
@@ -16821,7 +16813,9 @@ async fn list_store_index_response_attempt(
                 request_id,
                 request_started_at,
                 cached,
-            ) {
+            )
+            .await
+            {
                 return response;
             }
             if allow_namespace_retry {
@@ -17060,39 +17054,28 @@ async fn list_store_index_response_attempt(
     }
     let media_lookup_ms = media_lookup_started_at.elapsed().as_millis();
 
-    let label_lookup_started_at = Instant::now();
-    let label_keys = entries
-        .iter()
-        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
-        .map(|entry| entry.path.clone())
-        .collect::<Vec<_>>();
-    let labels_by_key = {
-        let store = read_store(state, "store_index.labels").await;
-        store.gallery_object_labels_by_key(&label_keys).await
+    let mut label_lookup_ms = 0;
+    let labels_by_key = if label_filter_requested {
+        let label_lookup_started_at = Instant::now();
+        let labels_by_key =
+            match store_index_media_labels_by_key(state, &entries, "store_index.filtered_labels")
+                .await
+            {
+                Ok(labels_by_key) => labels_by_key,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "failed to load labels while a label filter was requested"
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+        populate_store_index_entry_labels(&mut entries, &labels_by_key);
+        label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
+        Some(labels_by_key)
+    } else {
+        None
     };
-    let labels_by_key = match labels_by_key {
-        Ok(labels_by_key) => labels_by_key,
-        Err(error) if label_filter_requested => {
-            tracing::error!(
-                error = %error,
-                "failed to load labels while a label filter was requested"
-            );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "failed to load optional labels for generic store index"
-            );
-            HashMap::new()
-        }
-    };
-    for entry in &mut entries {
-        if let Some(labels) = labels_by_key.get(&entry.path) {
-            entry.labels = labels.clone();
-        }
-    }
-    let label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
 
     let collapse_started_at = Instant::now();
     if matches!(query.view, Some(StoreIndexView::Tree)) {
@@ -17112,9 +17095,12 @@ async fn list_store_index_response_attempt(
                 // projection rows therefore remain unresolved and must stay
                 // hidden whenever a caller requested a label filter.
                 || (looks_like_media_path(&entry.path)
-                    && labels_by_key.get(&entry.path).is_some_and(|labels| {
-                        storage::gallery_label_filter_matches(labels, &label_filter)
-                    }))
+                    && labels_by_key
+                        .as_ref()
+                        .and_then(|labels_by_key| labels_by_key.get(&entry.path))
+                        .is_some_and(|labels| {
+                            storage::gallery_label_filter_matches(labels, &label_filter)
+                        }))
         });
     }
     let filter_ms = filter_started_at.elapsed().as_millis();
@@ -17187,6 +17173,17 @@ async fn list_store_index_response_attempt(
         materialized_entry_count = total_entry_count;
     }
     let pagination_ms = pagination_started_at.elapsed().as_millis();
+    if !label_filter_requested {
+        let label_lookup_started_at = Instant::now();
+        match store_index_media_labels_by_key(state, &entries, "store_index.page_labels").await {
+            Ok(labels_by_key) => populate_store_index_entry_labels(&mut entries, &labels_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional labels for generic store index page"
+            ),
+        }
+        label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
+    }
     let returned_entry_count = entries.len();
     let total_ms = request_started_at.elapsed().as_millis();
 

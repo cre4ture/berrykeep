@@ -15332,6 +15332,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
             std::time::Instant::now(),
             stale_cached,
         )
+        .await
         .is_none(),
         "a mutation between cache lookup and response must reject the stale page"
     );

@@ -21,7 +21,7 @@ use client_sdk::{
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     ironmesh_client::{DownloadRangeRequest, RelativePathResponse},
-    public_key_fingerprint,
+    parse_comma_separated_labels, public_key_fingerprint,
 };
 use common::logging::{LogBuffer, LogBufferEntry};
 use reqwest::Url;
@@ -3150,6 +3150,14 @@ async fn web_store_list(
             );
         }
     };
+    let require_labels = match web_label_filter_values(query.require_labels.as_deref()) {
+        Ok(labels) => labels,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+    let exclude_labels = match web_label_filter_values(query.exclude_labels.as_deref()) {
+        Ok(labels) => labels,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
 
     match current_sdk(&state)
         .await
@@ -3166,8 +3174,8 @@ async fn web_store_list(
                 sort,
                 media_filter,
                 viewport,
-                require_labels: web_label_filter_values(query.require_labels.as_deref()),
-                exclude_labels: web_label_filter_values(query.exclude_labels.as_deref()),
+                require_labels,
+                exclude_labels,
                 synthesize_missing_folder_markers: matches!(view, Some(StoreIndexView::Tree))
                     && query.offset.is_none()
                     && query.limit.is_none()
@@ -3280,13 +3288,8 @@ async fn web_gallery_map_clusters(
     }
 }
 
-fn web_label_filter_values(raw: Option<&str>) -> Vec<String> {
-    raw.unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-        .map(str::to_string)
-        .collect()
+fn web_label_filter_values(raw: Option<&str>) -> std::result::Result<Vec<String>, &'static str> {
+    parse_comma_separated_labels(raw)
 }
 
 async fn web_gallery_map_cluster_entries(
@@ -4557,6 +4560,21 @@ mod tests {
             "docs/archive/"
         );
         assert_eq!(normalize_store_restore_path("   ", false), "");
+    }
+
+    #[test]
+    fn web_store_list_label_filters_preserve_escaped_label_characters() {
+        assert_eq!(
+            super::web_label_filter_values(Some(r"family\, close,travel\\journal")),
+            Ok(vec![
+                "family, close".to_string(),
+                "travel\\journal".to_string()
+            ])
+        );
+        assert_eq!(
+            super::web_label_filter_values(Some(r"invalid\q")),
+            Err("label filters may only escape commas and backslashes")
+        );
     }
 
     #[test]
