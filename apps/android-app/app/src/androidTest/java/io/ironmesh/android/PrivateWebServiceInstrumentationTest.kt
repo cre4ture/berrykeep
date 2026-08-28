@@ -44,9 +44,20 @@ class PrivateWebServiceInstrumentationTest {
                     "document.body?.innerText.includes('NAS ready') === true"
                 }
                 assertEquals(Lifecycle.State.RESUMED, scenario.state)
+
+                scenario.recreate()
+                val restoredWebView = waitForWebView(scenario)
+                waitForCondition(restoredWebView, "the authenticated NAS page after recreation") {
+                    "document.body?.innerText.includes('NAS ready') === true"
+                }
+                assertEquals(Lifecycle.State.RESUMED, scenario.state)
             }
 
-            assertTrue("Expected the private-service launch endpoint to be requested", server.sawOpen())
+            assertEquals(
+                "Activity recreation must reuse the gateway session instead of redeeming the launch token again",
+                1,
+                server.openRequestCount(),
+            )
             assertTrue(
                 "Expected the redirected private-service request to include the gateway session cookie",
                 server.sawAuthenticatedLanding(),
@@ -134,7 +145,7 @@ class PrivateWebServiceInstrumentationTest {
             }
         }
 
-        fun sawOpen(): Boolean = requests.any { it.path == "/_ironmesh/open" }
+        fun openRequestCount(): Int = requests.count { it.path == "/_ironmesh/open" }
 
         fun sawAuthenticatedLanding(): Boolean = requests.any { request ->
             request.path == "/" && request.cookie.contains(SESSION_COOKIE)

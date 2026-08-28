@@ -20,7 +20,6 @@ import io.ironmesh.android.ui.components.isSameEmbeddedWebUiOrigin
 /** Displays one issued private-service origin in an isolated BerryKeep WebView. */
 class PrivateWebServiceActivity : ComponentActivity() {
     private var hostedWebView: WebView? = null
-    private var launchUrl: String? = null
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
@@ -29,8 +28,7 @@ class PrivateWebServiceActivity : ComponentActivity() {
             finish()
             return
         }
-        this.launchUrl = launchUrl
-        hostedWebView = WebView(this).apply {
+        val webView = WebView(this).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.allowFileAccess = false
@@ -41,19 +39,37 @@ class PrivateWebServiceActivity : ComponentActivity() {
             webViewClient = PrivateWebServiceClient(launchUrl)
             webChromeClient = WebChromeClient()
             setDownloadListener(EmbeddedWebUiDownloadListener(context, launchUrl))
-            loadUrl(launchUrl)
         }
-        setContentView(requireNotNull(hostedWebView))
+        val restored = savedInstanceState?.let(webView::restoreState) != null
+        if (!restored) {
+            webView.loadUrl(launchUrl)
+        }
+        hostedWebView = webView
+        setContentView(webView)
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                val webView = hostedWebView
-                if (webView != null && webView.canGoBack()) {
-                    webView.goBack()
+                val currentWebView = hostedWebView
+                if (currentWebView != null && currentWebView.canGoBack()) {
+                    currentWebView.goBack()
                 } else {
                     finish()
                 }
             }
         })
+    }
+
+    override fun onSaveInstanceState(outState: android.os.Bundle) {
+        hostedWebView?.saveState(outState)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onDestroy() {
+        hostedWebView?.apply {
+            stopLoading()
+            destroy()
+        }
+        hostedWebView = null
+        super.onDestroy()
     }
 
     companion object {
