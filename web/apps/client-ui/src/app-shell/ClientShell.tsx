@@ -43,11 +43,13 @@ import {
   runClientLatencyTest,
   deleteStoreValue,
   getBinaryObjectDownloadUrl,
+  getClientDeviceIdentity,
   getClientHealth,
   getClientClusterNodes,
   getClientClusterStatus,
   type ClientLatencyTestResponse,
   type ClientLatencyProbeTargetResult,
+  type ClientDeviceIdentityView,
   getClientRendezvous,
   getClientReplicationPlan,
   getClientPing,
@@ -241,6 +243,7 @@ export function ClientShell() {
   const [health, setHealth] = useState<JsonObject | null>(null);
   const [clusterStatus, setClusterStatus] = useState<JsonObject | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<ClientRendezvousView | null>(null);
+  const [deviceIdentity, setDeviceIdentity] = useState<ClientDeviceIdentityView | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(true);
   const [overviewError, setOverviewError] = useState<string | null>(null);
   const overviewRefreshSequence = useRef(0);
@@ -259,16 +262,18 @@ export function ClientShell() {
     setOverviewError(null);
     const diagnosticContext = `overview-refresh-${Date.now()}-${++overviewRefreshSequence.current}`;
     try {
-      const [nextPing, nextHealth, nextClusterStatus, nextConnectionStatus] = await Promise.all([
+      const [nextPing, nextHealth, nextClusterStatus, nextConnectionStatus, nextDeviceIdentity] = await Promise.all([
         getClientPing({ diagnosticContext }),
         getClientHealth({ diagnosticContext }),
         getClientClusterStatus({ diagnosticContext }),
-        getClientRendezvous({ diagnosticContext })
+        getClientRendezvous({ diagnosticContext }),
+        getClientDeviceIdentity()
       ]);
       setPing(nextPing);
       setHealth(nextHealth);
       setClusterStatus(nextClusterStatus);
       setConnectionStatus(nextConnectionStatus);
+      setDeviceIdentity(nextDeviceIdentity);
     } catch (error) {
       setOverviewError(error instanceof Error ? error.message : "Failed to refresh client overview");
     } finally {
@@ -310,6 +315,7 @@ export function ClientShell() {
           health={health}
           clusterStatus={clusterStatus}
           connectionStatus={connectionStatus}
+          deviceIdentity={deviceIdentity}
           loading={overviewLoading}
           error={overviewError}
           onRefresh={refreshOverview}
@@ -787,6 +793,7 @@ type OverviewPageProps = {
   health: JsonObject | null;
   clusterStatus: JsonObject | null;
   connectionStatus: ClientRendezvousView | null;
+  deviceIdentity: ClientDeviceIdentityView | null;
   loading: boolean;
   error: string | null;
   onRefresh: () => Promise<void>;
@@ -797,6 +804,7 @@ function OverviewPage({
   health,
   clusterStatus,
   connectionStatus,
+  deviceIdentity,
   loading,
   error,
   onRefresh
@@ -853,6 +861,58 @@ function OverviewPage({
               <Text c="dimmed" size="sm">
                 This web UI runs on top of the same transport-aware Rust client used by desktop, Android, and CLI flows.
               </Text>
+            </Stack>
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 6 }}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Text fw={700}>Device identity</Text>
+              {deviceIdentity === null ? (
+                <Text c="dimmed" size="sm">
+                  Loading identity metadata...
+                </Text>
+              ) : deviceIdentity.available ? (
+                <>
+                  <Text size="sm">
+                    Device: <Code>{deviceIdentity.label ?? "Unnamed device"}</Code>
+                  </Text>
+                  <Text size="sm">
+                    Device ID: <Code>{deviceIdentity.device_id}</Code>
+                  </Text>
+                  <Text size="sm">
+                    Cluster ID: <Code>{deviceIdentity.cluster_id}</Code>
+                  </Text>
+                  <Text size="sm">
+                    Public key fingerprint: <Code>{deviceIdentity.public_key_fingerprint}</Code>
+                  </Text>
+                  <Text size="sm">
+                    Credential fingerprint: <Code>{deviceIdentity.credential_fingerprint ?? "Not issued"}</Code>
+                  </Text>
+                  <Group gap="sm">
+                    <Badge color={deviceIdentity.rendezvous_mtls_identity_available ? "teal" : "gray"} variant="light">
+                      Rendezvous mTLS {deviceIdentity.rendezvous_mtls_identity_available ? "available" : "not configured"}
+                    </Badge>
+                    {deviceIdentity.issued_at_unix ? (
+                      <Badge color="gray" variant="light">
+                        Issued {formatUnixTimestamp(deviceIdentity.issued_at_unix)}
+                      </Badge>
+                    ) : null}
+                    {deviceIdentity.expires_at_unix ? (
+                      <Badge color="blue" variant="light">
+                        Expires {formatUnixTimestamp(deviceIdentity.expires_at_unix)}
+                      </Badge>
+                    ) : null}
+                  </Group>
+                  <Text c="dimmed" size="sm">
+                    Identity metadata used to authenticate this client. Secret key and certificate material stay local.
+                  </Text>
+                </>
+              ) : (
+                <Text c="dimmed" size="sm">
+                  This client is not configured with a device identity.
+                </Text>
+              )}
             </Stack>
           </Card>
         </Grid.Col>

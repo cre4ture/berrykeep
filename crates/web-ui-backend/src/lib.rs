@@ -315,6 +315,7 @@ struct WebState {
     map_glyphs_root: Option<PathBuf>,
     service_name: String,
     client_cache_scope: Option<String>,
+    client_device_identity: WebClientDeviceIdentityView,
     log_buffer: Arc<LogBuffer>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<mbtiles::LogicalMbtilesSource>>>>,
     gallery_map_upstream_routes: Arc<RwLock<GalleryMapUpstreamRoutes>>,
@@ -375,6 +376,8 @@ pub fn router(config: WebUiConfig) -> Router {
     let embedded_session_authorization = config.embedded_session_authorization.clone();
     let client_cache_scope =
         client_cache_scope(&config.service_name, config.client_identity.as_ref());
+    let client_device_identity =
+        WebClientDeviceIdentityView::from_identity(config.client_identity.as_ref());
     let sdk = match config.transport_client {
         Some(client) => client,
         None if config.connection_bootstrap.is_some() => config
@@ -416,6 +419,7 @@ pub fn router(config: WebUiConfig) -> Router {
         map_glyphs_root: resolve_map_glyphs_root(config.map_glyphs_root),
         service_name: config.service_name,
         client_cache_scope,
+        client_device_identity,
         log_buffer,
         mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
         gallery_map_upstream_routes: Arc::new(RwLock::new(GalleryMapUpstreamRoutes::default())),
@@ -437,6 +441,7 @@ pub fn router(config: WebUiConfig) -> Router {
 
     let api_v1 = Router::new()
         .route("/cache-context", get(web_cache_context))
+        .route("/device-identity", get(web_device_identity))
         .route("/media/thumbnail", get(web_media_thumbnail))
         .route("/media/cache/retry", post(web_media_cache_retry))
         .route("/maps/config", get(web_map_config))
@@ -514,6 +519,7 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/ping", get(web_ping));
 
     let legacy_api = Router::new()
+        .route("/api/device-identity", get(web_device_identity))
         .route("/media/thumbnail", get(web_media_thumbnail))
         .route("/media/cache/retry", post(web_media_cache_retry))
         .route("/api/maps/config", get(web_map_config))
@@ -945,6 +951,58 @@ struct WebDiagnosticLogExportResponse {
     generated_at_unix: u64,
     requested_window_secs: u64,
     entries: Vec<LogBufferEntry>,
+}
+
+/// Non-secret identity metadata for the local client runtime.
+///
+/// This intentionally excludes private keys and both the issued credential and
+/// rendezvous mTLS certificate. Fingerprints allow a user to compare this
+/// identity with the server administration UI without exposing those secrets.
+#[derive(Debug, Clone, Serialize)]
+struct WebClientDeviceIdentityView {
+    available: bool,
+    cluster_id: Option<String>,
+    device_id: Option<String>,
+    label: Option<String>,
+    public_key_fingerprint: Option<String>,
+    credential_fingerprint: Option<String>,
+    issued_at_unix: Option<u64>,
+    expires_at_unix: Option<u64>,
+    rendezvous_mtls_identity_available: bool,
+}
+
+impl WebClientDeviceIdentityView {
+    fn from_identity(identity: Option<&ClientIdentityMaterial>) -> Self {
+        let Some(identity) = identity else {
+            return Self {
+                available: false,
+                cluster_id: None,
+                device_id: None,
+                label: None,
+                public_key_fingerprint: None,
+                credential_fingerprint: None,
+                issued_at_unix: None,
+                expires_at_unix: None,
+                rendezvous_mtls_identity_available: false,
+            };
+        };
+
+        Self {
+            available: true,
+            cluster_id: Some(identity.cluster_id.to_string()),
+            device_id: Some(identity.device_id.to_string()),
+            label: identity.label.clone(),
+            public_key_fingerprint: Some(
+                blake3::hash(identity.public_key_pem.trim().as_bytes())
+                    .to_hex()
+                    .to_string(),
+            ),
+            credential_fingerprint: identity.credential_fingerprint().ok().flatten(),
+            issued_at_unix: identity.issued_at_unix,
+            expires_at_unix: identity.expires_at_unix,
+            rendezvous_mtls_identity_available: identity.rendezvous_client_identity_pem.is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2271,6 +2329,16 @@ async fn web_cache_context(State(state): State<WebState>) -> impl IntoResponse {
             // cluster/device/application profile.
             "scope": state.client_cache_scope,
         })),
+    )
+}
+
+async fn web_device_identity(State(state): State<WebState>) -> impl IntoResponse {
+    (
+        [
+            ("cache-control", "no-store, private"),
+            ("pragma", "no-cache"),
+        ],
+        Json(state.client_device_identity.clone()),
     )
 }
 
@@ -4534,6 +4602,86 @@ mod tests {
         assert!(payload.get("device_id").is_none());
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn device_identity_exposes_non_secret_authentication_metadata() {
+        let mut identity = ClientIdentityMaterial::generate(
+            Uuid::now_v7(),
+            Some(Uuid::now_v7()),
+            Some("dashboard-device".to_string()),
+        )
+        .expect("identity should be generated");
+        identity.credential_pem = Some("issued-credential".to_string());
+        identity.rendezvous_client_identity_pem = Some("rendezvous-identity".to_string());
+        identity.issued_at_unix = Some(100);
+        identity.expires_at_unix = Some(200);
+        let expected_credential_fingerprint = identity
+            .credential_fingerprint()
+            .expect("credential fingerprint should be generated")
+            .expect("issued credential should have a fingerprint");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have a local address");
+        let app = router(
+            WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
+                .with_client_identity(identity.clone()),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::get(format!("http://{address}/api/v1/device-identity"))
+            .await
+            .expect("device identity request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private")
+        );
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .expect("device identity should return JSON");
+        assert_eq!(payload["available"], true);
+        assert_eq!(payload["cluster_id"], identity.cluster_id.to_string());
+        assert_eq!(payload["device_id"], identity.device_id.to_string());
+        assert_eq!(payload["label"], "dashboard-device");
+        assert_eq!(
+            payload["public_key_fingerprint"],
+            blake3::hash(identity.public_key_pem.trim().as_bytes())
+                .to_hex()
+                .to_string()
+        );
+        assert_eq!(
+            payload["credential_fingerprint"],
+            expected_credential_fingerprint
+        );
+        assert_eq!(payload["issued_at_unix"], 100);
+        assert_eq!(payload["expires_at_unix"], 200);
+        assert_eq!(payload["rendezvous_mtls_identity_available"], true);
+        assert!(payload.get("private_key_pem").is_none());
+        assert!(payload.get("credential_pem").is_none());
+        assert!(payload.get("rendezvous_client_identity_pem").is_none());
+
+        server.abort();
+    }
+
+    #[test]
+    fn device_identity_marks_anonymous_clients_as_unavailable() {
+        let identity = super::WebClientDeviceIdentityView::from_identity(None);
+
+        assert!(!identity.available);
+        assert!(identity.cluster_id.is_none());
+        assert!(identity.device_id.is_none());
+        assert!(!identity.rendezvous_mtls_identity_available);
     }
 
     #[tokio::test]

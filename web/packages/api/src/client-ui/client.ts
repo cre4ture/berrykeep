@@ -14,6 +14,7 @@ import type {
   StoreIndexDeltaResponse,
   ClientConnectionRouteSnapshot,
   ClientCacheContextResponse,
+  ClientDeviceIdentityView,
   ClientDiagnosticLogExport,
   ClientLatencyTestResponse,
   ClientRendezvousView,
@@ -110,6 +111,13 @@ export async function getClientPing(
 
 export async function getClientCacheContext(): Promise<ClientCacheContextResponse> {
   return fetchJson<ClientCacheContextResponse>(apiV1("/cache-context"), {
+    cache: "no-store",
+    credentials: "same-origin"
+  });
+}
+
+export async function getClientDeviceIdentity(): Promise<ClientDeviceIdentityView> {
+  return fetchJson<ClientDeviceIdentityView>(apiV1("/device-identity"), {
     cache: "no-store",
     credentials: "same-origin"
   });
