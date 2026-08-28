@@ -103,6 +103,14 @@ pub fn credential_fingerprint(credential_pem: &str) -> Result<String> {
     Ok(hash_hex(blake3::hash(credential_pem.as_bytes())))
 }
 
+pub fn public_key_fingerprint(public_key_pem: &str) -> Result<String> {
+    let public_key_pem = public_key_pem.trim();
+    if public_key_pem.is_empty() {
+        bail!("public key fingerprint requires a non-empty public key");
+    }
+    Ok(hash_hex(blake3::hash(public_key_pem.as_bytes())))
+}
+
 pub fn build_signed_request_headers(
     identity: &ClientIdentityMaterial,
     method: &str,
@@ -243,5 +251,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("verification failed"));
+    }
+
+    #[test]
+    fn public_key_fingerprint_normalizes_surrounding_whitespace() {
+        let fingerprint = public_key_fingerprint("  public-key\n")
+            .expect("public key fingerprint should be generated");
+
+        assert_eq!(fingerprint, public_key_fingerprint("public-key").unwrap());
+        assert!(public_key_fingerprint(" \n ").is_err());
     }
 }

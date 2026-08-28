@@ -29,6 +29,22 @@ export type ClientCacheContextResponse = {
   scope: string | null;
 };
 
+/**
+ * Non-secret identity metadata used by the embedded client to authenticate to
+ * the cluster. Private keys and certificate contents are never exposed here.
+ */
+export type ClientDeviceIdentityView = {
+  available: boolean;
+  cluster_id: string | null;
+  device_id: string | null;
+  label: string | null;
+  public_key_fingerprint: string | null;
+  credential_fingerprint: string | null;
+  issued_at_unix: number | null;
+  expires_at_unix: number | null;
+  rendezvous_mtls_identity_available: boolean;
+};
+
 export type ClientUiRuntimeInfo = {
   app_name: string;
   transport_mode: "direct" | "relay-capable";
