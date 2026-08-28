@@ -14,6 +14,7 @@ import type {
   StoreIndexDeltaResponse,
   ClientConnectionRouteSnapshot,
   ClientCacheContextResponse,
+  ClientDeviceIdentityView,
   ClientDiagnosticLogExport,
   ClientLatencyTestResponse,
   ClientRendezvousView,
@@ -113,6 +114,20 @@ export async function getClientCacheContext(): Promise<ClientCacheContextRespons
     cache: "no-store",
     credentials: "same-origin"
   });
+}
+
+export async function getClientDeviceIdentity(
+  options?: ClientDiagnosticRequestOptions
+): Promise<ClientDeviceIdentityView> {
+  const identity = await fetchJson<ClientDeviceIdentityView | null>(apiV1("/device-identity"), {
+    cache: "no-store",
+    credentials: "same-origin",
+    ...diagnosticRequestInit(options)
+  });
+  if (identity === null) {
+    throw new Error("Device identity response did not contain JSON");
+  }
+  return identity;
 }
 
 export async function getClientGalleryMapConfiguration(): Promise<GalleryMapConfigurationResponse> {
@@ -358,6 +373,12 @@ function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchPa
   });
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());
+  }
+  if (request.resolutionViewport) {
+    query.set("resolution_south", String(request.resolutionViewport.south));
+    query.set("resolution_west", String(request.resolutionViewport.west));
+    query.set("resolution_north", String(request.resolutionViewport.north));
+    query.set("resolution_east", String(request.resolutionViewport.east));
   }
   if (cellSizePx !== null) {
     query.set("cluster_cell_size_px", String(cellSizePx));

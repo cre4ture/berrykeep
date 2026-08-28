@@ -132,7 +132,10 @@ export type GalleryMapClustersRequest = {
   prefix?: string;
   depth: number;
   mediaFilter: StoreListMediaFilter;
+  /** Bounds used to fetch server clusters, including the client-side prefetch buffer. */
   viewport: StoreIndexViewport;
+  /** Visible camera bounds used only to preserve the requested grid density under response caps. */
+  resolutionViewport?: StoreIndexViewport;
   zoom: number;
   /** Desired cluster-cell width in CSS pixels; the server bounds and quantizes it. */
   clusterCellSizePx?: number;

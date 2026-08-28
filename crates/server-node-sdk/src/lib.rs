@@ -98,7 +98,7 @@ use transport_sdk::{
     TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
     TransportSessionRole, TransportStreamKind, credential_fingerprint, endpoint_id_from_candidate,
     load_or_create_secret_key, perform_transport_client_handshake,
-    perform_transport_server_handshake, read_buffered_transport_response,
+    perform_transport_server_handshake, public_key_fingerprint, read_buffered_transport_response,
     read_transport_request_head, read_transport_response_head, verify_signed_request_headers,
     write_buffered_transport_request, write_buffered_transport_response,
     write_transport_response_head,
@@ -13314,6 +13314,12 @@ struct GalleryMapClustersQuery {
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
+    /// Optional visible camera bounds used to cap grid resolution independently from a prefetch
+    /// viewport. Older nodes ignore these additive fields.
+    resolution_south: Option<f64>,
+    resolution_west: Option<f64>,
+    resolution_north: Option<f64>,
+    resolution_east: Option<f64>,
     /// Integral legacy wire field. Keep it for nodes and SDKs that predate fractional zoom.
     zoom: Option<u8>,
     /// Optional fractional MapLibre camera zoom. Older nodes ignore this additive field.
@@ -15900,6 +15906,12 @@ async fn gallery_map_clusters_response(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
         }
     };
+    let resolution_viewport = match gallery_map_resolution_viewport_from_query(&query, viewport) {
+        Ok(viewport) => viewport,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
     let prefix = query
         .prefix
         .unwrap_or_default()
@@ -15928,6 +15940,16 @@ async fn gallery_map_clusters_response(
                     .into_response();
             }
         };
+    let requested_resolution =
+        gallery_map::gallery_map_resolution_for_zoom(precise_zoom, cluster_cell_size_px);
+    let storage_viewport = gallery_map::storage_viewport(viewport);
+    let storage_resolution_viewport = gallery_map::storage_viewport(resolution_viewport);
+    let max_clusters = storage::gallery_map_prefetch_max_clusters(
+        GALLERY_MAP_MAX_CLUSTERS,
+        requested_resolution,
+        storage_resolution_viewport,
+        storage_viewport,
+    );
     let page = {
         let store = read_store(state, "gallery_map.clusters").await;
         store
@@ -15935,12 +15957,9 @@ async fn gallery_map_clusters_response(
                 prefix: prefix.clone(),
                 depth,
                 media_filter: gallery_map::storage_media_filter(media_filter),
-                viewport: gallery_map::storage_viewport(viewport),
-                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(
-                    precise_zoom,
-                    cluster_cell_size_px,
-                ),
-                max_clusters: GALLERY_MAP_MAX_CLUSTERS,
+                viewport: storage_viewport,
+                requested_resolution,
+                max_clusters,
                 label_filter: label_filter.clone(),
             })
             .await
@@ -16127,6 +16146,41 @@ fn gallery_map_viewport_from_query(
     };
     if !gallery_map::gallery_map_viewport_is_valid(viewport) {
         return Err("gallery map viewport bounds are invalid");
+    }
+    Ok(viewport)
+}
+
+fn gallery_map_resolution_viewport_from_query(
+    query: &GalleryMapClustersQuery,
+    fallback: gallery_map::GalleryMapViewport,
+) -> std::result::Result<gallery_map::GalleryMapViewport, &'static str> {
+    let bounds = (
+        query.resolution_south,
+        query.resolution_west,
+        query.resolution_north,
+        query.resolution_east,
+    );
+    if bounds == (None, None, None, None) {
+        return Ok(fallback);
+    }
+    let (Some(south), Some(west), Some(north), Some(east)) = bounds else {
+        return Err(
+            "resolution_south, resolution_west, resolution_north, and resolution_east must be supplied together",
+        );
+    };
+    let viewport = gallery_map::GalleryMapViewport {
+        south,
+        west,
+        north,
+        east,
+    };
+    if !gallery_map::gallery_map_viewport_is_valid(viewport) {
+        return Err("gallery map resolution viewport bounds are invalid");
+    }
+    if !gallery_map::gallery_map_viewport_is_prefetch_envelope(fallback, viewport) {
+        return Err(
+            "gallery map resolution viewport must be contained in a query viewport no more than twice as wide or high",
+        );
     }
     Ok(viewport)
 }
@@ -20790,16 +20844,18 @@ fn client_credential_replication_record(
         return Ok(None);
     };
 
+    let public_key_fingerprint = record
+        .public_key_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or(public_key_fingerprint(&public_key_pem)?);
+
     Ok(Some(ClientCredentialReplicationRecord {
         device_id: record.device_id.trim().to_string(),
         label: record.label.clone(),
-        public_key_fingerprint: record
-            .public_key_fingerprint
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .or_else(|| Some(text_fingerprint(&public_key_pem))),
+        public_key_fingerprint: Some(public_key_fingerprint),
         public_key_pem,
         credential_fingerprint,
         created_at_unix: record.created_at_unix,
@@ -20851,11 +20907,18 @@ fn imported_client_credential_record(
         ));
     }
 
+    let public_key_fingerprint =
+        match normalize_optional_replication_text(record.public_key_fingerprint) {
+            Some(fingerprint) => fingerprint,
+            None => public_key_fingerprint(&public_key_pem).map_err(|error| {
+                format!("failed to fingerprint replicated client public key: {error}")
+            })?,
+        };
+
     Ok(ClientCredentialRecord {
         device_id,
         label: normalize_optional_replication_text(record.label),
-        public_key_fingerprint: normalize_optional_replication_text(record.public_key_fingerprint)
-            .or_else(|| Some(text_fingerprint(&public_key_pem))),
+        public_key_fingerprint: Some(public_key_fingerprint),
         public_key_pem: Some(public_key_pem),
         issued_credential_pem: None,
         credential_fingerprint: Some(credential_fingerprint),
@@ -24233,7 +24296,15 @@ async fn enroll_client_device_impl(
         pairing_auth.consumed_by_device_id = Some(device_id.clone());
 
         let final_label = label.or_else(|| pairing_auth.label.clone());
-        let public_key_fingerprint = text_fingerprint(public_key_pem);
+        let public_key_fingerprint = match public_key_fingerprint(public_key_pem) {
+            Ok(fingerprint) => fingerprint,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to fingerprint client public key: {err}"),
+                ));
+            }
+        };
         let credential_fingerprint = match credential_fingerprint(&credential_pem) {
             Ok(fingerprint) => fingerprint,
             Err(err) => {
@@ -24684,10 +24755,12 @@ async fn list_client_credentials(
             .map(|credential| ClientCredentialView {
                 device_id: credential.device_id.clone(),
                 label: credential.label.clone(),
-                public_key_fingerprint: credential
-                    .public_key_fingerprint
-                    .clone()
-                    .or_else(|| credential.public_key_pem.as_deref().map(text_fingerprint)),
+                public_key_fingerprint: credential.public_key_fingerprint.clone().or_else(|| {
+                    credential
+                        .public_key_pem
+                        .as_deref()
+                        .and_then(|pem| public_key_fingerprint(pem).ok())
+                }),
                 credential_fingerprint: credential.credential_fingerprint.clone().or_else(|| {
                     credential
                         .issued_credential_pem

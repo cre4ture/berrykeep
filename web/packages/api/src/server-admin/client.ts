@@ -322,6 +322,12 @@ export async function getAdminGalleryMapClusters(
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());
   }
+  if (request.resolutionViewport) {
+    query.set("resolution_south", String(request.resolutionViewport.south));
+    query.set("resolution_west", String(request.resolutionViewport.west));
+    query.set("resolution_north", String(request.resolutionViewport.north));
+    query.set("resolution_east", String(request.resolutionViewport.east));
+  }
   if (cellSizePx !== null) {
     query.set("cluster_cell_size_px", String(cellSizePx));
   }
