@@ -5,19 +5,69 @@ use sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenKind, OpenOptions, Vf
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::io::{Error, ErrorKind};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tracing::info;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::{info, warn};
 
 use crate::LoadedSplitLogicalFileManifest;
 
 const SQLITE_RANGE_CACHE_CHUNK_BYTES: u64 = 1024 * 1024;
 const SQLITE_RANGE_CACHE_MAX_CHUNKS: usize = 1024;
+pub(crate) const MOBILE_PERSISTENT_MAP_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MOBILE_MAP_MEMORY_CACHE_MAX_CHUNKS: usize = 8;
+const MOBILE_MEMORY_ONLY_MAP_CACHE_MAX_CHUNKS: usize = 64;
+const PERSISTENT_CACHE_INDEX_FILE_NAME: &str = "index.json";
+const PERSISTENT_CACHE_CHUNKS_DIRECTORY_NAME: &str = "chunks";
 
 static NEXT_VFS_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_PERSISTENT_CACHE_WRITE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Controls where an MBTiles source keeps its SQLite range chunks.
+///
+/// Desktop and server callers retain the historical in-memory cache. Mobile callers provide a
+/// cache root, which makes the large cache durable while keeping only a small hot set in RAM.
+#[derive(Clone, Debug)]
+pub(crate) struct MbtilesChunkCacheConfig {
+    persistent_chunk_cache: Option<Arc<PersistentChunkCache>>,
+    persistent_cache_scope: Option<String>,
+    memory_max_chunks: usize,
+}
+
+impl Default for MbtilesChunkCacheConfig {
+    fn default() -> Self {
+        Self {
+            persistent_chunk_cache: None,
+            persistent_cache_scope: None,
+            memory_max_chunks: SQLITE_RANGE_CACHE_MAX_CHUNKS,
+        }
+    }
+}
+
+impl MbtilesChunkCacheConfig {
+    pub(crate) fn mobile_persistent(root: PathBuf, cache_scope: Option<String>) -> Result<Self> {
+        Ok(Self {
+            persistent_chunk_cache: Some(Arc::new(PersistentChunkCache::open(
+                root.join("map-mbtiles"),
+                MOBILE_PERSISTENT_MAP_CACHE_MAX_BYTES,
+            )?)),
+            persistent_cache_scope: cache_scope,
+            memory_max_chunks: MOBILE_MAP_MEMORY_CACHE_MAX_CHUNKS,
+        })
+    }
+
+    pub(crate) fn mobile_memory_only() -> Self {
+        Self {
+            persistent_chunk_cache: None,
+            persistent_cache_scope: None,
+            memory_max_chunks: MOBILE_MEMORY_ONLY_MAP_CACHE_MAX_CHUNKS,
+        }
+    }
+}
 
 std::thread_local! {
     static ACTIVE_TILE_LOOKUP_PERF_STATS: RefCell<Option<Rc<RefCell<MbtilesTileLookupPerfStats>>>> =
@@ -39,6 +89,271 @@ struct MbtilesTileLookupPerfStats {
     segment_downloads: u64,
     segment_bytes: u64,
     segment_download_elapsed_ms: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PersistentChunkCacheIndex {
+    entries: HashMap<String, PersistentChunkCacheEntry>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistentChunkCacheEntry {
+    byte_len: u64,
+    last_access_unix_ms: u64,
+}
+
+/// A small persistent LRU for immutable logical-file ranges.
+///
+/// The cache key includes the manifest ETag, so republishing an MBTiles manifest naturally
+/// creates a new namespace. Stale namespaces are evicted with every insertion.
+#[derive(Debug)]
+struct PersistentChunkCache {
+    root: PathBuf,
+    chunks_root: PathBuf,
+    index_path: PathBuf,
+    max_bytes: u64,
+    index: Mutex<PersistentChunkCacheIndex>,
+}
+
+impl PersistentChunkCache {
+    fn open(root: PathBuf, max_bytes: u64) -> Result<Self> {
+        let chunks_root = root.join(PERSISTENT_CACHE_CHUNKS_DIRECTORY_NAME);
+        fs::create_dir_all(&chunks_root).with_context(|| {
+            format!(
+                "failed creating persistent MBTiles cache directory {}",
+                chunks_root.display()
+            )
+        })?;
+        let index_path = root.join(PERSISTENT_CACHE_INDEX_FILE_NAME);
+        let mut index = read_persistent_chunk_cache_index(&index_path);
+        prune_missing_persistent_chunk_cache_entries(&chunks_root, &mut index);
+        prune_orphaned_persistent_chunk_cache_files(&chunks_root, &index);
+        let cache = Self {
+            root,
+            chunks_root,
+            index_path,
+            max_bytes,
+            index: Mutex::new(index),
+        };
+        {
+            let mut index = cache
+                .index
+                .lock()
+                .map_err(|_| anyhow!("persistent MBTiles cache index lock poisoned"))?;
+            cache.prune_locked(&mut index)?;
+        }
+        cache.persist_index()?;
+        Ok(cache)
+    }
+
+    fn entry_key(namespace: &str, chunk_index: u64) -> String {
+        format!("{namespace}-{chunk_index:016x}.chunk")
+    }
+
+    fn read(&self, namespace: &str, chunk_index: u64, expected_len: u64) -> Option<Vec<u8>> {
+        let entry_key = Self::entry_key(namespace, chunk_index);
+        let path = self.chunks_root.join(&entry_key);
+        let bytes = fs::read(&path).ok()?;
+        if bytes.len() as u64 != expected_len {
+            let _ = fs::remove_file(&path);
+            if let Ok(mut index) = self.index.lock() {
+                index.entries.remove(&entry_key);
+                let _ = self.persist_index_locked(&index);
+            }
+            return None;
+        }
+
+        if let Ok(mut index) = self.index.lock() {
+            let last_access_unix_ms = next_persistent_cache_access_order(&index);
+            index.entries.insert(
+                entry_key,
+                PersistentChunkCacheEntry {
+                    byte_len: expected_len,
+                    last_access_unix_ms,
+                },
+            );
+        }
+        Some(bytes)
+    }
+
+    fn insert(&self, namespace: &str, chunk_index: u64, bytes: &[u8]) -> Result<()> {
+        fs::create_dir_all(&self.chunks_root).with_context(|| {
+            format!(
+                "failed recreating persistent MBTiles cache directory {}",
+                self.chunks_root.display()
+            )
+        })?;
+        let entry_key = Self::entry_key(namespace, chunk_index);
+        let path = self.chunks_root.join(&entry_key);
+        let temporary_path = self.chunks_root.join(format!(
+            ".{entry_key}.{}.{}.partial",
+            std::process::id(),
+            NEXT_PERSISTENT_CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&temporary_path, bytes).with_context(|| {
+            format!(
+                "failed writing persistent MBTiles cache chunk {}",
+                temporary_path.display()
+            )
+        })?;
+        fs::rename(&temporary_path, &path).with_context(|| {
+            format!(
+                "failed publishing persistent MBTiles cache chunk {}",
+                path.display()
+            )
+        })?;
+
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| anyhow!("persistent MBTiles cache index lock poisoned"))?;
+        let last_access_unix_ms = next_persistent_cache_access_order(&index);
+        index.entries.insert(
+            entry_key,
+            PersistentChunkCacheEntry {
+                byte_len: bytes.len() as u64,
+                last_access_unix_ms,
+            },
+        );
+        self.prune_locked(&mut index)?;
+        self.persist_index_locked(&index)
+    }
+
+    fn persist_index(&self) -> Result<()> {
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| anyhow!("persistent MBTiles cache index lock poisoned"))?;
+        self.persist_index_locked(&index)
+    }
+
+    fn persist_index_locked(&self, index: &PersistentChunkCacheIndex) -> Result<()> {
+        fs::create_dir_all(&self.root).with_context(|| {
+            format!(
+                "failed recreating persistent MBTiles cache root {}",
+                self.root.display()
+            )
+        })?;
+        let bytes =
+            serde_json::to_vec(index).context("failed serializing persistent MBTiles index")?;
+        let temporary_path = self.root.join(format!(
+            ".{PERSISTENT_CACHE_INDEX_FILE_NAME}.{}.{}.partial",
+            std::process::id(),
+            NEXT_PERSISTENT_CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&temporary_path, bytes).with_context(|| {
+            format!(
+                "failed writing persistent MBTiles cache index {}",
+                temporary_path.display()
+            )
+        })?;
+        fs::rename(&temporary_path, &self.index_path).with_context(|| {
+            format!(
+                "failed publishing persistent MBTiles cache index {}",
+                self.index_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn prune_locked(&self, index: &mut PersistentChunkCacheIndex) -> Result<()> {
+        let mut total_bytes = index
+            .entries
+            .values()
+            .map(|entry| entry.byte_len)
+            .sum::<u64>();
+        if total_bytes <= self.max_bytes {
+            return Ok(());
+        }
+
+        let mut entries = index
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.last_access_unix_ms, entry.byte_len))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(_, last_access, _)| *last_access);
+        for (entry_key, _, byte_len) in entries {
+            if total_bytes <= self.max_bytes {
+                break;
+            }
+            let _ = fs::remove_file(self.chunks_root.join(&entry_key));
+            if index.entries.remove(&entry_key).is_some() {
+                total_bytes = total_bytes.saturating_sub(byte_len);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PersistentChunkCache {
+    fn drop(&mut self) {
+        // Disk hits only update the in-memory LRU order. Flush it when the Web UI shuts down so
+        // rendering does not take a synchronous filesystem write on every chunk read.
+        let _ = self.persist_index();
+    }
+}
+
+fn read_persistent_chunk_cache_index(path: &Path) -> PersistentChunkCacheIndex {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn prune_missing_persistent_chunk_cache_entries(
+    chunks_root: &Path,
+    index: &mut PersistentChunkCacheIndex,
+) {
+    index.entries.retain(|entry_key, entry| {
+        fs::metadata(chunks_root.join(entry_key))
+            .map(|metadata| metadata.is_file() && metadata.len() == entry.byte_len)
+            .unwrap_or(false)
+    });
+}
+
+fn prune_orphaned_persistent_chunk_cache_files(
+    chunks_root: &Path,
+    index: &PersistentChunkCacheIndex,
+) {
+    let Ok(entries) = fs::read_dir(chunks_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !index.entries.contains_key(file_name) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// Return an ordering value that stays monotonic even if multiple accesses occur in one clock
+/// tick. This gives the persistent cache a deterministic LRU eviction order.
+fn next_persistent_cache_access_order(index: &PersistentChunkCacheIndex) -> u64 {
+    let latest_access = index
+        .entries
+        .values()
+        .map(|entry| entry.last_access_unix_ms)
+        .max()
+        .unwrap_or_default();
+    now_unix_ms().max(latest_access.saturating_add(1))
 }
 
 struct ActiveTileLookupPerfGuard {
@@ -149,14 +464,32 @@ impl LogicalMbtilesSource {
         sdk: IronMeshClient,
         loaded_manifest: LoadedSplitLogicalFileManifest,
         perf_logging_enabled: bool,
+        cache_config: MbtilesChunkCacheConfig,
     ) -> Result<Self> {
+        let persistent_chunk_cache = cache_config.persistent_chunk_cache;
+        let persistent_cache_scope = cache_config
+            .persistent_cache_scope
+            .unwrap_or_else(|| "anonymous".to_string());
+        let persistent_cache_namespace = persistent_chunk_cache.as_ref().map(|_| {
+            blake3::hash(
+                format!(
+                    "{}:{}:{}",
+                    persistent_cache_scope, manifest_key, loaded_manifest.etag
+                )
+                .as_bytes(),
+            )
+            .to_hex()
+            .to_string()
+        });
         let shared = Arc::new(LogicalFileSharedState {
             manifest_key: manifest_key.clone(),
             perf_logging_enabled,
             sdk,
             loaded_manifest,
             chunk_size_bytes: SQLITE_RANGE_CACHE_CHUNK_BYTES,
-            cache: Mutex::new(LogicalFileChunkCache::default()),
+            cache: Mutex::new(LogicalFileChunkCache::new(cache_config.memory_max_chunks)),
+            persistent_chunk_cache,
+            persistent_cache_namespace,
         });
         let vfs_name = format!(
             "ironmesh-mbtiles-{}",
@@ -457,6 +790,8 @@ struct LogicalFileSharedState {
     loaded_manifest: LoadedSplitLogicalFileManifest,
     chunk_size_bytes: u64,
     cache: Mutex<LogicalFileChunkCache>,
+    persistent_chunk_cache: Option<Arc<PersistentChunkCache>>,
+    persistent_cache_namespace: Option<String>,
 }
 
 impl LogicalFileSharedState {
@@ -545,6 +880,28 @@ impl LogicalFileSharedState {
         let chunk_len = self
             .chunk_size_bytes
             .min(self.file_size_bytes().saturating_sub(chunk_start));
+        if let (Some(persistent_chunk_cache), Some(namespace)) = (
+            self.persistent_chunk_cache.as_ref(),
+            self.persistent_cache_namespace.as_deref(),
+        ) && let Some(bytes) = persistent_chunk_cache.read(namespace, chunk_index, chunk_len)
+        {
+            let bytes = Arc::new(bytes);
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| Error::other("logical-file chunk cache lock poisoned"))?;
+            cache.insert(chunk_index, Arc::clone(&bytes));
+            if self.perf_logging_enabled {
+                info!(
+                    manifest_key = %self.manifest_key,
+                    chunk_index,
+                    chunk_len = bytes.len(),
+                    cache_entries = cache.chunks.len(),
+                    "map perf: persistent logical-file chunk cache hit"
+                );
+            }
+            return Ok((bytes, true));
+        }
         let started = Instant::now();
         let bytes = download_logical_range_blocking(
             &self.sdk,
@@ -555,6 +912,18 @@ impl LogicalFileSharedState {
             self.perf_logging_enabled,
         )
         .map_err(other_io_error)?;
+        if let (Some(persistent_chunk_cache), Some(namespace)) = (
+            self.persistent_chunk_cache.as_ref(),
+            self.persistent_cache_namespace.as_deref(),
+        ) && let Err(error) = persistent_chunk_cache.insert(namespace, chunk_index, &bytes)
+        {
+            warn!(
+                manifest_key = %self.manifest_key,
+                chunk_index,
+                %error,
+                "failed persisting MBTiles chunk to the persistent cache"
+            );
+        }
         let bytes = Arc::new(bytes);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         record_active_tile_lookup_perf_stats(|stats| {
@@ -583,18 +952,26 @@ impl LogicalFileSharedState {
     }
 }
 
-#[derive(Default)]
 struct LogicalFileChunkCache {
+    max_chunks: usize,
     chunks: HashMap<u64, Arc<Vec<u8>>>,
     access_order: VecDeque<u64>,
 }
 
 impl LogicalFileChunkCache {
+    fn new(max_chunks: usize) -> Self {
+        Self {
+            max_chunks,
+            chunks: HashMap::new(),
+            access_order: VecDeque::new(),
+        }
+    }
+
     fn insert(&mut self, chunk_index: u64, bytes: Arc<Vec<u8>>) {
         self.chunks.insert(chunk_index, bytes);
         self.touch(chunk_index);
 
-        while self.chunks.len() > SQLITE_RANGE_CACHE_MAX_CHUNKS {
+        while self.chunks.len() > self.max_chunks {
             let Some(oldest) = self.access_order.pop_front() else {
                 break;
             };
@@ -605,7 +982,15 @@ impl LogicalFileChunkCache {
     }
 
     fn touch(&mut self, chunk_index: u64) {
+        self.access_order
+            .retain(|existing| *existing != chunk_index);
         self.access_order.push_back(chunk_index);
+    }
+}
+
+impl Default for LogicalFileChunkCache {
+    fn default() -> Self {
+        Self::new(SQLITE_RANGE_CACHE_MAX_CHUNKS)
     }
 }
 
@@ -1019,6 +1404,43 @@ mod tests {
                 .chunks
                 .contains_key(&(SQLITE_RANGE_CACHE_MAX_CHUNKS as u64))
         );
+    }
+
+    #[test]
+    fn logical_file_chunk_cache_keeps_a_recently_touched_chunk() {
+        let mut cache = LogicalFileChunkCache::new(2);
+        cache.insert(0, Arc::new(vec![0]));
+        cache.insert(1, Arc::new(vec![1]));
+        cache.touch(0);
+        cache.insert(2, Arc::new(vec![2]));
+
+        assert!(cache.chunks.contains_key(&0));
+        assert!(!cache.chunks.contains_key(&1));
+        assert!(cache.chunks.contains_key(&2));
+    }
+
+    #[test]
+    fn persistent_chunk_cache_survives_reopen_and_evicts_least_recent_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "ironmesh-mbtiles-cache-test-{}-{}",
+            std::process::id(),
+            NEXT_PERSISTENT_CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cache = PersistentChunkCache::open(root.clone(), 4).unwrap();
+        cache.insert("test", 0, &[1, 2]).unwrap();
+        cache.insert("test", 1, &[3, 4]).unwrap();
+        assert_eq!(cache.read("test", 0, 2), Some(vec![1, 2]));
+        cache.insert("test", 2, &[5, 6]).unwrap();
+        assert_eq!(cache.read("test", 0, 2), Some(vec![1, 2]));
+        assert!(cache.read("test", 1, 2).is_none());
+        assert_eq!(cache.read("test", 2, 2), Some(vec![5, 6]));
+        drop(cache);
+
+        let reopened = PersistentChunkCache::open(root.clone(), 4).unwrap();
+        assert_eq!(reopened.read("test", 0, 2), Some(vec![1, 2]));
+        assert_eq!(reopened.read("test", 2, 2), Some(vec![5, 6]));
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.webkit.WebStorage
 import android.os.SystemClock
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
@@ -487,6 +488,33 @@ class MainViewModel(
             )
             uiState.value = uiState.value.copy(objectBody = body)
             "GET ok: ${body.length} bytes"
+        }
+    }
+
+    fun clearCachedData() {
+        webUiSessionBackgroundGrace.cancel()
+        uiState.value = uiState.value.copy(status = "Clearing cached data…")
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.Main) {
+                    WebStorage.getInstance().deleteAllData()
+                }
+                withContext(Dispatchers.IO) {
+                    repository.clearCachedData()
+                }
+            }
+            result.onSuccess {
+                ThumbnailBitmapCache.clear()
+                EmbeddedWebUiSessionRegistry.clear()
+                uiState.value = uiState.value.copy(
+                    webUiSession = null,
+                    status = "Cached data cleared. Reopen the Web UI to fetch fresh map data.",
+                )
+            }.onFailure { error ->
+                uiState.value = uiState.value.copy(
+                    status = "Failed to clear cached data: ${error.message}",
+                )
+            }
         }
     }
 

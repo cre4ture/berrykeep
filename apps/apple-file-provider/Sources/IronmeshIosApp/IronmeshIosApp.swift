@@ -1175,6 +1175,15 @@ private struct IronmeshSettingsView: View {
                     }
                 }
 
+                Section("Cached data") {
+                    Button("Clear cached data", role: .destructive) {
+                        model.clearCachedData()
+                    }
+                    Text("Removes local map, Web UI, and temporary cached data. Enrollment, settings, and files stay intact.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Advanced") {
                     DisclosureGroup(
                         "Experimental server priorities",

@@ -62,6 +62,7 @@ fun SettingsScreen(
     onOpenConnectionDiagnostics: () -> Unit,
     onOpenTimingDiagnostics: () -> Unit,
     onOpenWebConsole: () -> Unit,
+    onClearCachedData: () -> Unit,
     onThemeAccentColorChange: (String) -> Unit,
     onTitleLatencyMonitorEnabledChange: (Boolean) -> Unit,
     onTitleLatencyMonitorPeriodSecondsChange: (Long) -> Unit,
@@ -154,6 +155,14 @@ fun SettingsScreen(
             Button(onClick = onOpenFiles) {
                 Text(stringResource(R.string.open_files))
             }
+            OutlinedButton(onClick = onClearCachedData) {
+                Text("Clear cached data")
+            }
+            Text(
+                text = "Removes locally cached map and Web UI data. Enrollment and files stay intact.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
 
         SectionCard(title = stringResource(R.string.settings_advanced)) {

@@ -1260,6 +1260,32 @@ final class IronmeshBrowserModel: ObservableObject {
         }
     }
 
+    /// Removes discardable local data without touching enrollment, connection settings, or files.
+    /// A running embedded Web UI is stopped first so no open SQLite VFS handle can retain chunks.
+    func clearCachedData() {
+        let remoteSession = remoteSession
+        beginOperation()
+        Task {
+            defer { endOperation() }
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try remoteSession.stopWebUI()
+                    clearIronmeshCachedFiles()
+                }.value
+                URLCache.shared.removeAllCachedResponses()
+                webUIPresentation = nil
+                galleryMapPresentation = nil
+                lastErrorMessage = nil
+                statusText = "Cached data cleared. Reopen the Web UI to fetch fresh map data."
+                addAction("Cleared cached data", detail: "Removed local map and Web UI cache data.")
+            } catch {
+                lastErrorMessage = error.localizedDescription
+                statusText = "Failed to clear cached data: \(error.localizedDescription)"
+                addAction("Cache clear failed", detail: error.localizedDescription)
+            }
+        }
+    }
+
     func loadPreview(for item: AppleBridgeItem) async -> IronmeshFilePreviewResult {
         guard draft.isConfigured else {
             return IronmeshFilePreviewResult(
@@ -1536,6 +1562,15 @@ final class IronmeshBrowserModel: ObservableObject {
         pendingOperations = max(0, pendingOperations - 1)
         isBusy = pendingOperations > 0
     }
+}
+
+private func clearIronmeshCachedFiles() {
+    let fileManager = FileManager.default
+    guard let cachesDirectory = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+        return
+    }
+    let ironmeshCacheDirectory = cachesDirectory.appendingPathComponent("IronMesh", isDirectory: true)
+    try? fileManager.removeItem(at: ironmeshCacheDirectory)
 }
 
 private func appleDiagnosticPlatformName() -> String {
