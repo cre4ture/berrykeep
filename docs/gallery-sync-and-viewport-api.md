@@ -125,9 +125,22 @@ from the visible map area (smaller maps favor legible bubbles; larger displays f
 grid). The server clamps and quantizes all supplied values to `16`, `24`, `32`, `48`, or `64`
 pixels, with `32` pixels as the default; it rejects non-finite values. Older nodes ignore this
 additive parameter and retain their default clustering behavior. The Gallery UI starts with the
-world viewport and the maximum supported UI depth (`64`), then issues a new request after each map
-movement. Map clustering is available for current data; selecting an immutable snapshot switches
-the Gallery to grid view.
+world viewport and the maximum supported UI depth (`64`). For a rendered map camera, it queries a
+prefetch envelope twice as wide and twice as high as the visible viewport (bounded by the poles and
+the full world, and preserving antimeridian wrapping). The regular bounds filter that prefetch
+envelope; the additive `resolution_south`, `resolution_west`, `resolution_north`, and
+`resolution_east` parameters carry the unbuffered visible bounds. They must be supplied together
+when present and must be fully contained in a query viewport no more than twice as wide or high.
+The server uses the visible bounds as the reference for its 2,048-cell on-screen budget. For a
+prefetch envelope, it scales the response budget by the bounded cell-area ratio (up to 8,192 cells
+for the 2× width and height envelope) and applies that paired budget to the prefetched viewport.
+This preserves the on-screen grid density while bounding the returned cells. Small pans therefore
+already have server clusters to render before the next request completes. The client additionally groups nearby
+server-cluster bubbles in screen space on every camera update, so their display reacts smoothly to
+live pans and fractional zoom changes. A client-merged bubble retains the underlying server clusters
+for selection and Ctrl- or Cmd-click zooming; the server remains authoritative for paging their
+entries. Map clustering is available for current data; selecting an immutable snapshot switches the
+Gallery to grid view.
 
 For cluster diagnostics, the Gallery map display controls offer **Show cluster cells (debug)**.
 It renders the occupied Web Mercator cells from the current server response using that response's

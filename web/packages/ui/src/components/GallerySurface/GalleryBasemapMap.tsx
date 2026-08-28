@@ -8,6 +8,15 @@ import { createPortal } from "react-dom";
 import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
 import { updateGalleryMapClusterGrid } from "./gallery-map-cluster-grid";
 import { galleryMapClusterCellSizeForViewport } from "./gallery-map-cluster-density";
+import {
+  clusterScreenPoints,
+  type ClusterableScreenPoint,
+  type ScreenPointCluster
+} from "./gallery-marker-clusters";
+import {
+  galleryMapPrefetchViewport,
+  type GalleryMapViewport
+} from "./gallery-map-viewport";
 
 const MBTILES_PROTOCOL = "ironmesh-mbtiles";
 const SQLJS_WORKER_URL = new URL(
@@ -18,6 +27,8 @@ const SQLJS_WASM_URL = new URL("sql.js-httpvfs/dist/sql-wasm.wasm", import.meta.
 const MAP_MARKER_VIEWPORT_PADDING = 64;
 const MAX_VISIBLE_THUMBNAIL_MARKERS = 120;
 const MAX_CACHED_MARKER_IMAGES = 256;
+const BASEMAP_MARKER_CLUSTER_RADIUS_PX_MIN = 26;
+const BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX = 68;
 const BASEMAP_CLUSTER_LEAF_ZOOM_THRESHOLD = 19;
 const GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE = 100;
 const BASEMAP_CLUSTER_GEO_EPSILON = 0.00001;
@@ -25,11 +36,7 @@ const TRANSPARENT_PNG_BYTES = base64ToUint8Array(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0N8AAAAASUVORK5CYII="
 );
 
-type GalleryBasemapMarkerPoint = {
-  id: string;
-  item: GalleryBasemapMapCluster;
-  x: number;
-  y: number;
+type GalleryBasemapMarkerPoint = ClusterableScreenPoint<GalleryBasemapMapCluster> & {
   latitude: number;
   longitude: number;
 };
@@ -49,12 +56,7 @@ type GalleryBasemapMapEntry = {
   } | null;
 };
 
-type GalleryBasemapMapViewport = {
-  south: number;
-  west: number;
-  north: number;
-  east: number;
-};
+type GalleryBasemapMapViewport = GalleryMapViewport;
 
 type GalleryBasemapMapCluster = {
   cluster_id: string;
@@ -138,7 +140,8 @@ type GalleryBasemapMapProps = {
   onViewportChange: (
     viewport: GalleryBasemapMapViewport,
     zoom: number,
-    clusterCellSizePx: number
+    clusterCellSizePx: number,
+    resolutionViewport: GalleryBasemapMapViewport
   ) => void;
   loadClusterEntries: (
     queryToken: string,
@@ -250,6 +253,11 @@ export function GalleryBasemapMap({
     loading: boolean;
     error: string | null;
   } | null>(null);
+  const [clientClusterDialog, setClientClusterDialog] = useState<{
+    clusters: GalleryBasemapMapCluster[];
+    queryToken: string;
+    totalEntryCount: number;
+  } | null>(null);
   const serverRasterBasemap = isServerRasterBasemap(basemap) ? basemap : null;
   const localRasterBasemap = isLocalRasterBasemap(basemap) ? basemap : null;
   const usesRasterServerTiles = serverRasterBasemap !== null;
@@ -333,10 +341,13 @@ export function GalleryBasemapMap({
           const viewport = galleryViewportForMap(map);
           if (viewport) {
             const container = map.getContainer();
+            const prefetchViewport = galleryMapPrefetchViewport(viewport);
+            updateGalleryMapViewportDiagnostics(container, viewport, prefetchViewport);
             onViewportChangeRef.current(
-              viewport,
+              prefetchViewport,
               map.getZoom(),
-              galleryMapClusterCellSizeForViewport(container.clientWidth, container.clientHeight)
+              galleryMapClusterCellSizeForViewport(container.clientWidth, container.clientHeight),
+              viewport
             );
           }
         };
@@ -531,10 +542,6 @@ export function GalleryBasemapMap({
         : [],
     [clusters, map, mapReady, viewportVersion]
   );
-  const visibleSelectionEntries = useMemo(
-    () => clusters.flatMap((cluster) => (cluster.entry ? [cluster.entry] : [])),
-    [clusters]
-  );
   const visibleMarkerPoints = useMemo(
     () =>
       mapReady && map
@@ -548,14 +555,31 @@ export function GalleryBasemapMap({
         : [],
     [map, mapHeight, mapReady, mapWidth, projectedMarkerPoints]
   );
+  const visibleSelectionEntries = useMemo(
+    () =>
+      visibleMarkerPoints.flatMap((point) => (point.item.entry ? [point.item.entry] : [])),
+    [visibleMarkerPoints]
+  );
+  const markerClusterRadius = map
+    ? resolveBasemapMarkerClusterRadius(map.getZoom())
+    : BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX;
+  const visibleMarkerClusters = useMemo(
+    () => clusterScreenPoints(visibleMarkerPoints, markerClusterRadius),
+    [markerClusterRadius, visibleMarkerPoints]
+  );
   const markerOverlayTarget = mapReady && map ? map.getCanvasContainer() : null;
   const suppressMarkerThumbnails =
-    isInteracting || visibleMarkerPoints.length > MAX_VISIBLE_THUMBNAIL_MARKERS;
-  const clusteredVisibleMarkerCount = visibleMarkerPoints.filter(
-    (point) => point.item.count > 1
+    isInteracting || visibleMarkerClusters.length > MAX_VISIBLE_THUMBNAIL_MARKERS;
+  const clusteredVisibleMarkerCount = visibleMarkerClusters.filter(
+    (cluster) => cluster.points.length > 1 || cluster.points.some((point) => point.item.count > 1)
   ).length;
+  const visibleMarkerCount = visibleMarkerPoints.reduce((count, point) => count + point.item.count, 0);
 
-  async function handleClusterClick(cluster: GalleryBasemapMapCluster, allowAutoZoom: boolean) {
+  async function handleServerClusterClick(
+    cluster: GalleryBasemapMapCluster,
+    allowAutoZoom: boolean,
+    queryToken?: string
+  ) {
     if (cluster.count === 1 && cluster.entry) {
       onSelectPath(cluster.entry.path, visibleSelectionEntries);
       return;
@@ -568,25 +592,70 @@ export function GalleryBasemapMap({
       currentMap.getZoom() < BASEMAP_CLUSTER_LEAF_ZOOM_THRESHOLD &&
       basemapClusterHasGeoSpread(cluster)
     ) {
-      currentMap.fitBounds(
-        [
-          [cluster.bounds.west, cluster.bounds.south],
-          [cluster.bounds.east, cluster.bounds.north]
-        ],
-        {
-          padding: 96,
-          maxZoom: Math.min(20, Math.max(currentMap.getZoom() + 2.25, 13)),
-          duration: 240
-        }
-      );
+      if (zoomToClusters([cluster])) {
+        return;
+      }
+    }
+
+    await loadClusterDialogPage(cluster, false, queryToken);
+  }
+
+  async function handleVisibleClusterClick(
+    cluster: ScreenPointCluster<GalleryBasemapMapCluster>,
+    allowAutoZoom: boolean
+  ) {
+    const serverClusters = cluster.points.map((point) => point.item);
+    if (serverClusters.length === 1) {
+      const serverCluster = serverClusters[0];
+      if (serverCluster) {
+        await handleServerClusterClick(serverCluster, allowAutoZoom);
+      }
       return;
     }
 
-    await loadClusterDialogPage(cluster, false);
+    if (allowAutoZoom && zoomToClusters(serverClusters)) {
+      return;
+    }
+
+    const queryToken = clustersPayload?.query_token;
+    if (!queryToken) {
+      return;
+    }
+    setClientClusterDialog({
+      clusters: serverClusters,
+      queryToken,
+      totalEntryCount: serverClusters.reduce((count, serverCluster) => count + serverCluster.count, 0)
+    });
   }
 
-  async function loadClusterDialogPage(cluster: GalleryBasemapMapCluster, append: boolean) {
-    const queryToken = append ? clusterDialog?.queryToken : clustersPayload?.query_token;
+  function zoomToClusters(serverClusters: GalleryBasemapMapCluster[]): boolean {
+    const currentMap = mapRef.current;
+    const bounds = boundsForClusters(serverClusters);
+    if (
+      !currentMap ||
+      !bounds ||
+      currentMap.getZoom() >= BASEMAP_CLUSTER_LEAF_ZOOM_THRESHOLD ||
+      !boundsHaveGeoSpread(bounds)
+    ) {
+      return false;
+    }
+
+    currentMap.fitBounds(bounds, {
+      padding: 96,
+      maxZoom: Math.min(20, Math.max(currentMap.getZoom() + 2.25, 13)),
+      duration: 240
+    });
+    return true;
+  }
+
+  async function loadClusterDialogPage(
+    cluster: GalleryBasemapMapCluster,
+    append: boolean,
+    initialQueryToken?: string
+  ) {
+    const queryToken = append
+      ? clusterDialog?.queryToken
+      : initialQueryToken ?? clustersPayload?.query_token;
     if (!queryToken) {
       return;
     }
@@ -747,37 +816,44 @@ export function GalleryBasemapMap({
                 pointerEvents: "none"
               }}
             >
-              {visibleMarkerPoints.map((point) => {
-                const cluster = point.item;
-                const selected = cluster.entry?.path === selectedPath;
-                if (cluster.count === 1 && cluster.entry) {
-                  return (
-                    <GalleryBasemapMarker
-                      key={cluster.cluster_id}
-                      entry={cluster.entry}
-                      request={
-                        !suppressMarkerThumbnails || selected
-                          ? getMarkerRequest(cluster.entry)
-                          : null
-                      }
-                      left={point.x}
-                      top={point.y}
-                      selected={selected}
-                      onClick={() =>
-                        onSelectPath(cluster.entry!.path, visibleSelectionEntries)
-                      }
-                    />
-                  );
+              {visibleMarkerClusters.map((cluster) => {
+                const count = cluster.points.reduce((total, point) => total + point.item.count, 0);
+                const selected = cluster.points.some(
+                  (point) => point.item.entry?.path === selectedPath
+                );
+                if (cluster.points.length === 1 && count === 1) {
+                  const point = cluster.points[0];
+                  const serverCluster = point?.item;
+                  if (point && serverCluster?.entry) {
+                    return (
+                      <GalleryBasemapMarker
+                        key={cluster.id}
+                        entry={serverCluster.entry}
+                        request={
+                          !suppressMarkerThumbnails || selected
+                            ? getMarkerRequest(serverCluster.entry)
+                            : null
+                        }
+                        left={cluster.x}
+                        top={cluster.y}
+                        selected={selected}
+                        onClick={() =>
+                          onSelectPath(serverCluster.entry!.path, visibleSelectionEntries)
+                        }
+                      />
+                    );
+                  }
                 }
 
                 return (
                   <GalleryBasemapClusterMarker
-                    key={cluster.cluster_id}
-                    count={cluster.count}
-                    left={point.x}
-                    top={point.y}
-                    selected={false}
-                    onClick={(ctrlKey) => void handleClusterClick(cluster, ctrlKey)}
+                    key={cluster.id}
+                    count={count}
+                    left={cluster.x}
+                    top={cluster.y}
+                    selected={selected}
+                    liveMerged={cluster.points.length > 1}
+                    onClick={(ctrlKey) => void handleVisibleClusterClick(cluster, ctrlKey)}
                   />
                 );
               })}
@@ -798,7 +874,7 @@ export function GalleryBasemapMap({
           }}
         >
           <Badge color="grape" variant="filled">
-            {clustersPayload?.visible_geotagged_count ?? 0} markers
+            {visibleMarkerCount} markers
           </Badge>
           {showClusterGrid && clustersPayload ? (
             <Badge
@@ -830,8 +906,8 @@ export function GalleryBasemapMap({
             {isInteracting
               ? "Marker thumbnails paused while moving"
               : clusteredVisibleMarkerCount > 0
-                ? `Server clustered ${clustersPayload?.visible_geotagged_count ?? 0} markers into ${visibleMarkerPoints.length}`
-                : `Showing pins for ${visibleMarkerPoints.length} visible markers`}
+                ? `Showing ${visibleMarkerClusters.length} live clusters from ${visibleMarkerCount} markers`
+                : `Showing pins for ${visibleMarkerClusters.length} visible markers`}
           </Badge>
         </div>
       ) : clusteredVisibleMarkerCount > 0 ? (
@@ -844,7 +920,7 @@ export function GalleryBasemapMap({
           }}
         >
           <Badge color="dark" variant="filled">
-            {clusteredVisibleMarkerCount} server cluster
+            {clusteredVisibleMarkerCount} live cluster
             {clusteredVisibleMarkerCount === 1 ? "" : "s"}
           </Badge>
         </div>
@@ -936,6 +1012,42 @@ export function GalleryBasemapMap({
           ) : null}
         </Stack>
       </EmbeddedViewportModal>
+
+      <EmbeddedViewportModal
+        data-gallery-map-client-cluster-dialog="true"
+        usesEmbeddedViewport={usesEmbeddedViewport}
+        opened={clientClusterDialog !== null}
+        onClose={() => setClientClusterDialog(null)}
+        title={
+          clientClusterDialog
+            ? `${clientClusterDialog.totalEntryCount} items in nearby map clusters`
+            : "Nearby map clusters"
+        }
+        centered
+      >
+        <Stack gap="xs">
+          <Text size="sm" c="dimmed">
+            Nearby server clusters are grouped live while the map moves. Select one to inspect its
+            items, or Ctrl- or Cmd-click the bubble to zoom into all of them.
+          </Text>
+          <Stack gap="xs">
+            {clientClusterDialog?.clusters.map((serverCluster, index) => (
+              <Button
+                key={serverCluster.cluster_id}
+                variant="default"
+                fullWidth
+                onClick={() => {
+                  setClientClusterDialog(null);
+                  void handleServerClusterClick(serverCluster, false, clientClusterDialog.queryToken);
+                }}
+              >
+                Server cluster {index + 1}: {formatClusterCount(serverCluster.count)} item
+                {serverCluster.count === 1 ? "" : "s"}
+              </Button>
+            ))}
+          </Stack>
+        </Stack>
+      </EmbeddedViewportModal>
     </>
   );
 }
@@ -1024,6 +1136,7 @@ type GalleryBasemapClusterMarkerProps = {
   left: number;
   top: number;
   selected: boolean;
+  liveMerged: boolean;
   onClick: (ctrlKey: boolean) => void;
 };
 
@@ -1032,6 +1145,7 @@ function GalleryBasemapClusterMarker({
   left,
   top,
   selected,
+  liveMerged,
   onClick
 }: GalleryBasemapClusterMarkerProps) {
   const markerSize = count >= 100 ? 64 : count >= 25 ? 58 : 52;
@@ -1040,7 +1154,11 @@ function GalleryBasemapClusterMarker({
     <button
       type="button"
       aria-label={`Open map cluster with ${count} items`}
-      title={`${count} items in this server-side map cluster. Ctrl- or Cmd-click to zoom to the cluster bounds.`}
+      title={
+        liveMerged
+          ? `${count} items in nearby server clusters. Ctrl- or Cmd-click to zoom to all cluster bounds.`
+          : `${count} items in this server-side map cluster. Ctrl- or Cmd-click to zoom to the cluster bounds.`
+      }
       onClick={(event) => onClick(event.ctrlKey || event.metaKey)}
       onContextMenu={(event) => {
         if (!event.ctrlKey) {
@@ -1103,6 +1221,22 @@ function basemapClusterHasGeoSpread(cluster: GalleryBasemapMapCluster): boolean 
   );
 }
 
+function boundsHaveGeoSpread(bounds: maplibregl.LngLatBounds): boolean {
+  return (
+    bounds.getNorth() - bounds.getSouth() > BASEMAP_CLUSTER_GEO_EPSILON ||
+    bounds.getEast() - bounds.getWest() > BASEMAP_CLUSTER_GEO_EPSILON
+  );
+}
+
+function resolveBasemapMarkerClusterRadius(zoom: number): number {
+  const normalizedZoom = Number.isFinite(zoom) ? zoom : 0;
+  const interpolated = BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX - normalizedZoom * 4.2;
+  return Math.max(
+    BASEMAP_MARKER_CLUSTER_RADIUS_PX_MIN,
+    Math.min(BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX, interpolated)
+  );
+}
+
 function projectVisibleBasemapMarkerPoint(
   map: maplibregl.Map,
   cluster: GalleryBasemapMapCluster
@@ -1140,6 +1274,19 @@ function galleryViewportForMap(map: maplibregl.Map): GalleryBasemapMapViewport |
     north,
     east: normalizeLongitude(rawEast)
   };
+}
+
+function updateGalleryMapViewportDiagnostics(
+  container: HTMLElement,
+  viewport: GalleryBasemapMapViewport,
+  prefetchViewport: GalleryBasemapMapViewport
+): void {
+  container.dataset.galleryMapVisibleViewport = galleryMapViewportDiagnosticValue(viewport);
+  container.dataset.galleryMapPrefetchViewport = galleryMapViewportDiagnosticValue(prefetchViewport);
+}
+
+function galleryMapViewportDiagnosticValue(viewport: GalleryBasemapMapViewport): string {
+  return [viewport.south, viewport.west, viewport.north, viewport.east].join(",");
 }
 
 function normalizeLongitude(longitude: number): number {

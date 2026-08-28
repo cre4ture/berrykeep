@@ -4,6 +4,7 @@ import type { GalleryMapConfiguration } from "@ironmesh/api";
 import { expect, test, type Page, type Route } from "@playwright/test";
 import {
   createInitialOverviewGalleryEntries,
+  createLiveClusterGalleryEntries,
   registerGalleryMapContractTests
 } from "./gallery-map.contract";
 import { GalleryMapMockSession } from "./gallery-map.mock";
@@ -35,6 +36,11 @@ registerGalleryMapContractTests({
   setupInitialOverviewScenario: (page) =>
     installServerAdminMocks(page, {
       galleryEntries: createInitialOverviewGalleryEntries(),
+      mapMetadataCenter: [8.5417, 47.3769, 3]
+    }),
+  setupLiveClusterScenario: (page) =>
+    installServerAdminMocks(page, {
+      galleryEntries: createLiveClusterGalleryEntries(),
       mapMetadataCenter: [8.5417, 47.3769, 3]
     }),
   openGallery: async (page) => {
@@ -1487,7 +1493,7 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
 
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("12 markers", { exact: true })).toBeVisible();
-  await expect(page.getByText("1 server cluster", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 live cluster", { exact: true })).toBeVisible();
 
   const clusterButton = page.getByRole("button", {
     name: "Open map cluster with 12 items"

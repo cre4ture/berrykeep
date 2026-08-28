@@ -4,6 +4,7 @@ import { gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import {
   createInitialOverviewGalleryEntries,
+  createLiveClusterGalleryEntries,
   registerGalleryMapContractTests
 } from "./gallery-map.contract";
 import { GalleryMapMockSession } from "./gallery-map.mock";
@@ -45,6 +46,11 @@ registerGalleryMapContractTests({
   setupInitialOverviewScenario: (page) =>
     installClientUiMocks(page, {
       storeEntries: createInitialOverviewGalleryEntries(),
+      mapMetadataCenter: [8.5417, 47.3769, 3]
+    }),
+  setupLiveClusterScenario: (page) =>
+    installClientUiMocks(page, {
+      storeEntries: createLiveClusterGalleryEntries(),
       mapMetadataCenter: [8.5417, 47.3769, 3]
     }),
   openGallery: async (page) => {
