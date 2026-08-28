@@ -20,6 +20,7 @@ const SQLITE_RANGE_CACHE_CHUNK_BYTES: u64 = 1024 * 1024;
 const SQLITE_RANGE_CACHE_MAX_CHUNKS: usize = 1024;
 pub(crate) const MOBILE_PERSISTENT_MAP_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MOBILE_MAP_MEMORY_CACHE_MAX_CHUNKS: usize = 8;
+const MOBILE_MEMORY_ONLY_MAP_CACHE_MAX_CHUNKS: usize = 64;
 const PERSISTENT_CACHE_INDEX_FILE_NAME: &str = "index.json";
 const PERSISTENT_CACHE_CHUNKS_DIRECTORY_NAME: &str = "chunks";
 
@@ -63,7 +64,7 @@ impl MbtilesChunkCacheConfig {
         Self {
             persistent_chunk_cache: None,
             persistent_cache_scope: None,
-            memory_max_chunks: MOBILE_MAP_MEMORY_CACHE_MAX_CHUNKS,
+            memory_max_chunks: MOBILE_MEMORY_ONLY_MAP_CACHE_MAX_CHUNKS,
         }
     }
 }
@@ -176,6 +177,12 @@ impl PersistentChunkCache {
     }
 
     fn insert(&self, namespace: &str, chunk_index: u64, bytes: &[u8]) -> Result<()> {
+        fs::create_dir_all(&self.chunks_root).with_context(|| {
+            format!(
+                "failed recreating persistent MBTiles cache directory {}",
+                self.chunks_root.display()
+            )
+        })?;
         let entry_key = Self::entry_key(namespace, chunk_index);
         let path = self.chunks_root.join(&entry_key);
         let temporary_path = self.chunks_root.join(format!(
@@ -221,6 +228,12 @@ impl PersistentChunkCache {
     }
 
     fn persist_index_locked(&self, index: &PersistentChunkCacheIndex) -> Result<()> {
+        fs::create_dir_all(&self.root).with_context(|| {
+            format!(
+                "failed recreating persistent MBTiles cache root {}",
+                self.root.display()
+            )
+        })?;
         let bytes =
             serde_json::to_vec(index).context("failed serializing persistent MBTiles index")?;
         let temporary_path = self.root.join(format!(
@@ -269,6 +282,14 @@ impl PersistentChunkCache {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for PersistentChunkCache {
+    fn drop(&mut self) {
+        // Disk hits only update the in-memory LRU order. Flush it when the Web UI shuts down so
+        // rendering does not take a synchronous filesystem write on every chunk read.
+        let _ = self.persist_index();
     }
 }
 

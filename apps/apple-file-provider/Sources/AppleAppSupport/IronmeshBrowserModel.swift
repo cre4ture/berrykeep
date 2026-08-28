@@ -2,7 +2,6 @@ import AppleCore
 import Combine
 import FileProvider
 import Foundation
-import WebKit
 
 extension IronmeshConnectionDraft {
     init(bundleConfiguration: IronmeshBundleConfiguration) {
@@ -1274,10 +1273,6 @@ final class IronmeshBrowserModel: ObservableObject {
                     clearIronmeshCachedFiles()
                 }.value
                 URLCache.shared.removeAllCachedResponses()
-                await WKWebsiteDataStore.default().removeData(
-                    ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
-                    modifiedSince: .distantPast
-                )
                 webUIPresentation = nil
                 galleryMapPresentation = nil
                 lastErrorMessage = nil
