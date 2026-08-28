@@ -3537,7 +3537,32 @@ fn gallery_map_clusters_request() -> GalleryMapClustersRequest {
             east: 180.0,
         },
         zoom: 1.0,
+        require_labels: Vec::new(),
+        exclude_labels: Vec::new(),
     }
+}
+
+#[test]
+fn gallery_map_label_filters_use_one_comma_separated_query_value_each() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let mut request = gallery_map_clusters_request();
+    request.require_labels = vec!["  travel ".to_string(), "family".to_string()];
+    request.exclude_labels = vec!["private".to_string(), "nsfw ".to_string()];
+
+    let url = client
+        .gallery_map_clusters_url("/api/v1/gallery/map/clusters", &request, 1, 1.0)
+        .expect("gallery map URL should build");
+    let query = url
+        .query_pairs()
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        query.get("require_labels").map(|value| value.as_ref()),
+        Some("travel,family")
+    );
+    assert_eq!(
+        query.get("exclude_labels").map(|value| value.as_ref()),
+        Some("private,nsfw")
+    );
 }
 
 fn gallery_map_clusters_response_body() -> Vec<u8> {

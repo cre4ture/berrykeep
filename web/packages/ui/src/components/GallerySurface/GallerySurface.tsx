@@ -371,6 +371,8 @@ export type GalleryDataSource = {
     viewport: GalleryMapViewport;
     zoom: number;
     clusterCellSizePx?: number;
+    requireLabels?: string[];
+    excludeLabels?: string[];
   }) => Promise<GalleryMapClustersPayload>;
   loadMapClusterEntries: (
     queryToken: string,
@@ -625,14 +627,11 @@ export function GallerySurface({
     }
     return [...entriesByPath.values()];
   }, [mapClustersPayload, mapSelectionEntries, showSensitiveContent]);
-  const visibleMapClustersPayload = useMemo(
-    () => filterSensitiveMapClusters(mapClustersPayload, showSensitiveContent),
-    [mapClustersPayload, showSensitiveContent]
-  );
-  const visibleMapInitialOverviewPayload = useMemo(
-    () => filterSensitiveMapClusters(mapInitialOverviewPayload, showSensitiveContent),
-    [mapInitialOverviewPayload, showSensitiveContent]
-  );
+  // Cluster totals and representative entries are already filtered by the
+  // server. Unlike an entry-level browser filter, this also keeps a private
+  // image out of aggregate counts and map geometry.
+  const visibleMapClustersPayload = mapClustersPayload;
+  const visibleMapInitialOverviewPayload = mapInitialOverviewPayload;
   const mapMediaEntriesByPath = useMemo(
     () => new Map(mapMediaEntries.map((entry) => [entry.path, entry] as const)),
     [mapMediaEntries]
@@ -1078,7 +1077,8 @@ export function GallerySurface({
         mediaFilter: requestedServerMediaFilter,
         viewport,
         zoom,
-        clusterCellSizePx
+        clusterCellSizePx,
+        excludeLabels: showSensitiveContent ? [] : [...GALLERY_SENSITIVE_LABELS]
       });
       if (requestVersion !== mapClusterRequestVersionRef.current) {
         return null;
@@ -1165,7 +1165,8 @@ export function GallerySurface({
             mediaFilter: requestedServerMediaFilter,
             viewport: mapViewportRequest.viewport,
             zoom: mapViewportRequest.zoom,
-            clusterCellSizePx: mapViewportRequest.clusterCellSizePx
+            clusterCellSizePx: mapViewportRequest.clusterCellSizePx,
+            excludeLabels: showSensitiveContent ? [] : [...GALLERY_SENSITIVE_LABELS]
           })
         ]);
 
@@ -4595,20 +4596,6 @@ function sensitiveLabelColor(label: string): string {
     return "orange";
   }
   return "gray";
-}
-
-function filterSensitiveMapClusters(
-  payload: GalleryMapClustersPayload | null,
-  showSensitiveContent: boolean
-): GalleryMapClustersPayload | null {
-  if (!payload || showSensitiveContent) {
-    return payload;
-  }
-
-  const clusters = payload.clusters.filter(
-    (cluster) => !cluster.entry || !isSensitiveGalleryEntry(cluster.entry)
-  );
-  return clusters.length === payload.clusters.length ? payload : { ...payload, clusters };
 }
 
 function arraysEqual(left: readonly string[], right: readonly string[]): boolean {

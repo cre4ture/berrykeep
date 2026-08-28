@@ -756,10 +756,8 @@ struct WebStoreListQuery {
     limit: Option<usize>,
     sort: Option<String>,
     media_filter: Option<String>,
-    #[serde(default)]
-    require_labels: Vec<String>,
-    #[serde(default)]
-    exclude_labels: Vec<String>,
+    require_labels: Option<String>,
+    exclude_labels: Option<String>,
     south: Option<f64>,
     west: Option<f64>,
     north: Option<f64>,
@@ -785,6 +783,8 @@ struct WebGalleryMapClustersQuery {
     zoom: Option<u8>,
     /// Additive fractional camera zoom, ignored by nodes that predate it.
     zoom_precise: Option<f64>,
+    require_labels: Option<String>,
+    exclude_labels: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3101,8 +3101,8 @@ async fn web_store_list(
                 sort,
                 media_filter,
                 viewport,
-                require_labels: query.require_labels,
-                exclude_labels: query.exclude_labels,
+                require_labels: web_label_filter_values(query.require_labels.as_deref()),
+                exclude_labels: web_label_filter_values(query.exclude_labels.as_deref()),
                 synthesize_missing_folder_markers: matches!(view, Some(StoreIndexView::Tree))
                     && query.offset.is_none()
                     && query.limit.is_none()
@@ -3176,6 +3176,22 @@ async fn web_gallery_map_clusters(
         if let Some(zoom_precise) = zoom_precise {
             params.append_pair("zoom_precise", &zoom_precise.to_string());
         }
+        if let Some(require_labels) = query
+            .require_labels
+            .as_deref()
+            .map(str::trim)
+            .filter(|labels| !labels.is_empty())
+        {
+            params.append_pair("require_labels", require_labels);
+        }
+        if let Some(exclude_labels) = query
+            .exclude_labels
+            .as_deref()
+            .map(str::trim)
+            .filter(|labels| !labels.is_empty())
+        {
+            params.append_pair("exclude_labels", exclude_labels);
+        }
     }
     let mut path = request_url.path().to_string();
     if let Some(query) = request_url.query() {
@@ -3197,6 +3213,15 @@ async fn web_gallery_map_clusters(
             error.to_string(),
         ),
     }
+}
+
+fn web_label_filter_values(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 async fn web_gallery_map_cluster_entries(

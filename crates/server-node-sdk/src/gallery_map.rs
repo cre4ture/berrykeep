@@ -25,6 +25,8 @@ pub(super) struct GalleryMapQueryTokenPayload {
     pub(super) media_filter: StoreIndexMediaFilter,
     pub(super) viewport: GalleryMapViewport,
     pub(super) resolution: u32,
+    #[serde(default)]
+    pub(super) label_filter: storage::GalleryLabelFilter,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -55,6 +57,7 @@ pub(super) fn decode_gallery_map_query_token(token: &str) -> Option<GalleryMapQu
         || payload.prefix != payload.prefix.trim().trim_matches('/')
         || payload.resolution == 0
         || payload.resolution > MAX_GALLERY_MAP_RESOLUTION
+        || !super::gallery_label_filter_is_within_limit(&payload.label_filter)
         || !gallery_map_viewport_is_valid(payload.viewport)
     {
         return None;
@@ -172,6 +175,7 @@ mod tests {
                 east: -170.0,
             },
             resolution: 1024,
+            label_filter: storage::GalleryLabelFilter::default(),
         }
     }
 
@@ -188,6 +192,18 @@ mod tests {
     fn map_query_token_rejects_out_of_range_resolution() {
         let mut payload = token_payload();
         payload.resolution = MAX_GALLERY_MAP_RESOLUTION + 1;
+        assert!(
+            decode_gallery_map_query_token(&encode_gallery_map_query_token(&payload)).is_none()
+        );
+    }
+
+    #[test]
+    fn map_query_token_rejects_label_filters_over_the_index_limit() {
+        let mut payload = token_payload();
+        payload.label_filter.required = (0..=super::super::MAX_GALLERY_LABEL_FILTER_LABELS)
+            .map(|index| format!("label-{index}"))
+            .collect();
+
         assert!(
             decode_gallery_map_query_token(&encode_gallery_map_query_token(&payload)).is_none()
         );

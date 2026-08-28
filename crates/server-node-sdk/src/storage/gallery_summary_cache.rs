@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{GalleryIndexMediaFilter, GalleryIndexMediaSummary};
+use super::{GalleryIndexMediaFilter, GalleryIndexMediaSummary, GalleryLabelFilter};
 
 /// Identifies one gallery map "scope" whose whole-library summary (total entry count and media
 /// breakdown, independent of the current viewport) can be cached and refreshed independently of
@@ -12,6 +12,9 @@ pub(crate) struct GallerySummaryScope {
     pub(crate) prefix: String,
     pub(crate) depth: usize,
     pub(crate) media_filter: GalleryIndexMediaFilter,
+    /// The label filter is part of the aggregate's identity: a cached
+    /// unfiltered summary must never be reused for a restricted map view.
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 /// Client-visible status of a scope's background summary refresh, so a caller can show that the
@@ -177,6 +180,7 @@ mod tests {
             prefix: format!("gallery/{index}"),
             depth: 1,
             media_filter: GalleryIndexMediaFilter::All,
+            label_filter: GalleryLabelFilter::default(),
         }
     }
 

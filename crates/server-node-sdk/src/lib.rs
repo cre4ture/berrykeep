@@ -13262,14 +13262,17 @@ struct StoreIndexQuery {
 ///
 /// Blank entries are dropped, so a trailing comma or an empty parameter does
 /// not become a filter on the empty label.
-fn store_index_labels(raw: Option<&String>) -> Vec<String> {
+fn store_index_labels(raw: Option<&str>) -> Vec<String> {
     raw.map(|value| {
-        value
+        let mut labels = value
             .split(',')
             .map(str::trim)
             .filter(|label| !label.is_empty())
             .map(str::to_string)
-            .collect()
+            .collect::<Vec<_>>();
+        labels.sort_unstable();
+        labels.dedup();
+        labels
     })
     .unwrap_or_default()
 }
@@ -13277,8 +13280,18 @@ fn store_index_labels(raw: Option<&String>) -> Vec<String> {
 fn store_index_label_filter(
     query: &StoreIndexQuery,
 ) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
-    let required = store_index_labels(query.require_labels.as_ref());
-    let excluded = store_index_labels(query.exclude_labels.as_ref());
+    label_filter_from_query_values(
+        query.require_labels.as_deref(),
+        query.exclude_labels.as_deref(),
+    )
+}
+
+fn label_filter_from_query_values(
+    required: Option<&str>,
+    excluded: Option<&str>,
+) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
+    let required = store_index_labels(required);
+    let excluded = store_index_labels(excluded);
     let label_filter = storage::GalleryLabelFilter { required, excluded };
     if !gallery_label_filter_is_within_limit(&label_filter) {
         return Err("at most 64 labels may be specified across require_labels and exclude_labels");
@@ -13307,6 +13320,10 @@ struct GalleryMapClustersQuery {
     zoom_precise: Option<f64>,
     /// Optional desired cluster cell width in CSS pixels. Older nodes ignore this additive field.
     cluster_cell_size_px: Option<f64>,
+    /// Comma-separated labels an entry must carry to contribute to a cluster.
+    require_labels: Option<String>,
+    /// Comma-separated labels that must not contribute to a cluster.
+    exclude_labels: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -15868,6 +15885,15 @@ async fn gallery_map_clusters_response(
     query: GalleryMapClustersQuery,
     thumbnail_route: &str,
 ) -> Response {
+    let label_filter = match label_filter_from_query_values(
+        query.require_labels.as_deref(),
+        query.exclude_labels.as_deref(),
+    ) {
+        Ok(label_filter) => label_filter,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
     let viewport = match gallery_map_viewport_from_query(&query) {
         Ok(viewport) => viewport,
         Err(message) => {
@@ -15915,6 +15941,7 @@ async fn gallery_map_clusters_response(
                     cluster_cell_size_px,
                 ),
                 max_clusters: GALLERY_MAP_MAX_CLUSTERS,
+                label_filter: label_filter.clone(),
             })
             .await
     };
@@ -15943,6 +15970,7 @@ async fn gallery_map_clusters_response(
             media_filter,
             viewport,
             resolution: page.resolution,
+            label_filter,
         });
     Json(GalleryMapClustersResponse {
         prefix,
@@ -16033,6 +16061,7 @@ async fn gallery_map_cluster_entries_response(
                 cell_y,
                 offset: requested_offset,
                 limit,
+                label_filter: token.label_filter.clone(),
             })
             .await
     };
@@ -16335,14 +16364,9 @@ fn store_index_viewport_bounds(
     }))
 }
 
-/// Whether `query` asks for a label filter, independent of whether the gallery
-/// fast path can actually honour it.
-///
-/// The generic listing fallback hard-codes `labels: Vec::new()` on every entry
-/// and cannot filter by label at all, so a caller that requested filtering has
-/// to be told the request could not be honoured rather than silently receiving
-/// an unfiltered `200` -- the motivating use case is keeping `private` media
-/// out of a view, so a silent fallback would leak it.
+/// Whether `query` asks for a label filter. Generic listings resolve the same
+/// current label projection as the gallery fast path, so they can honour this
+/// filter for every offset-paginated sort and snapshot shape.
 fn store_index_label_filter_requested(label_filter: &storage::GalleryLabelFilter) -> bool {
     !label_filter.is_empty()
 }
@@ -16582,14 +16606,16 @@ async fn list_store_index_response_attempt(
     let depth = query.depth.unwrap_or(1).max(1);
     let snapshot_label = query.snapshot.as_deref().unwrap_or("<current>");
     let cursor_mode = query.cursor.is_some() || query.page_size.is_some();
-    let page_cache_key = store_index_page_cache_key(&query, thumbnail_route);
     let namespace_change_sequence = state
         .storage
         .namespace_change_sequence
         .load(Ordering::SeqCst);
 
     let label_filter_requested = store_index_label_filter_requested(&label_filter);
-    let gallery_query = store_index_gallery_query(&query, &prefix, depth, label_filter);
+    let page_cache_key = (!label_filter_requested)
+        .then(|| store_index_page_cache_key(&query, thumbnail_route))
+        .flatten();
+    let gallery_query = store_index_gallery_query(&query, &prefix, depth, label_filter.clone());
     if viewport.is_some() && gallery_query.is_none() {
         return (
             StatusCode::BAD_REQUEST,
@@ -16599,11 +16625,11 @@ async fn list_store_index_response_attempt(
         )
             .into_response();
     }
-    if label_filter_requested && gallery_query.is_none() {
+    if label_filter_requested && cursor_mode && gallery_query.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "label filters require a current, paginated gallery query sorted by captured time"
+                "error": "label filters are unavailable with cursor pagination"
             })),
         )
             .into_response();
@@ -16667,25 +16693,7 @@ async fn list_store_index_response_attempt(
                 )
                     .into_response();
             }
-            Ok(None) if label_filter_requested => {
-                return (
-                    StatusCode::NOT_IMPLEMENTED,
-                    Json(json!({
-                        "error": "label filters require a metadata backend with gallery projection support"
-                    })),
-                )
-                    .into_response();
-            }
             Ok(None) => {}
-            Err(err) if label_filter_requested => {
-                tracing::error!(
-                    error = %err,
-                    prefix = %prefix,
-                    "gallery index fast path failed while a label filter was requested; \
-                     refusing to fall back to the unfiltered generic store index"
-                );
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
             Err(err) => {
                 warn!(
                     error = %err,
@@ -16950,6 +16958,30 @@ async fn list_store_index_response_attempt(
     }
     let media_lookup_ms = media_lookup_started_at.elapsed().as_millis();
 
+    let label_lookup_started_at = Instant::now();
+    let label_keys = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "key")
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    let labels_by_key = {
+        let store = read_store(state, "store_index.labels").await;
+        store.gallery_object_labels_by_key(&label_keys).await
+    };
+    let labels_by_key = match labels_by_key {
+        Ok(labels_by_key) => labels_by_key,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load labels for generic store index");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    for entry in &mut entries {
+        if let Some(labels) = labels_by_key.get(&entry.path) {
+            entry.labels = labels.clone();
+        }
+    }
+    let label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
+
     let collapse_started_at = Instant::now();
     if matches!(query.view, Some(StoreIndexView::Tree)) {
         entries = collapse_store_index_entries_for_tree_view(entries);
@@ -16959,6 +16991,12 @@ async fn list_store_index_response_attempt(
     let filter_started_at = Instant::now();
     if let Some(media_filter) = query.media_filter {
         entries.retain(|entry| matches_store_index_media_filter(entry, media_filter));
+    }
+    if label_filter_requested {
+        entries.retain(|entry| {
+            entry.entry_type != "key"
+                || storage::gallery_label_filter_matches(&entry.labels, &label_filter)
+        });
     }
     let filter_ms = filter_started_at.elapsed().as_millis();
 
@@ -17039,6 +17077,7 @@ async fn list_store_index_response_attempt(
         || content_summary_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || modified_time_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || metadata_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || label_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || media_lookup_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
         || media_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || tree_collapse_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
@@ -17064,6 +17103,7 @@ async fn list_store_index_response_attempt(
             content_summary_lookup_ms,
             modified_time_lookup_ms,
             metadata_lookup_ms,
+            label_lookup_ms,
             media_lookup_lock_waited_ms = media_lookup_waited_ms,
             media_lookup_ms,
             tree_collapse_ms,
@@ -17105,7 +17145,7 @@ async fn list_store_index_response_attempt(
         request_id,
         response,
         format!(
-            "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
+            "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, label-lookup;dur={label_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
         ),
         keys.len(),
         entry_plan.file_entries.len(),
@@ -17352,6 +17392,28 @@ async fn list_store_index_response_cursor_mode(
         }
     }
     let media_lookup_ms = media_lookup_started_at.elapsed().as_millis();
+
+    let label_keys = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "key")
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    let labels_by_key = {
+        let store = read_store(state, "store_index.cursor_labels").await;
+        store.gallery_object_labels_by_key(&label_keys).await
+    };
+    let labels_by_key = match labels_by_key {
+        Ok(labels_by_key) => labels_by_key,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load labels for cursor store index");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    for entry in &mut entries {
+        if let Some(labels) = labels_by_key.get(&entry.path) {
+            entry.labels = labels.clone();
+        }
+    }
 
     let media_summary = summarize_store_index_entries(&entries);
     let returned_entry_count = entries.len();

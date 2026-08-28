@@ -2011,6 +2011,10 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
             });
             locked.persist_media_cache_record(&metadata).await.unwrap();
         }
+        locked
+            .set_media_labels("gallery/second.png", vec!["private".to_string()])
+            .await
+            .unwrap();
         first.manifest_hash
     };
 
@@ -2027,6 +2031,8 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
             zoom: Some(3),
             zoom_precise: Some(3.75),
             cluster_cell_size_px: Some(16.0),
+            require_labels: None,
+            exclude_labels: Some("private".to_string()),
         },
         super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
     )
@@ -2034,11 +2040,11 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
     assert_eq!(clusters.status(), StatusCode::OK);
     let clusters_payload: serde_json::Value =
         serde_json::from_slice(&to_bytes(clusters.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(clusters_payload["total_entry_count"], 2);
-    assert_eq!(clusters_payload["visible_geotagged_count"], 2);
+    assert_eq!(clusters_payload["total_entry_count"], 1);
+    assert_eq!(clusters_payload["visible_geotagged_count"], 1);
     assert_eq!(clusters_payload["zoom"].as_u64(), Some(3));
     assert_eq!(clusters_payload["clusters"].as_array().unwrap().len(), 1);
-    assert_eq!(clusters_payload["clusters"][0]["count"], 2);
+    assert_eq!(clusters_payload["clusters"][0]["count"], 1);
     let query_token = clusters_payload["query_token"].as_str().unwrap();
     let cluster_id = clusters_payload["clusters"][0]["cluster_id"]
         .as_str()
@@ -2060,11 +2066,11 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
         serde_json::from_slice(&to_bytes(first_page.into_body(), usize::MAX).await.unwrap())
             .unwrap();
     assert_eq!(first_page_payload["entry_count"], 1);
-    assert_eq!(first_page_payload["total_entry_count"], 2);
-    assert_eq!(first_page_payload["has_more"], true);
+    assert_eq!(first_page_payload["total_entry_count"], 1);
+    assert_eq!(first_page_payload["has_more"], false);
     assert_eq!(
         first_page_payload["entries"][0]["path"],
-        "gallery/second.png"
+        "gallery/first.png"
     );
 
     {
@@ -14298,8 +14304,15 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
             .unwrap()
     };
     {
-        let locked = lock_store(&state, "tests.state.store").await;
+        let mut locked = lock_store(&state, "tests.state.store").await;
         locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
+        locked
+            .set_media_labels(
+                "gallery/cat.png",
+                vec!["private".to_string(), "travel".to_string()],
+            )
+            .await
+            .unwrap();
     }
 
     let response = axum::response::IntoResponse::into_response(
@@ -14338,12 +14351,49 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
     assert_eq!(media["mime_type"], "image/png");
     assert_eq!(media["width"], 4);
     assert_eq!(media["height"], 3);
+    assert_eq!(
+        entries[0]["labels"],
+        serde_json::json!(["private", "travel"])
+    );
     assert!(
         media["thumbnail"]["url"]
             .as_str()
             .unwrap()
             .contains("/media/thumbnail?key=gallery%2Fcat.png")
     );
+
+    // Path sorting takes the generic listing route rather than the captured
+    // gallery projection. It must still apply labels before pagination so the
+    // default UI filter cannot display this private thumbnail.
+    let filtered = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(100),
+                sort: Some(super::StoreIndexSortOrder::PathAsc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+                south: None,
+                west: None,
+                north: None,
+                east: None,
+                require_labels: None,
+                exclude_labels: Some("private".to_string()),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(filtered.status(), axum::http::StatusCode::OK);
+    let filtered_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(filtered.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(filtered_payload["total_entry_count"], 0);
+    assert_eq!(filtered_payload["entries"], serde_json::json!([]));
 
     cleanup_test_state(&state).await;
 }

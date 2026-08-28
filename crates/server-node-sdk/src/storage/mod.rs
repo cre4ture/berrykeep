@@ -79,8 +79,8 @@ pub(crate) use gallery_capture_time::effective_gallery_captured_at_unix;
 pub(super) use gallery_capture_time::version_created_at_unix_from_payload;
 pub(super) use gallery_labels::{
     GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GalleryLabelFilter,
-    decode_gallery_labels, encode_gallery_labels, gallery_label_filter_matches_json,
-    gallery_label_predicates,
+    decode_gallery_labels, encode_gallery_labels, gallery_label_filter_matches,
+    gallery_label_filter_matches_json, gallery_label_predicates,
 };
 use media_cache::MediaCacheBuildConfig;
 #[cfg(test)]
@@ -1149,6 +1149,10 @@ pub(crate) struct GalleryMapClusterQuery {
     pub(crate) viewport: GalleryViewportBounds,
     pub(crate) requested_resolution: u32,
     pub(crate) max_clusters: usize,
+    /// Labels used to limit every aggregate and representative entry in this
+    /// map query. Keeping the filter with the storage query prevents a
+    /// sensitive entry from affecting a cluster count or summary.
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 #[derive(Debug, Clone)]
@@ -1188,6 +1192,8 @@ pub(crate) struct GalleryMapClusterEntriesQuery {
     pub(crate) cell_y: u32,
     pub(crate) offset: usize,
     pub(crate) limit: usize,
+    /// The filter captured in the query token that selected this cluster.
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2464,6 +2470,13 @@ trait MetadataStore: Send + Sync {
     /// for the sidecar ingest, which resolves the labels of a media key from its
     /// XMP sidecar.
     async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()>;
+    /// Returns the current complete label list for each requested key. Generic
+    /// store listings use this projection too, so gallery label edits never
+    /// replace labels that were omitted from a non-gallery query shape.
+    async fn gallery_object_labels_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, Vec<String>>>;
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
@@ -3791,6 +3804,13 @@ impl PersistentStore {
         self.metadata_store
             .set_gallery_object_labels(key, labels)
             .await
+    }
+
+    pub(crate) async fn gallery_object_labels_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        self.metadata_store.gallery_object_labels_by_key(keys).await
     }
 
     pub(crate) async fn query_gallery_delta(

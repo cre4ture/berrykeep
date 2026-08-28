@@ -387,6 +387,7 @@ fn gallery_map_query(
         viewport,
         requested_resolution,
         max_clusters,
+        label_filter: Default::default(),
     }
 }
 
@@ -551,6 +552,7 @@ fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
             cell_y: cluster.cell_y,
             offset: 0,
             limit: 1,
+            label_filter: Default::default(),
         },
     )
     .expect("first cluster entry page should load");
@@ -570,6 +572,7 @@ fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
             cell_y: cluster.cell_y,
             offset: 1,
             limit: 1,
+            label_filter: Default::default(),
         },
     )
     .expect("second cluster entry page should load");
@@ -661,6 +664,7 @@ async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope() {
             cell_y: cluster.cell_y,
             offset: 0,
             limit: 100,
+            label_filter: Default::default(),
         })
         .await
         .expect("cluster page should load after unrelated ingest")
@@ -690,6 +694,7 @@ async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope() {
             cell_y: cluster.cell_y,
             offset: 0,
             limit: 100,
+            label_filter: Default::default(),
         })
         .await
         .expect("cluster page should load after in-scope change")

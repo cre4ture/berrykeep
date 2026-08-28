@@ -136,6 +136,10 @@ export type GalleryMapClustersRequest = {
   zoom: number;
   /** Desired cluster-cell width in CSS pixels; the server bounds and quantizes it. */
   clusterCellSizePx?: number;
+  /** Labels every mapped entry must contain. */
+  requireLabels?: string[];
+  /** Labels excluded from map totals, clusters, and cluster entries. */
+  excludeLabels?: string[];
 };
 
 /** Keeps fractional MapLibre zoom while constraining requests to supported map levels. */

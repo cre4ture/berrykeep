@@ -308,16 +308,8 @@ export async function listStoreEntries(
     query.set("north", String(options.viewport.north));
     query.set("east", String(options.viewport.east));
   }
-  for (const label of options.requireLabels ?? []) {
-    if (label.trim()) {
-      query.append("require_labels", label.trim());
-    }
-  }
-  for (const label of options.excludeLabels ?? []) {
-    if (label.trim()) {
-      query.append("exclude_labels", label.trim());
-    }
-  }
+  appendLabelFilter(query, "require_labels", options.requireLabels);
+  appendLabelFilter(query, "exclude_labels", options.excludeLabels);
   return fetchJson<StoreListResponse>(`${apiV1("/store/list")}?${query.toString()}`);
 }
 
@@ -370,7 +362,23 @@ function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchPa
   if (cellSizePx !== null) {
     query.set("cluster_cell_size_px", String(cellSizePx));
   }
+  appendLabelFilter(query, "require_labels", request.requireLabels);
+  appendLabelFilter(query, "exclude_labels", request.excludeLabels);
   return query;
+}
+
+function appendLabelFilter(
+  query: URLSearchParams,
+  parameter: "require_labels" | "exclude_labels",
+  labels: string[] | undefined
+): void {
+  const value = (labels ?? [])
+    .map((label) => label.trim())
+    .filter(Boolean)
+    .join(",");
+  if (value) {
+    query.set(parameter, value);
+  }
 }
 
 export async function getStoreIndexDelta(

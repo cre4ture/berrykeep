@@ -3599,6 +3599,10 @@ pub struct GalleryMapClustersRequest {
     pub media_filter: StoreIndexMediaFilter,
     pub viewport: StoreIndexViewport,
     pub zoom: f64,
+    /// Labels that must all be present in map aggregates.
+    pub require_labels: Vec<String>,
+    /// Labels that must not affect map aggregates or cluster entries.
+    pub exclude_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -5233,18 +5237,8 @@ impl IronMeshClient {
                 .append_pair("north", &viewport.north.to_string())
                 .append_pair("east", &viewport.east.to_string());
         }
-        for label in &options.require_labels {
-            let label = label.trim();
-            if !label.is_empty() {
-                url.query_pairs_mut().append_pair("require_labels", label);
-            }
-        }
-        for label in &options.exclude_labels {
-            let label = label.trim();
-            if !label.is_empty() {
-                url.query_pairs_mut().append_pair("exclude_labels", label);
-            }
-        }
+        append_comma_separated_labels(&mut url, "require_labels", &options.require_labels);
+        append_comma_separated_labels(&mut url, "exclude_labels", &options.exclude_labels);
 
         let response = self
             .execute_buffered_request(Method::GET, url, Vec::new(), None)
@@ -5437,6 +5431,8 @@ impl IronMeshClient {
             .append_pair("zoom", &zoom.to_string())
             .append_pair("zoom_precise", &zoom_precise.to_string());
         drop(query);
+        append_comma_separated_labels(&mut url, "require_labels", &request.require_labels);
+        append_comma_separated_labels(&mut url, "exclude_labels", &request.exclude_labels);
         Ok(url)
     }
 
@@ -7596,6 +7592,21 @@ impl IronMeshClient {
         }
 
         Ok(url)
+    }
+}
+
+/// Appends a label filter using the stable comma-separated wire format accepted
+/// by the node and web proxy. Empty labels are ignored consistently across the
+/// store index and map clients.
+fn append_comma_separated_labels(url: &mut Url, parameter: &str, labels: &[String]) {
+    let labels = labels
+        .iter()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    if !labels.is_empty() {
+        url.query_pairs_mut()
+            .append_pair(parameter, &labels.join(","));
     }
 }
 

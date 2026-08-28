@@ -27,8 +27,8 @@ use super::{
     RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
     S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
     SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    StorageStatsSample, StorageStatsState, compress_snapshot_json, decode_gallery_labels,
+    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -256,6 +256,38 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()> {
         self.store_gallery_object_labels(key, labels).await
+    }
+
+    async fn gallery_object_labels_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        const LABEL_LOOKUP_CHUNK_SIZE: usize = 500;
+        let mut labels_by_key = HashMap::new();
+        for keys in keys.chunks(LABEL_LOOKUP_CHUNK_SIZE) {
+            if keys.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=keys.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!(
+                        "SELECT key, labels_json FROM gallery_objects WHERE key IN ({placeholders})"
+                    ),
+                    params_from_iter(keys.iter().cloned()),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let key = row_string(&row, 0, "gallery_objects.key")?;
+                let labels_json = row_string(&row, 1, "gallery_objects.labels_json")?;
+                labels_by_key.insert(key, decode_gallery_labels(&labels_json)?);
+            }
+        }
+        Ok(labels_by_key)
     }
 
     async fn query_gallery_index(
