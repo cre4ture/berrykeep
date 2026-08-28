@@ -40,6 +40,13 @@
         <activity
             android:name=".WebUiActivity"
             android:exported="false" />
+        <activity
+            android:name=".PrivateWebServiceActivity"
+            android:exported="false" />
+        <service
+            android:name=".PrivateWebServiceBrowserService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <service
             android:name=".work.FolderSyncForegroundService"
             android:exported="false"

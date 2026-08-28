@@ -1,6 +1,9 @@
 package io.ironmesh.android.ui.components
 
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.net.Uri
 import android.net.http.SslError
 import android.webkit.ConsoleMessage
@@ -12,6 +15,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
@@ -19,6 +23,8 @@ import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import io.ironmesh.android.data.EmbeddedWebUiSession
+import io.ironmesh.android.data.PrivateWebServiceBrowserSession
+import io.ironmesh.android.PrivateWebServiceActivity
 import io.ironmesh.android.share.OriginalShareCoordinator
 import java.net.URI
 import java.util.concurrent.Executors
@@ -207,12 +213,12 @@ private class EmbeddedWebUiClient(
     private val initialUrl: String,
 ) : WebViewClient() {
     override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
-        !isSameEmbeddedWebUiOrigin(initialUrl, url)
+        shouldOverrideNavigation(view, url)
 
     override fun shouldOverrideUrlLoading(
         view: WebView,
         request: WebResourceRequest,
-    ): Boolean = !isSameEmbeddedWebUiOrigin(initialUrl, request.url.toString())
+    ): Boolean = shouldOverrideNavigation(view, request.url.toString())
 
     override fun onReceivedHttpError(
         view: WebView,
@@ -271,6 +277,61 @@ private class EmbeddedWebUiClient(
                 errorCode = error.primaryError,
             ),
         )
+    }
+
+    private fun shouldOverrideNavigation(view: WebView, candidateUrl: String): Boolean {
+        val privateServiceLaunch = parsePrivateWebServiceLaunch(initialUrl, candidateUrl)
+        if (privateServiceLaunch != null) {
+            openPrivateService(view, privateServiceLaunch)
+            return true
+        }
+        return !isSameEmbeddedWebUiOrigin(initialUrl, candidateUrl)
+    }
+
+    private fun openPrivateService(view: WebView, launch: PrivateWebServiceLaunch) {
+        when (launch.target) {
+            PrivateWebServiceOpenTarget.IN_APP -> {
+                view.context.startActivity(PrivateWebServiceActivity.intent(view.context, launch.url))
+            }
+
+            PrivateWebServiceOpenTarget.BROWSER -> {
+                if (!PrivateWebServiceBrowserSession.acquire(view.context)) {
+                    reportPrivateServiceLaunchFailure(view, launch.url, "Could not keep the local proxy active")
+                    return
+                }
+                try {
+                    view.context.startActivity(
+                        Intent(Intent.ACTION_VIEW, Uri.parse(launch.url))
+                            .addCategory(Intent.CATEGORY_BROWSABLE)
+                            .apply {
+                                if (view.context !is Activity) {
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                            },
+                    )
+                } catch (error: ActivityNotFoundException) {
+                    PrivateWebServiceBrowserSession.release(view.context)
+                    reportPrivateServiceLaunchFailure(
+                        view,
+                        launch.url,
+                        error.message ?: "No browser is available for the private service",
+                    )
+                }
+            }
+        }
+    }
+
+    private fun reportPrivateServiceLaunchFailure(view: WebView, requestUrl: String, detail: String) {
+        EmbeddedWebUiDiagnostics.report(
+            EmbeddedWebUiDiagnostic(
+                level = EmbeddedWebUiDiagnosticLevel.ERROR,
+                event = "private_service_launch_failed",
+                pageUrl = view.url,
+                requestUrl = requestUrl,
+                detail = detail,
+            ),
+        )
+        Toast.makeText(view.context, "Could not open private service", Toast.LENGTH_LONG).show()
     }
 }
 

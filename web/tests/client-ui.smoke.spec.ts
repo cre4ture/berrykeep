@@ -171,6 +171,15 @@ test("a blocked service popup leaves the client UI open", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Web services" })).toBeVisible();
 });
 
+test("the embedded Android client offers in-app and external private-service handoff", async ({ page }) => {
+  await installClientUiMocks(page);
+  await page.goto("/?embedded_client=android");
+  await page.getByText("Web services", { exact: true }).click();
+
+  await expect(page.getByRole("button", { name: "Open in BerryKeep" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open in browser" })).toBeVisible();
+});
+
 test("web service results appear while another node is still checking", async ({ page }) => {
   const slowNodeStarted = createDeferred();
   const releaseSlowNode = createDeferred();
