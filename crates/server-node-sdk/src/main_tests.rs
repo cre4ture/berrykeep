@@ -11638,9 +11638,10 @@ async fn web_service_listing_requires_identity_even_when_legacy_client_auth_is_o
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn persisted_web_service_is_visible_through_signed_client_and_web_ui_node_api() {
-    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+async fn register_test_client_identity(
+    state: &ServerState,
+    label: &str,
+) -> transport_sdk::ClientIdentityMaterial {
     let mut identity =
         transport_sdk::ClientIdentityMaterial::generate(state.cluster_id, None, None).unwrap();
     let credential_pem = super::generate_client_credential_pem(
@@ -11659,7 +11660,7 @@ async fn persisted_web_service_is_visible_through_signed_client_and_web_ui_node_
         .credentials
         .push(super::ClientCredentialRecord {
             device_id: identity.device_id.to_string(),
-            label: Some("Web service discovery integration test client".to_string()),
+            label: Some(label.to_string()),
             public_key_pem: Some(identity.public_key_pem.clone()),
             public_key_fingerprint: None,
             issued_credential_pem: Some(credential_pem),
@@ -11670,6 +11671,20 @@ async fn persisted_web_service_is_visible_through_signed_client_and_web_ui_node_
             revoked_by_actor: None,
             revoked_at_unix: None,
         });
+    identity
+}
+
+#[tokio::test]
+async fn persisted_web_service_is_visible_through_signed_client_and_web_ui_node_api() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let identity =
+        register_test_client_identity(&state, "Web service discovery integration test client")
+            .await;
+    let denied_identity = register_test_client_identity(
+        &state,
+        "Web service discovery integration test denied client",
+    )
+    .await;
 
     state
         .web_services
@@ -11720,17 +11735,15 @@ async fn persisted_web_service_is_visible_through_signed_client_and_web_ui_node_
         device_id: Some(identity.device_id.to_string()),
         node_priority_overrides: BTreeMap::new(),
     };
-    let client = bootstrap
+
+    // Use a newly built client for the Web UI's first request. Reusing the
+    // direct listing client here would mask failures that only occur while
+    // establishing its initial signed multiplex transport session.
+    let cold_web_ui_client = bootstrap
         .build_client_with_identity(&identity)
         .expect("signed client should build from the persisted bootstrap");
-    assert_eq!(client.target_node_ids(), vec![state.node_id]);
-    let direct_services = client
-        .list_web_services_on_node(state.node_id)
-        .await
-        .expect("signed client should receive the persisted web service from its node");
-    assert_eq!(direct_services.len(), 1);
-    assert_eq!(direct_services[0].id, "jonsbo-nas");
-    let web_ui = web_ui_backend::router(web_ui_backend::WebUiConfig::from_client(client));
+    let web_ui =
+        web_ui_backend::router(web_ui_backend::WebUiConfig::from_client(cold_web_ui_client));
 
     let response = web_ui
         .oneshot(
@@ -11745,6 +11758,27 @@ async fn persisted_web_service_is_visible_through_signed_client_and_web_ui_node_
     let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
 
+    let direct_client = bootstrap
+        .build_client_with_identity(&identity)
+        .expect("signed client should build from the persisted bootstrap");
+    assert_eq!(direct_client.target_node_ids(), vec![state.node_id]);
+    let direct_services = direct_client
+        .list_web_services_on_node(state.node_id)
+        .await
+        .expect("signed client should receive the persisted web service from its node");
+
+    let denied_bootstrap = client_sdk::ConnectionBootstrap {
+        device_id: Some(denied_identity.device_id.to_string()),
+        ..bootstrap.clone()
+    };
+    let denied_client = denied_bootstrap
+        .build_client_with_identity(&denied_identity)
+        .expect("other signed client should build from the persisted bootstrap");
+    let denied_response = denied_client
+        .get_relative_path("/web-services")
+        .await
+        .expect("other signed client should receive the filtered service list");
+
     server_task.abort();
     let _ = server_task.await;
     cleanup_test_state(&state).await;
@@ -11758,6 +11792,13 @@ async fn persisted_web_service_is_visible_through_signed_client_and_web_ui_node_
     assert_eq!(body["services"][0]["name"], "Jonsbo NAS");
     assert_eq!(body["services"][0]["description"], "Private home NAS");
     assert_eq!(body["services"][0]["nodeId"], state.node_id.to_string());
+
+    assert_eq!(direct_services.len(), 1);
+    assert_eq!(direct_services[0].id, "jonsbo-nas");
+    assert_eq!(denied_response.status, StatusCode::OK);
+    let denied_services: Vec<serde_json::Value> =
+        serde_json::from_slice(&denied_response.body).unwrap();
+    assert!(denied_services.is_empty());
 }
 
 #[tokio::test]
