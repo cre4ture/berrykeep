@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::LoadedSplitLogicalFileManifest;
 
@@ -33,6 +33,7 @@ static NEXT_PERSISTENT_CACHE_WRITE_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug)]
 pub(crate) struct MbtilesChunkCacheConfig {
     persistent_chunk_cache: Option<Arc<PersistentChunkCache>>,
+    persistent_cache_scope: Option<String>,
     memory_max_chunks: usize,
 }
 
@@ -40,20 +41,30 @@ impl Default for MbtilesChunkCacheConfig {
     fn default() -> Self {
         Self {
             persistent_chunk_cache: None,
+            persistent_cache_scope: None,
             memory_max_chunks: SQLITE_RANGE_CACHE_MAX_CHUNKS,
         }
     }
 }
 
 impl MbtilesChunkCacheConfig {
-    pub(crate) fn mobile_persistent(root: PathBuf) -> Result<Self> {
+    pub(crate) fn mobile_persistent(root: PathBuf, cache_scope: Option<String>) -> Result<Self> {
         Ok(Self {
             persistent_chunk_cache: Some(Arc::new(PersistentChunkCache::open(
                 root.join("map-mbtiles"),
                 MOBILE_PERSISTENT_MAP_CACHE_MAX_BYTES,
             )?)),
+            persistent_cache_scope: cache_scope,
             memory_max_chunks: MOBILE_MAP_MEMORY_CACHE_MAX_CHUNKS,
         })
+    }
+
+    pub(crate) fn mobile_memory_only() -> Self {
+        Self {
+            persistent_chunk_cache: None,
+            persistent_cache_scope: None,
+            memory_max_chunks: MOBILE_MAP_MEMORY_CACHE_MAX_CHUNKS,
+        }
     }
 }
 
@@ -160,7 +171,6 @@ impl PersistentChunkCache {
                     last_access_unix_ms,
                 },
             );
-            let _ = self.persist_index_locked(&index);
         }
         Some(bytes)
     }
@@ -436,10 +446,19 @@ impl LogicalMbtilesSource {
         cache_config: MbtilesChunkCacheConfig,
     ) -> Result<Self> {
         let persistent_chunk_cache = cache_config.persistent_chunk_cache;
+        let persistent_cache_scope = cache_config
+            .persistent_cache_scope
+            .unwrap_or_else(|| "anonymous".to_string());
         let persistent_cache_namespace = persistent_chunk_cache.as_ref().map(|_| {
-            blake3::hash(format!("{}:{}", manifest_key, loaded_manifest.etag).as_bytes())
-                .to_hex()
-                .to_string()
+            blake3::hash(
+                format!(
+                    "{}:{}:{}",
+                    persistent_cache_scope, manifest_key, loaded_manifest.etag
+                )
+                .as_bytes(),
+            )
+            .to_hex()
+            .to_string()
         });
         let shared = Arc::new(LogicalFileSharedState {
             manifest_key: manifest_key.clone(),
@@ -875,10 +894,14 @@ impl LogicalFileSharedState {
         if let (Some(persistent_chunk_cache), Some(namespace)) = (
             self.persistent_chunk_cache.as_ref(),
             self.persistent_cache_namespace.as_deref(),
-        ) {
-            persistent_chunk_cache
-                .insert(namespace, chunk_index, &bytes)
-                .map_err(other_io_error)?;
+        ) && let Err(error) = persistent_chunk_cache.insert(namespace, chunk_index, &bytes)
+        {
+            warn!(
+                manifest_key = %self.manifest_key,
+                chunk_index,
+                %error,
+                "failed persisting MBTiles chunk to the persistent cache"
+            );
         }
         let bytes = Arc::new(bytes);
         let elapsed_ms = started.elapsed().as_millis() as u64;

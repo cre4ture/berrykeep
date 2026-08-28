@@ -1271,7 +1271,7 @@ final class IronmeshBrowserModel: ObservableObject {
             do {
                 try await Task.detached(priority: .userInitiated) {
                     try remoteSession.stopWebUI()
-                    try clearIronmeshCachedFiles()
+                    clearIronmeshCachedFiles()
                 }.value
                 URLCache.shared.removeAllCachedResponses()
                 await WKWebsiteDataStore.default().removeData(
@@ -1569,22 +1569,13 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 }
 
-private func clearIronmeshCachedFiles() throws {
+private func clearIronmeshCachedFiles() {
     let fileManager = FileManager.default
-    let directories = [
-        fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first,
-        fileManager.temporaryDirectory,
-    ].compactMap { $0 }
-    for directory in directories {
-        let contents = try fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )
-        for item in contents {
-            try fileManager.removeItem(at: item)
-        }
+    guard let cachesDirectory = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+        return
     }
+    let ironmeshCacheDirectory = cachesDirectory.appendingPathComponent("IronMesh", isDirectory: true)
+    try? fileManager.removeItem(at: ironmeshCacheDirectory)
 }
 
 private func appleDiagnosticPlatformName() -> String {

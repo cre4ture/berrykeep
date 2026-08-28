@@ -1,7 +1,6 @@
 package io.ironmesh.android.data
 
 import android.content.Context
-import android.webkit.WebStorage
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.CoroutineScope
@@ -241,7 +240,6 @@ object RustPreferencesBridge {
         context.cacheDir.listFiles()?.forEach { file ->
             file.deleteRecursively()
         }
-        WebStorage.getInstance().deleteAllData()
     }
 
     @JvmStatic

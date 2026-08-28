@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.webkit.WebStorage
 import android.os.SystemClock
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
@@ -495,6 +496,9 @@ class MainViewModel(
         uiState.value = uiState.value.copy(status = "Clearing cached data…")
         viewModelScope.launch {
             val result = runCatching {
+                withContext(Dispatchers.Main) {
+                    WebStorage.getInstance().deleteAllData()
+                }
                 withContext(Dispatchers.IO) {
                     repository.clearCachedData()
                 }

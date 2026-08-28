@@ -429,7 +429,10 @@ pub fn router(config: WebUiConfig) -> Router {
         .unwrap_or_else(|| Arc::new(LogBuffer::new(LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY)));
     let mbtiles_chunk_cache_config = config
         .map_chunk_cache_root
-        .map(|root| match mbtiles::MbtilesChunkCacheConfig::mobile_persistent(root.clone()) {
+        .map(|root| match mbtiles::MbtilesChunkCacheConfig::mobile_persistent(
+            root.clone(),
+            client_cache_scope.clone(),
+        ) {
             Ok(cache_config) => cache_config,
             Err(error) => {
                 warn!(
@@ -437,7 +440,7 @@ pub fn router(config: WebUiConfig) -> Router {
                     error = %error,
                     "persistent mobile MBTiles cache is unavailable; using the in-memory fallback"
                 );
-                mbtiles::MbtilesChunkCacheConfig::default()
+                mbtiles::MbtilesChunkCacheConfig::mobile_memory_only()
             }
         })
         .unwrap_or_default();
