@@ -25,7 +25,7 @@ pub(super) struct GalleryMapQueryTokenPayload {
     pub(super) media_filter: StoreIndexMediaFilter,
     pub(super) viewport: GalleryMapViewport,
     pub(super) resolution: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "storage::GalleryLabelFilter::is_empty")]
     pub(super) label_filter: storage::GalleryLabelFilter,
 }
 

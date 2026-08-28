@@ -625,10 +625,22 @@ export function GallerySurface({
     }
     return [...entriesByPath.values()];
   }, [mapClustersPayload, mapSelectionEntries, showSensitiveContent]);
-  // Cluster totals and representative entries are already filtered by the
-  // server. Unlike an entry-level browser filter, this also keeps a private
-  // image out of aggregate counts and map geometry.
-  const visibleMapClustersPayload = mapClustersPayload;
+  // Cluster totals and representative entries are filtered by current servers.
+  // Older nodes ignore the additive label query parameter, so clear a sensitive
+  // representative entry locally before it can render as a map thumbnail.
+  const visibleMapClustersPayload = useMemo(() => {
+    if (!mapClustersPayload || showSensitiveContent) {
+      return mapClustersPayload;
+    }
+    return {
+      ...mapClustersPayload,
+      clusters: mapClustersPayload.clusters.map((cluster) =>
+        cluster.entry && isSensitiveGalleryEntry(cluster.entry)
+          ? { ...cluster, entry: null }
+          : cluster
+      )
+    };
+  }, [mapClustersPayload, showSensitiveContent]);
   const visibleMapInitialOverviewPayload = mapInitialOverviewPayload;
   const mapMediaEntriesByPath = useMemo(
     () => new Map(mapMediaEntries.map((entry) => [entry.path, entry] as const)),
