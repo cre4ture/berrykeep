@@ -7620,8 +7620,18 @@ async fn start_background_runtimes(
 }
 
 fn build_server_apps(state: &ServerState) -> ServerApps {
-    let public_client_api = Router::new()
+    // The multiplexed client transport always carries a signed device identity.
+    // Its WebSocket handler needs that identity for every request it serves, so
+    // it cannot inherit the optional legacy-client policy of the other public
+    // client endpoints.
+    let public_client_transport_api = Router::new()
         .route("/transport/ws", get(client_transport_ws))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_signed_client_auth,
+        ));
+
+    let public_client_api = Router::new()
         .route("/diagnostics/latency", get(latency_diagnostic))
         .route(
             "/auth/device/renew-rendezvous-identity",
@@ -7980,6 +7990,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .merge(public_admin_api.clone())
         .merge(public_cluster_info_api.clone())
         .merge(web_service_client_api.clone())
+        .merge(public_client_transport_api.clone())
         .merge(public_client_api.clone());
 
     let legacy_public_api = Router::new()
@@ -8049,6 +8060,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .merge(public_admin_api)
         .merge(public_cluster_info_api)
         .merge(web_service_client_api)
+        .merge(public_client_transport_api)
         .merge(public_client_api);
 
     let public_logs_api =

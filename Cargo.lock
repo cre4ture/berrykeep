@@ -5657,6 +5657,7 @@ dependencies = [
  "transport-sdk",
  "turso",
  "uuid",
+ "web-ui-backend",
  "x509-parser 0.16.0",
  "zstd",
 ]
