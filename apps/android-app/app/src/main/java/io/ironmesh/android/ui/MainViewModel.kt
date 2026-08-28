@@ -78,7 +78,6 @@ private data class PersistedMainUiState(
     val deviceAuthResult: Result<DeviceAuthState>,
     val appConnectionStatus: AppConnectionStatus,
     val galleryViewMode: GalleryViewMode,
-    val galleryShowSensitiveContent: Boolean,
     val titleLatencyMonitorSettings: TitleLatencyMonitorSettings,
     val themeAccentColorHex: String,
 )
@@ -280,7 +279,6 @@ class MainViewModel(
                             .filterNotNull()
                             .first(),
                         galleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication()),
-                        galleryShowSensitiveContent = IronmeshPreferences.getGalleryShowSensitiveContent(getApplication()),
                         titleLatencyMonitorSettings =
                             IronmeshPreferences.getTitleLatencyMonitorSettings(getApplication()),
                         themeAccentColorHex = IronmeshPreferences.getThemeAccentColor(getApplication()),
@@ -305,7 +303,6 @@ class MainViewModel(
                 deviceLabelInput = deviceAuth.label.orEmpty(),
                 appConnectionStatus = persisted.appConnectionStatus,
                 galleryMode = persisted.galleryViewMode,
-                galleryShowSensitiveContent = persisted.galleryShowSensitiveContent,
                 titleLatencyMonitorSettings = persisted.titleLatencyMonitorSettings,
                 themeAccentColorHex = persisted.themeAccentColorHex,
                 status = persisted.deviceAuthResult.exceptionOrNull()?.let { error ->
@@ -803,9 +800,6 @@ class MainViewModel(
             galleryCollection = null,
             galleryPages = emptyMap(),
         )
-        persistPreference {
-            IronmeshPreferences.setGalleryShowSensitiveContent(getApplication(), showSensitiveContent)
-        }
         refreshGallery()
     }
 
@@ -1468,9 +1462,6 @@ class MainViewModel(
                 webUiSession = null,
                 status = "Device enrolled: ${authState.deviceId}",
             )
-            persistPreference {
-                IronmeshPreferences.setGalleryShowSensitiveContent(getApplication(), false)
-            }
             if (uiState.value.titleLatencyMonitorSettings.enabled) {
                 configureTitleLatencyMonitor()
             }
@@ -1914,9 +1905,6 @@ class MainViewModel(
                 uiState.value.galleryShowSensitiveContent
         ) {
             uiState.value = uiState.value.copy(galleryShowSensitiveContent = false)
-            withContext(Dispatchers.IO) {
-                IronmeshPreferences.setGalleryShowSensitiveContent(getApplication(), false)
-            }
         }
         return persisted
     }
