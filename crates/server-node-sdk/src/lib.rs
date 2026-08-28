@@ -39,7 +39,10 @@ use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
 use common::xmp::{is_sidecar_key, sidecar_key_for_media};
-use common::{ClusterId, DeviceId, HealthStatus, NodeId, normalize_node_hostname};
+use common::{
+    ClusterId, DeviceId, HealthStatus, NodeId, normalize_node_hostname,
+    parse_comma_separated_labels,
+};
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
 };
@@ -13271,8 +13274,8 @@ fn label_filter_from_query_values(
     required: Option<&str>,
     excluded: Option<&str>,
 ) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
-    let required = client_sdk::parse_comma_separated_labels(required)?;
-    let excluded = client_sdk::parse_comma_separated_labels(excluded)?;
+    let required = parse_comma_separated_labels(required)?;
+    let excluded = parse_comma_separated_labels(excluded)?;
     let label_filter = storage::GalleryLabelFilter { required, excluded };
     if !gallery_label_filter_is_within_limit(&label_filter) {
         return Err("at most 64 labels may be specified across require_labels and exclude_labels");

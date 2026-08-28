@@ -21,9 +21,12 @@ use client_sdk::{
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     ironmesh_client::{DownloadRangeRequest, RelativePathResponse},
-    parse_comma_separated_labels, public_key_fingerprint,
+    public_key_fingerprint,
 };
-use common::logging::{LogBuffer, LogBufferEntry};
+use common::{
+    logging::{LogBuffer, LogBufferEntry},
+    parse_comma_separated_labels,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
