@@ -17549,11 +17549,7 @@ async fn list_store_index_response_cursor_mode(
             HashMap::new()
         }
     };
-    for entry in &mut entries {
-        if let Some(labels) = labels_by_key.get(&entry.path) {
-            entry.labels = labels.clone();
-        }
-    }
+    populate_store_index_entry_labels(&mut entries, &labels_by_key);
 
     let media_summary = summarize_store_index_entries(&entries);
     let returned_entry_count = entries.len();
