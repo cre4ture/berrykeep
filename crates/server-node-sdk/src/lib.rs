@@ -17024,9 +17024,19 @@ async fn list_store_index_response_attempt(
     };
     let labels_by_key = match labels_by_key {
         Ok(labels_by_key) => labels_by_key,
-        Err(error) => {
-            tracing::error!(error = %error, "failed to load labels for generic store index");
+        Err(error) if label_filter_requested => {
+            tracing::error!(
+                error = %error,
+                "failed to load labels while a label filter was requested"
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to load optional labels for generic store index"
+            );
+            HashMap::new()
         }
     };
     for entry in &mut entries {
@@ -17459,8 +17469,11 @@ async fn list_store_index_response_cursor_mode(
     let labels_by_key = match labels_by_key {
         Ok(labels_by_key) => labels_by_key,
         Err(error) => {
-            tracing::error!(error = %error, "failed to load labels for cursor store index");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            tracing::warn!(
+                error = %error,
+                "failed to load optional labels for cursor store index"
+            );
+            HashMap::new()
         }
     };
     for entry in &mut entries {
