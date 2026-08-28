@@ -13608,6 +13608,7 @@ struct StoreIndexPageCacheKey {
     view: Option<StoreIndexView>,
     sort: Option<StoreIndexSortOrder>,
     media_filter: Option<StoreIndexMediaFilter>,
+    label_filter: storage::GalleryLabelFilter,
     thumbnail_route: String,
 }
 
@@ -16387,6 +16388,7 @@ fn build_reconciliation_object_path(key: &str, version_id: &str) -> String {
 fn store_index_page_cache_key(
     query: &StoreIndexQuery,
     thumbnail_route: &str,
+    label_filter: &storage::GalleryLabelFilter,
 ) -> Option<StoreIndexPageCacheKey> {
     if !matches!(query.view, Some(StoreIndexView::Tree))
         || query.limit.is_none()
@@ -16402,6 +16404,7 @@ fn store_index_page_cache_key(
         view: query.view,
         sort: query.sort,
         media_filter: query.media_filter,
+        label_filter: label_filter.clone(),
         thumbnail_route: thumbnail_route.to_string(),
     })
 }
@@ -16440,7 +16443,7 @@ fn store_index_viewport_bounds(
 
 /// Whether `query` asks for a label filter. Generic listings resolve the same
 /// current label projection as the gallery fast path, so they can honour this
-/// filter for every offset-paginated sort and snapshot shape.
+/// filter for every current, offset-paginated sort shape.
 fn store_index_label_filter_requested(label_filter: &storage::GalleryLabelFilter) -> bool {
     !label_filter.is_empty()
 }
@@ -16596,14 +16599,17 @@ fn with_store_index_response_headers(
     response
 }
 
-async fn store_index_media_labels_by_key(
+async fn store_index_labels_by_key(
     state: &ServerState,
     entries: &[StoreIndexEntry],
     operation: &'static str,
+    include_non_media: bool,
 ) -> Result<HashMap<String, Vec<String>>> {
     let keys = entries
         .iter()
-        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
+        .filter(|entry| {
+            entry.entry_type == "key" && (include_non_media || looks_like_media_path(&entry.path))
+        })
         .map(|entry| entry.path.clone())
         .collect::<Vec<_>>();
     if keys.is_empty() {
@@ -16611,6 +16617,14 @@ async fn store_index_media_labels_by_key(
     }
     let store = read_store(state, operation).await;
     store.gallery_object_labels_by_key(&keys).await
+}
+
+async fn store_index_media_labels_by_key(
+    state: &ServerState,
+    entries: &[StoreIndexEntry],
+    operation: &'static str,
+) -> Result<HashMap<String, Vec<String>>> {
+    store_index_labels_by_key(state, entries, operation, false).await
 }
 
 fn populate_store_index_entry_labels(
@@ -16727,9 +16741,7 @@ async fn list_store_index_response_attempt(
         .load(Ordering::SeqCst);
 
     let label_filter_requested = store_index_label_filter_requested(&label_filter);
-    let page_cache_key = (!label_filter_requested)
-        .then(|| store_index_page_cache_key(&query, thumbnail_route))
-        .flatten();
+    let page_cache_key = store_index_page_cache_key(&query, thumbnail_route, &label_filter);
     let gallery_query = store_index_gallery_query(&query, &prefix, depth, label_filter.clone());
     if viewport.is_some() && gallery_query.is_none() {
         return (
@@ -16745,6 +16757,15 @@ async fn list_store_index_response_attempt(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "label filters are unavailable with cursor pagination"
+            })),
+        )
+            .into_response();
+    }
+    if label_filter_requested && query.snapshot.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "label filters are unavailable for snapshot listings"
             })),
         )
             .into_response();
@@ -17079,7 +17100,7 @@ async fn list_store_index_response_attempt(
     let labels_by_key = if label_filter_requested {
         let label_lookup_started_at = Instant::now();
         let labels_by_key =
-            match store_index_media_labels_by_key(state, &entries, "store_index.filtered_labels")
+            match store_index_labels_by_key(state, &entries, "store_index.filtered_labels", true)
                 .await
             {
                 Ok(labels_by_key) => labels_by_key,
@@ -17112,16 +17133,15 @@ async fn list_store_index_response_attempt(
         entries.retain(|entry| {
             entry.entry_type != "key"
                 // The current gallery projection is the only label source
-                // available to this generic path. Non-media keys and missing
-                // projection rows therefore remain unresolved and must stay
-                // hidden whenever a caller requested a label filter.
-                || (looks_like_media_path(&entry.path)
-                    && labels_by_key
-                        .as_ref()
-                        .and_then(|labels_by_key| labels_by_key.get(&entry.path))
-                        .is_some_and(|labels| {
-                            storage::gallery_label_filter_matches(labels, &label_filter)
-                        }))
+                // available to this generic path. Missing projection rows
+                // therefore remain unresolved and must stay hidden whenever
+                // a caller requested a label filter.
+                || labels_by_key
+                    .as_ref()
+                    .and_then(|labels_by_key| labels_by_key.get(&entry.path))
+                    .is_some_and(|labels| {
+                        storage::gallery_label_filter_matches(labels, &label_filter)
+                    })
         });
     }
     let filter_ms = filter_started_at.elapsed().as_millis();

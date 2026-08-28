@@ -14572,6 +14572,14 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
             .await
             .unwrap();
         locked
+            .put_object_versioned(
+                "gallery/public.txt",
+                bytes::Bytes::from_static(b"public notes"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        locked
             .set_media_labels("gallery/private.txt", vec!["private".to_string()])
             .await
             .unwrap();
@@ -14651,6 +14659,46 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
             .iter()
             .all(|entry| entry["path"].as_str() != Some("gallery/private.txt")),
         "a private non-media entry must be excluded by the generic label filter"
+    );
+    assert!(
+        filtered_non_media_payload["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"].as_str() == Some("gallery/public.txt")),
+        "an unlabelled non-media entry must remain in the generic label-filtered listing"
+    );
+
+    // Historical snapshots have no historical label projection. Rejecting the
+    // request keeps the privacy default fail-closed rather than returning a
+    // silently incomplete snapshot listing.
+    let snapshot_filter = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: Some("historical".to_string()),
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(100),
+                sort: Some(super::StoreIndexSortOrder::PathAsc),
+                media_filter: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
+                require_labels: None,
+                exclude_labels: Some("private".to_string()),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        snapshot_filter.status(),
+        axum::http::StatusCode::BAD_REQUEST
     );
 
     cleanup_test_state(&state).await;
@@ -15480,6 +15528,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
     let cached_key = super::store_index_page_cache_key(
         &cached_query,
         super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+        &Default::default(),
     )
     .expect("paginated tree query should have a cache key");
     let stale_cached = state
