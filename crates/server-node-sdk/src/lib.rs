@@ -17203,7 +17203,7 @@ async fn list_store_index_response_attempt(
         materialized_entry_count = total_entry_count;
     }
     let pagination_ms = pagination_started_at.elapsed().as_millis();
-    if !label_filter_requested {
+    if !label_filter_requested && query.snapshot.is_none() {
         let label_lookup_started_at = Instant::now();
         match store_index_media_labels_by_key(state, &entries, "store_index.page_labels").await {
             Ok(labels_by_key) => populate_store_index_entry_labels(&mut entries, &labels_by_key),
