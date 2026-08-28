@@ -17,6 +17,8 @@ type WebServiceNodeState = {
   services: ClientWebService[];
 };
 
+type WebServiceOpenTarget = "in-app" | "browser";
+
 const MAX_CONCURRENT_NODE_SERVICE_REQUESTS = 4;
 
 function sortServices(services: ClientWebService[]): ClientWebService[] {
@@ -36,6 +38,8 @@ export function WebServicesPage() {
   const [error, setError] = useState<string | null>(null);
   const refreshSequence = useRef(0);
   const refreshController = useRef<AbortController | null>(null);
+  const embeddedAndroidClient =
+    new URLSearchParams(window.location.search).get("embedded_client") === "android";
 
   const services = sortServices(
     directServices ?? nodeStates.flatMap((nodeState) => nodeState.services)
@@ -127,16 +131,24 @@ export function WebServicesPage() {
     return () => refreshController.current?.abort();
   }, [refresh]);
 
-  async function openService(service: ClientWebService) {
+  async function openService(service: ClientWebService, target: WebServiceOpenTarget = "browser") {
     const launchKey = `${service.nodeId}:${service.id}`;
-    const popup = window.open("about:blank", "_blank");
-    if (!popup) {
-      setError("The browser blocked the service popup. Allow popups and try again.");
-      return;
-    }
+    let popup: Window | null = null;
     setLaunching(launchKey);
     setError(null);
     try {
+      if (embeddedAndroidClient) {
+        const launch = await launchClientWebService(service.nodeId, service.id);
+        const launchUrl = new URL(launch.url);
+        launchUrl.searchParams.set("ironmesh_open", target);
+        window.location.assign(launchUrl.toString());
+        return;
+      }
+
+      popup = window.open("about:blank", "_blank");
+      if (!popup) {
+        throw new Error("The browser blocked the service popup. Allow popups and try again.");
+      }
       popup.opener = null;
       popup.document.title = `Opening ${service.name}…`;
       if (!popup.document.body) {
@@ -146,7 +158,7 @@ export function WebServicesPage() {
       const launch = await launchClientWebService(service.nodeId, service.id);
       popup.location.replace(launch.url);
     } catch (nextError) {
-      popup.close();
+      popup?.close();
       setError(nextError instanceof Error ? nextError.message : String(nextError));
     } finally {
       setLaunching(null);
@@ -257,12 +269,23 @@ export function WebServicesPage() {
                 <Text size="xs" c="dimmed" ff="monospace">
                   Node {service.nodeId}
                 </Text>
+                {embeddedAndroidClient ? (
+                  <Button
+                    mt="auto"
+                    variant="light"
+                    loading={launching === launchKey}
+                    disabled={launching !== null && launching !== launchKey}
+                    onClick={() => void openService(service, "in-app")}
+                  >
+                    Open in BerryKeep
+                  </Button>
+                ) : null}
                 <Button
-                  mt="auto"
+                  mt={embeddedAndroidClient ? undefined : "auto"}
                   leftSection={<IconExternalLink size={16} />}
                   loading={launching === launchKey}
                   disabled={launching !== null && launching !== launchKey}
-                  onClick={() => void openService(service)}
+                  onClick={() => void openService(service, "browser")}
                 >
                   Open in browser
                 </Button>

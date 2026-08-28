@@ -24,6 +24,7 @@ import io.ironmesh.android.data.writeAndroidDiagnosticLogExport
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.EnrollmentAccessVerification
 import io.ironmesh.android.data.EmbeddedWebUiSessionRegistry
+import io.ironmesh.android.data.PrivateWebServiceBrowserSession
 import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
@@ -136,6 +137,13 @@ class MainViewModel(
     }
 
     init {
+        PrivateWebServiceBrowserSession.registerBackgroundSessionEndedCallback {
+            runOnMainThread {
+                if (uiState.value.webUiSession != null && !uiObservationGate.observationJobsActive) {
+                    webUiSessionBackgroundGrace.schedule()
+                }
+            }
+        }
         registerProcessLifecycleObserver()
         loadPersistedState()
     }
@@ -143,6 +151,7 @@ class MainViewModel(
     override fun onCleared() {
         processLifecycleObserverActive = false
         unregisterProcessLifecycleObserver()
+        PrivateWebServiceBrowserSession.clearBackgroundSessionEndedCallback()
         webUiSessionBackgroundGrace.cancel()
         titleLatencyBackgroundGrace.cancel()
         titleLatencyNativeControlGate.next()
@@ -198,6 +207,7 @@ class MainViewModel(
     }
 
     private fun handleProcessStarted() {
+        PrivateWebServiceBrowserSession.appForegrounded(getApplication())
         webUiSessionBackgroundGrace.cancel()
         titleLatencyBackgroundGrace.cancel()
         titleLatencyNativeControlGate.next()
@@ -209,6 +219,7 @@ class MainViewModel(
     }
 
     private fun handleProcessStopped() {
+        PrivateWebServiceBrowserSession.appBackgrounded()
         if (uiObservationGate.leaveForeground() == UiObservationTransition.STOP) {
             stopUiObservationJobs()
         }
@@ -220,7 +231,7 @@ class MainViewModel(
                 },
             )
         }
-        if (uiState.value.webUiSession != null) {
+        if (uiState.value.webUiSession != null && !PrivateWebServiceBrowserSession.isActive()) {
             webUiSessionBackgroundGrace.schedule()
         }
         if (uiState.value.titleLatencyMonitorSettings.enabled) {
@@ -1289,7 +1300,11 @@ class MainViewModel(
     }
 
     private fun stopWebUiAfterBackgroundGrace() {
-        if (uiState.value.webUiSession == null) {
+        if (
+            uiState.value.webUiSession == null ||
+                uiObservationGate.observationJobsActive ||
+                PrivateWebServiceBrowserSession.isActive()
+        ) {
             return
         }
         EmbeddedWebUiSessionRegistry.clear()
