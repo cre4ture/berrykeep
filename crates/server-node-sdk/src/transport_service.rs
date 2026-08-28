@@ -26,12 +26,12 @@ use crate::{
     reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
     rendezvous_contact_config, renew_device_rendezvous_identity, replication, replication_plan,
     request_has_admin_auth, require_client_auth, require_client_or_admin_auth,
-    require_internal_caller, restore_snapshot_path, restore_version_path, run_cleanup,
-    run_tombstone_archive_purge, run_tombstone_archive_restore, run_tombstone_compaction,
-    s3_frontend, set_media_labels, start_upload_session, storage_stats_current,
-    storage_stats_history, store_index_delta_response, transport_headers_from_response,
-    trigger_replication_audit, upload_session_chunk, validate_client_auth_request,
-    wait_for_store_index_change,
+    require_internal_caller, require_signed_client_auth, restore_snapshot_path,
+    restore_version_path, run_cleanup, run_tombstone_archive_purge, run_tombstone_archive_restore,
+    run_tombstone_compaction, s3_frontend, set_media_labels, start_upload_session,
+    storage_stats_current, storage_stats_history, store_index_delta_response,
+    transport_headers_from_response, trigger_replication_audit, upload_session_chunk,
+    validate_client_auth_request, wait_for_store_index_change, web_service_proxy,
 };
 
 #[derive(Clone)]
@@ -552,6 +552,18 @@ async fn buffered_response_from_axum_response(
 }
 
 fn build_public_transport_router(state: ServerState) -> Router {
+    // Web service ACLs are device-specific, including when the request reaches
+    // the public API through a multiplexed direct or relay transport session.
+    let web_service_client_api = Router::new()
+        .route(
+            "/web-services",
+            get(web_service_proxy::list_client_services),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_signed_client_auth,
+        ));
+
     let public_client_api = Router::new()
         .route("/diagnostics/latency", get(latency_diagnostic))
         .route(
@@ -674,6 +686,7 @@ fn build_public_transport_router(state: ServerState) -> Router {
             post(run_tombstone_archive_purge),
         )
         .merge(public_cluster_info_api.clone())
+        .merge(web_service_client_api.clone())
         .merge(public_client_api.clone());
 
     let legacy_public_api = Router::new()
@@ -719,6 +732,7 @@ fn build_public_transport_router(state: ServerState) -> Router {
             post(run_tombstone_archive_purge),
         )
         .merge(public_cluster_info_api)
+        .merge(web_service_client_api)
         .merge(public_client_api);
 
     Router::new()
