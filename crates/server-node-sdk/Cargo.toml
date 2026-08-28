@@ -66,6 +66,7 @@ x509-parser = "0.16"
 
 [dev-dependencies]
 client-sdk = { path = "../client-sdk" }
+web-ui-backend = { path = "../web-ui-backend" }
 
 [build-dependencies]
 fs2 = "0.4"
