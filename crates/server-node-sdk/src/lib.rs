@@ -16643,15 +16643,19 @@ async fn cached_store_index_page_response(
         .unwrap_or(cached.total_entry_count);
     let has_more = end < cached.total_entry_count;
     let (mut entries, materialized_entry_count) = cached.page(offset, end);
-    let label_lookup_started_at = Instant::now();
-    match store_index_media_labels_by_key(state, &entries, "store_index.cached_labels").await {
-        Ok(labels_by_key) => populate_store_index_entry_labels(&mut entries, &labels_by_key),
-        Err(error) => tracing::warn!(
-            error = %error,
-            "failed to load optional labels for cached generic store index"
-        ),
-    }
-    let label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
+    let label_lookup_ms = if query.snapshot.is_none() {
+        let label_lookup_started_at = Instant::now();
+        match store_index_media_labels_by_key(state, &entries, "store_index.cached_labels").await {
+            Ok(labels_by_key) => populate_store_index_entry_labels(&mut entries, &labels_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional labels for cached generic store index"
+            ),
+        }
+        label_lookup_started_at.elapsed().as_millis()
+    } else {
+        0
+    };
     if state
         .storage
         .namespace_change_sequence
@@ -17541,7 +17545,11 @@ async fn list_store_index_response_cursor_mode(
 
     let label_keys = entries
         .iter()
-        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
+        .filter(|entry| {
+            query.snapshot.is_none()
+                && entry.entry_type == "key"
+                && looks_like_media_path(&entry.path)
+        })
         .map(|entry| entry.path.clone())
         .collect::<Vec<_>>();
     let labels_by_key = {
