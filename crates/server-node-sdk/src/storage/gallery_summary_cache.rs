@@ -77,9 +77,9 @@ pub(crate) struct GallerySummaryCache {
     trackers: Mutex<HashMap<GallerySummaryScope, Arc<GallerySummaryRefreshTracker>>>,
 }
 
-/// The gallery controls expose one scope at a time and only offer a small fixed set of media
-/// filters. This LRU prevents request parameters from growing the process memory without bound
-/// while retaining the scopes a user is most likely to revisit.
+/// The gallery controls expose one scope at a time and only offer a fixed vocabulary of media
+/// and privacy-label filters. This LRU prevents request parameters from growing the process
+/// memory without bound while retaining the scopes a user is most likely to revisit.
 const GALLERY_SUMMARY_CACHE_MAX_SCOPES: usize = 64;
 
 #[derive(Default)]

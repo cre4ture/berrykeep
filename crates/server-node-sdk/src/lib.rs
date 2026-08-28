@@ -13299,6 +13299,17 @@ fn label_filter_from_query_values(
     Ok(label_filter)
 }
 
+/// Gallery-map summaries are cached over their entire scope. Limiting map filters to the
+/// privacy labels keeps their cache vocabulary finite and prevents arbitrary query strings from
+/// triggering a synchronous full-library aggregate scan on every request.
+fn gallery_map_label_filter_is_supported(label_filter: &storage::GalleryLabelFilter) -> bool {
+    label_filter
+        .required
+        .iter()
+        .chain(&label_filter.excluded)
+        .all(|label| matches!(label.as_str(), "private" | "nsfw"))
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct StoreIndexDeltaQuery {
     token: Option<String>,
@@ -15900,6 +15911,15 @@ async fn gallery_map_clusters_response(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
         }
     };
+    if !gallery_map_label_filter_is_supported(&label_filter) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "gallery map label filters only support private and nsfw"
+            })),
+        )
+            .into_response();
+    }
     let viewport = match gallery_map_viewport_from_query(&query) {
         Ok(viewport) => viewport,
         Err(message) => {

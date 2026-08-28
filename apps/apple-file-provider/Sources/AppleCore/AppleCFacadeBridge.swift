@@ -95,32 +95,6 @@ public protocol AppleManualCBridgeFFI: Sendable {
 }
 
 public extension AppleManualCBridgeFFI {
-    func storeIndexJSON(
-        handle: AppleRustHandle,
-        prefix: String?,
-        depth: Int,
-        snapshot: String?,
-        view: String?,
-        offset: Int?,
-        limit: Int?,
-        sort: String?,
-        mediaFilter: String?,
-        excludeLabels: String?
-    ) throws -> String {
-        _ = excludeLabels
-        return try storeIndexJSON(
-            handle: handle,
-            prefix: prefix,
-            depth: depth,
-            snapshot: snapshot,
-            view: view,
-            offset: offset,
-            limit: limit,
-            sort: sort,
-            mediaFilter: mediaFilter
-        )
-    }
-
     func setMediaLabels(handle: AppleRustHandle, key: String, labelsJSON: String) throws {
         _ = handle
         _ = key

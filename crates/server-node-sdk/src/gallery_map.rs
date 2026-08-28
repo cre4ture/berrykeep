@@ -58,6 +58,7 @@ pub(super) fn decode_gallery_map_query_token(token: &str) -> Option<GalleryMapQu
         || payload.resolution == 0
         || payload.resolution > MAX_GALLERY_MAP_RESOLUTION
         || !super::gallery_label_filter_is_within_limit(&payload.label_filter)
+        || !super::gallery_map_label_filter_is_supported(&payload.label_filter)
         || !gallery_map_viewport_is_valid(payload.viewport)
     {
         return None;
@@ -266,6 +267,16 @@ mod tests {
         payload.label_filter.required = (0..=super::super::MAX_GALLERY_LABEL_FILTER_LABELS)
             .map(|index| format!("label-{index}"))
             .collect();
+
+        assert!(
+            decode_gallery_map_query_token(&encode_gallery_map_query_token(&payload)).is_none()
+        );
+    }
+
+    #[test]
+    fn map_query_token_rejects_non_privacy_label_filters() {
+        let mut payload = token_payload();
+        payload.label_filter.excluded = vec!["archived".to_string()];
 
         assert!(
             decode_gallery_map_query_token(&encode_gallery_map_query_token(&payload)).is_none()

@@ -2018,26 +2018,27 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
         first.manifest_hash
     };
 
+    let cluster_query = super::GalleryMapClustersQuery {
+        prefix: Some("gallery".to_string()),
+        depth: Some(64),
+        media_filter: Some(super::StoreIndexMediaFilter::Image),
+        south: Some(46.5),
+        west: Some(7.5),
+        north: Some(48.5),
+        east: Some(9.5),
+        resolution_south: Some(47.0),
+        resolution_west: Some(8.0),
+        resolution_north: Some(48.0),
+        resolution_east: Some(9.0),
+        zoom: Some(3),
+        zoom_precise: Some(3.75),
+        cluster_cell_size_px: Some(16.0),
+        require_labels: None,
+        exclude_labels: Some("private".to_string()),
+    };
     let clusters = super::gallery_map_clusters_response(
         &state,
-        super::GalleryMapClustersQuery {
-            prefix: Some("gallery".to_string()),
-            depth: Some(64),
-            media_filter: Some(super::StoreIndexMediaFilter::Image),
-            south: Some(46.5),
-            west: Some(7.5),
-            north: Some(48.5),
-            east: Some(9.5),
-            resolution_south: Some(47.0),
-            resolution_west: Some(8.0),
-            resolution_north: Some(48.0),
-            resolution_east: Some(9.0),
-            zoom: Some(3),
-            zoom_precise: Some(3.75),
-            cluster_cell_size_px: Some(16.0),
-            require_labels: None,
-            exclude_labels: Some("private".to_string()),
-        },
+        cluster_query.clone(),
         super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
     )
     .await;
@@ -2050,6 +2051,17 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
     assert_eq!(clusters_payload["resolution"].as_u64(), Some(512));
     assert_eq!(clusters_payload["clusters"].as_array().unwrap().len(), 1);
     assert_eq!(clusters_payload["clusters"][0]["count"], 1);
+
+    let mut unsupported_label_query = cluster_query;
+    unsupported_label_query.exclude_labels = Some("archived".to_string());
+    let unsupported_labels = super::gallery_map_clusters_response(
+        &state,
+        unsupported_label_query,
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(unsupported_labels.status(), StatusCode::BAD_REQUEST);
+
     let query_token = clusters_payload["query_token"].as_str().unwrap();
     let cluster_id = clusters_payload["clusters"][0]["cluster_id"]
         .as_str()
