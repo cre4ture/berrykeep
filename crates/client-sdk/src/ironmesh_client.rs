@@ -7596,13 +7596,15 @@ impl IronMeshClient {
 }
 
 /// Appends a label filter using the stable comma-separated wire format accepted
-/// by the node and web proxy. Empty labels are ignored consistently across the
-/// store index and map clients.
+/// by the node and web proxy. Commas and backslashes inside label names are
+/// escaped so the server can recover each exact label. Empty labels are ignored
+/// consistently across the store index and map clients.
 fn append_comma_separated_labels(url: &mut Url, parameter: &str, labels: &[String]) {
     let labels = labels
         .iter()
         .map(|label| label.trim())
         .filter(|label| !label.is_empty())
+        .map(|label| label.replace('\\', "\\\\").replace(',', "\\,"))
         .collect::<Vec<_>>();
     if !labels.is_empty() {
         url.query_pairs_mut()

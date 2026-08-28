@@ -2191,6 +2191,21 @@ fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
     assert!(antimeridian.west > antimeridian.east);
 }
 
+#[test]
+fn store_index_label_filters_preserve_escaped_commas_and_backslashes() {
+    let filter = super::label_filter_from_query_values(
+        Some(r"family\, close,travel\\journal"),
+        Some(r"private\, archive"),
+    )
+    .expect("escaped label filters should parse");
+    assert_eq!(
+        filter.required,
+        vec!["family, close".to_string(), "travel\\journal".to_string()]
+    );
+    assert_eq!(filter.excluded, vec!["private, archive".to_string()]);
+    assert!(super::label_filter_from_query_values(Some("invalid\\escape"), None).is_err());
+}
+
 #[tokio::test]
 async fn gallery_label_filter_limit_returns_bad_request() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;

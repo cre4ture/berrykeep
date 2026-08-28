@@ -348,6 +348,7 @@ function appendLabelFilter(
   const value = (labels ?? [])
     .map((label) => label.trim())
     .filter(Boolean)
+    .map((label) => label.replaceAll("\\", "\\\\").replaceAll(",", "\\,"))
     .join(",");
   if (value) {
     query.set(parameter, value);

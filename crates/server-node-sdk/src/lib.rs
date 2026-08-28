@@ -13260,21 +13260,49 @@ struct StoreIndexQuery {
 
 /// Splits a comma-separated label parameter into the labels it names.
 ///
-/// Blank entries are dropped, so a trailing comma or an empty parameter does
-/// not become a filter on the empty label.
-fn store_index_labels(raw: Option<&str>) -> Vec<String> {
-    raw.map(|value| {
-        let mut labels = value
-            .split(',')
-            .map(str::trim)
-            .filter(|label| !label.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        labels.sort_unstable();
-        labels.dedup();
-        labels
-    })
-    .unwrap_or_default()
+/// A backslash escapes a comma or another backslash, allowing an XMP keyword
+/// containing either character to remain an exact-match filter value. Blank
+/// entries are dropped, so a trailing comma or an empty parameter does not
+/// become a filter on the empty label.
+fn store_index_labels(raw: Option<&str>) -> std::result::Result<Vec<String>, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+
+    let mut labels = Vec::new();
+    let mut label = String::new();
+    let mut escaped = false;
+    for character in raw.chars() {
+        if escaped {
+            if !matches!(character, ',' | '\\') {
+                return Err("label filters may only escape commas and backslashes");
+            }
+            label.push(character);
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            ',' => {
+                let trimmed_label = label.trim();
+                if !trimmed_label.is_empty() {
+                    labels.push(trimmed_label.to_string());
+                }
+                label.clear();
+            }
+            _ => label.push(character),
+        }
+    }
+    if escaped {
+        return Err("label filters must not end with an escape character");
+    }
+    let label = label.trim();
+    if !label.is_empty() {
+        labels.push(label.to_string());
+    }
+    labels.sort_unstable();
+    labels.dedup();
+    Ok(labels)
 }
 
 fn store_index_label_filter(
@@ -13290,8 +13318,8 @@ fn label_filter_from_query_values(
     required: Option<&str>,
     excluded: Option<&str>,
 ) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
-    let required = store_index_labels(required);
-    let excluded = store_index_labels(excluded);
+    let required = store_index_labels(required)?;
+    let excluded = store_index_labels(excluded)?;
     let label_filter = storage::GalleryLabelFilter { required, excluded };
     if !gallery_label_filter_is_within_limit(&label_filter) {
         return Err("at most 64 labels may be specified across require_labels and exclude_labels");

@@ -3546,8 +3546,8 @@ fn gallery_map_clusters_request() -> GalleryMapClustersRequest {
 fn gallery_map_label_filters_use_one_comma_separated_query_value_each() {
     let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
     let mut request = gallery_map_clusters_request();
-    request.require_labels = vec!["  travel ".to_string(), "family".to_string()];
-    request.exclude_labels = vec!["private".to_string(), "nsfw ".to_string()];
+    request.require_labels = vec![" private ".to_string()];
+    request.exclude_labels = vec!["nsfw ".to_string()];
 
     let url = client
         .gallery_map_clusters_url("/api/v1/gallery/map/clusters", &request, 1, 1.0)
@@ -3557,11 +3557,28 @@ fn gallery_map_label_filters_use_one_comma_separated_query_value_each() {
         .collect::<std::collections::HashMap<_, _>>();
     assert_eq!(
         query.get("require_labels").map(|value| value.as_ref()),
-        Some("travel,family")
+        Some("private")
     );
     assert_eq!(
         query.get("exclude_labels").map(|value| value.as_ref()),
-        Some("private,nsfw")
+        Some("nsfw")
+    );
+}
+
+#[test]
+fn label_filter_wire_format_escapes_commas_and_backslashes() {
+    let mut url = Url::parse("http://127.0.0.1:18080/store/list")
+        .expect("label filter test URL should parse");
+    append_comma_separated_labels(
+        &mut url,
+        "require_labels",
+        &["family, close".to_string(), "travel\\journal".to_string()],
+    );
+
+    assert_eq!(
+        url.query_pairs()
+            .find_map(|(key, value)| (key == "require_labels").then_some(value.into_owned())),
+        Some(r"family\, close,travel\\journal".to_string())
     );
 }
 
