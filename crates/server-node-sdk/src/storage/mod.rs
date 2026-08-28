@@ -1072,6 +1072,33 @@ pub(crate) fn gallery_map_bounded_resolution(
     max_clusters: usize,
 ) -> u32 {
     let max_clusters = max_clusters.max(1) as f64;
+    let mut resolution = requested_resolution.max(1);
+    while gallery_map_viewport_cell_upper_bound(viewport, resolution) > max_clusters
+        && resolution > 1
+    {
+        resolution /= 2;
+    }
+    resolution
+}
+
+/// Scales a visible-viewport cluster budget to cover a prefetched query viewport. The multiplier
+/// is bounded by the 2× width and height prefetch contract, so a normal request keeps its base
+/// budget while a full 2× envelope can return at most four times as many occupied cells.
+pub(crate) fn gallery_map_prefetch_max_clusters(
+    visible_max_clusters: usize,
+    requested_resolution: u32,
+    visible_viewport: GalleryViewportBounds,
+    prefetch_viewport: GalleryViewportBounds,
+) -> usize {
+    let visible_cells =
+        gallery_map_viewport_cell_upper_bound(visible_viewport, requested_resolution).max(1.0);
+    let prefetch_cells =
+        gallery_map_viewport_cell_upper_bound(prefetch_viewport, requested_resolution);
+    let multiplier = (prefetch_cells / visible_cells).ceil().clamp(1.0, 4.0) as usize;
+    visible_max_clusters.max(1).saturating_mul(multiplier)
+}
+
+fn gallery_map_viewport_cell_upper_bound(viewport: GalleryViewportBounds, resolution: u32) -> f64 {
     let longitude_span = if viewport.west <= viewport.east {
         viewport.east - viewport.west
     } else {
@@ -1086,17 +1113,10 @@ pub(crate) fn gallery_map_bounded_resolution(
     let latitude_span = (mercator_y(viewport.north) - mercator_y(viewport.south))
         .abs()
         .clamp(0.0, 1.0);
-    let mut resolution = requested_resolution.max(1);
-    while gallery_map_viewport_cell_upper_bound(longitude_span, latitude_span, resolution)
-        > max_clusters
-        && resolution > 1
-    {
-        resolution /= 2;
-    }
-    resolution
+    gallery_map_viewport_cell_count(longitude_span, latitude_span, resolution)
 }
 
-fn gallery_map_viewport_cell_upper_bound(
+fn gallery_map_viewport_cell_count(
     longitude_span: f64,
     latitude_span: f64,
     resolution: u32,
