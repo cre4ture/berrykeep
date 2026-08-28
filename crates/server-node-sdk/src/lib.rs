@@ -16599,17 +16599,14 @@ fn with_store_index_response_headers(
     response
 }
 
-async fn store_index_labels_by_key(
+async fn store_index_media_labels_by_key(
     state: &ServerState,
     entries: &[StoreIndexEntry],
     operation: &'static str,
-    include_non_media: bool,
 ) -> Result<HashMap<String, Vec<String>>> {
     let keys = entries
         .iter()
-        .filter(|entry| {
-            entry.entry_type == "key" && (include_non_media || looks_like_media_path(&entry.path))
-        })
+        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
         .map(|entry| entry.path.clone())
         .collect::<Vec<_>>();
     if keys.is_empty() {
@@ -16617,14 +16614,6 @@ async fn store_index_labels_by_key(
     }
     let store = read_store(state, operation).await;
     store.gallery_object_labels_by_key(&keys).await
-}
-
-async fn store_index_media_labels_by_key(
-    state: &ServerState,
-    entries: &[StoreIndexEntry],
-    operation: &'static str,
-) -> Result<HashMap<String, Vec<String>>> {
-    store_index_labels_by_key(state, entries, operation, false).await
 }
 
 fn populate_store_index_entry_labels(
@@ -17100,7 +17089,7 @@ async fn list_store_index_response_attempt(
     let labels_by_key = if label_filter_requested {
         let label_lookup_started_at = Instant::now();
         let labels_by_key =
-            match store_index_labels_by_key(state, &entries, "store_index.filtered_labels", true)
+            match store_index_media_labels_by_key(state, &entries, "store_index.filtered_labels")
                 .await
             {
                 Ok(labels_by_key) => labels_by_key,
@@ -17133,9 +17122,9 @@ async fn list_store_index_response_attempt(
         entries.retain(|entry| {
             entry.entry_type != "key"
                 // The current gallery projection is the only label source
-                // available to this generic path. Missing projection rows
-                // therefore remain unresolved and must stay hidden whenever
-                // a caller requested a label filter.
+                // available to this generic path. It only applies to media,
+                // while non-media keys remain visible in file listings.
+                || !looks_like_media_path(&entry.path)
                 || labels_by_key
                     .as_ref()
                     .and_then(|labels_by_key| labels_by_key.get(&entry.path))

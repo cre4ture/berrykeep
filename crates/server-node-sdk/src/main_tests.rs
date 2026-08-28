@@ -14565,8 +14565,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
         let mut locked = lock_store(&state, "tests.state.store").await;
         locked
             .put_object_versioned(
-                "gallery/private.txt",
-                bytes::Bytes::from_static(b"private notes"),
+                "gallery/readme.txt",
+                bytes::Bytes::from_static(b"readme"),
                 PutOptions::default(),
             )
             .await
@@ -14577,10 +14577,6 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 bytes::Bytes::from_static(b"public notes"),
                 PutOptions::default(),
             )
-            .await
-            .unwrap();
-        locked
-            .set_media_labels("gallery/private.txt", vec!["private".to_string()])
             .await
             .unwrap();
     }
@@ -14618,9 +14614,9 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
     assert_eq!(filtered_payload["total_entry_count"], 0);
     assert_eq!(filtered_payload["entries"], serde_json::json!([]));
 
-    // Labels are valid on non-media objects too. The generic path must resolve
-    // those labels whenever it filters, instead of treating an unpopulated
-    // `labels` field as an unlabelled object.
+    // Label filters apply to gallery media. Generic file listings must retain
+    // non-media entries instead of discarding them for lacking a media label
+    // projection.
     let filtered_non_media = axum::response::IntoResponse::into_response(
         super::list_store_index(
             axum::extract::State(state.clone()),
@@ -14657,8 +14653,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
             .as_array()
             .unwrap()
             .iter()
-            .all(|entry| entry["path"].as_str() != Some("gallery/private.txt")),
-        "a private non-media entry must be excluded by the generic label filter"
+            .any(|entry| entry["path"].as_str() == Some("gallery/readme.txt")),
+        "a non-media entry must remain in the generic label-filtered listing"
     );
     assert!(
         filtered_non_media_payload["entries"]

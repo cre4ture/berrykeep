@@ -8596,14 +8596,22 @@ impl PersistentStore {
         let Some(media_key) = media_key_for_sidecar(key) else {
             return Ok(());
         };
+        if gallery_media_type_for_path(&media_key).is_none() {
+            return Ok(());
+        }
         self.set_gallery_object_labels(&media_key, &[]).await
     }
 
     /// Applies the labels of the sidecar already stored for `media_key`, if any.
     ///
-    /// Every current object has a gallery projection row, so generic listings
-    /// can apply the same label-filter semantics to media and non-media keys.
+    /// Only objects the gallery projects can surface labels, and the current
+    /// object cache does not retain misses. Gating on the media type therefore
+    /// keeps the common ingest of non-media files from paying a sidecar lookup
+    /// that can never resolve to a visible label.
     async fn apply_stored_sidecar_labels(&self, media_key: &str) -> Result<()> {
+        if gallery_media_type_for_path(media_key).is_none() {
+            return Ok(());
+        }
         let sidecar_key = sidecar_key_for_media(media_key);
         let Some(sidecar) = self.current_object_entry(&sidecar_key).await? else {
             return Ok(());
@@ -8615,6 +8623,9 @@ impl PersistentStore {
     /// Stores the keywords of the given sidecar object on the projection row of
     /// `media_key`.
     async fn apply_sidecar_labels(&self, media_key: &str, manifest_hash: &str) -> Result<()> {
+        if gallery_media_type_for_path(media_key).is_none() {
+            return Ok(());
+        }
         let Some(keywords) = self.read_sidecar_keywords(media_key, manifest_hash).await else {
             return Ok(());
         };
