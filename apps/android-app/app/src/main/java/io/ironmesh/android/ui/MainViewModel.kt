@@ -810,6 +810,12 @@ class MainViewModel(
     }
 
     fun toggleGalleryMediaLabel(item: GalleryImageItem, label: String) {
+        if (!item.labelsResolved) {
+            uiState.value = uiState.value.copy(
+                status = "Image labels are temporarily unavailable. Refresh before editing them.",
+            )
+            return
+        }
         val nextLabels = if (item.labels.contains(label)) {
             item.labels.filterNot { it == label }
         } else {
@@ -1458,9 +1464,13 @@ class MainViewModel(
                 connectionRoutesError = null,
                 connectionRoutesLastLoadedUnixMs = 0L,
                 selectedSection = MainSection.HOME,
+                galleryShowSensitiveContent = false,
                 webUiSession = null,
                 status = "Device enrolled: ${authState.deviceId}",
             )
+            persistPreference {
+                IronmeshPreferences.setGalleryShowSensitiveContent(getApplication(), false)
+            }
             if (uiState.value.titleLatencyMonitorSettings.enabled) {
                 configureTitleLatencyMonitor()
             }
@@ -1884,6 +1894,7 @@ class MainViewModel(
         val persisted = withContext(Dispatchers.IO) {
             IronmeshPreferences.getDeviceAuthState(getApplication())
         }
+        val previousDeviceId = deviceAuthState.deviceId
         deviceAuthState = persisted
         val identity = persisted.toDeviceIdentityUiState()
         val nodePriorityOverrides = persisted.nodePriorityOverrides()
@@ -1895,6 +1906,17 @@ class MainViewModel(
                 deviceIdentity = identity,
                 nodePriorityOverrides = nodePriorityOverrides,
             )
+        }
+        if (
+            previousDeviceId.isNotBlank() &&
+                persisted.deviceId.isNotBlank() &&
+                previousDeviceId != persisted.deviceId &&
+                uiState.value.galleryShowSensitiveContent
+        ) {
+            uiState.value = uiState.value.copy(galleryShowSensitiveContent = false)
+            withContext(Dispatchers.IO) {
+                IronmeshPreferences.setGalleryShowSensitiveContent(getApplication(), false)
+            }
         }
         return persisted
     }
@@ -2244,6 +2266,7 @@ class MainViewModel(
             height = entry.media?.height,
             thumbnailStatus = entry.media?.status,
             labels = entry.labels,
+            labelsResolved = entry.labels_resolved,
         )
     }
 

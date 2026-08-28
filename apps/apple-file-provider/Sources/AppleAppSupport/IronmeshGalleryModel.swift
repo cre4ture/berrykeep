@@ -91,6 +91,10 @@ final class IronmeshGalleryModel: ObservableObject {
         guard let context = activeContext else {
             return
         }
+        guard entry.labelsResolved == true else {
+            errorMessage = "Image labels are temporarily unavailable. Refresh before editing them."
+            return
+        }
         let labels = entry.labels ?? []
         let nextLabels = labels.contains(label)
             ? labels.filter { $0 != label }

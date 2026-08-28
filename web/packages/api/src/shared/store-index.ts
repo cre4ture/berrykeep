@@ -39,6 +39,7 @@ export type StoreIndexEntry = {
   path: string;
   entry_type: string;
   labels?: string[];
+  labels_resolved?: boolean;
   version?: string | null;
   content_hash?: string | null;
   size_bytes?: number | null;

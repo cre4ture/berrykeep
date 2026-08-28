@@ -13484,6 +13484,10 @@ struct StoreIndexEntry {
     /// none, so responses for unlabelled media stay byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     labels: Vec<String>,
+    /// Whether `labels` is an authoritative view of the sidecar. Clients must
+    /// not replace labels while this is false, because doing so could discard
+    /// labels that were unavailable during a best-effort projection lookup.
+    labels_resolved: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -16548,6 +16552,7 @@ fn store_index_entry_from_gallery_entry(
         content_fingerprint: entry.content_fingerprint,
         media,
         labels: entry.labels,
+        labels_resolved: true,
     }
 }
 
@@ -16615,6 +16620,7 @@ fn populate_store_index_entry_labels(
     for entry in entries {
         if let Some(labels) = labels_by_key.get(&entry.path) {
             entry.labels = labels.clone();
+            entry.labels_resolved = true;
         }
     }
 }
@@ -17673,6 +17679,7 @@ fn collapse_store_index_entries_for_tree_view(
                 content_fingerprint: None,
                 media: None,
                 labels: Vec::new(),
+                labels_resolved: false,
             });
     }
 
@@ -18238,6 +18245,7 @@ fn build_store_index_prefix_entry(path: String) -> StoreIndexEntry {
         // Labels are a property of the gallery projection; the generic listing
         // does not resolve them.
         labels: Vec::new(),
+        labels_resolved: false,
     }
 }
 
@@ -18272,6 +18280,7 @@ fn build_store_index_object_entry(
         // Labels are a property of the gallery projection; the generic listing
         // does not resolve them.
         labels: Vec::new(),
+        labels_resolved: false,
     }
 }
 

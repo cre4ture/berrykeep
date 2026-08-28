@@ -62,6 +62,7 @@ data class GalleryImageItem(
     val height: Int? = null,
     val thumbnailStatus: String? = null,
     val labels: List<String> = emptyList(),
+    val labelsResolved: Boolean = false,
 )
 
 @Immutable

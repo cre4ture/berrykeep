@@ -80,7 +80,6 @@ const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".web
 const videoExtensions = [".m4v", ".mkv", ".mov", ".mp4", ".ogv", ".webm"];
 const GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY = "ironmesh.gallery.thumbnails_per_row";
 const GALLERY_SHOW_METADATA_STORAGE_KEY = "ironmesh.gallery.show_metadata";
-const GALLERY_SHOW_SENSITIVE_CONTENT_STORAGE_KEY = "ironmesh.gallery.show_sensitive_content";
 const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
 const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
 const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
@@ -154,6 +153,7 @@ export type GalleryEntry = {
   path: string;
   entry_type: string;
   labels?: string[];
+  labels_resolved?: boolean;
   version?: string | null;
   size_bytes?: number | null;
   media?: {
@@ -445,9 +445,9 @@ export function GallerySurface({
   const [depth, setDepth] = useState(GALLERY_MAX_DEPTH);
   const [thumbnailsPerRow, setThumbnailsPerRow] = useState(loadStoredThumbnailsPerRow);
   const [showMetadata, setShowMetadata] = useState(loadStoredShowMetadata);
-  const [showSensitiveContent, setShowSensitiveContent] = useState(
-    loadStoredShowSensitiveContent
-  );
+  // Sensitive-content visibility is intentionally scoped to this mounted gallery. Persisting it
+  // at the browser-origin level would reveal media after the user switches to another gallery.
+  const [showSensitiveContent, setShowSensitiveContent] = useState(false);
   const { ref: galleryGridRef, width: galleryGridWidth } = useElementSize();
   const [viewMode, setViewMode] = useState(() => loadInitialViewMode(initialViewMode));
   const [activeBasemapId, setActiveBasemapId] = useState(loadStoredBasemapId);
@@ -537,10 +537,6 @@ export function GallerySurface({
   useEffect(() => {
     persistShowMetadata(showMetadata);
   }, [showMetadata]);
-
-  useEffect(() => {
-    persistShowSensitiveContent(showSensitiveContent);
-  }, [showSensitiveContent]);
 
   useEffect(() => {
     persistViewMode(viewMode);
@@ -1033,6 +1029,10 @@ export function GallerySurface({
   async function toggleSensitiveLabel(entry: GalleryEntry, label: (typeof GALLERY_SENSITIVE_LABELS)[number]) {
     if (!setMediaLabels) {
       setError("Editing image labels is not available on this surface.");
+      return;
+    }
+    if (entry.labels_resolved !== true) {
+      setError("Image labels are temporarily unavailable. Refresh before editing them.");
       return;
     }
 
@@ -4446,16 +4446,6 @@ function loadStoredShowMetadata(): boolean {
   return parseShowMetadata(window.localStorage.getItem(GALLERY_SHOW_METADATA_STORAGE_KEY));
 }
 
-function loadStoredShowSensitiveContent(): boolean {
-  if (typeof window === "undefined") {
-    return false;
-  }
-
-  return parseShowSensitiveContent(
-    window.localStorage.getItem(GALLERY_SHOW_SENSITIVE_CONTENT_STORAGE_KEY)
-  );
-}
-
 function loadStoredViewMode(): GalleryViewMode {
   if (typeof window === "undefined") {
     return "grid";
@@ -4511,17 +4501,6 @@ function persistShowMetadata(value: boolean) {
   window.localStorage.setItem(
     GALLERY_SHOW_METADATA_STORAGE_KEY,
     String(parseShowMetadata(value))
-  );
-}
-
-function persistShowSensitiveContent(value: boolean) {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  window.localStorage.setItem(
-    GALLERY_SHOW_SENSITIVE_CONTENT_STORAGE_KEY,
-    String(parseShowSensitiveContent(value))
   );
 }
 
@@ -4589,10 +4568,6 @@ function parseShowMetadata(value: boolean | string | null | undefined): boolean 
   }
 
   return true;
-}
-
-function parseShowSensitiveContent(value: boolean | string | null | undefined): boolean {
-  return value === true || value === "true";
 }
 
 function isSensitiveGalleryEntry(entry: GalleryEntry): boolean {

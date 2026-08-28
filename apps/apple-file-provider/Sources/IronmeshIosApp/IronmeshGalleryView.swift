@@ -7,7 +7,9 @@ struct IronmeshGalleryView: View {
     @StateObject private var galleryModel = IronmeshGalleryModel()
     @State private var mode: AppleGalleryMode = .allImages
     @State private var sort: AppleGallerySort = .newest
-    @AppStorage("ironmesh.gallery.show_sensitive_content") private var showSensitiveContent = false
+    // Do not persist a reveal decision across connection configurations. A different gallery
+    // must start private and NSFW media hidden until the user explicitly opts in again.
+    @State private var showSensitiveContent = false
     @State private var selection: IronmeshGallerySelection?
 
     private var loadID: IronmeshGalleryLoadID {
@@ -45,6 +47,9 @@ struct IronmeshGalleryView: View {
         }
         .onChange(of: loadID) { _ in
             selection = nil
+        }
+        .onChange(of: browserModel.draft.connectionConfiguration) { _ in
+            showSensitiveContent = false
         }
         .fullScreenCover(item: $selection) { selection in
             if let configuration = browserModel.draft.connectionConfiguration {

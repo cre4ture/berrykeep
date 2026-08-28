@@ -186,6 +186,7 @@ public struct AppleStoreIndexEntry: Codable, Equatable, Sendable, Identifiable {
     public var modifiedAtUnix: UInt64?
     public var contentFingerprint: String?
     public var labels: [String]?
+    public var labelsResolved: Bool?
     public var media: AppleStoreIndexMedia?
 
     public var id: String { path }
@@ -199,6 +200,7 @@ public struct AppleStoreIndexEntry: Codable, Equatable, Sendable, Identifiable {
         case modifiedAtUnix = "modified_at_unix"
         case contentFingerprint = "content_fingerprint"
         case labels
+        case labelsResolved = "labels_resolved"
         case media
     }
 }

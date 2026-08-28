@@ -13194,6 +13194,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             content_fingerprint: None,
             media: None,
             labels: Vec::new(),
+            labels_resolved: false,
         },
         super::StoreIndexEntry {
             path: "images/".to_string(),
@@ -13205,6 +13206,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             content_fingerprint: None,
             media: None,
             labels: Vec::new(),
+            labels_resolved: false,
         },
         super::StoreIndexEntry {
             path: "images/cat.png".to_string(),
@@ -13216,6 +13218,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             content_fingerprint: None,
             media: None,
             labels: Vec::new(),
+            labels_resolved: false,
         },
     ];
 
@@ -14550,6 +14553,7 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
         entries[0]["labels"],
         serde_json::json!(["private", "travel"])
     );
+    assert_eq!(entries[0]["labels_resolved"], true);
     assert!(
         media["thumbnail"]["url"]
             .as_str()
@@ -16163,6 +16167,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 error: None,
             }),
             labels: Vec::new(),
+            labels_resolved: false,
         },
         super::StoreIndexEntry {
             path: "gallery/newer.jpg".to_string(),
@@ -16196,6 +16201,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 error: None,
             }),
             labels: Vec::new(),
+            labels_resolved: false,
         },
         super::StoreIndexEntry {
             path: "gallery/clip.mp4".to_string(),
@@ -16226,6 +16232,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 error: None,
             }),
             labels: Vec::new(),
+            labels_resolved: false,
         },
         super::StoreIndexEntry {
             path: "gallery/subdir/".to_string(),
@@ -16237,6 +16244,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
             content_fingerprint: None,
             media: None,
             labels: Vec::new(),
+            labels_resolved: false,
         },
     ];
 
@@ -16346,6 +16354,7 @@ fn store_index_prepared_sort_materializes_only_requested_prefix() {
                 error: None,
             }),
             labels: Vec::new(),
+            labels_resolved: false,
         })
         .collect::<Vec<_>>();
     let mut prepared = super::StoreIndexPreparedEntries::new(

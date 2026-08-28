@@ -1307,6 +1307,7 @@ mod tests {
                     path: "docs/readme.txt".to_string(),
                     entry_type: "key".to_string(),
                     labels: Vec::new(),
+                    labels_resolved: false,
                     version: Some("v1".to_string()),
                     content_hash: Some("hash-1".to_string()),
                     size_bytes: Some(42),

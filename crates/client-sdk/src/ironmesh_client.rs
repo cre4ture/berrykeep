@@ -3387,6 +3387,10 @@ pub struct StoreIndexEntry {
     pub entry_type: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// True only when the response could authoritatively read the entry's
+    /// XMP-sidecar labels. Callers must not replace labels when false.
+    #[serde(default)]
+    pub labels_resolved: bool,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -8999,6 +9003,7 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>, scope_prefi
                 path: marker,
                 entry_type: "prefix".to_string(),
                 labels: Vec::new(),
+                labels_resolved: false,
                 version: None,
                 content_hash: None,
                 size_bytes: None,
