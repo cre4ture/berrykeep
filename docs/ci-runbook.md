@@ -41,6 +41,50 @@ The validation job does not run on ordinary pushes or manual CI runs. Add the
 stable `vX.Y.Z` release tag to run it automatically alongside the signed
 release workflow.
 
+## Signed Windows client sideload releases
+
+The `Release` workflow also creates a Windows client test-release artifact.
+It builds the MSIX from the requested immutable release tag with
+`Build-StoreUploadPackage.ps1 -SkipSigning`, then passes the single unsigned
+MSIX to a separate protected `windows-client-signing` job. That job checks out
+the protected default branch only for `Sign-Msix.ps1` and
+`New-MsixUploadPackage.ps1`, verifies the certificate and manifest publisher,
+timestamps the MSIX, and creates an `.msixupload` from the signed package.
+
+Configure these values before a client-signed release:
+
+- repository variable
+  `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_THUMBPRINT` - normalized
+  SHA-1 thumbprint of the client PFX;
+- environment secret
+  `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_B64` - base64-encoded PFX;
+- environment secret
+  `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD` - PFX password;
+- environment variable `BERRYKEEP_WINDOWS_CLIENT_TIMESTAMP_URL` - approved
+  RFC-3161 timestamp endpoint.
+
+Keep the last three values in the `windows-client-signing` environment, not
+as repository secrets. Configure independent approval, prevent
+self-approval/admin bypass, and limit the environment to stable release tags.
+The certificate subject must exactly match the `Publisher` in
+`windows/thumbnail-provider/AppxManifest.xml`; the signing helper refuses a
+mismatch. Protect `.github/workflows/release.yml` and
+`windows/thumbnail-provider/{Sign-Msix.ps1,New-MsixUploadPackage.ps1}` with
+code-owner review.
+
+The unsigned MSIX has one-day retention and is never published. The signed
+`release-windows-client` Actions artifact has fourteen-day retention and
+contains only:
+
+- `berrykeep-client-<version>.msix` for a controlled sideload test;
+- `berrykeep-client-<version>.cer`, the public certificate to import into
+  `LocalMachine\TrustedPeople` on that test machine;
+- `berrykeep-client-<version>.msixupload` for a later Partner Center upload.
+
+Do not attach these test artifacts to the public GitHub Release. Store
+submission and its metadata/certification remain deliberate Partner Center
+steps; the Store handles the final consumer-package signing.
+
 ## Android release builds on pull requests
 
 Pull requests run the Android debug checks by default. To request the signed

@@ -6,6 +6,10 @@ param(
     [string]$CargoTargetDir,
     [switch]$SkipSigning,
     [switch]$IncludePdbSymbols,
+    [string]$SigningCertificatePath,
+    [string]$SigningCertificatePassword,
+    [string]$SigningCertificateThumbprint,
+    [string]$TimestampUrl,
     [string]$CertificateSubject = 'CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21',
     [string]$CertificatePassword = 'ironmesh-store-upload'
 )
@@ -281,34 +285,6 @@ function New-AppxSymArchive {
     return $true
 }
 
-function New-MsixUploadArchive {
-    param(
-        [string]$PackagePath,
-        [string]$AppxSymPath,
-        [string]$DestinationPath
-    )
-
-    $stagePath = Join-Path (Split-Path -Parent $DestinationPath) 'msixupload-stage'
-    $zipPath = [System.IO.Path]::ChangeExtension($DestinationPath, '.zip')
-
-    Reset-Directory -Path $stagePath
-    Copy-Item $PackagePath $stagePath
-    if ($AppxSymPath -and (Test-Path $AppxSymPath)) {
-        Copy-Item $AppxSymPath $stagePath
-    }
-
-    if (Test-Path $zipPath) {
-        Remove-Item -Force $zipPath
-    }
-    if (Test-Path $DestinationPath) {
-        Remove-Item -Force $DestinationPath
-    }
-
-    Compress-Archive -Path (Join-Path $stagePath '*') -DestinationPath $zipPath -CompressionLevel Optimal
-    Move-Item $zipPath $DestinationPath
-    Remove-Item -Recurse -Force $stagePath
-}
-
 $repoRoot = Get-RepoRoot
 $scriptDir = Split-Path -Parent $PSCommandPath
 $manifestPath = Join-Path $scriptDir 'AppxManifest.xml'
@@ -345,14 +321,29 @@ else {
 $packagePath = Join-Path $artifactRoot ($artifactName + '.msix')
 $uploadPath = Join-Path $artifactRoot ($artifactName + '.msixupload')
 $appxSymPath = Join-Path $artifactRoot ($artifactName + '.appxsym')
-$pfxPath = Join-Path $artifactRoot ($artifactName + '.pfx')
+$developmentPfxPath = Join-Path $artifactRoot ($artifactName + '.pfx')
 $cerPath = Join-Path $artifactRoot ($artifactName + '.cer')
+
+$externalSigningValues = @(@(
+    $SigningCertificatePath,
+    $SigningCertificatePassword,
+    $SigningCertificateThumbprint
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if ($SkipSigning -and ($externalSigningValues.Count -gt 0 -or -not [string]::IsNullOrWhiteSpace($TimestampUrl))) {
+    throw '-SkipSigning cannot be combined with external signing certificate parameters.'
+}
+if ($externalSigningValues.Count -gt 0 -and $externalSigningValues.Count -ne 3) {
+    throw 'External signing requires -SigningCertificatePath, -SigningCertificatePassword, and -SigningCertificateThumbprint together.'
+}
+if ($externalSigningValues.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
+    throw '-TimestampUrl requires an external signing certificate.'
+}
 
 New-Item -ItemType Directory -Force -Path $artifactRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $cargoTargetDir | Out-Null
 Reset-Directory -Path $stagePath
 
-foreach ($path in @($packagePath, $uploadPath, $appxSymPath, $pfxPath, $cerPath)) {
+foreach ($path in @($packagePath, $uploadPath, $appxSymPath, $developmentPfxPath, $cerPath)) {
     if (Test-Path $path) {
         Remove-Item -Force $path
     }
@@ -427,14 +418,34 @@ if ($SkipSigning) {
     Write-Warning 'Skipping MSIX signing. The output is intended for Partner Center upload, not local installation.'
 }
 else {
-    $null = Ensure-CodeSigningCertificate `
-        -Subject $CertificateSubject `
-        -PfxPath $pfxPath `
-        -CerPath $cerPath `
-        -Password $CertificatePassword
+    if ($externalSigningValues.Count -eq 3) {
+        $certificatePathForSigning = (Resolve-Path -LiteralPath $SigningCertificatePath).Path
+        $certificatePasswordForSigning = $SigningCertificatePassword
+        $certificateThumbprintForSigning = $SigningCertificateThumbprint
+    }
+    else {
+        $certificate = Ensure-CodeSigningCertificate `
+            -Subject $CertificateSubject `
+            -PfxPath $developmentPfxPath `
+            -CerPath $cerPath `
+            -Password $CertificatePassword
+        $certificatePathForSigning = $developmentPfxPath
+        $certificatePasswordForSigning = $CertificatePassword
+        $certificateThumbprintForSigning = $certificate.Thumbprint
+    }
 
-    Write-Step 'Signing MSIX with SignTool.exe'
-    Invoke-NativeChecked -FilePath $signTool -Arguments @('sign', '/fd', 'SHA256', '/f', $pfxPath, '/p', $CertificatePassword, $packagePath)
+    Write-Step 'Signing and verifying MSIX with the selected certificate'
+    $signingArguments = @{
+        MsixPath = $packagePath
+        SigningCertificatePath = $certificatePathForSigning
+        SigningCertificatePassword = $certificatePasswordForSigning
+        SigningCertificateThumbprint = $certificateThumbprintForSigning
+        PublicCertificatePath = $cerPath
+    }
+    if ($TimestampUrl) {
+        $signingArguments.TimestampUrl = $TimestampUrl
+    }
+    & (Join-Path $scriptDir 'Sign-Msix.ps1') @signingArguments
 }
 
 $createdAppxSym = $false
@@ -450,7 +461,14 @@ if ($IncludePdbSymbols) {
 }
 
 Write-Step 'Creating .msixupload archive'
-New-MsixUploadArchive -PackagePath $packagePath -AppxSymPath $(if ($createdAppxSym) { $appxSymPath } else { $null }) -DestinationPath $uploadPath
+$uploadArguments = @{
+    MsixPath = $packagePath
+    OutputPath = $uploadPath
+}
+if ($createdAppxSym) {
+    $uploadArguments.AppxSymPath = $appxSymPath
+}
+& (Join-Path $scriptDir 'New-MsixUploadPackage.ps1') @uploadArguments
 
 Write-Host ''
 Write-Host 'Store upload package ready:' -ForegroundColor Green

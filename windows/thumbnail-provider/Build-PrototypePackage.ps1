@@ -48,6 +48,10 @@ param(
     [switch]$StageOnly,
     [switch]$Install,
     [switch]$NoStartAfterInstall,
+    [string]$SigningCertificatePath,
+    [string]$SigningCertificatePassword,
+    [string]$SigningCertificateThumbprint,
+    [string]$TimestampUrl,
     [string]$CertificateSubject = "CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21",
     [string]$CertificatePassword = "ironmesh-dev"
 )
@@ -251,8 +255,7 @@ function Ensure-CodeSigningCertificate {
 
 function Ensure-LocalMachineTrustedPeopleCertificate {
     param(
-        [string]$PfxPath,
-        [string]$Password,
+        [string]$CertificatePath,
         [string]$Thumbprint
     )
 
@@ -267,8 +270,7 @@ function Ensure-LocalMachineTrustedPeopleCertificate {
         throw "Installing the MSIX package requires the signing certificate to be imported into Cert:\\LocalMachine\\TrustedPeople. Re-run this script from an elevated PowerShell when using -Install."
     }
 
-    $securePassword = ConvertTo-SecureString -String $Password -AsPlainText -Force
-    Import-PfxCertificate -FilePath $PfxPath -Password $securePassword -CertStoreLocation "Cert:\\LocalMachine\\TrustedPeople" | Out-Null
+    Import-Certificate -FilePath $CertificatePath -CertStoreLocation "Cert:\\LocalMachine\\TrustedPeople" | Out-Null
 }
 
 $repoRoot = Get-RepoRoot
@@ -280,13 +282,28 @@ $stagePath = Join-Path $outputRoot "stage"
 $cargoTargetDir = Join-Path $outputRoot "cargo-target"
 $packageName = "IronMesh.msix"
 $packagePath = Join-Path $outputRoot $packageName
-$pfxPath = Join-Path $outputRoot "IronMesh.pfx"
+$developmentPfxPath = Join-Path $outputRoot "IronMesh.pfx"
 $cerPath = Join-Path $outputRoot "IronMesh.cer"
 $cargoVersion = Get-WorkspaceCargoVersion -RepoRoot $repoRoot
 $resolvedPackageVersion = if ($PackageVersion) {
     $PackageVersion
 } else {
     Convert-CargoVersionToPackageVersion -CargoVersion $cargoVersion
+}
+
+$externalSigningValues = @(@(
+    $SigningCertificatePath,
+    $SigningCertificatePassword,
+    $SigningCertificateThumbprint
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if ($externalSigningValues.Count -gt 0 -and $externalSigningValues.Count -ne 3) {
+    throw 'External signing requires -SigningCertificatePath, -SigningCertificatePassword, and -SigningCertificateThumbprint together.'
+}
+if ($externalSigningValues.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
+    throw '-TimestampUrl requires an external signing certificate.'
+}
+if ($StageOnly -and ($externalSigningValues.Count -gt 0 -or -not [string]::IsNullOrWhiteSpace($TimestampUrl))) {
+    throw '-StageOnly cannot be combined with external signing certificate parameters.'
 }
 
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
@@ -386,23 +403,46 @@ if (Test-Path $packagePath) {
     Remove-Item -Force $packagePath
 }
 
-$certificate = Ensure-CodeSigningCertificate `
-    -Subject $CertificateSubject `
-    -PfxPath $pfxPath `
-    -CerPath $cerPath `
-    -Password $CertificatePassword
+if ($externalSigningValues.Count -eq 3) {
+    $certificatePathForSigning = (Resolve-Path -LiteralPath $SigningCertificatePath).Path
+    $certificatePasswordForSigning = $SigningCertificatePassword
+    $certificateThumbprintForSigning = $SigningCertificateThumbprint
+    $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        $certificatePathForSigning,
+        $certificatePasswordForSigning
+    )
+}
+else {
+    $certificate = Ensure-CodeSigningCertificate `
+        -Subject $CertificateSubject `
+        -PfxPath $developmentPfxPath `
+        -CerPath $cerPath `
+        -Password $CertificatePassword
+    $certificatePathForSigning = $developmentPfxPath
+    $certificatePasswordForSigning = $CertificatePassword
+    $certificateThumbprintForSigning = $certificate.Thumbprint
+}
 
 Write-Step "Packing MSIX with MakeAppx.exe"
 Invoke-NativeChecked -FilePath $makeAppx -Arguments @("pack", "/o", "/h", "SHA256", "/d", $stagePath, "/p", $packagePath)
 
-Write-Step "Signing package with SignTool.exe"
-Invoke-NativeChecked -FilePath $signTool -Arguments @("sign", "/fd", "SHA256", "/f", $pfxPath, "/p", $CertificatePassword, $packagePath)
+Write-Step 'Signing and verifying MSIX with the selected certificate'
+$signingArguments = @{
+    MsixPath = $packagePath
+    SigningCertificatePath = $certificatePathForSigning
+    SigningCertificatePassword = $certificatePasswordForSigning
+    SigningCertificateThumbprint = $certificateThumbprintForSigning
+    PublicCertificatePath = $cerPath
+}
+if ($TimestampUrl) {
+    $signingArguments.TimestampUrl = $TimestampUrl
+}
+& (Join-Path $scriptDir 'Sign-Msix.ps1') @signingArguments
 
 if ($Install) {
     Write-Step "Trusting development certificate for package installation"
     Ensure-LocalMachineTrustedPeopleCertificate `
-        -PfxPath $pfxPath `
-        -Password $CertificatePassword `
+        -CertificatePath $cerPath `
         -Thumbprint $certificate.Thumbprint
 
     Write-Step "Installing package"

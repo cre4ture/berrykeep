@@ -177,6 +177,36 @@ Notes:
 - `-IncludePdbSymbols` packages raw PDBs into `.appxsym`; use that only if you are comfortable uploading private symbol information
 - the script prepares the upload artifact only; Partner Center metadata, screenshots, age ratings, privacy policy, and certification notes still have to be filled manually
 
+## Signing with an existing certificate
+
+Both MSIX helpers retain their local self-signed development-certificate mode,
+but can also sign with an existing PFX. Use that path for a controlled
+test/sideload release; it verifies that the PFX thumbprint and subject match
+the package before publishing only the signed MSIX and its public `.cer` file.
+
+The signing certificate subject must exactly equal the `Publisher` value in
+`AppxManifest.xml`. Provide the three external-signing parameters together;
+an RFC-3161 timestamp URL is optional for local tests and recommended for
+release artifacts:
+
+```powershell
+$env:BERRYKEEP_CLIENT_PFX = 'C:\secure\berrykeep-client.pfx'
+$env:BERRYKEEP_CLIENT_PFX_PASSWORD = '<PFX password>'
+$env:BERRYKEEP_CLIENT_PFX_THUMBPRINT = '<40-character SHA-1 thumbprint>'
+$env:BERRYKEEP_CLIENT_TIMESTAMP_URL = 'https://<approved-rfc3161-endpoint>'
+
+powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-StoreUploadPackage.ps1 `
+  -SigningCertificatePath $env:BERRYKEEP_CLIENT_PFX `
+  -SigningCertificatePassword $env:BERRYKEEP_CLIENT_PFX_PASSWORD `
+  -SigningCertificateThumbprint $env:BERRYKEEP_CLIENT_PFX_THUMBPRINT `
+  -TimestampUrl $env:BERRYKEEP_CLIENT_TIMESTAMP_URL
+```
+
+The PFX remains at its supplied path and is never copied into the output
+directory. The generated `.cer` contains the public certificate only. A test
+machine must trust that `.cer` in `LocalMachine\TrustedPeople` before it can
+install the signed MSIX.
+
 ## Installing a locally signed MSIX on another PC
 
 Packages produced by the prototype and Store upload helpers are signed with a local development certificate unless you replace the signing certificate. A new client PC will reject the raw `.msix` with `0x800B010A` until that certificate is trusted on that PC.
