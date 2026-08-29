@@ -3,8 +3,10 @@ use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
     CONTENT_RANGE, CONTENT_TYPE, ETAG, RANGE,
 };
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -388,11 +390,35 @@ pub(crate) async fn font_range(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let Some(path) = resolve_glyph_asset_path(&glyphs_root, &fontstack, &range) else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let glyphs_dir = match Dir::open_ambient_dir(&glyphs_root, ambient_authority()) {
+        Ok(dir) => dir,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
+    match glyphs_dir.symlink_metadata(&fontstack) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    }
+    let font_dir = match glyphs_dir.open_dir(&fontstack) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    match font_dir.symlink_metadata(&range) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    }
 
-    match tokio::fs::read(&path).await {
+    match font_dir.read(&range) {
         Ok(bytes) => {
             let mut response_headers = HeaderMap::new();
             response_headers.insert(
@@ -816,21 +842,6 @@ fn is_safe_glyph_range_segment(value: &str) -> bool {
         && end.chars().all(|ch| ch.is_ascii_digit())
 }
 
-fn resolve_glyph_asset_path(glyphs_root: &FsPath, fontstack: &str, range: &str) -> Option<PathBuf> {
-    let fontstack_path = FsPath::new(fontstack);
-    let range_path = FsPath::new(range);
-    if fontstack_path.components().count() != 1
-        || fontstack_path.file_name() != Some(fontstack_path.as_os_str())
-        || range_path.components().count() != 1
-        || range_path.file_name() != Some(range_path.as_os_str())
-    {
-        return None;
-    }
-
-    let path = glyphs_root.join(fontstack_path).join(range_path);
-    path.starts_with(glyphs_root).then_some(path)
-}
-
 fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
     match error {
         StoreReadError::NotFound => anyhow!("object not found"),
@@ -842,11 +853,10 @@ fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorResponseBody, error_response, is_safe_fontstack_segment, resolve_glyph_asset_path,
+        ErrorResponseBody, error_response, is_safe_fontstack_segment, is_safe_glyph_range_segment,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
-    use std::path::Path as FsPath;
 
     #[tokio::test]
     async fn error_response_preserves_public_json_contract() {
@@ -869,21 +879,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_glyph_asset_path_rejects_parent_traversal() {
-        let glyphs_root = FsPath::new("/tmp/fonts");
-        assert!(
-            resolve_glyph_asset_path(glyphs_root, "../Noto Sans Regular", "0-255.pbf").is_none()
-        );
-        assert!(
-            resolve_glyph_asset_path(glyphs_root, "Noto Sans Regular", "../0-255.pbf").is_none()
-        );
-        // A bare ".." fontstack (no slash) must also be rejected: it is a
-        // single path component that still traverses to the parent directory.
-        assert!(resolve_glyph_asset_path(glyphs_root, "..", "0-255.pbf").is_none());
-        assert!(resolve_glyph_asset_path(glyphs_root, ".", "0-255.pbf").is_none());
-    }
-
-    #[test]
     fn is_safe_fontstack_segment_rejects_dot_segments() {
         // Regression test: splitting on '.' would never produce the literal
         // segment ".." for a value that IS "..", so the check must compare
@@ -895,14 +890,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_glyph_asset_path_accepts_single_segments() {
-        let glyphs_root = FsPath::new("/tmp/fonts");
-        let resolved =
-            resolve_glyph_asset_path(glyphs_root, "Noto Sans Regular", "0-255.pbf").unwrap();
-
-        assert_eq!(
-            resolved,
-            glyphs_root.join("Noto Sans Regular").join("0-255.pbf")
-        );
+    fn is_safe_glyph_range_segment_rejects_path_components() {
+        assert!(!is_safe_glyph_range_segment("../0-255.pbf"));
+        assert!(!is_safe_glyph_range_segment("0-255.pbf/.."));
+        assert!(!is_safe_glyph_range_segment("0-255.pbf\\.."));
+        assert!(is_safe_glyph_range_segment("0-255.pbf"));
     }
 }
