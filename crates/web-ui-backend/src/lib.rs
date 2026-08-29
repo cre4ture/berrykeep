@@ -1316,6 +1316,32 @@ fn server_map_font_path(fontstack: &str, range: &str) -> String {
     relative_request_path(&url)
 }
 
+fn is_safe_map_fontstack_segment(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed != "."
+        && trimmed != ".."
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains('\0')
+}
+
+fn is_safe_map_glyph_range_segment(value: &str) -> bool {
+    if value.contains('/') || value.contains('\\') || value.contains('\0') {
+        return false;
+    }
+    let Some((start, end)) = value.split_once('-') else {
+        return false;
+    };
+    let Some(end) = end.strip_suffix(".pbf") else {
+        return false;
+    };
+    !start.is_empty()
+        && !end.is_empty()
+        && start.chars().all(|character| character.is_ascii_digit())
+        && end.chars().all(|character| character.is_ascii_digit())
+}
+
 async fn proxy_server_map_request(state: &WebState, path: &str) -> Result<RelativePathResponse> {
     current_sdk(state)
         .await
@@ -2817,6 +2843,12 @@ async fn web_map_font_range(
     State(state): State<WebState>,
     Path((fontstack, range)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    // Reject dot segments before constructing the SDK URL. Url::join normalizes
+    // them and could otherwise redirect a malformed font request to another
+    // authenticated /maps endpoint.
+    if !is_safe_map_fontstack_segment(&fontstack) || !is_safe_map_glyph_range_segment(&range) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let path = server_map_font_path(&fontstack, &range);
     match proxy_server_map_request(&state, &path).await {
         Ok(response) => proxied_map_response(response),
@@ -4065,8 +4097,9 @@ mod tests {
     use super::{
         DIAGNOSTIC_CONTEXT_HEADER, EMBEDDED_WEB_UI_SESSION_COOKIE, EMBEDDED_WEB_UI_SESSION_HEADER,
         EmbeddedWebUiSessionAuthorization, ErrorResponseBody, WebUiConfig, client_cache_scope,
-        error_response, is_safe_web_ui_method, normalize_store_restore_path, router,
-        trusted_loopback_origin, web_latency_probe_timeout,
+        error_response, is_safe_map_fontstack_segment, is_safe_map_glyph_range_segment,
+        is_safe_web_ui_method, normalize_store_restore_path, router, trusted_loopback_origin,
+        web_latency_probe_timeout,
     };
     use axum::Router;
     use axum::body::to_bytes;
@@ -4083,6 +4116,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::task::JoinHandle;
     use uuid::Uuid;
 
@@ -4692,6 +4726,63 @@ mod tests {
             "docs/archive/"
         );
         assert_eq!(normalize_store_restore_path("   ", false), "");
+    }
+
+    #[test]
+    fn map_font_proxy_rejects_dot_segments_before_url_normalization() {
+        assert!(!is_safe_map_fontstack_segment(".."));
+        assert!(!is_safe_map_fontstack_segment("."));
+        assert!(!is_safe_map_fontstack_segment("Noto/Regular"));
+        assert!(is_safe_map_fontstack_segment("Noto Sans Regular"));
+
+        assert!(!is_safe_map_glyph_range_segment(".."));
+        assert!(!is_safe_map_glyph_range_segment("0-255.pbf/.."));
+        assert!(!is_safe_map_glyph_range_segment("0-255.pbf\\.."));
+        assert!(is_safe_map_glyph_range_segment("0-255.pbf"));
+    }
+
+    #[tokio::test]
+    async fn map_font_proxy_rejects_encoded_dot_segments_without_contacting_the_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web UI listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("web UI listener should have a local address");
+        let sdk = IronMeshClient::from_direct_base_url("http://127.0.0.1:9");
+        let app = router(WebUiConfig::from_client(sdk.clone()));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("web UI listener should accept a connection");
+        socket
+            .write_all(
+                b"GET /api/v1/maps/fonts/%2E%2E/0-255.pbf HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("raw encoded dot-segment request should be writable");
+        let mut response = Vec::new();
+        socket
+            .read_to_end(&mut response)
+            .await
+            .expect("raw encoded dot-segment response should be readable");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400"),
+            "encoded dot segment should be rejected locally: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(
+            sdk.connection_diagnostics()
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.recent_attempts.is_empty()),
+            "an invalid local font path must not make an upstream request"
+        );
+
+        server.abort();
     }
 
     #[test]

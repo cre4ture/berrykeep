@@ -390,36 +390,9 @@ pub(crate) async fn font_range(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let glyphs_dir = match Dir::open_ambient_dir(&glyphs_root, ambient_authority()) {
-        Ok(dir) => dir,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
-    match glyphs_dir.symlink_metadata(&fontstack) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    }
-    let font_dir = match glyphs_dir.open_dir(&fontstack) {
-        Ok(dir) => dir,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
-    match font_dir.symlink_metadata(&range) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    }
-
-    match font_dir.read(&range) {
-        Ok(bytes) => {
+    match tokio::task::spawn_blocking(move || read_glyph_range(glyphs_root, fontstack, range)).await
+    {
+        Ok(GlyphRangeReadResult::Found(bytes)) => {
             let mut response_headers = HeaderMap::new();
             response_headers.insert(
                 CONTENT_TYPE,
@@ -431,10 +404,56 @@ pub(crate) async fn font_range(
             );
             (StatusCode::OK, response_headers, bytes).into_response()
         }
+        Ok(GlyphRangeReadResult::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Ok(GlyphRangeReadResult::Unavailable) | Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+enum GlyphRangeReadResult {
+    Found(Vec<u8>),
+    NotFound,
+    Unavailable,
+}
+
+fn read_glyph_range(
+    glyphs_root: PathBuf,
+    fontstack: String,
+    range: String,
+) -> GlyphRangeReadResult {
+    let glyphs_dir = match Dir::open_ambient_dir(&glyphs_root, ambient_authority()) {
+        Ok(dir) => dir,
+        Err(_) => return GlyphRangeReadResult::Unavailable,
+    };
+    match glyphs_dir.symlink_metadata(&fontstack) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return GlyphRangeReadResult::NotFound,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            StatusCode::NOT_FOUND.into_response()
+            return GlyphRangeReadResult::NotFound;
         }
-        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+        Err(_) => return GlyphRangeReadResult::Unavailable,
+    }
+    let font_dir = match glyphs_dir.open_dir(&fontstack) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return GlyphRangeReadResult::NotFound;
+        }
+        Err(_) => return GlyphRangeReadResult::Unavailable,
+    };
+    match font_dir.symlink_metadata(&range) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return GlyphRangeReadResult::NotFound,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return GlyphRangeReadResult::NotFound;
+        }
+        Err(_) => return GlyphRangeReadResult::Unavailable,
+    }
+
+    match font_dir.read(&range) {
+        Ok(bytes) => GlyphRangeReadResult::Found(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            GlyphRangeReadResult::NotFound
+        }
+        Err(_) => GlyphRangeReadResult::Unavailable,
     }
 }
 
@@ -815,8 +834,8 @@ fn is_safe_fontstack_segment(value: &str) -> bool {
     // Note: `value.split('.').any(|segment| segment == "..")` would NOT catch
     // `value == ".."` (splitting ".." on '.' yields ["", "", ""], never "..").
     // Compare the whole (trimmed) value against "." / ".." directly instead.
-    // `resolve_glyph_asset_path` also independently rejects non-single-segment
-    // and "."/".." components, so this is defense in depth.
+    // The capability directory lookup below independently verifies entry types
+    // and rejects symlinks, so this is defense in depth.
     let trimmed = value.trim();
     !trimmed.is_empty()
         && trimmed != "."
