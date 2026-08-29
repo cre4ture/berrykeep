@@ -2789,12 +2789,7 @@ async fn web_map_xyz_tile(
     let path = server_map_manifest_path(&format!("/maps/tiles/{z}/{x}/{y}"), manifest_key);
     match proxy_server_map_request(&state, &path).await {
         Ok(response) => proxied_map_response(response),
-        Err(error) => logged_error_response(
-            &state,
-            StatusCode::BAD_GATEWAY,
-            "map raster tile request failed",
-            error.to_string(),
-        ),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
 }
 
@@ -2811,12 +2806,7 @@ async fn web_map_vector_tile(
     let path = server_map_manifest_path(&format!("/maps/vector-tiles/{z}/{x}/{y}"), manifest_key);
     match proxy_server_map_request(&state, &path).await {
         Ok(response) => proxied_map_response(response),
-        Err(error) => logged_error_response(
-            &state,
-            StatusCode::BAD_GATEWAY,
-            "map vector tile request failed",
-            error.to_string(),
-        ),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
 }
 
@@ -2827,12 +2817,7 @@ async fn web_map_font_range(
     let path = server_map_font_path(&fontstack, &range);
     match proxy_server_map_request(&state, &path).await {
         Ok(response) => proxied_map_response(response),
-        Err(error) => logged_error_response(
-            &state,
-            StatusCode::BAD_GATEWAY,
-            "map font request failed",
-            error.to_string(),
-        ),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
 }
 
@@ -4644,6 +4629,39 @@ mod tests {
                 .as_ref(),
             b"compressed-vector-tile"
         );
+    }
+
+    #[tokio::test]
+    async fn map_tile_transport_failures_do_not_fill_diagnostic_logs() {
+        let buffer = Arc::new(LogBuffer::new(32));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web UI listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("web UI listener should have a local address");
+        let app = router(
+            WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
+                .with_log_buffer(Arc::clone(&buffer)),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "http://{address}/api/v1/maps/tiles/3/4/5?manifest_key=sys/maps/test.mbtiles.manifest.json"
+            ))
+            .send()
+            .await
+            .expect("map tile request should complete");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            buffer.recent(32).is_empty(),
+            "high-volume map tile failures must not evict useful diagnostics"
+        );
+
+        server.abort();
     }
 
     #[test]
