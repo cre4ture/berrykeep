@@ -39,7 +39,10 @@ use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
 use common::xmp::{is_sidecar_key, sidecar_key_for_media};
-use common::{ClusterId, DeviceId, HealthStatus, NodeId, normalize_node_hostname};
+use common::{
+    ClusterId, DeviceId, HealthStatus, NodeId, normalize_node_hostname,
+    parse_comma_separated_labels,
+};
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
 };
@@ -13270,32 +13273,37 @@ struct StoreIndexQuery {
     exclude_labels: Option<String>,
 }
 
-/// Splits a comma-separated label parameter into the labels it names.
-///
-/// Blank entries are dropped, so a trailing comma or an empty parameter does
-/// not become a filter on the empty label.
-fn store_index_labels(raw: Option<&String>) -> Vec<String> {
-    raw.map(|value| {
-        value
-            .split(',')
-            .map(str::trim)
-            .filter(|label| !label.is_empty())
-            .map(str::to_string)
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
 fn store_index_label_filter(
     query: &StoreIndexQuery,
 ) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
-    let required = store_index_labels(query.require_labels.as_ref());
-    let excluded = store_index_labels(query.exclude_labels.as_ref());
+    label_filter_from_query_values(
+        query.require_labels.as_deref(),
+        query.exclude_labels.as_deref(),
+    )
+}
+
+fn label_filter_from_query_values(
+    required: Option<&str>,
+    excluded: Option<&str>,
+) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
+    let required = parse_comma_separated_labels(required)?;
+    let excluded = parse_comma_separated_labels(excluded)?;
     let label_filter = storage::GalleryLabelFilter { required, excluded };
     if !gallery_label_filter_is_within_limit(&label_filter) {
         return Err("at most 64 labels may be specified across require_labels and exclude_labels");
     }
     Ok(label_filter)
+}
+
+/// Gallery-map summaries are cached over their entire scope. Limiting map filters to the
+/// privacy labels keeps their cache vocabulary finite and prevents arbitrary query strings from
+/// triggering a synchronous full-library aggregate scan on every request.
+fn gallery_map_label_filter_is_supported(label_filter: &storage::GalleryLabelFilter) -> bool {
+    label_filter
+        .required
+        .iter()
+        .chain(&label_filter.excluded)
+        .all(|label| matches!(label.as_str(), "private" | "nsfw"))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -13325,6 +13333,10 @@ struct GalleryMapClustersQuery {
     zoom_precise: Option<f64>,
     /// Optional desired cluster cell width in CSS pixels. Older nodes ignore this additive field.
     cluster_cell_size_px: Option<f64>,
+    /// Comma-separated labels an entry must carry to contribute to a cluster.
+    require_labels: Option<String>,
+    /// Comma-separated labels that must not contribute to a cluster.
+    exclude_labels: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -13472,6 +13484,10 @@ struct StoreIndexEntry {
     /// none, so responses for unlabelled media stay byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     labels: Vec<String>,
+    /// Whether `labels` is an authoritative view of the sidecar. Clients must
+    /// not replace labels while this is false, because doing so could discard
+    /// labels that were unavailable during a best-effort projection lookup.
+    labels_resolved: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -13592,6 +13608,7 @@ struct StoreIndexPageCacheKey {
     view: Option<StoreIndexView>,
     sort: Option<StoreIndexSortOrder>,
     media_filter: Option<StoreIndexMediaFilter>,
+    label_filter: storage::GalleryLabelFilter,
     thumbnail_route: String,
 }
 
@@ -15886,6 +15903,24 @@ async fn gallery_map_clusters_response(
     query: GalleryMapClustersQuery,
     thumbnail_route: &str,
 ) -> Response {
+    let label_filter = match label_filter_from_query_values(
+        query.require_labels.as_deref(),
+        query.exclude_labels.as_deref(),
+    ) {
+        Ok(label_filter) => label_filter,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
+    if !gallery_map_label_filter_is_supported(&label_filter) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "gallery map label filters only support private and nsfw"
+            })),
+        )
+            .into_response();
+    }
     let viewport = match gallery_map_viewport_from_query(&query) {
         Ok(viewport) => viewport,
         Err(message) => {
@@ -15946,6 +15981,7 @@ async fn gallery_map_clusters_response(
                 viewport: storage_viewport,
                 requested_resolution,
                 max_clusters,
+                label_filter: label_filter.clone(),
             })
             .await
     };
@@ -15974,6 +16010,7 @@ async fn gallery_map_clusters_response(
             media_filter,
             viewport,
             resolution: page.resolution,
+            label_filter,
         });
     Json(GalleryMapClustersResponse {
         prefix,
@@ -16064,6 +16101,7 @@ async fn gallery_map_cluster_entries_response(
                 cell_y,
                 offset: requested_offset,
                 limit,
+                label_filter: token.label_filter.clone(),
             })
             .await
     };
@@ -16350,6 +16388,7 @@ fn build_reconciliation_object_path(key: &str, version_id: &str) -> String {
 fn store_index_page_cache_key(
     query: &StoreIndexQuery,
     thumbnail_route: &str,
+    label_filter: &storage::GalleryLabelFilter,
 ) -> Option<StoreIndexPageCacheKey> {
     if !matches!(query.view, Some(StoreIndexView::Tree))
         || query.limit.is_none()
@@ -16365,6 +16404,7 @@ fn store_index_page_cache_key(
         view: query.view,
         sort: query.sort,
         media_filter: query.media_filter,
+        label_filter: label_filter.clone(),
         thumbnail_route: thumbnail_route.to_string(),
     })
 }
@@ -16401,14 +16441,9 @@ fn store_index_viewport_bounds(
     }))
 }
 
-/// Whether `query` asks for a label filter, independent of whether the gallery
-/// fast path can actually honour it.
-///
-/// The generic listing fallback hard-codes `labels: Vec::new()` on every entry
-/// and cannot filter by label at all, so a caller that requested filtering has
-/// to be told the request could not be honoured rather than silently receiving
-/// an unfiltered `200` -- the motivating use case is keeping `private` media
-/// out of a view, so a silent fallback would leak it.
+/// Whether `query` asks for a label filter. Generic listings resolve the same
+/// current label projection as the gallery fast path, so they can honour this
+/// filter for every current, offset-paginated sort shape.
 fn store_index_label_filter_requested(label_filter: &storage::GalleryLabelFilter) -> bool {
     !label_filter.is_empty()
 }
@@ -16520,6 +16555,7 @@ fn store_index_entry_from_gallery_entry(
         content_fingerprint: entry.content_fingerprint,
         media,
         labels: entry.labels,
+        labels_resolved: true,
     }
 }
 
@@ -16563,7 +16599,36 @@ fn with_store_index_response_headers(
     response
 }
 
-fn cached_store_index_page_response(
+async fn store_index_media_labels_by_key(
+    state: &ServerState,
+    entries: &[StoreIndexEntry],
+    operation: &'static str,
+) -> Result<HashMap<String, Vec<String>>> {
+    let keys = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let store = read_store(state, operation).await;
+    store.gallery_object_labels_by_key(&keys).await
+}
+
+fn populate_store_index_entry_labels(
+    entries: &mut [StoreIndexEntry],
+    labels_by_key: &HashMap<String, Vec<String>>,
+) {
+    for entry in entries {
+        if let Some(labels) = labels_by_key.get(&entry.path) {
+            entry.labels = labels.clone();
+            entry.labels_resolved = true;
+        }
+    }
+}
+
+async fn cached_store_index_page_response(
     state: &ServerState,
     namespace_change_sequence: u64,
     query: &StoreIndexQuery,
@@ -16577,7 +16642,20 @@ fn cached_store_index_page_response(
         .map(|value| offset.saturating_add(value).min(cached.total_entry_count))
         .unwrap_or(cached.total_entry_count);
     let has_more = end < cached.total_entry_count;
-    let (entries, materialized_entry_count) = cached.page(offset, end);
+    let (mut entries, materialized_entry_count) = cached.page(offset, end);
+    let label_lookup_ms = if query.snapshot.is_none() {
+        let label_lookup_started_at = Instant::now();
+        match store_index_media_labels_by_key(state, &entries, "store_index.cached_labels").await {
+            Ok(labels_by_key) => populate_store_index_entry_labels(&mut entries, &labels_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional labels for cached generic store index"
+            ),
+        }
+        label_lookup_started_at.elapsed().as_millis()
+    } else {
+        0
+    };
     if state
         .storage
         .namespace_change_sequence
@@ -16609,7 +16687,9 @@ fn cached_store_index_page_response(
         namespace_change_sequence,
         request_id,
         response,
-        format!("store-index-page-cache;desc=hit, total;dur={total_ms}"),
+        format!(
+            "store-index-page-cache;desc=hit, label-lookup;dur={label_lookup_ms}, total;dur={total_ms}"
+        ),
         cached.matching_key_count,
         cached.visible_file_count,
         materialized_entry_count,
@@ -16648,14 +16728,14 @@ async fn list_store_index_response_attempt(
     let depth = query.depth.unwrap_or(1).max(1);
     let snapshot_label = query.snapshot.as_deref().unwrap_or("<current>");
     let cursor_mode = query.cursor.is_some() || query.page_size.is_some();
-    let page_cache_key = store_index_page_cache_key(&query, thumbnail_route);
     let namespace_change_sequence = state
         .storage
         .namespace_change_sequence
         .load(Ordering::SeqCst);
 
     let label_filter_requested = store_index_label_filter_requested(&label_filter);
-    let gallery_query = store_index_gallery_query(&query, &prefix, depth, label_filter);
+    let page_cache_key = store_index_page_cache_key(&query, thumbnail_route, &label_filter);
+    let gallery_query = store_index_gallery_query(&query, &prefix, depth, label_filter.clone());
     if viewport.is_some() && gallery_query.is_none() {
         return (
             StatusCode::BAD_REQUEST,
@@ -16665,11 +16745,20 @@ async fn list_store_index_response_attempt(
         )
             .into_response();
     }
-    if label_filter_requested && gallery_query.is_none() {
+    if label_filter_requested && cursor_mode && gallery_query.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "label filters require a current, paginated gallery query sorted by captured time"
+                "error": "label filters are unavailable with cursor pagination"
+            })),
+        )
+            .into_response();
+    }
+    if label_filter_requested && query.snapshot.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "label filters are unavailable for snapshot listings"
             })),
         )
             .into_response();
@@ -16733,25 +16822,7 @@ async fn list_store_index_response_attempt(
                 )
                     .into_response();
             }
-            Ok(None) if label_filter_requested => {
-                return (
-                    StatusCode::NOT_IMPLEMENTED,
-                    Json(json!({
-                        "error": "label filters require a metadata backend with gallery projection support"
-                    })),
-                )
-                    .into_response();
-            }
             Ok(None) => {}
-            Err(err) if label_filter_requested => {
-                tracing::error!(
-                    error = %err,
-                    prefix = %prefix,
-                    "gallery index fast path failed while a label filter was requested; \
-                     refusing to fall back to the unfiltered generic store index"
-                );
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
             Err(err) => {
                 warn!(
                     error = %err,
@@ -16777,7 +16848,9 @@ async fn list_store_index_response_attempt(
                 request_id,
                 request_started_at,
                 cached,
-            ) {
+            )
+            .await
+            {
                 return response;
             }
             if allow_namespace_retry {
@@ -17016,6 +17089,29 @@ async fn list_store_index_response_attempt(
     }
     let media_lookup_ms = media_lookup_started_at.elapsed().as_millis();
 
+    let mut label_lookup_ms = 0;
+    let labels_by_key = if label_filter_requested {
+        let label_lookup_started_at = Instant::now();
+        let labels_by_key =
+            match store_index_media_labels_by_key(state, &entries, "store_index.filtered_labels")
+                .await
+            {
+                Ok(labels_by_key) => labels_by_key,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "failed to load labels while a label filter was requested"
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+        populate_store_index_entry_labels(&mut entries, &labels_by_key);
+        label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
+        Some(labels_by_key)
+    } else {
+        None
+    };
+
     let collapse_started_at = Instant::now();
     if matches!(query.view, Some(StoreIndexView::Tree)) {
         entries = collapse_store_index_entries_for_tree_view(entries);
@@ -17025,6 +17121,21 @@ async fn list_store_index_response_attempt(
     let filter_started_at = Instant::now();
     if let Some(media_filter) = query.media_filter {
         entries.retain(|entry| matches_store_index_media_filter(entry, media_filter));
+    }
+    if label_filter_requested {
+        entries.retain(|entry| {
+            entry.entry_type != "key"
+                // The current gallery projection is the only label source
+                // available to this generic path. It only applies to media,
+                // while non-media keys remain visible in file listings.
+                || !looks_like_media_path(&entry.path)
+                || labels_by_key
+                    .as_ref()
+                    .and_then(|labels_by_key| labels_by_key.get(&entry.path))
+                    .is_some_and(|labels| {
+                        storage::gallery_label_filter_matches(labels, &label_filter)
+                    })
+        });
     }
     let filter_ms = filter_started_at.elapsed().as_millis();
 
@@ -17096,6 +17207,17 @@ async fn list_store_index_response_attempt(
         materialized_entry_count = total_entry_count;
     }
     let pagination_ms = pagination_started_at.elapsed().as_millis();
+    if !label_filter_requested && query.snapshot.is_none() {
+        let label_lookup_started_at = Instant::now();
+        match store_index_media_labels_by_key(state, &entries, "store_index.page_labels").await {
+            Ok(labels_by_key) => populate_store_index_entry_labels(&mut entries, &labels_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional labels for generic store index page"
+            ),
+        }
+        label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
+    }
     let returned_entry_count = entries.len();
     let total_ms = request_started_at.elapsed().as_millis();
 
@@ -17105,6 +17227,7 @@ async fn list_store_index_response_attempt(
         || content_summary_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || modified_time_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || metadata_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || label_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || media_lookup_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
         || media_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || tree_collapse_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
@@ -17130,6 +17253,7 @@ async fn list_store_index_response_attempt(
             content_summary_lookup_ms,
             modified_time_lookup_ms,
             metadata_lookup_ms,
+            label_lookup_ms,
             media_lookup_lock_waited_ms = media_lookup_waited_ms,
             media_lookup_ms,
             tree_collapse_ms,
@@ -17171,7 +17295,7 @@ async fn list_store_index_response_attempt(
         request_id,
         response,
         format!(
-            "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
+            "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, label-lookup;dur={label_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
         ),
         keys.len(),
         entry_plan.file_entries.len(),
@@ -17419,6 +17543,31 @@ async fn list_store_index_response_cursor_mode(
     }
     let media_lookup_ms = media_lookup_started_at.elapsed().as_millis();
 
+    let label_keys = entries
+        .iter()
+        .filter(|entry| {
+            query.snapshot.is_none()
+                && entry.entry_type == "key"
+                && looks_like_media_path(&entry.path)
+        })
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    let labels_by_key = {
+        let store = read_store(state, "store_index.cursor_labels").await;
+        store.gallery_object_labels_by_key(&label_keys).await
+    };
+    let labels_by_key = match labels_by_key {
+        Ok(labels_by_key) => labels_by_key,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to load optional labels for cursor store index"
+            );
+            HashMap::new()
+        }
+    };
+    populate_store_index_entry_labels(&mut entries, &labels_by_key);
+
     let media_summary = summarize_store_index_entries(&entries);
     let returned_entry_count = entries.len();
     let total_ms = request_started_at.elapsed().as_millis();
@@ -17543,6 +17692,7 @@ fn collapse_store_index_entries_for_tree_view(
                 content_fingerprint: None,
                 media: None,
                 labels: Vec::new(),
+                labels_resolved: false,
             });
     }
 
@@ -18108,6 +18258,7 @@ fn build_store_index_prefix_entry(path: String) -> StoreIndexEntry {
         // Labels are a property of the gallery projection; the generic listing
         // does not resolve them.
         labels: Vec::new(),
+        labels_resolved: false,
     }
 }
 
@@ -18142,6 +18293,7 @@ fn build_store_index_object_entry(
         // Labels are a property of the gallery projection; the generic listing
         // does not resolve them.
         labels: Vec::new(),
+        labels_resolved: false,
     }
 }
 

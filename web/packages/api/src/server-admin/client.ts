@@ -284,7 +284,21 @@ export async function listAdminStoreEntries(
     query.set("north", String(options.viewport.north));
     query.set("east", String(options.viewport.east));
   }
+  appendLabelFilter(query, "require_labels", options.requireLabels);
+  appendLabelFilter(query, "exclude_labels", options.excludeLabels);
   return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
+    adminTokenOverride
+  });
+}
+
+export async function setAdminStoreMediaLabels(
+  path: string,
+  labels: string[],
+  adminTokenOverride?: string
+): Promise<void> {
+  await fetchAdminJson<unknown>(apiV1("/auth/store/labels"), {
+    method: "POST",
+    body: { path, labels },
     adminTokenOverride
   });
 }
@@ -317,11 +331,28 @@ export async function getAdminGalleryMapClusters(
   if (cellSizePx !== null) {
     query.set("cluster_cell_size_px", String(cellSizePx));
   }
+  appendLabelFilter(query, "require_labels", request.requireLabels);
+  appendLabelFilter(query, "exclude_labels", request.excludeLabels);
   return fetchAdminGalleryMapJson<GalleryMapClustersResponse>(
     "clusters",
     query,
     adminTokenOverride
   );
+}
+
+function appendLabelFilter(
+  query: URLSearchParams,
+  parameter: "require_labels" | "exclude_labels",
+  labels: string[] | undefined
+): void {
+  const value = (labels ?? [])
+    .map((label) => label.trim())
+    .filter(Boolean)
+    .map((label) => label.replaceAll("\\", "\\\\").replaceAll(",", "\\,"))
+    .join(",");
+  if (value) {
+    query.set(parameter, value);
+  }
 }
 
 export async function getAdminGalleryMapClusterEntries(

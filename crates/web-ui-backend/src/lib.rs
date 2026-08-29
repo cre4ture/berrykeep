@@ -23,7 +23,10 @@ use client_sdk::{
     ironmesh_client::{DownloadRangeRequest, RelativePathResponse},
     public_key_fingerprint,
 };
-use common::logging::{LogBuffer, LogBufferEntry};
+use common::{
+    logging::{LogBuffer, LogBufferEntry},
+    parse_comma_separated_labels,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -508,6 +511,7 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/store/get", get(web_store_get))
         .route("/store/put", post(web_store_put))
+        .route("/store/labels", post(web_store_labels))
         .route("/store/rename", post(web_store_rename))
         .route("/store/delete", delete(web_store_delete))
         .route("/store/restore", post(web_store_restore))
@@ -595,6 +599,7 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/api/store/get", get(web_store_get))
         .route("/api/store/put", post(web_store_put))
+        .route("/api/store/labels", post(web_store_labels))
         .route("/api/store/rename", post(web_store_rename))
         .route("/api/store/delete", delete(web_store_delete))
         .route("/api/store/restore", post(web_store_restore))
@@ -791,6 +796,8 @@ struct WebStoreListQuery {
     limit: Option<usize>,
     sort: Option<String>,
     media_filter: Option<String>,
+    require_labels: Option<String>,
+    exclude_labels: Option<String>,
     south: Option<f64>,
     west: Option<f64>,
     north: Option<f64>,
@@ -816,6 +823,8 @@ struct WebGalleryMapClustersQuery {
     zoom: Option<u8>,
     /// Additive fractional camera zoom, ignored by nodes that predate it.
     zoom_precise: Option<f64>,
+    require_labels: Option<String>,
+    exclude_labels: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -838,6 +847,12 @@ struct WebStoreGetQuery {
 struct WebStorePutRequest {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreLabelsRequest {
+    path: String,
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3170,6 +3185,14 @@ async fn web_store_list(
             );
         }
     };
+    let require_labels = match web_label_filter_values(query.require_labels.as_deref()) {
+        Ok(labels) => labels,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+    let exclude_labels = match web_label_filter_values(query.exclude_labels.as_deref()) {
+        Ok(labels) => labels,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
 
     match current_sdk(&state)
         .await
@@ -3186,6 +3209,8 @@ async fn web_store_list(
                 sort,
                 media_filter,
                 viewport,
+                require_labels,
+                exclude_labels,
                 synthesize_missing_folder_markers: matches!(view, Some(StoreIndexView::Tree))
                     && query.offset.is_none()
                     && query.limit.is_none()
@@ -3259,6 +3284,22 @@ async fn web_gallery_map_clusters(
         if let Some(zoom_precise) = zoom_precise {
             params.append_pair("zoom_precise", &zoom_precise.to_string());
         }
+        if let Some(require_labels) = query
+            .require_labels
+            .as_deref()
+            .map(str::trim)
+            .filter(|labels| !labels.is_empty())
+        {
+            params.append_pair("require_labels", require_labels);
+        }
+        if let Some(exclude_labels) = query
+            .exclude_labels
+            .as_deref()
+            .map(str::trim)
+            .filter(|labels| !labels.is_empty())
+        {
+            params.append_pair("exclude_labels", exclude_labels);
+        }
     }
     let mut path = request_url.path().to_string();
     if let Some(query) = request_url.query() {
@@ -3280,6 +3321,10 @@ async fn web_gallery_map_clusters(
             error.to_string(),
         ),
     }
+}
+
+fn web_label_filter_values(raw: Option<&str>) -> std::result::Result<Vec<String>, &'static str> {
+    parse_comma_separated_labels(raw)
 }
 
 async fn web_gallery_map_cluster_entries(
@@ -3442,6 +3487,30 @@ async fn web_store_put(
             &state,
             StatusCode::BAD_GATEWAY,
             "store put request failed",
+            err.to_string(),
+        ),
+    }
+}
+
+async fn web_store_labels(
+    State(state): State<WebState>,
+    Json(request): Json<WebStoreLabelsRequest>,
+) -> impl IntoResponse {
+    let path = request.path.trim();
+    if path.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "path must not be empty");
+    }
+
+    match current_sdk(&state)
+        .await
+        .set_media_labels(path, request.labels)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store labels request failed",
             err.to_string(),
         ),
     }
@@ -4526,6 +4595,21 @@ mod tests {
             "docs/archive/"
         );
         assert_eq!(normalize_store_restore_path("   ", false), "");
+    }
+
+    #[test]
+    fn web_store_list_label_filters_preserve_escaped_label_characters() {
+        assert_eq!(
+            super::web_label_filter_values(Some(r"family\, close,travel\\journal")),
+            Ok(vec![
+                "family, close".to_string(),
+                "travel\\journal".to_string()
+            ])
+        );
+        assert_eq!(
+            super::web_label_filter_values(Some(r"invalid\q")),
+            Err("label filters may only escape commas and backslashes")
+        );
     }
 
     #[test]

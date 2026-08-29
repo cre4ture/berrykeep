@@ -133,6 +133,32 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         sort: String?,
         mediaFilter: String?
     ) throws -> String {
+        try storeIndexJSON(
+            handle: handle,
+            prefix: prefix,
+            depth: depth,
+            snapshot: snapshot,
+            view: view,
+            offset: offset,
+            limit: limit,
+            sort: sort,
+            mediaFilter: mediaFilter,
+            excludeLabels: nil
+        )
+    }
+
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?,
+        excludeLabels: String?
+    ) throws -> String {
         var jsonPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
         let status = withOptionalCString(prefix) { prefixPointer in
@@ -140,19 +166,22 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
                 withOptionalCString(view) { viewPointer in
                     withOptionalCString(sort) { sortPointer in
                         withOptionalCString(mediaFilter) { mediaFilterPointer in
-                            ironmesh_ios_facade_store_index_with_options_json(
-                                handle,
-                                prefixPointer,
-                                numericCast(max(depth, 1)),
-                                snapshotPointer,
-                                viewPointer,
-                                offset ?? -1,
-                                limit ?? -1,
-                                sortPointer,
-                                mediaFilterPointer,
-                                &jsonPointer,
-                                &errorPointer
-                            )
+                            withOptionalCString(excludeLabels) { excludeLabelsPointer in
+                                ironmesh_ios_facade_store_index_with_options_json(
+                                    handle,
+                                    prefixPointer,
+                                    numericCast(max(depth, 1)),
+                                    snapshotPointer,
+                                    viewPointer,
+                                    offset ?? -1,
+                                    limit ?? -1,
+                                    sortPointer,
+                                    mediaFilterPointer,
+                                    excludeLabelsPointer,
+                                    &jsonPointer,
+                                    &errorPointer
+                                )
+                            }
                         }
                     }
                 }
@@ -164,6 +193,21 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
             throw IronmeshRustFFIError(message: "Rust bridge returned no store index JSON.")
         }
         return consumeString(jsonPointer)
+    }
+
+    func setMediaLabels(handle: AppleRustHandle, key: String, labelsJSON: String) throws {
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = withOptionalCString(key) { keyPointer in
+            withOptionalCString(labelsJSON) { labelsPointer in
+                ironmesh_ios_facade_set_media_labels_json(
+                    handle,
+                    keyPointer,
+                    labelsPointer,
+                    &errorPointer
+                )
+            }
+        }
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
     }
 
     func metadataJSON(handle: AppleRustHandle, key: String) throws -> String {

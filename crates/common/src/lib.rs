@@ -30,6 +30,56 @@ pub fn normalize_node_hostname(value: impl AsRef<str>) -> Option<String> {
         .then(|| hostname.to_string())
 }
 
+/// Decodes the stable comma-separated label-filter format used by the node and
+/// user interfaces.
+///
+/// A backslash escapes a comma or another backslash, allowing an XMP keyword
+/// containing either character to remain an exact-match filter value. Blank
+/// entries are dropped, so a trailing comma or an empty parameter does not
+/// become a filter on the empty label.
+pub fn parse_comma_separated_labels(
+    raw: Option<&str>,
+) -> std::result::Result<Vec<String>, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+
+    let mut labels = Vec::new();
+    let mut label = String::new();
+    let mut escaped = false;
+    for character in raw.chars() {
+        if escaped {
+            if !matches!(character, ',' | '\\') {
+                return Err("label filters may only escape commas and backslashes");
+            }
+            label.push(character);
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            ',' => {
+                let trimmed_label = label.trim();
+                if !trimmed_label.is_empty() {
+                    labels.push(trimmed_label.to_string());
+                }
+                label.clear();
+            }
+            _ => label.push(character),
+        }
+    }
+    if escaped {
+        return Err("label filters must not end with an escape character");
+    }
+    let label = label.trim();
+    if !label.is_empty() {
+        labels.push(label.to_string());
+    }
+    labels.sort_unstable();
+    labels.dedup();
+    Ok(labels)
+}
+
 fn is_disallowed_hostname_character(character: char) -> bool {
     matches!(
         get_general_category(character),
@@ -45,7 +95,7 @@ fn is_disallowed_hostname_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_NODE_HOSTNAME_BYTES, normalize_node_hostname};
+    use super::{MAX_NODE_HOSTNAME_BYTES, normalize_node_hostname, parse_comma_separated_labels};
 
     #[test]
     fn normalizes_display_hostnames_without_accepting_invalid_values() {
@@ -60,6 +110,21 @@ mod tests {
         assert_eq!(
             normalize_node_hostname("a".repeat(MAX_NODE_HOSTNAME_BYTES + 1)),
             None
+        );
+    }
+
+    #[test]
+    fn label_filter_wire_format_decodes_commas_and_backslashes() {
+        assert_eq!(
+            parse_comma_separated_labels(Some(r"family\, close,travel\\journal")),
+            Ok(vec![
+                "family, close".to_string(),
+                "travel\\journal".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_comma_separated_labels(Some(r"invalid\q")),
+            Err("label filters may only escape commas and backslashes")
         );
     }
 }

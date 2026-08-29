@@ -76,6 +76,8 @@ type GalleryBasemapClustersPayload = {
 };
 
 type GalleryBasemapClusterEntriesPayload = {
+  offset: number;
+  limit: number;
   total_entry_count: number;
   has_more: boolean;
   entries: GalleryBasemapMapEntry[];
@@ -248,6 +250,7 @@ export function GalleryBasemapMap({
     cluster: GalleryBasemapMapCluster;
     queryToken: string;
     entries: GalleryBasemapMapEntry[];
+    nextOffset: number;
     totalEntryCount: number;
     hasMore: boolean;
     loading: boolean;
@@ -660,10 +663,12 @@ export function GalleryBasemapMap({
       return;
     }
     const existingEntries = append ? clusterDialog?.entries ?? [] : [];
+    const nextOffset = append ? clusterDialog?.nextOffset ?? 0 : 0;
     setClusterDialog({
       cluster,
       queryToken,
       entries: existingEntries,
+      nextOffset,
       totalEntryCount: append ? clusterDialog?.totalEntryCount ?? cluster.count : cluster.count,
       hasMore: append ? clusterDialog?.hasMore ?? true : true,
       loading: true,
@@ -673,13 +678,14 @@ export function GalleryBasemapMap({
       const page = await loadClusterEntries(
         queryToken,
         cluster.cluster_id,
-        existingEntries.length,
+        nextOffset,
         GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE
       );
       setClusterDialog({
         cluster,
         queryToken,
         entries: [...existingEntries, ...page.entries],
+        nextOffset: page.offset + page.limit,
         totalEntryCount: page.total_entry_count,
         hasMore: page.has_more,
         loading: false,
@@ -690,6 +696,7 @@ export function GalleryBasemapMap({
         cluster,
         queryToken,
         entries: existingEntries,
+        nextOffset,
         totalEntryCount: cluster.count,
         hasMore: append,
         loading: false,

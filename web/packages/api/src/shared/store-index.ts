@@ -38,6 +38,8 @@ export type StoreIndexMediaSummary = {
 export type StoreIndexEntry = {
   path: string;
   entry_type: string;
+  labels?: string[];
+  labels_resolved?: boolean;
   version?: string | null;
   content_hash?: string | null;
   size_bytes?: number | null;
@@ -138,6 +140,10 @@ export type GalleryMapClustersRequest = {
   zoom: number;
   /** Desired cluster-cell width in CSS pixels; the server bounds and quantizes it. */
   clusterCellSizePx?: number;
+  /** Labels every mapped entry must contain. */
+  requireLabels?: string[];
+  /** Labels excluded from map totals, clusters, and cluster entries. */
+  excludeLabels?: string[];
 };
 
 /** Keeps fractional MapLibre zoom while constraining requests to supported map levels. */
@@ -185,4 +191,6 @@ export type StoreListRequestOptions = {
   sort?: StoreListSortOrder;
   mediaFilter?: StoreListMediaFilter;
   viewport?: StoreIndexViewport;
+  requireLabels?: string[];
+  excludeLabels?: string[];
 };

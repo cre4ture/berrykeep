@@ -40,6 +40,7 @@ final class IronmeshGalleryModel: ObservableObject {
         sort: AppleGallerySort,
         currentPath: String,
         configuration: AppleConnectionConfiguration?,
+        showSensitiveContent: Bool = false,
         force: Bool = false
     ) {
         guard let configuration else {
@@ -49,7 +50,12 @@ final class IronmeshGalleryModel: ObservableObject {
 
         let context = IronmeshGalleryLoadContext(
             configuration: configuration,
-            query: AppleGalleryQuery(mode: mode, currentPath: currentPath, sort: sort)
+            query: AppleGalleryQuery(
+                mode: mode,
+                currentPath: currentPath,
+                sort: sort,
+                showSensitiveContent: showSensitiveContent
+            )
         )
         guard force || context != activeContext else {
             return
@@ -76,8 +82,44 @@ final class IronmeshGalleryModel: ObservableObject {
             sort: activeContext.query.sort,
             currentPath: activeContext.query.currentPath,
             configuration: activeContext.configuration,
+            showSensitiveContent: activeContext.query.showSensitiveContent,
             force: true
         )
+    }
+
+    func toggleSensitiveLabel(for entry: AppleStoreIndexEntry, label: String) {
+        guard let context = activeContext else {
+            return
+        }
+        guard entry.labelsResolved == true else {
+            errorMessage = "Image labels are temporarily unavailable. Refresh before editing them."
+            return
+        }
+        let labels = entry.labels ?? []
+        let nextLabels = labels.contains(label)
+            ? labels.filter { $0 != label }
+            : labels + [label]
+        let remoteSession = remoteSession
+        Task { [weak self] in
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try remoteSession.setMediaLabels(
+                        path: entry.path,
+                        labels: nextLabels,
+                        configuration: context.configuration
+                    )
+                }.value
+                guard let self, self.activeContext == context else {
+                    return
+                }
+                self.refresh()
+            } catch {
+                guard let self, self.activeContext == context else {
+                    return
+                }
+                self.errorMessage = error.localizedDescription
+            }
+        }
     }
 
     func loadNextPage() {
@@ -383,6 +425,16 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
     ) throws -> Data {
         try withBridge(configuration: configuration) { bridge in
             try bridge.download(path: path, revisionHint: nil)
+        }
+    }
+
+    func setMediaLabels(
+        path: String,
+        labels: [String],
+        configuration: AppleConnectionConfiguration
+    ) throws {
+        try withBridge(configuration: configuration) { bridge in
+            try bridge.setMediaLabels(path: path, labels: labels)
         }
     }
 

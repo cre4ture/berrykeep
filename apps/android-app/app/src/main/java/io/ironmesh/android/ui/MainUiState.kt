@@ -61,6 +61,8 @@ data class GalleryImageItem(
     val width: Int? = null,
     val height: Int? = null,
     val thumbnailStatus: String? = null,
+    val labels: List<String> = emptyList(),
+    val labelsResolved: Boolean = false,
 )
 
 @Immutable
@@ -153,6 +155,7 @@ data class MainUiState(
     val galleryCurrentDirectoryDocumentId: String = "dir:",
     val galleryCurrentDirectoryPath: String = "/",
     val gallerySort: GallerySortOption = GallerySortOption.CREATION_TIME,
+    val galleryShowSensitiveContent: Boolean = false,
     val themeAccentColorHex: String = DEFAULT_IRONMESH_ACCENT_COLOR_HEX,
     val galleryLoading: Boolean = false,
     val galleryError: GalleryLoadError? = null,

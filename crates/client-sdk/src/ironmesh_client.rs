@@ -3385,6 +3385,12 @@ struct ResumableDownloadFileState {
 pub struct StoreIndexEntry {
     pub path: String,
     pub entry_type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// True only when the response could authoritatively read the entry's
+    /// XMP-sidecar labels. Callers must not replace labels when false.
+    #[serde(default)]
+    pub labels_resolved: bool,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -3557,6 +3563,10 @@ pub struct StoreIndexRequestOptions {
     pub sort: Option<StoreIndexSortOrder>,
     pub media_filter: Option<StoreIndexMediaFilter>,
     pub viewport: Option<StoreIndexViewport>,
+    /// Labels that must all be present on an entry.
+    pub require_labels: Vec<String>,
+    /// Labels that must not be present on an entry.
+    pub exclude_labels: Vec<String>,
     pub synthesize_missing_folder_markers: bool,
 }
 
@@ -3571,6 +3581,8 @@ impl Default for StoreIndexRequestOptions {
             sort: None,
             media_filter: None,
             viewport: None,
+            require_labels: Vec::new(),
+            exclude_labels: Vec::new(),
             synthesize_missing_folder_markers: true,
         }
     }
@@ -3591,6 +3603,10 @@ pub struct GalleryMapClustersRequest {
     pub media_filter: StoreIndexMediaFilter,
     pub viewport: StoreIndexViewport,
     pub zoom: f64,
+    /// Labels that must all be present in map aggregates.
+    pub require_labels: Vec<String>,
+    /// Labels that must not affect map aggregates or cluster entries.
+    pub exclude_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -3777,6 +3793,12 @@ struct SnapshotRestoreRequest {
 struct VersionRestoreRequest {
     to_path: String,
     overwrite: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MediaLabelsRequest {
+    path: String,
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5219,6 +5241,8 @@ impl IronMeshClient {
                 .append_pair("north", &viewport.north.to_string())
                 .append_pair("east", &viewport.east.to_string());
         }
+        append_comma_separated_labels(&mut url, "require_labels", &options.require_labels);
+        append_comma_separated_labels(&mut url, "exclude_labels", &options.exclude_labels);
 
         let response = self
             .execute_buffered_request(Method::GET, url, Vec::new(), None)
@@ -5282,6 +5306,47 @@ impl IronMeshClient {
     ) -> Result<StoreIndexResponse> {
         let runtime = blocking_runtime()?;
         runtime.block_on(self.store_index_with_options(prefix, depth, snapshot, options))
+    }
+
+    /// Replaces the XMP sidecar labels attached to a media object.
+    pub async fn set_media_labels(
+        &self,
+        key: impl Into<String>,
+        labels: Vec<String>,
+    ) -> Result<()> {
+        let key = key.into();
+        let payload = serde_json::to_vec(&MediaLabelsRequest {
+            path: key.clone(),
+            labels,
+        })
+        .context("failed to encode media labels request")?;
+        let response = self
+            .execute_buffered_request(
+                Method::POST,
+                self.store_labels_url()?,
+                vec![json_content_type_header()],
+                Some(payload),
+            )
+            .await
+            .with_context(|| format!("failed to update media labels for {key}"))?;
+
+        if response.status == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            bail!(
+                "updating media labels for {key} returned non-success status: {}",
+                response.status
+            )
+        }
+    }
+
+    pub fn set_media_labels_blocking(
+        &self,
+        key: impl Into<String>,
+        labels: Vec<String>,
+    ) -> Result<()> {
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.set_media_labels(key, labels))
     }
 
     pub async fn wait_for_store_index_change(
@@ -5370,6 +5435,8 @@ impl IronMeshClient {
             .append_pair("zoom", &zoom.to_string())
             .append_pair("zoom_precise", &zoom_precise.to_string());
         drop(query);
+        append_comma_separated_labels(&mut url, "require_labels", &request.require_labels);
+        append_comma_separated_labels(&mut url, "exclude_labels", &request.exclude_labels);
         Ok(url)
     }
 
@@ -7352,6 +7419,20 @@ impl IronMeshClient {
         Ok(url)
     }
 
+    fn store_labels_url(&self) -> Result<Url> {
+        let mut url = self.client_api_base_url()?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("labels");
+        }
+
+        Ok(url)
+    }
+
     fn store_versions_url(&self, key: &str) -> Result<Url> {
         let mut url = self.client_api_base_url()?;
 
@@ -7515,6 +7596,23 @@ impl IronMeshClient {
         }
 
         Ok(url)
+    }
+}
+
+/// Appends a label filter using the stable comma-separated wire format accepted
+/// by the node and web proxy. Commas and backslashes inside label names are
+/// escaped so the server can recover each exact label. Empty labels are ignored
+/// consistently across the store index and map clients.
+fn append_comma_separated_labels(url: &mut Url, parameter: &str, labels: &[String]) {
+    let labels = labels
+        .iter()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .map(|label| label.replace('\\', "\\\\").replace(',', "\\,"))
+        .collect::<Vec<_>>();
+    if !labels.is_empty() {
+        url.query_pairs_mut()
+            .append_pair(parameter, &labels.join(","));
     }
 }
 
@@ -8904,6 +9002,8 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>, scope_prefi
             entries.push(StoreIndexEntry {
                 path: marker,
                 entry_type: "prefix".to_string(),
+                labels: Vec::new(),
+                labels_resolved: false,
                 version: None,
                 content_hash: None,
                 size_bytes: None,

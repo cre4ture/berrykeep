@@ -28,6 +28,8 @@ type ResourceDescriptor =
       limit: number | null;
       sort: GalleryLoadEntriesOptions["sort"] | null;
       mediaFilter: GalleryLoadEntriesOptions["mediaFilter"] | null;
+      requireLabels: string[];
+      excludeLabels: string[];
     };
 
 type ResourceConfig<T> = {
@@ -208,7 +210,13 @@ function galleryDataUpdate(
       ...(descriptor.offset === null ? {} : { offset: descriptor.offset }),
       ...(descriptor.limit === null ? {} : { limit: descriptor.limit }),
       ...(descriptor.sort === null ? {} : { sort: descriptor.sort }),
-      ...(descriptor.mediaFilter === null ? {} : { mediaFilter: descriptor.mediaFilter })
+      ...(descriptor.mediaFilter === null ? {} : { mediaFilter: descriptor.mediaFilter }),
+      ...(descriptor.requireLabels.length === 0
+        ? {}
+        : { requireLabels: descriptor.requireLabels }),
+      ...(descriptor.excludeLabels.length === 0
+        ? {}
+        : { excludeLabels: descriptor.excludeLabels })
     },
     payload
   };
@@ -247,7 +255,9 @@ function entryDescriptor(
         ? Math.max(1, Math.floor(options.limit))
         : null,
     sort: options.sort ?? null,
-    mediaFilter: options.mediaFilter ?? null
+    mediaFilter: options.mediaFilter ?? null,
+    requireLabels: options.requireLabels ?? [],
+    excludeLabels: options.excludeLabels ?? []
   };
 }
 

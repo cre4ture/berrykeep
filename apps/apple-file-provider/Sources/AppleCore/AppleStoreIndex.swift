@@ -94,19 +94,22 @@ public struct AppleStoreIndexRequestOptions: Equatable, Sendable {
     public var limit: Int?
     public var sort: AppleStoreIndexSortOrder?
     public var mediaFilter: AppleStoreIndexMediaFilter?
+    public var excludeLabels: [String]
 
     public init(
         view: AppleStoreIndexView? = nil,
         offset: Int? = nil,
         limit: Int? = nil,
         sort: AppleStoreIndexSortOrder? = nil,
-        mediaFilter: AppleStoreIndexMediaFilter? = nil
+        mediaFilter: AppleStoreIndexMediaFilter? = nil,
+        excludeLabels: [String] = []
     ) {
         self.view = view
         self.offset = offset.map { max(0, $0) }
         self.limit = limit.map { max(1, $0) }
         self.sort = sort
         self.mediaFilter = mediaFilter
+        self.excludeLabels = excludeLabels
     }
 }
 
@@ -182,6 +185,8 @@ public struct AppleStoreIndexEntry: Codable, Equatable, Sendable, Identifiable {
     public var sizeBytes: UInt64?
     public var modifiedAtUnix: UInt64?
     public var contentFingerprint: String?
+    public var labels: [String]?
+    public var labelsResolved: Bool?
     public var media: AppleStoreIndexMedia?
 
     public var id: String { path }
@@ -194,6 +199,8 @@ public struct AppleStoreIndexEntry: Codable, Equatable, Sendable, Identifiable {
         case sizeBytes = "size_bytes"
         case modifiedAtUnix = "modified_at_unix"
         case contentFingerprint = "content_fingerprint"
+        case labels
+        case labelsResolved = "labels_resolved"
         case media
     }
 }
@@ -276,17 +283,20 @@ public struct AppleGalleryQuery: Equatable, Sendable {
     public var currentPath: String
     public var sort: AppleGallerySort
     public var pageSize: Int
+    public var showSensitiveContent: Bool
 
     public init(
         mode: AppleGalleryMode,
         currentPath: String,
         sort: AppleGallerySort,
-        pageSize: Int = defaultPageSize
+        pageSize: Int = defaultPageSize,
+        showSensitiveContent: Bool = false
     ) {
         self.mode = mode
         self.currentPath = normalizedPath(currentPath)
         self.sort = sort
         self.pageSize = max(1, pageSize)
+        self.showSensitiveContent = showSensitiveContent
     }
 
     public func request(offset: Int) -> AppleStoreIndexRequest {
@@ -298,7 +308,8 @@ public struct AppleGalleryQuery: Equatable, Sendable {
                 offset: offset,
                 limit: pageSize,
                 sort: sort.storeIndexOrder,
-                mediaFilter: .image
+                mediaFilter: .image,
+                excludeLabels: showSensitiveContent ? [] : ["private", "nsfw"]
             )
         )
     }

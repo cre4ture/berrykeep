@@ -41,11 +41,14 @@ data class StoreIndexRequestOptions(
     val limit: Int? = null,
     val sort: StoreIndexSortOrder? = null,
     val mediaFilter: StoreIndexMediaFilter? = null,
+    val excludeLabels: List<String> = emptyList(),
 )
 
 data class StoreIndexEntry(
     val path: String,
     val entry_type: String,
+    val labels: List<String> = emptyList(),
+    val labels_resolved: Boolean = false,
     val version: String? = null,
     val content_hash: String? = null,
     val size_bytes: Long? = null,

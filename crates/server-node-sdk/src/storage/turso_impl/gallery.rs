@@ -660,6 +660,7 @@ impl TursoMetadataStore {
             prefix: query.prefix.trim().trim_matches('/').to_string(),
             depth: query.depth,
             media_filter: query.media_filter,
+            label_filter: query.label_filter.clone(),
         };
         let (total_entry_count, media_summary, summary_status) = self
             .gallery_map_summary(scope, &history_id, cache_revision)
@@ -1353,7 +1354,9 @@ fn turso_gallery_map_scope_values(
 async fn gallery_map_summary_query(
     connection: &turso::Connection,
     scope_values: &[Value],
+    label_filter: &super::super::GalleryLabelFilter,
 ) -> Result<(usize, GalleryIndexMediaSummary)> {
+    let (label_sql, label_values) = gallery_label_predicates(label_filter, scope_values.len() + 1)?;
     let summary_sql = format!(
         "SELECT
              COUNT(*),
@@ -1364,10 +1367,12 @@ async fn gallery_map_summary_query(
              COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(geotagged), 0)
          FROM gallery_objects
-         WHERE {GALLERY_MAP_SCOPE_SQL}"
+         WHERE {GALLERY_MAP_SCOPE_SQL}{label_sql}"
     );
+    let mut values = scope_values.to_vec();
+    values.extend(label_values.into_iter().map(Value::Text));
     let mut summary_rows = connection
-        .query(summary_sql, params_from_iter(scope_values.iter().cloned()))
+        .query(summary_sql, params_from_iter(values))
         .await?;
     let summary = summary_rows
         .next()
@@ -1390,27 +1395,6 @@ async fn gallery_map_summary_query(
     Ok((total_entry_count, media_summary))
 }
 
-const GALLERY_MAP_SUMMARY_CHUNK_SQL: &str = "
-    SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
-           gallery_objects.geotagged
-    FROM gallery_objects
-    WHERE (?1 = '' OR gallery_objects.key = ?1 OR gallery_objects.key LIKE ?2 ESCAPE '\\')
-      AND CASE
-            WHEN ?1 = '' THEN CASE
-                WHEN trim(gallery_objects.key, '/') = '' THEN 0
-                ELSE length(trim(gallery_objects.key, '/'))
-                     - length(replace(trim(gallery_objects.key, '/'), '/', '')) + 1
-            END
-            WHEN gallery_objects.key = ?1 THEN 0
-            ELSE length(substr(gallery_objects.key, length(?1) + 2))
-                 - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
-        END <= ?3
-      AND gallery_objects.inferred_media_type IS NOT NULL
-      AND (?4 IS NULL OR gallery_objects.media_type = ?4)
-      AND (?5 IS NULL OR gallery_objects.key > ?5)
-    ORDER BY gallery_objects.key
-    LIMIT ?6";
-
 const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
 
 /// Same result as [`gallery_map_summary_query`], but computed in small ordered chunks so a
@@ -1421,19 +1405,31 @@ const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
 async fn gallery_map_summary_chunked_query(
     connection: &turso::Connection,
     scope_values: &[Value],
+    label_filter: &super::super::GalleryLabelFilter,
     total_estimate: Option<usize>,
     progress: &GallerySummaryProgress,
 ) -> Result<(usize, GalleryIndexMediaSummary)> {
+    let (label_sql, label_values) = gallery_label_predicates(label_filter, scope_values.len() + 1)?;
+    let cursor_parameter = scope_values.len() + label_values.len() + 1;
+    let limit_parameter = cursor_parameter + 1;
+    let sql = format!(
+        "SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
+                gallery_objects.geotagged
+           FROM gallery_objects
+          WHERE {GALLERY_MAP_SCOPE_SQL}{label_sql}
+            AND (?{cursor_parameter} IS NULL OR gallery_objects.key > ?{cursor_parameter})
+          ORDER BY gallery_objects.key
+          LIMIT ?{limit_parameter}"
+    );
     let mut cursor: Option<String> = None;
     let mut total = 0usize;
     let mut summary = GalleryIndexMediaSummary::default();
     loop {
         let mut values = scope_values.to_vec();
+        values.extend(label_values.iter().cloned().map(Value::Text));
         values.push(optional_text_value(cursor.as_deref()));
         values.push(Value::from(GALLERY_MAP_SUMMARY_CHUNK_ROWS));
-        let mut rows = connection
-            .query(GALLERY_MAP_SUMMARY_CHUNK_SQL, params_from_iter(values))
-            .await?;
+        let mut rows = connection.query(&sql, params_from_iter(values)).await?;
         let mut chunk_len = 0usize;
         let mut last_key = None;
         while let Some(row) = rows.next().await? {
@@ -1476,10 +1472,14 @@ async fn gallery_map_cluster_cells_query(
     base_values: &[Value],
     requested_resolution: u32,
     max_clusters: usize,
+    label_filter: &super::super::GalleryLabelFilter,
 ) -> Result<(u32, Vec<GalleryMapCluster>)> {
     let max_clusters = max_clusters.max(1);
     let mut resolution = requested_resolution.max(1);
     let clusters = loop {
+        let (label_sql, label_values) =
+            gallery_label_predicates(label_filter, base_values.len() + 2)?;
+        let limit_parameter = base_values.len() + 2 + label_values.len();
         let sql = format!(
             "SELECT
                  CAST(gallery_objects.spatial_x * ?13 AS INTEGER),
@@ -1505,13 +1505,14 @@ async fn gallery_map_cluster_cells_query(
                ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
-             WHERE {GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
+             WHERE {GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}{label_sql}
              GROUP BY 1, 2
              ORDER BY 2 ASC, 1 ASC
-             LIMIT ?14"
+             LIMIT ?{limit_parameter}"
         );
         let mut values = base_values.to_vec();
         values.push(Value::from(i64::from(resolution)));
+        values.extend(label_values.into_iter().map(Value::Text));
         values.push(Value::from(
             i64::try_from(max_clusters.saturating_add(1))
                 .context("gallery map cluster limit overflow")?,
@@ -1586,7 +1587,7 @@ async fn query_gallery_map_clusters(
         query.viewport,
     )?;
     let (total_entry_count, media_summary) =
-        gallery_map_summary_query(connection, &base_values[..4]).await?;
+        gallery_map_summary_query(connection, &base_values[..4], &query.label_filter).await?;
     let (resolution, clusters) = gallery_map_cluster_cells_query(
         connection,
         &base_values,
@@ -1596,6 +1597,7 @@ async fn query_gallery_map_clusters(
             query.max_clusters,
         ),
         query.max_clusters,
+        &query.label_filter,
     )
     .await?;
     let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
@@ -1640,6 +1642,7 @@ pub(super) async fn query_gallery_map_cluster_cells(
             query.max_clusters,
         ),
         query.max_clusters,
+        &query.label_filter,
     )
     .await?;
     let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
@@ -1678,12 +1681,15 @@ pub(super) async fn query_gallery_map_summary(
                 gallery_map_summary_chunked_query(
                     &transaction,
                     &scope_values,
+                    &scope.label_filter,
                     total_estimate,
                     progress,
                 )
                 .await?
             }
-            None => gallery_map_summary_query(&transaction, &scope_values).await?,
+            None => {
+                gallery_map_summary_query(&transaction, &scope_values, &scope.label_filter).await?
+            }
         };
         Ok(GallerySummaryCacheValue {
             history_id,
@@ -1718,10 +1724,15 @@ async fn query_gallery_map_cluster_entries(
     values.push(Value::from(i64::from(query.resolution.max(1))));
     values.push(Value::from(i64::from(query.cell_x)));
     values.push(Value::from(i64::from(query.cell_y)));
+    let (label_sql, label_values) =
+        gallery_label_predicates(&query.label_filter, values.len() + 1)?;
+    values.extend(label_values.into_iter().map(Value::Text));
+    let limit_parameter = values.len() + 1;
+    let offset_parameter = limit_parameter + 1;
     let cell_scope = format!(
         "{GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
          AND CAST(gallery_objects.spatial_x * ?13 AS INTEGER) = ?14
-         AND CAST(gallery_objects.spatial_y * ?13 AS INTEGER) = ?15"
+         AND CAST(gallery_objects.spatial_y * ?13 AS INTEGER) = ?15{label_sql}"
     );
     let summary_sql = format!(
         "SELECT
@@ -1774,7 +1785,7 @@ async fn query_gallery_map_cluster_entries(
            ON version_indexes.object_id = gallery_objects.object_id
          WHERE {cell_scope}
          ORDER BY gallery_objects.captured_at_unix DESC, gallery_objects.key ASC
-         LIMIT ?16 OFFSET ?17"
+         LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
     );
     values.push(Value::from(
         i64::try_from(query.limit.max(1)).context("gallery map entry limit overflow")?,
@@ -2289,6 +2300,7 @@ mod tests {
             viewport,
             requested_resolution,
             max_clusters,
+            label_filter: Default::default(),
         }
     }
 
@@ -2499,6 +2511,7 @@ mod tests {
                 cell_y: cluster.cell_y,
                 offset: 0,
                 limit: 1,
+                label_filter: Default::default(),
             },
             history_id,
             revision,
@@ -2632,6 +2645,7 @@ mod tests {
                 cell_y: cluster.cell_y,
                 offset: 0,
                 limit: 100,
+                label_filter: Default::default(),
             })
             .await
             .expect("cluster page should load after unrelated ingest")
@@ -2658,6 +2672,7 @@ mod tests {
                 cell_y: cluster.cell_y,
                 offset: 0,
                 limit: 100,
+                label_filter: Default::default(),
             })
             .await
             .expect("cluster page should load after in-scope change")

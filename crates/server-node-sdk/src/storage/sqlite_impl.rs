@@ -680,6 +680,7 @@ fn query_gallery_map_cluster_cells_from_db(
             query.max_clusters,
         ),
         query.max_clusters,
+        &query.label_filter,
     )?;
     transaction.commit()?;
     let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
@@ -726,10 +727,11 @@ fn query_gallery_map_summary_from_db(
         Some(progress) => gallery_map_summary_chunked_from_db(
             &transaction,
             &scope_values,
+            &scope.label_filter,
             total_estimate,
             progress,
         )?,
-        None => gallery_map_summary_from_db(&transaction, &scope_values)?,
+        None => gallery_map_summary_from_db(&transaction, &scope_values, &scope.label_filter)?,
     };
     transaction.commit()?;
     Ok(GallerySummaryCacheValue {
@@ -1016,7 +1018,9 @@ fn sqlite_gallery_map_scope_values(
 fn gallery_map_summary_from_db(
     db: &Connection,
     scope_values: &[Value],
+    label_filter: &super::GalleryLabelFilter,
 ) -> Result<(usize, GalleryIndexMediaSummary)> {
+    let (label_sql, label_values) = gallery_label_predicates(label_filter, scope_values.len() + 1)?;
     let summary_sql = format!(
         "SELECT
              COUNT(*),
@@ -1027,56 +1031,35 @@ fn gallery_map_summary_from_db(
              COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(geotagged), 0)
          FROM gallery_objects
-         WHERE {GALLERY_MAP_SCOPE_SQL}"
+         WHERE {GALLERY_MAP_SCOPE_SQL}{label_sql}"
     );
-    Ok(
-        db.query_row(&summary_sql, params_from_iter(scope_values.iter()), |row| {
-            let count = |index| {
-                row.get::<_, i64>(index).and_then(|value| {
-                    usize::try_from(value).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            index,
-                            rusqlite::types::Type::Integer,
-                            Box::new(error),
-                        )
-                    })
+    let mut values = scope_values.to_vec();
+    values.extend(label_values.into_iter().map(Value::Text));
+    Ok(db.query_row(&summary_sql, params_from_iter(values), |row| {
+        let count = |index| {
+            row.get::<_, i64>(index).and_then(|value| {
+                usize::try_from(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        index,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
                 })
-            };
-            Ok((
-                count(0)?,
-                GalleryIndexMediaSummary {
-                    ready_count: count(1)?,
-                    pending_count: count(2)?,
-                    incomplete_count: count(3)?,
-                    image_count: count(4)?,
-                    video_count: count(5)?,
-                    geotagged_count: count(6)?,
-                },
-            ))
-        })?,
-    )
+            })
+        };
+        Ok((
+            count(0)?,
+            GalleryIndexMediaSummary {
+                ready_count: count(1)?,
+                pending_count: count(2)?,
+                incomplete_count: count(3)?,
+                image_count: count(4)?,
+                video_count: count(5)?,
+                geotagged_count: count(6)?,
+            },
+        ))
+    })?)
 }
-
-const GALLERY_MAP_SUMMARY_CHUNK_SQL: &str = "
-    SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
-           gallery_objects.geotagged
-    FROM gallery_objects
-    WHERE (?1 = '' OR gallery_objects.key = ?1 OR gallery_objects.key LIKE ?2 ESCAPE '\\')
-      AND CASE
-            WHEN ?1 = '' THEN CASE
-                WHEN trim(gallery_objects.key, '/') = '' THEN 0
-                ELSE length(trim(gallery_objects.key, '/'))
-                     - length(replace(trim(gallery_objects.key, '/'), '/', '')) + 1
-            END
-            WHEN gallery_objects.key = ?1 THEN 0
-            ELSE length(substr(gallery_objects.key, length(?1) + 2))
-                 - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
-        END <= ?3
-      AND gallery_objects.inferred_media_type IS NOT NULL
-      AND (?4 IS NULL OR gallery_objects.media_type = ?4)
-      AND (?5 IS NULL OR gallery_objects.key > ?5)
-    ORDER BY gallery_objects.key
-    LIMIT ?6";
 
 const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
 
@@ -1088,16 +1071,30 @@ const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
 fn gallery_map_summary_chunked_from_db(
     db: &Connection,
     scope_values: &[Value],
+    label_filter: &super::GalleryLabelFilter,
     total_estimate: Option<usize>,
     progress: &GallerySummaryProgress,
 ) -> Result<(usize, GalleryIndexMediaSummary)> {
-    let mut statement = db.prepare_cached(GALLERY_MAP_SUMMARY_CHUNK_SQL)?;
+    let (label_sql, label_values) = gallery_label_predicates(label_filter, scope_values.len() + 1)?;
+    let cursor_parameter = scope_values.len() + label_values.len() + 1;
+    let limit_parameter = cursor_parameter + 1;
+    let sql = format!(
+        "SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
+                gallery_objects.geotagged
+           FROM gallery_objects
+          WHERE {GALLERY_MAP_SCOPE_SQL}{label_sql}
+            AND (?{cursor_parameter} IS NULL OR gallery_objects.key > ?{cursor_parameter})
+          ORDER BY gallery_objects.key
+          LIMIT ?{limit_parameter}"
+    );
+    let mut statement = db.prepare_cached(&sql)?;
     let mut cursor: Option<String> = None;
     let mut total = 0usize;
     let mut summary = GalleryIndexMediaSummary::default();
     loop {
         let cursor_value = cursor.clone().map(Value::Text).unwrap_or(Value::Null);
         let mut values = scope_values.to_vec();
+        values.extend(label_values.iter().cloned().map(Value::Text));
         values.push(cursor_value);
         values.push(Value::Integer(GALLERY_MAP_SUMMARY_CHUNK_ROWS));
         let mut rows = statement.query(params_from_iter(values))?;
@@ -1143,10 +1140,14 @@ fn gallery_map_cluster_cells_from_db(
     base_values: &[Value],
     requested_resolution: u32,
     max_clusters: usize,
+    label_filter: &super::GalleryLabelFilter,
 ) -> Result<(u32, Vec<GalleryMapCluster>)> {
     let max_clusters = max_clusters.max(1);
     let mut resolution = requested_resolution.max(1);
     let clusters = loop {
+        let (label_sql, label_values) =
+            gallery_label_predicates(label_filter, base_values.len() + 2)?;
+        let limit_parameter = base_values.len() + 2 + label_values.len();
         let sql = format!(
             "SELECT
                  CAST(gallery_objects.spatial_x * ?13 AS INTEGER),
@@ -1172,13 +1173,14 @@ fn gallery_map_cluster_cells_from_db(
                ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
-             WHERE {GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
+             WHERE {GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}{label_sql}
              GROUP BY 1, 2
              ORDER BY 2 ASC, 1 ASC
-             LIMIT ?14"
+             LIMIT ?{limit_parameter}"
         );
         let mut values = base_values.to_vec();
         values.push(Value::Integer(i64::from(resolution)));
+        values.extend(label_values.into_iter().map(Value::Text));
         values.push(Value::Integer(
             i64::try_from(max_clusters.saturating_add(1))
                 .context("gallery map cluster limit overflow")?,
@@ -1249,7 +1251,8 @@ fn query_gallery_map_clusters_in_transaction(
         query.media_filter,
         query.viewport,
     )?;
-    let (total_entry_count, media_summary) = gallery_map_summary_from_db(db, &base_values[..4])?;
+    let (total_entry_count, media_summary) =
+        gallery_map_summary_from_db(db, &base_values[..4], &query.label_filter)?;
     let (resolution, clusters) = gallery_map_cluster_cells_from_db(
         db,
         &base_values,
@@ -1259,6 +1262,7 @@ fn query_gallery_map_clusters_in_transaction(
             query.max_clusters,
         ),
         query.max_clusters,
+        &query.label_filter,
     )?;
     let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
     Ok(GalleryMapClusterPage {
@@ -1295,10 +1299,15 @@ fn query_gallery_map_cluster_entries_in_transaction(
     values.push(Value::Integer(i64::from(query.resolution.max(1))));
     values.push(Value::Integer(i64::from(query.cell_x)));
     values.push(Value::Integer(i64::from(query.cell_y)));
+    let (label_sql, label_values) =
+        gallery_label_predicates(&query.label_filter, values.len() + 1)?;
+    values.extend(label_values.into_iter().map(Value::Text));
+    let limit_parameter = values.len() + 1;
+    let offset_parameter = limit_parameter + 1;
     let cell_scope = format!(
         "{GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
          AND CAST(gallery_objects.spatial_x * ?13 AS INTEGER) = ?14
-         AND CAST(gallery_objects.spatial_y * ?13 AS INTEGER) = ?15"
+         AND CAST(gallery_objects.spatial_y * ?13 AS INTEGER) = ?15{label_sql}"
     );
     let summary_sql = format!(
         "SELECT
@@ -1355,7 +1364,7 @@ fn query_gallery_map_cluster_entries_in_transaction(
            ON version_indexes.object_id = gallery_objects.object_id
          WHERE {cell_scope}
          ORDER BY gallery_objects.captured_at_unix DESC, gallery_objects.key ASC
-         LIMIT ?16 OFFSET ?17"
+         LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
     );
     values.push(Value::Integer(
         i64::try_from(query.limit.max(1)).context("gallery map entry limit overflow")?,
@@ -1873,6 +1882,39 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn gallery_object_labels_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        const LABEL_LOOKUP_CHUNK_SIZE: usize = 500;
+        let keys = keys.to_vec();
+        self.read(move |db| {
+            let mut labels_by_key = HashMap::new();
+            for keys in keys.chunks(LABEL_LOOKUP_CHUNK_SIZE) {
+                if keys.is_empty() {
+                    continue;
+                }
+                let placeholders = (1..=keys.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT key, labels_json FROM gallery_objects WHERE key IN ({placeholders})"
+                );
+                let mut statement = db.prepare(&sql)?;
+                let rows = statement.query_map(params_from_iter(keys.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (key, labels_json) = row?;
+                    labels_by_key.insert(key, decode_gallery_labels(&labels_json)?);
+                }
+            }
+            Ok(labels_by_key)
+        })
+        .await
+    }
+
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
@@ -1895,6 +1937,7 @@ impl MetadataStore for SqliteMetadataStore {
             prefix: query.prefix.trim().trim_matches('/').to_string(),
             depth: query.depth,
             media_filter: query.media_filter,
+            label_filter: query.label_filter.clone(),
         };
         let (total_entry_count, media_summary, summary_status) = self
             .gallery_map_summary(scope, &history_id, cache_revision)

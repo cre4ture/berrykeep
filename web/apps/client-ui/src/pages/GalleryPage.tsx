@@ -7,7 +7,8 @@ import {
   listSnapshots,
   listStoreEntries,
   restoreStoreVersion,
-  retryStoreMediaCacheEntry
+  retryStoreMediaCacheEntry,
+  setStoreMediaLabels
 } from "@ironmesh/api";
 import {
   GallerySurface,
@@ -85,7 +86,8 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
         retryStoreMediaCacheEntry(entry.path, {
           snapshot: snapshotId,
           version: typeof entry.version === "string" ? entry.version : null
-        })
+        }),
+      setMediaLabels: (entry, labels) => setStoreMediaLabels(entry.path, labels)
     }),
     []
   );

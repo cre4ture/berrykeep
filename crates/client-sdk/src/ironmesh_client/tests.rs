@@ -1092,6 +1092,8 @@ fn snapshot_conversion_maps_prefix_and_keys() {
         StoreIndexEntry {
             path: "docs/".to_string(),
             entry_type: "prefix".to_string(),
+            labels: Vec::new(),
+            labels_resolved: false,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -1102,6 +1104,8 @@ fn snapshot_conversion_maps_prefix_and_keys() {
         StoreIndexEntry {
             path: "docs/readme.txt".to_string(),
             entry_type: "key".to_string(),
+            labels: Vec::new(),
+            labels_resolved: false,
             version: None,
             content_hash: None,
             size_bytes: Some(42),
@@ -1180,6 +1184,8 @@ fn ensure_missing_folder_markers_adds_nested_parents() {
     let mut entries = vec![StoreIndexEntry {
         path: "a/b/c.txt".to_string(),
         entry_type: "key".to_string(),
+        labels: Vec::new(),
+        labels_resolved: false,
         version: None,
         content_hash: None,
         size_bytes: Some(7),
@@ -1203,6 +1209,8 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
         StoreIndexEntry {
             path: "docs/".to_string(),
             entry_type: "prefix".to_string(),
+            labels: Vec::new(),
+            labels_resolved: false,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -1213,6 +1221,8 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
         StoreIndexEntry {
             path: "docs/guides/readme.md".to_string(),
             entry_type: "key".to_string(),
+            labels: Vec::new(),
+            labels_resolved: false,
             version: None,
             content_hash: None,
             size_bytes: Some(11),
@@ -1239,6 +1249,8 @@ fn ensure_missing_folder_markers_stays_within_the_requested_prefix() {
     let mut entries = vec![StoreIndexEntry {
         path: "devices/Oppo-uli/Fotos/image.jpg".to_string(),
         entry_type: "key".to_string(),
+        labels: Vec::new(),
+        labels_resolved: false,
         version: None,
         content_hash: None,
         size_bytes: Some(7),
@@ -1358,6 +1370,8 @@ fn store_index_test_entry(path: &str) -> StoreIndexEntry {
     StoreIndexEntry {
         path: path.to_string(),
         entry_type: "key".to_string(),
+        labels: Vec::new(),
+        labels_resolved: false,
         version: None,
         content_hash: None,
         size_bytes: None,
@@ -1755,6 +1769,8 @@ fn snapshot_index_response_body(path: &str) -> Vec<u8> {
         entries: vec![StoreIndexEntry {
             path: path.to_string(),
             entry_type: "key".to_string(),
+            labels: Vec::new(),
+            labels_resolved: false,
             version: Some("v1".to_string()),
             content_hash: Some("hash-1".to_string()),
             size_bytes: Some(42),
@@ -3529,7 +3545,49 @@ fn gallery_map_clusters_request() -> GalleryMapClustersRequest {
             east: 180.0,
         },
         zoom: 1.0,
+        require_labels: Vec::new(),
+        exclude_labels: Vec::new(),
     }
+}
+
+#[test]
+fn gallery_map_label_filters_use_one_comma_separated_query_value_each() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let mut request = gallery_map_clusters_request();
+    request.require_labels = vec![" private ".to_string()];
+    request.exclude_labels = vec!["nsfw ".to_string()];
+
+    let url = client
+        .gallery_map_clusters_url("/api/v1/gallery/map/clusters", &request, 1, 1.0)
+        .expect("gallery map URL should build");
+    let query = url
+        .query_pairs()
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        query.get("require_labels").map(|value| value.as_ref()),
+        Some("private")
+    );
+    assert_eq!(
+        query.get("exclude_labels").map(|value| value.as_ref()),
+        Some("nsfw")
+    );
+}
+
+#[test]
+fn label_filter_wire_format_escapes_commas_and_backslashes() {
+    let mut url = Url::parse("http://127.0.0.1:18080/store/list")
+        .expect("label filter test URL should parse");
+    append_comma_separated_labels(
+        &mut url,
+        "require_labels",
+        &["family, close".to_string(), "travel\\journal".to_string()],
+    );
+
+    assert_eq!(
+        url.query_pairs()
+            .find_map(|(key, value)| (key == "require_labels").then_some(value.into_owned())),
+        Some(r"family\, close,travel\\journal".to_string())
+    );
 }
 
 fn gallery_map_clusters_response_body() -> Vec<u8> {
@@ -3821,6 +3879,8 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
                         entry_type: "key".to_string(),
+                        labels: Vec::new(),
+                        labels_resolved: false,
                         version: Some("v1".to_string()),
                         content_hash: Some("hash-1".to_string()),
                         size_bytes: Some(42),
@@ -3849,6 +3909,8 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
+                labels: Vec::new(),
+                labels_resolved: false,
                 version: Some("v1".to_string()),
                 content_hash: Some("hash-1".to_string()),
                 size_bytes: Some(42),
@@ -5136,6 +5198,8 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
                         entry_type: "key".to_string(),
+                        labels: Vec::new(),
+                        labels_resolved: false,
                         version: Some("v1".to_string()),
                         content_hash: Some("hash-1".to_string()),
                         size_bytes: Some(42),
@@ -5164,6 +5228,8 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
+                labels: Vec::new(),
+                labels_resolved: false,
                 version: Some("v1".to_string()),
                 content_hash: Some("hash-1".to_string()),
                 size_bytes: Some(42),

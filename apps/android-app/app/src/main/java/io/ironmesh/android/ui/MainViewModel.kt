@@ -802,6 +802,52 @@ class MainViewModel(
         refreshGallery()
     }
 
+    fun updateGalleryShowSensitiveContent(showSensitiveContent: Boolean) {
+        if (uiState.value.galleryShowSensitiveContent == showSensitiveContent) {
+            return
+        }
+        uiState.value = uiState.value.copy(
+            galleryShowSensitiveContent = showSensitiveContent,
+            galleryCollection = null,
+            galleryPages = emptyMap(),
+        )
+        refreshGallery()
+    }
+
+    fun toggleGalleryMediaLabel(item: GalleryImageItem, label: String) {
+        if (!item.labelsResolved) {
+            uiState.value = uiState.value.copy(
+                status = "Image labels are temporarily unavailable. Refresh before editing them.",
+            )
+            return
+        }
+        val nextLabels = if (item.labels.contains(label)) {
+            item.labels.filterNot { it == label }
+        } else {
+            item.labels + label
+        }
+        viewModelScope.launch {
+            runCatching {
+                val deviceAuth = refreshPersistedDeviceAuthState()
+                withContext(Dispatchers.IO) {
+                    repository.setMediaLabels(
+                        connectionInput = deviceAuth.connectionBootstrapJson(),
+                        key = item.remotePath,
+                        labels = nextLabels,
+                        serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                        clientIdentityJson = deviceAuth.toClientIdentityJson(),
+                    )
+                }
+            }.onSuccess {
+                refreshGallery()
+            }.onFailure { error ->
+                uiState.value = uiState.value.copy(
+                    status = "Failed to update labels: ${error.message}",
+                )
+            }
+        }
+    }
+
     fun updateGalleryViewMode(mode: GalleryViewMode) {
         if (uiState.value.galleryMode == mode) {
             return
@@ -1427,6 +1473,7 @@ class MainViewModel(
                 connectionRoutesError = null,
                 connectionRoutesLastLoadedUnixMs = 0L,
                 selectedSection = MainSection.HOME,
+                galleryShowSensitiveContent = false,
                 webUiSession = null,
                 status = "Device enrolled: ${authState.deviceId}",
             )
@@ -1704,6 +1751,7 @@ class MainViewModel(
         val currentDirectoryPath: String,
         val breadcrumbs: List<GalleryBreadcrumbItem>,
         val sort: GallerySortOption,
+        val showSensitiveContent: Boolean,
         val pageSize: Int,
     )
 
@@ -1725,6 +1773,7 @@ class MainViewModel(
             currentDirectoryPath = current.galleryCurrentDirectoryPath,
             breadcrumbs = current.galleryBreadcrumbs,
             sort = current.gallerySort,
+            showSensitiveContent = current.galleryShowSensitiveContent,
             pageSize = pageSize.coerceAtLeast(1),
         )
     }
@@ -1752,6 +1801,7 @@ class MainViewModel(
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
             clientIdentityJson = deviceAuth.toClientIdentityJson(),
         )
@@ -1794,6 +1844,7 @@ class MainViewModel(
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = serverCaPem,
             clientIdentityJson = clientIdentityJson,
         )
@@ -1839,6 +1890,7 @@ class MainViewModel(
             offset = offset,
             limit = pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
             clientIdentityJson = deviceAuth.toClientIdentityJson(),
         )
@@ -1848,6 +1900,7 @@ class MainViewModel(
         val persisted = withContext(Dispatchers.IO) {
             IronmeshPreferences.getDeviceAuthState(getApplication())
         }
+        val previousDeviceId = deviceAuthState.deviceId
         deviceAuthState = persisted
         val identity = persisted.toDeviceIdentityUiState()
         val nodePriorityOverrides = persisted.nodePriorityOverrides()
@@ -1859,6 +1912,14 @@ class MainViewModel(
                 deviceIdentity = identity,
                 nodePriorityOverrides = nodePriorityOverrides,
             )
+        }
+        if (
+            previousDeviceId.isNotBlank() &&
+                persisted.deviceId.isNotBlank() &&
+                previousDeviceId != persisted.deviceId &&
+                uiState.value.galleryShowSensitiveContent
+        ) {
+            uiState.value = uiState.value.copy(galleryShowSensitiveContent = false)
         }
         return persisted
     }
@@ -2207,6 +2268,8 @@ class MainViewModel(
             width = entry.media?.width,
             height = entry.media?.height,
             thumbnailStatus = entry.media?.status,
+            labels = entry.labels,
+            labelsResolved = entry.labels_resolved,
         )
     }
 
