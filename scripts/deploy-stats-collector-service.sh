@@ -470,7 +470,7 @@ REMOTE
 }
 
 upload_public_dashboard() {
-  local checksum remote_archive_q public_dir_q remote_dir_q checksum_q
+  local checksum remote_archive_q public_dir_q remote_dir_q checksum_q remote_public_dir_state
   prepare_public_dashboard_archive
   checksum="$(sha256sum "${LOCAL_PUBLIC_ARCHIVE}" | cut -d' ' -f1)"
   remote_archive_q="$(quote_for_sh "${REMOTE_PUBLIC_ARCHIVE}")"
@@ -479,11 +479,23 @@ upload_public_dashboard() {
   checksum_q="$(quote_for_sh "${checksum}")"
 
   log "uploading checksum-verified public dashboard to ${REMOTE_HOST}"
-  ssh "${SSH_OPTIONS[@]}" "${REMOTE_HOST}" \
-    "REMOTE_DIR=${remote_dir_q} bash -s" <<'REMOTE'
+  remote_public_dir_state="$(
+    ssh "${SSH_OPTIONS[@]}" "${REMOTE_HOST}" \
+      "REMOTE_DIR=${remote_dir_q} REMOTE_PUBLIC_DIR=${public_dir_q} bash -s" <<'REMOTE'
 set -euo pipefail
+if [[ -d "$REMOTE_PUBLIC_DIR" ]]; then
+  printf 'public_dashboard_previous=present\n'
+else
+  printf 'public_dashboard_previous=absent\n'
+fi
 install -d -m 0700 "$REMOTE_DIR"
 REMOTE
+  )"
+  case "$remote_public_dir_state" in
+    public_dashboard_previous=present) REMOTE_HAD_PUBLIC_DIR=true ;;
+    public_dashboard_previous=absent) ;;
+    *) die "could not determine whether the remote public dashboard directory exists" ;;
+  esac
   scp "${SCP_OPTIONS[@]}" "${LOCAL_PUBLIC_ARCHIVE}" "${REMOTE_HOST}:${REMOTE_PUBLIC_ARCHIVE}"
   ssh "${SSH_OPTIONS[@]}" "${REMOTE_HOST}" \
     "REMOTE_ARCHIVE=${remote_archive_q} REMOTE_PUBLIC_DIR=${public_dir_q} EXPECTED_CHECKSUM=${checksum_q} bash -s" <<'REMOTE'
@@ -500,10 +512,6 @@ find "$staged_dir" -type d -exec chmod 0755 {} +
 find "$staged_dir" -type f -exec chmod 0644 {} +
 printf 'public_dashboard=staged\n'
 REMOTE
-
-  if ssh "${SSH_OPTIONS[@]}" "${REMOTE_HOST}" "test -d ${public_dir_q}"; then
-    REMOTE_HAD_PUBLIC_DIR=true
-  fi
 }
 
 configure_remote() {
