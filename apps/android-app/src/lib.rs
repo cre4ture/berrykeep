@@ -1257,22 +1257,6 @@ fn android_no_backup_files_dir() -> Result<PathBuf> {
     })
 }
 
-fn android_cache_dir() -> Result<PathBuf> {
-    with_android_preferences_env(|env, class| {
-        let value = env
-            .call_static_method(&class, "cacheDirPath", "()Ljava/lang/String;", &[])
-            .context("failed to query Android cache dir path")?
-            .l()
-            .context("Android cache dir path returned invalid value")?;
-        let value = JString::from(value);
-        let value: String = env
-            .get_string(&value)
-            .context("failed to decode Android cache dir path")?
-            .into();
-        Ok(PathBuf::from(value))
-    })
-}
-
 fn clear_android_cached_data() -> Result<()> {
     stop_embedded_web_ui()?;
     with_android_preferences_env(|env, class| {
@@ -1817,9 +1801,8 @@ fn start_embedded_web_ui(
         client_identity_json.clone(),
     )?;
     let client = configured.client.with_connection_name("android web ui");
-    let mut web_ui_config = web_ui_backend::WebUiConfig::from_client(client)
-        .with_service_name("ironmesh-android")
-        .with_map_chunk_cache_root(android_cache_dir()?.join("ironmesh-client"));
+    let mut web_ui_config =
+        web_ui_backend::WebUiConfig::from_client(client).with_service_name("ironmesh-android");
     let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
         .context("failed to parse android bootstrap for embedded web ui")?;
     if let Some(server_ca_pem) = server_ca_pem.as_ref() {

@@ -6,7 +6,8 @@ mod tests {
         ChildGuard, EnrolledTestClient, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
         issue_bootstrap_bundle, issue_bootstrap_bundle_and_enroll_client,
         latest_snapshot_id_for_client, lock_test_resources, run_cli, start_authenticated_server,
-        start_open_server_with_env, start_rendezvous_service, stop_server, tcp_resource_key,
+        start_authenticated_server_with_env_options, start_open_server_with_env,
+        start_rendezvous_service, stop_server, tcp_resource_key,
         wait_for_rendezvous_registered_endpoints, wait_for_url_status,
     };
     use anyhow::{Context, Result};
@@ -318,12 +319,21 @@ mod tests {
         web_bind: &str,
         server_name: &str,
         client_name: &str,
-        web_env: &[(&str, &str)],
+        server_env: &[(&str, &str)],
     ) -> Result<(ChildGuard, ChildGuard, EnrolledTestClient)> {
         let data_dir = fresh_data_dir(server_name);
         let client_dir = fresh_data_dir(client_name);
         let node_id = Uuid::new_v4().to_string();
-        let server = start_authenticated_server(server_bind, &data_dir, &node_id, 1).await?;
+        let server = start_authenticated_server_with_env_options(
+            server_bind,
+            &data_dir,
+            &node_id,
+            1,
+            None,
+            None,
+            server_env,
+        )
+        .await?;
         let base_url = format!("http://{server_bind}");
         let http = reqwest::Client::new();
         let enrolled = issue_bootstrap_bundle_and_enroll_client(
@@ -337,12 +347,9 @@ mod tests {
         )
         .await?;
         let bootstrap_arg = enrolled.bootstrap_path.to_string_lossy().into_owned();
-        let web = start_web_backend_with_args_and_env(
-            web_bind,
-            &["--bootstrap-file", bootstrap_arg.as_str()],
-            web_env,
-        )
-        .await?;
+        let web =
+            start_web_backend_with_args(web_bind, &["--bootstrap-file", bootstrap_arg.as_str()])
+                .await?;
         Ok((server, web, enrolled))
     }
 
@@ -2034,6 +2041,7 @@ mod tests {
             ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
             ("IRONMESH_ADMIN_TOKEN", admin_token),
             ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("IRONMESH_MAP_GLYPHS_DIR", glyphs_dir_env.as_str()),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -2084,12 +2092,9 @@ mod tests {
             bootstrap.relay_mode = RelayMode::Required;
             bootstrap.write_to_path(&bootstrap_path)?;
 
-            let mut web = start_web_backend_with_args_and_env(
-                web_bind,
-                &["--bootstrap-file", bootstrap_arg.as_str()],
-                &[("IRONMESH_MAP_GLYPHS_DIR", glyphs_dir_env.as_str())],
-            )
-            .await?;
+            let mut web =
+                start_web_backend_with_args(web_bind, &["--bootstrap-file", bootstrap_arg.as_str()])
+                    .await?;
 
             let result = async {
                 let rendezvous_refresh: serde_json::Value = http
