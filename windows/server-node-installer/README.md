@@ -56,6 +56,19 @@ powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Build-M
   -TimestampUrl https://<approved-rfc3161-timestamp-service>
 ```
 
+`Sign-Msi.ps1` signs an already-built MSI and verifies its signer. Release CI
+uses it in a separate protected job after the unsigned build artifact is
+available, so the build itself never receives private-key material:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Sign-Msi.ps1 `
+  -MsiPath .\windows\server-node-installer\out\BerryKeepServerNode_1.0.38_x64\BerryKeepServerNode.msi `
+  -SigningCertificatePath C:\secure\berrykeep-release.pfx `
+  -SigningCertificatePassword $env:BERRYKEEP_SIGNING_PASSWORD `
+  -TimestampUrl https://<approved-rfc3161-timestamp-service> `
+  -SigningCertificateThumbprint <certificate-thumbprint>
+```
+
 ## Automatic updates
 
 Release MSIs embed a pinned release-signing certificate thumbprint and an

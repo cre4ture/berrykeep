@@ -7,6 +7,10 @@ Builds the release server-node executable, then uses the pinned WiX SDK
 packages in BerryKeepServerNode.wixproj to produce a per-machine MSI. The
 installer owns program files, the Windows service, and local-subnet firewall
 rules. It intentionally leaves ProgramData state intact on uninstall.
+
+When signing inputs are supplied, delegates Authenticode signing and
+verification to Sign-Msi.ps1. This lets CI build an unsigned installer before
+the protected signing job receives any private-key material.
 #>
 [CmdletBinding()]
 param(
@@ -73,24 +77,6 @@ function Normalize-Thumbprint {
     param([string]$Value)
 
     return ($Value -replace '\s', '').ToUpperInvariant()
-}
-
-function Find-SignTool {
-    $command = Get-Command signtool.exe -ErrorAction SilentlyContinue
-    if ($command) {
-        return $command.Source
-    }
-
-    $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
-    if (-not (Test-Path -LiteralPath $kitsRoot)) {
-        return $null
-    }
-
-    return Get-ChildItem -LiteralPath $kitsRoot -Directory |
-        Sort-Object Name -Descending |
-        ForEach-Object { Join-Path $_.FullName "x64\signtool.exe" } |
-        Where-Object { Test-Path -LiteralPath $_ } |
-        Select-Object -First 1
 }
 
 $installerRoot = $PSScriptRoot
@@ -194,27 +180,16 @@ if ([string]::IsNullOrWhiteSpace($msiPath) -or -not (Test-Path -LiteralPath $msi
 }
 
 if (-not [string]::IsNullOrWhiteSpace($SigningCertificatePath)) {
-    if ([string]::IsNullOrWhiteSpace($TimestampUrl)) {
-        throw "-TimestampUrl is required when -SigningCertificatePath is supplied."
+    $signMsiScript = Join-Path $installerRoot "Sign-Msi.ps1"
+    if (-not (Test-Path -LiteralPath $signMsiScript)) {
+        throw "MSI signing script was not found: $signMsiScript"
     }
-    if (-not (Test-Path -LiteralPath $SigningCertificatePath)) {
-        throw "Signing certificate was not found: $SigningCertificatePath"
-    }
-
-    $signTool = Find-SignTool
-    if ([string]::IsNullOrWhiteSpace($signTool)) {
-        throw "SignTool.exe was not found. Install the Windows SDK signing tools or add SignTool.exe to PATH."
-    }
-
-    $arguments = @("sign", "/fd", "SHA256", "/f", $SigningCertificatePath)
-    if (-not [string]::IsNullOrWhiteSpace($SigningCertificatePassword)) {
-        $arguments += @("/p", $SigningCertificatePassword)
-    }
-    $arguments += @("/tr", $TimestampUrl, "/td", "SHA256", $msiPath)
-    & $signTool @arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "SignTool failed with exit code $LASTEXITCODE"
-    }
+    & $signMsiScript `
+        -MsiPath $msiPath `
+        -SigningCertificatePath $SigningCertificatePath `
+        -SigningCertificatePassword $SigningCertificatePassword `
+        -TimestampUrl $TimestampUrl `
+        -SigningCertificateThumbprint $SigningCertificateThumbprint
 }
 
 Write-Host "Built BerryKeep Server Node MSI:" -ForegroundColor Green

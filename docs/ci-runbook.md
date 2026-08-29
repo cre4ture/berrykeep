@@ -4,15 +4,34 @@
 
 Pushing an annotated stable `vX.Y.Z` tag whose value matches
 `[workspace.package].version` starts the `Release` workflow. It builds the
-Windows Server Node MSI again from the tagged source, signs and timestamps it
-inside the protected `release-signing` environment, then publishes the MSI,
-signed stable manifest, and `SHA256SUMS` on the matching GitHub Release page.
+Windows Server Node MSI again from the tagged source without signing inputs.
+A separate protected `release-signing` job downloads that single unsigned MSI,
+signs and timestamps it, verifies the signer, creates the matching signed
+stable manifest, then publishes the MSI, manifest, and `SHA256SUMS` on the
+matching GitHub Release page.
 
-Configure these protected-environment values before tagging:
+Configure these values before tagging:
 
+- repository variable `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT` -
+  normalized SHA-1 thumbprint of the release certificate; this is public and
+  is embedded in the MSI updater configuration before signing;
 - secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64` - base64-encoded PFX;
 - secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD` - PFX password;
 - variable `BERRYKEEP_WINDOWS_TIMESTAMP_URL` - approved RFC-3161 endpoint.
+
+Keep the PFX and its password as *environment* secrets in `release-signing`,
+not repository secrets. Require independent environment approval, prevent
+self-approval, disallow administrator bypass, and limit the environment to
+stable release tags. The signing job checks out the protected default branch
+only for the minimal signing utilities; the MSI itself is always built from
+the requested release tag. This also lets `workflow_dispatch` repair a failed
+publication of an existing immutable tag without recreating it.
+
+The unsigned release artifact has one-day retention and is never published.
+Protect `.github/workflows/release.yml` and
+`windows/server-node-installer/{Sign-Msi.ps1,New-ReleaseManifest.ps1}` with
+code-owner review. Never use the self-signed Store/MSIX development
+certificate for this release signing path.
 
 The normal `Win Server MSI` CI job remains intentionally unsigned and uploads
 only a short-lived validation artifact. Never publish that artifact.

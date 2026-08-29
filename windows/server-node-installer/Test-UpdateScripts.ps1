@@ -4,10 +4,12 @@ param()
 $ErrorActionPreference = "Stop"
 $installerRoot = $PSScriptRoot
 $scriptFiles = @(
+    "Build-Msi.ps1",
     "ServerNodeUpdate.psm1",
     "Enable-ServerNodeAutoUpdate.ps1",
     "Disable-ServerNodeAutoUpdate.ps1",
     "Update-ServerNode.ps1",
+    "Sign-Msi.ps1",
     "New-ReleaseManifest.ps1"
 )
 
