@@ -530,8 +530,12 @@ telemetry would unnecessarily complicate their security boundaries.
   - Aggregated, k-anonymous processed statistics: publicly viewable at the collector's root Fleet
     Reliability dashboard and via `GET /v1/stats/dashboard`. This versioned API includes only the
     k-anonymized current participant, country, and hardware-profile counts plus generation/build
-    metadata; it never serializes a raw record, subject id, token, or administrative field. The
-    legacy `GET /v1/stats/summary` endpoint remains available for machine clients.
+    metadata; its total is rounded down to a k-sized cohort so suppressed groups cannot be
+    recovered by subtraction. Both public statistics endpoints are rate-limited per source IP and
+    share a five-minute server-side aggregate cache, preventing a cache-bypassing client from
+    repeatedly scanning raw rows. Neither endpoint serializes a raw record, subject id, token, or
+    administrative field. The legacy `GET /v1/stats/summary` endpoint remains available for machine
+    clients.
 
 ### 5.4 Standalone Service vs. Existing Backend Infrastructure
 

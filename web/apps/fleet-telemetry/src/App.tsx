@@ -119,14 +119,15 @@ function FleetDashboardContent({ dashboard }: { dashboard: FleetDashboard }) {
       <Alert color="brand" title="Privacy-preserving by design" icon={<IconShieldCheck size={18} />}>
         No raw telemetry, IP addresses, node IDs, or telemetry subject IDs are shown here. Country
         and hardware-profile groups appear only when at least {dashboard.k_anonymity_min} distinct
-        participants contribute to them.
+        participants contribute to them. The fleet total is rounded down to a
+        {` ${dashboard.k_anonymity_min}`}-participant cohort.
       </Alert>
 
       <SimpleGrid cols={{ base: 1, sm: 2, lg: 4 }}>
         <StatCard
-          label="Participants recorded"
+          label="Participants (minimum)"
           value={dashboard.total_subjects.toLocaleString()}
-          hint="Distinct pseudonymous telemetry subjects"
+          hint={`Rounded down to k = ${dashboard.k_anonymity_min}`}
         />
         <StatCard
           label="Published countries"

@@ -5,15 +5,15 @@ const dashboard = {
   generated_at_unix: 1_785_888_000,
   software_version: "1.0.46",
   k_anonymity_min: 5,
-  total_subjects: 12,
+  total_subjects: 10,
   by_country: [
-    { country_code: "CH", subject_count: 7 },
+    { country_code: "CH", subject_count: 5 },
     { country_code: "DE", subject_count: 5 }
   ],
   by_hardware_profile: [
     {
       hardware_profile_id: "85b22e9027fafc77961c9602662e75071e33ca16f9af8e47a1e41be5809f53dc",
-      subject_count: 7
+      subject_count: 5
     },
     {
       hardware_profile_id: "c709c18dd9f1069f6842220e1c499023849fa4361a3fb44eeb1ed5cb1515a24a",
@@ -36,8 +36,8 @@ test("public fleet telemetry dashboard renders only aggregate statistics", async
 
   await expect(page.getByRole("heading", { name: "Fleet reliability" })).toBeVisible();
   await expect(page.getByText("Privacy-preserving by design")).toBeVisible();
-  await expect(page.getByText("Participants recorded")).toBeVisible();
-  await expect(page.getByText("12", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Participants (minimum)")).toBeVisible();
+  await expect(page.getByText("10", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Published countries")).toBeVisible();
   await expect(page.getByText("Published hardware profiles")).toBeVisible();
   await expect(page.getByText("Participation by country")).toBeVisible();

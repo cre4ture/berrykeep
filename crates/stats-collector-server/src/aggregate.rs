@@ -40,6 +40,9 @@ pub struct CountryProfileCount {
 #[derive(Debug, Clone, Serialize)]
 pub struct FleetSummary {
     pub k_anonymity_min: u32,
+    /// Lower bound rounded down to a k-sized cohort. Publishing an exact fleet total would make
+    /// otherwise-suppressed groups recoverable by subtraction and expose individual join/erasure
+    /// events through deltas.
     pub total_subjects: u64,
     pub by_hardware_profile: Vec<ProfileCount>,
     pub by_country: Vec<CountryCount>,
@@ -66,6 +69,7 @@ fn extract_hardware_profile_id(raw_payload_json: &str) -> Option<String> {
 
 /// Builds the k-anonymous summary from raw rows (passed most-recent-first).
 pub fn summarize(records: &[StoredRecord], k_anonymity_min: u32) -> FleetSummary {
+    let k_anonymity_min = k_anonymity_min.max(1);
     // Dedupe to one current record per subject: the first row seen per subject wins, since the
     // caller orders rows most-recent-first.
     let mut current: HashMap<&str, SubjectAttributes> = HashMap::new();
@@ -78,7 +82,7 @@ pub fn summarize(records: &[StoredRecord], k_anonymity_min: u32) -> FleetSummary
             });
     }
 
-    let total_subjects = current.len() as u64;
+    let raw_total_subjects = current.len() as u64;
 
     // Distinct subjects per grouping key. Using sets keyed on subject id makes "distinct subject"
     // explicit and robust even though we already deduped above.
@@ -108,6 +112,7 @@ pub fn summarize(records: &[StoredRecord], k_anonymity_min: u32) -> FleetSummary
     }
 
     let threshold = u64::from(k_anonymity_min);
+    let total_subjects = raw_total_subjects - (raw_total_subjects % threshold);
 
     let mut by_hardware_profile: Vec<ProfileCount> = by_profile
         .into_iter()
@@ -182,7 +187,7 @@ mod tests {
         }
 
         let summary = summarize(&records, 5);
-        assert_eq!(summary.total_subjects, 7);
+        assert_eq!(summary.total_subjects, 5);
 
         // "common" has 5 distinct subjects (>= 5) and is visible; "rare" has 2 and is suppressed.
         assert_eq!(summary.by_hardware_profile.len(), 1);
@@ -214,6 +219,17 @@ mod tests {
         let summary = summarize(&records, 1);
         assert_eq!(summary.total_subjects, 1);
         assert_eq!(summary.by_hardware_profile[0].subject_count, 1);
+    }
+
+    #[test]
+    fn rounds_the_total_down_to_a_k_sized_cohort() {
+        let records = (0..9)
+            .map(|index| record(index, &format!("s-{index}"), "p", Some("DE")))
+            .collect::<Vec<_>>();
+
+        let summary = summarize(&records, 5);
+
+        assert_eq!(summary.total_subjects, 5);
     }
 
     #[test]

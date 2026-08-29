@@ -31,7 +31,7 @@ pub mod storage;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
@@ -41,6 +41,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
@@ -104,12 +105,37 @@ pub const RATE_LIMIT_REGISTER_PER_IP_WINDOW: Duration = Duration::from_secs(60 *
 pub const RATE_LIMIT_UNTOKENED_PER_SUBJECT_MAX_REQUESTS: u32 = 2;
 pub const RATE_LIMIT_UNTOKENED_PER_SUBJECT_WINDOW: Duration = Duration::from_secs(60 * 60);
 
+/// Public aggregate statistics can be read without a token, so they use their own per-IP limiter
+/// instead of sharing ingestion's quota. The allowance covers normal browsing and manual refreshes
+/// while ensuring the endpoint cannot be used as an unbounded response-amplification surface.
+pub const RATE_LIMIT_PUBLIC_STATS_PER_IP_MAX_REQUESTS: u32 = 60;
+pub const RATE_LIMIT_PUBLIC_STATS_PER_IP_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// The server-side public aggregate cache lifetime. This exactly matches the HTTP cache policy
+/// advertised to browsers and intermediaries, so a cache-bypassing client cannot turn every
+/// request into a raw-table scan.
+const PUBLIC_SUMMARY_CACHE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+
 /// Default local bind address, overridable via `STATS_COLLECTOR_BIND_ADDR`.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:44044";
 
 /// Default Turso (embedded, SQLite-compatible) database path, overridable via
 /// `STATS_COLLECTOR_DB_PATH`.
 pub const DEFAULT_DB_PATH: &str = "stats-collector.sqlite3";
+
+/// One memoized, privacy-safe public aggregate. The cache never retains raw records or subject
+/// identifiers, so it has the same data classification as the response it serves.
+struct PublicSummaryCache {
+    cached_at: Instant,
+    generated_at_unix: i64,
+    summary: FleetSummary,
+}
+
+impl PublicSummaryCache {
+    fn is_fresh(&self) -> bool {
+        self.cached_at.elapsed() < PUBLIC_SUMMARY_CACHE_MAX_AGE
+    }
+}
 
 #[derive(Clone)]
 pub struct StatsCollectorAppState {
@@ -123,6 +149,12 @@ pub struct StatsCollectorAppState {
     /// Stricter per-subject limiter applied only to tokenless ingestion requests, in addition to
     /// `subject_limiter` (doc Section 8). See `RATE_LIMIT_UNTOKENED_PER_SUBJECT_MAX_REQUESTS`.
     untokened_subject_limiter: Arc<SlidingWindowLimiter>,
+    /// Dedicated per-IP limiter for the unauthenticated public aggregate endpoints. It is separate
+    /// from ingestion so dashboard traffic cannot consume a node's telemetry-ingestion quota.
+    public_stats_ip_limiter: Arc<SlidingWindowLimiter>,
+    /// A single, shared cache gate both memoizes the O(rows) aggregation and coalesces concurrent
+    /// cache misses into one database read.
+    public_summary_cache: Arc<AsyncMutex<Option<PublicSummaryCache>>>,
     /// Admin bearer token for the raw-access / erasure endpoints (doc Sections 4.5, 5.3). `None`
     /// means "not configured", in which case those endpoints return 412 rather than operating
     /// unauthenticated.
@@ -172,6 +204,11 @@ impl StatsCollectorAppState {
                 RATE_LIMIT_UNTOKENED_PER_SUBJECT_MAX_REQUESTS,
                 RATE_LIMIT_UNTOKENED_PER_SUBJECT_WINDOW,
             )),
+            public_stats_ip_limiter: Arc::new(SlidingWindowLimiter::new(
+                RATE_LIMIT_PUBLIC_STATS_PER_IP_MAX_REQUESTS,
+                RATE_LIMIT_PUBLIC_STATS_PER_IP_WINDOW,
+            )),
+            public_summary_cache: Arc::new(AsyncMutex::new(None)),
             admin_token: None,
             k_anonymity_min: DEFAULT_K_ANONYMITY_MIN,
             country_resolver: Arc::new(NoopCountryResolver),
@@ -193,6 +230,12 @@ impl StatsCollectorAppState {
         window: Duration,
     ) -> Self {
         self.untokened_subject_limiter = Arc::new(SlidingWindowLimiter::new(max_requests, window));
+        self
+    }
+
+    /// Overrides the public-stats per-IP rate limit, primarily so tests can use a small ceiling.
+    pub fn with_public_stats_rate_limit(mut self, max_requests: u32, window: Duration) -> Self {
+        self.public_stats_ip_limiter = Arc::new(SlidingWindowLimiter::new(max_requests, window));
         self
     }
 
@@ -225,6 +268,7 @@ impl StatsCollectorAppState {
         self.subject_limiter.cleanup_stale_entries();
         self.register_ip_limiter.cleanup_stale_entries();
         self.untokened_subject_limiter.cleanup_stale_entries();
+        self.public_stats_ip_limiter.cleanup_stale_entries();
     }
 
     /// Exposes the underlying storage.
@@ -550,11 +594,12 @@ fn internal_error(message: &str) -> Response {
         .into_response()
 }
 
-/// Public, k-anonymity-safe fleet statistics (doc Sections 4.3, 5.3). Computed on request; the
-/// small target fleet makes this cheap, and the code is structured so a periodic batch job could
-/// replace the on-request computation later without changing the response shape.
-async fn stats_summary(State(state): State<StatsCollectorAppState>) -> Response {
-    public_summary_response(state, false).await
+/// Public, k-anonymity-safe fleet statistics (doc Sections 4.3, 5.3).
+async fn stats_summary(
+    State(state): State<StatsCollectorAppState>,
+    ConnectInfo(source_addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    public_stats_response(state, source_addr, false).await
 }
 
 /// Versioned shape consumed by the public dashboard. It deliberately only includes values already
@@ -569,42 +614,72 @@ struct FleetDashboardResponse {
     summary: FleetSummary,
 }
 
-/// Public dashboard data, computed on request from the same k-anonymized aggregate used by the
-/// compatibility summary endpoint. Its cache policy is deliberately short: normal viewers do not
-/// trigger a database read for every page view, while new daily telemetry remains visible promptly.
-async fn stats_dashboard(State(state): State<StatsCollectorAppState>) -> Response {
-    public_summary_response(state, true).await
+/// Public dashboard data from the same k-anonymized aggregate used by the compatibility summary
+/// endpoint.
+async fn stats_dashboard(
+    State(state): State<StatsCollectorAppState>,
+    ConnectInfo(source_addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    public_stats_response(state, source_addr, true).await
 }
 
-async fn public_summary_response(state: StatsCollectorAppState, dashboard: bool) -> Response {
-    match state.storage.all_records().await {
-        Ok(records) => {
-            let summary: FleetSummary = summarize(&records, state.k_anonymity_min);
-            let mut response = if dashboard {
-                (
-                    StatusCode::OK,
-                    Json(FleetDashboardResponse {
-                        schema_version: 1,
-                        generated_at_unix: now_unix(),
-                        software_version: PACKAGE_VERSION,
-                        summary,
-                    }),
-                )
-                    .into_response()
-            } else {
-                (StatusCode::OK, Json(summary)).into_response()
-            };
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=300, stale-while-revalidate=600"),
-            );
-            response
-        }
-        Err(error) => {
-            warn!(%error, "failed to compute public fleet summary");
-            internal_error("failed to compute summary")
-        }
+async fn public_stats_response(
+    state: StatsCollectorAppState,
+    source_addr: SocketAddr,
+    dashboard: bool,
+) -> Response {
+    if !state
+        .public_stats_ip_limiter
+        .check_and_record(&source_addr.ip().to_string())
+    {
+        return RateLimited.into_response();
     }
+
+    public_summary_response(state, dashboard).await
+}
+
+/// Returns a server-memoized public aggregate. Holding the asynchronous cache gate while a cache
+/// miss is computed is intentional: it makes simultaneous requests share one full-table read
+/// instead of stampeding the storage backend.
+async fn public_summary_response(state: StatsCollectorAppState, dashboard: bool) -> Response {
+    let mut cache = state.public_summary_cache.lock().await;
+    if cache.as_ref().is_none_or(|summary| !summary.is_fresh()) {
+        let records = match state.storage.all_records().await {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(%error, "failed to compute public fleet summary");
+                return internal_error("failed to compute summary");
+            }
+        };
+        *cache = Some(PublicSummaryCache {
+            cached_at: Instant::now(),
+            generated_at_unix: now_unix(),
+            summary: summarize(&records, state.k_anonymity_min),
+        });
+    }
+
+    let cache = cache
+        .as_ref()
+        .expect("public summary cache was just populated");
+    let mut response = if dashboard {
+        (
+            StatusCode::OK,
+            Json(FleetDashboardResponse {
+                schema_version: 1,
+                generated_at_unix: cache.generated_at_unix,
+                software_version: PACKAGE_VERSION,
+                summary: cache.summary.clone(),
+            }),
+        )
+            .into_response()
+    } else {
+        (StatusCode::OK, Json(cache.summary.clone())).into_response()
+    };
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300, stale-while-revalidate=600"),
+    );
+    response
 }
 
 fn now_unix() -> i64 {
@@ -794,6 +869,14 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri(format!("/v1/register/{telemetry_subject_id}"))
+            .extension(ConnectInfo(addr))
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
+    fn public_stats_request(uri: &str, addr: SocketAddr) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
             .extension(ConnectInfo(addr))
             .body(Body::empty())
             .expect("request should build")
@@ -1082,17 +1165,12 @@ mod tests {
         let router = build_router(state);
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/stats/summary")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(public_stats_request("/v1/stats/summary", source_addr(21)))
             .await
             .expect("router should respond");
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        assert_eq!(body["total_subjects"], 6);
+        assert_eq!(body["total_subjects"], 5);
         let profiles = body["by_hardware_profile"].as_array().unwrap();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0]["hardware_profile_id"], "common");
@@ -1128,12 +1206,7 @@ mod tests {
         let router = build_router(StatsCollectorAppState::new(storage).with_k_anonymity_min(5));
 
         let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/stats/dashboard")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(public_stats_request("/v1/stats/dashboard", source_addr(22)))
             .await
             .expect("router should respond");
 
@@ -1146,7 +1219,7 @@ mod tests {
         assert_eq!(body["schema_version"], 1);
         assert_eq!(body["software_version"], PACKAGE_VERSION);
         assert!(body["generated_at_unix"].as_i64().unwrap() > 0);
-        assert_eq!(body["total_subjects"], 6);
+        assert_eq!(body["total_subjects"], 5);
         assert_eq!(body["by_hardware_profile"].as_array().unwrap().len(), 1);
         assert_eq!(
             body["by_hardware_profile"][0]["hardware_profile_id"],
@@ -1157,6 +1230,95 @@ mod tests {
         assert!(body.get("telemetry_subject_id").is_none());
         assert!(!body.to_string().contains("subject-common-0"));
         assert!(!body.to_string().contains("subject-rare"));
+    }
+
+    #[tokio::test]
+    async fn public_stats_endpoints_are_rate_limited_per_source_ip() {
+        let state = test_state()
+            .await
+            .with_public_stats_rate_limit(2, Duration::from_secs(60 * 60));
+        let router = build_router(state);
+        let addr = source_addr(23);
+
+        for uri in ["/v1/stats/summary", "/v1/stats/dashboard"] {
+            let response = router
+                .clone()
+                .oneshot(public_stats_request(uri, addr))
+                .await
+                .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = router
+            .oneshot(public_stats_request("/v1/stats/dashboard", addr))
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn public_dashboard_memoizes_the_aggregate_for_its_cache_lifetime() {
+        let storage = IngestStorage::open_in_memory()
+            .await
+            .expect("storage should open");
+        for index in 0..5 {
+            storage
+                .insert(
+                    index,
+                    &format!("subject-common-{index}"),
+                    1,
+                    Some("CH"),
+                    "{\"hardware_profile_id\":\"common\"}",
+                )
+                .await
+                .expect("initial record should insert");
+        }
+        let state = StatsCollectorAppState::new(storage);
+        let router = build_router(state.clone());
+
+        let initial = router
+            .clone()
+            .oneshot(public_stats_request("/v1/stats/dashboard", source_addr(24)))
+            .await
+            .expect("router should respond");
+        let initial_body = body_json(initial).await;
+        assert_eq!(initial_body["total_subjects"], 5);
+        assert_eq!(
+            initial_body["by_hardware_profile"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        for index in 0..5 {
+            state
+                .storage()
+                .insert(
+                    100 + index,
+                    &format!("subject-new-{index}"),
+                    1,
+                    Some("DE"),
+                    "{\"hardware_profile_id\":\"new\"}",
+                )
+                .await
+                .expect("post-cache record should insert");
+        }
+
+        let cached = router
+            .oneshot(public_stats_request("/v1/stats/dashboard", source_addr(25)))
+            .await
+            .expect("router should respond");
+        let cached_body = body_json(cached).await;
+        assert_eq!(cached_body["total_subjects"], 5);
+        assert_eq!(
+            cached_body["by_hardware_profile"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            cached_body["by_hardware_profile"][0]["hardware_profile_id"],
+            "common"
+        );
     }
 
     #[tokio::test]
