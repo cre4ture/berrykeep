@@ -84,10 +84,10 @@ function Get-MsixManifestPublisher {
     }
 }
 
-function Add-TemporaryTrustedPeopleCertificate {
+function Add-TemporaryTrustedRootCertificate {
     param([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
 
-    $store = [Security.Cryptography.X509Certificates.X509Store]::new('TrustedPeople', 'CurrentUser')
+    $store = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
     $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
     try {
         $matches = $store.Certificates.Find(
@@ -110,10 +110,10 @@ function Add-TemporaryTrustedPeopleCertificate {
     }
 }
 
-function Remove-TemporaryTrustedPeopleCertificate {
+function Remove-TemporaryTrustedRootCertificate {
     param([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
 
-    $store = [Security.Cryptography.X509Certificates.X509Store]::new('TrustedPeople', 'CurrentUser')
+    $store = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
     $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
     try {
         $matches = $store.Certificates.Find(
@@ -183,7 +183,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "SignTool failed with exit code $LASTEXITCODE"
 }
 
-$addedTrustedCertificate = Add-TemporaryTrustedPeopleCertificate -Certificate $certificate
+# A self-signed MSIX signer belongs in TrustedPeople on client machines. However,
+# SignTool's /pa policy verifies the certificate chain against the root store.
+# Scope the temporary current-user root trust to this verification and remove it
+# immediately afterwards.
+$addedTrustedCertificate = Add-TemporaryTrustedRootCertificate -Certificate $certificate
 try {
     & $signTool 'verify' '/pa' '/v' $MsixPath
     if ($LASTEXITCODE -ne 0) {
@@ -200,7 +204,7 @@ try {
 }
 finally {
     if ($addedTrustedCertificate) {
-        Remove-TemporaryTrustedPeopleCertificate -Certificate $certificate
+        Remove-TemporaryTrustedRootCertificate -Certificate $certificate
     }
 }
 
