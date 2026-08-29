@@ -732,21 +732,53 @@ struct RoutedBufferedTransportResponse {
     response: BufferedTransportResponse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteHealthTracking {
+    Enabled,
+    Disabled,
+}
+
+impl RouteHealthTracking {
+    const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 /// Shared foreground failover policy. Transport-specific functions perform I/O and construct
 /// measurements; this executor is the single owner of stable candidate resolution, admission,
 /// retry/stop classification, circuit transitions, and terminal diagnostics publication.
 struct ForegroundRequestExecutor<'a> {
     client: &'a IronMeshClient,
     routes: RequestExecutor,
+    route_health_tracking: RouteHealthTracking,
     last_error: Option<anyhow::Error>,
     last_completed_operation: Option<ClientConnectionOperationResult>,
 }
 
 impl<'a> ForegroundRequestExecutor<'a> {
     fn new(client: &'a IronMeshClient, route_ids: Vec<RouteId>) -> Self {
+        Self::new_with_route_health_tracking(client, route_ids, RouteHealthTracking::Enabled)
+    }
+
+    /// Some high-volume auxiliary requests, such as map tiles, must use the
+    /// normal route selection and failover policy without changing the health
+    /// state used for foreground product operations.
+    fn new_without_route_health_tracking(
+        client: &'a IronMeshClient,
+        route_ids: Vec<RouteId>,
+    ) -> Self {
+        Self::new_with_route_health_tracking(client, route_ids, RouteHealthTracking::Disabled)
+    }
+
+    fn new_with_route_health_tracking(
+        client: &'a IronMeshClient,
+        route_ids: Vec<RouteId>,
+        route_health_tracking: RouteHealthTracking,
+    ) -> Self {
         Self {
             client,
             routes: RequestExecutor::new(route_ids),
+            route_health_tracking,
             last_error: None,
             last_completed_operation: None,
         }
@@ -761,17 +793,28 @@ impl<'a> ForegroundRequestExecutor<'a> {
             else {
                 continue;
             };
-            self.client
-                .transport_router
-                .log_route_candidate_scheduled(index, &endpoint);
+            if self.route_health_tracking.is_enabled() {
+                self.client
+                    .transport_router
+                    .log_route_candidate_scheduled(index, &endpoint);
+            }
             return Some((index, endpoint));
         }
         None
     }
 
+    fn record_route_used(&self, index: usize, endpoint: &ClientEndpoint, used_at_unix_ms: u64) {
+        if self.route_health_tracking.is_enabled() {
+            self.client
+                .record_route_used(index, endpoint, used_at_unix_ms);
+        }
+    }
+
     fn record_preflight_failure(&mut self, endpoint: &ClientEndpoint, error: anyhow::Error) {
-        self.client
-            .record_route_failure(endpoint, &format!("{error:#}"));
+        if self.route_health_tracking.is_enabled() {
+            self.client
+                .record_route_failure(endpoint, &format!("{error:#}"));
+        }
         self.last_error = Some(error);
     }
 
@@ -787,13 +830,15 @@ impl<'a> ForegroundRequestExecutor<'a> {
             RequestExecutor::classify_http_status(is_retryable_transport_status(status)),
             AttemptDisposition::RetryNextRoute
         );
-        self.last_completed_operation = Some(self.client.record_request_failure_with_status(
-            index,
-            endpoint,
-            attempt,
-            &format!("{error:#}"),
-            Some(status),
-        ));
+        if self.route_health_tracking.is_enabled() {
+            self.last_completed_operation = Some(self.client.record_request_failure_with_status(
+                index,
+                endpoint,
+                attempt,
+                &format!("{error:#}"),
+                Some(status),
+            ));
+        }
         self.last_error = Some(error);
     }
 
@@ -809,12 +854,14 @@ impl<'a> ForegroundRequestExecutor<'a> {
             should_suppress_route_fanout(&error),
             request_body_reusable,
         );
-        self.last_completed_operation = Some(self.client.record_request_failure(
-            index,
-            endpoint,
-            attempt,
-            &format!("{error:#}"),
-        ));
+        if self.route_health_tracking.is_enabled() {
+            self.last_completed_operation = Some(self.client.record_request_failure(
+                index,
+                endpoint,
+                attempt,
+                &format!("{error:#}"),
+            ));
+        }
         self.last_error = Some(error);
         if disposition == AttemptDisposition::Stop {
             tracing::info!(
@@ -837,6 +884,9 @@ impl<'a> ForegroundRequestExecutor<'a> {
         attempt: ClientRequestAttemptContext<'_>,
         measurement: ClientRequestSuccessMeasurement<'_>,
     ) {
+        if !self.route_health_tracking.is_enabled() {
+            return;
+        }
         let completed_operation =
             self.client
                 .record_request_success(index, endpoint, attempt, measurement);
@@ -847,9 +897,11 @@ impl<'a> ForegroundRequestExecutor<'a> {
 
     fn finish<T>(self, no_routes: impl FnOnce() -> anyhow::Error) -> Result<T> {
         let error = self.last_error.unwrap_or_else(no_routes);
-        self.client
-            .publish_connection_diagnostics(self.last_completed_operation);
-        self.client.signal_route_supervisor();
+        if self.route_health_tracking.is_enabled() {
+            self.client
+                .publish_connection_diagnostics(self.last_completed_operation);
+            self.client.signal_route_supervisor();
+        }
         Err(error)
     }
 }
@@ -4526,16 +4578,59 @@ impl IronMeshClient {
         &self,
         method: Method,
         url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+        route_ids: &[RouteId],
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_on_routes_with_route_health_tracking(
+            method,
+            url,
+            headers,
+            body,
+            route_ids,
+            RouteHealthTracking::Enabled,
+        )
+        .await
+    }
+
+    async fn execute_buffered_request_on_routes_without_route_health_tracking(
+        &self,
+        method: Method,
+        url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+        route_ids: &[RouteId],
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_on_routes_with_route_health_tracking(
+            method,
+            url,
+            headers,
+            body,
+            route_ids,
+            RouteHealthTracking::Disabled,
+        )
+        .await
+    }
+
+    async fn execute_buffered_request_on_routes_with_route_health_tracking(
+        &self,
+        method: Method,
+        url: Url,
         mut headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
         route_ids: &[RouteId],
+        route_health_tracking: RouteHealthTracking,
     ) -> Result<RoutedBufferedTransportResponse> {
         ensure_operation_id_header(&method, &mut headers);
         let request_timeout = buffered_request_timeout(&url);
 
         let auth = self.auth_snapshot();
 
-        let mut execution = ForegroundRequestExecutor::new(self, route_ids.to_vec());
+        let mut execution = if route_health_tracking.is_enabled() {
+            ForegroundRequestExecutor::new(self, route_ids.to_vec())
+        } else {
+            ForegroundRequestExecutor::new_without_route_health_tracking(self, route_ids.to_vec())
+        };
         while let Some((index, endpoint)) = execution.next() {
             let endpoint_context = endpoint_context(index, &endpoint);
             let endpoint_url = endpoint
@@ -4559,7 +4654,7 @@ impl IronMeshClient {
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
-            self.record_route_used(index, &endpoint, started_unix_ms);
+            execution.record_route_used(index, &endpoint, started_unix_ms);
             match execute_buffered_request_for_transport(
                 &endpoint.transport,
                 &auth,
@@ -4815,17 +4910,42 @@ impl IronMeshClient {
     async fn execute_buffered_request_with_route(
         &self,
         method: Method,
+        url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_with_route_health_tracking(
+            method,
+            url,
+            headers,
+            body,
+            RouteHealthTracking::Enabled,
+        )
+        .await
+    }
+
+    async fn execute_buffered_request_with_route_health_tracking(
+        &self,
+        method: Method,
         mut url: Url,
         headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
+        route_health_tracking: RouteHealthTracking,
     ) -> Result<RoutedBufferedTransportResponse> {
         let snapshot_owner_node_id = normalize_client_snapshot_selector_in_url(&mut url)?;
         let route_ids = match snapshot_owner_node_id {
             Some(node_id) => self.route_ids_for_target_node(node_id)?,
             None => self.transport_router.foreground_route_ids(),
         };
-        self.execute_buffered_request_on_routes(method, url, headers, body, &route_ids)
+        if route_health_tracking.is_enabled() {
+            self.execute_buffered_request_on_routes(method, url, headers, body, &route_ids)
+                .await
+        } else {
+            self.execute_buffered_request_on_routes_without_route_health_tracking(
+                method, url, headers, body, &route_ids,
+            )
             .await
+        }
     }
 
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
@@ -5595,19 +5715,67 @@ impl IronMeshClient {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<RelativePathResponse> {
+        self.request_relative_path_with_route_health_tracking(
+            method,
+            path,
+            headers,
+            body,
+            RouteHealthTracking::Enabled,
+        )
+        .await
+    }
+
+    /// Requests a relative path using normal route selection and failover, but
+    /// leaves the connection-health state and diagnostics untouched.
+    ///
+    /// This is for high-volume auxiliary traffic whose failures do not indicate
+    /// that the underlying transport route is unhealthy. Callers should keep
+    /// ordinary application requests on [`Self::request_relative_path`] so
+    /// connection diagnostics continue to represent product traffic.
+    pub async fn request_relative_path_without_route_health_tracking(
+        &self,
+        method: Method,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+    ) -> Result<RelativePathResponse> {
+        self.request_relative_path_with_route_health_tracking(
+            method,
+            path,
+            headers,
+            body,
+            RouteHealthTracking::Disabled,
+        )
+        .await
+    }
+
+    async fn request_relative_path_with_route_health_tracking(
+        &self,
+        method: Method,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+        route_health_tracking: RouteHealthTracking,
+    ) -> Result<RelativePathResponse> {
         let url = self.relative_url(path)?;
         let headers = headers
             .into_iter()
             .map(|(name, value)| RelayHttpHeader { name, value })
             .collect::<Vec<_>>();
         let response = self
-            .execute_buffered_request(method, url, headers, body)
+            .execute_buffered_request_with_route_health_tracking(
+                method,
+                url,
+                headers,
+                body,
+                route_health_tracking,
+            )
             .await
             .with_context(|| format!("failed to request {path}"))?;
         Ok(RelativePathResponse {
-            status: response.status,
-            headers: response.headers,
-            body: response.body,
+            status: response.response.status,
+            headers: response.response.headers,
+            body: response.response.body,
         })
     }
 

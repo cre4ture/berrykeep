@@ -1635,6 +1635,60 @@ async fn spawn_direct_http_route_server(
     .await
 }
 
+#[tokio::test]
+async fn untracked_relative_path_requests_do_not_change_route_health_or_diagnostics() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("test listener should have an address");
+    let server = tokio::spawn(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/maps/test-success",
+                get(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/api/v1/maps/test-failure",
+                get(|| async { StatusCode::BAD_GATEWAY }),
+            );
+        let _ = axum::serve(listener, app).await;
+    });
+    let client = IronMeshClient::from_direct_base_url(format!("http://{address}"));
+
+    let success = client
+        .request_relative_path_without_route_health_tracking(
+            Method::GET,
+            "/maps/test-success",
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("untracked success request should complete");
+    assert_eq!(success.status, StatusCode::OK);
+
+    let failure = client
+        .request_relative_path_without_route_health_tracking(
+            Method::GET,
+            "/maps/test-failure",
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect_err("retryable map status should fail the request");
+    assert!(format!("{failure:#}").contains("502"));
+
+    let endpoint = &client.connection_diagnostics().endpoints[0];
+    assert_eq!(endpoint.consecutive_failures, 0);
+    assert_eq!(endpoint.total_failures, 0);
+    assert_eq!(endpoint.total_successes, 0);
+    assert!(endpoint.last_used_unix_ms.is_none());
+    assert!(endpoint.recent_attempts.is_empty());
+
+    server.abort();
+}
+
 #[derive(Clone)]
 struct SnapshotHttpRouteState {
     hits: Arc<AtomicUsize>,

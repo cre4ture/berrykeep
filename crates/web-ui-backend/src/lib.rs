@@ -1317,7 +1317,10 @@ fn server_map_font_path(fontstack: &str, range: &str) -> String {
 }
 
 async fn proxy_server_map_request(state: &WebState, path: &str) -> Result<RelativePathResponse> {
-    current_sdk(state).await.get_relative_path(path).await
+    current_sdk(state)
+        .await
+        .request_relative_path_without_route_health_tracking(Method::GET, path, Vec::new(), None)
+        .await
 }
 
 fn proxied_map_response(response: RelativePathResponse) -> Response {
@@ -4450,9 +4453,9 @@ mod tests {
         let web_address = web_listener
             .local_addr()
             .expect("web listener should have an address");
-        let app = router(WebUiConfig::from_client(
-            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}")),
-        ));
+        let upstream_sdk =
+            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}"));
+        let app = router(WebUiConfig::from_client(upstream_sdk.clone()));
         let web = tokio::spawn(async move {
             let _ = axum::serve(web_listener, app).await;
         });
@@ -4578,6 +4581,14 @@ mod tests {
                 .expect("missing map response should be readable"),
             r#"{"error":"map does not exist"}"#
         );
+        assert!(
+            upstream_sdk
+                .connection_diagnostics()
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.recent_attempts.is_empty()),
+            "map assets must not displace foreground route diagnostics"
+        );
 
         web.abort();
         upstream.abort();
@@ -4640,10 +4651,9 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("web UI listener should have a local address");
-        let app = router(
-            WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
-                .with_log_buffer(Arc::clone(&buffer)),
-        );
+        let map_sdk = IronMeshClient::from_direct_base_url("http://127.0.0.1:9");
+        let app =
+            router(WebUiConfig::from_client(map_sdk.clone()).with_log_buffer(Arc::clone(&buffer)));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -4660,6 +4670,9 @@ mod tests {
             buffer.recent(32).is_empty(),
             "high-volume map tile failures must not evict useful diagnostics"
         );
+        let endpoint = &map_sdk.connection_diagnostics().endpoints[0];
+        assert_eq!(endpoint.total_failures, 0);
+        assert!(endpoint.recent_attempts.is_empty());
 
         server.abort();
     }
