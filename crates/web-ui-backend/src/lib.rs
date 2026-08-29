@@ -1345,7 +1345,7 @@ fn is_safe_map_glyph_range_segment(value: &str) -> bool {
 async fn proxy_server_map_request(state: &WebState, path: &str) -> Result<RelativePathResponse> {
     current_sdk(state)
         .await
-        .request_relative_path_without_route_health_tracking(Method::GET, path, Vec::new(), None)
+        .request_relative_path_without_route_diagnostics(Method::GET, path, Vec::new(), None)
         .await
 }
 
@@ -4705,8 +4705,13 @@ mod tests {
             "high-volume map tile failures must not evict useful diagnostics"
         );
         let endpoint = &map_sdk.connection_diagnostics().endpoints[0];
-        assert_eq!(endpoint.total_failures, 0);
+        assert_eq!(endpoint.total_failures, 1);
         assert!(endpoint.recent_attempts.is_empty());
+        assert!(
+            map_sdk.connection_route_snapshot().endpoints[0]
+                .circuit_open_until_unix_ms
+                .is_some()
+        );
 
         server.abort();
     }

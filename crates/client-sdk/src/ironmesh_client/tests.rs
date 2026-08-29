@@ -1636,7 +1636,7 @@ async fn spawn_direct_http_route_server(
 }
 
 #[tokio::test]
-async fn untracked_relative_path_requests_do_not_change_route_health_or_diagnostics() {
+async fn untracked_relative_path_requests_keep_server_failures_out_of_route_diagnostics() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("test listener should bind");
@@ -1658,7 +1658,7 @@ async fn untracked_relative_path_requests_do_not_change_route_health_or_diagnost
     let client = IronMeshClient::from_direct_base_url(format!("http://{address}"));
 
     let success = client
-        .request_relative_path_without_route_health_tracking(
+        .request_relative_path_without_route_diagnostics(
             Method::GET,
             "/maps/test-success",
             Vec::new(),
@@ -1669,15 +1669,15 @@ async fn untracked_relative_path_requests_do_not_change_route_health_or_diagnost
     assert_eq!(success.status, StatusCode::OK);
 
     let failure = client
-        .request_relative_path_without_route_health_tracking(
+        .request_relative_path_without_route_diagnostics(
             Method::GET,
             "/maps/test-failure",
             Vec::new(),
             None,
         )
         .await
-        .expect_err("retryable map status should fail the request");
-    assert!(format!("{failure:#}").contains("502"));
+        .expect("server response should remain available to the caller");
+    assert_eq!(failure.status, StatusCode::BAD_GATEWAY);
 
     let endpoint = &client.connection_diagnostics().endpoints[0];
     assert_eq!(endpoint.consecutive_failures, 0);
@@ -1687,6 +1687,40 @@ async fn untracked_relative_path_requests_do_not_change_route_health_or_diagnost
     assert!(endpoint.recent_attempts.is_empty());
 
     server.abort();
+
+    let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("temporary listener should bind");
+    let unavailable_address = unavailable_listener
+        .local_addr()
+        .expect("temporary listener should have an address");
+    drop(unavailable_listener);
+    let unavailable_client =
+        IronMeshClient::from_direct_base_url(format!("http://{unavailable_address}"));
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let observed_refreshes = Arc::clone(&refreshes);
+    unavailable_client.set_transport_failure_refresh_observer(Some(Arc::new(move || {
+        observed_refreshes.fetch_add(1, Ordering::SeqCst);
+    })));
+    unavailable_client
+        .request_relative_path_without_route_diagnostics(
+            Method::GET,
+            "/maps/test-unavailable",
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect_err("unreachable map endpoint should fail");
+    let endpoint = &unavailable_client.connection_diagnostics().endpoints[0];
+    assert_eq!(endpoint.consecutive_failures, 1);
+    assert_eq!(endpoint.total_failures, 1);
+    assert!(endpoint.recent_attempts.is_empty());
+    assert!(
+        unavailable_client.connection_route_snapshot().endpoints[0]
+            .circuit_open_until_unix_ms
+            .is_some()
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
 }
 
 #[derive(Clone)]

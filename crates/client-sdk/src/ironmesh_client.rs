@@ -733,12 +733,12 @@ struct RoutedBufferedTransportResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RouteHealthTracking {
+enum RouteDiagnosticsTracking {
     Enabled,
     Disabled,
 }
 
-impl RouteHealthTracking {
+impl RouteDiagnosticsTracking {
     const fn is_enabled(self) -> bool {
         matches!(self, Self::Enabled)
     }
@@ -750,35 +750,43 @@ impl RouteHealthTracking {
 struct ForegroundRequestExecutor<'a> {
     client: &'a IronMeshClient,
     routes: RequestExecutor,
-    route_health_tracking: RouteHealthTracking,
+    route_diagnostics_tracking: RouteDiagnosticsTracking,
     last_error: Option<anyhow::Error>,
     last_completed_operation: Option<ClientConnectionOperationResult>,
 }
 
 impl<'a> ForegroundRequestExecutor<'a> {
     fn new(client: &'a IronMeshClient, route_ids: Vec<RouteId>) -> Self {
-        Self::new_with_route_health_tracking(client, route_ids, RouteHealthTracking::Enabled)
+        Self::new_with_route_diagnostics_tracking(
+            client,
+            route_ids,
+            RouteDiagnosticsTracking::Enabled,
+        )
     }
 
     /// Some high-volume auxiliary requests, such as map tiles, must use the
-    /// normal route selection and failover policy without changing the health
-    /// state used for foreground product operations.
-    fn new_without_route_health_tracking(
+    /// normal route selection and failover policy without adding high-volume
+    /// traffic to foreground connection diagnostics.
+    fn new_without_route_diagnostics_tracking(
         client: &'a IronMeshClient,
         route_ids: Vec<RouteId>,
     ) -> Self {
-        Self::new_with_route_health_tracking(client, route_ids, RouteHealthTracking::Disabled)
+        Self::new_with_route_diagnostics_tracking(
+            client,
+            route_ids,
+            RouteDiagnosticsTracking::Disabled,
+        )
     }
 
-    fn new_with_route_health_tracking(
+    fn new_with_route_diagnostics_tracking(
         client: &'a IronMeshClient,
         route_ids: Vec<RouteId>,
-        route_health_tracking: RouteHealthTracking,
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
     ) -> Self {
         Self {
             client,
             routes: RequestExecutor::new(route_ids),
-            route_health_tracking,
+            route_diagnostics_tracking,
             last_error: None,
             last_completed_operation: None,
         }
@@ -793,27 +801,26 @@ impl<'a> ForegroundRequestExecutor<'a> {
             else {
                 continue;
             };
-            if self.route_health_tracking.is_enabled() {
-                self.client
-                    .transport_router
-                    .log_route_candidate_scheduled(index, &endpoint);
-            }
+            self.client
+                .transport_router
+                .log_route_candidate_scheduled(index, &endpoint);
             return Some((index, endpoint));
         }
         None
     }
 
     fn record_route_used(&self, index: usize, endpoint: &ClientEndpoint, used_at_unix_ms: u64) {
-        if self.route_health_tracking.is_enabled() {
+        if self.route_diagnostics_tracking.is_enabled() {
             self.client
                 .record_route_used(index, endpoint, used_at_unix_ms);
         }
     }
 
     fn record_preflight_failure(&mut self, endpoint: &ClientEndpoint, error: anyhow::Error) {
-        if self.route_health_tracking.is_enabled() {
-            self.client
-                .record_route_failure(endpoint, &format!("{error:#}"));
+        self.client
+            .record_route_failure(endpoint, &format!("{error:#}"));
+        if !self.route_diagnostics_tracking.is_enabled() {
+            self.client.signal_route_supervisor();
         }
         self.last_error = Some(error);
     }
@@ -830,7 +837,7 @@ impl<'a> ForegroundRequestExecutor<'a> {
             RequestExecutor::classify_http_status(is_retryable_transport_status(status)),
             AttemptDisposition::RetryNextRoute
         );
-        if self.route_health_tracking.is_enabled() {
+        if self.route_diagnostics_tracking.is_enabled() {
             self.last_completed_operation = Some(self.client.record_request_failure_with_status(
                 index,
                 endpoint,
@@ -854,13 +861,20 @@ impl<'a> ForegroundRequestExecutor<'a> {
             should_suppress_route_fanout(&error),
             request_body_reusable,
         );
-        if self.route_health_tracking.is_enabled() {
+        if self.route_diagnostics_tracking.is_enabled() {
             self.last_completed_operation = Some(self.client.record_request_failure(
                 index,
                 endpoint,
                 attempt,
                 &format!("{error:#}"),
             ));
+        } else {
+            self.client.record_transport_failure_without_diagnostics(
+                index,
+                endpoint,
+                &format!("{error:#}"),
+            );
+            self.client.signal_route_supervisor();
         }
         self.last_error = Some(error);
         if disposition == AttemptDisposition::Stop {
@@ -884,7 +898,7 @@ impl<'a> ForegroundRequestExecutor<'a> {
         attempt: ClientRequestAttemptContext<'_>,
         measurement: ClientRequestSuccessMeasurement<'_>,
     ) {
-        if !self.route_health_tracking.is_enabled() {
+        if !self.route_diagnostics_tracking.is_enabled() {
             return;
         }
         let completed_operation =
@@ -897,7 +911,7 @@ impl<'a> ForegroundRequestExecutor<'a> {
 
     fn finish<T>(self, no_routes: impl FnOnce() -> anyhow::Error) -> Result<T> {
         let error = self.last_error.unwrap_or_else(no_routes);
-        if self.route_health_tracking.is_enabled() {
+        if self.route_diagnostics_tracking.is_enabled() {
             self.client
                 .publish_connection_diagnostics(self.last_completed_operation);
             self.client.signal_route_supervisor();
@@ -1580,6 +1594,24 @@ impl ClientEndpointRouter {
         let mut state = lock_endpoint_state(&endpoint.state);
         record_endpoint_failure_sample(&mut state, error, false);
         drop(state);
+        self.notify_transport_failure_when_exhausted(had_selectable_route);
+    }
+
+    /// Updates failure backoff for an actual transport error without adding a
+    /// high-volume auxiliary request to the foreground attempt history.
+    fn record_transport_failure_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        error: &str,
+    ) {
+        let had_selectable_route = self.has_selectable_route();
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_failure_sample(&mut state, error, false);
+        drop(state);
+        if is_timeout_error_message(error) {
+            self.log_timeout_route_reprioritized(index, error);
+        }
         self.notify_transport_failure_when_exhausted(had_selectable_route);
     }
 
@@ -4341,6 +4373,16 @@ impl IronMeshClient {
             .record_endpoint_failure(endpoint, error);
     }
 
+    fn record_transport_failure_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        error: &str,
+    ) {
+        self.transport_router
+            .record_transport_failure_without_diagnostics(index, endpoint, error);
+    }
+
     fn record_request_failure(
         &self,
         index: usize,
@@ -4582,18 +4624,18 @@ impl IronMeshClient {
         body: Option<Vec<u8>>,
         route_ids: &[RouteId],
     ) -> Result<RoutedBufferedTransportResponse> {
-        self.execute_buffered_request_on_routes_with_route_health_tracking(
+        self.execute_buffered_request_on_routes_with_route_diagnostics_tracking(
             method,
             url,
             headers,
             body,
             route_ids,
-            RouteHealthTracking::Enabled,
+            RouteDiagnosticsTracking::Enabled,
         )
         .await
     }
 
-    async fn execute_buffered_request_on_routes_without_route_health_tracking(
+    async fn execute_buffered_request_on_routes_without_route_diagnostics_tracking(
         &self,
         method: Method,
         url: Url,
@@ -4601,35 +4643,38 @@ impl IronMeshClient {
         body: Option<Vec<u8>>,
         route_ids: &[RouteId],
     ) -> Result<RoutedBufferedTransportResponse> {
-        self.execute_buffered_request_on_routes_with_route_health_tracking(
+        self.execute_buffered_request_on_routes_with_route_diagnostics_tracking(
             method,
             url,
             headers,
             body,
             route_ids,
-            RouteHealthTracking::Disabled,
+            RouteDiagnosticsTracking::Disabled,
         )
         .await
     }
 
-    async fn execute_buffered_request_on_routes_with_route_health_tracking(
+    async fn execute_buffered_request_on_routes_with_route_diagnostics_tracking(
         &self,
         method: Method,
         url: Url,
         mut headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
         route_ids: &[RouteId],
-        route_health_tracking: RouteHealthTracking,
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
     ) -> Result<RoutedBufferedTransportResponse> {
         ensure_operation_id_header(&method, &mut headers);
         let request_timeout = buffered_request_timeout(&url);
 
         let auth = self.auth_snapshot();
 
-        let mut execution = if route_health_tracking.is_enabled() {
+        let mut execution = if route_diagnostics_tracking.is_enabled() {
             ForegroundRequestExecutor::new(self, route_ids.to_vec())
         } else {
-            ForegroundRequestExecutor::new_without_route_health_tracking(self, route_ids.to_vec())
+            ForegroundRequestExecutor::new_without_route_diagnostics_tracking(
+                self,
+                route_ids.to_vec(),
+            )
         };
         while let Some((index, endpoint)) = execution.next() {
             let endpoint_context = endpoint_context(index, &endpoint);
@@ -4671,6 +4716,13 @@ impl IronMeshClient {
                         response.status,
                     )) == AttemptDisposition::RetryNextRoute =>
                 {
+                    if !route_diagnostics_tracking.is_enabled() {
+                        return Ok(RoutedBufferedTransportResponse {
+                            route_affinity: NodeRouteAffinity::from_endpoint(&endpoint),
+                            endpoint_context,
+                            response,
+                        });
+                    }
                     execution.record_retryable_status(
                         index,
                         &endpoint,
@@ -4914,34 +4966,34 @@ impl IronMeshClient {
         headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
     ) -> Result<RoutedBufferedTransportResponse> {
-        self.execute_buffered_request_with_route_health_tracking(
+        self.execute_buffered_request_with_route_diagnostics_tracking(
             method,
             url,
             headers,
             body,
-            RouteHealthTracking::Enabled,
+            RouteDiagnosticsTracking::Enabled,
         )
         .await
     }
 
-    async fn execute_buffered_request_with_route_health_tracking(
+    async fn execute_buffered_request_with_route_diagnostics_tracking(
         &self,
         method: Method,
         mut url: Url,
         headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
-        route_health_tracking: RouteHealthTracking,
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
     ) -> Result<RoutedBufferedTransportResponse> {
         let snapshot_owner_node_id = normalize_client_snapshot_selector_in_url(&mut url)?;
         let route_ids = match snapshot_owner_node_id {
             Some(node_id) => self.route_ids_for_target_node(node_id)?,
             None => self.transport_router.foreground_route_ids(),
         };
-        if route_health_tracking.is_enabled() {
+        if route_diagnostics_tracking.is_enabled() {
             self.execute_buffered_request_on_routes(method, url, headers, body, &route_ids)
                 .await
         } else {
-            self.execute_buffered_request_on_routes_without_route_health_tracking(
+            self.execute_buffered_request_on_routes_without_route_diagnostics_tracking(
                 method, url, headers, body, &route_ids,
             )
             .await
@@ -5715,47 +5767,49 @@ impl IronMeshClient {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<RelativePathResponse> {
-        self.request_relative_path_with_route_health_tracking(
+        self.request_relative_path_with_route_diagnostics_tracking(
             method,
             path,
             headers,
             body,
-            RouteHealthTracking::Enabled,
+            RouteDiagnosticsTracking::Enabled,
         )
         .await
     }
 
     /// Requests a relative path using normal route selection and failover, but
-    /// leaves the connection-health state and diagnostics untouched.
+    /// leaves high-volume request attempts out of connection diagnostics.
     ///
-    /// This is for high-volume auxiliary traffic whose failures do not indicate
-    /// that the underlying transport route is unhealthy. Callers should keep
-    /// ordinary application requests on [`Self::request_relative_path`] so
-    /// connection diagnostics continue to represent product traffic.
-    pub async fn request_relative_path_without_route_health_tracking(
+    /// This is for high-volume auxiliary traffic where an HTTP failure does not
+    /// by itself indicate an unhealthy transport or failed product operation.
+    /// Actual transport failures still update route backoff so this traffic
+    /// cannot hammer an unreachable endpoint. Callers should keep ordinary
+    /// application requests on [`Self::request_relative_path`] so connection
+    /// diagnostics continue to represent product traffic.
+    pub async fn request_relative_path_without_route_diagnostics(
         &self,
         method: Method,
         path: &str,
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<RelativePathResponse> {
-        self.request_relative_path_with_route_health_tracking(
+        self.request_relative_path_with_route_diagnostics_tracking(
             method,
             path,
             headers,
             body,
-            RouteHealthTracking::Disabled,
+            RouteDiagnosticsTracking::Disabled,
         )
         .await
     }
 
-    async fn request_relative_path_with_route_health_tracking(
+    async fn request_relative_path_with_route_diagnostics_tracking(
         &self,
         method: Method,
         path: &str,
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
-        route_health_tracking: RouteHealthTracking,
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
     ) -> Result<RelativePathResponse> {
         let url = self.relative_url(path)?;
         let headers = headers
@@ -5763,12 +5817,12 @@ impl IronMeshClient {
             .map(|(name, value)| RelayHttpHeader { name, value })
             .collect::<Vec<_>>();
         let response = self
-            .execute_buffered_request_with_route_health_tracking(
+            .execute_buffered_request_with_route_diagnostics_tracking(
                 method,
                 url,
                 headers,
                 body,
-                route_health_tracking,
+                route_diagnostics_tracking,
             )
             .await
             .with_context(|| format!("failed to request {path}"))?;
