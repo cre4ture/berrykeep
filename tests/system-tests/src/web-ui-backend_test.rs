@@ -1428,6 +1428,20 @@ mod tests {
         let part_ac = fixture_bytes[split_two..].to_vec();
 
         let result = async {
+            for map_api_path in [
+                "/api/v1/maps/mbtiles-metadata",
+                "/api/v1/maps/logical-file",
+                "/api/maps/mbtiles-metadata",
+                "/api/maps/logical-file",
+            ] {
+                let unauthenticated_response = client
+                    .get(format!("http://{server_bind}{map_api_path}"))
+                    .query(&[("manifest_key", manifest_key)])
+                    .send()
+                    .await?;
+                assert_eq!(unauthenticated_response.status(), StatusCode::UNAUTHORIZED);
+            }
+
             for (key, payload) in [
                 (part_aa_key, part_aa.clone()),
                 (part_ab_key, part_ab.clone()),
