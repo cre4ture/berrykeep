@@ -1,3 +1,17 @@
+ironmesh (1.1.0-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add integrated private web service discovery, proxying, and progressive UI
+    across desktop and mobile clients.
+  * Expand gallery mapping with server-side spatial clustering, persistent
+    mobile caches, and private or NSFW XMP labels.
+  * Support sharing original media on Android and iOS, plus Windows Explorer
+    remote-metadata previews.
+  * Strengthen mobile sync recovery, server-node setup and distribution, and
+    production client routing.
+  * Roll the workspace release to 1.1.0.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 29 Aug 2026 16:10:03 +0200
+
 ironmesh (1.0.46-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Bound per-client rendezvous tickets and global connection and handshake
