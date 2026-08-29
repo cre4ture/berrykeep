@@ -9,6 +9,7 @@ exec "${ROOT_DIR}/scripts/deploy-stats-collector-service.sh" \
   --tls-cert-path /etc/letsencrypt/live/217.160.159.105/fullchain.pem \
   --tls-key-path /etc/letsencrypt/live/217.160.159.105/privkey.pem \
   --health-url https://217.160.159.105:9444/health \
+  --dashboard-url https://217.160.159.105:9444/ \
   --ssh-option=-o \
   --ssh-option=BatchMode=yes \
   --ssh-option=-o \

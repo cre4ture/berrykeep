@@ -88,10 +88,14 @@ The core of this strategy is implemented across the node and a new central colle
 - **Production TLS and deployment helper** (Section 5.2): `stats-collector-server` supports direct
   TLS from environment-provided PEM files and reloads renewed certificates periodically.
   `scripts/deploy-stats-collector-service.sh` provides checksum-verified MUSL deployment with
-  remote-only admin-token initialization and rollback. The primary
+  remote-only admin-token initialization and rollback. It also builds and deploys the public
+  `web/apps/fleet-telemetry` Vite bundle to the collector's `STATS_COLLECTOR_PUBLIC_DIR`, so the
+  dashboard and its public `/v1/stats/dashboard` API share an HTTPS origin without CORS or browser
+  credentials. The primary
   `scripts/deploy-strato-stats-collector-service.sh` wrapper fixes the intended
   `root@217.160.159.105`, `/root/ironmesh/telemetry`, and
-  `https://217.160.159.105:9444` layout. It expects the automatically renewed, short-lived
+  `https://217.160.159.105:9444` layout; its root path is the publicly accessible Fleet
+  Reliability dashboard. It expects the automatically renewed, short-lived
   Let's Encrypt IP certificate at `/etc/letsencrypt/live/217.160.159.105`; Certbot 5.4 or newer can
   request it with the `shortlived` profile and `--ip-address 217.160.159.105`. The former
   `scripts/deploy-home-stats-collector-service.sh` Uberspace wrapper remains available as a
@@ -523,9 +527,15 @@ telemetry would unnecessarily complicate their security boundaries.
   - Raw data (including `telemetry_subject_id` mapping over time): project maintainers/operators of
     the collector service only, admin-authenticated analogous to the existing
     `IRONMESH_ADMIN_TOKEN`/RBAC model from `docs/security-architecture.md`.
-  - Aggregated, k-anonymous processed statistics: publicly viewable (e.g. a future "Fleet Reliability"
-    dashboard, including the country-level usage map from Section 4.2), since that is exactly the
-    community value this feature provides.
+  - Aggregated, k-anonymous processed statistics: publicly viewable at the collector's root Fleet
+    Reliability dashboard and via `GET /v1/stats/dashboard`. This versioned API includes only the
+    k-anonymized current participant, country, and hardware-profile counts plus generation/build
+    metadata; its total is rounded down to a k-sized cohort so suppressed groups cannot be
+    recovered by subtraction. Both public statistics endpoints are rate-limited per source IP and
+    share a five-minute server-side aggregate cache, preventing a cache-bypassing client from
+    repeatedly scanning raw rows. Neither endpoint serializes a raw record, subject id, token, or
+    administrative field. The legacy `GET /v1/stats/summary` endpoint remains available for machine
+    clients.
 
 ### 5.4 Standalone Service vs. Existing Backend Infrastructure
 

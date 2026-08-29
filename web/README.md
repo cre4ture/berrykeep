@@ -4,6 +4,7 @@ This workspace is the shared frontend home for:
 
 - `server-admin`
 - `client-ui`
+- `fleet-telemetry` — a credential-free public dashboard served by the telemetry collector
 - shared UI components
 - shared API helpers
 
@@ -17,9 +18,11 @@ Use `pnpm`.
 pnpm install
 pnpm dev:server-admin
 pnpm dev:client-ui
+pnpm dev:fleet-telemetry
 pnpm typecheck
 pnpm build
 pnpm test:e2e:client-ui
+pnpm test:e2e:fleet-telemetry
 pnpm test:e2e:server-admin
 pnpm test:e2e:server-admin-rust
 pnpm test:e2e:server-admin-setup-rust
