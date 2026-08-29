@@ -5,6 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKAGE_NAME="stats-collector-server"
 BINARY_NAME="stats-collector-server"
 MANIFEST_PATH="${ROOT_DIR}/crates/stats-collector-server/Cargo.toml"
+WEB_ROOT="${ROOT_DIR}/web"
+PUBLIC_DASHBOARD_PACKAGE="@ironmesh/fleet-telemetry"
+LOCAL_PUBLIC_DIR="${IRONMESH_STATS_COLLECTOR_DEPLOY_PUBLIC_DIR:-${WEB_ROOT}/apps/fleet-telemetry/dist}"
 
 TARGET_TRIPLE="${IRONMESH_STATS_COLLECTOR_DEPLOY_TARGET:-x86_64-unknown-linux-musl}"
 REMOTE_DIR="${IRONMESH_STATS_COLLECTOR_DEPLOY_REMOTE_DIR:-}"
@@ -12,11 +15,13 @@ BIND_ADDR="${IRONMESH_STATS_COLLECTOR_DEPLOY_BIND_ADDR:-0.0.0.0:44044}"
 TLS_CERT_PATH="${IRONMESH_STATS_COLLECTOR_DEPLOY_TLS_CERT_PATH:-}"
 TLS_KEY_PATH="${IRONMESH_STATS_COLLECTOR_DEPLOY_TLS_KEY_PATH:-}"
 HEALTH_URL="${IRONMESH_STATS_COLLECTOR_DEPLOY_HEALTH_URL:-}"
+DASHBOARD_URL="${IRONMESH_STATS_COLLECTOR_DEPLOY_DASHBOARD_URL:-}"
 TLS_SERVER_NAME="${IRONMESH_STATS_COLLECTOR_DEPLOY_TLS_SERVER_NAME:-}"
 STOP_TIMEOUT_SECS="${IRONMESH_STATS_COLLECTOR_DEPLOY_STOP_TIMEOUT_SECS:-20}"
 AUTO_ADD_TARGET="${IRONMESH_STATS_COLLECTOR_DEPLOY_AUTO_ADD_TARGET:-true}"
 
 SKIP_BUILD=false
+SKIP_DASHBOARD_BUILD=false
 DRY_RUN=false
 APPLY=false
 REMOTE_HOST=""
@@ -28,7 +33,11 @@ REMOTE_LOGFILE=""
 REMOTE_ENV_FILE=""
 REMOTE_START_SCRIPT=""
 REMOTE_DB_PATH=""
+REMOTE_PUBLIC_DIR=""
+REMOTE_PUBLIC_ARCHIVE=""
 REMOTE_HAD_BINARY=false
+REMOTE_HAD_PUBLIC_DIR=false
+LOCAL_PUBLIC_ARCHIVE=""
 
 declare -a SSH_OPTIONS=()
 declare -a SCP_OPTIONS=()
@@ -63,11 +72,13 @@ Required:
 
 Options:
   --bind-addr ADDR        Listener address (default: 0.0.0.0:44044).
+  --dashboard-url URL     Public HTTPS dashboard URL (default: health URL's origin).
   --tls-server-name NAME  Expected certificate hostname; defaults to the host
                           parsed from --health-url.
   --target TRIPLE         Rust target (default: x86_64-unknown-linux-musl).
   --stop-timeout SECS     Graceful shutdown timeout (default: 20).
   --skip-build            Reuse the existing target release binary.
+  --skip-dashboard-build  Reuse the existing fleet-dashboard `dist` directory.
   --ssh-option OPT        Append one ssh option token; repeat as needed.
   --scp-option OPT        Append one scp option token; repeat as needed.
   --dry-run               Print the resolved deployment plan without changes.
@@ -80,6 +91,7 @@ The remote layout is:
   <remote-dir>/stats-collector-server.log
   <remote-dir>/start.sh
   <remote-dir>/data/stats-collector.sqlite3
+  <remote-dir>/public/
 
 The script never prints the admin token or private-key contents. If activation
 or health verification fails, the previous binary is restored and restarted.
@@ -115,6 +127,15 @@ parse_args() {
         (($# >= 2)) || fail '--remote-dir requires a value'
         REMOTE_DIR="$2"
         shift 2
+        ;;
+      --dashboard-url)
+        (($# >= 2)) || fail '--dashboard-url requires a value'
+        DASHBOARD_URL="$2"
+        shift 2
+        ;;
+      --dashboard-url=*)
+        DASHBOARD_URL="${1#*=}"
+        shift
         ;;
       --remote-dir=*)
         REMOTE_DIR="${1#*=}"
@@ -205,6 +226,10 @@ parse_args() {
         SKIP_BUILD=true
         shift
         ;;
+      --skip-dashboard-build)
+        SKIP_DASHBOARD_BUILD=true
+        shift
+        ;;
       --dry-run)
         DRY_RUN=true
         shift
@@ -238,6 +263,10 @@ resolve_layout() {
   [[ -n "${TLS_KEY_PATH}" ]] || fail 'set --tls-key-path'
   [[ -n "${HEALTH_URL}" ]] || fail 'set --health-url'
   [[ "${HEALTH_URL}" == https://* ]] || fail '--health-url must use https://'
+  if [[ -z "${DASHBOARD_URL}" ]]; then
+    DASHBOARD_URL="${HEALTH_URL%/health}/"
+  fi
+  [[ "${DASHBOARD_URL}" == https://* ]] || fail '--dashboard-url must use https://'
   if [[ -z "${TLS_SERVER_NAME}" ]]; then
     TLS_SERVER_NAME="${HEALTH_URL#https://}"
     TLS_SERVER_NAME="${TLS_SERVER_NAME%%/*}"
@@ -254,6 +283,8 @@ resolve_layout() {
   REMOTE_ENV_FILE="${REMOTE_DIR}/${BINARY_NAME}.env"
   REMOTE_START_SCRIPT="${REMOTE_DIR}/start.sh"
   REMOTE_DB_PATH="${REMOTE_DIR}/data/stats-collector.sqlite3"
+  REMOTE_PUBLIC_DIR="${REMOTE_DIR}/public"
+  REMOTE_PUBLIC_ARCHIVE="${REMOTE_DIR}/.fleet-telemetry.tar.new.$$"
 }
 
 print_dry_run() {
@@ -264,6 +295,8 @@ print_dry_run() {
   log "listener: ${BIND_ADDR} with native TLS"
   log "certificate: ${TLS_CERT_PATH}"
   log "health verification: ${HEALTH_URL}"
+  log "public dashboard verification: ${DASHBOARD_URL}"
+  log "public dashboard source: ${LOCAL_PUBLIC_DIR}"
   log "build: ${PACKAGE_NAME} --features bundled-country-db --target ${TARGET_TRIPLE}"
   log 'plan: key-only SSH preflight, MUSL build, checksum-verified upload, restart, version/HTTPS verification, rollback on failure'
 }
@@ -323,6 +356,35 @@ build_binary() {
   log "verified local binary version ${EXPECTED_PACKAGE_VERSION}"
 }
 
+build_public_dashboard() {
+  if [[ "${SKIP_DASHBOARD_BUILD}" == true ]]; then
+    log "reusing existing fleet dashboard build"
+  else
+    require_command pnpm
+    log "building ${PUBLIC_DASHBOARD_PACKAGE}"
+    (
+      cd "${WEB_ROOT}"
+      pnpm --filter "${PUBLIC_DASHBOARD_PACKAGE}" build
+    )
+  fi
+
+  [[ -f "${LOCAL_PUBLIC_DIR}/index.html" ]] || \
+    fail "fleet dashboard build did not produce ${LOCAL_PUBLIC_DIR}/index.html"
+}
+
+prepare_public_dashboard_archive() {
+  LOCAL_PUBLIC_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/ironmesh-fleet-telemetry.XXXXXX.tar")"
+  tar -C "${LOCAL_PUBLIC_DIR}" --create --file "${LOCAL_PUBLIC_ARCHIVE}" .
+  tar -tf "${LOCAL_PUBLIC_ARCHIVE}" | grep -Fxq './index.html' || \
+    fail 'fleet dashboard archive does not contain index.html'
+}
+
+cleanup_local_public_dashboard_archive() {
+  if [[ -n "${LOCAL_PUBLIC_ARCHIVE}" && -f "${LOCAL_PUBLIC_ARCHIVE}" ]]; then
+    rm -f -- "${LOCAL_PUBLIC_ARCHIVE}"
+  fi
+}
+
 preflight_remote() {
   local remote_dir_q cert_q key_q binary_q pidfile_q
   remote_dir_q="$(quote_for_sh "${REMOTE_DIR}")"
@@ -344,6 +406,7 @@ test -r "$TLS_KEY_PATH"
 command -v curl >/dev/null
 command -v openssl >/dev/null
 command -v sha256sum >/dev/null
+command -v tar >/dev/null
 if [[ "$TLS_SERVER_NAME" =~ ^[0-9]+(\.[0-9]+){3}$ || "$TLS_SERVER_NAME" == *:* ]]; then
   openssl x509 -in "$TLS_CERT_PATH" -noout -checkip "$TLS_SERVER_NAME" >/dev/null
 else
@@ -406,19 +469,57 @@ REMOTE
   fi
 }
 
+upload_public_dashboard() {
+  local checksum remote_archive_q public_dir_q remote_dir_q checksum_q
+  prepare_public_dashboard_archive
+  checksum="$(sha256sum "${LOCAL_PUBLIC_ARCHIVE}" | cut -d' ' -f1)"
+  remote_archive_q="$(quote_for_sh "${REMOTE_PUBLIC_ARCHIVE}")"
+  public_dir_q="$(quote_for_sh "${REMOTE_PUBLIC_DIR}")"
+  remote_dir_q="$(quote_for_sh "${REMOTE_DIR}")"
+  checksum_q="$(quote_for_sh "${checksum}")"
+
+  log "uploading checksum-verified public dashboard to ${REMOTE_HOST}"
+  ssh "${SSH_OPTIONS[@]}" "${REMOTE_HOST}" \
+    "REMOTE_DIR=${remote_dir_q} bash -s" <<'REMOTE'
+set -euo pipefail
+install -d -m 0700 "$REMOTE_DIR"
+REMOTE
+  scp "${SCP_OPTIONS[@]}" "${LOCAL_PUBLIC_ARCHIVE}" "${REMOTE_HOST}:${REMOTE_PUBLIC_ARCHIVE}"
+  ssh "${SSH_OPTIONS[@]}" "${REMOTE_HOST}" \
+    "REMOTE_ARCHIVE=${remote_archive_q} REMOTE_PUBLIC_DIR=${public_dir_q} EXPECTED_CHECKSUM=${checksum_q} bash -s" <<'REMOTE'
+set -euo pipefail
+actual_checksum="$(sha256sum "$REMOTE_ARCHIVE" | cut -d' ' -f1)"
+test "$actual_checksum" = "$EXPECTED_CHECKSUM"
+staged_dir="${REMOTE_PUBLIC_DIR}.new"
+rm -rf "$staged_dir"
+install -d -m 0755 "$staged_dir"
+tar -C "$staged_dir" --extract --file "$REMOTE_ARCHIVE"
+rm -f "$REMOTE_ARCHIVE"
+test -f "$staged_dir/index.html"
+find "$staged_dir" -type d -exec chmod 0755 {} +
+find "$staged_dir" -type f -exec chmod 0644 {} +
+printf 'public_dashboard=staged\n'
+REMOTE
+
+  if ssh "${SSH_OPTIONS[@]}" "${REMOTE_HOST}" "test -d ${public_dir_q}"; then
+    REMOTE_HAD_PUBLIC_DIR=true
+  fi
+}
+
 configure_remote() {
-  local remote_dir_q env_q start_q db_q bind_q cert_q key_q
+  local remote_dir_q env_q start_q db_q public_dir_q bind_q cert_q key_q
   remote_dir_q="$(quote_for_sh "${REMOTE_DIR}")"
   env_q="$(quote_for_sh "${REMOTE_ENV_FILE}")"
   start_q="$(quote_for_sh "${REMOTE_START_SCRIPT}")"
   db_q="$(quote_for_sh "${REMOTE_DB_PATH}")"
+  public_dir_q="$(quote_for_sh "${REMOTE_PUBLIC_DIR}")"
   bind_q="$(quote_for_sh "${BIND_ADDR}")"
   cert_q="$(quote_for_sh "${TLS_CERT_PATH}")"
   key_q="$(quote_for_sh "${TLS_KEY_PATH}")"
 
   log "ensuring remote configuration without exposing secrets"
   ssh "${SSH_OPTIONS[@]}" "${REMOTE_HOST}" \
-    "REMOTE_DIR=${remote_dir_q} ENV_FILE=${env_q} START_SCRIPT=${start_q} DB_PATH=${db_q} BIND_ADDR=${bind_q} TLS_CERT_PATH=${cert_q} TLS_KEY_PATH=${key_q} bash -s" <<'REMOTE'
+    "REMOTE_DIR=${remote_dir_q} ENV_FILE=${env_q} START_SCRIPT=${start_q} DB_PATH=${db_q} PUBLIC_DIR=${public_dir_q} BIND_ADDR=${bind_q} TLS_CERT_PATH=${cert_q} TLS_KEY_PATH=${key_q} bash -s" <<'REMOTE'
 set -euo pipefail
 umask 077
 install -d -m 0700 "$REMOTE_DIR" "$(dirname "$DB_PATH")"
@@ -437,6 +538,7 @@ set_setting() {
 
 set_setting STATS_COLLECTOR_BIND_ADDR "$BIND_ADDR"
 set_setting STATS_COLLECTOR_DB_PATH "$DB_PATH"
+set_setting STATS_COLLECTOR_PUBLIC_DIR "$PUBLIC_DIR"
 set_setting STATS_COLLECTOR_K_ANONYMITY_MIN 5
 set_setting STATS_COLLECTOR_RETENTION_DAYS 180
 set_setting STATS_COLLECTOR_TLS_CERT_PATH "$TLS_CERT_PATH"
@@ -556,6 +658,25 @@ mv "$REMOTE_TMP" "$REMOTE_BINARY"
 REMOTE
 }
 
+activate_uploaded_public_dashboard() {
+  local public_dir_q
+  public_dir_q="$(quote_for_sh "${REMOTE_PUBLIC_DIR}")"
+
+  ssh "${SSH_OPTIONS[@]}" "${REMOTE_HOST}" \
+    "REMOTE_PUBLIC_DIR=${public_dir_q} bash -s" <<'REMOTE'
+set -euo pipefail
+staged_dir="${REMOTE_PUBLIC_DIR}.new"
+previous_dir="${REMOTE_PUBLIC_DIR}.previous"
+test -d "$staged_dir"
+test -f "$staged_dir/index.html"
+rm -rf "$previous_dir"
+if [[ -d "$REMOTE_PUBLIC_DIR" ]]; then
+  mv "$REMOTE_PUBLIC_DIR" "$previous_dir"
+fi
+mv "$staged_dir" "$REMOTE_PUBLIC_DIR"
+REMOTE
+}
+
 start_remote_service() {
   local remote_dir_q pidfile_q logfile_q start_q
   remote_dir_q="$(quote_for_sh "${REMOTE_DIR}")"
@@ -579,7 +700,7 @@ REMOTE
 }
 
 verify_deployment() {
-  local binary_q pidfile_q env_q db_q expected_q health_body
+  local binary_q pidfile_q env_q db_q expected_q health_body dashboard_body
   binary_q="$(quote_for_sh "${REMOTE_BINARY}")"
   pidfile_q="$(quote_for_sh "${REMOTE_PIDFILE}")"
   env_q="$(quote_for_sh "${REMOTE_ENV_FILE}")"
@@ -622,6 +743,23 @@ REMOTE
     return 1
   fi
   log "public HTTPS health verified for version ${EXPECTED_PACKAGE_VERSION}"
+
+  log "verifying public fleet dashboard ${DASHBOARD_URL}"
+  if ! dashboard_body="$(curl \
+    --silent \
+    --show-error \
+    --fail \
+    --connect-timeout 7 \
+    --max-time 15 \
+    "${DASHBOARD_URL}")"
+  then
+    return 1
+  fi
+  if ! grep -Fq '<title>IronMesh Fleet Reliability</title>' <<<"${dashboard_body}"; then
+    log 'public fleet dashboard did not contain its expected document title'
+    return 1
+  fi
+  log 'public fleet dashboard verified'
 }
 
 rollback_remote() {
@@ -632,13 +770,21 @@ rollback_remote() {
     return 0
   fi
 
-  local binary_q
+  local binary_q public_dir_q
   binary_q="$(quote_for_sh "${REMOTE_BINARY}")"
+  public_dir_q="$(quote_for_sh "${REMOTE_PUBLIC_DIR}")"
   ssh "${SSH_OPTIONS[@]}" "${REMOTE_HOST}" \
-    "REMOTE_BINARY=${binary_q} bash -s" <<'REMOTE'
+    "REMOTE_BINARY=${binary_q} REMOTE_PUBLIC_DIR=${public_dir_q} REMOTE_HAD_PUBLIC_DIR=${REMOTE_HAD_PUBLIC_DIR} bash -s" <<'REMOTE'
 set -euo pipefail
 test -x "${REMOTE_BINARY}.previous"
 mv "${REMOTE_BINARY}.previous" "$REMOTE_BINARY"
+if [[ "$REMOTE_HAD_PUBLIC_DIR" == true ]]; then
+  test -d "${REMOTE_PUBLIC_DIR}.previous"
+  rm -rf "$REMOTE_PUBLIC_DIR"
+  mv "${REMOTE_PUBLIC_DIR}.previous" "$REMOTE_PUBLIC_DIR"
+elif [[ -d "$REMOTE_PUBLIC_DIR" ]]; then
+  mv "$REMOTE_PUBLIC_DIR" "${REMOTE_PUBLIC_DIR}.failed.$$"
+fi
 REMOTE
   start_remote_service
   log 'previous binary restored and restarted'
@@ -662,14 +808,20 @@ main() {
   require_command sed
   require_command sha256sum
   require_command ssh
+  require_command tar
+
+  trap cleanup_local_public_dashboard_archive EXIT
 
   resolve_local_build_artifact
   preflight_remote
   build_binary
+  build_public_dashboard
   upload_binary
+  upload_public_dashboard
   configure_remote
   stop_remote_service
   activate_uploaded_binary
+  activate_uploaded_public_dashboard
 
   if ! start_remote_service || ! verify_deployment; then
     rollback_remote

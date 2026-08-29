@@ -29,17 +29,19 @@ pub mod registration;
 pub mod storage;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
 use crate::aggregate::{FleetSummary, summarize};
@@ -242,10 +244,26 @@ impl StatsCollectorAppState {
     }
 }
 
-/// Builds the axum [`Router`] for this service. Callers are responsible for TLS termination and
-/// for actually binding/serving it (see `main.rs`).
+/// Builds the API-only axum [`Router`] for this service. Callers are responsible for TLS
+/// termination and for actually binding/serving it (see `main.rs`).
+///
+/// Production deployments normally use [`build_router_with_public_assets`] so the public
+/// dashboard and its API share the same HTTPS origin. Keeping the API-only constructor also makes
+/// small integration tests and API-only deployments straightforward.
 pub fn build_router(state: StatsCollectorAppState) -> Router {
-    Router::new()
+    build_router_with_public_assets(state, None)
+}
+
+/// Builds the collector router, optionally serving a compiled public dashboard as its fallback.
+///
+/// The dashboard contains no credentials and calls only the k-anonymized public statistics API.
+/// Serving it from the collector's HTTPS origin avoids an unnecessarily broad CORS policy. The
+/// caller must provide a directory containing a Vite build, including `index.html` and `assets/`.
+pub fn build_router_with_public_assets(
+    state: StatsCollectorAppState,
+    public_assets_dir: Option<PathBuf>,
+) -> Router {
+    let router = Router::new()
         .route("/health", get(health))
         .route(
             "/v1/ingest/hardware-reliability",
@@ -258,13 +276,21 @@ pub fn build_router(state: StatsCollectorAppState) -> Router {
         )
         // Public, k-anonymity-safe fleet statistics (doc Sections 4.3, 5.3).
         .route("/v1/stats/summary", get(stats_summary))
+        .route("/v1/stats/dashboard", get(stats_dashboard))
         // Admin-token-protected GDPR access + erasure (doc Section 4.5).
         .route("/v1/admin/raw", get(admin_raw_records))
         .route(
             "/v1/admin/subject/{telemetry_subject_id}",
             delete(admin_delete_subject),
         )
-        .with_state(state)
+        .with_state(state);
+
+    match public_assets_dir {
+        Some(dir) => {
+            router.fallback_service(ServeDir::new(dir).append_index_html_on_directories(true))
+        }
+        None => router,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -528,16 +554,64 @@ fn internal_error(message: &str) -> Response {
 /// small target fleet makes this cheap, and the code is structured so a periodic batch job could
 /// replace the on-request computation later without changing the response shape.
 async fn stats_summary(State(state): State<StatsCollectorAppState>) -> Response {
+    public_summary_response(state, false).await
+}
+
+/// Versioned shape consumed by the public dashboard. It deliberately only includes values already
+/// approved for public release by [`summarize`]; there are no raw batches, subject identifiers, or
+/// administrative fields in this response.
+#[derive(Debug, Serialize)]
+struct FleetDashboardResponse {
+    schema_version: u32,
+    generated_at_unix: i64,
+    software_version: &'static str,
+    #[serde(flatten)]
+    summary: FleetSummary,
+}
+
+/// Public dashboard data, computed on request from the same k-anonymized aggregate used by the
+/// compatibility summary endpoint. Its cache policy is deliberately short: normal viewers do not
+/// trigger a database read for every page view, while new daily telemetry remains visible promptly.
+async fn stats_dashboard(State(state): State<StatsCollectorAppState>) -> Response {
+    public_summary_response(state, true).await
+}
+
+async fn public_summary_response(state: StatsCollectorAppState, dashboard: bool) -> Response {
     match state.storage.all_records().await {
         Ok(records) => {
             let summary: FleetSummary = summarize(&records, state.k_anonymity_min);
-            (StatusCode::OK, Json(summary)).into_response()
+            let mut response = if dashboard {
+                (
+                    StatusCode::OK,
+                    Json(FleetDashboardResponse {
+                        schema_version: 1,
+                        generated_at_unix: now_unix(),
+                        software_version: PACKAGE_VERSION,
+                        summary,
+                    }),
+                )
+                    .into_response()
+            } else {
+                (StatusCode::OK, Json(summary)).into_response()
+            };
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=300, stale-while-revalidate=600"),
+            );
+            response
         }
         Err(error) => {
-            warn!(%error, "failed to compute fleet summary");
+            warn!(%error, "failed to compute public fleet summary");
             internal_error("failed to compute summary")
         }
     }
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// Authorizes an admin request against the configured token. Returns 412 when no token is
@@ -738,6 +812,29 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_asset_fallback_serves_the_dashboard_index() {
+        let assets = tempfile::tempdir().expect("temporary dashboard asset directory should open");
+        std::fs::write(
+            assets.path().join("index.html"),
+            "<!doctype html><title>IronMesh Fleet Reliability</title>",
+        )
+        .expect("dashboard index should be written");
+        let router =
+            build_router_with_public_assets(test_state().await, Some(assets.path().to_path_buf()));
+
+        let response = router
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("dashboard response body should read");
+        assert!(String::from_utf8_lossy(&body).contains("IronMesh Fleet Reliability"));
     }
 
     #[tokio::test]
@@ -999,6 +1096,67 @@ mod tests {
         let profiles = body["by_hardware_profile"].as_array().unwrap();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0]["hardware_profile_id"], "common");
+    }
+
+    #[tokio::test]
+    async fn public_dashboard_exposes_only_k_anonymous_aggregate_data() {
+        let storage = IngestStorage::open_in_memory()
+            .await
+            .expect("storage should open");
+        for index in 0..5 {
+            storage
+                .insert(
+                    index,
+                    &format!("subject-common-{index}"),
+                    1,
+                    Some("CH"),
+                    "{\"hardware_profile_id\":\"common\"}",
+                )
+                .await
+                .unwrap();
+        }
+        storage
+            .insert(
+                100,
+                "subject-rare",
+                1,
+                Some("LI"),
+                "{\"hardware_profile_id\":\"rare\"}",
+            )
+            .await
+            .unwrap();
+        let router = build_router(StatsCollectorAppState::new(storage).with_k_anonymity_min(5));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stats/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "public, max-age=300, stale-while-revalidate=600"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["software_version"], PACKAGE_VERSION);
+        assert!(body["generated_at_unix"].as_i64().unwrap() > 0);
+        assert_eq!(body["total_subjects"], 6);
+        assert_eq!(body["by_hardware_profile"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["by_hardware_profile"][0]["hardware_profile_id"],
+            "common"
+        );
+        assert_eq!(body["by_country"].as_array().unwrap().len(), 1);
+        assert_eq!(body["by_country"][0]["country_code"], "CH");
+        assert!(body.get("telemetry_subject_id").is_none());
+        assert!(!body.to_string().contains("subject-common-0"));
+        assert!(!body.to_string().contains("subject-rare"));
     }
 
     #[tokio::test]

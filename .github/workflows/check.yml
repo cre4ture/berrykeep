@@ -220,6 +220,9 @@ jobs:
           - name: server-admin-setup-rust
             label: adm-setup
             command: pnpm test:e2e:server-admin-setup-rust
+          - name: fleet-telemetry
+            label: fleet
+            command: pnpm test:e2e:fleet-telemetry
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"

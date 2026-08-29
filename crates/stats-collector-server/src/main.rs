@@ -17,6 +17,9 @@
 //!   serving HTTPS directly. Both must be set together. The files are reloaded periodically so a
 //!   hosting provider can renew them in place without requiring a redeployment.
 //! - `STATS_COLLECTOR_TLS_RELOAD_SECS`: TLS file reload interval, defaults to 24 hours.
+//! - `STATS_COLLECTOR_PUBLIC_DIR`: optional directory containing the compiled public fleet
+//!   dashboard. When configured, it is served on this listener's HTTPS origin, so its browser
+//!   requests to `/v1/stats/dashboard` need no cross-origin privileges.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -30,7 +33,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use stats_collector_server::country::BundledCountryResolver;
 use stats_collector_server::{
     DEFAULT_BIND_ADDR, DEFAULT_DB_PATH, DEFAULT_K_ANONYMITY_MIN, DEFAULT_RETENTION_DAYS,
-    StatsCollectorAppState, build_router, storage::IngestStorage,
+    StatsCollectorAppState, build_router_with_public_assets, storage::IngestStorage,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -78,6 +81,15 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_RETENTION_DAYS);
+    let public_assets_dir = std::env::var_os("STATS_COLLECTOR_PUBLIC_DIR").map(PathBuf::from);
+    if let Some(path) = public_assets_dir.as_ref()
+        && !path.is_dir()
+    {
+        anyhow::bail!(
+            "STATS_COLLECTOR_PUBLIC_DIR must name an existing directory: {}",
+            path.display()
+        );
+    }
     let tls_files = tls_files_from_env()?;
 
     if admin_token.is_none() {
@@ -101,7 +113,7 @@ async fn main() -> Result<()> {
     spawn_rate_limit_cleanup(state.clone());
     spawn_retention_sweeper(state.clone(), retention_days);
 
-    let app = build_router(state);
+    let app = build_router_with_public_assets(state, public_assets_dir.clone());
 
     info!(
         %bind_addr,
@@ -109,6 +121,7 @@ async fn main() -> Result<()> {
         k_anonymity_min,
         retention_days,
         tls = tls_files.is_some(),
+        public_dashboard = public_assets_dir.is_some(),
         "stats-collector-server listening"
     );
 
