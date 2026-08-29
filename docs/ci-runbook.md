@@ -49,7 +49,8 @@ It builds the MSIX from the requested immutable release tag with
 MSIX to a separate protected `windows-client-signing` job. That job checks out
 the protected default branch only for `Sign-Msix.ps1` and
 `New-MsixUploadPackage.ps1`, verifies the certificate and manifest publisher,
-timestamps the MSIX, and creates an `.msixupload` from the signed package.
+signs the MSIX without contacting a timestamp server, and creates an
+`.msixupload` from the signed package.
 
 Configure these values before a client-signed release:
 
@@ -59,13 +60,13 @@ Configure these values before a client-signed release:
 - environment secret
   `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_B64` - base64-encoded PFX;
 - environment secret
-  `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD` - PFX password;
-- environment variable `BERRYKEEP_WINDOWS_CLIENT_TIMESTAMP_URL` - approved
-  RFC-3161 timestamp endpoint.
+  `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD` - PFX password.
 
-Keep the last three values in the `windows-client-signing` environment, not
+Keep both secrets in the `windows-client-signing` environment, not
 as repository secrets. Configure independent approval, prevent
-self-approval/admin bypass, and limit the environment to stable release tags.
+self-approval/admin bypass, and limit the environment to the protected
+default branch. Run a protected client signing release through
+`workflow_dispatch` from that branch.
 The certificate subject must exactly match the `Publisher` in
 `windows/thumbnail-provider/AppxManifest.xml`; the signing helper refuses a
 mismatch. Protect `.github/workflows/release.yml` and

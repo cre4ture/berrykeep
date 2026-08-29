@@ -186,21 +186,21 @@ the package before publishing only the signed MSIX and its public `.cer` file.
 
 The signing certificate subject must exactly equal the `Publisher` value in
 `AppxManifest.xml`. Provide the three external-signing parameters together;
-an RFC-3161 timestamp URL is optional for local tests and recommended for
-release artifacts:
+the local self-signed certificate does not require a timestamp server:
 
 ```powershell
 $env:BERRYKEEP_CLIENT_PFX = 'C:\secure\berrykeep-client.pfx'
 $env:BERRYKEEP_CLIENT_PFX_PASSWORD = '<PFX password>'
 $env:BERRYKEEP_CLIENT_PFX_THUMBPRINT = '<40-character SHA-1 thumbprint>'
-$env:BERRYKEEP_CLIENT_TIMESTAMP_URL = 'https://<approved-rfc3161-endpoint>'
 
 powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-StoreUploadPackage.ps1 `
   -SigningCertificatePath $env:BERRYKEEP_CLIENT_PFX `
   -SigningCertificatePassword $env:BERRYKEEP_CLIENT_PFX_PASSWORD `
-  -SigningCertificateThumbprint $env:BERRYKEEP_CLIENT_PFX_THUMBPRINT `
-  -TimestampUrl $env:BERRYKEEP_CLIENT_TIMESTAMP_URL
+  -SigningCertificateThumbprint $env:BERRYKEEP_CLIENT_PFX_THUMBPRINT
 ```
+
+`-TimestampUrl https://<approved-rfc3161-endpoint>` remains available when a
+timestamped signature is needed later.
 
 The PFX remains at its supplied path and is never copied into the output
 directory. The generated `.cer` contains the public certificate only. A test

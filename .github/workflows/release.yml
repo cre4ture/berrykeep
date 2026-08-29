@@ -316,11 +316,10 @@ jobs:
         env:
           BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_B64: ${{ secrets.BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_B64 }}
           BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD }}
-          BERRYKEEP_WINDOWS_CLIENT_TIMESTAMP_URL: ${{ vars.BERRYKEEP_WINDOWS_CLIENT_TIMESTAMP_URL }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ([string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_B64) -or [string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD) -or [string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_CLIENT_TIMESTAMP_URL)) {
-            throw "The windows-client-signing environment must provide the certificate, certificate password, and RFC-3161 timestamp URL."
+          if ([string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_B64) -or [string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD)) {
+            throw "The windows-client-signing environment must provide the certificate and certificate password."
           }
 
           $expectedThumbprint = ($env:BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
@@ -357,7 +356,6 @@ jobs:
               -SigningCertificatePath $signingCertificatePath `
               -SigningCertificatePassword $env:BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD `
               -SigningCertificateThumbprint $expectedThumbprint `
-              -TimestampUrl $env:BERRYKEEP_WINDOWS_CLIENT_TIMESTAMP_URL `
               -PublicCertificatePath $certificatePath
 
             & .\windows\thumbnail-provider\New-MsixUploadPackage.ps1 `
