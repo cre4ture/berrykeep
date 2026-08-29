@@ -828,10 +828,12 @@ main() {
   upload_public_dashboard
   configure_remote
   stop_remote_service
-  activate_uploaded_binary
-  activate_uploaded_public_dashboard
 
-  if ! start_remote_service || ! verify_deployment; then
+  if ! activate_uploaded_binary ||
+    ! activate_uploaded_public_dashboard ||
+    ! start_remote_service ||
+    ! verify_deployment
+  then
     rollback_remote
     fail 'deployment failed and rollback was attempted'
   fi
