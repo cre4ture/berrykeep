@@ -471,6 +471,59 @@ struct ClientRequestSuccessMeasurement<'a> {
     response_body_complete: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ClientRequestSuccessTiming {
+    total_duration_us: u64,
+    server_processing_duration_us: Option<u64>,
+    transport_overhead_us: Option<u64>,
+    session_pool_after: TransportSessionPoolSnapshot,
+    session_setup_duration_us: u64,
+    relay_pairing_duration_us: u64,
+    network_transfer_duration_us: Option<u64>,
+    route_latency_us: u64,
+}
+
+impl ClientRequestSuccessTiming {
+    fn measure(
+        endpoint: &ClientEndpoint,
+        attempt: ClientRequestAttemptContext<'_>,
+        measurement: &ClientRequestSuccessMeasurement<'_>,
+    ) -> Self {
+        let total_duration_us = duration_ms_as_u64_micros(measurement.total_duration_ms);
+        let server_processing_duration_us = parse_header_u64(
+            measurement.response_headers,
+            HEADER_SERVER_PROCESSING_DURATION_US,
+        );
+        let transport_overhead_us = server_processing_duration_us
+            .map(|server_duration| total_duration_us.saturating_sub(server_duration));
+        let session_pool_after = endpoint.transport.session_pool_snapshot();
+        let session_setup_duration_us = session_pool_after
+            .connect_duration_us
+            .saturating_sub(attempt.session_pool_before.connect_duration_us);
+        let relay_pairing_duration_us = session_pool_after
+            .relay_pairing_duration_us
+            .saturating_sub(attempt.session_pool_before.relay_pairing_duration_us);
+        let network_transfer_duration_us = transport_overhead_us
+            .map(|overhead| overhead.saturating_sub(session_setup_duration_us));
+        let route_latency_us = route_latency_duration_us(
+            total_duration_us,
+            server_processing_duration_us,
+            session_setup_duration_us,
+        );
+
+        Self {
+            total_duration_us,
+            server_processing_duration_us,
+            transport_overhead_us,
+            session_pool_after,
+            session_setup_duration_us,
+            relay_pairing_duration_us,
+            network_transfer_duration_us,
+            route_latency_us,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ClientEndpoint {
     descriptor: ClientEndpointDescriptor,
@@ -732,21 +785,64 @@ struct RoutedBufferedTransportResponse {
     response: BufferedTransportResponse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteDiagnosticsTracking {
+    Enabled,
+    Disabled,
+}
+
+impl RouteDiagnosticsTracking {
+    const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 /// Shared foreground failover policy. Transport-specific functions perform I/O and construct
 /// measurements; this executor is the single owner of stable candidate resolution, admission,
 /// retry/stop classification, circuit transitions, and terminal diagnostics publication.
 struct ForegroundRequestExecutor<'a> {
     client: &'a IronMeshClient,
     routes: RequestExecutor,
+    route_diagnostics_tracking: RouteDiagnosticsTracking,
     last_error: Option<anyhow::Error>,
     last_completed_operation: Option<ClientConnectionOperationResult>,
 }
 
 impl<'a> ForegroundRequestExecutor<'a> {
     fn new(client: &'a IronMeshClient, route_ids: Vec<RouteId>) -> Self {
+        Self::new_with_route_diagnostics_tracking(
+            client,
+            route_ids,
+            RouteDiagnosticsTracking::Enabled,
+        )
+    }
+
+    /// Some high-volume auxiliary requests, such as map tiles, use normal
+    /// route selection and transport-error failover without adding their
+    /// request attempts to foreground connection diagnostics. Retryable HTTP
+    /// responses are returned to the caller without route fanout because they
+    /// can describe an application-level map-data failure rather than an
+    /// unhealthy transport.
+    fn new_without_route_diagnostics_tracking(
+        client: &'a IronMeshClient,
+        route_ids: Vec<RouteId>,
+    ) -> Self {
+        Self::new_with_route_diagnostics_tracking(
+            client,
+            route_ids,
+            RouteDiagnosticsTracking::Disabled,
+        )
+    }
+
+    fn new_with_route_diagnostics_tracking(
+        client: &'a IronMeshClient,
+        route_ids: Vec<RouteId>,
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
+    ) -> Self {
         Self {
             client,
             routes: RequestExecutor::new(route_ids),
+            route_diagnostics_tracking,
             last_error: None,
             last_completed_operation: None,
         }
@@ -769,9 +865,19 @@ impl<'a> ForegroundRequestExecutor<'a> {
         None
     }
 
+    fn record_route_used(&self, index: usize, endpoint: &ClientEndpoint, used_at_unix_ms: u64) {
+        if self.route_diagnostics_tracking.is_enabled() {
+            self.client
+                .record_route_used(index, endpoint, used_at_unix_ms);
+        }
+    }
+
     fn record_preflight_failure(&mut self, endpoint: &ClientEndpoint, error: anyhow::Error) {
         self.client
             .record_route_failure(endpoint, &format!("{error:#}"));
+        if !self.route_diagnostics_tracking.is_enabled() {
+            self.client.signal_route_supervisor();
+        }
         self.last_error = Some(error);
     }
 
@@ -787,13 +893,15 @@ impl<'a> ForegroundRequestExecutor<'a> {
             RequestExecutor::classify_http_status(is_retryable_transport_status(status)),
             AttemptDisposition::RetryNextRoute
         );
-        self.last_completed_operation = Some(self.client.record_request_failure_with_status(
-            index,
-            endpoint,
-            attempt,
-            &format!("{error:#}"),
-            Some(status),
-        ));
+        if self.route_diagnostics_tracking.is_enabled() {
+            self.last_completed_operation = Some(self.client.record_request_failure_with_status(
+                index,
+                endpoint,
+                attempt,
+                &format!("{error:#}"),
+                Some(status),
+            ));
+        }
         self.last_error = Some(error);
     }
 
@@ -809,12 +917,21 @@ impl<'a> ForegroundRequestExecutor<'a> {
             should_suppress_route_fanout(&error),
             request_body_reusable,
         );
-        self.last_completed_operation = Some(self.client.record_request_failure(
-            index,
-            endpoint,
-            attempt,
-            &format!("{error:#}"),
-        ));
+        if self.route_diagnostics_tracking.is_enabled() {
+            self.last_completed_operation = Some(self.client.record_request_failure(
+                index,
+                endpoint,
+                attempt,
+                &format!("{error:#}"),
+            ));
+        } else {
+            self.client.record_transport_failure_without_diagnostics(
+                index,
+                endpoint,
+                &format!("{error:#}"),
+            );
+            self.client.signal_route_supervisor();
+        }
         self.last_error = Some(error);
         if disposition == AttemptDisposition::Stop {
             tracing::info!(
@@ -837,19 +954,31 @@ impl<'a> ForegroundRequestExecutor<'a> {
         attempt: ClientRequestAttemptContext<'_>,
         measurement: ClientRequestSuccessMeasurement<'_>,
     ) {
-        let completed_operation =
+        if self.route_diagnostics_tracking.is_enabled() {
+            let completed_operation =
+                self.client
+                    .record_request_success(index, endpoint, attempt, measurement);
             self.client
-                .record_request_success(index, endpoint, attempt, measurement);
-        self.client
-            .publish_connection_diagnostics(Some(completed_operation));
-        self.client.signal_route_supervisor();
+                .publish_connection_diagnostics(Some(completed_operation));
+            self.client.signal_route_supervisor();
+        } else {
+            let timing = ClientRequestSuccessTiming::measure(endpoint, attempt, &measurement);
+            self.client.record_transport_success_without_diagnostics(
+                index,
+                endpoint,
+                timing.route_latency_us as f64 / 1_000.0,
+                measurement.response_bytes,
+            );
+        }
     }
 
     fn finish<T>(self, no_routes: impl FnOnce() -> anyhow::Error) -> Result<T> {
         let error = self.last_error.unwrap_or_else(no_routes);
-        self.client
-            .publish_connection_diagnostics(self.last_completed_operation);
-        self.client.signal_route_supervisor();
+        if self.route_diagnostics_tracking.is_enabled() {
+            self.client
+                .publish_connection_diagnostics(self.last_completed_operation);
+            self.client.signal_route_supervisor();
+        }
         Err(error)
     }
 }
@@ -1531,6 +1660,43 @@ impl ClientEndpointRouter {
         self.notify_transport_failure_when_exhausted(had_selectable_route);
     }
 
+    /// Updates failure backoff for an actual transport error without adding a
+    /// high-volume auxiliary request to the foreground attempt history.
+    fn record_transport_failure_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        error: &str,
+    ) {
+        let had_selectable_route = self.has_selectable_route();
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_failure_sample(&mut state, error, false);
+        drop(state);
+        if is_timeout_error_message(error) {
+            self.log_timeout_route_reprioritized(index, error);
+        }
+        self.notify_transport_failure_when_exhausted(had_selectable_route);
+    }
+
+    /// Updates endpoint health for a successful high-volume auxiliary request
+    /// without adding an entry to the foreground attempt history.
+    fn record_transport_success_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        route_latency_ms: f64,
+        response_bytes: usize,
+    ) {
+        let mut state = lock_endpoint_state(&endpoint.state);
+        let first_relay_connection =
+            state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
+        record_endpoint_success_sample(&mut state, route_latency_ms, response_bytes, false);
+        drop(state);
+        if first_relay_connection {
+            self.notify_first_relay_connection(index, endpoint);
+        }
+    }
+
     #[cfg(test)]
     fn record_background_probe_successes(&self, index: usize, latency_samples_ms: &[f64]) {
         let Some(candidate) = self.background_probe_candidate_at_index(index) else {
@@ -1678,35 +1844,15 @@ impl ClientEndpointRouter {
         let first_relay_connection =
             state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
         let finished_unix_ms = unix_ts_ms();
-        let total_duration_us = duration_ms_as_u64_micros(measurement.total_duration_ms);
-        let server_processing_duration_us = parse_header_u64(
-            measurement.response_headers,
-            HEADER_SERVER_PROCESSING_DURATION_US,
-        );
-        let transport_overhead_us = server_processing_duration_us
-            .map(|server_duration| total_duration_us.saturating_sub(server_duration));
-        let session_pool_after = endpoint.transport.session_pool_snapshot();
-        let session_setup_duration_us = session_pool_after
-            .connect_duration_us
-            .saturating_sub(attempt.session_pool_before.connect_duration_us);
-        let relay_pairing_duration_us = session_pool_after
-            .relay_pairing_duration_us
-            .saturating_sub(attempt.session_pool_before.relay_pairing_duration_us);
-        let network_transfer_duration_us = transport_overhead_us
-            .map(|overhead| overhead.saturating_sub(session_setup_duration_us));
-        let route_latency_us = route_latency_duration_us(
-            total_duration_us,
-            server_processing_duration_us,
-            session_setup_duration_us,
-        );
+        let timing = ClientRequestSuccessTiming::measure(endpoint, attempt, &measurement);
         record_endpoint_success_sample(
             &mut state,
-            route_latency_us as f64 / 1_000.0,
+            timing.route_latency_us as f64 / 1_000.0,
             measurement.response_bytes,
             false,
         );
         let session_reused =
-            session_pool_after.reuse_count > attempt.session_pool_before.reuse_count;
+            timing.session_pool_after.reuse_count > attempt.session_pool_before.reuse_count;
         let server_received_unix_ms =
             parse_header_u64(measurement.response_headers, HEADER_SERVER_RECEIVED_UNIX_MS);
         let server_responded_unix_ms = parse_header_u64(
@@ -1718,7 +1864,7 @@ impl ClientEndpointRouter {
             finished_unix_ms,
             server_received_unix_ms,
             server_responded_unix_ms,
-            transport_overhead_us,
+            timing.transport_overhead_us,
         );
         let display_url = attempt_display_url(endpoint, attempt.url);
         if impact.affects_user_facing_connection_status() {
@@ -1734,12 +1880,12 @@ impl ClientEndpointRouter {
             timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
             outcome: "success".to_string(),
             status_code: Some(measurement.status.as_u16()),
-            total_duration_us: Some(total_duration_us),
-            server_processing_duration_us,
-            transport_overhead_us,
-            session_setup_duration_us,
-            relay_pairing_duration_us,
-            network_transfer_duration_us,
+            total_duration_us: Some(timing.total_duration_us),
+            server_processing_duration_us: timing.server_processing_duration_us,
+            transport_overhead_us: timing.transport_overhead_us,
+            session_setup_duration_us: timing.session_setup_duration_us,
+            relay_pairing_duration_us: timing.relay_pairing_duration_us,
+            network_transfer_duration_us: timing.network_transfer_duration_us,
             session_reused,
             request_bytes: usize_as_u64(measurement.request_bytes),
             response_bytes: usize_as_u64(measurement.response_bytes),
@@ -4289,6 +4435,32 @@ impl IronMeshClient {
             .record_endpoint_failure(endpoint, error);
     }
 
+    fn record_transport_failure_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        error: &str,
+    ) {
+        self.transport_router
+            .record_transport_failure_without_diagnostics(index, endpoint, error);
+    }
+
+    fn record_transport_success_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        route_latency_ms: f64,
+        response_bytes: usize,
+    ) {
+        self.transport_router
+            .record_transport_success_without_diagnostics(
+                index,
+                endpoint,
+                route_latency_ms,
+                response_bytes,
+            );
+    }
+
     fn record_request_failure(
         &self,
         index: usize,
@@ -4526,16 +4698,62 @@ impl IronMeshClient {
         &self,
         method: Method,
         url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+        route_ids: &[RouteId],
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_on_routes_with_route_diagnostics_tracking(
+            method,
+            url,
+            headers,
+            body,
+            route_ids,
+            RouteDiagnosticsTracking::Enabled,
+        )
+        .await
+    }
+
+    async fn execute_buffered_request_on_routes_without_route_diagnostics_tracking(
+        &self,
+        method: Method,
+        url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+        route_ids: &[RouteId],
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_on_routes_with_route_diagnostics_tracking(
+            method,
+            url,
+            headers,
+            body,
+            route_ids,
+            RouteDiagnosticsTracking::Disabled,
+        )
+        .await
+    }
+
+    async fn execute_buffered_request_on_routes_with_route_diagnostics_tracking(
+        &self,
+        method: Method,
+        url: Url,
         mut headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
         route_ids: &[RouteId],
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
     ) -> Result<RoutedBufferedTransportResponse> {
         ensure_operation_id_header(&method, &mut headers);
         let request_timeout = buffered_request_timeout(&url);
 
         let auth = self.auth_snapshot();
 
-        let mut execution = ForegroundRequestExecutor::new(self, route_ids.to_vec());
+        let mut execution = if route_diagnostics_tracking.is_enabled() {
+            ForegroundRequestExecutor::new(self, route_ids.to_vec())
+        } else {
+            ForegroundRequestExecutor::new_without_route_diagnostics_tracking(
+                self,
+                route_ids.to_vec(),
+            )
+        };
         while let Some((index, endpoint)) = execution.next() {
             let endpoint_context = endpoint_context(index, &endpoint);
             let endpoint_url = endpoint
@@ -4559,7 +4777,7 @@ impl IronMeshClient {
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
-            self.record_route_used(index, &endpoint, started_unix_ms);
+            execution.record_route_used(index, &endpoint, started_unix_ms);
             match execute_buffered_request_for_transport(
                 &endpoint.transport,
                 &auth,
@@ -4576,6 +4794,13 @@ impl IronMeshClient {
                         response.status,
                     )) == AttemptDisposition::RetryNextRoute =>
                 {
+                    if !route_diagnostics_tracking.is_enabled() {
+                        return Ok(RoutedBufferedTransportResponse {
+                            route_affinity: NodeRouteAffinity::from_endpoint(&endpoint),
+                            endpoint_context,
+                            response,
+                        });
+                    }
                     execution.record_retryable_status(
                         index,
                         &endpoint,
@@ -4815,17 +5040,42 @@ impl IronMeshClient {
     async fn execute_buffered_request_with_route(
         &self,
         method: Method,
+        url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_with_route_diagnostics_tracking(
+            method,
+            url,
+            headers,
+            body,
+            RouteDiagnosticsTracking::Enabled,
+        )
+        .await
+    }
+
+    async fn execute_buffered_request_with_route_diagnostics_tracking(
+        &self,
+        method: Method,
         mut url: Url,
         headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
     ) -> Result<RoutedBufferedTransportResponse> {
         let snapshot_owner_node_id = normalize_client_snapshot_selector_in_url(&mut url)?;
         let route_ids = match snapshot_owner_node_id {
             Some(node_id) => self.route_ids_for_target_node(node_id)?,
             None => self.transport_router.foreground_route_ids(),
         };
-        self.execute_buffered_request_on_routes(method, url, headers, body, &route_ids)
+        if route_diagnostics_tracking.is_enabled() {
+            self.execute_buffered_request_on_routes(method, url, headers, body, &route_ids)
+                .await
+        } else {
+            self.execute_buffered_request_on_routes_without_route_diagnostics_tracking(
+                method, url, headers, body, &route_ids,
+            )
             .await
+        }
     }
 
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
@@ -5595,19 +5845,70 @@ impl IronMeshClient {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<RelativePathResponse> {
+        self.request_relative_path_with_route_diagnostics_tracking(
+            method,
+            path,
+            headers,
+            body,
+            RouteDiagnosticsTracking::Enabled,
+        )
+        .await
+    }
+
+    /// Requests a relative path using normal route selection and transport-error
+    /// failover, but leaves high-volume request attempts out of connection
+    /// diagnostics. Retryable HTTP responses are returned without route fanout.
+    ///
+    /// This is for high-volume auxiliary traffic where an HTTP failure does not
+    /// by itself indicate an unhealthy transport or failed product operation.
+    /// Actual transport failures still update route backoff so this traffic
+    /// cannot hammer an unreachable endpoint. Callers should keep ordinary
+    /// application requests on [`Self::request_relative_path`] so connection
+    /// diagnostics continue to represent product traffic.
+    pub async fn request_relative_path_without_route_diagnostics(
+        &self,
+        method: Method,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+    ) -> Result<RelativePathResponse> {
+        self.request_relative_path_with_route_diagnostics_tracking(
+            method,
+            path,
+            headers,
+            body,
+            RouteDiagnosticsTracking::Disabled,
+        )
+        .await
+    }
+
+    async fn request_relative_path_with_route_diagnostics_tracking(
+        &self,
+        method: Method,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
+    ) -> Result<RelativePathResponse> {
         let url = self.relative_url(path)?;
         let headers = headers
             .into_iter()
             .map(|(name, value)| RelayHttpHeader { name, value })
             .collect::<Vec<_>>();
         let response = self
-            .execute_buffered_request(method, url, headers, body)
+            .execute_buffered_request_with_route_diagnostics_tracking(
+                method,
+                url,
+                headers,
+                body,
+                route_diagnostics_tracking,
+            )
             .await
             .with_context(|| format!("failed to request {path}"))?;
         Ok(RelativePathResponse {
-            status: response.status,
-            headers: response.headers,
-            body: response.body,
+            status: response.response.status,
+            headers: response.response.headers,
+            body: response.response.body,
         })
     }
 

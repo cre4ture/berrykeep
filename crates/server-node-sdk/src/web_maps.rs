@@ -3,10 +3,12 @@ use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
     CONTENT_RANGE, CONTENT_TYPE, ETAG, RANGE,
 };
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 mod mbtiles;
@@ -15,6 +17,38 @@ pub(crate) use mbtiles::LogicalMbtilesSource;
 
 const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
 const MAP_MANIFEST_PREFIX: &str = "sys/maps/";
+
+/// Cancels a blocking tile lookup when its request handler is dropped.
+#[derive(Clone, Default)]
+struct RequestCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RequestCancellation {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    fn guard(&self) -> RequestCancellationGuard {
+        RequestCancellationGuard {
+            cancelled: Arc::clone(&self.cancelled),
+        }
+    }
+}
+
+struct RequestCancellationGuard {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for RequestCancellationGuard {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WebMapLogicalFileQuery {
@@ -283,6 +317,8 @@ pub(crate) async fn xyz_tile(
         Err((status, message)) => return error_response(status, message),
     };
     let started = Instant::now();
+    let request_cancellation = RequestCancellation::new();
+    let _request_cancellation_guard = request_cancellation.guard();
 
     let source = match get_or_create_mbtiles_source(&state, &manifest_key).await {
         Ok(source) => source,
@@ -290,7 +326,7 @@ pub(crate) async fn xyz_tile(
     };
 
     let tile_lookup = tokio::task::spawn_blocking({
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = request_cancellation.flag();
         move || source.lookup_tile_with_cancellation(z, x, y, cancelled)
     })
     .await;
@@ -317,7 +353,7 @@ pub(crate) async fn xyz_tile(
     response_headers.insert(CONTENT_TYPE, HeaderValue::from_static(tile.content_type));
     response_headers.insert(
         CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=86400"),
+        HeaderValue::from_static("private, max-age=3600, stale-while-revalidate=86400"),
     );
 
     (StatusCode::OK, response_headers, tile.bytes).into_response()
@@ -333,6 +369,8 @@ pub(crate) async fn vector_tile(
         Err((status, message)) => return error_response(status, message),
     };
     let started = Instant::now();
+    let request_cancellation = RequestCancellation::new();
+    let _request_cancellation_guard = request_cancellation.guard();
 
     let source = match get_or_create_mbtiles_source(&state, &manifest_key).await {
         Ok(source) => source,
@@ -340,7 +378,7 @@ pub(crate) async fn vector_tile(
     };
 
     let tile_lookup = tokio::task::spawn_blocking({
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = request_cancellation.flag();
         move || source.lookup_vector_tile_with_cancellation(z, x, y, cancelled)
     })
     .await;
@@ -370,7 +408,7 @@ pub(crate) async fn vector_tile(
     }
     response_headers.insert(
         CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=86400"),
+        HeaderValue::from_static("private, max-age=3600, stale-while-revalidate=86400"),
     );
 
     (StatusCode::OK, response_headers, tile.bytes).into_response()
@@ -388,12 +426,9 @@ pub(crate) async fn font_range(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let Some(path) = resolve_glyph_asset_path(&glyphs_root, &fontstack, &range) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
+    match tokio::task::spawn_blocking(move || read_glyph_range(glyphs_root, fontstack, range)).await
+    {
+        Ok(GlyphRangeReadResult::Found(bytes)) => {
             let mut response_headers = HeaderMap::new();
             response_headers.insert(
                 CONTENT_TYPE,
@@ -401,14 +436,60 @@ pub(crate) async fn font_range(
             );
             response_headers.insert(
                 CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400, stale-while-revalidate=604800"),
+                HeaderValue::from_static("private, max-age=86400, stale-while-revalidate=604800"),
             );
             (StatusCode::OK, response_headers, bytes).into_response()
         }
+        Ok(GlyphRangeReadResult::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Ok(GlyphRangeReadResult::Unavailable) | Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+enum GlyphRangeReadResult {
+    Found(Vec<u8>),
+    NotFound,
+    Unavailable,
+}
+
+fn read_glyph_range(
+    glyphs_root: PathBuf,
+    fontstack: String,
+    range: String,
+) -> GlyphRangeReadResult {
+    let glyphs_dir = match Dir::open_ambient_dir(&glyphs_root, ambient_authority()) {
+        Ok(dir) => dir,
+        Err(_) => return GlyphRangeReadResult::Unavailable,
+    };
+    match glyphs_dir.symlink_metadata(&fontstack) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return GlyphRangeReadResult::NotFound,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            StatusCode::NOT_FOUND.into_response()
+            return GlyphRangeReadResult::NotFound;
         }
-        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+        Err(_) => return GlyphRangeReadResult::Unavailable,
+    }
+    let font_dir = match glyphs_dir.open_dir(&fontstack) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return GlyphRangeReadResult::NotFound;
+        }
+        Err(_) => return GlyphRangeReadResult::Unavailable,
+    };
+    match font_dir.symlink_metadata(&range) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return GlyphRangeReadResult::NotFound,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return GlyphRangeReadResult::NotFound;
+        }
+        Err(_) => return GlyphRangeReadResult::Unavailable,
+    }
+
+    match font_dir.read(&range) {
+        Ok(bytes) => GlyphRangeReadResult::Found(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            GlyphRangeReadResult::NotFound
+        }
+        Err(_) => GlyphRangeReadResult::Unavailable,
     }
 }
 
@@ -789,8 +870,8 @@ fn is_safe_fontstack_segment(value: &str) -> bool {
     // Note: `value.split('.').any(|segment| segment == "..")` would NOT catch
     // `value == ".."` (splitting ".." on '.' yields ["", "", ""], never "..").
     // Compare the whole (trimmed) value against "." / ".." directly instead.
-    // `resolve_glyph_asset_path` also independently rejects non-single-segment
-    // and "."/".." components, so this is defense in depth.
+    // The capability directory lookup below independently verifies entry types
+    // and rejects symlinks, so this is defense in depth.
     let trimmed = value.trim();
     !trimmed.is_empty()
         && trimmed != "."
@@ -816,21 +897,6 @@ fn is_safe_glyph_range_segment(value: &str) -> bool {
         && end.chars().all(|ch| ch.is_ascii_digit())
 }
 
-fn resolve_glyph_asset_path(glyphs_root: &FsPath, fontstack: &str, range: &str) -> Option<PathBuf> {
-    let fontstack_path = FsPath::new(fontstack);
-    let range_path = FsPath::new(range);
-    if fontstack_path.components().count() != 1
-        || fontstack_path.file_name() != Some(fontstack_path.as_os_str())
-        || range_path.components().count() != 1
-        || range_path.file_name() != Some(range_path.as_os_str())
-    {
-        return None;
-    }
-
-    let path = glyphs_root.join(fontstack_path).join(range_path);
-    path.starts_with(glyphs_root).then_some(path)
-}
-
 fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
     match error {
         StoreReadError::NotFound => anyhow!("object not found"),
@@ -842,11 +908,23 @@ fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorResponseBody, error_response, is_safe_fontstack_segment, resolve_glyph_asset_path,
+        ErrorResponseBody, RequestCancellation, error_response, is_safe_fontstack_segment,
+        is_safe_glyph_range_segment,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
-    use std::path::Path as FsPath;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn request_cancellation_sets_lookup_flag_when_request_ends() {
+        let cancellation = RequestCancellation::new();
+        let flag = cancellation.flag();
+        let guard = cancellation.guard();
+
+        assert!(!flag.load(Ordering::Relaxed));
+        drop(guard);
+        assert!(flag.load(Ordering::Relaxed));
+    }
 
     #[tokio::test]
     async fn error_response_preserves_public_json_contract() {
@@ -869,21 +947,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_glyph_asset_path_rejects_parent_traversal() {
-        let glyphs_root = FsPath::new("/tmp/fonts");
-        assert!(
-            resolve_glyph_asset_path(glyphs_root, "../Noto Sans Regular", "0-255.pbf").is_none()
-        );
-        assert!(
-            resolve_glyph_asset_path(glyphs_root, "Noto Sans Regular", "../0-255.pbf").is_none()
-        );
-        // A bare ".." fontstack (no slash) must also be rejected: it is a
-        // single path component that still traverses to the parent directory.
-        assert!(resolve_glyph_asset_path(glyphs_root, "..", "0-255.pbf").is_none());
-        assert!(resolve_glyph_asset_path(glyphs_root, ".", "0-255.pbf").is_none());
-    }
-
-    #[test]
     fn is_safe_fontstack_segment_rejects_dot_segments() {
         // Regression test: splitting on '.' would never produce the literal
         // segment ".." for a value that IS "..", so the check must compare
@@ -895,14 +958,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_glyph_asset_path_accepts_single_segments() {
-        let glyphs_root = FsPath::new("/tmp/fonts");
-        let resolved =
-            resolve_glyph_asset_path(glyphs_root, "Noto Sans Regular", "0-255.pbf").unwrap();
-
-        assert_eq!(
-            resolved,
-            glyphs_root.join("Noto Sans Regular").join("0-255.pbf")
-        );
+    fn is_safe_glyph_range_segment_rejects_path_components() {
+        assert!(!is_safe_glyph_range_segment("../0-255.pbf"));
+        assert!(!is_safe_glyph_range_segment("0-255.pbf/.."));
+        assert!(!is_safe_glyph_range_segment("0-255.pbf\\.."));
+        assert!(is_safe_glyph_range_segment("0-255.pbf"));
     }
 }

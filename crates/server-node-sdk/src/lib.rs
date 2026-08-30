@@ -7937,7 +7937,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/maps/tiles/{z}/{x}/{y}", get(web_maps::xyz_tile))
         .route("/maps/vector-tiles/{z}/{x}/{y}", get(web_maps::vector_tile))
-        .route("/maps/fonts/{fontstack}/{range}", get(web_maps::font_range));
+        .route("/maps/fonts/{fontstack}/{range}", get(web_maps::font_range))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_client_or_admin_auth,
+        ));
 
     let public_api_v1 = Router::new()
         .route("/health", get(health))
@@ -7993,8 +7997,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .merge(public_client_transport_api.clone())
         .merge(public_client_api.clone());
 
-    let legacy_public_api = Router::new()
-        .route("/health", get(health))
+    let legacy_public_maps_api = Router::new()
         .route(
             "/api/maps/mbtiles-metadata",
             get(web_maps::mbtiles_metadata),
@@ -8012,6 +8015,14 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             "/api/maps/fonts/{fontstack}/{range}",
             get(web_maps::font_range),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_client_or_admin_auth,
+        ));
+
+    let legacy_public_api = Router::new()
+        .route("/health", get(health))
+        .merge(legacy_public_maps_api)
         .route(
             "/auth/bootstrap-claims/redeem",
             post(redeem_client_bootstrap_claim),

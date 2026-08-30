@@ -1635,6 +1635,125 @@ async fn spawn_direct_http_route_server(
     .await
 }
 
+#[tokio::test]
+async fn untracked_relative_path_requests_keep_server_failures_out_of_route_diagnostics() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("test listener should have an address");
+    let server = tokio::spawn(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/maps/test-success",
+                get(|| async {
+                    // Make the raw wall-clock duration unusable as a route
+                    // latency sample. Untracked requests must still apply the
+                    // server-work exclusion used by ordinary requests.
+                    (
+                        [(HEADER_SERVER_PROCESSING_DURATION_US, "1000000")],
+                        StatusCode::OK,
+                    )
+                }),
+            )
+            .route(
+                "/api/v1/maps/test-failure",
+                get(|| async { StatusCode::BAD_GATEWAY }),
+            );
+        let _ = axum::serve(listener, app).await;
+    });
+    let client = IronMeshClient::from_direct_base_url(format!("http://{address}"));
+
+    let success = client
+        .request_relative_path_without_route_diagnostics(
+            Method::GET,
+            "/maps/test-success",
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("untracked success request should complete");
+    assert_eq!(success.status, StatusCode::OK);
+
+    let failure = client
+        .request_relative_path_without_route_diagnostics(
+            Method::GET,
+            "/maps/test-failure",
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("server response should remain available to the caller");
+    assert_eq!(failure.status, StatusCode::BAD_GATEWAY);
+
+    let endpoint = &client.connection_diagnostics().endpoints[0];
+    assert_eq!(endpoint.consecutive_failures, 0);
+    assert_eq!(endpoint.total_failures, 0);
+    assert_eq!(endpoint.total_successes, 1);
+    assert!(endpoint.last_error.is_none());
+    assert_eq!(
+        client.connection_route_snapshot().endpoints[0].ewma_latency_ms,
+        Some(0.0)
+    );
+    assert!(endpoint.last_used_unix_ms.is_none());
+    assert!(endpoint.recent_attempts.is_empty());
+
+    server.abort();
+
+    let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("temporary listener should bind");
+    let unavailable_address = unavailable_listener
+        .local_addr()
+        .expect("temporary listener should have an address");
+    drop(unavailable_listener);
+    let unavailable_client =
+        IronMeshClient::from_direct_base_url(format!("http://{unavailable_address}"));
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let observed_refreshes = Arc::clone(&refreshes);
+    unavailable_client.set_transport_failure_refresh_observer(Some(Arc::new(move || {
+        observed_refreshes.fetch_add(1, Ordering::SeqCst);
+    })));
+    unavailable_client
+        .request_relative_path_without_route_diagnostics(
+            Method::GET,
+            "/maps/test-unavailable",
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect_err("unreachable map endpoint should fail");
+    let endpoint = &unavailable_client.connection_diagnostics().endpoints[0];
+    assert_eq!(endpoint.consecutive_failures, 1);
+    assert_eq!(endpoint.total_failures, 1);
+    assert!(endpoint.recent_attempts.is_empty());
+    assert!(
+        unavailable_client.connection_route_snapshot().endpoints[0]
+            .circuit_open_until_unix_ms
+            .is_some()
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+
+    let endpoint = unavailable_client
+        .transport_router
+        .endpoint(0)
+        .expect("unavailable endpoint should remain registered");
+    unavailable_client.record_transport_success_without_diagnostics(0, &endpoint, 1.0, 128);
+
+    let endpoint = &unavailable_client.connection_diagnostics().endpoints[0];
+    assert_eq!(endpoint.consecutive_failures, 0);
+    assert_eq!(endpoint.total_failures, 1);
+    assert_eq!(endpoint.total_successes, 1);
+    assert!(endpoint.last_error.is_none());
+    assert!(endpoint.recent_attempts.is_empty());
+    assert!(
+        unavailable_client.connection_route_snapshot().endpoints[0]
+            .circuit_open_until_unix_ms
+            .is_none()
+    );
+}
+
 #[derive(Clone)]
 struct SnapshotHttpRouteState {
     hits: Arc<AtomicUsize>,

@@ -718,7 +718,7 @@ fn start_embedded_web_ui(
     bootstrap_json: String,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
-    cache_root: PathBuf,
+    _cache_root: PathBuf,
 ) -> Result<EmbeddedWebUiLaunch> {
     init_ios_tracing();
     let runtime = web_ui_runtime()?;
@@ -748,8 +748,7 @@ fn start_embedded_web_ui(
         Some("ios-web-ui".to_string()),
     )?;
     let mut web_ui_config = web_ui_backend::WebUiConfig::from_client(configured.sdk.clone())
-        .with_service_name("ironmesh-ios")
-        .with_map_chunk_cache_root(cache_root);
+        .with_service_name("ironmesh-ios");
     let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
         .context("failed to parse iOS bootstrap for embedded web ui")?;
     if let Some(server_ca_pem) = server_ca_pem.as_ref() {

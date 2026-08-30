@@ -31,7 +31,7 @@ use crate::{
     run_tombstone_compaction, s3_frontend, set_media_labels, start_upload_session,
     storage_stats_current, storage_stats_history, store_index_delta_response,
     transport_headers_from_response, trigger_replication_audit, upload_session_chunk,
-    validate_client_auth_request, wait_for_store_index_change, web_service_proxy,
+    validate_client_auth_request, wait_for_store_index_change, web_maps, web_service_proxy,
 };
 
 #[derive(Clone)]
@@ -603,6 +603,10 @@ fn build_public_transport_router(state: ServerState) -> Router {
         )
         .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/maps/config", get(crate::map_config::public_config))
+        .route("/maps/mbtiles-metadata", get(web_maps::mbtiles_metadata))
+        .route("/maps/tiles/{z}/{x}/{y}", get(web_maps::xyz_tile))
+        .route("/maps/vector-tiles/{z}/{x}/{y}", get(web_maps::vector_tile))
+        .route("/maps/fonts/{fontstack}/{range}", get(web_maps::font_range))
         .route(
             "/cluster/rendezvous-contacts",
             get(rendezvous_contact_config::public_config),

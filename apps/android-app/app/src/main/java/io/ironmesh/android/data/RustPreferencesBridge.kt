@@ -228,12 +228,6 @@ object RustPreferencesBridge {
             .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
     }
 
-    @JvmStatic
-    fun cacheDirPath(): String {
-        val context = appContext ?: error("RustPreferencesBridge is not initialized")
-        return context.cacheDir.absolutePath
-    }
-
     /** Removes only discardable app cache files; enrollment and user settings live elsewhere. */
     @JvmStatic
     fun clearCacheDirectory() {
