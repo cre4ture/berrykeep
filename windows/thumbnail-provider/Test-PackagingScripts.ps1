@@ -8,13 +8,15 @@ $scriptFiles = @(
     'Build-PrototypePackage.ps1',
     'Build-StoreUploadPackage.ps1',
     'New-MsixUploadPackage.ps1',
-    'Sign-Msix.ps1'
+    'Sign-Msix.ps1',
+    (Join-Path $PSScriptRoot '..\Verify-ExpectedAuthenticodeSignature.ps1')
 )
 
 foreach ($file in $scriptFiles) {
     $tokens = $null
     $errors = $null
-    $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $file), [ref]$tokens, [ref]$errors)
+    $path = if ([System.IO.Path]::IsPathRooted($file)) { $file } else { Join-Path $PSScriptRoot $file }
+    $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
     if ($errors.Count -gt 0) {
         throw "PowerShell parser errors in ${file}: $($errors.Extent.Text -join '; ')"
     }

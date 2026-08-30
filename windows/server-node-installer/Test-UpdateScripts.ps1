@@ -10,13 +10,15 @@ $scriptFiles = @(
     "Disable-ServerNodeAutoUpdate.ps1",
     "Update-ServerNode.ps1",
     "Sign-Msi.ps1",
-    "New-ReleaseManifest.ps1"
+    "New-ReleaseManifest.ps1",
+    (Join-Path $installerRoot "..\Verify-ExpectedAuthenticodeSignature.ps1")
 )
 
 foreach ($file in $scriptFiles) {
     $tokens = $null
     $errors = $null
-    $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $installerRoot $file), [ref]$tokens, [ref]$errors)
+    $path = if ([System.IO.Path]::IsPathRooted($file)) { $file } else { Join-Path $installerRoot $file }
+    $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
     if ($errors.Count -gt 0) {
         throw "PowerShell parser errors in ${file}: $($errors.Extent.Text -join '; ')"
     }

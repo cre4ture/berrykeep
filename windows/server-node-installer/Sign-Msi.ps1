@@ -100,19 +100,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "SignTool failed with exit code $LASTEXITCODE"
 }
 
-$signature = Get-AuthenticodeSignature -LiteralPath $MsiPath
-if ($null -eq $signature.SignerCertificate) {
-    throw "MSI does not have an Authenticode signer. Status: $($signature.Status)."
-}
-if ((Normalize-Thumbprint -Value $signature.SignerCertificate.Thumbprint) -ne $SigningCertificateThumbprint) {
-    throw "MSI Authenticode signer does not match the expected certificate."
-}
-if ($signature.Status -notin @("Valid", "NotTrusted")) {
-    throw "MSI signature validation failed. Status: $($signature.Status)."
-}
-if ($signature.Status -eq "NotTrusted") {
-    Write-Host "Accepted the expected self-signed MSI signer without modifying certificate stores."
-}
+& (Join-Path $PSScriptRoot '..\Verify-ExpectedAuthenticodeSignature.ps1') `
+    -FilePath $MsiPath `
+    -SigningCertificateThumbprint $SigningCertificateThumbprint
 
 Write-Host "Signed and verified BerryKeep Server Node MSI:" -ForegroundColor Green
 Write-Host "  $MsiPath"

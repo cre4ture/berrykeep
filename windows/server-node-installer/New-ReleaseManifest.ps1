@@ -58,19 +58,9 @@ if ($thumbprint -notmatch '^[0-9A-F]{40}$') {
     throw "Signing certificate did not expose a usable SHA-1 thumbprint."
 }
 
-$authenticode = Get-AuthenticodeSignature -LiteralPath $MsiPath
-if ($null -eq $authenticode.SignerCertificate) {
-    throw "MSI must have an Authenticode signer before publishing. Status: $($authenticode.Status)."
-}
-if ((ConvertTo-Thumbprint -Value $authenticode.SignerCertificate.Thumbprint) -ne $thumbprint) {
-    throw "MSI Authenticode signer does not match the release manifest signing certificate."
-}
-if ($authenticode.Status -notin @("Valid", "NotTrusted")) {
-    throw "MSI signature validation failed before publishing. Status: $($authenticode.Status)."
-}
-if ($authenticode.Status -eq "NotTrusted") {
-    Write-Host "Accepted the expected self-signed MSI signer without modifying certificate stores."
-}
+& (Join-Path $PSScriptRoot '..\Verify-ExpectedAuthenticodeSignature.ps1') `
+    -FilePath $MsiPath `
+    -SigningCertificateThumbprint $thumbprint
 
 $manifest = [ordered]@{
     schemaVersion = 1

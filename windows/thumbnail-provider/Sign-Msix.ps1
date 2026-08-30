@@ -137,19 +137,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "SignTool failed with exit code $LASTEXITCODE"
 }
 
-$signature = Get-AuthenticodeSignature -LiteralPath $MsixPath
-if ($null -eq $signature.SignerCertificate) {
-    throw "MSIX does not have an Authenticode signer. Status: $($signature.Status)."
-}
-if ((Normalize-Thumbprint -Value $signature.SignerCertificate.Thumbprint) -ne $SigningCertificateThumbprint) {
-    throw 'MSIX Authenticode signer does not match the expected certificate.'
-}
-if ($signature.Status -notin @('Valid', 'NotTrusted')) {
-    throw "MSIX signature validation failed. Status: $($signature.Status)."
-}
-if ($signature.Status -eq 'NotTrusted') {
-    Write-Host 'Accepted the expected self-signed MSIX signer without modifying certificate stores.'
-}
+& (Join-Path $PSScriptRoot '..\Verify-ExpectedAuthenticodeSignature.ps1') `
+    -FilePath $MsixPath `
+    -SigningCertificateThumbprint $SigningCertificateThumbprint
 
 if ($PublicCertificatePath) {
     $publicCertificateDirectory = Split-Path -Parent $PublicCertificatePath
