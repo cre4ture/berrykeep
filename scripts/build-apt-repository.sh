@@ -14,8 +14,11 @@ ORIGIN="${APT_REPO_ORIGIN:-Ironmesh}"
 LABEL="${APT_REPO_LABEL:-Ironmesh}"
 DESCRIPTION="${APT_REPO_DESCRIPTION:-Ironmesh Debian package repository}"
 SIGNING_KEY="${APT_REPO_SIGN_KEY:-${DEBUILD_KEYID:-${DEBSIGN_KEYID:-}}}"
+GPG_PASSPHRASE="${APT_REPO_GPG_PASSPHRASE:-}"
 IMPORT_REMOTE="${APT_REPO_IMPORT_REMOTE:-}"
 SIGN_REPO=true
+SERVER_NODE_ONLY=false
+SERVER_NODE_MATRIX=""
 DEB_PATHS=()
 REQUESTED_ARCHES=()
 
@@ -44,13 +47,21 @@ Options:
                        before updating it, for example
                        creature@creax.de:/home/creature/html/apt/ironmesh.
   --sign-key KEY       GPG key ID or fingerprint used for Release signing.
+  --server-node-only   Publish only ironmesh-server-node packages. With no
+                       explicit .deb path, expects only that package.
+  --server-node-matrix FILE
+                       Sign each server-node-only matrix row. Each non-comment
+                       row is: SUITE ARCH PACKAGE_PATH. Relative package paths
+                       are resolved from FILE's directory. The existing remote
+                       repository is imported only before the first row.
   --no-sign            Build repository metadata without signing it.
   -h, --help           Show this help text.
 
 Environment defaults:
   APT_REPO_DIR, APT_REPO_SUITE, APT_REPO_CODENAME, APT_REPO_COMPONENT,
   APT_REPO_ARCH, APT_REPO_ORIGIN, APT_REPO_LABEL, APT_REPO_DESCRIPTION,
-  APT_REPO_IMPORT_REMOTE, APT_REPO_SIGN_KEY, DEBUILD_KEYID, DEBSIGN_KEYID.
+  APT_REPO_IMPORT_REMOTE, APT_REPO_SIGN_KEY, APT_REPO_GPG_PASSPHRASE,
+  DEBUILD_KEYID, DEBSIGN_KEYID.
 
 If no .deb paths are passed, the script expects the current changelog version
 artifacts in the parent directory of the checkout. Run
@@ -122,6 +133,119 @@ verify_signed_release() {
   fi
 }
 
+sign_release() {
+  local mode="$1"
+  local output_path="$2"
+  local input_path="$3"
+  local -a sign_args=(
+    --batch
+    --yes
+    --local-user "${SIGNING_KEY}"
+    --digest-algo SHA256
+  )
+
+  if [[ -n "${GPG_PASSPHRASE}" ]]; then
+    sign_args+=(--pinentry-mode loopback --passphrase-fd 0)
+  fi
+
+  case "${mode}" in
+    clearsign)
+      sign_args+=(--clearsign -o "${output_path}" "${input_path}")
+      ;;
+    detached)
+      sign_args+=(--armor --detach-sign -o "${output_path}" "${input_path}")
+      ;;
+    *)
+      printf 'unsupported apt Release signing mode: %s\n' "${mode}" >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ -n "${GPG_PASSPHRASE}" ]]; then
+    printf '%s\n' "${GPG_PASSPHRASE}" | \
+      gpg "${sign_args[@]}"
+  else
+    gpg "${sign_args[@]}"
+  fi
+}
+
+run_server_node_matrix() {
+  local matrix_path="$1"
+  local matrix_dir raw_line suite architecture package_path extra
+  local line_number=0 processed_rows=0 import_remote_for_row
+  local -a child_args
+
+  [[ -f "${matrix_path}" ]] || {
+    printf 'server-node matrix not found: %s\n' "${matrix_path}" >&2
+    exit 1
+  }
+  if [[ -n "${CODENAME}" ]]; then
+    printf '%s\n' '--codename cannot be combined with --server-node-matrix; each row uses its suite as codename' >&2
+    exit 1
+  fi
+  if ((${#DEB_PATHS[@]} != 0)); then
+    printf '%s\n' '--server-node-matrix cannot be combined with explicit .deb paths' >&2
+    exit 1
+  fi
+  if ((${#REQUESTED_ARCHES[@]} != 0)); then
+    printf '%s\n' '--server-node-matrix cannot be combined with --arch; each row declares its architecture' >&2
+    exit 1
+  fi
+
+  matrix_path="$(cd "$(dirname "${matrix_path}")" && pwd)/$(basename "${matrix_path}")"
+  matrix_dir="$(dirname "${matrix_path}")"
+  import_remote_for_row="${IMPORT_REMOTE}"
+
+  while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
+    ((line_number += 1))
+    [[ -z "${raw_line//[[:space:]]/}" || "${raw_line}" =~ ^[[:space:]]*# ]] && continue
+    ((processed_rows += 1))
+
+    suite=""
+    architecture=""
+    package_path=""
+    extra=""
+    read -r suite architecture package_path extra <<<"${raw_line}"
+    if [[ -z "${suite}" || -z "${architecture}" || -z "${package_path}" || -n "${extra}" ]]; then
+      printf 'invalid server-node matrix row %s in %s; expected: SUITE ARCH PACKAGE_PATH\n' \
+        "${line_number}" "${matrix_path}" >&2
+      exit 1
+    fi
+    if [[ "${package_path}" != /* ]]; then
+      package_path="${matrix_dir}/${package_path}"
+    fi
+
+    child_args=(
+      --repo-dir "${REPO_DIR}"
+      --suite "${suite}"
+      --component "${COMPONENT}"
+      --arch "${architecture}"
+      --server-node-only
+    )
+    if [[ "${SIGN_REPO}" == true ]]; then
+      child_args+=(--sign-key "${SIGNING_KEY}")
+    else
+      child_args+=(--no-sign)
+    fi
+    if [[ -n "${import_remote_for_row}" ]]; then
+      child_args+=(--import-remote "${import_remote_for_row}")
+      import_remote_for_row=""
+    fi
+
+    log "processing server-node matrix row ${suite}/${architecture}"
+    # Child processes inherit environment defaults. Clear the import source so
+    # only the first row receives the captured --import-remote value above.
+    APT_REPO_IMPORT_REMOTE="" \
+      APT_REPO_GPG_PASSPHRASE="${GPG_PASSPHRASE}" \
+      "${ROOT_DIR}/scripts/build-apt-repository.sh" "${child_args[@]}" -- "${package_path}"
+  done < "${matrix_path}"
+
+  if ((processed_rows == 0)); then
+    printf 'server-node matrix is empty: %s\n' "${matrix_path}" >&2
+    exit 1
+  fi
+}
+
 while (($# > 0)); do
   case "$1" in
     --repo-dir)
@@ -180,6 +304,22 @@ while (($# > 0)); do
       SIGNING_KEY="${1#*=}"
       shift
       ;;
+    --server-node-only)
+      SERVER_NODE_ONLY=true
+      shift
+      ;;
+    --server-node-matrix)
+      [[ $# -ge 2 ]] || {
+        printf '%s\n' '--server-node-matrix requires a matrix file' >&2
+        exit 1
+      }
+      SERVER_NODE_MATRIX="$2"
+      shift 2
+      ;;
+    --server-node-matrix=*)
+      SERVER_NODE_MATRIX="${1#*=}"
+      shift
+      ;;
     --no-sign)
       SIGN_REPO=false
       shift
@@ -206,11 +346,19 @@ while (($# > 0)); do
 done
 
 require_command apt-ftparchive
+require_command awk
 require_command dpkg
 require_command dpkg-deb
 require_command dpkg-parsechangelog
 require_command dpkg-scanpackages
 require_command gzip
+require_command mktemp
+require_command sed
+
+if [[ -n "${SERVER_NODE_MATRIX}" ]]; then
+  run_server_node_matrix "${SERVER_NODE_MATRIX}"
+  exit 0
+fi
 
 if [[ -z "${SUITE}" ]]; then
   SUITE="$(native_suite)"
@@ -223,8 +371,6 @@ fi
 validate_release_name 'apt suite' "${SUITE}"
 validate_release_name 'apt codename' "${CODENAME}"
 validate_release_name 'apt component' "${COMPONENT}"
-
-"${ROOT_DIR}/scripts/sync-debian-version.sh"
 
 if [[ "${SIGN_REPO}" == true ]]; then
   require_command gpg
@@ -273,7 +419,192 @@ add_architecture() {
   fi
 }
 
+has_server_node_package_for_architecture() {
+  local architecture="$1"
+  local package_path package_architecture
+
+  for package_path in "${DEB_PATHS[@]}"; do
+    package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
+    if [[ "${package_architecture}" == "${architecture}" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+server_node_version_for_architecture() {
+  local architecture="$1"
+  local package_path package_name package_architecture package_version
+  local selected_version=""
+
+  for package_path in "${DEB_PATHS[@]}"; do
+    package_name="$(dpkg-deb -f "${package_path}" Package)"
+    package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
+    [[ "${package_name}" == "ironmesh-server-node" && "${package_architecture}" == "${architecture}" ]] || continue
+    package_version="$(dpkg-deb -f "${package_path}" Version)"
+    if [[ -z "${selected_version}" ]] || \
+      dpkg --compare-versions "${package_version}" gt "${selected_version}"; then
+      selected_version="${package_version}"
+    fi
+  done
+
+  printf '%s\n' "${selected_version}"
+}
+
+legacy_package_is_indexed_in_suite() {
+  local architecture="$1"
+  local package_path="$2"
+  local packages_path legacy_filename
+
+  packages_path="${SUITE_DIR}/${COMPONENT}/binary-${architecture}/Packages"
+  legacy_filename="${LEGACY_POOL_REL}/$(basename "${package_path}")"
+
+  if [[ -f "${packages_path}" ]]; then
+    grep -Fxq -- "Filename: ${legacy_filename}" "${packages_path}"
+    return
+  fi
+
+  if [[ -f "${packages_path}.gz" ]]; then
+    grep -Fxq -- "Filename: ${legacy_filename}" < <(gzip -cd -- "${packages_path}.gz")
+    return
+  fi
+
+  return 1
+}
+
+preserve_legacy_suite_packages() {
+  local architecture="$1"
+  local package_path
+  local -a legacy_packages=("${LEGACY_POOL_DIR}"/*_"${architecture}".deb)
+
+  for package_path in "${legacy_packages[@]}"; do
+    [[ -f "${package_path}" ]] || continue
+    if ! legacy_package_is_indexed_in_suite "${architecture}" "${package_path}"; then
+      continue
+    fi
+    cp -f "${package_path}" "${POOL_DIR}/"
+  done
+}
+
+prune_server_node_versions() {
+  local architecture="$1"
+  local package_path package_name package_architecture package_version depends required_version retained
+  local retained_version
+  local -a retained_versions=()
+
+  # Keep the Server Node version being published as well as every older
+  # version still required by a retained map-tools package. The latter has an
+  # exact server-node dependency, so retaining only the latest package would
+  # make that previously published package uninstallable.
+  for package_path in "${DEB_PATHS[@]}"; do
+    package_name="$(dpkg-deb -f "${package_path}" Package)"
+    package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
+    [[ "${package_name}" == "ironmesh-server-node" && "${package_architecture}" == "${architecture}" ]] || continue
+    retained_versions+=("$(dpkg-deb -f "${package_path}" Version)")
+  done
+
+  for package_path in "${POOL_DIR}"/*_"${architecture}".deb; do
+    [[ -f "${package_path}" ]] || continue
+    package_name="$(dpkg-deb -f "${package_path}" Package)"
+    [[ "${package_name}" == "ironmesh-server-node-map-tools" ]] || continue
+    depends="$(dpkg-deb -f "${package_path}" Depends)"
+    required_version="$(sed -n 's/.*ironmesh-server-node[[:space:]]*(=[[:space:]]*\([^)]*\)).*/\1/p' <<<"${depends}" | tr -d '[:space:]')"
+    [[ -n "${required_version}" ]] && retained_versions+=("${required_version}")
+  done
+
+  for package_path in "${POOL_DIR}"/*_"${architecture}".deb; do
+    [[ -f "${package_path}" ]] || continue
+    package_name="$(dpkg-deb -f "${package_path}" Package)"
+    [[ "${package_name}" == "ironmesh-server-node" ]] || continue
+    package_version="$(dpkg-deb -f "${package_path}" Version)"
+    retained=false
+    for retained_version in "${retained_versions[@]}"; do
+      if [[ "${package_version}" == "${retained_version}" ]]; then
+        retained=true
+        break
+      fi
+    done
+    if [[ "${retained}" == false ]]; then
+      log "removing unreferenced Server Node ${package_version} for ${architecture}"
+      rm -f "${package_path}"
+    fi
+  done
+}
+
+repack_exact_map_tools_dependencies() {
+  local architecture="$1"
+  local server_node_version server_node_upstream package_path package_name package_version depends required_version
+  local selected_package="" selected_version="" compatibility_path compatibility_depends staging_dir
+  local -a exact_map_tools_paths=()
+
+  server_node_version="$(server_node_version_for_architecture "${architecture}")"
+  if [[ -z "${server_node_version}" ]]; then
+    printf 'server-node-only requested architecture has no input package: %s\n' \
+      "${architecture}" >&2
+    exit 1
+  fi
+  server_node_upstream="${server_node_version%%-*}"
+
+  for package_path in "${POOL_DIR}"/*_"${architecture}".deb; do
+    [[ -f "${package_path}" ]] || continue
+    package_name="$(dpkg-deb -f "${package_path}" Package)"
+    [[ "${package_name}" == "ironmesh-server-node-map-tools" ]] || continue
+    depends="$(dpkg-deb -f "${package_path}" Depends)"
+    required_version="$(sed -n 's/.*ironmesh-server-node[[:space:]]*(=[[:space:]]*\([^)]*\)).*/\1/p' <<<"${depends}" | tr -d '[:space:]')"
+    [[ -n "${required_version}" ]] || continue
+
+    package_version="$(dpkg-deb -f "${package_path}" Version)"
+    exact_map_tools_paths+=("${package_path}")
+    if [[ -z "${selected_package}" ]] || \
+      dpkg --compare-versions "${package_version}" gt "${selected_version}"; then
+      selected_package="${package_path}"
+      selected_version="${package_version}"
+    fi
+  done
+
+  [[ -n "${selected_package}" ]] || return
+
+  if dpkg --compare-versions "${server_node_version}" lt "${selected_version}"; then
+    printf 'server-node-only package version %s is older than retained map-tools version %s for %s; publish a full package set instead\n' \
+      "${server_node_version}" "${selected_version}" "${architecture}" >&2
+    exit 1
+  fi
+  if dpkg --compare-versions "${server_node_version}" eq "${selected_version}"; then
+    return
+  fi
+
+  staging_dir="$(mktemp -d)"
+  dpkg-deb -R "${selected_package}" "${staging_dir}/map-tools"
+  sed -i \
+    -e "s/^Version: .*/Version: ${server_node_version}/" \
+    -e "s/ironmesh-server-node[[:space:]]*(=[[:space:]]*[^)]*)/ironmesh-server-node (>= ${server_node_upstream})/" \
+    "${staging_dir}/map-tools/DEBIAN/control"
+  compatibility_path="${POOL_DIR}/ironmesh-server-node-map-tools_${server_node_version}_${architecture}.deb"
+  dpkg-deb --root-owner-group --build "${staging_dir}/map-tools" "${compatibility_path}" >/dev/null
+  rm -rf "${staging_dir}"
+
+  if ! dpkg-deb -c "${compatibility_path}" | awk '$2 != "root/root" { exit 1 }'; then
+    printf 'compatibility package does not preserve root ownership: %s\n' \
+      "${compatibility_path}" >&2
+    exit 1
+  fi
+
+  compatibility_depends="$(dpkg-deb -f "${compatibility_path}" Depends)"
+  if ! grep -Fq "ironmesh-server-node (>= ${server_node_upstream})" <<<"${compatibility_depends}"; then
+    printf 'failed to relax map-tools dependency in compatibility package: %s\n' \
+      "${compatibility_path}" >&2
+    exit 1
+  fi
+
+  for package_path in "${exact_map_tools_paths[@]}"; do
+    rm -f "${package_path}"
+  done
+  log "repackaged map-tools for ${architecture} with Server Node >= ${server_node_upstream}"
+}
+
 if ((${#DEB_PATHS[@]} == 0)); then
+  "${ROOT_DIR}/scripts/sync-debian-version.sh" --check
   VERSION="$(cd "${ROOT_DIR}" && dpkg-parsechangelog -SVersion)"
   IMPLICIT_ARCHES=("${REQUESTED_ARCHES[@]}")
 
@@ -285,12 +616,16 @@ if ((${#DEB_PATHS[@]} == 0)); then
   DEB_PATHS=()
   for architecture in "${IMPLICIT_ARCHES[@]}"; do
     add_architecture "${architecture}"
-    DEB_PATHS+=(
-      "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${architecture}.deb"
-      "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb"
-      "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${architecture}.deb"
-      "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${architecture}.deb"
-    )
+    if [[ "${SERVER_NODE_ONLY}" == true ]]; then
+      DEB_PATHS+=("${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb")
+    else
+      DEB_PATHS+=(
+        "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${architecture}.deb"
+      )
+    fi
   done
 fi
 
@@ -303,10 +638,23 @@ for path in "${DEB_PATHS[@]}"; do
 done
 
 for path in "${DEB_PATHS[@]}"; do
+  package_name="$(dpkg-deb -f "${path}" Package)"
   package_architecture="$(dpkg-deb -f "${path}" Architecture)"
+  if [[ "${SERVER_NODE_ONLY}" == true && "${package_name}" != "ironmesh-server-node" ]]; then
+    printf 'server-node-only repository input must be ironmesh-server-node, got %s: %s\n' \
+      "${package_name:-empty}" "${path}" >&2
+    exit 1
+  fi
   if [[ -z "${package_architecture}" || "${package_architecture}" == "all" ]]; then
     printf 'package architecture must be a concrete architecture, not %s: %s\n' \
       "${package_architecture:-empty}" "${path}" >&2
+    exit 1
+  fi
+
+  if [[ "${SERVER_NODE_ONLY}" == true && ${#REQUESTED_ARCHES[@]} -ne 0 ]] && \
+    ! contains_architecture "${package_architecture}"; then
+    printf 'server-node-only package architecture %s does not match requested architecture: %s\n' \
+      "${package_architecture}" "${path}" >&2
     exit 1
   fi
 
@@ -315,6 +663,16 @@ done
 
 if ((${#REQUESTED_ARCHES[@]} == 0)); then
   add_architecture "${DEFAULT_ARCH}"
+fi
+
+if [[ "${SERVER_NODE_ONLY}" == true ]]; then
+  for architecture in "${REQUESTED_ARCHES[@]}"; do
+    if ! has_server_node_package_for_architecture "${architecture}"; then
+      printf 'server-node-only requested architecture has no input package: %s\n' \
+        "${architecture}" >&2
+      exit 1
+    fi
+  done
 fi
 
 for architecture in "${REQUESTED_ARCHES[@]}"; do
@@ -327,12 +685,24 @@ done
 SUITE_DIR="${REPO_DIR}/dists/${SUITE}"
 POOL_REL="pool/${COMPONENT}/i/ironmesh/${SUITE}"
 POOL_DIR="${REPO_DIR}/${POOL_REL}"
+LEGACY_POOL_DIR="${REPO_DIR}/pool/${COMPONENT}/i/ironmesh"
+LEGACY_POOL_REL="pool/${COMPONENT}/i/ironmesh"
 
 log "refreshing ${REPO_DIR}"
 mkdir -p "${POOL_DIR}"
 
 for architecture in "${REQUESTED_ARCHES[@]}"; do
-  rm -f "${POOL_DIR}"/*_"${architecture}".deb
+  if [[ "${SERVER_NODE_ONLY}" == true ]]; then
+    # A server-only refresh must retain the desktop/rendezvous packages that
+    # were published before suite-scoped pools existed. Preserve packages
+    # already migrated into this suite pool, then migrate only legacy packages
+    # explicitly referenced by this suite's old index. Keep previous server
+    # versions so an unchanged map-tools package with an exact server-node
+    # dependency remains installable after the new server package is added.
+    preserve_legacy_suite_packages "${architecture}"
+  else
+    rm -f "${POOL_DIR}"/*_"${architecture}".deb
+  fi
   rm -rf "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"
   mkdir -p "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"
 done
@@ -341,11 +711,15 @@ log "copying packages"
 cp -f "${DEB_PATHS[@]}" "${POOL_DIR}/"
 
 for architecture in "${REQUESTED_ARCHES[@]}"; do
+  if [[ "${SERVER_NODE_ONLY}" == true ]]; then
+    repack_exact_map_tools_dependencies "${architecture}"
+    prune_server_node_versions "${architecture}"
+  fi
   packages_rel="dists/${SUITE}/${COMPONENT}/binary-${architecture}/Packages"
   log "writing ${packages_rel}"
   (
     cd "${REPO_DIR}"
-    dpkg-scanpackages --arch "${architecture}" "${POOL_REL}" /dev/null > "${packages_rel}"
+    dpkg-scanpackages --multiversion --arch "${architecture}" "${POOL_REL}" /dev/null > "${packages_rel}"
     gzip -9cn "${packages_rel}" > "${packages_rel}.gz"
   )
 done
@@ -387,10 +761,8 @@ if [[ "${SIGN_REPO}" == true ]]; then
   fi
 
   log "signing Release metadata with ${SIGNING_KEY}"
-  gpg --yes --local-user "${SIGNING_KEY}" --clearsign --digest-algo SHA256 \
-    -o "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release"
-  gpg --yes --local-user "${SIGNING_KEY}" --armor --detach-sign --digest-algo SHA256 \
-    -o "${SUITE_DIR}/Release.gpg" "${SUITE_DIR}/Release"
+  sign_release clearsign "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release"
+  sign_release detached "${SUITE_DIR}/Release.gpg" "${SUITE_DIR}/Release"
   verify_signed_release \
     "${SUITE_DIR}/InRelease" \
     "${SUITE_DIR}/Release" \

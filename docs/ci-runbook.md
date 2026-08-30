@@ -280,19 +280,20 @@ is part of `Required CI`. It builds `x86_64-unknown-linux-musl`, rejects an ELF
 interpreter or `DT_NEEDED` entry, executes the binary, and uploads
 `static-server-node-linux-amd64` with checksums and build metadata.
 
-The separate `Focal A64` workflow performs the same checks natively for
-`aarch64-unknown-linux-musl` and uploads `static-server-node-linux-arm64`. Its
-Focal container receives that already verified executable through
-`build-local-debs.sh --prebuilt-server-node`; only the client and rendezvous
-components are compiled in the distribution container.
+The `Server Node Debian packages` workflow builds
+`aarch64-unknown-linux-musl` once with Zig on an x86_64 runner, validates the
+static artifact, and runs its `--version` smoke test under QEMU. Its
+`Focal A64` and `Trixie A64` package matrix entries each verify that artifact
+inside the target distribution container and use
+`build-local-debs.sh --server-node-only --static-server-node-artifact` to
+assemble only the portable `ironmesh-server-node` package. They do not compile
+or execute the AArch64 binary in the distribution container.
 
-On pull requests, add the `ci:debian-packages` label to run the full Debian
-package validation on both published architectures. It enables the native
-Focal ARM64 package build as well as the AMD64 binary-package handoff: the
-`Linux binaries` job builds the non-server bundle, and `Debian packages`
-combines it with the static Server Node. Both package workflows produce
-`ironmesh-server-node`, the optional `ironmesh-server-node-map-tools`,
-`ironmesh-client`, and `ironmesh-rendezvous-service`.
+On pull requests, add the `ci:debian-packages` label to run the Focal/Trixie
+ARM64 Server Node matrix and the AMD64 binary-package handoff. `Linux binaries`
+builds the AMD64 non-server bundle, and `Debian packages` combines it with the
+static Server Node to produce the complete AMD64 package set. The ARM64 matrix
+produces only `ironmesh-server-node` for each target suite.
 
 For a local static build, install the web workspace dependencies and ELF tools,
 then run:
