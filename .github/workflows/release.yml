@@ -227,8 +227,8 @@ jobs:
           BERRYKEEP_WINDOWS_TIMESTAMP_URL: ${{ vars.BERRYKEEP_WINDOWS_TIMESTAMP_URL }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ([string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64) -or [string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD) -or [string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_TIMESTAMP_URL)) {
-            throw "The release-signing environment must provide the certificate, certificate password, and RFC-3161 timestamp URL."
+          if ([string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64) -or [string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD)) {
+            throw "The release-signing environment must provide the certificate and certificate password."
           }
 
           $expectedThumbprint = ($env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
@@ -253,12 +253,16 @@ jobs:
               throw "The release certificate does not match BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT."
             }
 
-            & .\windows\server-node-installer\Sign-Msi.ps1 `
-              -MsiPath $msiPath `
-              -SigningCertificatePath $certificatePath `
-              -SigningCertificatePassword $env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD `
-              -TimestampUrl $env:BERRYKEEP_WINDOWS_TIMESTAMP_URL `
-              -SigningCertificateThumbprint $expectedThumbprint
+            $signingArguments = @{
+              MsiPath = $msiPath
+              SigningCertificatePath = $certificatePath
+              SigningCertificatePassword = $env:BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD
+              SigningCertificateThumbprint = $expectedThumbprint
+            }
+            if (-not [string]::IsNullOrWhiteSpace($env:BERRYKEEP_WINDOWS_TIMESTAMP_URL)) {
+              $signingArguments.TimestampUrl = $env:BERRYKEEP_WINDOWS_TIMESTAMP_URL
+            }
+            & .\windows\server-node-installer\Sign-Msi.ps1 @signingArguments
 
             $assetDirectory = Join-Path $env:RUNNER_TEMP "release-assets"
             New-Item -ItemType Directory -Path $assetDirectory -Force | Out-Null

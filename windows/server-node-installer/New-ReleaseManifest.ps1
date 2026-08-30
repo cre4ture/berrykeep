@@ -59,11 +59,17 @@ if ($thumbprint -notmatch '^[0-9A-F]{40}$') {
 }
 
 $authenticode = Get-AuthenticodeSignature -LiteralPath $MsiPath
-if ($authenticode.Status -ne "Valid" -or $null -eq $authenticode.SignerCertificate) {
-    throw "MSI must have a valid Authenticode signature before publishing. Status: $($authenticode.Status)."
+if ($null -eq $authenticode.SignerCertificate) {
+    throw "MSI must have an Authenticode signer before publishing. Status: $($authenticode.Status)."
 }
 if ((ConvertTo-Thumbprint -Value $authenticode.SignerCertificate.Thumbprint) -ne $thumbprint) {
     throw "MSI Authenticode signer does not match the release manifest signing certificate."
+}
+if ($authenticode.Status -notin @("Valid", "NotTrusted")) {
+    throw "MSI signature validation failed before publishing. Status: $($authenticode.Status)."
+}
+if ($authenticode.Status -eq "NotTrusted") {
+    Write-Host "Accepted the expected self-signed MSI signer without modifying certificate stores."
 }
 
 $manifest = [ordered]@{

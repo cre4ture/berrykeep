@@ -6,9 +6,9 @@ Pushing an annotated stable `vX.Y.Z` tag whose value matches
 `[workspace.package].version` starts the `Release` workflow. It builds the
 Windows Server Node MSI again from the tagged source without signing inputs.
 A separate protected `release-signing` job downloads that single unsigned MSI,
-signs and timestamps it, verifies the signer, creates the matching signed
-stable manifest, then publishes the MSI, manifest, and `SHA256SUMS` on the
-matching GitHub Release page.
+signs it, optionally timestamps it, verifies the signer, creates the matching
+signed stable manifest, then publishes the MSI, manifest, and `SHA256SUMS` on
+the matching GitHub Release page.
 
 Configure these values before tagging:
 
@@ -20,7 +20,7 @@ Configure these values before tagging:
 - environment secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD` - PFX
   password;
 - environment variable `BERRYKEEP_WINDOWS_TIMESTAMP_URL` - approved RFC-3161
-  endpoint.
+  endpoint, required for public releases and optional for self-signed tests.
 
 Keep the PFX and its password as *environment* secrets in `release-signing`,
 not repository secrets. Require independent environment approval, prevent
@@ -34,8 +34,48 @@ a failed publication of an existing immutable tag without recreating it.
 The unsigned release artifact has one-day retention and is never published.
 Protect `.github/workflows/release.yml` and
 `windows/server-node-installer/{Sign-Msi.ps1,New-ReleaseManifest.ps1}` with
-code-owner review. Never use the self-signed Store/MSIX development
+code-owner review. Never reuse the self-signed Store/MSIX development
 certificate for this release signing path.
+
+## Test-only self-signed Server Node releases
+
+For a controlled test, create a distinct self-signed Server Node certificate.
+It produces an untrusted-publisher warning when the MSI is installed, so do
+not use it for a public release. The updater still pins the exact certificate
+thumbprint for the signed manifest and MSI.
+
+Run this on a secure Windows machine, outside the repository:
+
+```powershell
+$certificate = New-SelfSignedCertificate `
+  -Type CodeSigningCert `
+  -Subject 'CN=BerryKeep Server Node Test Signing' `
+  -CertStoreLocation 'Cert:\CurrentUser\My' `
+  -KeyAlgorithm RSA `
+  -KeyLength 3072 `
+  -HashAlgorithm SHA256 `
+  -KeyExportPolicy Exportable `
+  -KeySpec Signature `
+  -NotAfter (Get-Date).AddYears(1) `
+  -FriendlyName 'BerryKeep Server Node Test Signing'
+
+$pfxPassword = Read-Host -AsSecureString 'Choose a PFX password'
+$pfxDirectory = 'C:\secure'
+New-Item -ItemType Directory -Path $pfxDirectory -Force | Out-Null
+$pfxPath = Join-Path $pfxDirectory 'berrykeep-server-node-test.pfx'
+Export-PfxCertificate -Cert $certificate.PSPath -FilePath $pfxPath -Password $pfxPassword | Out-Null
+$certificate.Thumbprint
+[Convert]::ToBase64String([System.IO.File]::ReadAllBytes($pfxPath)) | Set-Clipboard
+```
+
+Configure the returned thumbprint as the repository variable
+`BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT`. Base64-encode the PFX and
+store it as the `release-signing` environment secret
+`BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64`; store the password as
+`BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD`. Leave
+`BERRYKEEP_WINDOWS_TIMESTAMP_URL` unset for this test path. Do not commit the
+PFX, password, or Base64 value. The final command copies the Base64 value to
+the clipboard; paste it into GitHub immediately and clear the clipboard.
 
 The normal `Win Server MSI` CI job remains intentionally unsigned and uploads
 only a short-lived validation artifact. Never publish that artifact.

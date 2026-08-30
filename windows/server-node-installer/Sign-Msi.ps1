@@ -3,8 +3,9 @@
 Authenticode-signs and verifies a BerryKeep Server Node MSI.
 
 .DESCRIPTION
-Uses a PFX only for this process, timestamps the resulting MSI, and verifies
-that its Authenticode signer matches the expected certificate thumbprint.
+Uses a PFX only for this process, optionally timestamps the resulting MSI, and
+verifies that its Authenticode signer matches the expected certificate
+thumbprint.
 The script intentionally does not print certificate paths, passwords, or
 private-key material.
 #>
@@ -13,7 +14,7 @@ param(
     [Parameter(Mandatory)][string]$MsiPath,
     [Parameter(Mandatory)][string]$SigningCertificatePath,
     [Parameter(Mandatory)][string]$SigningCertificatePassword,
-    [Parameter(Mandatory)][string]$TimestampUrl,
+    [string]$TimestampUrl,
     [Parameter(Mandatory)][string]$SigningCertificateThumbprint
 )
 
@@ -58,7 +59,9 @@ if (-not (Test-Path -LiteralPath $MsiPath -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $SigningCertificatePath -PathType Leaf)) {
     throw "Signing certificate was not found: $SigningCertificatePath"
 }
-Assert-HttpsUri -Value $TimestampUrl -ParameterName "-TimestampUrl"
+if ($TimestampUrl) {
+    Assert-HttpsUri -Value $TimestampUrl -ParameterName "-TimestampUrl"
+}
 
 $SigningCertificateThumbprint = Normalize-Thumbprint -Value $SigningCertificateThumbprint
 if ($SigningCertificateThumbprint -notmatch '^[0-9A-F]{40}$') {
@@ -86,22 +89,29 @@ $arguments = @(
     "sign",
     "/fd", "SHA256",
     "/f", $SigningCertificatePath,
-    "/p", $SigningCertificatePassword,
-    "/tr", $TimestampUrl,
-    "/td", "SHA256",
-    $MsiPath
+    "/p", $SigningCertificatePassword
 )
+if ($TimestampUrl) {
+    $arguments += @("/tr", $TimestampUrl, "/td", "SHA256")
+}
+$arguments += $MsiPath
 & $signTool @arguments
 if ($LASTEXITCODE -ne 0) {
     throw "SignTool failed with exit code $LASTEXITCODE"
 }
 
 $signature = Get-AuthenticodeSignature -LiteralPath $MsiPath
-if ($signature.Status -ne "Valid" -or $null -eq $signature.SignerCertificate) {
-    throw "MSI does not have a valid Authenticode signature. Status: $($signature.Status)."
+if ($null -eq $signature.SignerCertificate) {
+    throw "MSI does not have an Authenticode signer. Status: $($signature.Status)."
 }
 if ((Normalize-Thumbprint -Value $signature.SignerCertificate.Thumbprint) -ne $SigningCertificateThumbprint) {
     throw "MSI Authenticode signer does not match the expected certificate."
+}
+if ($signature.Status -notin @("Valid", "NotTrusted")) {
+    throw "MSI signature validation failed. Status: $($signature.Status)."
+}
+if ($signature.Status -eq "NotTrusted") {
+    Write-Host "Accepted the expected self-signed MSI signer without modifying certificate stores."
 }
 
 Write-Host "Signed and verified BerryKeep Server Node MSI:" -ForegroundColor Green
