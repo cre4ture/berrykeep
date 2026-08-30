@@ -1647,7 +1647,15 @@ async fn untracked_relative_path_requests_keep_server_failures_out_of_route_diag
         let app = Router::new()
             .route(
                 "/api/v1/maps/test-success",
-                get(|| async { StatusCode::OK }),
+                get(|| async {
+                    // Make the raw wall-clock duration unusable as a route
+                    // latency sample. Untracked requests must still apply the
+                    // server-work exclusion used by ordinary requests.
+                    (
+                        [(HEADER_SERVER_PROCESSING_DURATION_US, "1000000")],
+                        StatusCode::OK,
+                    )
+                }),
             )
             .route(
                 "/api/v1/maps/test-failure",
@@ -1684,6 +1692,10 @@ async fn untracked_relative_path_requests_keep_server_failures_out_of_route_diag
     assert_eq!(endpoint.total_failures, 0);
     assert_eq!(endpoint.total_successes, 1);
     assert!(endpoint.last_error.is_none());
+    assert_eq!(
+        client.connection_route_snapshot().endpoints[0].ewma_latency_ms,
+        Some(0.0)
+    );
     assert!(endpoint.last_used_unix_ms.is_none());
     assert!(endpoint.recent_attempts.is_empty());
 

@@ -471,6 +471,59 @@ struct ClientRequestSuccessMeasurement<'a> {
     response_body_complete: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ClientRequestSuccessTiming {
+    total_duration_us: u64,
+    server_processing_duration_us: Option<u64>,
+    transport_overhead_us: Option<u64>,
+    session_pool_after: TransportSessionPoolSnapshot,
+    session_setup_duration_us: u64,
+    relay_pairing_duration_us: u64,
+    network_transfer_duration_us: Option<u64>,
+    route_latency_us: u64,
+}
+
+impl ClientRequestSuccessTiming {
+    fn measure(
+        endpoint: &ClientEndpoint,
+        attempt: ClientRequestAttemptContext<'_>,
+        measurement: &ClientRequestSuccessMeasurement<'_>,
+    ) -> Self {
+        let total_duration_us = duration_ms_as_u64_micros(measurement.total_duration_ms);
+        let server_processing_duration_us = parse_header_u64(
+            measurement.response_headers,
+            HEADER_SERVER_PROCESSING_DURATION_US,
+        );
+        let transport_overhead_us = server_processing_duration_us
+            .map(|server_duration| total_duration_us.saturating_sub(server_duration));
+        let session_pool_after = endpoint.transport.session_pool_snapshot();
+        let session_setup_duration_us = session_pool_after
+            .connect_duration_us
+            .saturating_sub(attempt.session_pool_before.connect_duration_us);
+        let relay_pairing_duration_us = session_pool_after
+            .relay_pairing_duration_us
+            .saturating_sub(attempt.session_pool_before.relay_pairing_duration_us);
+        let network_transfer_duration_us = transport_overhead_us
+            .map(|overhead| overhead.saturating_sub(session_setup_duration_us));
+        let route_latency_us = route_latency_duration_us(
+            total_duration_us,
+            server_processing_duration_us,
+            session_setup_duration_us,
+        );
+
+        Self {
+            total_duration_us,
+            server_processing_duration_us,
+            transport_overhead_us,
+            session_pool_after,
+            session_setup_duration_us,
+            relay_pairing_duration_us,
+            network_transfer_duration_us,
+            route_latency_us,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ClientEndpoint {
     descriptor: ClientEndpointDescriptor,
@@ -909,10 +962,11 @@ impl<'a> ForegroundRequestExecutor<'a> {
                 .publish_connection_diagnostics(Some(completed_operation));
             self.client.signal_route_supervisor();
         } else {
+            let timing = ClientRequestSuccessTiming::measure(endpoint, attempt, &measurement);
             self.client.record_transport_success_without_diagnostics(
                 index,
                 endpoint,
-                measurement.total_duration_ms,
+                timing.route_latency_us as f64 / 1_000.0,
                 measurement.response_bytes,
             );
         }
@@ -1630,13 +1684,13 @@ impl ClientEndpointRouter {
         &self,
         index: usize,
         endpoint: &ClientEndpoint,
-        total_duration_ms: f64,
+        route_latency_ms: f64,
         response_bytes: usize,
     ) {
         let mut state = lock_endpoint_state(&endpoint.state);
         let first_relay_connection =
             state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
-        record_endpoint_success_sample(&mut state, total_duration_ms, response_bytes, false);
+        record_endpoint_success_sample(&mut state, route_latency_ms, response_bytes, false);
         drop(state);
         if first_relay_connection {
             self.notify_first_relay_connection(index, endpoint);
@@ -1790,35 +1844,15 @@ impl ClientEndpointRouter {
         let first_relay_connection =
             state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
         let finished_unix_ms = unix_ts_ms();
-        let total_duration_us = duration_ms_as_u64_micros(measurement.total_duration_ms);
-        let server_processing_duration_us = parse_header_u64(
-            measurement.response_headers,
-            HEADER_SERVER_PROCESSING_DURATION_US,
-        );
-        let transport_overhead_us = server_processing_duration_us
-            .map(|server_duration| total_duration_us.saturating_sub(server_duration));
-        let session_pool_after = endpoint.transport.session_pool_snapshot();
-        let session_setup_duration_us = session_pool_after
-            .connect_duration_us
-            .saturating_sub(attempt.session_pool_before.connect_duration_us);
-        let relay_pairing_duration_us = session_pool_after
-            .relay_pairing_duration_us
-            .saturating_sub(attempt.session_pool_before.relay_pairing_duration_us);
-        let network_transfer_duration_us = transport_overhead_us
-            .map(|overhead| overhead.saturating_sub(session_setup_duration_us));
-        let route_latency_us = route_latency_duration_us(
-            total_duration_us,
-            server_processing_duration_us,
-            session_setup_duration_us,
-        );
+        let timing = ClientRequestSuccessTiming::measure(endpoint, attempt, &measurement);
         record_endpoint_success_sample(
             &mut state,
-            route_latency_us as f64 / 1_000.0,
+            timing.route_latency_us as f64 / 1_000.0,
             measurement.response_bytes,
             false,
         );
         let session_reused =
-            session_pool_after.reuse_count > attempt.session_pool_before.reuse_count;
+            timing.session_pool_after.reuse_count > attempt.session_pool_before.reuse_count;
         let server_received_unix_ms =
             parse_header_u64(measurement.response_headers, HEADER_SERVER_RECEIVED_UNIX_MS);
         let server_responded_unix_ms = parse_header_u64(
@@ -1830,7 +1864,7 @@ impl ClientEndpointRouter {
             finished_unix_ms,
             server_received_unix_ms,
             server_responded_unix_ms,
-            transport_overhead_us,
+            timing.transport_overhead_us,
         );
         let display_url = attempt_display_url(endpoint, attempt.url);
         if impact.affects_user_facing_connection_status() {
@@ -1846,12 +1880,12 @@ impl ClientEndpointRouter {
             timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
             outcome: "success".to_string(),
             status_code: Some(measurement.status.as_u16()),
-            total_duration_us: Some(total_duration_us),
-            server_processing_duration_us,
-            transport_overhead_us,
-            session_setup_duration_us,
-            relay_pairing_duration_us,
-            network_transfer_duration_us,
+            total_duration_us: Some(timing.total_duration_us),
+            server_processing_duration_us: timing.server_processing_duration_us,
+            transport_overhead_us: timing.transport_overhead_us,
+            session_setup_duration_us: timing.session_setup_duration_us,
+            relay_pairing_duration_us: timing.relay_pairing_duration_us,
+            network_transfer_duration_us: timing.network_transfer_duration_us,
             session_reused,
             request_bytes: usize_as_u64(measurement.request_bytes),
             response_bytes: usize_as_u64(measurement.response_bytes),
@@ -4415,14 +4449,14 @@ impl IronMeshClient {
         &self,
         index: usize,
         endpoint: &ClientEndpoint,
-        total_duration_ms: f64,
+        route_latency_ms: f64,
         response_bytes: usize,
     ) {
         self.transport_router
             .record_transport_success_without_diagnostics(
                 index,
                 endpoint,
-                total_duration_ms,
+                route_latency_ms,
                 response_bytes,
             );
     }
