@@ -764,9 +764,12 @@ impl<'a> ForegroundRequestExecutor<'a> {
         )
     }
 
-    /// Some high-volume auxiliary requests, such as map tiles, must use the
-    /// normal route selection and failover policy without adding high-volume
-    /// traffic to foreground connection diagnostics.
+    /// Some high-volume auxiliary requests, such as map tiles, use normal
+    /// route selection and transport-error failover without adding their
+    /// request attempts to foreground connection diagnostics. Retryable HTTP
+    /// responses are returned to the caller without route fanout because they
+    /// can describe an application-level map-data failure rather than an
+    /// unhealthy transport.
     fn new_without_route_diagnostics_tracking(
         client: &'a IronMeshClient,
         route_ids: Vec<RouteId>,
@@ -898,15 +901,21 @@ impl<'a> ForegroundRequestExecutor<'a> {
         attempt: ClientRequestAttemptContext<'_>,
         measurement: ClientRequestSuccessMeasurement<'_>,
     ) {
-        if !self.route_diagnostics_tracking.is_enabled() {
-            return;
-        }
-        let completed_operation =
+        if self.route_diagnostics_tracking.is_enabled() {
+            let completed_operation =
+                self.client
+                    .record_request_success(index, endpoint, attempt, measurement);
             self.client
-                .record_request_success(index, endpoint, attempt, measurement);
-        self.client
-            .publish_connection_diagnostics(Some(completed_operation));
-        self.client.signal_route_supervisor();
+                .publish_connection_diagnostics(Some(completed_operation));
+            self.client.signal_route_supervisor();
+        } else {
+            self.client.record_transport_success_without_diagnostics(
+                index,
+                endpoint,
+                measurement.total_duration_ms,
+                measurement.response_bytes,
+            );
+        }
     }
 
     fn finish<T>(self, no_routes: impl FnOnce() -> anyhow::Error) -> Result<T> {
@@ -1613,6 +1622,25 @@ impl ClientEndpointRouter {
             self.log_timeout_route_reprioritized(index, error);
         }
         self.notify_transport_failure_when_exhausted(had_selectable_route);
+    }
+
+    /// Updates endpoint health for a successful high-volume auxiliary request
+    /// without adding an entry to the foreground attempt history.
+    fn record_transport_success_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        total_duration_ms: f64,
+        response_bytes: usize,
+    ) {
+        let mut state = lock_endpoint_state(&endpoint.state);
+        let first_relay_connection =
+            state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
+        record_endpoint_success_sample(&mut state, total_duration_ms, response_bytes, false);
+        drop(state);
+        if first_relay_connection {
+            self.notify_first_relay_connection(index, endpoint);
+        }
     }
 
     #[cfg(test)]
@@ -4383,6 +4411,22 @@ impl IronMeshClient {
             .record_transport_failure_without_diagnostics(index, endpoint, error);
     }
 
+    fn record_transport_success_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        total_duration_ms: f64,
+        response_bytes: usize,
+    ) {
+        self.transport_router
+            .record_transport_success_without_diagnostics(
+                index,
+                endpoint,
+                total_duration_ms,
+                response_bytes,
+            );
+    }
+
     fn record_request_failure(
         &self,
         index: usize,
@@ -5777,8 +5821,9 @@ impl IronMeshClient {
         .await
     }
 
-    /// Requests a relative path using normal route selection and failover, but
-    /// leaves high-volume request attempts out of connection diagnostics.
+    /// Requests a relative path using normal route selection and transport-error
+    /// failover, but leaves high-volume request attempts out of connection
+    /// diagnostics. Retryable HTTP responses are returned without route fanout.
     ///
     /// This is for high-volume auxiliary traffic where an HTTP failure does not
     /// by itself indicate an unhealthy transport or failed product operation.

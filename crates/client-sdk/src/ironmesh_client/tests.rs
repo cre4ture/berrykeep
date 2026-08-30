@@ -1682,7 +1682,8 @@ async fn untracked_relative_path_requests_keep_server_failures_out_of_route_diag
     let endpoint = &client.connection_diagnostics().endpoints[0];
     assert_eq!(endpoint.consecutive_failures, 0);
     assert_eq!(endpoint.total_failures, 0);
-    assert_eq!(endpoint.total_successes, 0);
+    assert_eq!(endpoint.total_successes, 1);
+    assert!(endpoint.last_error.is_none());
     assert!(endpoint.last_used_unix_ms.is_none());
     assert!(endpoint.recent_attempts.is_empty());
 
@@ -1721,6 +1722,24 @@ async fn untracked_relative_path_requests_keep_server_failures_out_of_route_diag
             .is_some()
     );
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+
+    let endpoint = unavailable_client
+        .transport_router
+        .endpoint(0)
+        .expect("unavailable endpoint should remain registered");
+    unavailable_client.record_transport_success_without_diagnostics(0, &endpoint, 1.0, 128);
+
+    let endpoint = &unavailable_client.connection_diagnostics().endpoints[0];
+    assert_eq!(endpoint.consecutive_failures, 0);
+    assert_eq!(endpoint.total_failures, 1);
+    assert_eq!(endpoint.total_successes, 1);
+    assert!(endpoint.last_error.is_none());
+    assert!(endpoint.recent_attempts.is_empty());
+    assert!(
+        unavailable_client.connection_route_snapshot().endpoints[0]
+            .circuit_open_until_unix_ms
+            .is_none()
+    );
 }
 
 #[derive(Clone)]
