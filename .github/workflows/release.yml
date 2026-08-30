@@ -399,12 +399,23 @@ jobs:
           name: release-windows-server-node
           path: release-assets
 
+      - name: Download signed Windows client sideload assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-windows-client
+          path: release-assets
+
       - name: Create release checksums
         shell: bash
         run: |
           set -euo pipefail
           cd release-assets
-          sha256sum berrykeep-server-node-*.msi berrykeep-server-node-stable.json berrykeep-server-node-stable.json.p7s > SHA256SUMS
+          sha256sum \
+            berrykeep-server-node-*.msi \
+            berrykeep-server-node-stable.json \
+            berrykeep-server-node-stable.json.p7s \
+            berrykeep-client-*.msix \
+            berrykeep-client-*.cer > SHA256SUMS
 
       - name: Create or update GitHub release
         shell: bash
@@ -417,5 +428,12 @@ jobs:
               --title "BerryKeep $RELEASE_VERSION" \
               --generate-notes
           fi
-          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          gh release upload "$RELEASE_TAG" \
+            release-assets/berrykeep-server-node-*.msi \
+            release-assets/berrykeep-server-node-stable.json \
+            release-assets/berrykeep-server-node-stable.json.p7s \
+            release-assets/berrykeep-client-*.msix \
+            release-assets/berrykeep-client-*.cer \
+            release-assets/SHA256SUMS \
+            --clobber
           gh release edit "$RELEASE_TAG" --draft=false

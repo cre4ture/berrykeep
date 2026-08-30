@@ -7,8 +7,8 @@ Pushing an annotated stable `vX.Y.Z` tag whose value matches
 Windows Server Node MSI again from the tagged source without signing inputs.
 A separate protected `release-signing` job downloads that single unsigned MSI,
 signs it, optionally timestamps it, verifies the signer, creates the matching
-signed stable manifest, then publishes the MSI, manifest, and `SHA256SUMS` on
-the matching GitHub Release page.
+signed stable manifest, then publishes the MSI, manifest, signed client
+sideload assets, and `SHA256SUMS` on the matching GitHub Release page.
 
 Configure these values before tagging:
 
@@ -117,18 +117,19 @@ mismatch. Protect `.github/workflows/release.yml` and
 `windows/thumbnail-provider/{Sign-Msix.ps1,New-MsixUploadPackage.ps1}` with
 code-owner review.
 
-The unsigned MSIX has one-day retention and is never published. The signed
-`release-windows-client` Actions artifact has fourteen-day retention and
-contains only:
+The unsigned MSIX has one-day retention and is never published. The public
+GitHub Release includes the signed client MSIX and its public certificate for
+controlled sideload testing:
 
 - `berrykeep-client-<version>.msix` for a controlled sideload test;
 - `berrykeep-client-<version>.cer`, the public certificate to import into
   `LocalMachine\TrustedPeople` on that test machine;
-- `berrykeep-client-<version>.msixupload` for a later Partner Center upload.
 
-Do not attach these test artifacts to the public GitHub Release. Store
-submission and its metadata/certification remain deliberate Partner Center
-steps; the Store handles the final consumer-package signing.
+The signed `release-windows-client` Actions artifact has fourteen-day
+retention and additionally contains
+`berrykeep-client-<version>.msixupload` for a later Partner Center upload.
+The Store package remains an intentional Partner Center step; the Store
+handles the final consumer-package signing.
 
 ## Android release builds on pull requests
 
