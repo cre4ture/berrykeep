@@ -98,4 +98,9 @@ else {
         throw "Unexpected self-signed Authenticode status: $($signature.Status)."
     }
     Write-Host 'Accepted the expected self-signed signer without modifying certificate stores.'
+
+    # A successfully accepted self-signed signature is a successful script
+    # result. Do not let SignTool's expected non-zero verification exit code
+    # make the surrounding GitHub Actions PowerShell step fail.
+    $global:LASTEXITCODE = 0
 }
