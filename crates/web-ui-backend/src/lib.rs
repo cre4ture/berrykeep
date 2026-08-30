@@ -611,6 +611,8 @@ async fn require_embedded_web_ui_session(
     request: Request,
     next: Next,
 ) -> Response {
+    let preserves_map_asset_cache_control =
+        is_embedded_web_ui_cacheable_map_asset_request(request.method(), request.uri().path());
     let supplied_header = request
         .headers()
         .get(EMBEDDED_WEB_UI_SESSION_HEADER)
@@ -624,9 +626,14 @@ async fn require_embedded_web_ui_session(
     }
 
     let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
+    if !preserves_map_asset_cache_control
+        || !response.status().is_success()
+        || !response.headers().contains_key(CACHE_CONTROL)
+    {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
+    }
     response
         .headers_mut()
         .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
@@ -638,6 +645,23 @@ async fn require_embedded_web_ui_session(
         response.headers_mut().append(SET_COOKIE, cookie);
     }
     response
+}
+
+fn is_embedded_web_ui_cacheable_map_asset_request(method: &Method, path: &str) -> bool {
+    if *method != Method::GET {
+        return false;
+    }
+
+    let Some(asset_path) = path
+        .strip_prefix("/api/v1/maps/")
+        .or_else(|| path.strip_prefix("/api/maps/"))
+    else {
+        return false;
+    };
+
+    asset_path.starts_with("tiles/")
+        || asset_path.starts_with("vector-tiles/")
+        || asset_path.starts_with("fonts/")
 }
 
 async fn require_same_origin_web_ui_write(request: Request, next: Next) -> Response {
@@ -4101,13 +4125,13 @@ mod tests {
         is_safe_web_ui_method, normalize_store_restore_path, router, trusted_loopback_origin,
         web_latency_probe_timeout,
     };
-    use axum::Router;
     use axum::body::to_bytes;
     use axum::extract::{Path, Query};
     use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, HOST, ORIGIN};
     use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::routing::get;
+    use axum::{Router, middleware};
     use client_sdk::{
         ClientIdentityMaterial, IronMeshClient, LatencyProbeConfig,
         ironmesh_client::RelativePathResponse,
@@ -4135,6 +4159,39 @@ mod tests {
             WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
                 .with_embedded_session_authorization(authorization),
         );
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), task)
+    }
+
+    async fn start_embedded_map_asset_test_server(
+        authorization: EmbeddedWebUiSessionAuthorization,
+    ) -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have a local address");
+        let app = Router::new()
+            .route(
+                "/api/v1/maps/tiles/{z}/{x}/{y}",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        [(
+                            CACHE_CONTROL.as_str(),
+                            "private, max-age=3600, stale-while-revalidate=86400",
+                        )],
+                    )
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                authorization,
+                super::require_embedded_web_ui_session,
+            ));
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -5092,6 +5149,30 @@ mod tests {
             .await
             .expect("cookie-authenticated request should complete");
         assert_eq!(cookie_authenticated.status(), StatusCode::OK);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn embedded_session_preserves_private_map_asset_cache_control() {
+        let authorization = EmbeddedWebUiSessionAuthorization::new();
+        let (base_url, server) = start_embedded_map_asset_test_server(authorization.clone()).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/api/v1/maps/tiles/3/4/5"))
+            .header(EMBEDDED_WEB_UI_SESSION_HEADER, authorization.token())
+            .send()
+            .await
+            .expect("authorized embedded map request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=3600, stale-while-revalidate=86400")
+        );
 
         server.abort();
     }

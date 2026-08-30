@@ -353,7 +353,7 @@ pub(crate) async fn xyz_tile(
     response_headers.insert(CONTENT_TYPE, HeaderValue::from_static(tile.content_type));
     response_headers.insert(
         CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=86400"),
+        HeaderValue::from_static("private, max-age=3600, stale-while-revalidate=86400"),
     );
 
     (StatusCode::OK, response_headers, tile.bytes).into_response()
@@ -408,7 +408,7 @@ pub(crate) async fn vector_tile(
     }
     response_headers.insert(
         CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=86400"),
+        HeaderValue::from_static("private, max-age=3600, stale-while-revalidate=86400"),
     );
 
     (StatusCode::OK, response_headers, tile.bytes).into_response()
@@ -436,7 +436,7 @@ pub(crate) async fn font_range(
             );
             response_headers.insert(
                 CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400, stale-while-revalidate=604800"),
+                HeaderValue::from_static("private, max-age=86400, stale-while-revalidate=604800"),
             );
             (StatusCode::OK, response_headers, bytes).into_response()
         }

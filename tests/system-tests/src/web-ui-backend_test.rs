@@ -1630,6 +1630,13 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 Some("gzip")
             );
+            assert_eq!(
+                tile_response
+                    .headers()
+                    .get(reqwest::header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, max-age=3600, stale-while-revalidate=86400")
+            );
             let tile_body = tile_response.bytes().await?;
             assert_eq!(tile_body.as_ref(), expected_tile_bytes.as_slice());
 
@@ -1646,6 +1653,13 @@ mod tests {
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok()),
                 Some("application/x-protobuf")
+            );
+            assert_eq!(
+                glyph_response
+                    .headers()
+                    .get(reqwest::header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, max-age=86400, stale-while-revalidate=604800")
             );
             let glyph_body = glyph_response.bytes().await?;
             assert_eq!(glyph_body.as_ref(), glyph_bytes.as_slice());
