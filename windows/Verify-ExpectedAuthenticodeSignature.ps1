@@ -55,8 +55,19 @@ if ([string]::IsNullOrWhiteSpace($signTool)) {
     throw 'SignTool.exe was not found. Install the Windows SDK signing tools or add SignTool.exe to PATH.'
 }
 
-$verificationOutput = @(& $signTool 'verify' '/pa' '/v' $FilePath 2>&1)
-$verificationExitCode = $LASTEXITCODE
+# SignTool writes failed verification diagnostics to stderr.  Capturing that
+# stream with ErrorActionPreference set to Stop would throw before we can
+# distinguish the expected self-signed-root case from an invalid signature.
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $verificationOutput = @(& $signTool 'verify' '/pa' '/v' $FilePath 2>&1)
+    $verificationExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+
 $verificationText = ($verificationOutput | Out-String)
 $hasExpectedUntrustedRoot = $verificationExitCode -ne 0 -and $verificationText -match '(?is)(0x800B0109|CERT_E_UNTRUSTEDROOT|root\s+certificate\s+which\s+is\s+not\s+trusted)'
 if ($verificationExitCode -ne 0 -and -not $hasExpectedUntrustedRoot) {
