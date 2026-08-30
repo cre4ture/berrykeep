@@ -69,7 +69,12 @@ finally {
 }
 
 $verificationText = ($verificationOutput | Out-String)
-$hasExpectedUntrustedRoot = $verificationExitCode -ne 0 -and $verificationText -match '(?is)(0x800B0109|CERT_E_UNTRUSTEDROOT|root\s+certificate\s+which\s+is\s+not\s+trusted)'
+# PowerShell's NativeCommandError formatting can insert its own location text
+# between "root" and the rest of SignTool's untrusted-root diagnostic.  Match
+# the complete, unchanged prefix instead of relying on those two words being
+# adjacent in the captured stream.
+$expectedUntrustedRootPattern = '(?is)(0x800B0109|CERT_E_UNTRUSTEDROOT|SignTool\s+Error:\s+A certificate chain processed,\s+but terminated in a root)'
+$hasExpectedUntrustedRoot = $verificationExitCode -ne 0 -and $verificationText -match $expectedUntrustedRootPattern
 if ($verificationExitCode -ne 0 -and -not $hasExpectedUntrustedRoot) {
     Write-Host $verificationText.TrimEnd()
     throw "SignTool verification failed with exit code $verificationExitCode."
