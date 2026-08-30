@@ -8,7 +8,7 @@ use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 mod mbtiles;
@@ -17,6 +17,38 @@ pub(crate) use mbtiles::LogicalMbtilesSource;
 
 const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
 const MAP_MANIFEST_PREFIX: &str = "sys/maps/";
+
+/// Cancels a blocking tile lookup when its request handler is dropped.
+#[derive(Clone, Default)]
+struct RequestCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RequestCancellation {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    fn guard(&self) -> RequestCancellationGuard {
+        RequestCancellationGuard {
+            cancelled: Arc::clone(&self.cancelled),
+        }
+    }
+}
+
+struct RequestCancellationGuard {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for RequestCancellationGuard {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WebMapLogicalFileQuery {
@@ -285,6 +317,8 @@ pub(crate) async fn xyz_tile(
         Err((status, message)) => return error_response(status, message),
     };
     let started = Instant::now();
+    let request_cancellation = RequestCancellation::new();
+    let _request_cancellation_guard = request_cancellation.guard();
 
     let source = match get_or_create_mbtiles_source(&state, &manifest_key).await {
         Ok(source) => source,
@@ -292,7 +326,7 @@ pub(crate) async fn xyz_tile(
     };
 
     let tile_lookup = tokio::task::spawn_blocking({
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = request_cancellation.flag();
         move || source.lookup_tile_with_cancellation(z, x, y, cancelled)
     })
     .await;
@@ -335,6 +369,8 @@ pub(crate) async fn vector_tile(
         Err((status, message)) => return error_response(status, message),
     };
     let started = Instant::now();
+    let request_cancellation = RequestCancellation::new();
+    let _request_cancellation_guard = request_cancellation.guard();
 
     let source = match get_or_create_mbtiles_source(&state, &manifest_key).await {
         Ok(source) => source,
@@ -342,7 +378,7 @@ pub(crate) async fn vector_tile(
     };
 
     let tile_lookup = tokio::task::spawn_blocking({
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = request_cancellation.flag();
         move || source.lookup_vector_tile_with_cancellation(z, x, y, cancelled)
     })
     .await;
@@ -872,10 +908,23 @@ fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorResponseBody, error_response, is_safe_fontstack_segment, is_safe_glyph_range_segment,
+        ErrorResponseBody, RequestCancellation, error_response, is_safe_fontstack_segment,
+        is_safe_glyph_range_segment,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn request_cancellation_sets_lookup_flag_when_request_ends() {
+        let cancellation = RequestCancellation::new();
+        let flag = cancellation.flag();
+        let guard = cancellation.guard();
+
+        assert!(!flag.load(Ordering::Relaxed));
+        drop(guard);
+        assert!(flag.load(Ordering::Relaxed));
+    }
 
     #[tokio::test]
     async fn error_response_preserves_public_json_contract() {
