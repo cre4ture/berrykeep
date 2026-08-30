@@ -1375,12 +1375,35 @@ async fn proxy_server_map_request(state: &WebState, path: &str) -> Result<Relati
 
 fn proxied_map_response(response: RelativePathResponse) -> Response {
     let mut headers = HeaderMap::new();
-    for header_name in [CONTENT_TYPE, CONTENT_ENCODING, CACHE_CONTROL] {
+    for header_name in [CONTENT_TYPE, CONTENT_ENCODING] {
         if let Some(value) = response.headers.get(&header_name).cloned() {
             headers.insert(header_name, value);
         }
     }
+    if let Some(value) = response.headers.get(CACHE_CONTROL) {
+        headers.insert(CACHE_CONTROL, private_map_asset_cache_control(value));
+    }
     (response.status, headers, response.body).into_response()
+}
+
+fn private_map_asset_cache_control(value: &HeaderValue) -> HeaderValue {
+    let Ok(value) = value.to_str() else {
+        return HeaderValue::from_static("private");
+    };
+    let mut directives = value
+        .split(',')
+        .map(str::trim)
+        .filter(|directive| !directive.is_empty() && !directive.eq_ignore_ascii_case("public"))
+        .collect::<Vec<_>>();
+    if !directives
+        .iter()
+        .any(|directive| directive.eq_ignore_ascii_case("private"))
+    {
+        directives.push("private");
+    }
+
+    HeaderValue::from_str(&directives.join(", "))
+        .unwrap_or_else(|_| HeaderValue::from_static("private"))
 }
 
 async fn current_client(state: &WebState) -> ClientNode {
@@ -4596,7 +4619,7 @@ mod tests {
                 .headers()
                 .get(CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
-            Some("public, max-age=3600, stale-while-revalidate=86400")
+            Some("max-age=3600, stale-while-revalidate=86400, private")
         );
         assert_eq!(
             raster
@@ -4722,7 +4745,7 @@ mod tests {
                 .headers()
                 .get(CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
-            Some("public, max-age=3600, stale-while-revalidate=86400")
+            Some("max-age=3600, stale-while-revalidate=86400, private")
         );
         assert_eq!(
             to_bytes(response.into_body(), usize::MAX)
@@ -4731,6 +4754,14 @@ mod tests {
                 .as_ref(),
             b"compressed-vector-tile"
         );
+    }
+
+    #[test]
+    fn map_asset_cache_control_keeps_private_upstream_directives() {
+        let private = HeaderValue::from_static("private, max-age=3600");
+        let sanitized = super::private_map_asset_cache_control(&private);
+
+        assert_eq!(sanitized, private);
     }
 
     #[tokio::test]
