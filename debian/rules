@@ -7,6 +7,8 @@ export CARGO_HOME := $(CURDIR)/debian/cargo-home
 export CARGO_TARGET_DIR := $(CURDIR)/target/debian
 export CARGO_NET_OFFLINE := true
 
+SERVER_NODE_ONLY := $(filter server-node-only,$(DEB_BUILD_PROFILES))
+
 ifeq ($(IRONMESH_USE_PREBUILT_BINARIES),1)
 PACKAGE_BIN_DIR := $(IRONMESH_PREBUILT_BIN_DIR)
 SERVER_NODE_BIN := $(PACKAGE_BIN_DIR)/ironmesh-server-node
@@ -21,6 +23,10 @@ SERVER_NODE_CARGO_PACKAGE := -p server-node
 endif
 endif
 
+ifeq ($(SERVER_NODE_ONLY),server-node-only)
+PACKAGE_BINARIES := ironmesh-server-node
+CARGO_PACKAGE_ARGS :=
+else
 PACKAGE_BINARIES := \
 	ironmesh-server-node \
 	ironmesh-rendezvous-service \
@@ -38,6 +44,7 @@ CARGO_PACKAGE_ARGS := \
 	-p ironmesh-folder-agent \
 	-p os-integration \
 	-p rendezvous-service
+endif
 
 CARGO_BIN := $(firstword $(wildcard /usr/bin/cargo-1.91 /usr/bin/cargo-1.89 /usr/bin/cargo-1.85 /usr/bin/cargo $(HOME)/.cargo/bin/cargo))
 RUSTC_BIN := $(firstword $(wildcard /usr/bin/rustc-1.91 /usr/bin/rustc-1.89 /usr/bin/rustc-1.85 /usr/bin/rustc $(HOME)/.cargo/bin/rustc))
@@ -64,6 +71,16 @@ override_dh_auto_configure:
 		test -x "$(PACKAGE_BIN_DIR)/$$binary" || \
 			(echo "missing prebuilt package binary: $(PACKAGE_BIN_DIR)/$$binary" >&2; exit 1); \
 	done
+
+override_dh_auto_build:
+	:
+else
+ifeq ($(SERVER_NODE_ONLY),server-node-only)
+override_dh_auto_configure:
+	test "$(IRONMESH_USE_PREBUILT_SERVER_NODE)" = "1" || \
+		(echo "server-node-only builds require IRONMESH_USE_PREBUILT_SERVER_NODE=1" >&2; exit 1)
+	test -x "$(SERVER_NODE_BIN)" || \
+		(echo "missing prebuilt server-node binary: $(SERVER_NODE_BIN)" >&2; exit 1)
 
 override_dh_auto_build:
 	:
@@ -103,6 +120,7 @@ override_dh_auto_build:
 		--release \
 		$(CARGO_PACKAGE_ARGS)
 endif
+endif
 
 override_dh_auto_test:
 	# Skip the repository's long-running integration-heavy test suites during
@@ -111,9 +129,33 @@ override_dh_auto_test:
 	:
 
 override_dh_shlibdeps:
+
+ifeq ($(SERVER_NODE_ONLY),server-node-only)
+	# The server-only profile accepts an already verified static musl artifact.
+	# Avoid host-architecture ELF analysis when assembling an ARM package on an
+	# x86 package runner, while still defining the substitution variable used by
+	# the control file.
+	grep -q '^shlibs:Depends=' debian/ironmesh-server-node.substvars 2>/dev/null || \
+		printf '%s\n' 'shlibs:Depends=' >> debian/ironmesh-server-node.substvars
+else
 	dh_shlibdeps
 	grep -q '^shlibs:Depends=' debian/ironmesh-server-node.substvars 2>/dev/null || \
 		printf '%s\n' 'shlibs:Depends=' >> debian/ironmesh-server-node.substvars
+endif
+
+ifeq ($(SERVER_NODE_ONLY),server-node-only)
+override_dh_dwz:
+	# build-static-server-node.sh verifies and strips the static artifact before
+	# packaging. Skipping both helpers avoids requiring foreign-architecture
+	# binutils when an x86 builder assembles an ARM package wrapper.
+	:
+
+override_dh_strip:
+	:
+
+override_dh_makeshlibs:
+	:
+endif
 
 override_dh_auto_install:
 	install -d $(CURDIR)/debian/ironmesh-server-node/usr/bin
@@ -123,6 +165,7 @@ override_dh_auto_install:
 	install -m0644 debian/ironmesh-server-node.env \
 		$(CURDIR)/debian/ironmesh-server-node/etc/ironmesh/server-node.env
 
+ifeq ($(SERVER_NODE_ONLY),)
 	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/usr/bin
 	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-rendezvous-service \
 		$(CURDIR)/debian/ironmesh-rendezvous-service/usr/bin/ironmesh-rendezvous-service
@@ -165,6 +208,7 @@ override_dh_auto_install:
 	install -d $(CURDIR)/debian/ironmesh-client/etc/xdg/autostart
 	install -m0644 debian/ironmesh-config-app-background.desktop \
 		$(CURDIR)/debian/ironmesh-client/etc/xdg/autostart/ironmesh-config-app-background.desktop
+endif
 
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start --restart-after-upgrade
