@@ -9,6 +9,7 @@ RUN_LINTIAN=false
 CHECK_BUILD_DEPENDENCIES=true
 PREBUILT_BINARIES_DIR=""
 PREBUILT_SERVER_NODE=""
+TARGET_SUITE="${APT_REPO_SUITE:-}"
 DPKG_BUILD_ARGS=()
 
 log() {
@@ -36,6 +37,8 @@ Usage:
   ./scripts/build-local-debs.sh [options] [-- <dpkg-buildpackage args>]
 
 Options:
+  --suite SUITE  Build packages on a native builder for this apt suite.
+                 Defaults to APT_REPO_SUITE or the local VERSION_CODENAME.
   --no-prepare  Skip ./scripts/prepare-ppa-source.sh.
   --lintian     Run lintian on the generated .changes file after a successful build.
   --prebuilt-binaries DIR
@@ -55,6 +58,8 @@ Options:
 Notes:
   - This helper builds local binary packages with dpkg-buildpackage -b -us -uc.
   - It is separate from ./scripts/build-ppa-source.sh, which builds Launchpad/PPA source uploads.
+  - A package suite must match the native builder distribution. Static musl
+    binaries do not eliminate Debian helper-package dependencies in the .deb.
 EOF
 }
 
@@ -67,6 +72,37 @@ require_command() {
 
   printf '%s is required but was not found in PATH\n' "${command_name}" >&2
   exit 1
+}
+
+native_suite() {
+  local os_id os_suite
+
+  if [[ ! -r /etc/os-release ]]; then
+    printf '%s\n' 'unable to identify the native build suite: /etc/os-release is not readable' >&2
+    exit 1
+  fi
+
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  os_id="${ID:-unknown}"
+  os_suite="${VERSION_CODENAME:-}"
+
+  if [[ -z "${os_suite}" ]]; then
+    printf 'unable to identify the native build suite for %s: VERSION_CODENAME is empty\n' \
+      "${os_id}" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "${os_suite}"
+}
+
+validate_suite_name() {
+  local suite="$1"
+
+  if [[ ! "${suite}" =~ ^[a-z0-9][a-z0-9.-]*$ ]]; then
+    printf 'invalid apt suite: %s\n' "${suite}" >&2
+    exit 1
+  fi
 }
 
 check_build_dependencies() {
@@ -108,6 +144,18 @@ validate_prebuilt_binaries() {
 
 while (($# > 0)); do
   case "$1" in
+    --suite)
+      [[ $# -ge 2 ]] || {
+        printf '%s\n' '--suite requires a suite name' >&2
+        exit 1
+      }
+      TARGET_SUITE="$2"
+      shift 2
+      ;;
+    --suite=*)
+      TARGET_SUITE="${1#*=}"
+      shift
+      ;;
     --no-prepare)
       RUN_PREPARE=false
       shift
@@ -164,6 +212,22 @@ require_command git
 require_command dpkg-buildpackage
 require_command dpkg-parsechangelog
 require_command dpkg
+
+NATIVE_SUITE="$(native_suite)"
+if [[ -z "${TARGET_SUITE}" ]]; then
+  TARGET_SUITE="${NATIVE_SUITE}"
+fi
+validate_suite_name "${TARGET_SUITE}"
+
+if [[ "${TARGET_SUITE}" != "${NATIVE_SUITE}" ]]; then
+  printf 'refusing to build packages for %s on a %s builder\n' \
+    "${TARGET_SUITE}" "${NATIVE_SUITE}" >&2
+  printf '%s\n' \
+    'Build natively for the target suite so debhelper-generated package dependencies remain installable.' >&2
+  exit 1
+fi
+
+log "building packages for native suite ${TARGET_SUITE}"
 
 if [[ "${CHECK_BUILD_DEPENDENCIES}" == true ]]; then
   require_command dpkg-checkbuilddeps

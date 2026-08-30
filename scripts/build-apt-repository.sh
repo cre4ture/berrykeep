@@ -6,8 +6,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARTIFACT_DIR="$(cd "${ROOT_DIR}/.." && pwd)"
 
 REPO_DIR="${APT_REPO_DIR:-${ROOT_DIR}/target/apt-repo}"
-SUITE="${APT_REPO_SUITE:-noble}"
-CODENAME="${APT_REPO_CODENAME:-${SUITE}}"
+SUITE="${APT_REPO_SUITE:-}"
+CODENAME="${APT_REPO_CODENAME:-}"
 COMPONENT="${APT_REPO_COMPONENT:-main}"
 DEFAULT_ARCH="${APT_REPO_ARCH:-$(dpkg --print-architecture)}"
 ORIGIN="${APT_REPO_ORIGIN:-Ironmesh}"
@@ -32,7 +32,9 @@ Usage:
 
 Options:
   --repo-dir DIR       Output repository directory. Defaults to target/apt-repo.
-  --suite NAME         Apt suite/distribution. Defaults to noble.
+  --suite NAME         Apt suite/distribution. Defaults to APT_REPO_SUITE or
+                       the local VERSION_CODENAME. Use trixie for packages
+                       built natively on Debian Trixie.
   --codename NAME      Release codename. Defaults to the suite name.
   --component NAME     Apt component. Defaults to main.
   --arch ARCH          Architecture to update. May be passed more than once.
@@ -65,6 +67,59 @@ require_command() {
 
   printf '%s is required but was not found in PATH\n' "${command_name}" >&2
   exit 1
+}
+
+native_suite() {
+  local os_suite
+
+  if [[ ! -r /etc/os-release ]]; then
+    printf '%s\n' 'unable to identify the native build suite: /etc/os-release is not readable' >&2
+    exit 1
+  fi
+
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  os_suite="${VERSION_CODENAME:-}"
+  if [[ -z "${os_suite}" ]]; then
+    printf '%s\n' 'unable to identify the native build suite: VERSION_CODENAME is empty' >&2
+    exit 1
+  fi
+
+  printf '%s\n' "${os_suite}"
+}
+
+validate_release_name() {
+  local label="$1"
+  local value="$2"
+
+  if [[ ! "${value}" =~ ^[a-z0-9][a-z0-9.-]*$ ]]; then
+    printf 'invalid %s: %s\n' "${label}" "${value}" >&2
+    exit 1
+  fi
+}
+
+verify_signed_release() {
+  local inrelease_path="$1"
+  local release_path="$2"
+  local signature_path="$3"
+
+  if ! grep -Fxq -- '-----BEGIN PGP SIGNED MESSAGE-----' "${inrelease_path}" || \
+    ! grep -Fxq -- '-----BEGIN PGP SIGNATURE-----' "${inrelease_path}" || \
+    ! grep -Fxq -- '-----END PGP SIGNATURE-----' "${inrelease_path}"; then
+    printf 'generated InRelease is missing an inline OpenPGP signature: %s\n' \
+      "${inrelease_path}" >&2
+    exit 1
+  fi
+
+  if ! gpg --batch --verify "${inrelease_path}" >/dev/null 2>&1; then
+    printf 'failed to verify generated InRelease: %s\n' "${inrelease_path}" >&2
+    exit 1
+  fi
+
+  if ! gpg --batch --verify "${signature_path}" "${release_path}" >/dev/null 2>&1; then
+    printf 'failed to verify generated Release.gpg: %s\n' "${signature_path}" >&2
+    exit 1
+  fi
 }
 
 while (($# > 0)); do
@@ -156,6 +211,18 @@ require_command dpkg-deb
 require_command dpkg-parsechangelog
 require_command dpkg-scanpackages
 require_command gzip
+
+if [[ -z "${SUITE}" ]]; then
+  SUITE="$(native_suite)"
+fi
+
+if [[ -z "${CODENAME}" ]]; then
+  CODENAME="${SUITE}"
+fi
+
+validate_release_name 'apt suite' "${SUITE}"
+validate_release_name 'apt codename' "${CODENAME}"
+validate_release_name 'apt component' "${COMPONENT}"
 
 "${ROOT_DIR}/scripts/sync-debian-version.sh"
 
@@ -258,7 +325,8 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
 done
 
 SUITE_DIR="${REPO_DIR}/dists/${SUITE}"
-POOL_DIR="${REPO_DIR}/pool/${COMPONENT}/i/ironmesh"
+POOL_REL="pool/${COMPONENT}/i/ironmesh/${SUITE}"
+POOL_DIR="${REPO_DIR}/${POOL_REL}"
 
 log "refreshing ${REPO_DIR}"
 mkdir -p "${POOL_DIR}"
@@ -277,7 +345,7 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
   log "writing ${packages_rel}"
   (
     cd "${REPO_DIR}"
-    dpkg-scanpackages --arch "${architecture}" pool /dev/null > "${packages_rel}"
+    dpkg-scanpackages --arch "${architecture}" "${POOL_REL}" /dev/null > "${packages_rel}"
     gzip -9cn "${packages_rel}" > "${packages_rel}.gz"
   )
 done
@@ -296,6 +364,7 @@ fi
 RELEASE_ARCHITECTURES="${RELEASE_ARCHES[*]}"
 
 log "writing Release metadata"
+rm -f "${SUITE_DIR}/Release" "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release.gpg"
 RELEASE_TMP="$(mktemp)"
 trap 'rm -f "${RELEASE_TMP}"' EXIT
 apt-ftparchive \
@@ -312,16 +381,22 @@ mv "${RELEASE_TMP}" "${SUITE_DIR}/Release"
 if [[ "${SIGN_REPO}" == true ]]; then
   log "exporting public signing key"
   gpg --armor --export "${SIGNING_KEY}" > "${REPO_DIR}/ironmesh-archive-keyring.asc"
+  if [[ ! -s "${REPO_DIR}/ironmesh-archive-keyring.asc" ]]; then
+    printf 'failed to export public signing key: %s\n' "${SIGNING_KEY}" >&2
+    exit 1
+  fi
 
   log "signing Release metadata with ${SIGNING_KEY}"
-  rm -f "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release.gpg"
   gpg --yes --local-user "${SIGNING_KEY}" --clearsign --digest-algo SHA256 \
     -o "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release"
   gpg --yes --local-user "${SIGNING_KEY}" --armor --detach-sign --digest-algo SHA256 \
     -o "${SUITE_DIR}/Release.gpg" "${SUITE_DIR}/Release"
+  verify_signed_release \
+    "${SUITE_DIR}/InRelease" \
+    "${SUITE_DIR}/Release" \
+    "${SUITE_DIR}/Release.gpg"
 else
   log "leaving repository unsigned"
-  rm -f "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release.gpg"
 fi
 
 log "repository ready: ${REPO_DIR}"

@@ -104,9 +104,11 @@ creature@creax.de:/home/creature/html/apt/ironmesh
 ```
 
 The deploy script replaces metadata only for the suite being published and
-adds package files to the shared pool. It deliberately preserves other suites
-and package files, so adding Focal/ARM64 cannot remove the existing
-Noble/AMD64 publication.
+adds package files to a suite-specific pool. It deliberately preserves other
+suites and package files, so adding Trixie/ARM64 cannot remove the existing
+Focal/ARM64 or Noble/AMD64 publication. Legacy packages remain in the former
+shared pool until every published suite has been refreshed; this prevents a
+migration from breaking an existing suite's package index.
 
 ## Add the Focal ARM64 target
 
@@ -133,6 +135,34 @@ The build helper derives each package architecture from the `.deb` metadata and
 regenerates the `Release` architecture list from the package indexes. Repeating
 `--arch` permits a staging repository to refresh more than one architecture in
 one invocation.
+
+## Add the Trixie ARM64 target
+
+Build all four packages natively on Debian Trixie ARM64. The static musl Server
+Node can be reused, but the remaining binaries and Debhelper-generated package
+dependencies must come from the target suite:
+
+```bash
+./scripts/build-local-debs.sh --suite trixie -- -jauto
+```
+
+Copy the resulting ARM64 packages to the signing host, then build and deploy
+the Trixie repository metadata explicitly:
+
+```bash
+export GPG_TTY="$(tty)"
+APT_REPO_SIGN_KEY=5D7762BDB9A2A564D500DE702A2E3C589C188616 \
+  ./scripts/build-apt-repository.sh \
+    --suite trixie \
+    --arch arm64 \
+    --import-remote creature@creax.de:/home/creature/html/apt/ironmesh \
+    ../ironmesh-client_*_arm64.deb \
+    ../ironmesh-server-node_*_arm64.deb \
+    ../ironmesh-server-node-map-tools_*_arm64.deb \
+    ../ironmesh-rendezvous-service_*_arm64.deb
+
+./scripts/deploy-apt-repository.sh --suite trixie
+```
 
 ## Verify the published repository
 
