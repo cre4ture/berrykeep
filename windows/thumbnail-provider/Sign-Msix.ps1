@@ -5,8 +5,9 @@ Signs and verifies a BerryKeep MSIX package with an explicit PFX.
 .DESCRIPTION
 Loads the PFX only for this process, checks that its certificate matches the
 MSIX manifest publisher and the expected thumbprint, optionally timestamps the
-signature, and exports only the public certificate for sideload installation.
-The script deliberately never creates, exports, or logs private key material.
+signature, verifies the signed package, and exports only the public certificate
+for sideload installation. The script deliberately never creates, exports, or
+logs private key material.
 #>
 [CmdletBinding()]
 param(
@@ -84,53 +85,6 @@ function Get-MsixManifestPublisher {
     }
 }
 
-function Add-TemporaryTrustedRootCertificate {
-    param([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
-
-    $store = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
-    $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-    try {
-        $matches = $store.Certificates.Find(
-            [Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
-            $Certificate.Thumbprint,
-            $false
-        )
-        if ($matches.Count -gt 0) {
-            return $false
-        }
-
-        $publicCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
-            $Certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-        )
-        $store.Add($publicCertificate)
-        return $true
-    }
-    finally {
-        $store.Dispose()
-    }
-}
-
-function Remove-TemporaryTrustedRootCertificate {
-    param([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
-
-    $store = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
-    $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-    try {
-        $matches = $store.Certificates.Find(
-            [Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
-            $Certificate.Thumbprint,
-            $false
-        )
-        foreach ($match in $matches) {
-            $store.Remove($match)
-            break
-        }
-    }
-    finally {
-        $store.Dispose()
-    }
-}
-
 if (-not (Test-Path -LiteralPath $MsixPath -PathType Leaf)) {
     throw "MSIX was not found: $MsixPath"
 }
@@ -183,29 +137,18 @@ if ($LASTEXITCODE -ne 0) {
     throw "SignTool failed with exit code $LASTEXITCODE"
 }
 
-# A self-signed MSIX signer belongs in TrustedPeople on client machines. However,
-# SignTool's /pa policy verifies the certificate chain against the root store.
-# Scope the temporary current-user root trust to this verification and remove it
-# immediately afterwards.
-$addedTrustedCertificate = Add-TemporaryTrustedRootCertificate -Certificate $certificate
-try {
-    & $signTool 'verify' '/pa' '/v' $MsixPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "SignTool verification failed with exit code $LASTEXITCODE"
-    }
-
-    $signature = Get-AuthenticodeSignature -LiteralPath $MsixPath
-    if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate) {
-        throw "MSIX does not have a valid Authenticode signature. Status: $($signature.Status)."
-    }
-    if ((Normalize-Thumbprint -Value $signature.SignerCertificate.Thumbprint) -ne $SigningCertificateThumbprint) {
-        throw 'MSIX Authenticode signer does not match the expected certificate.'
-    }
+$signature = Get-AuthenticodeSignature -LiteralPath $MsixPath
+if ($null -eq $signature.SignerCertificate) {
+    throw "MSIX does not have an Authenticode signer. Status: $($signature.Status)."
 }
-finally {
-    if ($addedTrustedCertificate) {
-        Remove-TemporaryTrustedRootCertificate -Certificate $certificate
-    }
+if ((Normalize-Thumbprint -Value $signature.SignerCertificate.Thumbprint) -ne $SigningCertificateThumbprint) {
+    throw 'MSIX Authenticode signer does not match the expected certificate.'
+}
+if ($signature.Status -notin @('Valid', 'NotTrusted')) {
+    throw "MSIX signature validation failed. Status: $($signature.Status)."
+}
+if ($signature.Status -eq 'NotTrusted') {
+    Write-Host 'Accepted the expected self-signed MSIX signer without modifying certificate stores.'
 }
 
 if ($PublicCertificatePath) {

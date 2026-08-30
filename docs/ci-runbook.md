@@ -15,17 +15,21 @@ Configure these values before tagging:
 - repository variable `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT` -
   normalized SHA-1 thumbprint of the release certificate; this is public and
   is embedded in the MSI updater configuration before signing;
-- secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64` - base64-encoded PFX;
-- secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD` - PFX password;
-- variable `BERRYKEEP_WINDOWS_TIMESTAMP_URL` - approved RFC-3161 endpoint.
+- environment secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64` -
+  base64-encoded PFX;
+- environment secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD` - PFX
+  password;
+- environment variable `BERRYKEEP_WINDOWS_TIMESTAMP_URL` - approved RFC-3161
+  endpoint.
 
 Keep the PFX and its password as *environment* secrets in `release-signing`,
 not repository secrets. Require independent environment approval, prevent
 self-approval, disallow administrator bypass, and limit the environment to
-stable release tags. The signing job checks out the protected default branch
-only for the minimal signing utilities; the MSI itself is always built from
-the requested release tag. This also lets `workflow_dispatch` repair a failed
-publication of an existing immutable tag without recreating it.
+the protected default branch. Start a protected signing run through
+`workflow_dispatch` from that branch. The signing job checks out the protected
+default branch only for the minimal signing utilities; the MSI itself is always
+built from the requested release tag. This also lets `workflow_dispatch` repair
+a failed publication of an existing immutable tag without recreating it.
 
 The unsigned release artifact has one-day retention and is never published.
 Protect `.github/workflows/release.yml` and
