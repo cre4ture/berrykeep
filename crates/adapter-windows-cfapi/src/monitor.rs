@@ -831,6 +831,7 @@ impl SyncRootMonitor {
                     .upload_reader(&rel_path, &mut file, metadata.len())
                 {
                     Ok(receipt) => {
+                        let uploaded_revision = receipt.remote_version.clone();
                         if !was_placeholder {
                             try_convert_materialized_file(path, &rel_path, &metadata);
                         }
@@ -848,6 +849,12 @@ impl SyncRootMonitor {
                                 rel_path,
                                 err
                             );
+                        }
+                        // Keep the scan snapshot aligned with the placeholder identity we just
+                        // wrote. A user can delete the file before the next walk; that deletion
+                        // must still carry the revision returned by this upload.
+                        if let Some(entry) = current.get_mut(&rel_path) {
+                            entry.remote_revision = uploaded_revision;
                         }
                         tracing::info!("{}: uploaded file {}", self.name, rel_path);
                     }
