@@ -201,6 +201,19 @@ fn optional_values_do_not_conflict<T: Eq>(left: &Option<T>, right: &Option<T>) -
         .is_none_or(|(left, right)| left == right)
 }
 
+fn normalize_history_predecessor_path(
+    logical_path: Option<&str>,
+    display_path: &str,
+    history_key: &str,
+) -> String {
+    let logical_path = logical_path.unwrap_or(history_key);
+    if history_key.ends_with('/') && logical_path == history_key {
+        display_path.to_string()
+    } else {
+        logical_path.to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteSnapshotScope {
     pub prefix: Option<String>,
@@ -333,65 +346,32 @@ impl RemoteSnapshotFetcher {
 
         let mut confirmed_deletions = Vec::new();
         for (path, path_candidates) in candidates_by_path {
-            let graph = match self.client.list_versions_blocking(path) {
-                Ok(Some(graph)) => graph,
-                Ok(None) => continue,
-                Err(error) => {
-                    tracing::warn!(
-                        "remote-refresh: unable to verify possible deletion for {path}; preserving the prior entry: {error:#}"
-                    );
+            let mut history_keys = vec![path.to_string()];
+            if !path.ends_with('/') {
+                history_keys.push(format!("{path}/"));
+            }
+            for history_key in history_keys {
+                let graph = match self.client.list_versions_blocking(&history_key) {
+                    Ok(Some(graph)) => graph,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            "remote-refresh: unable to verify possible deletion for {path}; preserving the prior entry: {error:#}"
+                        );
+                        break;
+                    }
+                };
+                let Some(deletion) = confirmed_deletion_from_history(path, &history_key, &graph)
+                else {
                     continue;
+                };
+                if path_candidates
+                    .iter()
+                    .any(|candidate| deletion.matches_baseline(candidate))
+                {
+                    confirmed_deletions.push(deletion);
+                    break;
                 }
-            };
-            let Some(preferred_head_version_id) = graph.preferred_head_version_id.as_deref() else {
-                continue;
-            };
-            let Some(tombstone) = graph
-                .versions
-                .iter()
-                .find(|version| version.version_id == preferred_head_version_id)
-            else {
-                continue;
-            };
-            if tombstone.entry_type != "tombstone"
-                || tombstone.state != VersionConsistencyState::Confirmed
-            {
-                continue;
-            }
-
-            let predecessors: Vec<_> = tombstone
-                .parent_version_ids
-                .iter()
-                .filter_map(|parent_version_id| {
-                    graph.versions.iter().find(|version| {
-                        version.version_id == *parent_version_id && version.entry_type == "key"
-                    })
-                })
-                .map(|predecessor| RemoteEntryBaseline {
-                    path: predecessor
-                        .logical_path
-                        .clone()
-                        .unwrap_or_else(|| path.to_string()),
-                    version: Some(predecessor.version_id.clone()),
-                    content_hash: predecessor.content_hash.clone(),
-                    modified_at_unix: Some(predecessor.created_at_unix),
-                })
-                .collect();
-            if predecessors.is_empty() {
-                continue;
-            }
-
-            let deletion = RemoteDeletion {
-                path: path.to_string(),
-                tombstone_version: tombstone.version_id.clone(),
-                tombstone_created_at_unix: tombstone.created_at_unix,
-                predecessors,
-            };
-            if path_candidates
-                .iter()
-                .any(|candidate| deletion.matches_baseline(candidate))
-            {
-                confirmed_deletions.push(deletion);
             }
         }
 
@@ -445,6 +425,52 @@ impl RemoteSnapshotFetcher {
 
         Ok(snapshot)
     }
+}
+
+fn confirmed_deletion_from_history(
+    display_path: &str,
+    history_key: &str,
+    graph: &crate::ironmesh_client::VersionGraphSummary,
+) -> Option<RemoteDeletion> {
+    let preferred_head_version_id = graph.preferred_head_version_id.as_deref()?;
+    let tombstone = graph
+        .versions
+        .iter()
+        .find(|version| version.version_id == preferred_head_version_id)?;
+    if tombstone.entry_type != "tombstone" || tombstone.state != VersionConsistencyState::Confirmed
+    {
+        return None;
+    }
+
+    let predecessors: Vec<_> = tombstone
+        .parent_version_ids
+        .iter()
+        .filter_map(|parent_version_id| {
+            graph.versions.iter().find(|version| {
+                version.version_id == *parent_version_id && version.entry_type == "key"
+            })
+        })
+        .map(|predecessor| RemoteEntryBaseline {
+            path: normalize_history_predecessor_path(
+                predecessor.logical_path.as_deref(),
+                display_path,
+                history_key,
+            ),
+            version: Some(predecessor.version_id.clone()),
+            content_hash: predecessor.content_hash.clone(),
+            modified_at_unix: Some(predecessor.created_at_unix),
+        })
+        .collect();
+    if predecessors.is_empty() {
+        return None;
+    }
+
+    Some(RemoteDeletion {
+        path: display_path.to_string(),
+        tombstone_version: tombstone.version_id.clone(),
+        tombstone_created_at_unix: tombstone.created_at_unix,
+        predecessors,
+    })
 }
 
 fn snapshot_from_store_index_entries_with_progress<F>(
@@ -835,10 +861,12 @@ fn apply_snapshot_update_with_pending<C>(
             verified_candidates,
             next_update,
         );
-        let changed_paths: Vec<_> = changed_paths_between(previous, &merged_snapshot)
+        let mut changed_paths: BTreeSet<_> = changed_paths_between(previous, &merged_snapshot)
             .into_iter()
             .filter(|path| !unverified_paths.contains(path))
             .collect();
+        changed_paths.extend(deletions.iter().map(|deletion| deletion.path.clone()));
+        let changed_paths: Vec<_> = changed_paths.into_iter().collect();
         if !changed_paths.is_empty() || !deletions.is_empty() {
             on_change(RemoteSnapshotUpdate {
                 snapshot: merged_snapshot.clone(),
@@ -881,9 +909,6 @@ fn merge_snapshot_update(
     for previous_entry in &previous.remote {
         if next_paths.contains(&previous_entry.path) {
             unverified_missing.remove(&previous_entry.path);
-            continue;
-        }
-        if previous_entry.kind != EntryKind::File {
             continue;
         }
         let baseline = RemoteEntryBaseline::from(previous_entry);
@@ -951,7 +976,6 @@ fn deletion_baseline_candidates(
             snapshot
                 .remote
                 .iter()
-                .filter(|entry| entry.kind == EntryKind::File)
                 .map(|entry| (entry.path.clone(), RemoteEntryBaseline::from(entry)))
                 .collect()
         })
@@ -1255,6 +1279,163 @@ mod tests {
     }
 
     #[test]
+    fn directory_marker_history_uses_slash_key_despite_unrelated_display_path_history() {
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let requested_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requested_keys_for_route = Arc::clone(&requested_keys);
+        let router = Router::new().route(
+            "/api/v1/versions/{*key}",
+            get(move |Path(key): Path<String>| {
+                let requested_keys = Arc::clone(&requested_keys_for_route);
+                async move {
+                    requested_keys.lock().expect("keys mutex").push(key.clone());
+                    if key == "photos" {
+                        return Json(crate::ironmesh_client::VersionGraphSummary {
+                            key,
+                            object_id: "unrelated-file-object".to_string(),
+                            preferred_head_version_id: Some("unrelated-file-v1".to_string()),
+                            preferred_head_reason: None,
+                            head_version_ids: vec!["unrelated-file-v1".to_string()],
+                            versions: vec![crate::ironmesh_client::VersionRecordSummary {
+                                version_id: "unrelated-file-v1".to_string(),
+                                entry_type: "key".to_string(),
+                                content_hash: Some("unrelated-file-hash".to_string()),
+                                logical_path: Some("photos".to_string()),
+                                parent_version_ids: Vec::new(),
+                                state: VersionConsistencyState::Confirmed,
+                                created_at_unix: 1,
+                                copied_from_object_id: None,
+                                copied_from_version_id: None,
+                                copied_from_path: None,
+                            }],
+                        })
+                        .into_response();
+                    }
+                    if key != "photos/" {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    Json(crate::ironmesh_client::VersionGraphSummary {
+                        key,
+                        object_id: "directory-marker-object".to_string(),
+                        preferred_head_version_id: Some("directory-tombstone".to_string()),
+                        preferred_head_reason: None,
+                        head_version_ids: vec!["directory-tombstone".to_string()],
+                        versions: vec![
+                            crate::ironmesh_client::VersionRecordSummary {
+                                version_id: "directory-tombstone".to_string(),
+                                entry_type: "tombstone".to_string(),
+                                content_hash: None,
+                                logical_path: Some("photos/".to_string()),
+                                parent_version_ids: vec!["directory-v1".to_string()],
+                                state: VersionConsistencyState::Confirmed,
+                                created_at_unix: 2,
+                                copied_from_object_id: None,
+                                copied_from_version_id: None,
+                                copied_from_path: None,
+                            },
+                            crate::ironmesh_client::VersionRecordSummary {
+                                version_id: "directory-v1".to_string(),
+                                entry_type: "key".to_string(),
+                                content_hash: Some("directory-hash".to_string()),
+                                logical_path: Some("photos/".to_string()),
+                                parent_version_ids: Vec::new(),
+                                state: VersionConsistencyState::Confirmed,
+                                created_at_unix: 1,
+                                copied_from_object_id: None,
+                                copied_from_version_id: None,
+                                copied_from_path: None,
+                            },
+                        ],
+                    })
+                    .into_response()
+                }
+            }),
+        );
+        let (addr, shutdown_tx, server) = spawn_test_server(router);
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+
+        let update = fetcher
+            .confirm_snapshot_update_blocking(
+                SyncSnapshot::default(),
+                &[RemoteEntryBaseline {
+                    path: "photos".to_string(),
+                    version: Some("directory-v1".to_string()),
+                    content_hash: Some("directory-hash".to_string()),
+                    modified_at_unix: Some(1),
+                }],
+            )
+            .expect("directory marker history should be fetched");
+
+        assert_eq!(
+            *requested_keys.lock().expect("keys mutex"),
+            vec!["photos".to_string(), "photos/".to_string()]
+        );
+        assert_eq!(update.deletions.len(), 1);
+        assert_eq!(update.deletions[0].path, "photos");
+        assert_eq!(update.deletions[0].predecessors[0].path, "photos");
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+    }
+
+    #[test]
+    fn directory_absence_is_quarantined_until_a_matching_tombstone_proves_removal() {
+        let mut directory = NamespaceEntry::directory("photos");
+        directory.version = Some("directory-marker-v2".to_string());
+        directory.content_hash = Some("directory-marker-hash".to_string());
+        directory.modified_at_unix = Some(2);
+        let mut current_snapshot = Some(SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![directory.clone()],
+        });
+        let mut unverified_missing = BTreeMap::new();
+        let mut updates = Vec::new();
+
+        apply_snapshot_update_with_pending(
+            &mut current_snapshot,
+            &mut unverified_missing,
+            &[],
+            RemoteSnapshotUpdate::snapshot_only(SyncSnapshot::default()),
+            &mut |update| updates.push(update),
+        );
+        assert!(
+            updates.is_empty(),
+            "directory absence alone must not emit removal"
+        );
+        assert_eq!(unverified_missing.len(), 1);
+        assert_eq!(
+            deletion_baseline_candidates(current_snapshot.as_ref(), &unverified_missing),
+            Vec::<RemoteEntryBaseline>::new(),
+            "fresh directory quarantine should obey the verification cooldown"
+        );
+
+        apply_snapshot_update_with_pending(
+            &mut current_snapshot,
+            &mut unverified_missing,
+            &[],
+            RemoteSnapshotUpdate {
+                snapshot: SyncSnapshot::default(),
+                changed_paths: Vec::new(),
+                deletions: vec![deletion_for(RemoteEntryBaseline::from(&directory))],
+            },
+            &mut |update| updates.push(update),
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].changed_paths, vec![directory.path.clone()]);
+        assert_eq!(updates[0].deletions.len(), 1);
+        assert!(
+            current_snapshot
+                .expect("validated directory deletion")
+                .remote
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn unverified_missing_snapshot_is_quarantined_and_rate_limited() {
         let mut entry = NamespaceEntry::file("photos/newly-uploaded.jpg", "revision-2", "hash-2");
         entry.modified_at_unix = Some(2);
@@ -1335,6 +1516,7 @@ mod tests {
             &mut |update| updates.push(update),
         );
         assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].changed_paths, vec![entry.path.clone()]);
         assert_eq!(updates[0].deletions.len(), 1);
         assert!(unverified_missing.is_empty());
     }
