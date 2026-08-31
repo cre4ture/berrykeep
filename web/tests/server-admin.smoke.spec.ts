@@ -1695,6 +1695,86 @@ test("server-admin waits for session confirmation before protected dashboard fet
   await expect(page.getByText("Failed to load dashboard", { exact: true })).toHaveCount(0);
 });
 
+test("server-admin distinguishes an initial GC load from a confirmed empty GC result", async ({ page }) => {
+  let releaseMemoryResponse: (() => void) | undefined;
+  const memoryResponseAllowed = new Promise<void>((resolve) => {
+    releaseMemoryResponse = resolve;
+  });
+  let markMemoryRequestStarted: (() => void) | undefined;
+  const memoryRequestStarted = new Promise<void>((resolve) => {
+    markMemoryRequestStarted = resolve;
+  });
+  let markMemoryResponseDelivered: (() => void) | undefined;
+  const memoryResponseDelivered = new Promise<void>((resolve) => {
+    markMemoryResponseDelivered = resolve;
+  });
+  let releaseCurrentProcessStats: (() => void) | undefined;
+  const currentProcessStatsAllowed = new Promise<void>((resolve) => {
+    releaseCurrentProcessStats = resolve;
+  });
+
+  await installServerAdminMocks(page);
+  await page.route(`**${apiV1("/process/stats/current")}`, async (route) => {
+    await currentProcessStatsAllowed;
+    await json(route, {
+      sample: {
+        collected_at_unix: 1_900_000_120,
+        main_cpu_percent: 4.2,
+        main_memory_bytes: 1_024,
+        main_disk_read_bytes_per_sec: 0,
+        main_disk_write_bytes_per_sec: 0,
+        children_cpu_percent: 0,
+        children_memory_bytes: 0,
+        children_disk_read_bytes_per_sec: 0,
+        children_disk_write_bytes_per_sec: 0,
+        children_count: 0,
+        temperature_component_count: 0,
+        temperature_reporting_component_count: 0,
+        hottest_temperature_celsius: null,
+        average_temperature_celsius: null
+      },
+      children: [],
+      temperature_components: [],
+      logical_cpu_count: 4
+    });
+  });
+  await page.route(`**${apiV1("/process/stats/memory")}`, async (route) => {
+    markMemoryRequestStarted?.();
+    await memoryResponseAllowed;
+    await json(route, {
+      collected_at_unix: 1_900_000_120,
+      current_objects_cache: {
+        capacity: 100,
+        resident_entries: 1,
+        estimated_resident_bytes: 1_024
+      },
+      current_objects_total_count: 1,
+      in_flight_upload_session_count: 0,
+      in_flight_upload_bytes: 0,
+      last_gc_pass: null
+    });
+    markMemoryResponseDelivered?.();
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await memoryRequestStarted;
+
+  const lastGcPassCard = page.getByTestId("dashboard-last-gc-pass-card");
+  await expect(lastGcPassCard.getByText("no pass yet", { exact: true })).toHaveCount(0);
+
+  releaseMemoryResponse?.();
+  await memoryResponseDelivered;
+  try {
+    await expect(lastGcPassCard).toContainText("no pass yet");
+  } finally {
+    releaseCurrentProcessStats?.();
+  }
+});
+
 async function installServerAdminMocks(
   page: Page,
   options?: {

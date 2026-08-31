@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   clearAdminMediaCache,
   getClusterNodes,
@@ -44,7 +44,7 @@ import {
   formatTimeSeriesChartTimestamp
 } from "@ironmesh/ui";
 import { useDisclosure } from "@mantine/hooks";
-import { useCallback, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import {
   CartesianGrid,
   Line,
@@ -60,6 +60,8 @@ import { useAdminAccess } from "../lib/admin-access";
 type StorageHistoryRangeKey = "24h" | "7d" | "30d" | "90d" | "1y" | "all";
 
 const STORAGE_HISTORY_MAX_POINTS = 360;
+const DASHBOARD_CHART_REFRESH_INTERVAL_MS = 3_000;
+const DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS = 30_000;
 const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
   key: StorageHistoryRangeKey;
   label: string;
@@ -111,10 +113,10 @@ const STORAGE_CHART_SERIES: Array<{
 ];
 
 export function DashboardPage() {
-  const queryClient = useQueryClient();
   const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
   const [storageHistoryRange, setStorageHistoryRange] = useState<StorageHistoryRangeKey>("30d");
   const [clearMediaCacheOpened, clearMediaCacheDisclosure] = useDisclosure(false);
+  const [manualRefreshPending, setManualRefreshPending] = useState(false);
   const normalizedAdminTokenOverride = adminTokenOverride.trim();
   const hasExplicitAdminAccess =
     Boolean(normalizedAdminTokenOverride) || Boolean(sessionStatus?.authenticated);
@@ -126,12 +128,14 @@ export function DashboardPage() {
 
   const backendHealthQuery = useQuery({
     queryKey: ["dashboard", "health"],
-    queryFn: () => getServerHealth()
+    queryFn: () => getServerHealth(),
+    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
   const storageStatsQuery = useQuery({
     queryKey: ["dashboard", "storage-stats-current", normalizedAdminTokenOverride],
     queryFn: () => getStorageStatsCurrent(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectCluster
+    enabled: canInspectCluster,
+    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
   const storageHistoryQuery = useQuery({
     queryKey: ["dashboard", "storage-stats-history", storageHistoryRange, normalizedAdminTokenOverride],
@@ -142,84 +146,80 @@ export function DashboardPage() {
     queryKey: ["dashboard", "process-stats-current", normalizedAdminTokenOverride],
     queryFn: () => getProcessStatsCurrent(normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    refetchInterval: 3_000
+    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
   const processStatsHistoryQuery = useQuery({
     queryKey: ["dashboard", "process-stats-history", normalizedAdminTokenOverride],
     queryFn: () => getProcessStatsHistory(undefined, normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    refetchInterval: 3_000
+    refetchInterval: DASHBOARD_CHART_REFRESH_INTERVAL_MS
   });
   const processStatsMemoryQuery = useQuery({
     queryKey: ["dashboard", "process-stats-memory", normalizedAdminTokenOverride],
     queryFn: () => getProcessStatsMemory(normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    refetchInterval: 5_000
+    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
   const clusterSummaryQuery = useQuery({
     queryKey: ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
     queryFn: () =>
       getClusterSummary(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectCluster
+    enabled: canInspectCluster,
+    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
   const nodesQuery = useQuery({
     queryKey: ["dashboard", "cluster-nodes", normalizedAdminTokenOverride],
     queryFn: () => getClusterNodes(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectCluster
+    enabled: canInspectCluster,
+    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
   const replicationPlanQuery = useQuery({
     queryKey: ["dashboard", "replication-plan", normalizedAdminTokenOverride],
     queryFn: () => getReplicationPlan(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectCluster
+    enabled: canInspectCluster,
+    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
   const repairActivityQuery = useQuery({
     queryKey: ["dashboard", "repair-activity", normalizedAdminTokenOverride],
     queryFn: () => getRepairActivityStatus(normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    refetchInterval: 3_000
+    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
   const rendezvousConfigQuery = useQuery({
     queryKey: ["dashboard", "rendezvous-config", normalizedAdminTokenOverride],
     queryFn: () => getRendezvousConfig(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectRendezvous
+    enabled: canInspectRendezvous,
+    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
 
-  const refresh = useCallback(async () => {
-    const queryKeys: ReadonlyArray<readonly unknown[]> = [
-      ["dashboard", "health"],
-      ["dashboard", "storage-stats-current"],
-      ["dashboard", "storage-stats-history", storageHistoryRange],
+  async function refresh() {
+    await Promise.all([
+      backendHealthQuery.refetch(),
       ...(canInspectCluster
         ? [
-            ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
-            ["dashboard", "cluster-nodes", normalizedAdminTokenOverride],
-            ["dashboard", "replication-plan", normalizedAdminTokenOverride],
-            ["dashboard", "repair-activity", normalizedAdminTokenOverride],
-            ["dashboard", "process-stats-current", normalizedAdminTokenOverride],
-            ["dashboard", "process-stats-history", normalizedAdminTokenOverride],
-            ["dashboard", "process-stats-memory", normalizedAdminTokenOverride]
+            storageStatsQuery.refetch(),
+            storageHistoryQuery.refetch(),
+            clusterSummaryQuery.refetch(),
+            nodesQuery.refetch(),
+            replicationPlanQuery.refetch(),
+            repairActivityQuery.refetch(),
+            processStatsCurrentQuery.refetch(),
+            processStatsHistoryQuery.refetch(),
+            processStatsMemoryQuery.refetch()
           ]
         : []),
-      ...(canInspectRendezvous
-        ? [["dashboard", "rendezvous-config", normalizedAdminTokenOverride]]
-        : [])
-    ];
+      ...(canInspectRendezvous ? [rendezvousConfigQuery.refetch()] : [])
+    ]);
+  }
 
-    await Promise.all(
-      queryKeys.map((queryKey) =>
-        queryClient.refetchQueries({
-          queryKey,
-          exact: true
-        })
-      )
-    );
-  }, [
-    canInspectCluster,
-    canInspectRendezvous,
-    normalizedAdminTokenOverride,
-    queryClient,
-    storageHistoryRange
-  ]);
+  async function refreshDashboard() {
+    setManualRefreshPending(true);
+    try {
+      await refresh();
+    } finally {
+      setManualRefreshPending(false);
+    }
+  }
 
   const mediaCacheClearMutation = useMutation({
     mutationFn: () => clearAdminMediaCache(normalizedAdminTokenOverride || undefined),
@@ -251,19 +251,14 @@ export function DashboardPage() {
     canInspectCluster ? processStatsMemoryQuery.data ?? null : null;
   const mediaCacheClearResult = mediaCacheClearMutation.data ?? null;
   const mediaCacheClearPending = mediaCacheClearMutation.isPending;
-  const loading =
-    backendHealthQuery.isFetching ||
-    storageStatsQuery.isFetching ||
-    storageHistoryQuery.isFetching ||
-    (canInspectCluster &&
-      (clusterSummaryQuery.isFetching ||
-        nodesQuery.isFetching ||
-        replicationPlanQuery.isFetching ||
-        repairActivityQuery.isFetching ||
-        processStatsCurrentQuery.isFetching ||
-        processStatsHistoryQuery.isFetching ||
-        processStatsMemoryQuery.isFetching)) ||
-    (canInspectRendezvous && rendezvousConfigQuery.isFetching);
+  const clusterSummaryLoading = canInspectCluster && clusterSummaryQuery.isPending;
+  const replicationPlanLoading = canInspectCluster && replicationPlanQuery.isPending;
+  const storageStatsLoading = canInspectCluster && storageStatsQuery.isPending;
+  const repairActivityLoading = canInspectCluster && repairActivityQuery.isPending;
+  const processStatsCurrentLoading = canInspectCluster && processStatsCurrentQuery.isPending;
+  const memoryAttributionLoading = canInspectCluster && processStatsMemoryQuery.isPending;
+  const memoryAttributionUnavailable = canInspectCluster && processStatsMemoryQuery.isError;
+  const rendezvousConfigLoading = canInspectRendezvous && rendezvousConfigQuery.isPending;
   const error = firstErrorMessage([
     mediaCacheClearMutation.error,
     backendHealthQuery.error,
@@ -321,8 +316,8 @@ export function DashboardPage() {
           the migration.
         </Text>
         <Group>
-          <Button variant="light" onClick={() => void refresh()} loading={loading}>
-          Refresh
+          <Button variant="light" onClick={() => void refreshDashboard()} loading={manualRefreshPending}>
+            Refresh
           </Button>
         </Group>
       </Group>
@@ -332,7 +327,7 @@ export function DashboardPage() {
           <StatCard
             label="Cluster Nodes"
             value={
-              clusterSummary ? `${clusterSummary.online_nodes} / ${clusterSummary.total_nodes}` : loading ? <Loader size="sm" /> : "unknown"
+              clusterSummary ? `${clusterSummary.online_nodes} / ${clusterSummary.total_nodes}` : clusterSummaryLoading ? <Loader size="sm" /> : "unknown"
             }
             hint="Online / total nodes"
             testId="dashboard-cluster-nodes-card"
@@ -341,7 +336,7 @@ export function DashboardPage() {
         <Grid.Col span={{ base: 12, md: 4 }}>
           <StatCard
             label="Offline Nodes"
-            value={clusterSummary ? clusterSummary.offline_nodes : loading ? <Loader size="sm" /> : "unknown"}
+            value={clusterSummary ? clusterSummary.offline_nodes : clusterSummaryLoading ? <Loader size="sm" /> : "unknown"}
             hint="Detected from cluster heartbeats"
           />
         </Grid.Col>
@@ -349,7 +344,7 @@ export function DashboardPage() {
           <StatCard
             label="Replication Factor"
             value={
-              clusterSummary ? clusterSummary.policy.replication_factor : loading ? <Loader size="sm" /> : "unknown"
+              clusterSummary ? clusterSummary.policy.replication_factor : clusterSummaryLoading ? <Loader size="sm" /> : "unknown"
             }
             hint="Current cluster replication policy"
           />
@@ -360,21 +355,21 @@ export function DashboardPage() {
         <Grid.Col span={{ base: 12, md: 4 }}>
           <StatCard
             label="Under-replicated Items"
-            value={replicationPlan?.under_replicated ?? (loading ? <Loader size="sm" /> : "unknown")}
+            value={replicationPlan?.under_replicated ?? (replicationPlanLoading ? <Loader size="sm" /> : "unknown")}
             hint="Items still missing desired copies"
           />
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 4 }}>
           <StatCard
             label="Over-replicated Items"
-            value={replicationPlan?.over_replicated ?? (loading ? <Loader size="sm" /> : "unknown")}
+            value={replicationPlan?.over_replicated ?? (replicationPlanLoading ? <Loader size="sm" /> : "unknown")}
             hint="Items with extra copies pending cleanup"
           />
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 4 }}>
           <StatCard
             label="Deferred Cleanup"
-            value={replicationPlan?.cleanup_deferred_items ?? (loading ? <Loader size="sm" /> : "unknown")}
+            value={replicationPlan?.cleanup_deferred_items ?? (replicationPlanLoading ? <Loader size="sm" /> : "unknown")}
             hint="Items whose cleanup is intentionally deferred"
           />
         </Grid.Col>
@@ -387,7 +382,7 @@ export function DashboardPage() {
             value={
               latestStorageSample
                 ? formatBytes(latestStorageSample.chunk_store_bytes)
-                : storageStats?.collecting || loading
+                : storageStats?.collecting || storageStatsLoading
                   ? <Loader size="sm" />
                   : "pending"
             }
@@ -400,7 +395,7 @@ export function DashboardPage() {
             value={
               metadataFootprintBytes !== null
                 ? formatBytes(metadataFootprintBytes)
-                : storageStats?.collecting || loading
+                : storageStats?.collecting || storageStatsLoading
                   ? <Loader size="sm" />
                   : "pending"
             }
@@ -413,7 +408,7 @@ export function DashboardPage() {
             value={
               latestStorageSample
                 ? formatBytes(latestStorageSample.latest_snapshot_unique_chunk_bytes)
-                : storageStats?.collecting || loading
+                : storageStats?.collecting || storageStatsLoading
                   ? <Loader size="sm" />
                   : "pending"
             }
@@ -429,7 +424,7 @@ export function DashboardPage() {
               <Text fw={700}>This node</Text>
               <Group gap="sm">
                 <Badge variant="light">
-                  {clusterSummary?.local_node_id ?? (loading ? "loading" : "unknown")}
+                  {clusterSummary?.local_node_id ?? (clusterSummaryLoading ? "loading" : "unknown")}
                 </Badge>
                 <Badge
                   color={localNode?.reachability.relay_required ? ironmeshPrimaryColor : "blue"}
@@ -478,7 +473,7 @@ export function DashboardPage() {
               <Group justify="space-between" align="flex-start">
                 <Text fw={700}>Repair activity</Text>
                 <Badge color={repairActivityBadgeColor(repairActivity?.state)} variant="light">
-                  {repairActivity ? formatRepairActivityState(repairActivity.state) : loading ? "loading" : "unknown"}
+                  {repairActivity ? formatRepairActivityState(repairActivity.state) : repairActivityLoading ? "loading" : "unknown"}
                 </Badge>
               </Group>
               <Group gap="xs">
@@ -488,7 +483,7 @@ export function DashboardPage() {
                 <Badge variant="light">
                   {repairActivity
                     ? `${repairActivity.active_runs.length} active`
-                    : loading
+                    : repairActivityLoading
                       ? "loading"
                       : "unknown"}
                 </Badge>
@@ -519,7 +514,7 @@ export function DashboardPage() {
                 >
                   {rendezvousConfig
                     ? `${connectedRendezvousEndpoints.length}/${rendezvousConfig.endpoint_registrations.length} connected`
-                    : loading
+                    : rendezvousConfigLoading
                       ? "loading"
                       : "unknown"}
                 </Badge>
@@ -662,9 +657,9 @@ export function DashboardPage() {
                 <Stack gap={4}>
                   <Text fw={700}>Process resource usage</Text>
                   <Text size="sm" c="dimmed" maw={760}>
-                    CPU, memory, disk I/O, and temperature sensors for the ironmesh server host,
-                    sampled every few seconds. Child processes (e.g. ffmpeg during video thumbnail
-                    generation) are tracked separately.
+                    CPU, memory, disk I/O, and temperature sensors for the ironmesh server host.
+                    Live process charts refresh every few seconds; summary values refresh every 30 seconds. Child
+                    processes (e.g. ffmpeg during video thumbnail generation) are tracked separately.
                   </Text>
                 </Stack>
                 <Badge variant="light">
@@ -680,7 +675,7 @@ export function DashboardPage() {
                     value={
                       latestProcessSample
                         ? `${latestProcessSample.main_cpu_percent.toFixed(1)}%`
-                        : loading
+                        : processStatsCurrentLoading
                           ? <Loader size="sm" />
                           : "pending"
                     }
@@ -697,7 +692,7 @@ export function DashboardPage() {
                     value={
                       latestProcessSample
                         ? formatBytes(latestProcessSample.main_memory_bytes)
-                        : loading
+                        : processStatsCurrentLoading
                           ? <Loader size="sm" />
                           : "pending"
                     }
@@ -709,7 +704,7 @@ export function DashboardPage() {
                     value={
                       latestProcessSample
                         ? `R ${formatBytes(latestProcessSample.main_disk_read_bytes_per_sec)}/s`
-                        : loading
+                        : processStatsCurrentLoading
                           ? <Loader size="sm" />
                           : "pending"
                     }
@@ -726,7 +721,7 @@ export function DashboardPage() {
                     value={
                       latestProcessSample
                         ? `${latestProcessSample.children_cpu_percent.toFixed(1)}%`
-                        : loading
+                        : processStatsCurrentLoading
                           ? <Loader size="sm" />
                           : "pending"
                     }
@@ -743,7 +738,7 @@ export function DashboardPage() {
                     value={
                       latestProcessSample
                         ? formatBytes(latestProcessSample.children_memory_bytes)
-                        : loading
+                        : processStatsCurrentLoading
                           ? <Loader size="sm" />
                           : "pending"
                     }
@@ -755,7 +750,7 @@ export function DashboardPage() {
                     value={
                       latestProcessSample
                         ? `R ${formatBytes(latestProcessSample.children_disk_read_bytes_per_sec)}/s`
-                        : loading
+                        : processStatsCurrentLoading
                           ? <Loader size="sm" />
                           : "pending"
                     }
@@ -772,7 +767,7 @@ export function DashboardPage() {
                     value={
                       latestProcessSample
                         ? formatTemperature(latestProcessSample.hottest_temperature_celsius)
-                        : loading
+                        : processStatsCurrentLoading
                           ? <Loader size="sm" />
                           : "pending"
                     }
@@ -791,7 +786,7 @@ export function DashboardPage() {
                     value={
                       latestProcessSample
                         ? formatTemperature(latestProcessSample.average_temperature_celsius)
-                        : loading
+                        : processStatsCurrentLoading
                           ? <Loader size="sm" />
                           : "pending"
                     }
@@ -810,7 +805,7 @@ export function DashboardPage() {
                         ? (latestProcessSample.temperature_component_count ?? temperatureComponents.length) > 0
                           ? `${latestProcessSample.temperature_reporting_component_count ?? reportingTemperatureComponentCount} / ${latestProcessSample.temperature_component_count ?? temperatureComponents.length}`
                           : "not available"
-                        : loading
+                        : processStatsCurrentLoading
                           ? <Loader size="sm" />
                           : "pending"
                     }
@@ -908,9 +903,11 @@ export function DashboardPage() {
                     value={
                       memoryAttribution
                         ? `${memoryAttribution.current_objects_cache.resident_entries} / ${memoryAttribution.current_objects_cache.capacity}`
-                        : loading
+                        : memoryAttributionLoading
                           ? <Loader size="sm" />
-                          : "pending"
+                          : memoryAttributionUnavailable
+                            ? "unavailable"
+                            : "pending"
                     }
                     hint={
                       memoryAttribution
@@ -925,9 +922,11 @@ export function DashboardPage() {
                     value={
                       memoryAttribution
                         ? `${memoryAttribution.in_flight_upload_session_count} session${memoryAttribution.in_flight_upload_session_count === 1 ? "" : "s"}`
-                        : loading
+                        : memoryAttributionLoading
                           ? <Loader size="sm" />
-                          : "pending"
+                          : memoryAttributionUnavailable
+                            ? "unavailable"
+                            : "pending"
                     }
                     hint={
                       memoryAttribution
@@ -939,12 +938,15 @@ export function DashboardPage() {
                 <Grid.Col span={{ base: 12, md: 4 }}>
                   <StatCard
                     label="Last GC pass"
+                    testId="dashboard-last-gc-pass-card"
                     value={
                       memoryAttribution?.last_gc_pass
                         ? `${memoryAttribution.last_gc_pass.retained_manifests_processed} manifests`
-                        : loading
+                        : memoryAttributionLoading
                           ? <Loader size="sm" />
-                          : "no pass yet"
+                          : memoryAttributionUnavailable
+                            ? "unavailable"
+                            : "no pass yet"
                     }
                     hint={
                       memoryAttribution?.last_gc_pass
