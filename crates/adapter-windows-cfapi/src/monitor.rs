@@ -541,7 +541,8 @@ impl SyncRootMonitor {
         &self,
         current: &HashMap<String, SeenEntry>,
     ) -> std::collections::HashSet<String> {
-        let rename_pairs = detect_local_file_renames(&self.seen, current);
+        let rename_pairs =
+            detect_local_file_renames(&self.seen, current, &self.pending_delete_retries);
         let mut handled_paths = std::collections::HashSet::new();
 
         for rename in rename_pairs {
@@ -1528,6 +1529,7 @@ fn repair_locally_renamed_materialized_file(
 fn detect_local_file_renames(
     previous: &HashMap<String, SeenEntry>,
     current: &HashMap<String, SeenEntry>,
+    pending_delete_retries: &HashMap<String, PendingDeleteRetry>,
 ) -> Vec<LocalRenamePair> {
     let mut pairs = Vec::new();
     let mut matched_sources = std::collections::HashSet::new();
@@ -1544,6 +1546,7 @@ fn detect_local_file_renames(
             || matched_sources.contains(from_path)
             || matched_destinations.contains(to_path)
             || current.contains_key(from_path)
+            || pending_delete_retries.contains_key(from_path)
         {
             continue;
         }
@@ -1563,7 +1566,11 @@ fn detect_local_file_renames(
 
     let mut deleted_by_identity: HashMap<LocalFileIdentity, Vec<String>> = HashMap::new();
     for (from_path, entry) in previous {
-        if current.contains_key(from_path) || entry.is_dir || matched_sources.contains(from_path) {
+        if current.contains_key(from_path)
+            || entry.is_dir
+            || matched_sources.contains(from_path)
+            || pending_delete_retries.contains_key(from_path)
+        {
             continue;
         }
         let Some(identity) = entry.local_file_identity else {
@@ -1855,6 +1862,42 @@ mod tests {
             placeholder_state: None,
             provider_hydration_active: false,
         }
+    }
+
+    #[test]
+    fn pending_delete_is_not_a_file_identity_rename_source() {
+        let file_identity = LocalFileIdentity {
+            volume_serial_number: 7,
+            file_index: 42,
+        };
+        let mut deleted_entry = seen_entry(false);
+        deleted_entry.local_file_identity = Some(file_identity);
+        let mut unrelated_new_entry = seen_entry(false);
+        unrelated_new_entry.local_file_identity = Some(file_identity);
+        let previous = HashMap::from([("docs/deleted.txt".to_string(), deleted_entry)]);
+        let current = HashMap::from([("docs/unrelated-new.txt".to_string(), unrelated_new_entry)]);
+
+        assert_eq!(
+            detect_local_file_renames(&previous, &current, &HashMap::new()),
+            vec![LocalRenamePair {
+                from_path: "docs/deleted.txt".to_string(),
+                to_path: "docs/unrelated-new.txt".to_string(),
+                detection: "file-index",
+            }],
+            "the fixture models an MFT file-index reuse that would otherwise look like a rename"
+        );
+
+        let pending_deletes = HashMap::from([(
+            "docs/deleted.txt".to_string(),
+            PendingDeleteRetry {
+                attempts: 1,
+                not_before: Instant::now(),
+            },
+        )]);
+        assert!(
+            detect_local_file_renames(&previous, &current, &pending_deletes).is_empty(),
+            "a retained pending delete must never be used as a rename source"
+        );
     }
 
     fn registered_monitor_test_sync_root(
