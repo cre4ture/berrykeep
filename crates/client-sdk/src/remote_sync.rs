@@ -152,10 +152,11 @@ pub struct RemoteDeletion {
 impl RemoteDeletion {
     /// Returns true only when this deletion proves it supersedes `baseline`.
     ///
-    /// A concrete revision is authoritative, but any available hash or time
-    /// must agree as well. Without a concrete revision, both content hash and
-    /// modification time are required. This deliberately never matches from a
-    /// path or absence of metadata alone.
+    /// A concrete revision is authoritative, while an available content hash
+    /// must still agree. Store-index timestamps are compatibility metadata and
+    /// are not necessarily specific to the reported revision. Without a
+    /// concrete revision, both content hash and modification time are required.
+    /// This deliberately never matches from a path or absence of metadata alone.
     pub fn matches_baseline(&self, baseline: &RemoteEntryBaseline) -> bool {
         self.path == baseline.path
             && self
@@ -185,11 +186,7 @@ fn baseline_matches_predecessor(
         if baseline.version != predecessor.version {
             return false;
         }
-        return optional_values_do_not_conflict(&baseline.content_hash, &predecessor.content_hash)
-            && optional_values_do_not_conflict(
-                &baseline.modified_at_unix,
-                &predecessor.modified_at_unix,
-            );
+        return optional_values_do_not_conflict(&baseline.content_hash, &predecessor.content_hash);
     }
 
     baseline.content_hash.is_some()
@@ -1355,6 +1352,20 @@ mod tests {
             ..baseline.clone()
         };
         assert!(!deletion_for(contradictory).matches_baseline(&baseline));
+
+        let predecessor_with_version_timestamp = RemoteEntryBaseline {
+            modified_at_unix: Some(1),
+            ..baseline.clone()
+        };
+        let index_compatibility_timestamp = RemoteEntryBaseline {
+            modified_at_unix: Some(99),
+            ..baseline.clone()
+        };
+        assert!(
+            deletion_for(predecessor_with_version_timestamp)
+                .matches_baseline(&index_compatibility_timestamp),
+            "the exact revision must remain authoritative when index timestamp compatibility metadata differs"
+        );
 
         let legacy = RemoteEntryBaseline {
             version: Some("server-head:size=2".to_string()),
