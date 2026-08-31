@@ -31,13 +31,14 @@ use super::{
     RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
     S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
     SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
-    decode_gallery_labels, decompress_snapshot_json, effective_gallery_captured_at_unix,
-    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
+    StorageStatsSample, StorageStatsState, TOMBSTONE_KEY_INDEX_BACKFILL_KEY,
+    compress_snapshot_json, current_media_cache_metadata, decode_gallery_labels,
+    decompress_snapshot_json, effective_gallery_captured_at_unix, encode_gallery_labels,
+    gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
-    version_created_at_unix_from_payload,
+    metadata_db_logical_table_specs, preferred_tombstone_key_index_entry,
+    sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
 };
 
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1819,6 +1820,32 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn tombstone_key_index_backfill_needed(&self) -> Result<bool> {
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![TOMBSTONE_KEY_INDEX_BACKFILL_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_none())
+        })
+        .await
+    }
+
+    async fn mark_tombstone_key_index_backfill_complete(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![TOMBSTONE_KEY_INDEX_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn load_current_state(&self) -> Result<CurrentState> {
         self.read(|db| load_current_state_from_db(db)).await
     }
@@ -1864,6 +1891,50 @@ impl MetadataStore for SqliteMetadataStore {
         self.write_tx(move |db| {
             db.execute("DELETE FROM current_objects WHERE key = ?1", params![key])?;
             db.execute("DELETE FROM gallery_objects WHERE key = ?1", params![key])?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn load_tombstone_object_id_for_key(&self, key: &str) -> Result<Option<String>> {
+        let key = key.to_string();
+        self.read(move |db| {
+            db.query_row(
+                "SELECT object_id FROM tombstone_key_objects WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+    }
+
+    async fn upsert_tombstone_object_id_for_key(
+        &self,
+        key: &str,
+        object_id: &str,
+        version_id: &str,
+        created_at_unix: u64,
+    ) -> Result<()> {
+        let key = key.to_string();
+        let object_id = object_id.to_string();
+        let version_id = version_id.to_string();
+        let created_at_unix =
+            i64::try_from(created_at_unix).context("tombstone key index timestamp overflow")?;
+        self.write(move |db| {
+            db.execute(
+                "INSERT INTO tombstone_key_objects (key, object_id, version_id, created_at_unix)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(key) DO UPDATE SET
+                    object_id = excluded.object_id,
+                    version_id = excluded.version_id,
+                    created_at_unix = excluded.created_at_unix
+                 WHERE tombstone_key_objects.created_at_unix < excluded.created_at_unix
+                    OR (tombstone_key_objects.created_at_unix = excluded.created_at_unix
+                        AND tombstone_key_objects.version_id < excluded.version_id)",
+                params![key, object_id, version_id, created_at_unix],
+            )?;
             Ok(())
         })
         .await
@@ -3590,6 +3661,7 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
         let object_id = object_id.to_string();
+        let preferred_tombstone_key_index = preferred_tombstone_key_index_entry(index)?;
         self.write_tx(move |db| {
             let changed = db.execute(
                 "INSERT INTO version_indexes (object_id, index_json)
@@ -3604,6 +3676,29 @@ impl MetadataStore for SqliteMetadataStore {
                         db, &object_id,
                     )?;
                 record_gallery_upserts_for_keys(db, &unchanged_projection_keys)?;
+            }
+            db.execute(
+                "DELETE FROM tombstone_key_objects WHERE object_id = ?1",
+                params![object_id],
+            )?;
+            if let Some(tombstone) = preferred_tombstone_key_index {
+                db.execute(
+                    "INSERT INTO tombstone_key_objects (key, object_id, version_id, created_at_unix)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(key) DO UPDATE SET
+                        object_id = excluded.object_id,
+                        version_id = excluded.version_id,
+                        created_at_unix = excluded.created_at_unix
+                     WHERE tombstone_key_objects.created_at_unix < excluded.created_at_unix
+                        OR (tombstone_key_objects.created_at_unix = excluded.created_at_unix
+                            AND tombstone_key_objects.version_id < excluded.version_id)",
+                    params![
+                        tombstone.key,
+                        object_id,
+                        tombstone.version_id,
+                        u64_to_i64(tombstone.created_at_unix)?
+                    ],
+                )?;
             }
             Ok(())
         })
@@ -4166,6 +4261,10 @@ impl MetadataStore for SqliteMetadataStore {
         self.write(move |db| {
             db.execute(
                 "DELETE FROM version_indexes WHERE object_id = ?1",
+                params![&object_id],
+            )?;
+            db.execute(
+                "DELETE FROM tombstone_key_objects WHERE object_id = ?1",
                 params![object_id],
             )?;
             Ok(())
@@ -4280,6 +4379,13 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             key TEXT PRIMARY KEY,
             manifest_hash TEXT NOT NULL,
             object_id TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tombstone_key_objects (
+            key TEXT PRIMARY KEY,
+            object_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            created_at_unix INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS gallery_objects (
@@ -4493,6 +4599,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
             ON current_objects(object_id);
+        CREATE INDEX IF NOT EXISTS idx_tombstone_key_objects_object_id
+            ON tombstone_key_objects(object_id);
         CREATE INDEX IF NOT EXISTS idx_gallery_objects_media_order
             ON gallery_objects(media_type, captured_at_unix DESC, key ASC);
         CREATE INDEX IF NOT EXISTS idx_gallery_objects_manifest_hash

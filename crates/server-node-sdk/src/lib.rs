@@ -19800,17 +19800,13 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
 
                 if !is_tombstone {
                     match store
-                        .describe_object(
-                            key,
-                            None,
-                            Some(&version.version_id),
-                            ObjectReadMode::Preferred,
-                        )
+                        .describe_manifest_by_hash(&version.manifest_hash)
                         .await
                     {
-                        Ok(descriptor) => {
+                        Ok(Some(descriptor)) => {
                             size_bytes = Some(descriptor.total_size_bytes as u64);
                         }
+                        Ok(None) => {}
                         Err(err) => {
                             warn!(
                                 key = %key,

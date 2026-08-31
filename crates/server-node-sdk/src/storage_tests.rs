@@ -789,6 +789,42 @@ impl StorageTestBackend {
             }
         }
     }
+
+    /// Simulates metadata written before the bounded tombstone-key projection
+    /// existed while preserving the underlying version indexes.
+    async fn reset_tombstone_key_index_backfill(self, root: &Path) {
+        match self {
+            Self::Sqlite => {
+                let database = rusqlite::Connection::open(root.join("state/metadata.sqlite"))
+                    .expect("sqlite metadata database should open");
+                database
+                    .execute_batch(
+                        "DELETE FROM tombstone_key_objects;
+                         DELETE FROM metadata_meta
+                          WHERE key = 'tombstone_key_index_v1';",
+                    )
+                    .expect("legacy sqlite tombstone metadata should persist");
+            }
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => {
+                let database = turso::Builder::new_local(
+                    &root.join("state/metadata.turso.db").to_string_lossy(),
+                )
+                .build()
+                .await
+                .expect("turso metadata database should open");
+                let connection = database.connect().expect("turso metadata should connect");
+                connection
+                    .execute_batch(
+                        "DELETE FROM tombstone_key_objects;
+                         DELETE FROM metadata_meta
+                          WHERE key = 'tombstone_key_index_v1';",
+                    )
+                    .await
+                    .expect("legacy Turso tombstone metadata should persist");
+            }
+        }
+    }
 }
 
 macro_rules! run_on_all_metadata_backends {
@@ -1701,6 +1737,71 @@ run_on_all_metadata_backends!(
     compact_tombstone_indexes_dry_run_reports_without_deleting_index_impl,
     compact_tombstone_indexes_dry_run_reports_without_deleting_index,
     compact_tombstone_indexes_dry_run_reports_without_deleting_index_turso
+);
+
+async fn tombstone_key_index_backfills_legacy_history_once_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("tombstone-key-index-legacy-backfill")
+        .await;
+    let key = "docs/deleted-before-upgrade.txt";
+    let live = store
+        .put_object_versioned(
+            key,
+            Bytes::from_static(b"before-delete"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let tombstone_version = store
+        .tombstone_object(key, PutOptions::default())
+        .await
+        .unwrap();
+    drop(store);
+
+    backend.reset_tombstone_key_index_backfill(&root).await;
+    let reopened = backend.open_store(root.clone()).await;
+    assert_eq!(
+        reopened.full_version_index_scans_for_test(),
+        1,
+        "legacy history should be scanned exactly once during startup migration"
+    );
+
+    let graph = reopened
+        .list_versions_with_history(key)
+        .await
+        .unwrap()
+        .expect("legacy tombstone should be indexed after reopening");
+    assert_eq!(
+        graph.preferred_head_version_id.as_deref(),
+        Some(tombstone_version.as_str())
+    );
+    assert!(
+        graph
+            .versions
+            .iter()
+            .any(|version| version.version_id == live.version_id)
+    );
+    assert!(
+        reopened
+            .list_versions_with_history("docs/random-missing.txt")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        reopened.full_version_index_scans_for_test(),
+        1,
+        "steady-state history lookups must not repeat the migration scan"
+    );
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    tombstone_key_index_backfills_legacy_history_once_impl,
+    tombstone_key_index_backfills_legacy_history_once,
+    tombstone_key_index_backfills_legacy_history_once_turso
 );
 
 async fn compact_tombstone_indexes_archives_and_removes_old_tombstoned_index_impl(

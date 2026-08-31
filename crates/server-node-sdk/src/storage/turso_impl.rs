@@ -27,8 +27,9 @@ use super::{
     RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
     S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
     SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, decode_gallery_labels,
-    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    StorageStatsSample, StorageStatsState, TOMBSTONE_KEY_INDEX_BACKFILL_KEY,
+    compress_snapshot_json, decode_gallery_labels, decompress_snapshot_json,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -199,6 +200,29 @@ impl MetadataStore for TursoMetadataStore {
         Ok(())
     }
 
+    async fn tombstone_key_index_backfill_needed(&self) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (TOMBSTONE_KEY_INDEX_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(rows.next().await?.is_none())
+    }
+
+    async fn mark_tombstone_key_index_backfill_complete(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (TOMBSTONE_KEY_INDEX_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn load_current_state(&self) -> Result<CurrentState> {
         let mut rows = self
             .connection
@@ -252,6 +276,55 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn remove_current_object(&self, key: &str) -> Result<()> {
         self.remove_current_object_with_gallery(key).await
+    }
+
+    async fn load_tombstone_object_id_for_key(&self, key: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT object_id FROM tombstone_key_objects WHERE key = ?1",
+                (key,),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        Ok(Some(row_string(
+            &row,
+            0,
+            "tombstone_key_objects.object_id",
+        )?))
+    }
+
+    async fn upsert_tombstone_object_id_for_key(
+        &self,
+        key: &str,
+        object_id: &str,
+        version_id: &str,
+        created_at_unix: u64,
+    ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "INSERT INTO tombstone_key_objects (key, object_id, version_id, created_at_unix)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(key) DO UPDATE SET
+                    object_id = excluded.object_id,
+                    version_id = excluded.version_id,
+                    created_at_unix = excluded.created_at_unix
+                 WHERE tombstone_key_objects.created_at_unix < excluded.created_at_unix
+                    OR (tombstone_key_objects.created_at_unix = excluded.created_at_unix
+                        AND tombstone_key_objects.version_id < excluded.version_id)",
+                (
+                    key,
+                    object_id,
+                    version_id,
+                    i64::try_from(created_at_unix)
+                        .context("tombstone key index timestamp overflow")?,
+                ),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()> {
@@ -2302,6 +2375,12 @@ impl MetadataStore for TursoMetadataStore {
                 (object_id,),
             )
             .await?;
+        self.connection
+            .execute(
+                "DELETE FROM tombstone_key_objects WHERE object_id = ?1",
+                (object_id,),
+            )
+            .await?;
         Ok(())
     }
 
@@ -2404,6 +2483,13 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 key TEXT PRIMARY KEY,
                 manifest_hash TEXT NOT NULL,
                 object_id TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tombstone_key_objects (
+                key TEXT PRIMARY KEY,
+                object_id TEXT NOT NULL,
+                version_id TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS version_indexes (
@@ -2590,6 +2676,8 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
 
             CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
                 ON current_objects(object_id);
+            CREATE INDEX IF NOT EXISTS idx_tombstone_key_objects_object_id
+                ON tombstone_key_objects(object_id);
             CREATE INDEX IF NOT EXISTS idx_snapshots_created
                 ON snapshots(created_at_unix DESC, snapshot_id DESC);
             CREATE INDEX IF NOT EXISTS idx_storage_stats_history_collected

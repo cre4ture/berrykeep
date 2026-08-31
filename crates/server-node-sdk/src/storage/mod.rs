@@ -7,6 +7,7 @@ const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
+pub(super) const TOMBSTONE_KEY_INDEX_BACKFILL_KEY: &str = "tombstone_key_index_v1";
 
 fn current_objects_cache_capacity() -> usize {
     std::env::var("IRONMESH_CURRENT_OBJECTS_CACHE_CAPACITY")
@@ -1293,6 +1294,46 @@ pub(super) struct FileVersionIndex {
     preferred_head_version_id: Option<String>,
 }
 
+/// The preferred tombstone mapping implied by a persisted version index.
+/// Both metadata backends replace all mappings for the index's object ID and
+/// then upsert this entry in the same transaction as the index write.
+pub(super) struct TombstoneKeyIndexEntry {
+    pub(super) key: String,
+    pub(super) version_id: String,
+    pub(super) created_at_unix: u64,
+}
+
+pub(super) fn preferred_tombstone_key_index_entry(
+    index: &FileVersionIndex,
+) -> Result<Option<TombstoneKeyIndexEntry>> {
+    let Some(preferred_head) = index.preferred_head_version_id.as_deref() else {
+        return Ok(None);
+    };
+    let record = index.versions.get(preferred_head).with_context(|| {
+        format!(
+            "preferred head {preferred_head} missing in index for object {}",
+            index.object_id
+        )
+    })?;
+    let Some(key) = record
+        .logical_path
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+        Ok(Some(TombstoneKeyIndexEntry {
+            key: key.to_string(),
+            version_id: record.version_id.clone(),
+            created_at_unix: record.created_at_unix,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionRecordSummary {
     pub version_id: String,
@@ -2202,6 +2243,10 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["key", "manifest_hash", "object_id"],
     },
     MetadataDbLogicalTableSpec {
+        table: "tombstone_key_objects",
+        tracked_columns: &["key", "object_id", "version_id", "created_at_unix"],
+    },
+    MetadataDbLogicalTableSpec {
         table: "gallery_objects",
         tracked_columns: &[
             "key",
@@ -2406,6 +2451,8 @@ pub struct PersistentStore {
     chunk_ingestor: ChunkIngestor,
     media_tools: MediaToolPaths,
     #[cfg(test)]
+    full_version_index_scans_for_test: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     data_scrub_run_test_hook: Option<DataScrubRunTestHook>,
 }
 
@@ -2488,10 +2535,20 @@ trait MetadataStore: Send + Sync {
     /// Marks the sidecar label projection backfill complete only after every
     /// current sidecar has been considered successfully.
     async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()>;
+    async fn tombstone_key_index_backfill_needed(&self) -> Result<bool>;
+    async fn mark_tombstone_key_index_backfill_complete(&self) -> Result<()>;
     async fn load_current_state(&self) -> Result<CurrentState>;
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
     async fn remove_current_object(&self, key: &str) -> Result<()>;
+    async fn load_tombstone_object_id_for_key(&self, key: &str) -> Result<Option<String>>;
+    async fn upsert_tombstone_object_id_for_key(
+        &self,
+        key: &str,
+        object_id: &str,
+        version_id: &str,
+        created_at_unix: u64,
+    ) -> Result<()>;
     /// Replaces the user labels of a projected object. This is the entry point
     /// for the sidecar ingest, which resolves the labels of a media key from its
     /// XMP sidecar.
@@ -3635,11 +3692,14 @@ impl PersistentStore {
             chunk_ingestor,
             media_tools: MediaToolPaths::default(),
             #[cfg(test)]
+            full_version_index_scans_for_test: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             data_scrub_run_test_hook: None,
         };
         store
             .backfill_gallery_labels_from_current_sidecars()
             .await?;
+        store.backfill_tombstone_key_index().await?;
         Ok(store)
     }
 
@@ -3672,6 +3732,46 @@ impl PersistentStore {
 
         self.metadata_store
             .mark_gallery_sidecar_labels_backfill_complete()
+            .await
+    }
+
+    /// Builds the bounded tombstone-key lookup once for indexes written before
+    /// the lookup table existed. Records without a logical path are retained
+    /// as legacy history but intentionally not guessed at request time.
+    async fn backfill_tombstone_key_index(&self) -> Result<()> {
+        if !self
+            .metadata_store
+            .tombstone_key_index_backfill_needed()
+            .await?
+        {
+            return Ok(());
+        }
+
+        for index in self.load_all_version_indexes().await? {
+            let Some(preferred_head) = index.preferred_head_version_id.as_ref() else {
+                continue;
+            };
+            let Some(record) = index.versions.get(preferred_head) else {
+                continue;
+            };
+            if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+            let Some(key) = record.logical_path.as_deref().filter(|key| !key.is_empty()) else {
+                continue;
+            };
+            self.metadata_store
+                .upsert_tombstone_object_id_for_key(
+                    key,
+                    &index.object_id,
+                    &record.version_id,
+                    record.created_at_unix,
+                )
+                .await?;
+        }
+
+        self.metadata_store
+            .mark_tombstone_key_index_backfill_complete()
             .await
     }
 
@@ -3837,6 +3937,18 @@ impl PersistentStore {
     #[cfg(test)]
     pub fn set_gc_manifest_load_batch_size_for_test(&mut self, batch_size: usize) {
         self.gc_manifest_load_batch_size = batch_size;
+    }
+
+    #[cfg(test)]
+    pub fn reset_full_version_index_scans_for_test(&self) {
+        self.full_version_index_scans_for_test
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn full_version_index_scans_for_test(&self) -> usize {
+        self.full_version_index_scans_for_test
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) async fn store_index_inspector(&self) -> Result<StoreIndexInspector> {
@@ -6827,6 +6939,25 @@ impl PersistentStore {
         })
     }
 
+    /// Describes content already identified by its immutable manifest hash.
+    ///
+    /// Version-history callers use this instead of resolving a version through a
+    /// current logical key: after a tombstone, that resolution may not have a
+    /// live key binding at all.
+    pub async fn describe_manifest_by_hash(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Option<ObjectReadDescriptor>> {
+        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+            return Ok(None);
+        };
+
+        Ok(Some(ObjectReadDescriptor {
+            manifest_hash: manifest_hash.to_string(),
+            total_size_bytes: manifest.total_size_bytes,
+        }))
+    }
+
     #[allow(dead_code)]
     pub async fn read_object_range_by_manifest_hash(
         &self,
@@ -9114,13 +9245,9 @@ impl PersistentStore {
             return Ok(Some(object_id));
         }
 
-        for index in self.load_all_version_indexes().await? {
-            if self.resolve_key_for_version_index(&index).await?.as_deref() == Some(key) {
-                return Ok(Some(index.object_id));
-            }
-        }
-
-        Ok(None)
+        self.metadata_store
+            .load_tombstone_object_id_for_key(key)
+            .await
     }
 
     async fn resolve_object_id_for_key_version(
@@ -9734,6 +9861,9 @@ impl PersistentStore {
     }
 
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
+        #[cfg(test)]
+        self.full_version_index_scans_for_test
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.metadata_store.load_all_version_indexes().await
     }
 

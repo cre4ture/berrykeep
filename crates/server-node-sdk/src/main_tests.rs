@@ -13837,6 +13837,17 @@ async fn public_versions_preserves_tombstone_provenance_after_delete_impl(
             .tombstone_object(key, PutOptions::default())
             .await
             .unwrap();
+        for suffix in 0..32 {
+            store
+                .put_object_versioned(
+                    &format!("versions-delete-provenance-filler-{suffix}.txt"),
+                    Bytes::from_static(b"filler"),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+        }
+        store.reset_full_version_index_scans_for_test();
         (
             live.version_id,
             live.manifest_hash,
@@ -13845,8 +13856,9 @@ async fn public_versions_preserves_tombstone_provenance_after_delete_impl(
         )
     };
 
-    let response = super::build_server_apps(&state)
-        .public_app
+    let app = super::build_server_apps(&state).public_app;
+    let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/versions/{key}"))
@@ -13886,6 +13898,24 @@ async fn public_versions_preserves_tombstone_provenance_after_delete_impl(
     assert_eq!(
         predecessor["created_at_unix"].as_u64(),
         Some(live_created_at_unix)
+    );
+
+    let missing = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/versions/random-missing-key.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        lock_store(&state, "tests.versions_delete_provenance.scan_guard")
+            .await
+            .full_version_index_scans_for_test(),
+        0,
+        "public history lookups must not enumerate every version index"
     );
 
     cleanup_test_state(&state).await;

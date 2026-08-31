@@ -18,7 +18,8 @@ use super::super::{
     decode_gallery_labels, effective_gallery_captured_at_unix, encode_gallery_labels,
     gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
-    gallery_media_type_for_path, gallery_web_mercator_position, sqlite_like_prefix_pattern,
+    gallery_media_type_for_path, gallery_web_mercator_position,
+    preferred_tombstone_key_index_entry, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload,
 };
 #[cfg(test)]
@@ -580,6 +581,7 @@ impl TursoMetadataStore {
         index: &FileVersionIndex,
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
+        let preferred_tombstone_key_index = preferred_tombstone_key_index_entry(index)?;
         let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
@@ -601,6 +603,34 @@ impl TursoMetadataStore {
                     )
                     .await?;
                 record_gallery_upserts_for_keys(connection, &unchanged_projection_keys).await?;
+            }
+            connection
+                .execute(
+                    "DELETE FROM tombstone_key_objects WHERE object_id = ?1",
+                    (object_id,),
+                )
+                .await?;
+            if let Some(tombstone) = preferred_tombstone_key_index {
+                connection
+                    .execute(
+                        "INSERT INTO tombstone_key_objects (key, object_id, version_id, created_at_unix)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(key) DO UPDATE SET
+                            object_id = excluded.object_id,
+                            version_id = excluded.version_id,
+                            created_at_unix = excluded.created_at_unix
+                         WHERE tombstone_key_objects.created_at_unix < excluded.created_at_unix
+                            OR (tombstone_key_objects.created_at_unix = excluded.created_at_unix
+                                AND tombstone_key_objects.version_id < excluded.version_id)",
+                        (
+                            tombstone.key,
+                            object_id,
+                            tombstone.version_id,
+                            i64::try_from(tombstone.created_at_unix)
+                                .context("tombstone key index timestamp overflow")?,
+                        ),
+                    )
+                    .await?;
             }
             Ok(())
         }
