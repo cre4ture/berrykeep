@@ -1610,6 +1610,45 @@ async fn expected_revision_is_sent_separately_for_put_delete_and_recursive_delet
 }
 
 #[tokio::test]
+async fn direct_put_tolerates_unrecognized_success_body_without_metadata() {
+    async fn put() -> (axum::http::StatusCode, &'static str) {
+        (
+            axum::http::StatusCode::CREATED,
+            "legacy gateway acknowledgement",
+        )
+    }
+
+    let app = axum::Router::new().route("/api/v1/store/{key}", axum::routing::put(put));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app.into_make_service()).await;
+    });
+
+    let client = IronMeshClient::from_direct_base_url(format!("http://{addr}"));
+    let upload = client
+        .put_with_metadata("docs/readme.txt", bytes::Bytes::from_static(b"updated"))
+        .await
+        .expect("legacy successful PUT body must not fail upload");
+    assert_eq!(upload.version_id, None);
+    assert_eq!(upload.manifest_hash, None);
+
+    let meta = client
+        .put(
+            "docs/readme.txt",
+            bytes::Bytes::from_static(b"updated again"),
+        )
+        .await
+        .expect("put compatibility method must ignore legacy successful body");
+    assert_eq!(meta.key, "docs/readme.txt");
+    assert_eq!(meta.size_bytes, b"updated again".len());
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn list_versions_parses_version_graph_summary() {
     async fn versions(
         axum::extract::Path(key): axum::extract::Path<String>,

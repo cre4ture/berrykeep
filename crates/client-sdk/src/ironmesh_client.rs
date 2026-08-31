@@ -5148,8 +5148,17 @@ impl IronMeshClient {
                 manifest_hash: None,
             }
         } else {
-            serde_json::from_slice::<PutObjectResponse>(&response.body)
-                .with_context(|| format!("failed to parse PUT mutation response for key={key}"))?
+            serde_json::from_slice::<PutObjectResponse>(&response.body).unwrap_or_else(|error| {
+                tracing::warn!(
+                    key = %key,
+                    error = %error,
+                    "successful PUT returned an unrecognized mutation body; upload metadata is unavailable"
+                );
+                PutObjectResponse {
+                    version_id: None,
+                    manifest_hash: None,
+                }
+            })
         };
 
         Ok(UploadResult {
