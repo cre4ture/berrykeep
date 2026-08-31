@@ -763,11 +763,15 @@ mod tests {
         );
 
         let update = updates.pop().expect("a path-only removal update");
-        assert_eq!(
-            update.changed_paths,
-            vec!["photos/possibly-stale.jpg".to_string()]
-        );
-        assert!(update.snapshot.remote.is_empty());
+        // Exhaustive destructuring is intentional: adding deletion provenance
+        // to `RemoteSnapshotUpdate` must break this temporary characterization
+        // at compile time so it cannot silently survive the safety fix.
+        let RemoteSnapshotUpdate {
+            snapshot,
+            changed_paths,
+        } = update;
+        assert_eq!(changed_paths, vec!["photos/possibly-stale.jpg".to_string()]);
+        assert!(snapshot.remote.is_empty());
     }
 
     #[test]
