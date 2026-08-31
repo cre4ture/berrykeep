@@ -4258,7 +4258,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()> {
         let object_id = object_id.to_string();
-        self.write(move |db| {
+        self.write_tx(move |db| {
             db.execute(
                 "DELETE FROM version_indexes WHERE object_id = ?1",
                 params![&object_id],
@@ -5169,6 +5169,66 @@ mod tests {
             .await
             .expect("rewritten row should remain present");
         assert_eq!(remaining_payload, valid_payload);
+
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn delete_version_index_rolls_back_when_tombstone_projection_delete_fails() {
+        let metadata_db_path = sqlite_test_db_path("version-index-delete-atomicity");
+        let store = SqliteMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("sqlite metadata store should open");
+
+        store
+            .write(|db| {
+                db.execute_batch(
+                    "INSERT INTO version_indexes (object_id, index_json)
+                     VALUES ('object-1', '{}');
+                     INSERT INTO tombstone_key_objects (key, object_id, version_id, created_at_unix)
+                     VALUES ('deleted-key', 'object-1', 'version-1', 1);
+                     CREATE TRIGGER reject_tombstone_projection_delete
+                     BEFORE DELETE ON tombstone_key_objects
+                     WHEN OLD.object_id = 'object-1'
+                     BEGIN
+                         SELECT RAISE(ABORT, 'forced tombstone projection delete failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("atomicity fixture should persist");
+
+        assert!(
+            store
+                .delete_version_index_by_object_id("object-1")
+                .await
+                .is_err(),
+            "the projection delete trigger should fail the compound delete"
+        );
+
+        let (index_count, tombstone_projection_count) = store
+            .read(|db| {
+                Ok((
+                    db.query_row(
+                        "SELECT COUNT(*) FROM version_indexes WHERE object_id = 'object-1'",
+                        [],
+                        |row| row.get::<_, u64>(0),
+                    )?,
+                    db.query_row(
+                        "SELECT COUNT(*) FROM tombstone_key_objects WHERE object_id = 'object-1'",
+                        [],
+                        |row| row.get::<_, u64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .expect("rows should remain inspectable after the rejected delete");
+        assert_eq!(index_count, 1, "version index delete must roll back");
+        assert_eq!(
+            tombstone_projection_count, 1,
+            "tombstone projection delete must roll back"
+        );
 
         let _ = std::fs::remove_file(metadata_db_path);
     }

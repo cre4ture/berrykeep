@@ -2368,20 +2368,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
-        self.connection
-            .execute(
-                "DELETE FROM version_indexes WHERE object_id = ?1",
-                (object_id,),
-            )
-            .await?;
-        self.connection
-            .execute(
-                "DELETE FROM tombstone_key_objects WHERE object_id = ?1",
-                (object_id,),
-            )
-            .await?;
-        Ok(())
+        self.delete_version_index_and_tombstone_key_index_transactionally(object_id)
+            .await
     }
 
     async fn list_media_cache_fingerprints(&self) -> Result<Vec<String>> {
@@ -2942,6 +2930,61 @@ mod tests {
 
         drop(connection);
         drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn delete_version_index_rolls_back_when_tombstone_key_index_delete_fails() {
+        let metadata_db_path = turso_test_db_path("version-index-delete-atomicity");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("Turso metadata store should open");
+
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO version_indexes (object_id, index_json)
+                 VALUES ('object-1', '{}');
+                 INSERT INTO tombstone_key_objects (key, object_id, version_id, created_at_unix)
+                 VALUES ('deleted-key', 'object-1', 'version-1', 1);
+                 CREATE TRIGGER reject_tombstone_key_index_delete
+                 BEFORE DELETE ON tombstone_key_objects
+                 WHEN OLD.object_id = 'object-1'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced tombstone key index delete failure');
+                 END;",
+            )
+            .await
+            .expect("atomicity fixture should persist");
+
+        assert!(
+            store
+                .delete_version_index_by_object_id("object-1")
+                .await
+                .is_err(),
+            "the tombstone key index delete trigger should fail the compound delete"
+        );
+
+        for table in ["version_indexes", "tombstone_key_objects"] {
+            let query = format!("SELECT COUNT(*) FROM {table} WHERE object_id = 'object-1'");
+            let mut rows = store
+                .connection
+                .query(&query, ())
+                .await
+                .expect("row count should query");
+            let row = rows
+                .next()
+                .await
+                .expect("row count query should succeed")
+                .expect("row count should return one row");
+            assert_eq!(
+                row_u64(&row, 0, table).expect("row count should be an integer"),
+                1,
+                "{table} delete must roll back"
+            );
+        }
+
+        drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }
 }

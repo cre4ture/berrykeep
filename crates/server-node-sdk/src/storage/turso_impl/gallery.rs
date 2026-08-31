@@ -638,6 +638,33 @@ impl TursoMetadataStore {
         finish_gallery_transaction(transaction, result).await
     }
 
+    pub(super) async fn delete_version_index_and_tombstone_key_index_transactionally(
+        &self,
+        object_id: &str,
+    ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        let connection = &self.connection;
+        let transaction =
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
+        let result = async {
+            connection
+                .execute(
+                    "DELETE FROM version_indexes WHERE object_id = ?1",
+                    (object_id,),
+                )
+                .await?;
+            connection
+                .execute(
+                    "DELETE FROM tombstone_key_objects WHERE object_id = ?1",
+                    (object_id,),
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        finish_gallery_transaction(transaction, result).await
+    }
+
     pub(super) async fn query_turso_gallery_index(
         &self,
         query: &GalleryIndexQuery,
