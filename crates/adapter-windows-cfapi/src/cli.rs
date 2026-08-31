@@ -1,9 +1,12 @@
 #![cfg(windows)]
 
 use clap::{Parser, Subcommand};
-use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
+use client_sdk::{
+    RemoteEntryBaseline, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
+    is_concrete_remote_revision,
+};
 use desktop_status::default_remote_status_poll_interval_ms;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,7 +39,7 @@ use crate::runtime::{
 use crate::windows_status::{
     WindowsStatusOptions, WindowsStatusPublisher, WindowsTrayIconHandle, spawn_remote_status_thread,
 };
-use sync_core::SyncPolicy;
+use sync_core::{EntryKind, SyncPolicy, SyncSnapshot};
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_INFO: &str = git_version::git_version!(
@@ -52,6 +55,24 @@ const LONG_VERSION: &str = git_version::git_version!(
 
 fn windows_connection_name(role: &str, display_name: &str) -> String {
     format!("windows-cfapi/{role}/{display_name}")
+}
+
+/// Directory CFAPI entries have no on-disk identity. Keep only the concrete
+/// marker revisions that a live process observed, so an explicit remote
+/// tombstone can remove an empty directory without relying on absence alone.
+fn remote_directory_baselines(snapshot: &SyncSnapshot) -> BTreeMap<String, RemoteEntryBaseline> {
+    snapshot
+        .remote
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::Directory)
+        .filter(|entry| is_concrete_remote_revision(entry.version.as_deref()))
+        .map(|entry| {
+            (
+                normalize_path(&entry.path),
+                RemoteEntryBaseline::from(entry),
+            )
+        })
+        .collect()
 }
 
 fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
@@ -116,6 +137,7 @@ fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
 
 fn log_remote_delete_reconcile_summary(label: &str, report: &RemoteDeleteReconcileReport) {
     if report.deleted_paths.is_empty()
+        && report.deleted_directory_paths.is_empty()
         && report.preserved_paths.is_empty()
         && report.suppressed_startup_paths.is_empty()
     {
@@ -123,17 +145,24 @@ fn log_remote_delete_reconcile_summary(label: &str, report: &RemoteDeleteReconci
     }
 
     tracing::info!(
-        "remote-delete-reconcile: {} deleted={} preserved={} suppressed={}",
+        "remote-delete-reconcile: {} deleted_files={} deleted_directories={} preserved={} suppressed={}",
         label,
         report.deleted_paths.len(),
+        report.deleted_directory_paths.len(),
         report.preserved_paths.len(),
         report.suppressed_startup_paths.len()
     );
     tracing::info!(
-        "remote-delete-reconcile: {} deleted_sample={:?} preserved_sample={:?} suppressed_sample={:?}",
+        "remote-delete-reconcile: {} deleted_file_sample={:?} deleted_directory_sample={:?} preserved_sample={:?} suppressed_sample={:?}",
         label,
         report
             .deleted_paths
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>(),
+        report
+            .deleted_directory_paths
             .iter()
             .take(8)
             .cloned()
@@ -450,6 +479,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             &registration.root_path,
             &initial_update.deletions,
             sync_root_identity.provider_instance_id,
+            &BTreeMap::new(),
         ) {
             Ok(report) => {
                 log_remote_delete_reconcile_summary("startup", &report);
@@ -564,6 +594,8 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let refresh_remote_applied_tracker = remote_applied_tracker.clone();
         let refresh_monitor_gate = refresh_gate.clone();
         let refresh_status_publisher = status_publisher.clone();
+        let mut prior_remote_directory_baselines =
+            remote_directory_baselines(&initial_update.snapshot);
         refresh_poller.spawn_fetcher_loop(
             refresh_running,
             Some(initial_update.snapshot),
@@ -589,6 +621,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                         &refresh_registration.root_path,
                         &update.deletions,
                         refresh_provider_instance_id,
+                        &prior_remote_directory_baselines,
                     ) {
                         Ok(report) => report,
                         Err(err) => {
@@ -601,6 +634,9 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                     for path in &report.deleted_paths {
                         refresh_remote_applied_tracker.record_file_removal(path);
                     }
+                    for path in &report.deleted_directory_paths {
+                        refresh_remote_applied_tracker.record_directory_removal(path);
+                    }
                     if let Err(err) = apply_action_plan(
                         &refresh_registration.root_path,
                         &plan,
@@ -612,6 +648,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                     }
                     refresh_remote_applied_tracker
                         .record_plan_with_remote_snapshot(&plan, &update.snapshot);
+                    prior_remote_directory_baselines = remote_directory_baselines(&update.snapshot);
                     report
                 };
                 log_remote_delete_reconcile_summary(&summary_label, &remote_delete_report);

@@ -16,7 +16,7 @@ use crate::helpers::{
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use anyhow::{Context, Result};
 use client_sdk::{RemoteDeletion, RemoteEntryBaseline};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use sync_core::NamespaceMediaMetadata;
@@ -28,6 +28,10 @@ use windows_sys::Win32::Storage::FileSystem::FILE_BASIC_INFO;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RemoteDeleteReconcileReport {
     pub deleted_paths: BTreeSet<String>,
+    /// Directory removals are kept separate so the monitor can suppress their
+    /// corresponding local delete event without treating them like file
+    /// placeholder removals.
+    pub deleted_directory_paths: BTreeSet<String>,
     pub preserved_paths: BTreeSet<String>,
     pub suppressed_startup_paths: BTreeSet<String>,
 }
@@ -342,6 +346,7 @@ pub fn reconcile_remote_delete_state(
     sync_root_path: &Path,
     deletions: &[RemoteDeletion],
     provider_instance_id: Uuid,
+    prior_remote_directory_baselines: &BTreeMap<String, RemoteEntryBaseline>,
 ) -> Result<RemoteDeleteReconcileReport> {
     let mut report = RemoteDeleteReconcileReport::default();
     let mut explicit_deletions = deletions.iter().collect::<Vec<_>>();
@@ -361,10 +366,29 @@ pub fn reconcile_remote_delete_state(
                 continue;
             }
         };
-        // Directory identities do not yet carry a deletion baseline.  Leave
-        // them in place unless and until we can prove a safe predecessor.
         if metadata.is_dir() {
-            report.preserved_paths.insert(relative_path);
+            // Directories have no CFAPI file identity.  We may remove one only
+            // when this process previously observed the concrete directory
+            // marker revision and the server tombstone proves it supersedes
+            // that exact marker.  `remove_dir` below additionally refuses to
+            // remove a directory with any remaining local contents.
+            let Some(baseline) = prior_remote_directory_baselines.get(&relative_path) else {
+                report.preserved_paths.insert(relative_path);
+                continue;
+            };
+            if !deletion.matches_baseline(baseline) {
+                report.preserved_paths.insert(relative_path);
+                continue;
+            }
+            match fs::remove_dir(&full_path) {
+                Ok(()) => {
+                    report.deleted_directory_paths.insert(relative_path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    report.preserved_paths.insert(relative_path);
+                }
+            }
             continue;
         }
         let file = match open_sync_path(&full_path, false) {
@@ -653,8 +677,9 @@ mod tests {
         let full_path = sync_root.join("notes.txt");
         fs::write(&full_path, b"offline local").expect("local file should exist");
 
-        let report = reconcile_remote_delete_state(&sync_root, &[], Uuid::now_v7())
-            .expect("reconcile should succeed");
+        let report =
+            reconcile_remote_delete_state(&sync_root, &[], Uuid::now_v7(), &BTreeMap::new())
+                .expect("reconcile should succeed");
 
         assert!(report.deleted_paths.is_empty());
         assert!(full_path.exists());
@@ -744,6 +769,7 @@ mod tests {
                 }],
             }],
             provider_instance_id,
+            &BTreeMap::new(),
         )
         .expect("current reconciliation should complete");
 
@@ -774,8 +800,13 @@ mod tests {
             1_725_000_003,
         );
 
-        let report = reconcile_remote_delete_state(&sync_root.root_path, &[], provider_instance_id)
-            .expect("current reconciliation should complete");
+        let report = reconcile_remote_delete_state(
+            &sync_root.root_path,
+            &[],
+            provider_instance_id,
+            &BTreeMap::new(),
+        )
+        .expect("current reconciliation should complete");
 
         assert!(report.deleted_paths.is_empty());
         assert!(
@@ -807,11 +838,133 @@ mod tests {
         );
         let full_path = sync_root.root_path.join("holiday\\newer-photo.jpg");
 
-        let report = reconcile_remote_delete_state(&sync_root.root_path, &[], provider_instance_id)
-            .expect("reconciliation should complete");
+        let report = reconcile_remote_delete_state(
+            &sync_root.root_path,
+            &[],
+            provider_instance_id,
+            &BTreeMap::new(),
+        )
+        .expect("reconciliation should complete");
 
         assert!(full_path.exists(), "stale absence must preserve local data");
         assert!(report.deleted_paths.is_empty());
+    }
+
+    #[test]
+    fn reconcile_remote_delete_removes_only_empty_directories_with_matching_prior_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "ironmesh-placeholder-directory-delete-{}",
+            Uuid::new_v4()
+        ));
+        let root_path = "remote-folder-move/from";
+        let nested_path = "remote-folder-move/from/nested";
+        fs::create_dir_all(root.join(nested_path.replace('/', "\\")))
+            .expect("remote directory tree should exist");
+
+        let baselines = BTreeMap::from([
+            (
+                root_path.to_string(),
+                RemoteEntryBaseline {
+                    path: root_path.to_string(),
+                    version: Some("root-marker-revision".to_string()),
+                    content_hash: Some("root-marker-hash".to_string()),
+                    modified_at_unix: Some(1_725_000_010),
+                },
+            ),
+            (
+                nested_path.to_string(),
+                RemoteEntryBaseline {
+                    path: nested_path.to_string(),
+                    version: Some("nested-marker-revision".to_string()),
+                    content_hash: Some("nested-marker-hash".to_string()),
+                    modified_at_unix: Some(1_725_000_011),
+                },
+            ),
+        ]);
+        let deletion = |path: &str, version: &str, hash: &str, modified_at_unix| RemoteDeletion {
+            path: path.to_string(),
+            tombstone_version: format!("tombstone-{version}"),
+            tombstone_created_at_unix: modified_at_unix + 1,
+            predecessors: vec![RemoteEntryBaseline {
+                path: path.to_string(),
+                version: Some(version.to_string()),
+                content_hash: Some(hash.to_string()),
+                modified_at_unix: Some(modified_at_unix),
+            }],
+        };
+
+        let report = reconcile_remote_delete_state(
+            &root,
+            &[
+                deletion(
+                    root_path,
+                    "root-marker-revision",
+                    "root-marker-hash",
+                    1_725_000_010,
+                ),
+                deletion(
+                    nested_path,
+                    "nested-marker-revision",
+                    "nested-marker-hash",
+                    1_725_000_011,
+                ),
+            ],
+            Uuid::now_v7(),
+            &baselines,
+        )
+        .expect("directory reconciliation should complete");
+
+        assert_eq!(
+            report.deleted_directory_paths,
+            BTreeSet::from([root_path.to_string(), nested_path.to_string()]),
+            "the reverse path ordering must remove the empty child before its parent"
+        );
+        assert!(
+            !root.join(root_path.replace('/', "\\")).exists(),
+            "a confirmed marker tombstone must not leave the renamed source directory behind"
+        );
+
+        fs::create_dir_all(root.join(root_path.replace('/', "\\")))
+            .expect("local directory should be recreated for the safety check");
+        let report = reconcile_remote_delete_state(
+            &root,
+            &[deletion(
+                root_path,
+                "root-marker-revision",
+                "root-marker-hash",
+                1_725_000_010,
+            )],
+            Uuid::now_v7(),
+            &BTreeMap::new(),
+        )
+        .expect("directory reconciliation without provenance should complete");
+        assert!(root.join(root_path.replace('/', "\\")).exists());
+        assert!(report.deleted_directory_paths.is_empty());
+
+        let local_file = root
+            .join(root_path.replace('/', "\\"))
+            .join("local-only.txt");
+        fs::write(&local_file, b"must survive").expect("local-only content should be created");
+        let report = reconcile_remote_delete_state(
+            &root,
+            &[deletion(
+                root_path,
+                "root-marker-revision",
+                "root-marker-hash",
+                1_725_000_010,
+            )],
+            Uuid::now_v7(),
+            &baselines,
+        )
+        .expect("non-empty directory reconciliation should complete");
+        assert!(
+            local_file.exists(),
+            "local-only content must never be removed"
+        );
+        assert!(report.deleted_directory_paths.is_empty());
+        assert!(report.preserved_paths.contains(root_path));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

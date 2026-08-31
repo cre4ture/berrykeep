@@ -290,6 +290,7 @@ struct SnapshotEntries {
 pub struct RemoteAppliedTracker {
     directories: Arc<Mutex<HashMap<String, Option<String>>>>,
     file_removals: Arc<Mutex<HashSet<String>>>,
+    directory_removals: Arc<Mutex<HashSet<String>>>,
 }
 
 impl RemoteAppliedTracker {
@@ -382,11 +383,41 @@ impl RemoteAppliedTracker {
         }
     }
 
+    pub fn record_directory_removal(&self, path: &str) {
+        let normalized = normalize_monitor_relative_path(path);
+        if !normalized.is_empty() {
+            self.directory_removals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(normalized);
+        }
+    }
+
+    pub fn cancel_directory_removal(&self, path: &str) {
+        let normalized = normalize_monitor_relative_path(path);
+        if !normalized.is_empty() {
+            self.directory_removals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&normalized);
+        }
+    }
+
     fn take_file_removal_suppression(&self, path: &str) -> bool {
         let normalized = normalize_monitor_relative_path(path);
         !normalized.is_empty()
             && self
                 .file_removals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&normalized)
+    }
+
+    fn take_directory_removal_suppression(&self, path: &str) -> bool {
+        let normalized = normalize_monitor_relative_path(path);
+        !normalized.is_empty()
+            && self
+                .directory_removals
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&normalized)
@@ -523,6 +554,7 @@ impl SyncRootMonitor {
         // suppression; a later genuine user deletion still needs to upload.
         for path in current.keys() {
             self.remote_applied_tracker.cancel_file_removal(path);
+            self.remote_applied_tracker.cancel_directory_removal(path);
         }
         // A local recreation or an inbound refresh has resolved the pending
         // deletion state for that path. Do not carry a stale retry schedule
@@ -1315,6 +1347,19 @@ impl SyncRootMonitor {
             {
                 tracing::info!(
                     "{}: suppressing server-originated file removal {}",
+                    self.name,
+                    path
+                );
+                self.pending_delete_retries.remove(&path);
+                continue;
+            }
+            if entry.is_dir
+                && self
+                    .remote_applied_tracker
+                    .take_directory_removal_suppression(&path)
+            {
+                tracing::info!(
+                    "{}: suppressing server-originated directory removal {}",
                     self.name,
                     path
                 );
@@ -2541,6 +2586,7 @@ mod tests {
                 }],
             }],
             provider_instance_id,
+            &std::collections::BTreeMap::new(),
         )
         .expect("reconciliation should complete");
         assert!(report.deleted_paths.contains(path));
@@ -2557,6 +2603,37 @@ mod tests {
                 .is_empty(),
             "a reconciler removal must not be echoed as a new server delete"
         );
+    }
+
+    #[test]
+    fn monitor_does_not_echo_provider_applied_directory_removal_as_marker_delete() {
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            std::env::temp_dir(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        let mut directory = seen_entry(true);
+        directory.remote_revision = Some("remote-marker-revision".to_string());
+        monitor
+            .seen
+            .insert("remote-folder-move/from".to_string(), directory);
+        monitor
+            .remote_applied_tracker()
+            .record_directory_removal("remote-folder-move/from");
+
+        monitor.handle_deleted_entries(&mut HashMap::new(), &HashSet::new());
+
+        assert!(
+            uploader
+                .delete_revisions
+                .lock()
+                .expect("delete revisions lock poisoned")
+                .is_empty(),
+            "a reconciler-applied directory removal must not be echoed as a conditional marker delete"
+        );
+        assert!(monitor.pending_delete_retries.is_empty());
     }
 
     #[test]
