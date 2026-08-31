@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::windows::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -17,8 +17,8 @@ use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{error_chain_has_win32_hresult, path_to_relative};
 use crate::hydration_control::is_active_hydration_marked;
 use crate::placeholder_metadata::{
-    promote_remote_to_in_sync_content_baseline, record_in_sync_local_file_state,
-    record_uploaded_remote_state,
+    PendingRemoteDirectoryDeletion, promote_remote_to_in_sync_content_baseline,
+    record_in_sync_local_file_state, record_uploaded_remote_state,
 };
 #[cfg(test)]
 use crate::runtime::UploadReceipt;
@@ -38,6 +38,7 @@ const DEHYDRATE_SHARING_VIOLATION_RETRY_DELAY_MS: u64 = 250;
 const DELETE_RETRY_BASE_DELAY: Duration = Duration::from_secs(15);
 const DELETE_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 const DELETE_RETRY_MAX_EXPONENT: u32 = 5;
+const PENDING_REMOTE_DIRECTORY_DELETE_LIMIT: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct LocalFileIdentity {
@@ -68,6 +69,13 @@ struct SeenEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingDeleteRetry {
+    attempts: u32,
+    not_before: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct PendingRemoteDirectoryDelete {
+    evidence: PendingRemoteDirectoryDeletion,
     attempts: u32,
     not_before: Instant,
 }
@@ -291,6 +299,7 @@ pub struct RemoteAppliedTracker {
     directories: Arc<Mutex<HashMap<String, Option<String>>>>,
     file_removals: Arc<Mutex<HashSet<String>>>,
     directory_removals: Arc<Mutex<HashSet<String>>>,
+    pending_directory_deletes: Arc<Mutex<BTreeMap<String, PendingRemoteDirectoryDelete>>>,
 }
 
 impl RemoteAppliedTracker {
@@ -319,6 +328,15 @@ impl RemoteAppliedTracker {
             })
             .collect::<HashMap<_, _>>();
         self.record_plan_with_directory_revisions(plan, &directory_revisions);
+        let visible_remote_paths = remote_snapshot
+            .remote
+            .iter()
+            .map(|entry| normalize_monitor_relative_path(&entry.path))
+            .collect::<HashSet<_>>();
+        self.pending_directory_deletes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|path, _| !visible_remote_paths.contains(path));
     }
 
     fn record_plan_with_directory_revisions(
@@ -391,6 +409,96 @@ impl RemoteAppliedTracker {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(normalized);
         }
+    }
+
+    pub fn record_pending_directory_deletions(
+        &self,
+        pending: &BTreeMap<String, PendingRemoteDirectoryDeletion>,
+    ) {
+        let mut pending_deletes = self
+            .pending_directory_deletes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (path, evidence) in pending {
+            let normalized = normalize_monitor_relative_path(path);
+            if normalized.is_empty() {
+                continue;
+            }
+            if let Some(existing) = pending_deletes.get_mut(&normalized) {
+                if existing.evidence != *evidence {
+                    *existing = PendingRemoteDirectoryDelete {
+                        evidence: evidence.clone(),
+                        attempts: 1,
+                        not_before: Instant::now() + delete_retry_delay(1),
+                    };
+                }
+                continue;
+            }
+            if pending_deletes.len() >= PENDING_REMOTE_DIRECTORY_DELETE_LIMIT {
+                tracing::error!(
+                    path = %normalized,
+                    "remote-delete-reconcile: pending directory delete tracker is full; preserving the directory"
+                );
+                continue;
+            }
+            pending_deletes.insert(
+                normalized,
+                PendingRemoteDirectoryDelete {
+                    evidence: evidence.clone(),
+                    attempts: 1,
+                    not_before: Instant::now() + delete_retry_delay(1),
+                },
+            );
+        }
+    }
+
+    fn due_pending_directory_deletes(&self) -> Vec<(String, PendingRemoteDirectoryDelete)> {
+        let now = Instant::now();
+        self.pending_directory_deletes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(_, pending)| pending.not_before <= now)
+            .map(|(path, pending)| (path.clone(), pending.clone()))
+            .collect()
+    }
+
+    fn complete_pending_directory_delete(
+        &self,
+        path: &str,
+        evidence: &PendingRemoteDirectoryDeletion,
+    ) {
+        let normalized = normalize_monitor_relative_path(path);
+        let mut pending_deletes = self
+            .pending_directory_deletes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending_deletes
+            .get(&normalized)
+            .is_some_and(|pending| pending.evidence == *evidence)
+        {
+            pending_deletes.remove(&normalized);
+        }
+    }
+
+    fn defer_pending_directory_delete(
+        &self,
+        path: &str,
+        evidence: &PendingRemoteDirectoryDeletion,
+    ) {
+        let normalized = normalize_monitor_relative_path(path);
+        let mut pending_deletes = self
+            .pending_directory_deletes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(pending) = pending_deletes.get_mut(&normalized) else {
+            return;
+        };
+        if pending.evidence != *evidence {
+            return;
+        }
+        pending.attempts = pending.attempts.saturating_add(1);
+        pending.not_before = Instant::now() + delete_retry_delay(pending.attempts);
     }
 
     pub fn cancel_directory_removal(&self, path: &str) {
@@ -539,11 +647,48 @@ impl SyncRootMonitor {
         self.seen = seeded;
     }
 
+    /// The original remote refresh already verified every stored tombstone
+    /// against its direct predecessor. Retrying is intentionally local-only:
+    /// never infer a new authorization from snapshot absence.
+    fn retry_pending_remote_directory_deletes(&self) {
+        for (path, pending) in self.remote_applied_tracker.due_pending_directory_deletes() {
+            let full_path = self.sync_root.join(path.replace('/', "\\"));
+            match std::fs::remove_dir(&full_path) {
+                Ok(()) => {
+                    tracing::info!(
+                        "{}: retried validated remote directory removal {}",
+                        self.name,
+                        path
+                    );
+                    self.remote_applied_tracker.record_directory_removal(&path);
+                    self.remote_applied_tracker
+                        .complete_pending_directory_delete(&path, &pending.evidence);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.remote_applied_tracker.record_directory_removal(&path);
+                    self.remote_applied_tracker
+                        .complete_pending_directory_delete(&path, &pending.evidence);
+                }
+                Err(error) => {
+                    tracing::info!(
+                        "{}: validated remote directory removal remains pending {}: {}",
+                        self.name,
+                        path,
+                        error
+                    );
+                    self.remote_applied_tracker
+                        .defer_pending_directory_delete(&path, &pending.evidence);
+                }
+            }
+        }
+    }
+
     pub fn walk(&mut self) {
         let refresh_gate = self.refresh_gate.clone();
         let _refresh_gate = refresh_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.retry_pending_remote_directory_deletes();
         let SnapshotEntries {
             entries: current,
             walk_error_count,
@@ -1953,6 +2098,176 @@ mod tests {
             placeholder_state: None,
             provider_hydration_active: false,
         }
+    }
+
+    fn pending_remote_directory_deletion(
+        path: &str,
+        tombstone_version: &str,
+    ) -> PendingRemoteDirectoryDeletion {
+        let baseline = RemoteEntryBaseline {
+            path: path.to_string(),
+            version: Some("marker-revision".to_string()),
+            content_hash: Some("marker-hash".to_string()),
+            modified_at_unix: Some(1_725_000_040),
+        };
+        PendingRemoteDirectoryDeletion {
+            deletion: RemoteDeletion {
+                path: path.to_string(),
+                tombstone_version: tombstone_version.to_string(),
+                tombstone_created_at_unix: 1_725_000_041,
+                predecessors: vec![baseline.clone()],
+            },
+            baseline,
+        }
+    }
+
+    #[test]
+    fn pending_remote_directory_delete_retries_exact_evidence_and_cancels_on_reappearance() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-monitor-directory-retry-{unique}"));
+        let path = "remote-folder-move/from";
+        let full_path = sync_root.join(path.replace('/', "\\"));
+        std::fs::create_dir_all(&full_path).expect("directory should exist");
+        std::fs::write(full_path.join("local-child.txt"), b"local")
+            .expect("local child should exist");
+
+        let uploader = Arc::new(MockUploader::default());
+        let monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            uploader,
+        );
+        let tracker = monitor.remote_applied_tracker();
+        let evidence = pending_remote_directory_deletion(path, "marker-tombstone");
+        tracker.record_pending_directory_deletions(&std::collections::BTreeMap::from([(
+            path.to_string(),
+            evidence.clone(),
+        )]));
+        {
+            let mut pending = tracker
+                .pending_directory_deletes
+                .lock()
+                .expect("pending directory deletes lock poisoned");
+            pending
+                .get_mut(path)
+                .expect("retry should be retained")
+                .not_before = Instant::now();
+        }
+        monitor.retry_pending_remote_directory_deletes();
+        assert!(full_path.exists(), "a nonempty directory must stay pending");
+        assert_eq!(
+            tracker
+                .pending_directory_deletes
+                .lock()
+                .expect("pending directory deletes lock poisoned")
+                .get(path)
+                .expect("failed removal must retain evidence")
+                .evidence,
+            evidence
+        );
+
+        std::fs::remove_file(full_path.join("local-child.txt")).expect("child should be removed");
+        {
+            let mut pending = tracker
+                .pending_directory_deletes
+                .lock()
+                .expect("pending directory deletes lock poisoned");
+            pending
+                .get_mut(path)
+                .expect("retry should remain queued")
+                .not_before = Instant::now();
+        }
+        monitor.retry_pending_remote_directory_deletes();
+        assert!(
+            !full_path.exists(),
+            "retry should remove an empty directory"
+        );
+        assert!(
+            tracker
+                .directory_removals
+                .lock()
+                .expect("directory removals lock poisoned")
+                .contains(path),
+            "successful retry must suppress the monitor's delete echo"
+        );
+
+        let missing_path = "remote-folder-move/already-missing";
+        let missing_evidence =
+            pending_remote_directory_deletion(missing_path, "missing-marker-tombstone");
+        tracker.record_pending_directory_deletions(&std::collections::BTreeMap::from([(
+            missing_path.to_string(),
+            missing_evidence,
+        )]));
+        {
+            let mut pending = tracker
+                .pending_directory_deletes
+                .lock()
+                .expect("pending directory deletes lock poisoned");
+            pending
+                .get_mut(missing_path)
+                .expect("missing-path retry should be retained")
+                .not_before = Instant::now();
+        }
+        monitor.retry_pending_remote_directory_deletes();
+        assert!(
+            tracker
+                .directory_removals
+                .lock()
+                .expect("directory removals lock poisoned")
+                .contains(missing_path),
+            "an already-absent retry target must still suppress the monitor's delete echo"
+        );
+
+        tracker.record_pending_directory_deletions(&std::collections::BTreeMap::from([(
+            path.to_string(),
+            evidence,
+        )]));
+        let mut remote_directory = sync_core::NamespaceEntry::directory(path);
+        remote_directory.version = Some("marker-revision".to_string());
+        tracker.record_plan_with_remote_snapshot(
+            &CfapiActionPlan {
+                actions: vec![CfapiAction::EnsureDirectory {
+                    path: path.to_string(),
+                }],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![remote_directory],
+            },
+        );
+        assert!(
+            tracker
+                .pending_directory_deletes
+                .lock()
+                .expect("pending directory deletes lock poisoned")
+                .is_empty(),
+            "a reappeared remote directory must cancel stale tombstone evidence"
+        );
+
+        let bounded_tracker = RemoteAppliedTracker::default();
+        let overflow = (0..=PENDING_REMOTE_DIRECTORY_DELETE_LIMIT)
+            .map(|index| {
+                let path = format!("bounded/{index}");
+                (
+                    path.clone(),
+                    pending_remote_directory_deletion(&path, &format!("tombstone-{index}")),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        bounded_tracker.record_pending_directory_deletions(&overflow);
+        assert_eq!(
+            bounded_tracker
+                .pending_directory_deletes
+                .lock()
+                .expect("pending directory deletes lock poisoned")
+                .len(),
+            PENDING_REMOTE_DIRECTORY_DELETE_LIMIT,
+            "remote directory retry evidence must remain bounded"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
     }
 
     #[test]

@@ -17709,34 +17709,21 @@ fn collapse_store_index_entries_for_tree_view(
             collapsed.insert(entry.path.clone(), entry);
             continue;
         }
-        let path = entry.path.clone();
-        let canonical_entry = StoreIndexEntry {
-            path,
-            entry_type: "prefix".to_string(),
-            version: entry.version,
-            content_hash: entry.content_hash,
-            size_bytes: entry.size_bytes,
-            modified_at_unix: entry.modified_at_unix,
-            content_fingerprint: entry.content_fingerprint,
-            media: entry.media,
-            labels: entry.labels,
-            labels_resolved: entry.labels_resolved,
-        };
-        let has_marker_identity = canonical_entry.version.is_some()
-            || canonical_entry.content_hash.is_some()
-            || canonical_entry.modified_at_unix.is_some();
-        let replace_existing =
-            collapsed
-                .get(&canonical_entry.path)
-                .is_none_or(|existing: &StoreIndexEntry| {
-                    has_marker_identity
-                        && existing.version.is_none()
-                        && existing.content_hash.is_none()
-                        && existing.modified_at_unix.is_none()
-                });
-        if replace_existing {
-            collapsed.insert(canonical_entry.path.clone(), canonical_entry);
-        }
+
+        collapsed
+            .entry(entry.path.clone())
+            .or_insert_with(|| StoreIndexEntry {
+                path: entry.path,
+                entry_type: "prefix".to_string(),
+                version: None,
+                content_hash: None,
+                size_bytes: None,
+                modified_at_unix: None,
+                content_fingerprint: None,
+                media: None,
+                labels: Vec::new(),
+                labels_resolved: false,
+            });
     }
 
     collapsed.into_values().collect()

@@ -13199,10 +13199,10 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
         super::StoreIndexEntry {
             path: "images/".to_string(),
             entry_type: "key".to_string(),
-            version: Some("marker-revision".to_string()),
+            version: None,
             content_hash: Some("marker".to_string()),
             size_bytes: Some(0),
-            modified_at_unix: Some(1_725_000_010),
+            modified_at_unix: None,
             content_fingerprint: None,
             media: None,
             labels: Vec::new(),
@@ -13227,10 +13227,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
     assert_eq!(collapsed.len(), 2);
     assert_eq!(collapsed[0].path, "images/");
     assert_eq!(collapsed[0].entry_type, "prefix");
-    assert_eq!(collapsed[0].version.as_deref(), Some("marker-revision"));
-    assert_eq!(collapsed[0].content_hash.as_deref(), Some("marker"));
-    assert_eq!(collapsed[0].size_bytes, Some(0));
-    assert_eq!(collapsed[0].modified_at_unix, Some(1_725_000_010));
+    assert_eq!(collapsed[0].content_hash, None);
     assert_eq!(collapsed[1].path, "images/cat.png");
     assert_eq!(collapsed[1].entry_type, "key");
 }

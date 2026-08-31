@@ -138,6 +138,7 @@ fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
 fn log_remote_delete_reconcile_summary(label: &str, report: &RemoteDeleteReconcileReport) {
     if report.deleted_paths.is_empty()
         && report.deleted_directory_paths.is_empty()
+        && report.retryable_directory_deletions.is_empty()
         && report.preserved_paths.is_empty()
         && report.suppressed_startup_paths.is_empty()
     {
@@ -145,15 +146,16 @@ fn log_remote_delete_reconcile_summary(label: &str, report: &RemoteDeleteReconci
     }
 
     tracing::info!(
-        "remote-delete-reconcile: {} deleted_files={} deleted_directories={} preserved={} suppressed={}",
+        "remote-delete-reconcile: {} deleted_files={} deleted_directories={} pending_directory_retries={} preserved={} suppressed={}",
         label,
         report.deleted_paths.len(),
         report.deleted_directory_paths.len(),
+        report.retryable_directory_deletions.len(),
         report.preserved_paths.len(),
         report.suppressed_startup_paths.len()
     );
     tracing::info!(
-        "remote-delete-reconcile: {} deleted_file_sample={:?} deleted_directory_sample={:?} preserved_sample={:?} suppressed_sample={:?}",
+        "remote-delete-reconcile: {} deleted_file_sample={:?} deleted_directory_sample={:?} pending_directory_retry_sample={:?} preserved_sample={:?} suppressed_sample={:?}",
         label,
         report
             .deleted_paths
@@ -164,6 +166,12 @@ fn log_remote_delete_reconcile_summary(label: &str, report: &RemoteDeleteReconci
         report
             .deleted_directory_paths
             .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>(),
+        report
+            .retryable_directory_deletions
+            .keys()
             .take(8)
             .cloned()
             .collect::<Vec<_>>(),
@@ -637,6 +645,8 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                     for path in &report.deleted_directory_paths {
                         refresh_remote_applied_tracker.record_directory_removal(path);
                     }
+                    refresh_remote_applied_tracker
+                        .record_pending_directory_deletions(&report.retryable_directory_deletions);
                     if let Err(err) = apply_action_plan(
                         &refresh_registration.root_path,
                         &plan,
