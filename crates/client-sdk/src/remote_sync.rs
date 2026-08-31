@@ -456,16 +456,16 @@ where
                 remote.push(NamespaceEntry::directory(directory_path));
             }
         } else {
-            let version = entry.version.unwrap_or_else(|| "server-head".to_string());
-            let content_hash = entry
-                .content_hash
-                .unwrap_or_else(|| format!("server-head:{}", entry.path));
-            let mut remote_entry = NamespaceEntry::file_sized(
-                entry.path.clone(),
-                version,
-                content_hash,
-                entry.size_bytes,
-            );
+            let mut remote_entry = NamespaceEntry {
+                path: entry.path,
+                kind: EntryKind::File,
+                version: entry.version,
+                content_hash: entry.content_hash,
+                content_fingerprint: None,
+                size_bytes: entry.size_bytes,
+                modified_at_unix: None,
+                media: None,
+            };
             remote_entry.content_fingerprint = entry.content_fingerprint;
             remote_entry.modified_at_unix = entry.modified_at_unix;
             remote_entry.media = entry
@@ -999,6 +999,30 @@ mod tests {
                 "docs/readme.md".to_string(),
             ],
         );
+    }
+
+    #[test]
+    fn progress_snapshot_builder_preserves_absent_remote_identity_metadata() {
+        let snapshot = snapshot_from_store_index_entries_with_progress(
+            vec![crate::ironmesh_client::StoreIndexEntry {
+                path: "docs/readme.txt".to_string(),
+                entry_type: "key".to_string(),
+                labels: Vec::new(),
+                labels_resolved: false,
+                version: None,
+                content_hash: None,
+                size_bytes: Some(42),
+                modified_at_unix: Some(1_723_456_789),
+                content_fingerprint: None,
+                media: None,
+            }],
+            |_| {},
+        );
+
+        assert_eq!(snapshot.remote.len(), 1);
+        assert_eq!(snapshot.remote[0].version, None);
+        assert_eq!(snapshot.remote[0].content_hash, None);
+        assert_eq!(snapshot.remote[0].modified_at_unix, Some(1_723_456_789));
     }
 
     fn deletion_for(baseline: RemoteEntryBaseline) -> RemoteDeletion {
