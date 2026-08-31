@@ -290,12 +290,14 @@ fn remote_file_system_metadata_is_current(
     size_is_current && modified_at_is_current
 }
 
-/// Collects persisted provider file identities before a remote refresh.  The
-/// fetcher uses these baselines to ask the server for a tombstone only when a
-/// path is absent from the newly fetched snapshot.
-pub fn collect_provider_file_baselines(
+/// Collects persisted provider file identities only for local paths absent
+/// from the already fetched remote snapshot. This avoids opening every CFAPI
+/// placeholder during startup when the normal case is that most files remain
+/// visible remotely.
+pub fn collect_provider_file_baselines_missing_from_remote(
     sync_root_path: &Path,
     provider_instance_id: Uuid,
+    visible_remote_paths: &BTreeSet<String>,
 ) -> Vec<RemoteEntryBaseline> {
     let mut baselines = Vec::new();
     for entry in WalkDir::new(sync_root_path)
@@ -308,6 +310,9 @@ pub fn collect_provider_file_baselines(
         }
         let relative_path = path_to_relative(sync_root_path, &entry.path().to_string_lossy());
         if relative_path.is_empty() || is_internal_sync_root_relative_path(&relative_path) {
+            continue;
+        }
+        if visible_remote_paths.contains(&relative_path) {
             continue;
         }
         let Ok(file) = open_sync_path(entry.path(), false) else {
@@ -655,6 +660,41 @@ mod tests {
         assert!(full_path.exists());
 
         let _ = fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn collect_provider_file_baselines_only_reads_missing_remote_paths() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("collect-missing-provider-baselines");
+        let visible_path = "holiday/visible.jpg";
+        let missing_path = "holiday/missing.jpg";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            visible_path,
+            "visible-revision",
+            "visible-hash",
+            1_725_000_001,
+        );
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            missing_path,
+            "missing-revision",
+            "missing-hash",
+            1_725_000_002,
+        );
+
+        let visible_remote_paths = BTreeSet::from([visible_path.to_string()]);
+        let baselines = collect_provider_file_baselines_missing_from_remote(
+            &sync_root.root_path,
+            provider_instance_id,
+            &visible_remote_paths,
+        );
+
+        assert_eq!(baselines.len(), 1);
+        assert_eq!(baselines[0].path, missing_path);
+        assert_eq!(baselines[0].version.as_deref(), Some("missing-revision"));
     }
 
     #[test]

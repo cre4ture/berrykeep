@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
 use desktop_status::default_remote_status_poll_interval_ms;
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,7 +26,8 @@ use crate::live::ServerNodeHydrator;
 use crate::local_state::local_appdata_desktop_status_path;
 use crate::monitor::SyncRootMonitor;
 use crate::placeholder_metadata::{
-    RemoteDeleteReconcileReport, collect_provider_file_baselines, reconcile_remote_delete_state,
+    RemoteDeleteReconcileReport, collect_provider_file_baselines_missing_from_remote,
+    reconcile_remote_delete_state,
 };
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
@@ -431,11 +433,19 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             )),
             RemoteSnapshotScope::new(prefix.clone(), depth, None),
         );
-        let startup_baselines = collect_provider_file_baselines(
+        let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
+        let visible_remote_paths = initial_snapshot
+            .remote
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<BTreeSet<_>>();
+        let startup_baselines = collect_provider_file_baselines_missing_from_remote(
             &registration.root_path,
             sync_root_identity.provider_instance_id,
+            &visible_remote_paths,
         );
-        let initial_update = fetcher.fetch_snapshot_update_blocking(&startup_baselines)?;
+        let initial_update =
+            fetcher.confirm_snapshot_update_blocking(initial_snapshot, &startup_baselines)?;
         let startup_delete_report = match reconcile_remote_delete_state(
             &registration.root_path,
             &initial_update.deletions,

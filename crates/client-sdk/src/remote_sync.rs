@@ -14,6 +14,7 @@ const SNAPSHOT_BUILD_PROGRESS_STRIDE: u64 = 512;
 const PREFERRED_SERVER_NOTIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const UNVERIFIED_MISSING_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+const UNVERIFIED_MISSING_ENTRY_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RemoteSyncStrategy {
@@ -282,6 +283,18 @@ impl RemoteSnapshotFetcher {
         baseline_candidates: &[RemoteEntryBaseline],
     ) -> Result<RemoteSnapshotUpdate> {
         let snapshot = self.fetch_snapshot_blocking()?;
+        self.snapshot_update_for_snapshot_blocking(snapshot, baseline_candidates)
+    }
+
+    /// Confirms deletion candidates against an already fetched snapshot.
+    ///
+    /// This lets callers defer any expensive local baseline inspection until
+    /// after they know which local paths are absent from the remote listing.
+    pub fn confirm_snapshot_update_blocking(
+        &self,
+        snapshot: SyncSnapshot,
+        baseline_candidates: &[RemoteEntryBaseline],
+    ) -> Result<RemoteSnapshotUpdate> {
         self.snapshot_update_for_snapshot_blocking(snapshot, baseline_candidates)
     }
 
@@ -621,7 +634,6 @@ impl RemoteSnapshotPoller {
                         let baseline_candidates = deletion_baseline_candidates(
                             current_snapshot.as_ref(),
                             &unverified_missing,
-                            false,
                         );
                         let next_snapshot = match fetch_snapshot(&fetcher, &baseline_candidates) {
                             Ok(snapshot) => snapshot,
@@ -655,7 +667,6 @@ impl RemoteSnapshotPoller {
                         let mut should_fetch = current_snapshot.is_none();
                         let mut observed_sequence = last_sequence;
                         let mut sequence_regressed = false;
-                        let mut observed_remote_change = false;
                         if notifications_available {
                             match fetcher.client.wait_for_store_index_change_blocking(
                                 last_sequence,
@@ -672,7 +683,6 @@ impl RemoteSnapshotPoller {
                                         should_fetch = true;
                                     } else {
                                         should_fetch |= response.changed;
-                                        observed_remote_change |= response.changed;
                                     }
                                 }
                                 Err(error) => {
@@ -712,7 +722,6 @@ impl RemoteSnapshotPoller {
                         let baseline_candidates = deletion_baseline_candidates(
                             current_snapshot.as_ref(),
                             &unverified_missing,
-                            observed_remote_change && !sequence_regressed,
                         );
                         let mut next_snapshot = match fetch_snapshot(&fetcher, &baseline_candidates)
                         {
@@ -890,16 +899,7 @@ fn merge_snapshot_update(
             unverified_missing.remove(&previous_entry.path);
         } else {
             unverified_paths.insert(previous_entry.path.clone());
-            unverified_missing.insert(
-                previous_entry.path.clone(),
-                UnverifiedMissingEntry {
-                    baseline,
-                    // This refresh already performed the negative history
-                    // verification; do not repeat a full history scan on every
-                    // polling tick for the unchanged missing baseline.
-                    last_verified_at: Instant::now(),
-                },
-            );
+            retain_unverified_missing(unverified_missing, baseline);
         }
     }
 
@@ -948,7 +948,6 @@ fn merge_snapshot_update(
 fn deletion_baseline_candidates(
     snapshot: Option<&SyncSnapshot>,
     unverified_missing: &BTreeMap<String, UnverifiedMissingEntry>,
-    force_pending_recheck: bool,
 ) -> Vec<RemoteEntryBaseline> {
     let mut candidates: BTreeMap<String, RemoteEntryBaseline> = snapshot
         .map(|snapshot| {
@@ -962,13 +961,33 @@ fn deletion_baseline_candidates(
         .unwrap_or_default();
     let now = Instant::now();
     for pending in unverified_missing.values() {
-        if force_pending_recheck
-            || now.duration_since(pending.last_verified_at) >= UNVERIFIED_MISSING_RECHECK_INTERVAL
-        {
+        if now.duration_since(pending.last_verified_at) >= UNVERIFIED_MISSING_RECHECK_INTERVAL {
             candidates.insert(pending.baseline.path.clone(), pending.baseline.clone());
         }
     }
     candidates.into_values().collect()
+}
+
+fn retain_unverified_missing(
+    unverified_missing: &mut BTreeMap<String, UnverifiedMissingEntry>,
+    baseline: RemoteEntryBaseline,
+) {
+    if !unverified_missing.contains_key(&baseline.path)
+        && unverified_missing.len() >= UNVERIFIED_MISSING_ENTRY_LIMIT
+        && let Some(oldest_path) = unverified_missing
+            .iter()
+            .min_by_key(|(_, pending)| pending.last_verified_at)
+            .map(|(path, _)| path.clone())
+    {
+        unverified_missing.remove(&oldest_path);
+    }
+    unverified_missing.insert(
+        baseline.path.clone(),
+        UnverifiedMissingEntry {
+            baseline,
+            last_verified_at: Instant::now(),
+        },
+    );
 }
 
 pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) -> Vec<String> {
@@ -1264,8 +1283,7 @@ mod tests {
         assert_eq!(current_snapshot, Some(SyncSnapshot::default()));
         assert_eq!(unverified_missing.len(), 1);
         assert!(
-            deletion_baseline_candidates(current_snapshot.as_ref(), &unverified_missing, false,)
-                .is_empty()
+            deletion_baseline_candidates(current_snapshot.as_ref(), &unverified_missing).is_empty()
         );
 
         unverified_missing
@@ -1273,7 +1291,7 @@ mod tests {
             .expect("missing baseline should be retained for later proof")
             .last_verified_at = Instant::now() - UNVERIFIED_MISSING_RECHECK_INTERVAL;
         let recheck_candidates =
-            deletion_baseline_candidates(current_snapshot.as_ref(), &unverified_missing, false);
+            deletion_baseline_candidates(current_snapshot.as_ref(), &unverified_missing);
         assert_eq!(recheck_candidates, vec![RemoteEntryBaseline::from(&entry)]);
         apply_snapshot_update_with_pending(
             &mut current_snapshot,
@@ -1283,8 +1301,7 @@ mod tests {
             &mut |update| updates.push(update),
         );
         assert!(
-            deletion_baseline_candidates(current_snapshot.as_ref(), &unverified_missing, false,)
-                .is_empty()
+            deletion_baseline_candidates(current_snapshot.as_ref(), &unverified_missing).is_empty()
         );
 
         let mismatched = RemoteEntryBaseline {
@@ -1380,6 +1397,28 @@ mod tests {
 
         assert!(unverified_missing.is_empty());
         assert_eq!(updates.len(), 1);
+    }
+
+    #[test]
+    fn unverified_missing_quarantine_is_bounded_and_notifications_do_not_bypass_cooldown() {
+        let mut pending = BTreeMap::new();
+        for index in 0..=UNVERIFIED_MISSING_ENTRY_LIMIT {
+            retain_unverified_missing(
+                &mut pending,
+                RemoteEntryBaseline {
+                    path: format!("missing/{index}"),
+                    version: Some(format!("revision-{index}")),
+                    content_hash: Some(format!("hash-{index}")),
+                    modified_at_unix: Some(index as u64),
+                },
+            );
+        }
+
+        assert_eq!(pending.len(), UNVERIFIED_MISSING_ENTRY_LIMIT);
+        assert!(
+            deletion_baseline_candidates(None, &pending).is_empty(),
+            "an unrelated notification must not bypass the per-entry cooldown"
+        );
     }
 
     #[test]
