@@ -3474,6 +3474,31 @@ async fn rename_preserves_object_id_and_history_impl(backend: StorageTestBackend
         "pre-rename versions should keep the path that matches their stored manifest"
     );
 
+    let source_history = store
+        .list_versions_with_history("docs/a.txt")
+        .await
+        .unwrap()
+        .expect("renamed-away path should retain tombstone history");
+    let source_tombstone = source_history
+        .versions
+        .iter()
+        .find(|version| version.manifest_hash == TOMBSTONE_MANIFEST_HASH)
+        .expect("renamed-away path should resolve to a tombstone");
+    assert_eq!(
+        source_tombstone.parent_version_ids,
+        vec![put.version_id.clone()]
+    );
+    let source_predecessor = source_history
+        .versions
+        .iter()
+        .find(|version| version.version_id == put.version_id)
+        .expect("rename tombstone history should include its cross-index predecessor");
+    assert_eq!(
+        source_predecessor.logical_path.as_deref(),
+        Some("docs/a.txt")
+    );
+    assert_eq!(source_predecessor.manifest_hash, put.manifest_hash);
+
     let read = store
         .get_object("docs/b.txt", None, None, ObjectReadMode::Preferred)
         .await

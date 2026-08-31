@@ -5160,21 +5160,60 @@ impl PersistentStore {
             return Ok(None);
         };
 
-        let mut versions: Vec<VersionRecordSummary> = index
+        let mut versions_by_id: BTreeMap<String, VersionRecordSummary> = index
             .versions
             .values()
-            .map(|record| VersionRecordSummary {
-                version_id: record.version_id.clone(),
-                manifest_hash: record.manifest_hash.clone(),
-                logical_path: record.logical_path.clone(),
-                parent_version_ids: record.parent_version_ids.clone(),
-                state: record.state.clone(),
-                created_at_unix: record.created_at_unix,
-                copied_from_object_id: record.copied_from_object_id.clone(),
-                copied_from_version_id: record.copied_from_version_id.clone(),
-                copied_from_path: record.copied_from_path.clone(),
-            })
+            .map(version_record_summary)
+            .map(|record| (record.version_id.clone(), record))
             .collect();
+
+        // A rename tombstone is intentionally stored in a distinct object
+        // index so the old path remains resolvable after the destination is
+        // reused. Its direct parent still belongs to the source object's
+        // index. Include that explicitly referenced parent in the public
+        // graph, rather than asking clients to trust copied-from metadata
+        // without the predecessor's actual revision/hash/time record.
+        for record in index.versions.values() {
+            if record.manifest_hash != TOMBSTONE_MANIFEST_HASH
+                || record.logical_path.as_deref() != Some(key)
+                || record.copied_from_path.as_deref() != Some(key)
+            {
+                continue;
+            }
+            let (Some(source_object_id), Some(source_version_id)) = (
+                record.copied_from_object_id.as_deref(),
+                record.copied_from_version_id.as_deref(),
+            ) else {
+                continue;
+            };
+            if !record
+                .parent_version_ids
+                .iter()
+                .any(|parent| parent == source_version_id)
+            {
+                continue;
+            }
+            let Some(source_index) = self
+                .load_version_index_by_object_id(source_object_id)
+                .await?
+            else {
+                continue;
+            };
+            let Some(source_record) = source_index.versions.get(source_version_id) else {
+                continue;
+            };
+            if source_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+            if source_record.logical_path.as_deref() != Some(key) {
+                continue;
+            }
+            versions_by_id
+                .entry(source_record.version_id.clone())
+                .or_insert_with(|| version_record_summary(source_record));
+        }
+
+        let mut versions: Vec<_> = versions_by_id.into_values().collect();
 
         versions.sort_by(|a, b| {
             b.created_at_unix
@@ -9938,6 +9977,20 @@ impl PersistentStore {
             bail!("archive file not found: {}", path.display());
         }
         Ok(path)
+    }
+}
+
+fn version_record_summary(record: &FileVersionRecord) -> VersionRecordSummary {
+    VersionRecordSummary {
+        version_id: record.version_id.clone(),
+        manifest_hash: record.manifest_hash.clone(),
+        logical_path: record.logical_path.clone(),
+        parent_version_ids: record.parent_version_ids.clone(),
+        state: record.state.clone(),
+        created_at_unix: record.created_at_unix,
+        copied_from_object_id: record.copied_from_object_id.clone(),
+        copied_from_version_id: record.copied_from_version_id.clone(),
+        copied_from_path: record.copied_from_path.clone(),
     }
 }
 
