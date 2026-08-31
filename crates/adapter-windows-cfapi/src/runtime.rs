@@ -2529,11 +2529,15 @@ mod tests {
 
     struct TestSyncRootGuard {
         root_path: PathBuf,
+        _registration_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TestSyncRootGuard {
         fn new(root_path: PathBuf) -> Self {
-            Self { root_path }
+            Self {
+                root_path,
+                _registration_lock: crate::lock_sync_root_registration_tests(),
+            }
         }
     }
 

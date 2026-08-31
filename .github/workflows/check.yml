@@ -1016,6 +1016,9 @@ jobs:
       - name: Check Windows CFAPI adapter crate
         run: cargo check --locked -p adapter-windows-cfapi --all-targets
 
+      - name: Run Windows CFAPI adapter tests
+        run: cargo test --locked -p adapter-windows-cfapi
+
       - name: Run Windows workspace clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 

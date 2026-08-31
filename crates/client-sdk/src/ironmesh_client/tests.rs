@@ -1179,6 +1179,129 @@ fn snapshot_conversion_maps_prefix_and_keys() {
     );
 }
 
+/// Temporary green characterization of undesired current behavior.
+/// Remove this test when snapshots retain concrete server revision IDs.
+#[test]
+fn undesired_current_behavior_snapshot_entries_without_revisions_share_server_head_marker() {
+    let entries = [
+        ("docs/first.txt", "manifest-first", 1_723_456_789),
+        ("docs/second.txt", "manifest-second", 1_723_456_790),
+    ]
+    .into_iter()
+    .map(|(path, content_hash, modified_at_unix)| StoreIndexEntry {
+        path: path.to_string(),
+        entry_type: "key".to_string(),
+        labels: Vec::new(),
+        labels_resolved: false,
+        version: None,
+        content_hash: Some(content_hash.to_string()),
+        size_bytes: Some(42),
+        modified_at_unix: Some(modified_at_unix),
+        content_fingerprint: Some(format!("fingerprint-{content_hash}")),
+        media: None,
+    })
+    .collect();
+
+    let snapshot = snapshot_from_store_index_entries(entries);
+
+    assert_eq!(snapshot.remote.len(), 2);
+    assert!(
+        snapshot
+            .remote
+            .iter()
+            .all(|entry| entry.version.as_deref() == Some("server-head")),
+        "UNDESIRED CURRENT BEHAVIOR: distinct server objects without listed revision IDs are assigned the same non-authoritative marker"
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "a delete precondition requires a concrete server revision, not a shared selector"
+)]
+fn desired_behavior_snapshot_entries_never_use_server_head_as_a_revision_identity() {
+    let snapshot = snapshot_from_store_index_entries(vec![StoreIndexEntry {
+        path: "docs/readme.txt".to_string(),
+        entry_type: "key".to_string(),
+        labels: Vec::new(),
+        labels_resolved: false,
+        version: None,
+        content_hash: Some("manifest-readme".to_string()),
+        size_bytes: Some(42),
+        modified_at_unix: Some(1_723_456_789),
+        content_fingerprint: Some("fingerprint-readme".to_string()),
+        media: None,
+    }]);
+
+    assert_ne!(
+        snapshot.remote[0].version.as_deref(),
+        Some("server-head"),
+        "a delete precondition requires a concrete server revision, not a shared selector"
+    );
+}
+
+fn completed_upload_mapping_fixture() -> (UploadSessionView, UploadSessionCompleteResponse) {
+    let completed = UploadSessionCompleteResponse {
+        snapshot_id: "snapshot-after-upload".to_string(),
+        version_id: "revision-after-upload".to_string(),
+        manifest_hash: "manifest-after-upload".to_string(),
+        state: "confirmed".to_string(),
+        new_chunks: 1,
+        dedup_reused_chunks: 0,
+        created_new_version: true,
+        total_size_bytes: 42,
+    };
+    let session = UploadSessionView {
+        upload_id: "upload-1".to_string(),
+        key: "docs/readme.txt".to_string(),
+        total_size_bytes: 42,
+        chunk_size_bytes: 42,
+        chunk_count: 1,
+        received_indexes: vec![0],
+        completed: true,
+        completed_result: Some(completed.clone()),
+        expires_at_unix: 1_723_456_999,
+    };
+    (session, completed)
+}
+
+/// Temporary green characterization of undesired current behavior.
+/// Remove this test when upload results retain the confirmed revision and hash.
+#[test]
+fn undesired_current_behavior_upload_result_discards_server_revision_and_manifest_hash() {
+    let (session, completed) = completed_upload_mapping_fixture();
+
+    let result = upload_result_from_session_complete("docs/readme.txt", &session, &completed);
+    let serialized = serde_json::to_value(result).expect("upload result should serialize");
+
+    assert!(
+        serialized.get("version_id").is_none() && serialized.get("manifest_hash").is_none(),
+        "UNDESIRED CURRENT BEHAVIOR: the client receives revision/hash metadata but drops both from UploadResult"
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "completed upload result must retain the confirmed server revision and manifest hash"
+)]
+fn desired_behavior_upload_result_retains_server_revision_and_manifest_hash() {
+    let (session, completed) = completed_upload_mapping_fixture();
+
+    let result = upload_result_from_session_complete("docs/readme.txt", &session, &completed);
+    let serialized = serde_json::to_value(result).expect("upload result should serialize");
+
+    assert!(
+        serialized
+            .get("version_id")
+            .and_then(serde_json::Value::as_str)
+            == Some("revision-after-upload")
+            && serialized
+                .get("manifest_hash")
+                .and_then(serde_json::Value::as_str)
+                == Some("manifest-after-upload"),
+        "completed upload result must retain the confirmed server revision and manifest hash"
+    );
+}
+
 #[test]
 fn ensure_missing_folder_markers_adds_nested_parents() {
     let mut entries = vec![StoreIndexEntry {
