@@ -288,12 +288,43 @@ struct SnapshotEntries {
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteAppliedTracker {
-    directories: Arc<Mutex<HashSet<String>>>,
+    directories: Arc<Mutex<HashMap<String, Option<String>>>>,
     file_removals: Arc<Mutex<HashSet<String>>>,
 }
 
 impl RemoteAppliedTracker {
     pub fn record_plan(&self, plan: &CfapiActionPlan) {
+        self.record_plan_with_directory_revisions(plan, &HashMap::new());
+    }
+
+    pub fn record_plan_with_remote_snapshot(
+        &self,
+        plan: &CfapiActionPlan,
+        remote_snapshot: &SyncSnapshot,
+    ) {
+        let directory_revisions = remote_snapshot
+            .remote
+            .iter()
+            .filter(|entry| entry.kind == sync_core::EntryKind::Directory)
+            .filter_map(|entry| {
+                let revision = entry
+                    .version
+                    .as_deref()
+                    .filter(|revision| is_concrete_remote_revision(Some(revision)))?;
+                Some((
+                    normalize_monitor_relative_path(&entry.path),
+                    revision.to_string(),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        self.record_plan_with_directory_revisions(plan, &directory_revisions);
+    }
+
+    fn record_plan_with_directory_revisions(
+        &self,
+        plan: &CfapiActionPlan,
+        directory_revisions: &HashMap<String, String>,
+    ) {
         let mut directories = self
             .directories
             .lock()
@@ -302,12 +333,16 @@ impl RemoteAppliedTracker {
         for action in &plan.actions {
             match action {
                 CfapiAction::EnsureDirectory { path } => {
-                    record_remote_applied_directory(path, &mut directories);
+                    record_remote_applied_directory(
+                        path,
+                        directory_revisions.get(&normalize_monitor_relative_path(path)),
+                        &mut directories,
+                    );
                 }
                 CfapiAction::EnsurePlaceholder { path, .. }
                 | CfapiAction::HydrateOnDemand { path, .. } => {
                     for parent in parent_directories_for_path(path) {
-                        record_remote_applied_directory(&parent, &mut directories);
+                        record_remote_applied_directory(&parent, None, &mut directories);
                     }
                 }
                 CfapiAction::QueueUploadOnClose { .. } | CfapiAction::MarkConflict { .. } => {}
@@ -315,10 +350,10 @@ impl RemoteAppliedTracker {
         }
     }
 
-    fn take_directory_suppression(&self, path: &str) -> bool {
+    fn take_directory_suppression(&self, path: &str) -> Option<Option<String>> {
         let normalized = normalize_monitor_relative_path(path);
         if normalized.is_empty() {
-            return false;
+            return None;
         }
 
         self.directories
@@ -805,10 +840,13 @@ impl SyncRootMonitor {
         }
 
         if entry.is_dir {
-            if self
+            if let Some(remote_revision) = self
                 .remote_applied_tracker
                 .take_directory_suppression(&rel_path)
             {
+                if let Some(entry) = current.get_mut(&rel_path) {
+                    entry.remote_revision = remote_revision;
+                }
                 tracing::info!(
                     "{}: suppressing local upload for remote-applied directory {}",
                     self.name,
@@ -1442,15 +1480,23 @@ fn directory_marker_path(path: &str) -> String {
     }
 }
 
-fn record_remote_applied_directory(path: &str, directories: &mut HashSet<String>) {
+fn record_remote_applied_directory(
+    path: &str,
+    remote_revision: Option<&String>,
+    directories: &mut HashMap<String, Option<String>>,
+) {
     let normalized = normalize_monitor_relative_path(path);
     if normalized.is_empty() {
         return;
     }
 
-    directories.insert(normalized.clone());
+    if let Some(remote_revision) = remote_revision {
+        directories.insert(normalized.clone(), Some(remote_revision.clone()));
+    } else {
+        directories.entry(normalized.clone()).or_insert(None);
+    }
     for parent in parent_directories_for_path(&normalized) {
-        directories.insert(parent);
+        directories.entry(parent).or_insert(None);
     }
 }
 
@@ -2134,6 +2180,70 @@ mod tests {
         assert!(
             uploads.iter().all(|path| path != "docs/"),
             "remote-applied directory should remain suppressed, uploads={uploads:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn live_remote_directory_refresh_retains_marker_revision_for_later_delete() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-monitor-live-directory-refresh-{unique}"));
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        monitor.seed_seen();
+        std::fs::create_dir_all(sync_root.join("from-refresh"))
+            .expect("failed to materialize remote directory");
+
+        let mut remote_directory = sync_core::NamespaceEntry::directory("from-refresh");
+        remote_directory.version = Some("refresh-marker-revision".to_string());
+        monitor
+            .remote_applied_tracker()
+            .record_plan_with_remote_snapshot(
+                &CfapiActionPlan {
+                    actions: vec![CfapiAction::EnsureDirectory {
+                        path: "from-refresh".to_string(),
+                    }],
+                },
+                &SyncSnapshot {
+                    local: Vec::new(),
+                    remote: vec![remote_directory],
+                },
+            );
+        monitor.walk();
+
+        assert_eq!(
+            monitor
+                .seen
+                .get("from-refresh")
+                .and_then(|entry| entry.remote_revision.as_deref()),
+            Some("refresh-marker-revision"),
+            "the live refresh suppression must retain the concrete marker revision"
+        );
+
+        std::fs::remove_dir(sync_root.join("from-refresh"))
+            .expect("failed to delete refreshed directory");
+        monitor.walk();
+
+        assert_eq!(
+            uploader
+                .delete_revisions
+                .lock()
+                .expect("delete revisions lock poisoned")
+                .as_slice(),
+            [(
+                "from-refresh/".to_string(),
+                "refresh-marker-revision".to_string()
+            )],
+            "a live-refreshed directory deletion must use its conditional marker revision"
         );
 
         let _ = std::fs::remove_dir_all(sync_root);

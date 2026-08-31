@@ -610,7 +610,8 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                         tracing::info!("remote-refresh: apply_action_plan error: {err}");
                         return;
                     }
-                    refresh_remote_applied_tracker.record_plan(&plan);
+                    refresh_remote_applied_tracker
+                        .record_plan_with_remote_snapshot(&plan, &update.snapshot);
                     report
                 };
                 log_remote_delete_reconcile_summary(&summary_label, &remote_delete_report);
