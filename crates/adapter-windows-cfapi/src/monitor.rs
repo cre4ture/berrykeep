@@ -1456,8 +1456,14 @@ fn parent_directories_for_path(path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::placeholder_metadata::reconcile_remote_delete_state;
+    use crate::runtime::{
+        SyncRootRegistration, apply_action_plan, register_sync_root, unregister_sync_root,
+    };
     use std::io::Read;
+    use std::path::PathBuf;
     use std::sync::Mutex;
+    use sync_core::{NamespaceEntry, SyncSnapshot};
     use windows_sys::Win32::Storage::CloudFilters::{
         CF_IN_SYNC_STATE_NOT_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNSPECIFIED,
     };
@@ -1472,6 +1478,19 @@ mod tests {
     struct FailOnceUploader {
         attempts: Mutex<HashMap<String, usize>>,
         uploads: Mutex<Vec<String>>,
+    }
+
+    /// A real Windows CFAPI registration so the monitor observes the same placeholder kind that
+    /// remote reconciliation removes in production.
+    struct RegisteredMonitorTestSyncRoot {
+        root_path: PathBuf,
+    }
+
+    impl Drop for RegisteredMonitorTestSyncRoot {
+        fn drop(&mut self) {
+            let _ = unregister_sync_root(&self.root_path);
+            let _ = std::fs::remove_dir_all(&self.root_path);
+        }
     }
 
     impl Uploader for MockUploader {
@@ -1536,6 +1555,62 @@ mod tests {
             placeholder_identity_path: None,
             placeholder_state: None,
             provider_hydration_active: false,
+        }
+    }
+
+    fn registered_monitor_test_sync_root(
+        test_name: &str,
+    ) -> (RegisteredMonitorTestSyncRoot, uuid::Uuid) {
+        let unique = uuid::Uuid::new_v4();
+        let root_path = std::env::temp_dir().join(format!("ironmesh-monitor-{test_name}-{unique}"));
+        let registration = SyncRootRegistration::new(
+            format!("test-monitor-{test_name}-{unique}"),
+            "Ironmesh Monitor Test",
+            &root_path,
+            uuid::Uuid::new_v4(),
+            None,
+        );
+        let identity =
+            register_sync_root(&registration).expect("test sync root registration should succeed");
+
+        (
+            RegisteredMonitorTestSyncRoot { root_path },
+            identity.provider_instance_id,
+        )
+    }
+
+    fn create_clean_provider_placeholder(
+        sync_root: &std::path::Path,
+        provider_instance_id: uuid::Uuid,
+        path: &str,
+    ) {
+        apply_action_plan(
+            sync_root,
+            &CfapiActionPlan {
+                actions: vec![CfapiAction::EnsurePlaceholder {
+                    path: path.to_string(),
+                    remote_version: "newer-revision".to_string(),
+                    remote_content_hash: "newer-content-hash".to_string(),
+                    remote_size: Some(1_024),
+                    remote_content_fingerprint: Some("newer-fingerprint".to_string()),
+                    remote_modified_at_unix: Some(1_725_000_001),
+                    remote_media: None,
+                }],
+            },
+            provider_instance_id,
+            true,
+        )
+        .expect("clean provider placeholder should be created");
+    }
+
+    fn stale_snapshot_without_removed_path() -> SyncSnapshot {
+        SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file(
+                "small-unrelated-change.txt",
+                "unrelated-revision",
+                "unrelated-hash",
+            )],
         }
     }
 
@@ -1775,6 +1850,134 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn undesired_current_behavior_monitor_echoes_reconciler_removal_as_path_only_server_delete() {
+        // CHARACTERIZATION ONLY: `reconcile_remote_delete_state` performs the same local
+        // placeholder removal as the incident. No file-removal origin is handed to the monitor,
+        // and the only Uploader deletion API argument is the path. This deliberately captures
+        // the current, undesired behavior and must be removed with the safety fix.
+        let (sync_root, provider_instance_id) =
+            registered_monitor_test_sync_root("reconciler-removal-delete-echo");
+        let path = "photos/after-upload.jpg";
+        create_clean_provider_placeholder(&sync_root.root_path, provider_instance_id, path);
+
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.root_path.clone(),
+            provider_instance_id,
+            uploader.clone(),
+        );
+        monitor.seed_seen();
+        assert!(
+            monitor
+                .seen
+                .get(path)
+                .and_then(|entry| entry.placeholder_identity_path.as_deref())
+                .is_some_and(|identity_path| identity_path == path),
+            "the monitor has observed the real provider placeholder before reconciliation"
+        );
+
+        let report = reconcile_remote_delete_state(
+            &sync_root.root_path,
+            &stale_snapshot_without_removed_path(),
+            provider_instance_id,
+        )
+        .expect("current reconciliation should complete");
+        assert!(report.deleted_paths.contains(path));
+        monitor.walk();
+
+        assert_eq!(
+            uploader
+                .deletes
+                .lock()
+                .expect("deletes lock poisoned")
+                .as_slice(),
+            ["photos/after-upload.jpg"],
+            "current monitor behavior echoes the reconciler removal using Uploader::delete_path(path)"
+        );
+    }
+
+    #[test]
+    fn monitor_user_file_delete_is_propagated_exactly_once() {
+        // Control behavior: later origin tracking must preserve propagation of genuine user
+        // deletions, while suppressing only adapter-applied removals.
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-monitor-user-delete-count-{unique}"));
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let removed_path = sync_root.join("documents/user-deleted.txt");
+        std::fs::create_dir_all(
+            removed_path
+                .parent()
+                .expect("test file must have a parent directory"),
+        )
+        .expect("failed to create test file parent directory");
+        std::fs::write(&removed_path, b"user deletion").expect("failed to create test file");
+
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        monitor.seed_seen();
+        std::fs::remove_file(&removed_path).expect("failed to simulate user deletion");
+        monitor.walk();
+        monitor.walk();
+
+        assert_eq!(
+            uploader
+                .deletes
+                .lock()
+                .expect("deletes lock poisoned")
+                .as_slice(),
+            ["documents/user-deleted.txt"],
+            "a user file deletion is emitted exactly once after the monitor advances its seen set"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    #[ignore = "expected to fail until remote-applied file removals are recorded and consumed by the monitor"]
+    fn desired_behavior_monitor_does_not_echo_provider_applied_file_removal_as_server_delete() {
+        // Desired behavior: a reconciler-originated local removal should be observed by the
+        // monitor but attributed to the adapter, rather than becoming a new server deletion.
+        // This fails today because RemoteAppliedTracker tracks directories only.
+        let (sync_root, provider_instance_id) =
+            registered_monitor_test_sync_root("reconciler-removal-no-delete-echo");
+        let path = "photos/remote-tombstone.jpg";
+        create_clean_provider_placeholder(&sync_root.root_path, provider_instance_id, path);
+
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.root_path.clone(),
+            provider_instance_id,
+            uploader.clone(),
+        );
+        monitor.seed_seen();
+        let report = reconcile_remote_delete_state(
+            &sync_root.root_path,
+            &stale_snapshot_without_removed_path(),
+            provider_instance_id,
+        )
+        .expect("current reconciliation should complete");
+        assert!(report.deleted_paths.contains(path));
+        monitor.walk();
+
+        assert!(
+            uploader
+                .deletes
+                .lock()
+                .expect("deletes lock poisoned")
+                .is_empty(),
+            "a confirmed remote-applied removal must not be echoed back to the server"
+        );
     }
 
     #[test]

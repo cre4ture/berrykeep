@@ -553,8 +553,85 @@ fn is_internal_sync_root_relative_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::{CfapiAction, CfapiActionPlan};
+    use crate::runtime::{
+        SyncRootRegistration, apply_action_plan, register_sync_root, unregister_sync_root,
+    };
+    use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
     use sync_core::NamespaceEntry;
+
+    /// Registers a real Windows CFAPI root so reconciliation sees the same
+    /// provider-managed placeholders as it does in production.
+    struct RegisteredTestSyncRoot {
+        root_path: PathBuf,
+    }
+
+    impl Drop for RegisteredTestSyncRoot {
+        fn drop(&mut self) {
+            let _ = unregister_sync_root(&self.root_path);
+            let _ = fs::remove_dir_all(&self.root_path);
+        }
+    }
+
+    fn registered_test_sync_root(test_name: &str) -> (RegisteredTestSyncRoot, Uuid) {
+        let unique = Uuid::new_v4();
+        let root_path = std::env::temp_dir().join(format!(
+            "ironmesh-placeholder-metadata-{test_name}-{unique}"
+        ));
+        let registration = SyncRootRegistration::new(
+            format!("test-placeholder-metadata-{test_name}-{unique}"),
+            "Ironmesh Placeholder Metadata Test",
+            &root_path,
+            Uuid::new_v4(),
+            None,
+        );
+        let identity =
+            register_sync_root(&registration).expect("test sync root registration should succeed");
+
+        (
+            RegisteredTestSyncRoot { root_path },
+            identity.provider_instance_id,
+        )
+    }
+
+    fn create_clean_provider_placeholder(
+        sync_root: &Path,
+        provider_instance_id: Uuid,
+        path: &str,
+        remote_version: &str,
+        remote_content_hash: &str,
+        remote_modified_at_unix: u64,
+    ) {
+        apply_action_plan(
+            sync_root,
+            &CfapiActionPlan {
+                actions: vec![CfapiAction::EnsurePlaceholder {
+                    path: path.to_string(),
+                    remote_version: remote_version.to_string(),
+                    remote_content_hash: remote_content_hash.to_string(),
+                    remote_size: Some(1_024),
+                    remote_content_fingerprint: Some(format!("fingerprint-{remote_content_hash}")),
+                    remote_modified_at_unix: Some(remote_modified_at_unix),
+                    remote_media: None,
+                }],
+            },
+            provider_instance_id,
+            true,
+        )
+        .expect("clean provider placeholder should be created");
+    }
+
+    fn remote_snapshot_with_small_unrelated_change() -> SyncSnapshot {
+        SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file(
+                "small-unrelated-change.txt",
+                "unrelated-revision",
+                "unrelated-hash",
+            )],
+        }
+    }
 
     #[test]
     fn conflict_refresh_preserves_local_file_metadata_and_sync_state() {
@@ -633,5 +710,184 @@ mod tests {
         assert!(report.preserved_paths.contains("notes.txt"));
 
         let _ = fs::remove_dir_all(sync_root);
+    }
+
+    /// Temporary green characterization of undesired current behavior.
+    /// Remove this test when deletions require a baseline-matching tombstone.
+    #[test]
+    fn undesired_current_behavior_reconcile_remote_delete_removes_newer_clean_placeholder_from_stale_snapshot()
+     {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("stale-snapshot-removes-newer-placeholder");
+        let path = "holiday/newer-photo.jpg";
+        let remote_version = "newer-revision";
+        let remote_content_hash = "newer-content-hash";
+        let remote_modified_at_unix = 1_725_000_001;
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            remote_version,
+            remote_content_hash,
+            remote_modified_at_unix,
+        );
+
+        let full_path = sync_root.root_path.join("holiday\\newer-photo.jpg");
+        let file = open_sync_path(&full_path, false).expect("placeholder should be reopenable");
+        let info = cf_get_placeholder_standard_info_with_identity(&file)
+            .expect("placeholder identity should be available");
+        let identity = decode_placeholder_file_identity(info.file_identity())
+            .expect("placeholder identity should decode");
+        assert_eq!(identity.remote_version.as_deref(), Some(remote_version));
+        assert_eq!(
+            identity.remote_content_hash.as_deref(),
+            Some(remote_content_hash)
+        );
+        assert_eq!(
+            identity.remote_modified_at_unix,
+            Some(remote_modified_at_unix)
+        );
+
+        // This models a remote listing fetched before the local upload created
+        // `path`. It has an unrelated current change, but no tombstone for this
+        // placeholder's revision, hash, or timestamp.
+        let report = reconcile_remote_delete_state(
+            &sync_root.root_path,
+            &remote_snapshot_with_small_unrelated_change(),
+            provider_instance_id,
+        )
+        .expect("current reconciliation should complete");
+
+        // Characterization only: this is the data-loss behavior to remove when
+        // the safe tombstone/revision validation is implemented.
+        assert!(report.deleted_paths.contains(path));
+        assert!(!full_path.exists());
+    }
+
+    /// Temporary green characterization of undesired current behavior.
+    /// Remove this test when reconciliation is scoped to confirmed removals.
+    #[test]
+    fn undesired_current_behavior_reconcile_remote_delete_scans_global_absence_for_small_unrelated_change()
+     {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("global-absence-deletes-unrelated-paths");
+        let first_path = "holiday/first-newer-file.jpg";
+        let second_path = "holiday/second-newer-file.mp4";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            first_path,
+            "first-revision",
+            "first-hash",
+            1_725_000_002,
+        );
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            second_path,
+            "second-revision",
+            "second-hash",
+            1_725_000_003,
+        );
+
+        let report = reconcile_remote_delete_state(
+            &sync_root.root_path,
+            &remote_snapshot_with_small_unrelated_change(),
+            provider_instance_id,
+        )
+        .expect("current reconciliation should complete");
+
+        // Characterization only: one unrelated entry in the supplied listing
+        // causes a full-root absence scan and removes both provider placeholders.
+        assert_eq!(report.deleted_paths.len(), 2);
+        assert!(report.deleted_paths.contains(first_path));
+        assert!(report.deleted_paths.contains(second_path));
+        assert!(
+            !sync_root
+                .root_path
+                .join("holiday\\first-newer-file.jpg")
+                .exists()
+        );
+        assert!(
+            !sync_root
+                .root_path
+                .join("holiday\\second-newer-file.mp4")
+                .exists()
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until remote deletes require a confirmed, baseline-matching tombstone"]
+    fn desired_behavior_reconcile_remote_delete_preserves_newer_placeholder_when_stale_snapshot_has_no_tombstone()
+     {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("stale-snapshot-must-preserve-placeholder");
+        let path = "holiday/newer-photo.jpg";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "newer-revision",
+            "newer-content-hash",
+            1_725_000_004,
+        );
+        let full_path = sync_root.root_path.join("holiday\\newer-photo.jpg");
+
+        let report = reconcile_remote_delete_state(
+            &sync_root.root_path,
+            &remote_snapshot_with_small_unrelated_change(),
+            provider_instance_id,
+        )
+        .expect("reconciliation should complete");
+
+        assert!(full_path.exists(), "stale absence must preserve local data");
+        assert!(report.deleted_paths.is_empty());
+    }
+
+    #[test]
+    #[ignore = "expected to fail until reconciliation is restricted to explicit confirmed remote deletions"]
+    fn desired_behavior_reconcile_remote_delete_preserves_paths_unrelated_to_the_remote_change_set()
+    {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("small-change-set-must-not-delete-unrelated-paths");
+        let first_path = "holiday/first-newer-file.jpg";
+        let second_path = "holiday/second-newer-file.mp4";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            first_path,
+            "first-revision",
+            "first-hash",
+            1_725_000_005,
+        );
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            second_path,
+            "second-revision",
+            "second-hash",
+            1_725_000_006,
+        );
+
+        let report = reconcile_remote_delete_state(
+            &sync_root.root_path,
+            &remote_snapshot_with_small_unrelated_change(),
+            provider_instance_id,
+        )
+        .expect("reconciliation should complete");
+
+        assert!(
+            sync_root
+                .root_path
+                .join("holiday\\first-newer-file.jpg")
+                .exists()
+        );
+        assert!(
+            sync_root
+                .root_path
+                .join("holiday\\second-newer-file.mp4")
+                .exists()
+        );
+        assert!(report.deleted_paths.is_empty());
     }
 }

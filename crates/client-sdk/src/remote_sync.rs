@@ -657,6 +657,140 @@ mod tests {
         );
     }
 
+    /// Characterization only: an older snapshot can replace a newer accepted
+    /// snapshot and report a path removal. This is the unsafe behaviour seen
+    /// when a delayed server refresh is applied after newer state exists.
+    ///
+    /// Remove this test when snapshot ordering/freshness validation is added.
+    #[test]
+    fn undesired_current_behavior_apply_snapshot_update_accepts_an_out_of_order_removal() {
+        let newer_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file(
+                "photos/newly-uploaded.jpg",
+                "revision-2",
+                "hash-2",
+            )],
+        };
+        let older_snapshot_without_the_file = SyncSnapshot {
+            local: Vec::new(),
+            remote: Vec::new(),
+        };
+        let mut current_snapshot = Some(newer_snapshot);
+        let mut updates = Vec::new();
+
+        apply_snapshot_update(
+            &mut current_snapshot,
+            older_snapshot_without_the_file,
+            &mut |update| updates.push(update),
+        );
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].changed_paths,
+            vec!["photos/newly-uploaded.jpg".to_string()]
+        );
+        assert!(updates[0].snapshot.remote.is_empty());
+        assert!(
+            current_snapshot
+                .expect("the old snapshot is retained")
+                .remote
+                .is_empty()
+        );
+    }
+
+    /// Desired safety contract for the characterization above.
+    ///
+    /// This remains ignored because it is intentionally red until snapshot
+    /// ordering/freshness validation is implemented.
+    #[test]
+    #[ignore = "expected to fail until out-of-order snapshots cannot replace newer accepted state"]
+    fn desired_behavior_out_of_order_snapshot_removal_is_rejected_until_a_fresh_snapshot_is_available()
+     {
+        let newer_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file(
+                "photos/newly-uploaded.jpg",
+                "revision-2",
+                "hash-2",
+            )],
+        };
+        let older_snapshot_without_the_file = SyncSnapshot {
+            local: Vec::new(),
+            remote: Vec::new(),
+        };
+        let mut current_snapshot = Some(newer_snapshot.clone());
+        let mut updates = Vec::new();
+
+        apply_snapshot_update(
+            &mut current_snapshot,
+            older_snapshot_without_the_file,
+            &mut |update| updates.push(update),
+        );
+
+        assert!(
+            updates.is_empty(),
+            "an older snapshot must not emit a removal"
+        );
+        assert_eq!(current_snapshot, Some(newer_snapshot));
+    }
+
+    /// Characterization only: a removal update identifies only a path and the
+    /// resulting snapshot. It carries neither the preceding revision nor a
+    /// tombstone/operation origin with which a consumer could prove the
+    /// removal is an authoritative remote deletion.
+    ///
+    /// Remove this test when updates carry typed, revision-linked deletions.
+    #[test]
+    fn undesired_current_behavior_removal_update_has_no_tombstone_or_predecessor_provenance() {
+        let mut current_snapshot = Some(SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file(
+                "photos/possibly-stale.jpg",
+                "revision-7",
+                "hash-7",
+            )],
+        });
+        let mut updates = Vec::new();
+
+        apply_snapshot_update(
+            &mut current_snapshot,
+            SyncSnapshot {
+                local: Vec::new(),
+                remote: Vec::new(),
+            },
+            &mut |update| updates.push(update),
+        );
+
+        let update = updates.pop().expect("a path-only removal update");
+        assert_eq!(
+            update.changed_paths,
+            vec!["photos/possibly-stale.jpg".to_string()]
+        );
+        assert!(update.snapshot.remote.is_empty());
+    }
+
+    #[test]
+    fn duplicate_snapshot_does_not_emit_a_second_update() {
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file(
+                "photos/holiday.jpg",
+                "revision-2",
+                "hash-2",
+            )],
+        };
+        let mut current_snapshot = Some(snapshot.clone());
+        let mut updates = Vec::new();
+
+        apply_snapshot_update(&mut current_snapshot, snapshot.clone(), &mut |update| {
+            updates.push(update)
+        });
+
+        assert!(updates.is_empty());
+        assert_eq!(current_snapshot, Some(snapshot));
+    }
+
     #[test]
     fn changed_paths_between_detects_content_fingerprint_updates() {
         let mut previous_entry =
@@ -1153,6 +1287,148 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         let _ = server.join();
+    }
+
+    fn run_sequence_regression_scenario(
+        second_update_timeout: Duration,
+    ) -> (
+        Result<RemoteSnapshotUpdate, mpsc::RecvTimeoutError>,
+        Result<RemoteSnapshotUpdate, mpsc::RecvTimeoutError>,
+        usize,
+        usize,
+    ) {
+        let wait_attempts = Arc::new(AtomicUsize::new(0));
+        let wait_attempts_for_route = Arc::clone(&wait_attempts);
+        let router = Router::new().route(
+            "/api/v1/store/index/changes/wait",
+            get(move || {
+                let wait_attempts = Arc::clone(&wait_attempts_for_route);
+                async move {
+                    let attempt = wait_attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Json(serde_json::json!({ "sequence": 5, "changed": true }))
+                    } else {
+                        Json(serde_json::json!({ "sequence": 0, "changed": false }))
+                    }
+                }
+            }),
+        );
+        let (addr, shutdown_tx, server) = spawn_test_server(router);
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let fetch_attempts = Arc::new(AtomicUsize::new(0));
+        let fetch_attempts_for_loop = Arc::clone(&fetch_attempts);
+        let update_count = Arc::new(AtomicUsize::new(0));
+        let update_count_for_callback = Arc::clone(&update_count);
+        let (tx, rx) = mpsc::channel();
+        let running_for_callback = Arc::clone(&running);
+
+        let handle = poller.spawn_fetcher_loop_with_fetch(
+            Arc::clone(&running),
+            Some(SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![NamespaceEntry::file(
+                    "photos/holiday.jpg",
+                    "revision-1",
+                    "hash-1",
+                )],
+            }),
+            fetcher,
+            move |_fetcher| {
+                let attempt = fetch_attempts_for_loop.fetch_add(1, Ordering::SeqCst);
+                Ok(if attempt == 0 {
+                    SyncSnapshot {
+                        local: Vec::new(),
+                        remote: vec![NamespaceEntry::file(
+                            "photos/holiday.jpg",
+                            "revision-2",
+                            "hash-2",
+                        )],
+                    }
+                } else {
+                    SyncSnapshot {
+                        local: Vec::new(),
+                        remote: Vec::new(),
+                    }
+                })
+            },
+            move |update| {
+                let count = update_count_for_callback.fetch_add(1, Ordering::SeqCst) + 1;
+                tx.send(update).expect("update should send");
+                if count == 2 {
+                    running_for_callback.store(false, Ordering::SeqCst);
+                }
+            },
+        );
+
+        let first_update = rx.recv_timeout(Duration::from_secs(2));
+        let second_update = rx.recv_timeout(second_update_timeout);
+        running.store(false, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("notification loop should stop cleanly");
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+
+        (
+            first_update,
+            second_update,
+            wait_attempts.load(Ordering::SeqCst),
+            fetch_attempts.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Characterization only: after a server notification sequence regression,
+    /// the loop fetches and applies the returned snapshot even when that
+    /// snapshot is older and omits a file accepted by the preceding refresh.
+    ///
+    /// Remove this test when a sequence regression enters a deletion-safe
+    /// rebaseline mode instead of applying potentially stale removals.
+    #[test]
+    fn undesired_current_behavior_sequence_regression_can_emit_a_stale_file_removal() {
+        let (first_update, stale_removal, wait_attempts, fetch_attempts) =
+            run_sequence_regression_scenario(Duration::from_secs(2));
+
+        let first_update = first_update.expect("first refresh should update the file revision");
+        let stale_removal =
+            stale_removal.expect("sequence regression should apply the older empty snapshot");
+
+        assert_eq!(wait_attempts, 2);
+        assert_eq!(fetch_attempts, 2);
+        assert_eq!(
+            first_update.changed_paths,
+            vec!["photos/holiday.jpg".to_string()]
+        );
+        assert_eq!(
+            stale_removal.changed_paths,
+            vec!["photos/holiday.jpg".to_string()]
+        );
+        assert!(stale_removal.snapshot.remote.is_empty());
+    }
+
+    /// Desired safety contract for the sequence-regression characterization
+    /// above. It uses the production notification loop and fails today because
+    /// the second fetch emits a removal from the older empty snapshot.
+    #[test]
+    #[ignore = "expected to fail until sequence regressions cannot apply stale removals"]
+    fn desired_behavior_sequence_regression_does_not_emit_a_stale_file_removal() {
+        let (first_update, unexpected_removal, _, _) =
+            run_sequence_regression_scenario(Duration::from_millis(500));
+
+        let first_update = first_update.expect("first refresh should update the file revision");
+        assert_eq!(
+            first_update.changed_paths,
+            vec!["photos/holiday.jpg".to_string()]
+        );
+        assert!(
+            unexpected_removal.is_err(),
+            "a sequence regression must not emit a removal from an older snapshot"
+        );
     }
 
     #[test]

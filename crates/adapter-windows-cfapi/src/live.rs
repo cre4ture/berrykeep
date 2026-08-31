@@ -330,6 +330,46 @@ fn windows_download_stage_base_root(base: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn capture_single_http_request() -> (String, std::thread::JoinHandle<()>, mpsc::Receiver<String>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should expose its address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test request should connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout should be configurable");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4_096];
+            loop {
+                let read = stream.read(&mut chunk).expect("request should be readable");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx
+                .send(String::from_utf8_lossy(&request).into_owned())
+                .expect("captured request should be delivered");
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("test response should be writable");
+        });
+        (format!("http://{address}"), handle, request_rx)
+    }
 
     #[test]
     fn base_url_normalization_adds_scheme_and_trailing_slash() {
@@ -343,6 +383,57 @@ mod tests {
         assert_eq!(
             windows_download_stage_base_root(base.clone()),
             base.join("Ironmesh").join("cfapi-downloads")
+        );
+    }
+
+    /// Temporary green characterization of undesired current behavior.
+    /// Remove this test when adapter deletes carry a baseline revision precondition.
+    #[test]
+    fn undesired_current_behavior_windows_delete_request_has_no_revision_precondition() {
+        let (base_url, server, request_rx) = capture_single_http_request();
+        let client = IronMeshClient::from_direct_base_url(base_url);
+        let hydrator = ServerNodeHydrator::with_client(
+            client,
+            std::env::temp_dir().join(format!("ironmesh-delete-request-{}", uuid::Uuid::new_v4())),
+        );
+
+        Uploader::delete_path(&hydrator, "photos/stale.jpg")
+            .expect("current unconditional delete request should be accepted by the test server");
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delete request should be captured");
+        server.join().expect("test server should stop cleanly");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(request_line.starts_with("POST /api/v1/store/delete?"));
+        assert!(request_line.contains("key=photos%2Fstale.jpg"));
+        assert!(
+            !request_line.contains("expected_revision="),
+            "UNDESIRED CURRENT BEHAVIOR: the Windows adapter sends an unconditional server delete: {request_line}"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until the Windows adapter sends the placeholder baseline as expected_revision"]
+    fn desired_behavior_windows_delete_request_contains_revision_precondition() {
+        let (base_url, server, request_rx) = capture_single_http_request();
+        let client = IronMeshClient::from_direct_base_url(base_url);
+        let hydrator = ServerNodeHydrator::with_client(
+            client,
+            std::env::temp_dir().join(format!("ironmesh-delete-request-{}", uuid::Uuid::new_v4())),
+        );
+
+        Uploader::delete_path(&hydrator, "photos/stale.jpg")
+            .expect("delete request should be accepted by the test server");
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delete request should be captured");
+        server.join().expect("test server should stop cleanly");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(
+            request_line.contains("expected_revision="),
+            "a remote delete must be conditional on the revision observed before the local disappearance: {request_line}"
         );
     }
 }
