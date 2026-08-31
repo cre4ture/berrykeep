@@ -13244,6 +13244,13 @@ fn build_store_index_entries_with_hashes_propagates_content_fingerprints() {
         "docs/readme.txt".to_string(),
         "shared-fingerprint".to_string(),
     )]);
+    let revisions = std::collections::HashMap::from([(
+        "docs/readme.txt".to_string(),
+        super::storage::ObjectRevisionMetadata {
+            version_id: "version-42".to_string(),
+            created_at_unix: 1_723_456_789,
+        },
+    )]);
 
     let entries = super::build_store_index_entries_with_hashes(
         &keys,
@@ -13253,6 +13260,7 @@ fn build_store_index_entries_with_hashes_propagates_content_fingerprints() {
         Some(&sizes),
         Some(&content_fingerprints),
         None,
+        Some(&revisions),
     );
 
     let file_entry = entries
@@ -13266,6 +13274,7 @@ fn build_store_index_entries_with_hashes_propagates_content_fingerprints() {
         Some("shared-fingerprint")
     );
     assert_eq!(file_entry.size_bytes, Some(42));
+    assert_eq!(file_entry.version.as_deref(), Some("version-42"));
 }
 
 #[test]

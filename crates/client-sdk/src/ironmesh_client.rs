@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use sync_core::{NamespaceEntry, SyncSnapshot};
+use sync_core::{EntryKind, NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
     ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity,
@@ -3383,6 +3383,10 @@ pub struct UploadResult {
     pub upload_mode: UploadMode,
     pub chunk_size_bytes: Option<usize>,
     pub chunk_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3498,6 +3502,14 @@ struct UploadSessionCompleteResponse {
     total_size_bytes: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct PutObjectResponse {
+    #[serde(default)]
+    version_id: Option<String>,
+    #[serde(default)]
+    manifest_hash: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ObjectHeadResponse {
     total_size_bytes: u64,
@@ -3597,6 +3609,10 @@ pub enum PreferredHeadReason {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VersionRecordSummary {
     pub version_id: String,
+    #[serde(default)]
+    pub entry_type: String,
+    #[serde(default)]
+    pub content_hash: Option<String>,
     pub logical_path: Option<String>,
     pub parent_version_ids: Vec<String>,
     pub state: VersionConsistencyState,
@@ -5088,6 +5104,27 @@ impl IronMeshClient {
         data: Bytes,
         expected_revision: Option<&str>,
     ) -> Result<StorageObjectMeta> {
+        Ok(self
+            .put_with_metadata_expected_revision(key, data, expected_revision)
+            .await?
+            .meta)
+    }
+
+    pub async fn put_with_metadata(
+        &self,
+        key: impl Into<String>,
+        data: Bytes,
+    ) -> Result<UploadResult> {
+        self.put_with_metadata_expected_revision(key, data, None)
+            .await
+    }
+
+    pub async fn put_with_metadata_expected_revision(
+        &self,
+        key: impl Into<String>,
+        data: Bytes,
+        expected_revision: Option<&str>,
+    ) -> Result<UploadResult> {
         let key = key.into();
         let mut url = self.store_key_url(&key)?;
         append_optional_query(&mut url, "expected_revision", expected_revision);
@@ -5099,10 +5136,26 @@ impl IronMeshClient {
         if !response.status.is_success() {
             bail!("server rejected PUT for key={key}: {}", response.status);
         }
+        let mutation = if response.body.is_empty() {
+            PutObjectResponse {
+                version_id: None,
+                manifest_hash: None,
+            }
+        } else {
+            serde_json::from_slice::<PutObjectResponse>(&response.body)
+                .with_context(|| format!("failed to parse PUT mutation response for key={key}"))?
+        };
 
-        Ok(StorageObjectMeta {
-            key,
-            size_bytes: data.len(),
+        Ok(UploadResult {
+            meta: StorageObjectMeta {
+                key,
+                size_bytes: data.len(),
+            },
+            upload_mode: UploadMode::Direct,
+            chunk_size_bytes: None,
+            chunk_count: None,
+            version_id: mutation.version_id,
+            manifest_hash: mutation.manifest_hash,
         })
     }
 
@@ -7473,6 +7526,18 @@ impl IronMeshClient {
         runtime.block_on(self.delete_path(key))
     }
 
+    pub fn delete_path_with_expected_revision_blocking(
+        &self,
+        key: impl AsRef<str>,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        let key = key.as_ref().to_string();
+        let expected_revision = expected_revision.map(str::to_string);
+
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.delete_path_with_expected_revision(key, expected_revision.as_deref()))
+    }
+
     pub fn rename_path_blocking(
         &self,
         from_path: impl Into<String>,
@@ -7495,13 +7560,7 @@ impl IronMeshClient {
         let length = data.len();
 
         if length <= LARGE_UPLOAD_THRESHOLD_BYTES {
-            let meta = self.put(key, data).await?;
-            return Ok(UploadResult {
-                meta,
-                upload_mode: UploadMode::Direct,
-                chunk_size_bytes: None,
-                chunk_count: None,
-            });
+            return self.put_with_metadata(key, data).await;
         }
         let session = self
             .start_upload_session_with_chunk_refs(
@@ -7547,15 +7606,7 @@ impl IronMeshClient {
                 .with_context(|| format!("failed reading payload for key={key}"))?;
 
             let runtime = blocking_runtime()?;
-            return runtime.block_on(async {
-                let meta = self.put(key, Bytes::from(buf)).await?;
-                Ok(UploadResult {
-                    meta,
-                    upload_mode: UploadMode::Direct,
-                    chunk_size_bytes: None,
-                    chunk_count: None,
-                })
-            });
+            return runtime.block_on(async { self.put_with_metadata(key, Bytes::from(buf)).await });
         }
 
         tracing::info!("using chunked upload for key={key} with length={length} bytes");
@@ -9049,6 +9100,8 @@ fn upload_result_from_session_complete(
         upload_mode: UploadMode::Chunked,
         chunk_size_bytes: Some(session.chunk_size_bytes),
         chunk_count: Some(session.chunk_count),
+        version_id: Some(completed.version_id.clone()),
+        manifest_hash: Some(completed.manifest_hash.clone()),
     }
 }
 
@@ -9429,12 +9482,16 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
             continue;
         }
 
-        let version = entry.version.unwrap_or_else(|| "server-head".to_string());
-        let content_hash = entry
-            .content_hash
-            .unwrap_or_else(|| format!("server-head:{}", entry.path));
-        let mut remote_entry =
-            NamespaceEntry::file_sized(entry.path.clone(), version, content_hash, entry.size_bytes);
+        let mut remote_entry = NamespaceEntry {
+            path: entry.path,
+            kind: EntryKind::File,
+            version: entry.version,
+            content_hash: entry.content_hash,
+            content_fingerprint: None,
+            size_bytes: entry.size_bytes,
+            modified_at_unix: None,
+            media: None,
+        };
         remote_entry.content_fingerprint = entry.content_fingerprint;
         remote_entry.modified_at_unix = entry.modified_at_unix;
         remote_entry.media = entry.media.map(namespace_media_metadata);

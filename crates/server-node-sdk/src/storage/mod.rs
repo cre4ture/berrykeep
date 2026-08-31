@@ -2439,6 +2439,12 @@ pub(crate) struct StoreIndexInspector {
     metadata_store: Arc<dyn MetadataStore>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectRevisionMetadata {
+    pub(crate) version_id: String,
+    pub(crate) created_at_unix: u64,
+}
+
 #[derive(Clone)]
 pub(crate) struct ClusterReplicasPersister {
     metadata_store: Arc<dyn MetadataStore>,
@@ -3163,6 +3169,58 @@ impl StoreIndexInspector {
             }
         }
         Ok(modified)
+    }
+
+    /// Resolves the concrete revision represented by each store-index entry.
+    ///
+    /// Current listings expose the index's preferred head only when it matches
+    /// the current manifest. Snapshot listings instead select the newest
+    /// matching revision that existed when the snapshot was created.
+    pub(crate) async fn object_revision_metadata_by_key(
+        &self,
+        object_hashes: &HashMap<String, String>,
+        object_ids: &HashMap<String, String>,
+        max_created_at_unix: Option<u64>,
+    ) -> Result<HashMap<String, ObjectRevisionMetadata>> {
+        let mut revisions = HashMap::with_capacity(object_hashes.len());
+
+        for (key, manifest_hash) in object_hashes {
+            let Some(object_id) = object_ids.get(key) else {
+                continue;
+            };
+            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
+                continue;
+            };
+
+            let record = match max_created_at_unix {
+                None => choose_preferred_head(&index)
+                    .and_then(|version_id| index.versions.get(&version_id))
+                    .filter(|record| record.manifest_hash == *manifest_hash),
+                Some(limit) => index
+                    .versions
+                    .values()
+                    .filter(|record| {
+                        record.manifest_hash == *manifest_hash && record.created_at_unix <= limit
+                    })
+                    .max_by(|left, right| {
+                        left.created_at_unix
+                            .cmp(&right.created_at_unix)
+                            .then_with(|| left.version_id.cmp(&right.version_id))
+                    }),
+            };
+
+            if let Some(record) = record {
+                revisions.insert(
+                    key.clone(),
+                    ObjectRevisionMetadata {
+                        version_id: record.version_id.clone(),
+                        created_at_unix: record.created_at_unix,
+                    },
+                );
+            }
+        }
+
+        Ok(revisions)
     }
 
     pub(crate) async fn lookup_media_cache(

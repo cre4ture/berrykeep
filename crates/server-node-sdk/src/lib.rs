@@ -13810,6 +13810,8 @@ struct VersionRecordResponse {
     version_id: String,
     entry_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     logical_path: Option<String>,
     parent_version_ids: Vec<String>,
     state: VersionConsistencyState,
@@ -13839,6 +13841,12 @@ struct VersionGraphResponse {
     preferred_head_reason: Option<PreferredHeadReason>,
     head_version_ids: Vec<String>,
     versions: Vec<VersionRecordResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct PutObjectResponse {
+    version_id: String,
+    manifest_hash: String,
 }
 
 type StoreIndexSnapshotScan = (
@@ -14941,7 +14949,14 @@ async fn put_object_response(
                 dedup_reused_chunks = outcome.dedup_reused_chunks,
                 "stored object"
             );
-            StatusCode::CREATED.into_response()
+            (
+                StatusCode::CREATED,
+                Json(PutObjectResponse {
+                    version_id: outcome.version_id,
+                    manifest_hash: outcome.manifest_hash,
+                }),
+            )
+                .into_response()
         }
         Err(err) => {
             tracing::error!(error = %err, key = %key, "failed to store object");
@@ -16974,31 +16989,28 @@ async fn list_store_index_response_attempt(
         }
     };
     let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
-    let modified_time_lookup_started_at = Instant::now();
-    let key_modified_times = match store_index_inspector
-        .object_modified_at_by_key(
+    let revision_lookup_started_at = Instant::now();
+    let key_revisions = match store_index_inspector
+        .object_revision_metadata_by_key(
             &visible_object_hashes,
             &visible_object_ids,
             snapshot_created_at_limit,
         )
         .await
     {
-        Ok(modified_times) => modified_times,
+        Ok(revisions) => revisions,
         Err(err) => {
-            if query.snapshot.is_some() {
-                tracing::error!(
-                    snapshot = snapshot_label,
-                    error = %err,
-                    "failed to compute snapshot key modified times"
-                );
-            } else {
-                tracing::error!(error = %err, "failed to compute current key modified times");
-            }
+            tracing::error!(error = %err, "failed to resolve store index revisions");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let modified_time_lookup_ms = modified_time_lookup_started_at.elapsed().as_millis();
-    let metadata_lookup_ms = content_summary_lookup_ms + modified_time_lookup_ms;
+    let revision_lookup_ms = revision_lookup_started_at.elapsed().as_millis();
+    let key_modified_times = key_revisions
+        .iter()
+        .map(|(key, metadata)| (key.clone(), metadata.created_at_unix))
+        .collect::<HashMap<_, _>>();
+    let modified_time_lookup_ms = revision_lookup_ms;
+    let metadata_lookup_ms = content_summary_lookup_ms + revision_lookup_ms;
 
     let mut entries = build_store_index_entries_from_plan(
         &entry_plan,
@@ -17006,6 +17018,7 @@ async fn list_store_index_response_attempt(
         Some(&key_sizes),
         Some(&key_content_fingerprints),
         Some(&key_modified_times),
+        Some(&key_revisions),
     );
     let media_entry_count = entries
         .iter()
@@ -17418,31 +17431,28 @@ async fn list_store_index_response_cursor_mode(
         }
     };
     let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
-    let modified_time_lookup_started_at = Instant::now();
-    let key_modified_times = match store_index_inspector
-        .object_modified_at_by_key(
+    let revision_lookup_started_at = Instant::now();
+    let key_revisions = match store_index_inspector
+        .object_revision_metadata_by_key(
             &visible_object_hashes,
             &visible_object_ids,
             snapshot_created_at_limit,
         )
         .await
     {
-        Ok(modified_times) => modified_times,
+        Ok(revisions) => revisions,
         Err(err) => {
-            if query.snapshot.is_some() {
-                tracing::error!(
-                    snapshot = snapshot_label,
-                    error = %err,
-                    "failed to compute snapshot key modified times"
-                );
-            } else {
-                tracing::error!(error = %err, "failed to compute current key modified times");
-            }
+            tracing::error!(error = %err, "failed to resolve cursor store index revisions");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let modified_time_lookup_ms = modified_time_lookup_started_at.elapsed().as_millis();
-    let metadata_lookup_ms = content_summary_lookup_ms + modified_time_lookup_ms;
+    let revision_lookup_ms = revision_lookup_started_at.elapsed().as_millis();
+    let key_modified_times = key_revisions
+        .iter()
+        .map(|(key, metadata)| (key.clone(), metadata.created_at_unix))
+        .collect::<HashMap<_, _>>();
+    let modified_time_lookup_ms = revision_lookup_ms;
+    let metadata_lookup_ms = content_summary_lookup_ms + revision_lookup_ms;
 
     let mut entries = page
         .entries
@@ -17454,6 +17464,7 @@ async fn list_store_index_response_cursor_mode(
                 Some(&key_sizes),
                 Some(&key_content_fingerprints),
                 Some(&key_modified_times),
+                Some(&key_revisions),
             ),
             listing::KeyListingEntryKind::CommonPrefix => {
                 build_store_index_prefix_entry(entry.path.clone())
@@ -18134,7 +18145,7 @@ fn media_type_for_path(path: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec<StoreIndexEntry> {
-    build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None, None)
+    build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None, None, None)
 }
 
 #[derive(Debug, Clone)]
@@ -18221,6 +18232,7 @@ fn build_store_index_entries_with_hashes(
     sizes_by_key: Option<&HashMap<String, u64>>,
     content_fingerprints_by_key: Option<&HashMap<String, String>>,
     modified_times_by_key: Option<&HashMap<String, u64>>,
+    revisions_by_key: Option<&HashMap<String, storage::ObjectRevisionMetadata>>,
 ) -> Vec<StoreIndexEntry> {
     let plan = plan_store_index_entries(keys, prefix, depth);
     build_store_index_entries_from_plan(
@@ -18229,6 +18241,7 @@ fn build_store_index_entries_with_hashes(
         sizes_by_key,
         content_fingerprints_by_key,
         modified_times_by_key,
+        revisions_by_key,
     )
 }
 
@@ -18238,6 +18251,7 @@ fn build_store_index_entries_from_plan(
     sizes_by_key: Option<&HashMap<String, u64>>,
     content_fingerprints_by_key: Option<&HashMap<String, String>>,
     modified_times_by_key: Option<&HashMap<String, u64>>,
+    revisions_by_key: Option<&HashMap<String, storage::ObjectRevisionMetadata>>,
 ) -> Vec<StoreIndexEntry> {
     let mut entries = Vec::with_capacity(plan.file_entries.len() + plan.prefix_entries.len());
     for path in &plan.prefix_entries {
@@ -18250,6 +18264,7 @@ fn build_store_index_entries_from_plan(
             sizes_by_key,
             content_fingerprints_by_key,
             modified_times_by_key,
+            revisions_by_key,
         ));
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -18279,6 +18294,7 @@ fn build_store_index_object_entry(
     sizes_by_key: Option<&HashMap<String, u64>>,
     content_fingerprints_by_key: Option<&HashMap<String, String>>,
     modified_times_by_key: Option<&HashMap<String, u64>>,
+    revisions_by_key: Option<&HashMap<String, storage::ObjectRevisionMetadata>>,
 ) -> StoreIndexEntry {
     let content_hash = hashes_by_key
         .and_then(|values| values.get(path.as_str()))
@@ -18292,10 +18308,13 @@ fn build_store_index_object_entry(
     let modified_at_unix = modified_times_by_key
         .and_then(|values| values.get(path.as_str()))
         .copied();
+    let version = revisions_by_key
+        .and_then(|values| values.get(path.as_str()))
+        .map(|metadata| metadata.version_id.clone());
     StoreIndexEntry {
         path,
         entry_type: "key".to_string(),
-        version: None,
+        version,
         content_hash,
         size_bytes,
         modified_at_unix,
@@ -19779,7 +19798,7 @@ async fn list_versions_admin(
 
 async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route: &str) -> Response {
     let store = read_store(state, "versions.list").await;
-    match store.list_versions(key).await {
+    match store.list_versions_with_history(key).await {
         Ok(Some(summary)) => {
             let store_index_inspector = match store.store_index_inspector().await {
                 Ok(inspector) => inspector,
@@ -19859,6 +19878,7 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
                     } else {
                         "key".to_string()
                     },
+                    content_hash: (!is_tombstone).then_some(version.manifest_hash),
                     logical_path: version.logical_path,
                     parent_version_ids: version.parent_version_ids,
                     state: version.state,

@@ -1152,11 +1152,8 @@ fn snapshot_conversion_maps_prefix_and_keys() {
     assert_eq!(snapshot.remote.len(), 2);
     assert_eq!(snapshot.remote[0], NamespaceEntry::directory("docs"));
     assert_eq!(snapshot.remote[1].path, "docs/readme.txt");
-    assert_eq!(snapshot.remote[1].version.as_deref(), Some("server-head"));
-    assert_eq!(
-        snapshot.remote[1].content_hash.as_deref(),
-        Some("server-head:docs/readme.txt")
-    );
+    assert_eq!(snapshot.remote[1].version, None);
+    assert_eq!(snapshot.remote[1].content_hash, None);
     assert_eq!(
         snapshot.remote[1].content_fingerprint.as_deref(),
         Some("cfp-readme")
@@ -1179,10 +1176,8 @@ fn snapshot_conversion_maps_prefix_and_keys() {
     );
 }
 
-/// Temporary green characterization of undesired current behavior.
-/// Remove this test when snapshots retain concrete server revision IDs.
 #[test]
-fn undesired_current_behavior_snapshot_entries_without_revisions_share_server_head_marker() {
+fn snapshot_entries_without_revisions_leave_revision_identity_absent() {
     let entries = [
         ("docs/first.txt", "manifest-first", 1_723_456_789),
         ("docs/second.txt", "manifest-second", 1_723_456_790),
@@ -1205,20 +1200,19 @@ fn undesired_current_behavior_snapshot_entries_without_revisions_share_server_he
     let snapshot = snapshot_from_store_index_entries(entries);
 
     assert_eq!(snapshot.remote.len(), 2);
-    assert!(
-        snapshot
-            .remote
-            .iter()
-            .all(|entry| entry.version.as_deref() == Some("server-head")),
-        "UNDESIRED CURRENT BEHAVIOR: distinct server objects without listed revision IDs are assigned the same non-authoritative marker"
+    assert!(snapshot.remote.iter().all(|entry| entry.version.is_none()));
+    assert_eq!(
+        snapshot.remote[0].content_hash.as_deref(),
+        Some("manifest-first")
+    );
+    assert_eq!(
+        snapshot.remote[1].content_hash.as_deref(),
+        Some("manifest-second")
     );
 }
 
 #[test]
-#[should_panic(
-    expected = "a delete precondition requires a concrete server revision, not a shared selector"
-)]
-fn desired_behavior_snapshot_entries_never_use_server_head_as_a_revision_identity() {
+fn snapshot_entries_never_invent_server_head_as_a_revision_identity() {
     let snapshot = snapshot_from_store_index_entries(vec![StoreIndexEntry {
         path: "docs/readme.txt".to_string(),
         entry_type: "key".to_string(),
@@ -1232,10 +1226,10 @@ fn desired_behavior_snapshot_entries_never_use_server_head_as_a_revision_identit
         media: None,
     }]);
 
-    assert_ne!(
-        snapshot.remote[0].version.as_deref(),
-        Some("server-head"),
-        "a delete precondition requires a concrete server revision, not a shared selector"
+    assert_eq!(snapshot.remote[0].version, None);
+    assert_eq!(
+        snapshot.remote[0].content_hash.as_deref(),
+        Some("manifest-readme")
     );
 }
 
@@ -1264,25 +1258,7 @@ fn completed_upload_mapping_fixture() -> (UploadSessionView, UploadSessionComple
     (session, completed)
 }
 
-/// Temporary green characterization of undesired current behavior.
-/// Remove this test when upload results retain the confirmed revision and hash.
 #[test]
-fn undesired_current_behavior_upload_result_discards_server_revision_and_manifest_hash() {
-    let (session, completed) = completed_upload_mapping_fixture();
-
-    let result = upload_result_from_session_complete("docs/readme.txt", &session, &completed);
-    let serialized = serde_json::to_value(result).expect("upload result should serialize");
-
-    assert!(
-        serialized.get("version_id").is_none() && serialized.get("manifest_hash").is_none(),
-        "UNDESIRED CURRENT BEHAVIOR: the client receives revision/hash metadata but drops both from UploadResult"
-    );
-}
-
-#[test]
-#[should_panic(
-    expected = "completed upload result must retain the confirmed server revision and manifest hash"
-)]
 fn desired_behavior_upload_result_retains_server_revision_and_manifest_hash() {
     let (session, completed) = completed_upload_mapping_fixture();
 
@@ -1553,13 +1529,22 @@ async fn expected_revision_is_sent_separately_for_put_delete_and_recursive_delet
         axum::extract::Query(query): axum::extract::Query<
             std::collections::HashMap<String, String>,
         >,
-    ) -> axum::http::StatusCode {
+    ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
         if query.get("expected_revision").map(String::as_str) == Some("version-7")
             && !query.contains_key("parent")
         {
-            axum::http::StatusCode::CREATED
+            (
+                axum::http::StatusCode::CREATED,
+                axum::Json(serde_json::json!({
+                    "version_id": "version-8",
+                    "manifest_hash": "manifest-8",
+                })),
+            )
         } else {
-            axum::http::StatusCode::BAD_REQUEST
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({})),
+            )
         }
     }
 
@@ -1593,14 +1578,16 @@ async fn expected_revision_is_sent_separately_for_put_delete_and_recursive_delet
     });
 
     let client = IronMeshClient::from_direct_base_url(format!("http://{addr}"));
-    client
-        .put_with_expected_revision(
+    let upload = client
+        .put_with_metadata_expected_revision(
             "docs/readme.txt",
             bytes::Bytes::from_static(b"updated"),
             Some("version-7"),
         )
         .await
         .expect("expected revision PUT should be accepted");
+    assert_eq!(upload.version_id.as_deref(), Some("version-8"));
+    assert_eq!(upload.manifest_hash.as_deref(), Some("manifest-8"));
     client
         .delete_path_with_expected_revision("docs/readme.txt", Some("version-7"))
         .await
@@ -1626,6 +1613,8 @@ async fn list_versions_parses_version_graph_summary() {
             head_version_ids: vec!["v2".to_string()],
             versions: vec![VersionRecordSummary {
                 version_id: "v2".to_string(),
+                entry_type: "key".to_string(),
+                content_hash: Some("manifest-v2".to_string()),
                 logical_path: Some("docs/readme.txt".to_string()),
                 parent_version_ids: vec!["v1".to_string()],
                 state: VersionConsistencyState::Confirmed,
@@ -1658,6 +1647,11 @@ async fn list_versions_parses_version_graph_summary() {
     assert_eq!(versions.preferred_head_version_id.as_deref(), Some("v2"));
     assert_eq!(versions.versions.len(), 1);
     assert_eq!(versions.versions[0].version_id, "v2");
+    assert_eq!(versions.versions[0].entry_type, "key");
+    assert_eq!(
+        versions.versions[0].content_hash.as_deref(),
+        Some("manifest-v2")
+    );
 
     handle.abort();
 }
