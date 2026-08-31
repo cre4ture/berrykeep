@@ -2195,6 +2195,8 @@ mod tests {
             head_version_ids: vec![format!("version-{}", object.object_id)],
             versions: vec![VersionRecordSummary {
                 version_id: format!("version-{}", object.object_id),
+                entry_type: "key".to_string(),
+                content_hash: None,
                 logical_path: Some(key),
                 parent_version_ids: Vec::new(),
                 state: VersionConsistencyState::Confirmed,
