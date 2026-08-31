@@ -13808,6 +13808,96 @@ run_on_main_metadata_backends!(
     autonomous_post_write_replication_pushes_to_missing_remote_nodes_turso
 );
 
+async fn public_versions_preserves_tombstone_provenance_after_delete_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let key = "versions-delete-provenance.txt";
+
+    let (live_version_id, live_manifest_hash, live_created_at_unix, tombstone_version_id) = {
+        let mut store = lock_store(&state, "tests.versions_delete_provenance.seed").await;
+        let live = store
+            .put_object_versioned(
+                key,
+                Bytes::from_static(b"original version"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let live_created_at_unix = store
+            .list_versions(key)
+            .await
+            .unwrap()
+            .unwrap()
+            .versions
+            .into_iter()
+            .find(|version| version.version_id == live.version_id)
+            .expect("uploaded version should be listed before deletion")
+            .created_at_unix;
+        let tombstone_version_id = store
+            .tombstone_object(key, PutOptions::default())
+            .await
+            .unwrap();
+        (
+            live.version_id,
+            live.manifest_hash,
+            live_created_at_unix,
+            tombstone_version_id,
+        )
+    };
+
+    let response = super::build_server_apps(&state)
+        .public_app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/versions/{key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    assert_eq!(
+        payload["preferred_head_version_id"].as_str(),
+        Some(tombstone_version_id.as_str())
+    );
+    let versions = payload["versions"]
+        .as_array()
+        .expect("versions response should contain an array");
+    let tombstone = versions
+        .iter()
+        .find(|version| version["version_id"].as_str() == Some(tombstone_version_id.as_str()))
+        .expect("tombstone should be returned through version history");
+    assert_eq!(tombstone["entry_type"], "tombstone");
+    assert!(tombstone.get("content_hash").is_none());
+    assert_eq!(
+        tombstone["parent_version_ids"],
+        serde_json::json!([live_version_id.as_str()])
+    );
+
+    let predecessor = versions
+        .iter()
+        .find(|version| version["version_id"].as_str() == Some(live_version_id.as_str()))
+        .expect("live predecessor should remain visible after tombstoning");
+    assert_eq!(predecessor["entry_type"], "key");
+    assert_eq!(predecessor["content_hash"], live_manifest_hash);
+    assert_eq!(
+        predecessor["created_at_unix"].as_u64(),
+        Some(live_created_at_unix)
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    public_versions_preserves_tombstone_provenance_after_delete_impl,
+    public_versions_preserves_tombstone_provenance_after_delete,
+    public_versions_preserves_tombstone_provenance_after_delete_turso
+);
+
 async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
     backend: MainTestBackend,
 ) {
