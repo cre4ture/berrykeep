@@ -565,6 +565,7 @@ mod tests {
     /// provider-managed placeholders as it does in production.
     struct RegisteredTestSyncRoot {
         root_path: PathBuf,
+        _registration_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Drop for RegisteredTestSyncRoot {
@@ -575,6 +576,7 @@ mod tests {
     }
 
     fn registered_test_sync_root(test_name: &str) -> (RegisteredTestSyncRoot, Uuid) {
+        let registration_lock = crate::lock_sync_root_registration_tests();
         let unique = Uuid::new_v4();
         let root_path = std::env::temp_dir().join(format!(
             "ironmesh-placeholder-metadata-{test_name}-{unique}"
@@ -590,7 +592,10 @@ mod tests {
             register_sync_root(&registration).expect("test sync root registration should succeed");
 
         (
-            RegisteredTestSyncRoot { root_path },
+            RegisteredTestSyncRoot {
+                root_path,
+                _registration_lock: registration_lock,
+            },
             identity.provider_instance_id,
         )
     }

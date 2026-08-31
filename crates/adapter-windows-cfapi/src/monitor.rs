@@ -1484,6 +1484,7 @@ mod tests {
     /// remote reconciliation removes in production.
     struct RegisteredMonitorTestSyncRoot {
         root_path: PathBuf,
+        _registration_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Drop for RegisteredMonitorTestSyncRoot {
@@ -1561,6 +1562,7 @@ mod tests {
     fn registered_monitor_test_sync_root(
         test_name: &str,
     ) -> (RegisteredMonitorTestSyncRoot, uuid::Uuid) {
+        let registration_lock = crate::lock_sync_root_registration_tests();
         let unique = uuid::Uuid::new_v4();
         let root_path = std::env::temp_dir().join(format!("ironmesh-monitor-{test_name}-{unique}"));
         let registration = SyncRootRegistration::new(
@@ -1574,7 +1576,10 @@ mod tests {
             register_sync_root(&registration).expect("test sync root registration should succeed");
 
         (
-            RegisteredMonitorTestSyncRoot { root_path },
+            RegisteredMonitorTestSyncRoot {
+                root_path,
+                _registration_lock: registration_lock,
+            },
             identity.provider_instance_id,
         )
     }
