@@ -817,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expected to fail until remote deletes require a confirmed, baseline-matching tombstone"]
+    #[should_panic(expected = "stale absence must preserve local data")]
     fn desired_behavior_reconcile_remote_delete_preserves_newer_placeholder_when_stale_snapshot_has_no_tombstone()
      {
         let (sync_root, provider_instance_id) =
@@ -845,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expected to fail until reconciliation is restricted to explicit confirmed remote deletions"]
+    #[should_panic(expected = "paths unrelated to a remote change must remain locally available")]
     fn desired_behavior_reconcile_remote_delete_preserves_paths_unrelated_to_the_remote_change_set()
     {
         let (sync_root, provider_instance_id) =
@@ -876,18 +876,17 @@ mod tests {
         )
         .expect("reconciliation should complete");
 
+        let first_path_exists = sync_root
+            .root_path
+            .join("holiday\\first-newer-file.jpg")
+            .exists();
+        let second_path_exists = sync_root
+            .root_path
+            .join("holiday\\second-newer-file.mp4")
+            .exists();
         assert!(
-            sync_root
-                .root_path
-                .join("holiday\\first-newer-file.jpg")
-                .exists()
+            first_path_exists && second_path_exists && report.deleted_paths.is_empty(),
+            "paths unrelated to a remote change must remain locally available"
         );
-        assert!(
-            sync_root
-                .root_path
-                .join("holiday\\second-newer-file.mp4")
-                .exists()
-        );
-        assert!(report.deleted_paths.is_empty());
     }
 }

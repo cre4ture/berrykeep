@@ -1943,7 +1943,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expected to fail until remote-applied file removals are recorded and consumed by the monitor"]
+    #[should_panic(
+        expected = "a confirmed remote-applied removal must not be echoed back to the server"
+    )]
     fn desired_behavior_monitor_does_not_echo_provider_applied_file_removal_as_server_delete() {
         // Desired behavior: a reconciler-originated local removal should be observed by the
         // monitor but attributed to the adapter, rather than becoming a new server deletion.

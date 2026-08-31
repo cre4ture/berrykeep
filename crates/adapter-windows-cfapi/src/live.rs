@@ -414,7 +414,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expected to fail until the Windows adapter sends the placeholder baseline as expected_revision"]
+    #[should_panic(
+        expected = "a remote delete must be conditional on the revision observed before the local disappearance"
+    )]
     fn desired_behavior_windows_delete_request_contains_revision_precondition() {
         let (base_url, server, request_rx) = capture_single_http_request();
         let client = IronMeshClient::from_direct_base_url(base_url);

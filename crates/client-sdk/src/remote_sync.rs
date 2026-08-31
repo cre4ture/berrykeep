@@ -701,10 +701,10 @@ mod tests {
 
     /// Desired safety contract for the characterization above.
     ///
-    /// This remains ignored because it is intentionally red until snapshot
-    /// ordering/freshness validation is implemented.
+    /// The expected panic keeps the current failure executable in normal CI.
+    /// Remove it when snapshot ordering/freshness validation is implemented.
     #[test]
-    #[ignore = "expected to fail until out-of-order snapshots cannot replace newer accepted state"]
+    #[should_panic(expected = "an older snapshot must not emit a removal")]
     fn desired_behavior_out_of_order_snapshot_removal_is_rejected_until_a_fresh_snapshot_is_available()
      {
         let newer_snapshot = SyncSnapshot {
@@ -1419,7 +1419,9 @@ mod tests {
     /// above. It uses the production notification loop and fails today because
     /// the second fetch emits a removal from the older empty snapshot.
     #[test]
-    #[ignore = "expected to fail until sequence regressions cannot apply stale removals"]
+    #[should_panic(
+        expected = "a sequence regression must not emit a removal from an older snapshot"
+    )]
     fn desired_behavior_sequence_regression_does_not_emit_a_stale_file_removal() {
         let (first_update, unexpected_removal, _, _) =
             run_sequence_regression_scenario(Duration::from_millis(500));

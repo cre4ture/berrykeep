@@ -1215,7 +1215,9 @@ fn undesired_current_behavior_snapshot_entries_without_revisions_share_server_he
 }
 
 #[test]
-#[ignore = "expected to fail until remote snapshots retain concrete server revision IDs"]
+#[should_panic(
+    expected = "a delete precondition requires a concrete server revision, not a shared selector"
+)]
 fn desired_behavior_snapshot_entries_never_use_server_head_as_a_revision_identity() {
     let snapshot = snapshot_from_store_index_entries(vec![StoreIndexEntry {
         path: "docs/readme.txt".to_string(),
@@ -1278,24 +1280,25 @@ fn undesired_current_behavior_upload_result_discards_server_revision_and_manifes
 }
 
 #[test]
-#[ignore = "expected to fail until UploadResult retains the completed server revision and manifest hash"]
+#[should_panic(
+    expected = "completed upload result must retain the confirmed server revision and manifest hash"
+)]
 fn desired_behavior_upload_result_retains_server_revision_and_manifest_hash() {
     let (session, completed) = completed_upload_mapping_fixture();
 
     let result = upload_result_from_session_complete("docs/readme.txt", &session, &completed);
     let serialized = serde_json::to_value(result).expect("upload result should serialize");
 
-    assert_eq!(
+    assert!(
         serialized
             .get("version_id")
-            .and_then(serde_json::Value::as_str),
-        Some("revision-after-upload")
-    );
-    assert_eq!(
-        serialized
-            .get("manifest_hash")
-            .and_then(serde_json::Value::as_str),
-        Some("manifest-after-upload")
+            .and_then(serde_json::Value::as_str)
+            == Some("revision-after-upload")
+            && serialized
+                .get("manifest_hash")
+                .and_then(serde_json::Value::as_str)
+                == Some("manifest-after-upload"),
+        "completed upload result must retain the confirmed server revision and manifest hash"
     );
 }
 
