@@ -6,7 +6,8 @@ use anyhow::{Context, Result, anyhow};
 use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
 use client_sdk::{
     ClientIdentityMaterial, IronMeshClient, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem, normalize_server_base_url,
+    build_http_client_with_identity_from_pem, is_concrete_remote_revision,
+    normalize_server_base_url,
 };
 use common::range_chunk_cache::{RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES, RangeChunkCache};
 use reqwest::Url;
@@ -276,9 +277,16 @@ impl Uploader for ServerNodeHydrator {
             .finish()
             .with_context(|| format!("failed to finalize content fingerprint for {path}"))?;
 
+        let (remote_version, remote_content_hash) = self.resolve_uploaded_remote_metadata(
+            path,
+            &in_sync_content_fingerprint,
+            upload.version_id,
+            upload.manifest_hash,
+        );
+
         Ok(UploadReceipt {
-            remote_version: upload.version_id,
-            remote_content_hash: upload.manifest_hash,
+            remote_version,
+            remote_content_hash,
             in_sync_content_fingerprint: Some(in_sync_content_fingerprint),
         })
     }
@@ -295,6 +303,53 @@ impl Uploader for ServerNodeHydrator {
             .rename_path_blocking(from_path, to_path, false)
             .with_context(|| format!("failed to rename remote object {from_path} -> {to_path}"))?;
         Ok(true)
+    }
+}
+
+impl ServerNodeHydrator {
+    fn resolve_uploaded_remote_metadata(
+        &self,
+        path: &str,
+        in_sync_content_fingerprint: &str,
+        remote_version: Option<String>,
+        remote_content_hash: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        if is_concrete_remote_revision(remote_version.as_deref()) {
+            return (remote_version, remote_content_hash);
+        }
+
+        match self.sdk.store_index_blocking(Some(path), 1, None) {
+            Ok(index) => {
+                let recovered = index.entries.into_iter().find(|entry| {
+                    entry.path == path
+                        && entry.content_fingerprint.as_deref() == Some(in_sync_content_fingerprint)
+                        && is_concrete_remote_revision(entry.version.as_deref())
+                });
+                if let Some(entry) = recovered {
+                    tracing::info!(
+                        "recovered concrete upload revision from store index for {} after an empty upload receipt",
+                        path
+                    );
+                    return (entry.version, entry.content_hash);
+                }
+                tracing::warn!(
+                    "upload for {} returned no concrete revision and the store index could not recover a matching content fingerprint; local delete propagation will remain pending until a concrete baseline is observed",
+                    path
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "upload for {} returned no concrete revision and store-index recovery failed: {:#}; local delete propagation will remain pending until a concrete baseline is observed",
+                    path,
+                    error
+                );
+            }
+        }
+
+        // The server accepted new bytes, so an older version must never remain
+        // attached to this local content.  The caller deliberately downgrades
+        // the identity when recovery cannot establish a new concrete revision.
+        (None, None)
     }
 }
 
@@ -337,8 +392,9 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    fn capture_single_http_request() -> (String, std::thread::JoinHandle<()>, mpsc::Receiver<String>)
-    {
+    fn capture_single_http_request_with_response(
+        response: Vec<u8>,
+    ) -> (String, std::thread::JoinHandle<()>, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
         let address = listener
             .local_addr()
@@ -365,12 +421,17 @@ mod tests {
                 .send(String::from_utf8_lossy(&request).into_owned())
                 .expect("captured request should be delivered");
             stream
-                .write_all(
-                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
+                .write_all(&response)
                 .expect("test response should be writable");
         });
         (format!("http://{address}"), handle, request_rx)
+    }
+
+    fn capture_single_http_request() -> (String, std::thread::JoinHandle<()>, mpsc::Receiver<String>)
+    {
+        capture_single_http_request_with_response(
+            b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
     }
 
     #[test]
@@ -406,5 +467,72 @@ mod tests {
         server.join().expect("test server should stop cleanly");
         let request_line = request.lines().next().unwrap_or_default();
         assert!(request_line.contains("expected_revision=revision-42"));
+    }
+
+    #[test]
+    fn empty_upload_receipt_recovers_concrete_metadata_from_store_index() {
+        let body = br#"{"entries":[{"path":"photos/new.jpg","entry_type":"file","version":"revision-new","content_hash":"hash-new","content_fingerprint":"uploaded-fingerprint"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).expect("test JSON should be UTF-8")
+        )
+        .into_bytes();
+        let (base_url, server, request_rx) = capture_single_http_request_with_response(response);
+        let hydrator = ServerNodeHydrator::with_client(
+            IronMeshClient::from_direct_base_url(base_url),
+            std::env::temp_dir().join(format!("ironmesh-upload-recovery-{}", uuid::Uuid::new_v4())),
+        );
+
+        let metadata = hydrator.resolve_uploaded_remote_metadata(
+            "photos/new.jpg",
+            "uploaded-fingerprint",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            metadata,
+            (
+                Some("revision-new".to_string()),
+                Some("hash-new".to_string())
+            )
+        );
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("store-index request should be captured");
+        server.join().expect("test server should stop cleanly");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(request_line.starts_with("GET /api/v1/store/index?"));
+        assert!(request_line.contains("prefix=photos%2Fnew.jpg"));
+    }
+
+    #[test]
+    fn empty_upload_receipt_rejects_store_index_metadata_for_other_content() {
+        let body = br#"{"entries":[{"path":"photos/new.jpg","entry_type":"file","version":"concurrent-revision","content_hash":"concurrent-hash","content_fingerprint":"other-writer-fingerprint"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).expect("test JSON should be UTF-8")
+        )
+        .into_bytes();
+        let (base_url, server, request_rx) = capture_single_http_request_with_response(response);
+        let hydrator = ServerNodeHydrator::with_client(
+            IronMeshClient::from_direct_base_url(base_url),
+            std::env::temp_dir().join(format!("ironmesh-upload-recovery-{}", uuid::Uuid::new_v4())),
+        );
+
+        let metadata = hydrator.resolve_uploaded_remote_metadata(
+            "photos/new.jpg",
+            "uploaded-fingerprint",
+            None,
+            None,
+        );
+
+        assert_eq!(metadata, (None, None));
+        request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("store-index request should be captured");
+        server.join().expect("test server should stop cleanly");
     }
 }

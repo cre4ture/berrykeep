@@ -773,4 +773,47 @@ mod tests {
         assert!(full_path.exists(), "stale absence must preserve local data");
         assert!(report.deleted_paths.is_empty());
     }
+
+    #[test]
+    fn empty_upload_receipt_downgrades_stale_remote_identity() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("empty-upload-receipt-downgrades-baseline");
+        let path = "holiday/newer-photo.jpg";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "old-revision",
+            "old-content-hash",
+            1_725_000_007,
+        );
+
+        record_uploaded_remote_state(
+            &sync_root.root_path,
+            path,
+            provider_instance_id,
+            None,
+            None,
+            Some("new-local-content-fingerprint"),
+        )
+        .expect("identity should be safely downgraded after empty upload receipt");
+
+        let full_path = sync_root.root_path.join("holiday\\newer-photo.jpg");
+        let file = open_sync_path(&full_path, false).expect("placeholder should be reopenable");
+        let info = cf_get_placeholder_standard_info_with_identity(&file)
+            .expect("placeholder identity should be available");
+        let identity = decode_placeholder_file_identity(info.file_identity())
+            .expect("placeholder identity should decode");
+        assert!(identity.remote_version.is_none());
+        assert!(identity.remote_content_hash.is_none());
+        assert!(identity.remote_modified_at_unix.is_none());
+        assert_eq!(
+            identity.remote_content_fingerprint.as_deref(),
+            Some("new-local-content-fingerprint")
+        );
+        assert_eq!(
+            identity.in_sync_content_fingerprint.as_deref(),
+            Some("new-local-content-fingerprint")
+        );
+    }
 }

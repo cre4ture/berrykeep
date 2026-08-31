@@ -473,7 +473,7 @@ impl SyncRootMonitor {
 
         self.log_dehydrate_scan_summary(dehydrate_summary);
         if walk_error_count == 0 {
-            self.handle_deleted_entries(&current, &handled_renames);
+            self.handle_deleted_entries(&mut current, &handled_renames);
         } else {
             let preserved_count = self
                 .preserve_missing_entries_after_incomplete_snapshot(&mut current, &handled_renames);
@@ -1189,7 +1189,7 @@ impl SyncRootMonitor {
 
     fn handle_deleted_entries(
         &self,
-        current: &HashMap<String, SeenEntry>,
+        current: &mut HashMap<String, SeenEntry>,
         handled_renames: &std::collections::HashSet<String>,
     ) {
         let mut deleted_paths = self
@@ -1226,21 +1226,23 @@ impl SyncRootMonitor {
                     .as_deref()
                     .filter(|revision| is_concrete_remote_revision(Some(revision)))
                 else {
-                    tracing::info!(
-                        "{}: preserving remote directory delete {} because no marker revision baseline is available",
+                    tracing::error!(
+                        "{}: pending local directory delete {} has no concrete marker revision; refusing unsafe path-only delete and retaining it for retry",
                         self.name,
                         path
                     );
+                    current.insert(path.to_string(), entry);
                     continue;
                 };
                 let marker_path = directory_marker_path(path);
                 if let Err(err) = self.uploader.delete_path(&marker_path, expected_revision) {
-                    tracing::info!(
-                        "{}: failed to delete remote directory marker {}: {}",
+                    tracing::warn!(
+                        "{}: pending local directory delete failed for marker {}: {}; retaining it for retry",
                         self.name,
                         marker_path,
                         err
                     );
+                    current.insert(path.to_string(), entry);
                 }
                 continue;
             }
@@ -1260,21 +1262,23 @@ impl SyncRootMonitor {
                 .as_deref()
                 .filter(|revision| is_concrete_remote_revision(Some(revision)))
             else {
-                tracing::warn!(
-                    "{}: refusing unsafe delete for {} because its prior remote revision is missing or non-concrete",
+                tracing::error!(
+                    "{}: pending local file delete {} has no concrete remote revision; refusing unsafe path-only delete and retaining it for retry",
                     self.name,
                     path
                 );
+                current.insert(path.to_string(), entry);
                 continue;
             };
             tracing::info!("{}: detected deleted file {}", self.name, path);
             if let Err(err) = self.uploader.delete_path(path, expected_revision) {
-                tracing::info!(
-                    "{}: failed to delete remote file {}: {}",
+                tracing::warn!(
+                    "{}: pending local file delete failed for {}: {}; retaining it for retry",
                     self.name,
                     path,
                     err
                 );
+                current.insert(path.to_string(), entry);
             }
         }
     }
@@ -1569,6 +1573,11 @@ mod tests {
         uploads: Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct FailingDeleteUploader {
+        delete_attempts: Mutex<usize>,
+    }
+
     /// A real Windows CFAPI registration so the monitor observes the same placeholder kind that
     /// remote reconciliation removes in production.
     struct RegisteredMonitorTestSyncRoot {
@@ -1637,6 +1646,25 @@ mod tests {
                 .expect("uploads lock poisoned")
                 .push(path.to_string());
             Ok(UploadReceipt::default())
+        }
+    }
+
+    impl Uploader for FailingDeleteUploader {
+        fn upload_reader(
+            &self,
+            _path: &str,
+            _reader: &mut dyn Read,
+            _length: u64,
+        ) -> anyhow::Result<UploadReceipt> {
+            Ok(UploadReceipt::default())
+        }
+
+        fn delete_path(&self, _path: &str, _expected_revision: &str) -> anyhow::Result<()> {
+            *self
+                .delete_attempts
+                .lock()
+                .expect("delete attempts lock poisoned") += 1;
+            anyhow::bail!("simulated remote delete rejection")
         }
     }
 
@@ -1958,7 +1986,7 @@ mod tests {
         assert!(current.contains_key("docs/keep.txt"));
         assert!(!current.contains_key("docs/old-name.txt"));
 
-        monitor.handle_deleted_entries(&current, &handled_renames);
+        monitor.handle_deleted_entries(&mut current, &handled_renames);
 
         assert!(
             uploader
@@ -1970,6 +1998,68 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn failed_conditional_delete_stays_pending_and_retries() {
+        let uploader = Arc::new(FailingDeleteUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            std::env::temp_dir(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        let mut deleted_entry = seen_entry(false);
+        deleted_entry.remote_revision = Some("revision-before-delete".to_string());
+        monitor
+            .seen
+            .insert("documents/pending.txt".to_string(), deleted_entry);
+
+        let handled_renames = HashSet::new();
+        let mut first_current = HashMap::new();
+        monitor.handle_deleted_entries(&mut first_current, &handled_renames);
+        assert!(first_current.contains_key("documents/pending.txt"));
+
+        monitor.seen = first_current;
+        let mut second_current = HashMap::new();
+        monitor.handle_deleted_entries(&mut second_current, &handled_renames);
+
+        assert!(second_current.contains_key("documents/pending.txt"));
+        assert_eq!(
+            *uploader
+                .delete_attempts
+                .lock()
+                .expect("delete attempts lock poisoned"),
+            2,
+            "conditional delete failures must remain pending for retry"
+        );
+    }
+
+    #[test]
+    fn missing_delete_baseline_stays_pending_without_path_only_delete() {
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            std::env::temp_dir(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        monitor
+            .seen
+            .insert("documents/no-baseline.txt".to_string(), seen_entry(false));
+
+        let mut current = HashMap::new();
+        monitor.handle_deleted_entries(&mut current, &HashSet::new());
+
+        assert!(current.contains_key("documents/no-baseline.txt"));
+        assert!(
+            uploader
+                .deletes
+                .lock()
+                .expect("deletes lock poisoned")
+                .is_empty(),
+            "a missing baseline must never fall back to a path-only delete"
+        );
     }
 
     #[test]
