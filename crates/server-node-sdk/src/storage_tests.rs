@@ -1236,6 +1236,91 @@ fn preferred_head_prioritizes_confirmed_over_newer_provisional() {
     assert_eq!(preferred.as_deref(), Some("v-old-confirmed"));
 }
 
+async fn strict_revision_metadata_preserves_manifest_timestamp_fallbacks_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("store-index-revision-metadata-fallback")
+        .await;
+    let key = "docs/conflicted.txt";
+    let confirmed = store
+        .put_object_versioned(
+            key,
+            Bytes::from_static(b"confirmed"),
+            PutOptions {
+                explicit_version_id: Some("confirmed-head".to_string()),
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let provisional = store
+        .put_object_versioned(
+            key,
+            Bytes::from_static(b"conflicting-current"),
+            PutOptions {
+                explicit_version_id: Some("provisional-conflict".to_string()),
+                state: VersionConsistencyState::Provisional,
+                inherit_preferred_parent: false,
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let versions = store.list_versions(key).await.unwrap().unwrap();
+    assert_eq!(
+        versions.preferred_head_version_id.as_deref(),
+        Some(confirmed.version_id.as_str()),
+        "the confirmed branch is preferred over the conflicting provisional branch"
+    );
+    let provisional_created_at = versions
+        .versions
+        .iter()
+        .find(|record| record.version_id == provisional.version_id)
+        .expect("provisional conflict should remain in history")
+        .created_at_unix;
+    let object_hashes = HashMap::from([(key.to_string(), provisional.manifest_hash.clone())]);
+    let object_ids = HashMap::from([(key.to_string(), versions.object_id.clone())]);
+    let inspector = store.store_index_inspector().await.unwrap();
+
+    let current_metadata = inspector
+        .object_store_index_metadata_by_key(&object_hashes, &object_ids, None)
+        .await
+        .unwrap();
+    let current = current_metadata
+        .get(key)
+        .expect("conflicting current manifest should retain a timestamp");
+    assert_eq!(current.modified_at_unix, provisional_created_at);
+    assert!(
+        current.revision.is_none(),
+        "a non-preferred conflicting manifest must not fabricate a concrete revision"
+    );
+
+    let snapshot_metadata = inspector
+        .object_store_index_metadata_by_key(&object_hashes, &object_ids, Some(0))
+        .await
+        .unwrap();
+    let snapshot = snapshot_metadata
+        .get(key)
+        .expect("sparse legacy snapshot manifest should retain its fallback timestamp");
+    assert_eq!(snapshot.modified_at_unix, provisional_created_at);
+    assert!(
+        snapshot.revision.is_none(),
+        "a post-snapshot manifest must not acquire a concrete snapshot revision"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    strict_revision_metadata_preserves_manifest_timestamp_fallbacks_impl,
+    strict_revision_metadata_preserves_manifest_timestamp_fallbacks,
+    strict_revision_metadata_preserves_manifest_timestamp_fallbacks_turso
+);
+
 #[test]
 fn exif_gps_coordinate_rejects_non_finite_rationals() {
     let value = exif::Value::Rational(vec![

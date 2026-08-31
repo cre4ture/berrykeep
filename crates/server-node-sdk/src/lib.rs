@@ -16990,8 +16990,8 @@ async fn list_store_index_response_attempt(
     };
     let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
     let revision_lookup_started_at = Instant::now();
-    let key_revisions = match store_index_inspector
-        .object_revision_metadata_by_key(
+    let key_metadata = match store_index_inspector
+        .object_store_index_metadata_by_key(
             &visible_object_hashes,
             &visible_object_ids,
             snapshot_created_at_limit,
@@ -17005,9 +17005,13 @@ async fn list_store_index_response_attempt(
         }
     };
     let revision_lookup_ms = revision_lookup_started_at.elapsed().as_millis();
-    let key_modified_times = key_revisions
+    let key_modified_times = key_metadata
         .iter()
-        .map(|(key, metadata)| (key.clone(), metadata.created_at_unix))
+        .map(|(key, metadata)| (key.clone(), metadata.modified_at_unix))
+        .collect::<HashMap<_, _>>();
+    let key_revisions = key_metadata
+        .into_iter()
+        .filter_map(|(key, metadata)| metadata.revision.map(|revision| (key, revision)))
         .collect::<HashMap<_, _>>();
     let modified_time_lookup_ms = revision_lookup_ms;
     let metadata_lookup_ms = content_summary_lookup_ms + revision_lookup_ms;
@@ -17432,8 +17436,8 @@ async fn list_store_index_response_cursor_mode(
     };
     let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
     let revision_lookup_started_at = Instant::now();
-    let key_revisions = match store_index_inspector
-        .object_revision_metadata_by_key(
+    let key_metadata = match store_index_inspector
+        .object_store_index_metadata_by_key(
             &visible_object_hashes,
             &visible_object_ids,
             snapshot_created_at_limit,
@@ -17447,9 +17451,13 @@ async fn list_store_index_response_cursor_mode(
         }
     };
     let revision_lookup_ms = revision_lookup_started_at.elapsed().as_millis();
-    let key_modified_times = key_revisions
+    let key_modified_times = key_metadata
         .iter()
-        .map(|(key, metadata)| (key.clone(), metadata.created_at_unix))
+        .map(|(key, metadata)| (key.clone(), metadata.modified_at_unix))
+        .collect::<HashMap<_, _>>();
+    let key_revisions = key_metadata
+        .into_iter()
+        .filter_map(|(key, metadata)| metadata.revision.map(|revision| (key, revision)))
         .collect::<HashMap<_, _>>();
     let modified_time_lookup_ms = revision_lookup_ms;
     let metadata_lookup_ms = content_summary_lookup_ms + revision_lookup_ms;

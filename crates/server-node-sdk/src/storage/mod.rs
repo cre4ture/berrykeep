@@ -2489,7 +2489,15 @@ pub(crate) struct StoreIndexInspector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjectRevisionMetadata {
     pub(crate) version_id: String,
-    pub(crate) created_at_unix: u64,
+}
+
+/// Store-index metadata with independently resolved revision provenance and
+/// modification time. A conflicting current head can still have a valid
+/// timestamp for its manifest without representing the preferred revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectStoreIndexMetadata {
+    pub(crate) modified_at_unix: u64,
+    pub(crate) revision: Option<ObjectRevisionMetadata>,
 }
 
 #[derive(Clone)]
@@ -3186,13 +3194,22 @@ impl StoreIndexInspector {
         Ok((sizes, content_fingerprints))
     }
 
-    pub(crate) async fn object_modified_at_by_key(
+    /// Resolves each store-index entry's timestamp and concrete revision.
+    ///
+    /// Current listings expose the index's preferred head only when it matches
+    /// the current manifest. Snapshot listings instead select the newest
+    /// matching revision that existed when the snapshot was created. The
+    /// modification time intentionally retains the older manifest-match
+    /// fallback so conflicted current entries and sparse legacy snapshots do
+    /// not look spuriously changed.
+    pub(crate) async fn object_store_index_metadata_by_key(
         &self,
         object_hashes: &HashMap<String, String>,
         object_ids: &HashMap<String, String>,
         max_created_at_unix: Option<u64>,
-    ) -> Result<HashMap<String, u64>> {
-        let mut modified = HashMap::with_capacity(object_hashes.len());
+    ) -> Result<HashMap<String, ObjectStoreIndexMetadata>> {
+        let mut metadata = HashMap::with_capacity(object_hashes.len());
+
         for (key, manifest_hash) in object_hashes {
             let Some(object_id) = object_ids.get(key) else {
                 continue;
@@ -3201,7 +3218,24 @@ impl StoreIndexInspector {
                 continue;
             };
 
-            let matching_created_at = index
+            let revision = match max_created_at_unix {
+                None => choose_preferred_head(&index)
+                    .and_then(|version_id| index.versions.get(&version_id))
+                    .filter(|record| record.manifest_hash == *manifest_hash),
+                Some(limit) => index
+                    .versions
+                    .values()
+                    .filter(|record| {
+                        record.manifest_hash == *manifest_hash && record.created_at_unix <= limit
+                    })
+                    .max_by(|left, right| {
+                        left.created_at_unix
+                            .cmp(&right.created_at_unix)
+                            .then_with(|| left.version_id.cmp(&right.version_id))
+                    }),
+            };
+
+            let modified_at_unix = index
                 .versions
                 .values()
                 .filter(|record| record.manifest_hash == *manifest_hash)
@@ -3221,63 +3255,38 @@ impl StoreIndexInspector {
                         .max()
                 });
 
-            if let Some(created_at_unix) = matching_created_at {
-                modified.insert(key.clone(), created_at_unix);
-            }
-        }
-        Ok(modified)
-    }
-
-    /// Resolves the concrete revision represented by each store-index entry.
-    ///
-    /// Current listings expose the index's preferred head only when it matches
-    /// the current manifest. Snapshot listings instead select the newest
-    /// matching revision that existed when the snapshot was created.
-    pub(crate) async fn object_revision_metadata_by_key(
-        &self,
-        object_hashes: &HashMap<String, String>,
-        object_ids: &HashMap<String, String>,
-        max_created_at_unix: Option<u64>,
-    ) -> Result<HashMap<String, ObjectRevisionMetadata>> {
-        let mut revisions = HashMap::with_capacity(object_hashes.len());
-
-        for (key, manifest_hash) in object_hashes {
-            let Some(object_id) = object_ids.get(key) else {
-                continue;
-            };
-            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
-                continue;
-            };
-
-            let record = match max_created_at_unix {
-                None => choose_preferred_head(&index)
-                    .and_then(|version_id| index.versions.get(&version_id))
-                    .filter(|record| record.manifest_hash == *manifest_hash),
-                Some(limit) => index
-                    .versions
-                    .values()
-                    .filter(|record| {
-                        record.manifest_hash == *manifest_hash && record.created_at_unix <= limit
-                    })
-                    .max_by(|left, right| {
-                        left.created_at_unix
-                            .cmp(&right.created_at_unix)
-                            .then_with(|| left.version_id.cmp(&right.version_id))
-                    }),
-            };
-
-            if let Some(record) = record {
-                revisions.insert(
+            if let Some(modified_at_unix) = modified_at_unix {
+                metadata.insert(
                     key.clone(),
-                    ObjectRevisionMetadata {
-                        version_id: record.version_id.clone(),
-                        created_at_unix: record.created_at_unix,
+                    ObjectStoreIndexMetadata {
+                        modified_at_unix,
+                        revision: revision.map(|record| ObjectRevisionMetadata {
+                            version_id: record.version_id.clone(),
+                        }),
                     },
                 );
             }
         }
 
-        Ok(revisions)
+        Ok(metadata)
+    }
+
+    /// Returns modification times with the compatibility fallback used by
+    /// S3 listings. Generic store-index callers use
+    /// [`Self::object_store_index_metadata_by_key`] so they can reuse the same
+    /// index read for strict revision provenance.
+    pub(crate) async fn object_modified_at_by_key(
+        &self,
+        object_hashes: &HashMap<String, String>,
+        object_ids: &HashMap<String, String>,
+        max_created_at_unix: Option<u64>,
+    ) -> Result<HashMap<String, u64>> {
+        Ok(self
+            .object_store_index_metadata_by_key(object_hashes, object_ids, max_created_at_unix)
+            .await?
+            .into_iter()
+            .map(|(key, metadata)| (key, metadata.modified_at_unix))
+            .collect())
     }
 
     pub(crate) async fn lookup_media_cache(

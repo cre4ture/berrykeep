@@ -13248,7 +13248,6 @@ fn build_store_index_entries_with_hashes_propagates_content_fingerprints() {
         "docs/readme.txt".to_string(),
         super::storage::ObjectRevisionMetadata {
             version_id: "version-42".to_string(),
-            created_at_unix: 1_723_456_789,
         },
     )]);
 
