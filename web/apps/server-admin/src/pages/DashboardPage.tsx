@@ -251,14 +251,15 @@ export function DashboardPage() {
     canInspectCluster ? processStatsMemoryQuery.data ?? null : null;
   const mediaCacheClearResult = mediaCacheClearMutation.data ?? null;
   const mediaCacheClearPending = mediaCacheClearMutation.isPending;
-  const clusterSummaryLoading = canInspectCluster && clusterSummaryQuery.isPending;
-  const replicationPlanLoading = canInspectCluster && replicationPlanQuery.isPending;
-  const storageStatsLoading = canInspectCluster && storageStatsQuery.isPending;
-  const repairActivityLoading = canInspectCluster && repairActivityQuery.isPending;
-  const processStatsCurrentLoading = canInspectCluster && processStatsCurrentQuery.isPending;
-  const memoryAttributionLoading = canInspectCluster && processStatsMemoryQuery.isPending;
+  const accessLoading = sessionLoading;
+  const clusterSummaryLoading = accessLoading || (canInspectCluster && clusterSummaryQuery.isPending);
+  const replicationPlanLoading = accessLoading || (canInspectCluster && replicationPlanQuery.isPending);
+  const storageStatsLoading = accessLoading || (canInspectCluster && storageStatsQuery.isPending);
+  const repairActivityLoading = accessLoading || (canInspectCluster && repairActivityQuery.isPending);
+  const processStatsCurrentLoading = accessLoading || (canInspectCluster && processStatsCurrentQuery.isPending);
+  const memoryAttributionLoading = accessLoading || (canInspectCluster && processStatsMemoryQuery.isPending);
   const memoryAttributionUnavailable = canInspectCluster && processStatsMemoryQuery.isError;
-  const rendezvousConfigLoading = canInspectRendezvous && rendezvousConfigQuery.isPending;
+  const rendezvousConfigLoading = accessLoading || (canInspectRendezvous && rendezvousConfigQuery.isPending);
   const error = firstErrorMessage([
     mediaCacheClearMutation.error,
     backendHealthQuery.error,

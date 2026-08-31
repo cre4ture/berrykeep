@@ -1712,6 +1712,10 @@ test("server-admin distinguishes an initial GC load from a confirmed empty GC re
   const currentProcessStatsAllowed = new Promise<void>((resolve) => {
     releaseCurrentProcessStats = resolve;
   });
+  let markCurrentProcessStatsDelivered: (() => void) | undefined;
+  const currentProcessStatsDelivered = new Promise<void>((resolve) => {
+    markCurrentProcessStatsDelivered = resolve;
+  });
 
   await installServerAdminMocks(page);
   await page.route(`**${apiV1("/process/stats/current")}`, async (route) => {
@@ -1737,6 +1741,7 @@ test("server-admin distinguishes an initial GC load from a confirmed empty GC re
       temperature_components: [],
       logical_cpu_count: 4
     });
+    markCurrentProcessStatsDelivered?.();
   });
   await page.route(`**${apiV1("/process/stats/memory")}`, async (route) => {
     markMemoryRequestStarted?.();
@@ -1772,6 +1777,7 @@ test("server-admin distinguishes an initial GC load from a confirmed empty GC re
     await expect(lastGcPassCard).toContainText("no pass yet");
   } finally {
     releaseCurrentProcessStats?.();
+    await currentProcessStatsDelivered;
   }
 });
 
