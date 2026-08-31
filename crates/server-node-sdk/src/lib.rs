@@ -18145,7 +18145,8 @@ fn media_type_for_path(path: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec<StoreIndexEntry> {
-    build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None, None, None)
+    let plan = plan_store_index_entries(keys, prefix, depth);
+    build_store_index_entries_from_plan(&plan, None, None, None, None, None)
 }
 
 #[derive(Debug, Clone)]
@@ -18221,28 +18222,6 @@ fn filter_store_index_object_maps_for_prefix(
         .filter(|(key, _)| store_index_remainder_for_prefix(key, normalized_prefix).is_some())
         .collect();
     (object_hashes, object_ids)
-}
-
-#[cfg(test)]
-fn build_store_index_entries_with_hashes(
-    keys: &[String],
-    prefix: &str,
-    depth: usize,
-    hashes_by_key: Option<&HashMap<String, String>>,
-    sizes_by_key: Option<&HashMap<String, u64>>,
-    content_fingerprints_by_key: Option<&HashMap<String, String>>,
-    modified_times_by_key: Option<&HashMap<String, u64>>,
-    revisions_by_key: Option<&HashMap<String, storage::ObjectRevisionMetadata>>,
-) -> Vec<StoreIndexEntry> {
-    let plan = plan_store_index_entries(keys, prefix, depth);
-    build_store_index_entries_from_plan(
-        &plan,
-        hashes_by_key,
-        sizes_by_key,
-        content_fingerprints_by_key,
-        modified_times_by_key,
-        revisions_by_key,
-    )
 }
 
 fn build_store_index_entries_from_plan(

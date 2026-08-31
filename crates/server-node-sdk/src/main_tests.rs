@@ -13252,10 +13252,9 @@ fn build_store_index_entries_with_hashes_propagates_content_fingerprints() {
         },
     )]);
 
-    let entries = super::build_store_index_entries_with_hashes(
-        &keys,
-        "",
-        2,
+    let plan = super::plan_store_index_entries(&keys, "", 2);
+    let entries = super::build_store_index_entries_from_plan(
+        &plan,
         Some(&hashes),
         Some(&sizes),
         Some(&content_fingerprints),
