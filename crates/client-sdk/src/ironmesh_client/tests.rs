@@ -1087,15 +1087,15 @@ fn normalize_server_base_url_adds_scheme_and_trailing_slash() {
 }
 
 #[test]
-fn snapshot_conversion_maps_prefix_and_keys() {
+fn snapshot_conversion_preserves_directory_marker_and_keys() {
     let snapshot = snapshot_from_store_index_entries(vec![
         StoreIndexEntry {
             path: "docs/".to_string(),
-            entry_type: "prefix".to_string(),
+            entry_type: "key".to_string(),
             labels: Vec::new(),
             labels_resolved: false,
-            version: None,
-            content_hash: None,
+            version: Some("directory-marker-revision".to_string()),
+            content_hash: Some("directory-marker-hash".to_string()),
             size_bytes: None,
             modified_at_unix: None,
             content_fingerprint: None,
@@ -1150,7 +1150,16 @@ fn snapshot_conversion_maps_prefix_and_keys() {
 
     assert_eq!(snapshot.local.len(), 0);
     assert_eq!(snapshot.remote.len(), 2);
-    assert_eq!(snapshot.remote[0], NamespaceEntry::directory("docs"));
+    assert_eq!(snapshot.remote[0].path, "docs");
+    assert_eq!(snapshot.remote[0].kind, EntryKind::Directory);
+    assert_eq!(
+        snapshot.remote[0].version.as_deref(),
+        Some("directory-marker-revision")
+    );
+    assert_eq!(
+        snapshot.remote[0].content_hash.as_deref(),
+        Some("directory-marker-hash")
+    );
     assert_eq!(snapshot.remote[1].path, "docs/readme.txt");
     assert_eq!(snapshot.remote[1].version, None);
     assert_eq!(snapshot.remote[1].content_hash, None);

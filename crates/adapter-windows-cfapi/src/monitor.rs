@@ -25,6 +25,7 @@ use crate::runtime::UploadReceipt;
 use crate::runtime::Uploader;
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use client_sdk::is_concrete_remote_revision;
+use sync_core::SyncSnapshot;
 use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Storage::CloudFilters::{
     CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNPINNED,
@@ -424,6 +425,38 @@ impl SyncRootMonitor {
             self.seed_existing_entry(&mut seeded, path, false);
             for parent in parent_directories_for_path(path) {
                 self.seed_existing_entry(&mut seeded, &parent, true);
+            }
+        }
+        self.seen = seeded;
+    }
+
+    /// Seed the startup scan with directory-marker revisions from the remote
+    /// snapshot. Directories lack CFAPI identities, so their marker revision
+    /// cannot be recovered from disk after a process restart.
+    pub fn seed_remote_entries_from_snapshot_with_suppressed_paths(
+        &mut self,
+        plan: &CfapiActionPlan,
+        remote_snapshot: &SyncSnapshot,
+        suppressed_paths: &std::collections::BTreeSet<String>,
+    ) {
+        self.seed_remote_entries_with_suppressed_paths(plan, suppressed_paths);
+        let mut seeded = std::mem::take(&mut self.seen);
+
+        for remote_entry in remote_snapshot
+            .remote
+            .iter()
+            .filter(|entry| entry.kind == sync_core::EntryKind::Directory)
+        {
+            let Some(remote_revision) = remote_entry
+                .version
+                .as_deref()
+                .filter(|revision| is_concrete_remote_revision(Some(revision)))
+            else {
+                continue;
+            };
+            self.seed_existing_entry(&mut seeded, &remote_entry.path, true);
+            if let Some(seeded_entry) = seeded.get_mut(&remote_entry.path) {
+                seeded_entry.remote_revision = Some(remote_revision.to_string());
             }
         }
         self.seen = seeded;
@@ -1565,6 +1598,7 @@ mod tests {
     struct MockUploader {
         uploads: Mutex<Vec<String>>,
         deletes: Mutex<Vec<String>>,
+        delete_revisions: Mutex<Vec<(String, String)>>,
     }
 
     #[derive(Default)]
@@ -1611,11 +1645,15 @@ mod tests {
             })
         }
 
-        fn delete_path(&self, path: &str, _expected_revision: &str) -> anyhow::Result<()> {
+        fn delete_path(&self, path: &str, expected_revision: &str) -> anyhow::Result<()> {
             self.deletes
                 .lock()
                 .expect("deletes lock poisoned")
                 .push(path.to_string());
+            self.delete_revisions
+                .lock()
+                .expect("delete revisions lock poisoned")
+                .push((path.to_string(), expected_revision.to_string()));
             Ok(())
         }
     }
@@ -1947,6 +1985,59 @@ mod tests {
                 .as_slice(),
             ["documents/"],
             "directory removal must delete only its canonical marker with a baseline revision"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn restarted_monitor_deletes_remote_directory_marker_with_seeded_revision() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-monitor-directory-restart-{unique}"));
+        std::fs::create_dir_all(sync_root.join("documents"))
+            .expect("failed to create remotely seeded directory");
+
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        let mut remote_directory = sync_core::NamespaceEntry::directory("documents");
+        remote_directory.version = Some("directory-marker-revision".to_string());
+        monitor.seed_remote_entries_from_snapshot_with_suppressed_paths(
+            &CfapiActionPlan::default(),
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![remote_directory],
+            },
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(
+            monitor
+                .seen
+                .get("documents")
+                .and_then(|entry| entry.remote_revision.as_deref()),
+            Some("directory-marker-revision"),
+            "a restart must restore the concrete directory-marker revision from the remote snapshot"
+        );
+
+        std::fs::remove_dir(sync_root.join("documents")).expect("failed to delete local directory");
+        monitor.walk();
+
+        assert_eq!(
+            uploader
+                .delete_revisions
+                .lock()
+                .expect("delete revisions lock poisoned")
+                .as_slice(),
+            [(
+                "documents/".to_string(),
+                "directory-marker-revision".to_string()
+            )],
+            "restart deletion must target only the canonical marker with its restored revision"
         );
 
         let _ = std::fs::remove_dir_all(sync_root);

@@ -454,7 +454,22 @@ where
             let directory_path = entry.path.trim_end_matches('/').to_string();
             if !directory_path.is_empty() {
                 directory_count += 1;
-                remote.push(NamespaceEntry::directory(directory_path));
+                // A trailing-slash object is the Windows CFAPI directory
+                // marker.  Preserve its server identity so consumers which
+                // can safely use it (such as conditional marker deletion)
+                // do not lose that provenance during snapshot conversion.
+                remote.push(NamespaceEntry {
+                    path: directory_path,
+                    kind: EntryKind::Directory,
+                    version: entry.version,
+                    content_hash: entry.content_hash,
+                    content_fingerprint: entry.content_fingerprint,
+                    size_bytes: entry.size_bytes,
+                    modified_at_unix: entry.modified_at_unix,
+                    media: entry
+                        .media
+                        .map(crate::ironmesh_client::namespace_media_metadata),
+                });
             }
         } else {
             let mut remote_entry = NamespaceEntry {
@@ -1146,6 +1161,37 @@ mod tests {
         assert_eq!(snapshot.remote[0].version, None);
         assert_eq!(snapshot.remote[0].content_hash, None);
         assert_eq!(snapshot.remote[0].modified_at_unix, Some(1_723_456_789));
+    }
+
+    #[test]
+    fn progress_snapshot_builder_preserves_directory_marker_revision() {
+        let snapshot = snapshot_from_store_index_entries_with_progress(
+            vec![crate::ironmesh_client::StoreIndexEntry {
+                path: "docs/".to_string(),
+                entry_type: "key".to_string(),
+                labels: Vec::new(),
+                labels_resolved: false,
+                version: Some("directory-marker-revision".to_string()),
+                content_hash: Some("directory-marker-hash".to_string()),
+                size_bytes: Some(5),
+                modified_at_unix: Some(1_723_456_789),
+                content_fingerprint: Some("directory-marker-fingerprint".to_string()),
+                media: None,
+            }],
+            |_| {},
+        );
+
+        assert_eq!(snapshot.remote.len(), 1);
+        assert_eq!(snapshot.remote[0].kind, EntryKind::Directory);
+        assert_eq!(snapshot.remote[0].path, "docs");
+        assert_eq!(
+            snapshot.remote[0].version.as_deref(),
+            Some("directory-marker-revision")
+        );
+        assert_eq!(
+            snapshot.remote[0].content_hash.as_deref(),
+            Some("directory-marker-hash")
+        );
     }
 
     fn deletion_for(baseline: RemoteEntryBaseline) -> RemoteDeletion {

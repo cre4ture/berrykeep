@@ -9477,7 +9477,19 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
         if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
             let directory_path = entry.path.trim_end_matches('/').to_string();
             if !directory_path.is_empty() {
-                remote.push(NamespaceEntry::directory(directory_path));
+                // A trailing-slash object is a directory marker.  Keep its
+                // server identity available to clients which later perform a
+                // conditional delete of that marker.
+                remote.push(NamespaceEntry {
+                    path: directory_path,
+                    kind: EntryKind::Directory,
+                    version: entry.version,
+                    content_hash: entry.content_hash,
+                    content_fingerprint: entry.content_fingerprint,
+                    size_bytes: entry.size_bytes,
+                    modified_at_unix: entry.modified_at_unix,
+                    media: entry.media.map(namespace_media_metadata),
+                });
             }
             continue;
         }

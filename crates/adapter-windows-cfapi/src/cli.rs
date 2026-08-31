@@ -519,8 +519,9 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         );
         let remote_applied_tracker = monitor.remote_applied_tracker();
         let refresh_gate = monitor.refresh_gate();
-        monitor.seed_remote_entries_with_suppressed_paths(
+        monitor.seed_remote_entries_from_snapshot_with_suppressed_paths(
             &action_plan,
+            &initial_update.snapshot,
             &startup_delete_report.suppressed_startup_paths,
         );
         std::thread::spawn(move || {
