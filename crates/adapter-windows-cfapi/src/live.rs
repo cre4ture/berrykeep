@@ -1,11 +1,12 @@
 use crate::content_fingerprint::FingerprintingReader;
 use crate::runtime::{
-    HydrationProgress, HydrationRequest, HydrationResult, Hydrator, UploadReceipt, Uploader,
+    ConditionalDeleteResult, HydrationProgress, HydrationRequest, HydrationResult, Hydrator,
+    UploadReceipt, Uploader,
 };
 use anyhow::{Context, Result, anyhow};
 use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
 use client_sdk::{
-    ClientIdentityMaterial, IronMeshClient, build_http_client_from_pem,
+    ClientIdentityMaterial, ConditionalDeleteOutcome, IronMeshClient, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, is_concrete_remote_revision,
     normalize_server_base_url,
 };
@@ -298,6 +299,25 @@ impl Uploader for ServerNodeHydrator {
         Ok(())
     }
 
+    fn delete_path_conditionally(
+        &self,
+        path: &str,
+        expected_revision: &str,
+    ) -> ConditionalDeleteResult {
+        match self
+            .sdk
+            .delete_path_with_expected_revision_outcome_blocking(path, Some(expected_revision))
+        {
+            Ok(ConditionalDeleteOutcome::Deleted) => ConditionalDeleteResult::Deleted,
+            Ok(ConditionalDeleteOutcome::RevisionConflict) => {
+                ConditionalDeleteResult::RevisionConflict
+            }
+            Err(error) => ConditionalDeleteResult::Failed(
+                error.context(format!("failed to delete remote object for path {path}")),
+            ),
+        }
+    }
+
     fn rename_path(&self, from_path: &str, to_path: &str) -> Result<bool> {
         self.sdk
             .rename_path_blocking(from_path, to_path, false)
@@ -460,6 +480,29 @@ mod tests {
 
         Uploader::delete_path(&hydrator, "photos/stale.jpg", "revision-42")
             .expect("delete request should be accepted by the test server");
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delete request should be captured");
+        server.join().expect("test server should stop cleanly");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(request_line.contains("expected_revision=revision-42"));
+    }
+
+    #[test]
+    fn windows_delete_revision_conflict_is_classified_without_path_only_fallback() {
+        let (base_url, server, request_rx) = capture_single_http_request_with_response(
+            b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        );
+        let hydrator = ServerNodeHydrator::with_client(
+            IronMeshClient::from_direct_base_url(base_url),
+            std::env::temp_dir().join(format!("ironmesh-delete-conflict-{}", uuid::Uuid::new_v4())),
+        );
+
+        assert!(matches!(
+            Uploader::delete_path_conditionally(&hydrator, "photos/stale.jpg", "revision-42"),
+            ConditionalDeleteResult::RevisionConflict
+        ));
 
         let request = request_rx
             .recv_timeout(Duration::from_secs(5))

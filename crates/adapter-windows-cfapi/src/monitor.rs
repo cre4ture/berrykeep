@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::windows::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
@@ -22,7 +22,7 @@ use crate::placeholder_metadata::{
 };
 #[cfg(test)]
 use crate::runtime::UploadReceipt;
-use crate::runtime::Uploader;
+use crate::runtime::{ConditionalDeleteResult, Uploader};
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use client_sdk::is_concrete_remote_revision;
 use sync_core::SyncSnapshot;
@@ -35,6 +35,9 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_PINNED, FILE_ATTRIB
 
 const DEHYDRATE_SHARING_VIOLATION_MAX_RETRIES: usize = 8;
 const DEHYDRATE_SHARING_VIOLATION_RETRY_DELAY_MS: u64 = 250;
+const DELETE_RETRY_BASE_DELAY: Duration = Duration::from_secs(15);
+const DELETE_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
+const DELETE_RETRY_MAX_EXPONENT: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct LocalFileIdentity {
@@ -61,6 +64,12 @@ struct SeenEntry {
     remote_revision: Option<String>,
     placeholder_state: Option<PlaceholderSnapshot>,
     provider_hydration_active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingDeleteRetry {
+    attempts: u32,
+    not_before: Instant,
 }
 
 impl SeenEntry {
@@ -253,6 +262,7 @@ pub struct SyncRootMonitor {
     provider_instance_id: uuid::Uuid,
     uploader: Arc<dyn Uploader>,
     seen: HashMap<String, SeenEntry>,
+    pending_delete_retries: HashMap<String, PendingDeleteRetry>,
     dehydrations_in_flight: Arc<Mutex<HashSet<String>>>,
     hydrations_in_flight: Arc<Mutex<HashSet<String>>>,
     remote_applied_tracker: RemoteAppliedTracker,
@@ -361,6 +371,7 @@ impl SyncRootMonitor {
             provider_instance_id,
             uploader,
             seen: HashMap::new(),
+            pending_delete_retries: HashMap::new(),
             dehydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
             hydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
             remote_applied_tracker: RemoteAppliedTracker::default(),
@@ -478,6 +489,11 @@ impl SyncRootMonitor {
         for path in current.keys() {
             self.remote_applied_tracker.cancel_file_removal(path);
         }
+        // A local recreation or an inbound refresh has resolved the pending
+        // deletion state for that path. Do not carry a stale retry schedule
+        // into the next deletion event.
+        self.pending_delete_retries
+            .retain(|path, _| !current.contains_key(path));
         // Directories are represented remotely by marker objects, but Windows
         // directories do not provide a durable CFAPI identity. Retain a marker
         // revision observed in this monitor instance so their later removal can
@@ -1221,7 +1237,7 @@ impl SyncRootMonitor {
     }
 
     fn handle_deleted_entries(
-        &self,
+        &mut self,
         current: &mut HashMap<String, SeenEntry>,
         handled_renames: &std::collections::HashSet<String>,
     ) {
@@ -1232,25 +1248,42 @@ impl SyncRootMonitor {
                 if current.contains_key(path) {
                     None
                 } else {
-                    Some((path.as_str(), entry.clone()))
+                    Some((path.clone(), entry.clone()))
                 }
             })
             .collect::<Vec<_>>();
         deleted_paths.sort_by(|(left_path, _), (right_path, _)| right_path.cmp(left_path));
 
         for (path, entry) in deleted_paths {
-            if is_internal_client_identity_relative_path(path)
-                || is_internal_connection_bootstrap_relative_path(path)
-                || is_internal_remote_snapshot_relative_path(path)
+            if is_internal_client_identity_relative_path(&path)
+                || is_internal_connection_bootstrap_relative_path(&path)
+                || is_internal_remote_snapshot_relative_path(&path)
             {
                 continue;
             }
-            if handled_renames.contains(path) {
+            if handled_renames.contains(&path) {
                 tracing::info!(
                     "{}: skipping delete handling for renamed path {}",
                     self.name,
                     path
                 );
+                continue;
+            }
+            if !entry.is_dir
+                && self
+                    .remote_applied_tracker
+                    .take_file_removal_suppression(&path)
+            {
+                tracing::info!(
+                    "{}: suppressing server-originated file removal {}",
+                    self.name,
+                    path
+                );
+                self.pending_delete_retries.remove(&path);
+                continue;
+            }
+            if !self.delete_retry_is_due(&path) {
+                current.insert(path.to_string(), entry);
                 continue;
             }
             if entry.is_dir {
@@ -1264,30 +1297,45 @@ impl SyncRootMonitor {
                         self.name,
                         path
                     );
-                    current.insert(path.to_string(), entry);
+                    self.retain_pending_delete(
+                        current,
+                        &path,
+                        entry,
+                        "missing concrete marker revision",
+                    );
                     continue;
                 };
-                let marker_path = directory_marker_path(path);
-                if let Err(err) = self.uploader.delete_path(&marker_path, expected_revision) {
-                    tracing::warn!(
-                        "{}: pending local directory delete failed for marker {}: {}; retaining it for retry",
-                        self.name,
-                        marker_path,
-                        err
-                    );
-                    current.insert(path.to_string(), entry);
+                let marker_path = directory_marker_path(&path);
+                match self
+                    .uploader
+                    .delete_path_conditionally(&marker_path, expected_revision)
+                {
+                    ConditionalDeleteResult::Deleted => {
+                        self.pending_delete_retries.remove(&path);
+                    }
+                    ConditionalDeleteResult::RevisionConflict => {
+                        tracing::warn!(
+                            "{}: dropping pending local directory delete for marker {} because its revision is superseded; the next remote refresh will re-materialize the current object",
+                            self.name,
+                            marker_path
+                        );
+                        self.pending_delete_retries.remove(&path);
+                    }
+                    ConditionalDeleteResult::Failed(err) => {
+                        tracing::warn!(
+                            "{}: pending local directory delete failed for marker {}: {}; retaining it for retry",
+                            self.name,
+                            marker_path,
+                            err
+                        );
+                        self.retain_pending_delete(
+                            current,
+                            &path,
+                            entry,
+                            "conditional marker delete failed",
+                        );
+                    }
                 }
-                continue;
-            }
-            if self
-                .remote_applied_tracker
-                .take_file_removal_suppression(path)
-            {
-                tracing::info!(
-                    "{}: suppressing server-originated file removal {}",
-                    self.name,
-                    path
-                );
                 continue;
             }
             let Some(expected_revision) = entry
@@ -1300,21 +1348,84 @@ impl SyncRootMonitor {
                     self.name,
                     path
                 );
-                current.insert(path.to_string(), entry);
+                self.retain_pending_delete(
+                    current,
+                    &path,
+                    entry,
+                    "missing concrete remote revision",
+                );
                 continue;
             };
             tracing::info!("{}: detected deleted file {}", self.name, path);
-            if let Err(err) = self.uploader.delete_path(path, expected_revision) {
-                tracing::warn!(
-                    "{}: pending local file delete failed for {}: {}; retaining it for retry",
-                    self.name,
-                    path,
-                    err
-                );
-                current.insert(path.to_string(), entry);
+            match self
+                .uploader
+                .delete_path_conditionally(&path, expected_revision)
+            {
+                ConditionalDeleteResult::Deleted => {
+                    self.pending_delete_retries.remove(&path);
+                }
+                ConditionalDeleteResult::RevisionConflict => {
+                    tracing::warn!(
+                        "{}: dropping pending local file delete {} because its revision is superseded; the next remote refresh will re-materialize the current object",
+                        self.name,
+                        path
+                    );
+                    self.pending_delete_retries.remove(&path);
+                }
+                ConditionalDeleteResult::Failed(err) => {
+                    tracing::warn!(
+                        "{}: pending local file delete failed for {}: {}; retaining it for retry",
+                        self.name,
+                        path,
+                        err
+                    );
+                    self.retain_pending_delete(current, &path, entry, "conditional delete failed");
+                }
             }
         }
     }
+
+    fn delete_retry_is_due(&self, path: &str) -> bool {
+        self.pending_delete_retries
+            .get(path)
+            .is_none_or(|retry| Instant::now() >= retry.not_before)
+    }
+
+    fn retain_pending_delete(
+        &mut self,
+        current: &mut HashMap<String, SeenEntry>,
+        path: &str,
+        entry: SeenEntry,
+        reason: &'static str,
+    ) {
+        let retry = self
+            .pending_delete_retries
+            .entry(path.to_string())
+            .or_insert(PendingDeleteRetry {
+                attempts: 0,
+                not_before: Instant::now(),
+            });
+        retry.attempts = retry.attempts.saturating_add(1);
+        let delay = delete_retry_delay(retry.attempts);
+        retry.not_before = Instant::now() + delay;
+        tracing::warn!(
+            "{}: retaining pending local delete {} after {}; attempt={} retry_after_secs={}",
+            self.name,
+            path,
+            reason,
+            retry.attempts,
+            delay.as_secs()
+        );
+        current.insert(path.to_string(), entry);
+    }
+}
+
+fn delete_retry_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(DELETE_RETRY_MAX_EXPONENT);
+    DELETE_RETRY_BASE_DELAY
+        .checked_mul(1_u32 << exponent)
+        .unwrap_or(DELETE_RETRY_MAX_DELAY)
+        .min(DELETE_RETRY_MAX_DELAY)
 }
 
 fn normalize_monitor_relative_path(path: &str) -> String {
@@ -1612,6 +1723,11 @@ mod tests {
         delete_attempts: Mutex<usize>,
     }
 
+    #[derive(Default)]
+    struct ConflictingDeleteUploader {
+        delete_attempts: Mutex<usize>,
+    }
+
     /// A real Windows CFAPI registration so the monitor observes the same placeholder kind that
     /// remote reconciliation removes in production.
     struct RegisteredMonitorTestSyncRoot {
@@ -1703,6 +1819,29 @@ mod tests {
                 .lock()
                 .expect("delete attempts lock poisoned") += 1;
             anyhow::bail!("simulated remote delete rejection")
+        }
+    }
+
+    impl Uploader for ConflictingDeleteUploader {
+        fn upload_reader(
+            &self,
+            _path: &str,
+            _reader: &mut dyn Read,
+            _length: u64,
+        ) -> anyhow::Result<UploadReceipt> {
+            Ok(UploadReceipt::default())
+        }
+
+        fn delete_path_conditionally(
+            &self,
+            _path: &str,
+            _expected_revision: &str,
+        ) -> ConditionalDeleteResult {
+            *self
+                .delete_attempts
+                .lock()
+                .expect("delete attempts lock poisoned") += 1;
+            ConditionalDeleteResult::RevisionConflict
         }
     }
 
@@ -2092,7 +2231,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_conditional_delete_stays_pending_and_retries() {
+    fn failed_conditional_delete_stays_pending_with_bounded_backoff() {
         let uploader = Arc::new(FailingDeleteUploader::default());
         let mut monitor = SyncRootMonitor::new(
             "monitor-test",
@@ -2121,9 +2260,30 @@ mod tests {
                 .delete_attempts
                 .lock()
                 .expect("delete attempts lock poisoned"),
-            2,
-            "conditional delete failures must remain pending for retry"
+            1,
+            "a stale conditional delete must not be retried on every monitor walk"
         );
+
+        monitor.seen = second_current;
+        monitor
+            .pending_delete_retries
+            .get_mut("documents/pending.txt")
+            .expect("pending delete should have a retry schedule")
+            .not_before = Instant::now();
+        let mut third_current = HashMap::new();
+        monitor.handle_deleted_entries(&mut third_current, &handled_renames);
+
+        assert!(third_current.contains_key("documents/pending.txt"));
+        assert_eq!(
+            *uploader
+                .delete_attempts
+                .lock()
+                .expect("delete attempts lock poisoned"),
+            2,
+            "the pending conditional delete must retry once its bounded backoff expires"
+        );
+        assert_eq!(delete_retry_delay(1), Duration::from_secs(15));
+        assert_eq!(delete_retry_delay(100), Duration::from_secs(5 * 60));
     }
 
     #[test]
@@ -2150,6 +2310,42 @@ mod tests {
                 .expect("deletes lock poisoned")
                 .is_empty(),
             "a missing baseline must never fall back to a path-only delete"
+        );
+    }
+
+    #[test]
+    fn revision_conflict_drops_stale_pending_delete_without_path_only_retry() {
+        let uploader = Arc::new(ConflictingDeleteUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            std::env::temp_dir(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        let mut deleted_entry = seen_entry(false);
+        deleted_entry.remote_revision = Some("superseded-revision".to_string());
+        monitor
+            .seen
+            .insert("documents/conflicted.txt".to_string(), deleted_entry);
+
+        let mut current = HashMap::new();
+        monitor.handle_deleted_entries(&mut current, &HashSet::new());
+
+        assert!(
+            !current.contains_key("documents/conflicted.txt"),
+            "a known revision conflict must drop the stale pending delete so refresh can materialize the newer remote object"
+        );
+        assert!(monitor.pending_delete_retries.is_empty());
+
+        monitor.seen = current;
+        monitor.handle_deleted_entries(&mut HashMap::new(), &HashSet::new());
+        assert_eq!(
+            *uploader
+                .delete_attempts
+                .lock()
+                .expect("delete attempts lock poisoned"),
+            1,
+            "a revision conflict must not replay the same stale conditional delete"
         );
     }
 

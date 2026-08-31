@@ -176,6 +176,13 @@ pub struct UploadReceipt {
     pub in_sync_content_fingerprint: Option<String>,
 }
 
+#[derive(Debug)]
+pub enum ConditionalDeleteResult {
+    Deleted,
+    RevisionConflict,
+    Failed(anyhow::Error),
+}
+
 pub trait Uploader: Send + Sync + 'static {
     fn upload_reader(
         &self,
@@ -190,6 +197,17 @@ pub trait Uploader: Send + Sync + 'static {
 
     fn delete_path(&self, _path: &str, _expected_revision: &str) -> Result<()> {
         Ok(())
+    }
+
+    fn delete_path_conditionally(
+        &self,
+        path: &str,
+        expected_revision: &str,
+    ) -> ConditionalDeleteResult {
+        match self.delete_path(path, expected_revision) {
+            Ok(()) => ConditionalDeleteResult::Deleted,
+            Err(error) => ConditionalDeleteResult::Failed(error),
+        }
     }
 }
 

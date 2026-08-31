@@ -3389,6 +3389,12 @@ pub struct UploadResult {
     pub manifest_hash: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalDeleteOutcome {
+    Deleted,
+    RevisionConflict,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadSessionStatus {
     pub upload_id: String,
@@ -5343,6 +5349,23 @@ impl IronMeshClient {
         expected_revision: Option<&str>,
     ) -> Result<()> {
         let key = key.as_ref();
+        match self
+            .delete_path_with_expected_revision_outcome(key, expected_revision)
+            .await?
+        {
+            ConditionalDeleteOutcome::Deleted => Ok(()),
+            ConditionalDeleteOutcome::RevisionConflict => {
+                bail!("delete failed for {key}: {}", StatusCode::CONFLICT)
+            }
+        }
+    }
+
+    pub async fn delete_path_with_expected_revision_outcome(
+        &self,
+        key: impl AsRef<str>,
+        expected_revision: Option<&str>,
+    ) -> Result<ConditionalDeleteOutcome> {
+        let key = key.as_ref();
         let mut url = self.store_delete_url()?;
         url.query_pairs_mut().append_pair("key", key);
         append_optional_query(&mut url, "expected_revision", expected_revision);
@@ -5356,7 +5379,8 @@ impl IronMeshClient {
             .with_context(|| format!("failed to delete path {key}"))?;
 
         match response.status {
-            StatusCode::CREATED | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::CREATED | StatusCode::NO_CONTENT => Ok(ConditionalDeleteOutcome::Deleted),
+            StatusCode::CONFLICT => Ok(ConditionalDeleteOutcome::RevisionConflict),
             status => Err(anyhow!("delete failed for {key}: {status}")),
         }
     }
@@ -7536,6 +7560,20 @@ impl IronMeshClient {
 
         let runtime = blocking_runtime()?;
         runtime.block_on(self.delete_path_with_expected_revision(key, expected_revision.as_deref()))
+    }
+
+    pub fn delete_path_with_expected_revision_outcome_blocking(
+        &self,
+        key: impl AsRef<str>,
+        expected_revision: Option<&str>,
+    ) -> Result<ConditionalDeleteOutcome> {
+        let key = key.as_ref().to_string();
+        let expected_revision = expected_revision.map(str::to_string);
+
+        let runtime = blocking_runtime()?;
+        runtime.block_on(
+            self.delete_path_with_expected_revision_outcome(key, expected_revision.as_deref()),
+        )
     }
 
     pub fn rename_path_blocking(
