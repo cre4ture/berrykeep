@@ -63,8 +63,9 @@ pub use managed_client::{
     RouteRefreshOutcome, RouteRefreshReason,
 };
 pub use remote_sync::{
-    RemoteSnapshotFetchProgress, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
-    RemoteSnapshotUpdate, RemoteSyncScheduler, RemoteSyncStrategy, changed_paths_between,
+    RemoteDeletion, RemoteEntryBaseline, RemoteSnapshotFetchProgress, RemoteSnapshotFetcher,
+    RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate, RemoteSyncScheduler,
+    RemoteSyncStrategy, changed_paths_between, is_concrete_remote_revision,
 };
 pub use session_pool::TransportSessionPoolSnapshot;
 pub use transport_sdk::{

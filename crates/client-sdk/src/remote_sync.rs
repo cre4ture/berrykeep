@@ -1,5 +1,5 @@
 use crate::bootstrap::ConnectionBootstrap;
-use crate::ironmesh_client::IronMeshClient;
+use crate::ironmesh_client::{IronMeshClient, VersionConsistencyState};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -99,6 +99,107 @@ impl RemoteSyncScheduler {
 pub struct RemoteSnapshotUpdate {
     pub snapshot: SyncSnapshot,
     pub changed_paths: Vec<String>,
+    /// Deletions whose preferred remote tombstone directly proves the removed
+    /// predecessor. Consumers must apply a deletion only after matching it to
+    /// the entry they currently hold.
+    pub deletions: Vec<RemoteDeletion>,
+}
+
+impl RemoteSnapshotUpdate {
+    fn snapshot_only(snapshot: SyncSnapshot) -> Self {
+        Self {
+            snapshot,
+            changed_paths: Vec::new(),
+            deletions: Vec::new(),
+        }
+    }
+}
+
+/// The identity metadata needed to prove that a remote tombstone supersedes a
+/// specific entry. A path without concrete identity metadata is never enough
+/// to authorize deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteEntryBaseline {
+    pub path: String,
+    pub version: Option<String>,
+    pub content_hash: Option<String>,
+    pub modified_at_unix: Option<u64>,
+}
+
+impl From<&NamespaceEntry> for RemoteEntryBaseline {
+    fn from(entry: &NamespaceEntry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            version: entry.version.clone(),
+            content_hash: entry.content_hash.clone(),
+            modified_at_unix: entry.modified_at_unix,
+        }
+    }
+}
+
+/// A current, confirmed tombstone and the direct predecessor records it
+/// supersedes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDeletion {
+    pub path: String,
+    pub tombstone_version: String,
+    pub tombstone_created_at_unix: u64,
+    pub predecessors: Vec<RemoteEntryBaseline>,
+}
+
+impl RemoteDeletion {
+    /// Returns true only when this deletion proves it supersedes `baseline`.
+    ///
+    /// A concrete revision is authoritative, but any available hash or time
+    /// must agree as well. Without a concrete revision, both content hash and
+    /// modification time are required. This deliberately never matches from a
+    /// path or absence of metadata alone.
+    pub fn matches_baseline(&self, baseline: &RemoteEntryBaseline) -> bool {
+        self.path == baseline.path
+            && self
+                .predecessors
+                .iter()
+                .any(|predecessor| baseline_matches_predecessor(baseline, predecessor))
+    }
+}
+
+/// Whether a revision is safe to use as an authoritative remote identity.
+/// Legacy `server-head` placeholders are intentionally not concrete.
+pub fn is_concrete_remote_revision(revision: Option<&str>) -> bool {
+    revision
+        .map(str::trim)
+        .is_some_and(|revision| !revision.is_empty() && !revision.starts_with("server-head"))
+}
+
+fn baseline_matches_predecessor(
+    baseline: &RemoteEntryBaseline,
+    predecessor: &RemoteEntryBaseline,
+) -> bool {
+    if baseline.path != predecessor.path {
+        return false;
+    }
+
+    if is_concrete_remote_revision(baseline.version.as_deref()) {
+        if baseline.version != predecessor.version {
+            return false;
+        }
+        return optional_values_do_not_conflict(&baseline.content_hash, &predecessor.content_hash)
+            && optional_values_do_not_conflict(
+                &baseline.modified_at_unix,
+                &predecessor.modified_at_unix,
+            );
+    }
+
+    baseline.content_hash.is_some()
+        && baseline.modified_at_unix.is_some()
+        && baseline.content_hash == predecessor.content_hash
+        && baseline.modified_at_unix == predecessor.modified_at_unix
+}
+
+fn optional_values_do_not_conflict<T: Eq>(left: &Option<T>, right: &Option<T>) -> bool {
+    left.as_ref()
+        .zip(right.as_ref())
+        .is_none_or(|(left, right)| left == right)
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +269,122 @@ impl RemoteSnapshotFetcher {
             self.scope.depth,
             self.scope.snapshot.as_deref(),
         )
+    }
+
+    /// Fetches the visible remote snapshot and confirms only candidate paths
+    /// that are now missing through their version history. Passing all entries
+    /// from the prior snapshot is efficient: history is queried only for paths
+    /// absent from this newly fetched snapshot. Passing candidates at startup
+    /// lets a caller validate persisted entries before it adopts a fresh index.
+    pub fn fetch_snapshot_update_blocking(
+        &self,
+        baseline_candidates: &[RemoteEntryBaseline],
+    ) -> Result<RemoteSnapshotUpdate> {
+        let snapshot = self.fetch_snapshot_blocking()?;
+        self.snapshot_update_for_snapshot_blocking(snapshot, baseline_candidates)
+    }
+
+    fn snapshot_update_for_snapshot_blocking(
+        &self,
+        snapshot: SyncSnapshot,
+        baseline_candidates: &[RemoteEntryBaseline],
+    ) -> Result<RemoteSnapshotUpdate> {
+        let visible_paths: BTreeSet<&str> = snapshot
+            .remote
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        let missing_candidates: Vec<_> = baseline_candidates
+            .iter()
+            .filter(|candidate| !visible_paths.contains(candidate.path.as_str()))
+            .cloned()
+            .collect();
+        let deletions = self.confirm_missing_deletions_blocking(&missing_candidates)?;
+
+        Ok(RemoteSnapshotUpdate {
+            snapshot,
+            changed_paths: Vec::new(),
+            deletions,
+        })
+    }
+
+    fn confirm_missing_deletions_blocking(
+        &self,
+        candidates: &[RemoteEntryBaseline],
+    ) -> Result<Vec<RemoteDeletion>> {
+        let mut candidates_by_path: BTreeMap<&str, Vec<&RemoteEntryBaseline>> = BTreeMap::new();
+        for candidate in candidates {
+            candidates_by_path
+                .entry(candidate.path.as_str())
+                .or_default()
+                .push(candidate);
+        }
+
+        let mut confirmed_deletions = Vec::new();
+        for (path, path_candidates) in candidates_by_path {
+            let graph = match self.client.list_versions_blocking(path) {
+                Ok(Some(graph)) => graph,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        "remote-refresh: unable to verify possible deletion for {path}; preserving the prior entry: {error:#}"
+                    );
+                    continue;
+                }
+            };
+            let Some(preferred_head_version_id) = graph.preferred_head_version_id.as_deref() else {
+                continue;
+            };
+            let Some(tombstone) = graph
+                .versions
+                .iter()
+                .find(|version| version.version_id == preferred_head_version_id)
+            else {
+                continue;
+            };
+            if tombstone.entry_type != "tombstone"
+                || tombstone.state != VersionConsistencyState::Confirmed
+            {
+                continue;
+            }
+
+            let predecessors: Vec<_> = tombstone
+                .parent_version_ids
+                .iter()
+                .filter_map(|parent_version_id| {
+                    graph.versions.iter().find(|version| {
+                        version.version_id == *parent_version_id && version.entry_type == "key"
+                    })
+                })
+                .map(|predecessor| RemoteEntryBaseline {
+                    path: predecessor
+                        .logical_path
+                        .clone()
+                        .unwrap_or_else(|| path.to_string()),
+                    version: Some(predecessor.version_id.clone()),
+                    content_hash: predecessor.content_hash.clone(),
+                    modified_at_unix: Some(predecessor.created_at_unix),
+                })
+                .collect();
+            if predecessors.is_empty() {
+                continue;
+            }
+
+            let deletion = RemoteDeletion {
+                path: path.to_string(),
+                tombstone_version: tombstone.version_id.clone(),
+                tombstone_created_at_unix: tombstone.created_at_unix,
+                predecessors,
+            };
+            if path_candidates
+                .iter()
+                .any(|candidate| deletion.matches_baseline(candidate))
+            {
+                confirmed_deletions.push(deletion);
+            }
+        }
+
+        Ok(confirmed_deletions)
     }
 
     pub fn fetch_snapshot_blocking_with_progress<F>(
@@ -318,11 +535,13 @@ impl RemoteSnapshotPoller {
     where
         C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
     {
-        self.spawn_fetcher_loop_with_fetch(
+        self.spawn_fetcher_loop_with_update_fetch(
             running,
             initial_snapshot,
             fetcher,
-            |fetcher| fetcher.fetch_snapshot_blocking(),
+            |fetcher, baseline_candidates| {
+                fetcher.fetch_snapshot_update_blocking(baseline_candidates)
+            },
             on_change,
         )
     }
@@ -333,19 +552,64 @@ impl RemoteSnapshotPoller {
         initial_snapshot: Option<SyncSnapshot>,
         fetcher: RemoteSnapshotFetcher,
         mut fetch_snapshot: F,
-        mut on_change: C,
+        on_change: C,
     ) -> JoinHandle<()>
     where
         F: FnMut(&RemoteSnapshotFetcher) -> Result<SyncSnapshot> + Send + 'static,
         C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
     {
+        self.spawn_fetcher_loop_with_update_fetch(
+            running,
+            initial_snapshot,
+            fetcher,
+            move |fetcher, _baseline_candidates| {
+                let snapshot = fetch_snapshot(fetcher)?;
+                fetcher.snapshot_update_for_snapshot_blocking(snapshot, _baseline_candidates)
+            },
+            on_change,
+        )
+    }
+
+    fn spawn_fetcher_loop_with_update_fetch<F, C>(
+        &self,
+        running: Arc<AtomicBool>,
+        initial_snapshot: Option<SyncSnapshot>,
+        fetcher: RemoteSnapshotFetcher,
+        mut fetch_snapshot: F,
+        mut on_change: C,
+    ) -> JoinHandle<()>
+    where
+        F: FnMut(&RemoteSnapshotFetcher, &[RemoteEntryBaseline]) -> Result<RemoteSnapshotUpdate>
+            + Send
+            + 'static,
+        C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
+    {
         match self.scheduler.strategy.mode {
-            RemoteSyncMode::Polling { .. } => self.spawn_changed_paths_loop(
-                running,
-                initial_snapshot,
-                move || fetch_snapshot(&fetcher),
-                on_change,
-            ),
+            RemoteSyncMode::Polling { .. } => {
+                let scheduler = self.scheduler.clone();
+                thread::spawn(move || {
+                    let mut current_snapshot = initial_snapshot;
+                    while running.load(Ordering::SeqCst) {
+                        if !scheduler.wait_for_next_tick_blocking(&running)
+                            || !running.load(Ordering::SeqCst)
+                        {
+                            break;
+                        }
+                        let baseline_candidates = current_snapshot
+                            .as_ref()
+                            .map(remote_entry_baselines)
+                            .unwrap_or_default();
+                        let next_snapshot = match fetch_snapshot(&fetcher, &baseline_candidates) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                tracing::warn!("remote-refresh: snapshot polling error: {error:#}");
+                                continue;
+                            }
+                        };
+                        apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
+                    }
+                })
+            }
             RemoteSyncMode::ServerNotifications {
                 wait_timeout,
                 retry_interval: _,
@@ -359,6 +623,7 @@ impl RemoteSnapshotPoller {
                     while running.load(Ordering::SeqCst) {
                         let mut should_fetch = current_snapshot.is_none();
                         let mut observed_sequence = last_sequence;
+                        let mut sequence_regressed = false;
                         if notifications_available {
                             match fetcher.client.wait_for_store_index_change_blocking(
                                 last_sequence,
@@ -371,6 +636,7 @@ impl RemoteSnapshotPoller {
                                             "remote-refresh: server change sequence regressed from {last_sequence} to {}; reloading snapshot to rebaseline notification state",
                                             response.sequence
                                         );
+                                        sequence_regressed = true;
                                         should_fetch = true;
                                     } else {
                                         should_fetch |= response.changed;
@@ -410,13 +676,24 @@ impl RemoteSnapshotPoller {
                             continue;
                         }
 
-                        let next_snapshot = match fetch_snapshot(&fetcher) {
+                        let baseline_candidates = current_snapshot
+                            .as_ref()
+                            .map(remote_entry_baselines)
+                            .unwrap_or_default();
+                        let mut next_snapshot = match fetch_snapshot(&fetcher, &baseline_candidates)
+                        {
                             Ok(snapshot) => snapshot,
                             Err(error) => {
                                 tracing::warn!("remote-refresh: snapshot refresh error: {error:#}");
                                 continue;
                             }
                         };
+                        if sequence_regressed {
+                            // A regressed notification cannot establish that a
+                            // tombstone is newer than the accepted snapshot.
+                            // Rebaseline the sequence and accept only upserts.
+                            next_snapshot.deletions.clear();
+                        }
                         last_sequence = observed_sequence;
                         apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
                     }
@@ -453,7 +730,11 @@ impl RemoteSnapshotPoller {
                         continue;
                     }
                 };
-                apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
+                apply_snapshot_update(
+                    &mut current_snapshot,
+                    RemoteSnapshotUpdate::snapshot_only(next_snapshot),
+                    &mut on_change,
+                );
             }
         })
     }
@@ -473,22 +754,83 @@ fn should_fallback_to_polling_after_wait_error(error: &anyhow::Error) -> bool {
 
 fn apply_snapshot_update<C>(
     current_snapshot: &mut Option<SyncSnapshot>,
-    next_snapshot: SyncSnapshot,
+    next_update: RemoteSnapshotUpdate,
     on_change: &mut C,
 ) where
     C: FnMut(RemoteSnapshotUpdate),
 {
     if let Some(previous) = current_snapshot.as_ref() {
-        let changed_paths = changed_paths_between(previous, &next_snapshot);
+        let (merged_snapshot, deletions) = merge_snapshot_update(previous, next_update);
+        let changed_paths = changed_paths_between(previous, &merged_snapshot);
         if !changed_paths.is_empty() {
             on_change(RemoteSnapshotUpdate {
-                snapshot: next_snapshot.clone(),
+                snapshot: merged_snapshot.clone(),
                 changed_paths,
+                deletions,
             });
+        }
+        *current_snapshot = Some(merged_snapshot);
+        return;
+    }
+
+    *current_snapshot = Some(next_update.snapshot);
+}
+
+fn merge_snapshot_update(
+    previous: &SyncSnapshot,
+    next_update: RemoteSnapshotUpdate,
+) -> (SyncSnapshot, Vec<RemoteDeletion>) {
+    let mut merged_entries: BTreeMap<String, NamespaceEntry> = previous
+        .remote
+        .iter()
+        .cloned()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect();
+    let next_paths: BTreeSet<String> = next_update
+        .snapshot
+        .remote
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+
+    for entry in next_update.snapshot.remote {
+        merged_entries.insert(entry.path.clone(), entry);
+    }
+
+    let mut applied_deletions = Vec::new();
+    for deletion in next_update.deletions {
+        if next_paths.contains(&deletion.path) {
+            continue;
+        }
+        let Some(previous_entry) = previous
+            .remote
+            .iter()
+            .find(|entry| entry.path == deletion.path)
+        else {
+            continue;
+        };
+        if deletion.matches_baseline(&RemoteEntryBaseline::from(previous_entry)) {
+            merged_entries.remove(&deletion.path);
+            applied_deletions.push(deletion);
         }
     }
 
-    *current_snapshot = Some(next_snapshot);
+    (
+        SyncSnapshot {
+            local: next_update.snapshot.local,
+            remote: merged_entries.into_values().collect(),
+        },
+        applied_deletions,
+    )
+}
+
+fn remote_entry_baselines(snapshot: &SyncSnapshot) -> Vec<RemoteEntryBaseline> {
+    snapshot
+        .remote
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::File)
+        .map(RemoteEntryBaseline::from)
+        .collect()
 }
 
 pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) -> Vec<String> {
@@ -515,6 +857,7 @@ type RemoteSnapshotIndex = BTreeMap<
         Option<String>,
         Option<String>,
         Option<u64>,
+        Option<u64>,
     ),
 >;
 
@@ -529,6 +872,7 @@ fn remote_snapshot_index(snapshot: &SyncSnapshot) -> RemoteSnapshotIndex {
                 entry.content_hash.clone(),
                 entry.content_fingerprint.clone(),
                 entry.size_bytes,
+                entry.modified_at_unix,
             ),
         );
     }
@@ -657,121 +1001,118 @@ mod tests {
         );
     }
 
-    /// Characterization only: an older snapshot can replace a newer accepted
-    /// snapshot and report a path removal. This is the unsafe behaviour seen
-    /// when a delayed server refresh is applied after newer state exists.
-    ///
-    /// Remove this test when snapshot ordering/freshness validation is added.
+    fn deletion_for(baseline: RemoteEntryBaseline) -> RemoteDeletion {
+        RemoteDeletion {
+            path: baseline.path.clone(),
+            tombstone_version: "tombstone-9".to_string(),
+            tombstone_created_at_unix: 9,
+            predecessors: vec![baseline],
+        }
+    }
+
     #[test]
-    fn undesired_current_behavior_apply_snapshot_update_accepts_an_out_of_order_removal() {
-        let newer_snapshot = SyncSnapshot {
+    fn validated_tombstone_removes_only_its_proven_predecessor() {
+        let mut entry = NamespaceEntry::file("photos/newly-uploaded.jpg", "revision-2", "hash-2");
+        entry.modified_at_unix = Some(2);
+        let previous = SyncSnapshot {
             local: Vec::new(),
-            remote: vec![NamespaceEntry::file(
-                "photos/newly-uploaded.jpg",
-                "revision-2",
-                "hash-2",
-            )],
+            remote: vec![entry.clone()],
         };
-        let older_snapshot_without_the_file = SyncSnapshot {
-            local: Vec::new(),
-            remote: Vec::new(),
-        };
-        let mut current_snapshot = Some(newer_snapshot);
+        let mut current_snapshot = Some(previous);
         let mut updates = Vec::new();
 
         apply_snapshot_update(
             &mut current_snapshot,
-            older_snapshot_without_the_file,
+            RemoteSnapshotUpdate {
+                snapshot: SyncSnapshot {
+                    local: Vec::new(),
+                    remote: Vec::new(),
+                },
+                changed_paths: Vec::new(),
+                deletions: vec![deletion_for(RemoteEntryBaseline::from(&entry))],
+            },
             &mut |update| updates.push(update),
         );
 
         assert_eq!(updates.len(), 1);
-        assert_eq!(
-            updates[0].changed_paths,
-            vec!["photos/newly-uploaded.jpg".to_string()]
-        );
-        assert!(updates[0].snapshot.remote.is_empty());
+        assert_eq!(updates[0].changed_paths, vec![entry.path.clone()]);
+        assert_eq!(updates[0].deletions.len(), 1);
         assert!(
             current_snapshot
-                .expect("the old snapshot is retained")
+                .expect("validated deletion is retained")
                 .remote
                 .is_empty()
         );
     }
 
-    /// Desired safety contract for the characterization above.
-    ///
-    /// The expected panic keeps the current failure executable in normal CI.
-    /// Remove it when snapshot ordering/freshness validation is implemented.
     #[test]
-    #[should_panic(expected = "an older snapshot must not emit a removal")]
-    fn desired_behavior_out_of_order_snapshot_removal_is_rejected_until_a_fresh_snapshot_is_available()
-     {
-        let newer_snapshot = SyncSnapshot {
+    fn bare_or_mismatched_missing_snapshot_preserves_the_prior_entry() {
+        let mut entry = NamespaceEntry::file("photos/newly-uploaded.jpg", "revision-2", "hash-2");
+        entry.modified_at_unix = Some(2);
+        let previous = SyncSnapshot {
             local: Vec::new(),
-            remote: vec![NamespaceEntry::file(
-                "photos/newly-uploaded.jpg",
-                "revision-2",
-                "hash-2",
-            )],
+            remote: vec![entry.clone()],
         };
-        let older_snapshot_without_the_file = SyncSnapshot {
-            local: Vec::new(),
-            remote: Vec::new(),
-        };
-        let mut current_snapshot = Some(newer_snapshot.clone());
+        let mut current_snapshot = Some(previous.clone());
         let mut updates = Vec::new();
 
         apply_snapshot_update(
             &mut current_snapshot,
-            older_snapshot_without_the_file,
-            &mut |update| updates.push(update),
-        );
-
-        assert!(
-            updates.is_empty(),
-            "an older snapshot must not emit a removal"
-        );
-        assert_eq!(current_snapshot, Some(newer_snapshot));
-    }
-
-    /// Characterization only: a removal update identifies only a path and the
-    /// resulting snapshot. It carries neither the preceding revision nor a
-    /// tombstone/operation origin with which a consumer could prove the
-    /// removal is an authoritative remote deletion.
-    ///
-    /// Remove this test when updates carry typed, revision-linked deletions.
-    #[test]
-    fn undesired_current_behavior_removal_update_has_no_tombstone_or_predecessor_provenance() {
-        let mut current_snapshot = Some(SyncSnapshot {
-            local: Vec::new(),
-            remote: vec![NamespaceEntry::file(
-                "photos/possibly-stale.jpg",
-                "revision-7",
-                "hash-7",
-            )],
-        });
-        let mut updates = Vec::new();
-
-        apply_snapshot_update(
-            &mut current_snapshot,
-            SyncSnapshot {
+            RemoteSnapshotUpdate::snapshot_only(SyncSnapshot {
                 local: Vec::new(),
                 remote: Vec::new(),
+            }),
+            &mut |update| updates.push(update),
+        );
+        assert!(updates.is_empty());
+        assert_eq!(current_snapshot, Some(previous.clone()));
+
+        let mismatched = RemoteEntryBaseline {
+            version: Some("revision-1".to_string()),
+            ..RemoteEntryBaseline::from(&entry)
+        };
+        apply_snapshot_update(
+            &mut current_snapshot,
+            RemoteSnapshotUpdate {
+                snapshot: SyncSnapshot {
+                    local: Vec::new(),
+                    remote: Vec::new(),
+                },
+                changed_paths: Vec::new(),
+                deletions: vec![deletion_for(mismatched)],
             },
             &mut |update| updates.push(update),
         );
+        assert!(updates.is_empty());
+        assert_eq!(current_snapshot, Some(previous));
+    }
 
-        let update = updates.pop().expect("a path-only removal update");
-        // Exhaustive destructuring is intentional: adding deletion provenance
-        // to `RemoteSnapshotUpdate` must break this temporary characterization
-        // at compile time so it cannot silently survive the safety fix.
-        let RemoteSnapshotUpdate {
-            snapshot,
-            changed_paths,
-        } = update;
-        assert_eq!(changed_paths, vec!["photos/possibly-stale.jpg".to_string()]);
-        assert!(snapshot.remote.is_empty());
+    #[test]
+    fn deletion_matching_requires_consistent_revision_or_legacy_hash_and_time() {
+        let baseline = RemoteEntryBaseline {
+            path: "docs/readme.md".to_string(),
+            version: Some("revision-2".to_string()),
+            content_hash: Some("hash-2".to_string()),
+            modified_at_unix: Some(2),
+        };
+        let contradictory = RemoteEntryBaseline {
+            content_hash: Some("other-hash".to_string()),
+            ..baseline.clone()
+        };
+        assert!(!deletion_for(contradictory).matches_baseline(&baseline));
+
+        let legacy = RemoteEntryBaseline {
+            version: Some("server-head:size=2".to_string()),
+            ..baseline.clone()
+        };
+        assert!(deletion_for(legacy.clone()).matches_baseline(&legacy));
+        let no_timestamp = RemoteEntryBaseline {
+            modified_at_unix: None,
+            ..legacy.clone()
+        };
+        assert!(!deletion_for(no_timestamp.clone()).matches_baseline(&no_timestamp));
+        assert!(!is_concrete_remote_revision(Some("server-head")));
+        assert!(is_concrete_remote_revision(Some("revision-2")));
     }
 
     #[test]
@@ -787,9 +1128,11 @@ mod tests {
         let mut current_snapshot = Some(snapshot.clone());
         let mut updates = Vec::new();
 
-        apply_snapshot_update(&mut current_snapshot, snapshot.clone(), &mut |update| {
-            updates.push(update)
-        });
+        apply_snapshot_update(
+            &mut current_snapshot,
+            RemoteSnapshotUpdate::snapshot_only(snapshot.clone()),
+            &mut |update| updates.push(update),
+        );
 
         assert!(updates.is_empty());
         assert_eq!(current_snapshot, Some(snapshot));
@@ -1387,41 +1730,7 @@ mod tests {
         )
     }
 
-    /// Characterization only: after a server notification sequence regression,
-    /// the loop fetches and applies the returned snapshot even when that
-    /// snapshot is older and omits a file accepted by the preceding refresh.
-    ///
-    /// Remove this test when a sequence regression enters a deletion-safe
-    /// rebaseline mode instead of applying potentially stale removals.
     #[test]
-    fn undesired_current_behavior_sequence_regression_can_emit_a_stale_file_removal() {
-        let (first_update, stale_removal, wait_attempts, fetch_attempts) =
-            run_sequence_regression_scenario(Duration::from_secs(2));
-
-        let first_update = first_update.expect("first refresh should update the file revision");
-        let stale_removal =
-            stale_removal.expect("sequence regression should apply the older empty snapshot");
-
-        assert_eq!(wait_attempts, 2);
-        assert_eq!(fetch_attempts, 2);
-        assert_eq!(
-            first_update.changed_paths,
-            vec!["photos/holiday.jpg".to_string()]
-        );
-        assert_eq!(
-            stale_removal.changed_paths,
-            vec!["photos/holiday.jpg".to_string()]
-        );
-        assert!(stale_removal.snapshot.remote.is_empty());
-    }
-
-    /// Desired safety contract for the sequence-regression characterization
-    /// above. It uses the production notification loop and fails today because
-    /// the second fetch emits a removal from the older empty snapshot.
-    #[test]
-    #[should_panic(
-        expected = "a sequence regression must not emit a removal from an older snapshot"
-    )]
     fn desired_behavior_sequence_regression_does_not_emit_a_stale_file_removal() {
         let (first_update, unexpected_removal, _, _) =
             run_sequence_regression_scenario(Duration::from_secs(2));
