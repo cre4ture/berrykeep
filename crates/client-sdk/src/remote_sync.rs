@@ -6,13 +6,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sync_core::{EntryKind, NamespaceEntry, SyncSnapshot};
 use transport_sdk::ClientIdentityMaterial;
 
 const SNAPSHOT_BUILD_PROGRESS_STRIDE: u64 = 512;
 const PREFERRED_SERVER_NOTIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const UNVERIFIED_MISSING_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
 pub struct RemoteSyncStrategy {
@@ -502,6 +503,12 @@ pub struct RemoteSnapshotPoller {
     scheduler: RemoteSyncScheduler,
 }
 
+#[derive(Debug, Clone)]
+struct UnverifiedMissingEntry {
+    baseline: RemoteEntryBaseline,
+    last_verified_at: Instant,
+}
+
 impl RemoteSnapshotPoller {
     pub fn polling(interval: Duration) -> Self {
         Self {
@@ -589,16 +596,18 @@ impl RemoteSnapshotPoller {
                 let scheduler = self.scheduler.clone();
                 thread::spawn(move || {
                     let mut current_snapshot = initial_snapshot;
+                    let mut unverified_missing = BTreeMap::new();
                     while running.load(Ordering::SeqCst) {
                         if !scheduler.wait_for_next_tick_blocking(&running)
                             || !running.load(Ordering::SeqCst)
                         {
                             break;
                         }
-                        let baseline_candidates = current_snapshot
-                            .as_ref()
-                            .map(remote_entry_baselines)
-                            .unwrap_or_default();
+                        let baseline_candidates = deletion_baseline_candidates(
+                            current_snapshot.as_ref(),
+                            &unverified_missing,
+                            false,
+                        );
                         let next_snapshot = match fetch_snapshot(&fetcher, &baseline_candidates) {
                             Ok(snapshot) => snapshot,
                             Err(error) => {
@@ -606,7 +615,13 @@ impl RemoteSnapshotPoller {
                                 continue;
                             }
                         };
-                        apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
+                        apply_snapshot_update_with_pending(
+                            &mut current_snapshot,
+                            &mut unverified_missing,
+                            &baseline_candidates,
+                            next_snapshot,
+                            &mut on_change,
+                        );
                     }
                 })
             }
@@ -617,6 +632,7 @@ impl RemoteSnapshotPoller {
                 let scheduler = self.scheduler.clone();
                 thread::spawn(move || {
                     let mut current_snapshot = initial_snapshot;
+                    let mut unverified_missing = BTreeMap::new();
                     let mut last_sequence = 0u64;
                     let mut notifications_available = true;
 
@@ -624,6 +640,7 @@ impl RemoteSnapshotPoller {
                         let mut should_fetch = current_snapshot.is_none();
                         let mut observed_sequence = last_sequence;
                         let mut sequence_regressed = false;
+                        let mut observed_remote_change = false;
                         if notifications_available {
                             match fetcher.client.wait_for_store_index_change_blocking(
                                 last_sequence,
@@ -640,6 +657,7 @@ impl RemoteSnapshotPoller {
                                         should_fetch = true;
                                     } else {
                                         should_fetch |= response.changed;
+                                        observed_remote_change |= response.changed;
                                     }
                                 }
                                 Err(error) => {
@@ -676,10 +694,11 @@ impl RemoteSnapshotPoller {
                             continue;
                         }
 
-                        let baseline_candidates = current_snapshot
-                            .as_ref()
-                            .map(remote_entry_baselines)
-                            .unwrap_or_default();
+                        let baseline_candidates = deletion_baseline_candidates(
+                            current_snapshot.as_ref(),
+                            &unverified_missing,
+                            observed_remote_change && !sequence_regressed,
+                        );
                         let mut next_snapshot = match fetch_snapshot(&fetcher, &baseline_candidates)
                         {
                             Ok(snapshot) => snapshot,
@@ -695,7 +714,13 @@ impl RemoteSnapshotPoller {
                             next_snapshot.deletions.clear();
                         }
                         last_sequence = observed_sequence;
-                        apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
+                        apply_snapshot_update_with_pending(
+                            &mut current_snapshot,
+                            &mut unverified_missing,
+                            &baseline_candidates,
+                            next_snapshot,
+                            &mut on_change,
+                        );
                     }
                 })
             }
@@ -715,6 +740,7 @@ impl RemoteSnapshotPoller {
     {
         let scheduler = self.scheduler.clone();
         thread::spawn(move || {
+            let mut unverified_missing = BTreeMap::new();
             while running.load(Ordering::SeqCst) {
                 if !scheduler.wait_for_next_tick_blocking(&running) {
                     break;
@@ -730,8 +756,10 @@ impl RemoteSnapshotPoller {
                         continue;
                     }
                 };
-                apply_snapshot_update(
+                apply_snapshot_update_with_pending(
                     &mut current_snapshot,
+                    &mut unverified_missing,
+                    &[],
                     RemoteSnapshotUpdate::snapshot_only(next_snapshot),
                     &mut on_change,
                 );
@@ -752,6 +780,7 @@ fn should_fallback_to_polling_after_wait_error(error: &anyhow::Error) -> bool {
     })
 }
 
+#[cfg(test)]
 fn apply_snapshot_update<C>(
     current_snapshot: &mut Option<SyncSnapshot>,
     next_update: RemoteSnapshotUpdate,
@@ -759,10 +788,37 @@ fn apply_snapshot_update<C>(
 ) where
     C: FnMut(RemoteSnapshotUpdate),
 {
+    let mut unverified_missing = BTreeMap::new();
+    apply_snapshot_update_with_pending(
+        current_snapshot,
+        &mut unverified_missing,
+        &[],
+        next_update,
+        on_change,
+    );
+}
+
+fn apply_snapshot_update_with_pending<C>(
+    current_snapshot: &mut Option<SyncSnapshot>,
+    unverified_missing: &mut BTreeMap<String, UnverifiedMissingEntry>,
+    verified_candidates: &[RemoteEntryBaseline],
+    next_update: RemoteSnapshotUpdate,
+    on_change: &mut C,
+) where
+    C: FnMut(RemoteSnapshotUpdate),
+{
     if let Some(previous) = current_snapshot.as_ref() {
-        let (merged_snapshot, deletions) = merge_snapshot_update(previous, next_update);
-        let changed_paths = changed_paths_between(previous, &merged_snapshot);
-        if !changed_paths.is_empty() {
+        let (merged_snapshot, deletions, unverified_paths) = merge_snapshot_update(
+            previous,
+            unverified_missing,
+            verified_candidates,
+            next_update,
+        );
+        let changed_paths: Vec<_> = changed_paths_between(previous, &merged_snapshot)
+            .into_iter()
+            .filter(|path| !unverified_paths.contains(path))
+            .collect();
+        if !changed_paths.is_empty() || !deletions.is_empty() {
             on_change(RemoteSnapshotUpdate {
                 snapshot: merged_snapshot.clone(),
                 changed_paths,
@@ -778,9 +834,12 @@ fn apply_snapshot_update<C>(
 
 fn merge_snapshot_update(
     previous: &SyncSnapshot,
+    unverified_missing: &mut BTreeMap<String, UnverifiedMissingEntry>,
+    verified_candidates: &[RemoteEntryBaseline],
     next_update: RemoteSnapshotUpdate,
-) -> (SyncSnapshot, Vec<RemoteDeletion>) {
-    let mut merged_entries: BTreeMap<String, NamespaceEntry> = previous
+) -> (SyncSnapshot, Vec<RemoteDeletion>, BTreeSet<String>) {
+    let merged_entries: BTreeMap<String, NamespaceEntry> = next_update
+        .snapshot
         .remote
         .iter()
         .cloned()
@@ -793,25 +852,71 @@ fn merge_snapshot_update(
         .map(|entry| entry.path.clone())
         .collect();
 
-    for entry in next_update.snapshot.remote {
-        merged_entries.insert(entry.path.clone(), entry);
+    let mut applied_deletions = Vec::new();
+    let mut unverified_paths = BTreeSet::new();
+    for path in &next_paths {
+        unverified_missing.remove(path);
+    }
+    for previous_entry in &previous.remote {
+        if next_paths.contains(&previous_entry.path) {
+            unverified_missing.remove(&previous_entry.path);
+            continue;
+        }
+        if previous_entry.kind != EntryKind::File {
+            continue;
+        }
+        let baseline = RemoteEntryBaseline::from(previous_entry);
+        let deletion = next_update
+            .deletions
+            .iter()
+            .find(|deletion| deletion.matches_baseline(&baseline));
+        if let Some(deletion) = deletion {
+            applied_deletions.push(deletion.clone());
+            unverified_missing.remove(&previous_entry.path);
+        } else {
+            unverified_paths.insert(previous_entry.path.clone());
+            unverified_missing.insert(
+                previous_entry.path.clone(),
+                UnverifiedMissingEntry {
+                    baseline,
+                    // This refresh already performed the negative history
+                    // verification; do not repeat a full history scan on every
+                    // polling tick for the unchanged missing baseline.
+                    last_verified_at: Instant::now(),
+                },
+            );
+        }
     }
 
-    let mut applied_deletions = Vec::new();
     for deletion in next_update.deletions {
         if next_paths.contains(&deletion.path) {
             continue;
         }
-        let Some(previous_entry) = previous
-            .remote
-            .iter()
-            .find(|entry| entry.path == deletion.path)
-        else {
+        if applied_deletions.iter().any(|applied| {
+            applied.path == deletion.path && applied.tombstone_version == deletion.tombstone_version
+        }) {
             continue;
-        };
-        if deletion.matches_baseline(&RemoteEntryBaseline::from(previous_entry)) {
-            merged_entries.remove(&deletion.path);
+        }
+        if let Some(pending) = unverified_missing.get(&deletion.path)
+            && deletion.matches_baseline(&pending.baseline)
+        {
+            unverified_missing.remove(&deletion.path);
             applied_deletions.push(deletion);
+        }
+    }
+
+    for baseline in verified_candidates {
+        if next_paths.contains(&baseline.path)
+            || applied_deletions
+                .iter()
+                .any(|deletion| deletion.matches_baseline(baseline))
+        {
+            continue;
+        }
+        if let Some(pending) = unverified_missing.get_mut(&baseline.path)
+            && pending.baseline == *baseline
+        {
+            pending.last_verified_at = Instant::now();
         }
     }
 
@@ -821,16 +926,34 @@ fn merge_snapshot_update(
             remote: merged_entries.into_values().collect(),
         },
         applied_deletions,
+        unverified_paths,
     )
 }
 
-fn remote_entry_baselines(snapshot: &SyncSnapshot) -> Vec<RemoteEntryBaseline> {
-    snapshot
-        .remote
-        .iter()
-        .filter(|entry| entry.kind == EntryKind::File)
-        .map(RemoteEntryBaseline::from)
-        .collect()
+fn deletion_baseline_candidates(
+    snapshot: Option<&SyncSnapshot>,
+    unverified_missing: &BTreeMap<String, UnverifiedMissingEntry>,
+    force_pending_recheck: bool,
+) -> Vec<RemoteEntryBaseline> {
+    let mut candidates: BTreeMap<String, RemoteEntryBaseline> = snapshot
+        .map(|snapshot| {
+            snapshot
+                .remote
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::File)
+                .map(|entry| (entry.path.clone(), RemoteEntryBaseline::from(entry)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let now = Instant::now();
+    for pending in unverified_missing.values() {
+        if force_pending_recheck
+            || now.duration_since(pending.last_verified_at) >= UNVERIFIED_MISSING_RECHECK_INTERVAL
+        {
+            candidates.insert(pending.baseline.path.clone(), pending.baseline.clone());
+        }
+    }
+    candidates.into_values().collect()
 }
 
 pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) -> Vec<String> {
@@ -1070,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_or_mismatched_missing_snapshot_preserves_the_prior_entry() {
+    fn unverified_missing_snapshot_is_quarantined_and_rate_limited() {
         let mut entry = NamespaceEntry::file("photos/newly-uploaded.jpg", "revision-2", "hash-2");
         entry.modified_at_unix = Some(2);
         let previous = SyncSnapshot {
@@ -1078,10 +1201,13 @@ mod tests {
             remote: vec![entry.clone()],
         };
         let mut current_snapshot = Some(previous.clone());
+        let mut unverified_missing = BTreeMap::new();
         let mut updates = Vec::new();
 
-        apply_snapshot_update(
+        apply_snapshot_update_with_pending(
             &mut current_snapshot,
+            &mut unverified_missing,
+            &[],
             RemoteSnapshotUpdate::snapshot_only(SyncSnapshot {
                 local: Vec::new(),
                 remote: Vec::new(),
@@ -1089,14 +1215,40 @@ mod tests {
             &mut |update| updates.push(update),
         );
         assert!(updates.is_empty());
-        assert_eq!(current_snapshot, Some(previous.clone()));
+        assert_eq!(current_snapshot, Some(SyncSnapshot::default()));
+        assert_eq!(unverified_missing.len(), 1);
+        assert!(
+            deletion_baseline_candidates(current_snapshot.as_ref(), &unverified_missing, false,)
+                .is_empty()
+        );
+
+        unverified_missing
+            .get_mut(&entry.path)
+            .expect("missing baseline should be retained for later proof")
+            .last_verified_at = Instant::now() - UNVERIFIED_MISSING_RECHECK_INTERVAL;
+        let recheck_candidates =
+            deletion_baseline_candidates(current_snapshot.as_ref(), &unverified_missing, false);
+        assert_eq!(recheck_candidates, vec![RemoteEntryBaseline::from(&entry)]);
+        apply_snapshot_update_with_pending(
+            &mut current_snapshot,
+            &mut unverified_missing,
+            &recheck_candidates,
+            RemoteSnapshotUpdate::snapshot_only(SyncSnapshot::default()),
+            &mut |update| updates.push(update),
+        );
+        assert!(
+            deletion_baseline_candidates(current_snapshot.as_ref(), &unverified_missing, false,)
+                .is_empty()
+        );
 
         let mismatched = RemoteEntryBaseline {
             version: Some("revision-1".to_string()),
             ..RemoteEntryBaseline::from(&entry)
         };
-        apply_snapshot_update(
+        apply_snapshot_update_with_pending(
             &mut current_snapshot,
+            &mut unverified_missing,
+            &[],
             RemoteSnapshotUpdate {
                 snapshot: SyncSnapshot {
                     local: Vec::new(),
@@ -1108,7 +1260,23 @@ mod tests {
             &mut |update| updates.push(update),
         );
         assert!(updates.is_empty());
-        assert_eq!(current_snapshot, Some(previous));
+        assert_eq!(current_snapshot, Some(SyncSnapshot::default()));
+        assert_eq!(unverified_missing.len(), 1);
+
+        apply_snapshot_update_with_pending(
+            &mut current_snapshot,
+            &mut unverified_missing,
+            &[],
+            RemoteSnapshotUpdate {
+                snapshot: SyncSnapshot::default(),
+                changed_paths: Vec::new(),
+                deletions: vec![deletion_for(RemoteEntryBaseline::from(&entry))],
+            },
+            &mut |update| updates.push(update),
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].deletions.len(), 1);
+        assert!(unverified_missing.is_empty());
     }
 
     #[test]
@@ -1137,6 +1305,35 @@ mod tests {
         assert!(!deletion_for(no_timestamp.clone()).matches_baseline(&no_timestamp));
         assert!(!is_concrete_remote_revision(Some("server-head")));
         assert!(is_concrete_remote_revision(Some("revision-2")));
+    }
+
+    #[test]
+    fn reappearing_remote_path_clears_its_quarantined_baseline() {
+        let entry = NamespaceEntry::file("docs/readme.md", "revision-2", "hash-2");
+        let baseline = RemoteEntryBaseline::from(&entry);
+        let mut current_snapshot = Some(SyncSnapshot::default());
+        let mut unverified_missing = BTreeMap::from([(
+            entry.path.clone(),
+            UnverifiedMissingEntry {
+                baseline,
+                last_verified_at: Instant::now(),
+            },
+        )]);
+        let mut updates = Vec::new();
+
+        apply_snapshot_update_with_pending(
+            &mut current_snapshot,
+            &mut unverified_missing,
+            &[],
+            RemoteSnapshotUpdate::snapshot_only(SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![entry],
+            }),
+            &mut |update| updates.push(update),
+        );
+
+        assert!(unverified_missing.is_empty());
+        assert_eq!(updates.len(), 1);
     }
 
     #[test]
