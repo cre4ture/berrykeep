@@ -172,6 +172,7 @@ pub struct HydrationResult {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UploadReceipt {
     pub remote_version: Option<String>,
+    pub remote_content_hash: Option<String>,
     pub in_sync_content_fingerprint: Option<String>,
 }
 
@@ -187,7 +188,7 @@ pub trait Uploader: Send + Sync + 'static {
         Ok(false)
     }
 
-    fn delete_path(&self, _path: &str) -> Result<()> {
+    fn delete_path(&self, _path: &str, _expected_revision: &str) -> Result<()> {
         Ok(())
     }
 }
@@ -233,12 +234,13 @@ impl Uploader for DemoUploader {
         tracing::info!("demo upload: path={} bytes={}", path, read_bytes);
         Ok(UploadReceipt {
             remote_version: Some("demo-upload".to_string()),
+            remote_content_hash: None,
             in_sync_content_fingerprint: None,
         })
     }
 
-    fn delete_path(&self, path: &str) -> Result<()> {
-        tracing::info!("demo delete: path={path}");
+    fn delete_path(&self, path: &str, expected_revision: &str) -> Result<()> {
+        tracing::info!("demo delete: path={path} expected_revision={expected_revision}");
         Ok(())
     }
 

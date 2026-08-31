@@ -268,7 +268,8 @@ impl Uploader for ServerNodeHydrator {
         length: u64,
     ) -> Result<UploadReceipt> {
         let mut fingerprinting_reader = FingerprintingReader::new(reader, length);
-        self.sdk
+        let upload = self
+            .sdk
             .put_large_aware_reader(path.to_string(), &mut fingerprinting_reader, length)
             .with_context(|| format!("failed to upload object for path {path}"))?;
         let in_sync_content_fingerprint = fingerprinting_reader
@@ -276,14 +277,15 @@ impl Uploader for ServerNodeHydrator {
             .with_context(|| format!("failed to finalize content fingerprint for {path}"))?;
 
         Ok(UploadReceipt {
-            remote_version: Some(format!("server-head:size={length}")),
+            remote_version: upload.version_id,
+            remote_content_hash: upload.manifest_hash,
             in_sync_content_fingerprint: Some(in_sync_content_fingerprint),
         })
     }
 
-    fn delete_path(&self, path: &str) -> Result<()> {
+    fn delete_path(&self, path: &str, expected_revision: &str) -> Result<()> {
         self.sdk
-            .delete_path_blocking(path)
+            .delete_path_with_expected_revision_blocking(path, Some(expected_revision))
             .with_context(|| format!("failed to delete remote object for path {path}"))?;
         Ok(())
     }
@@ -386,10 +388,8 @@ mod tests {
         );
     }
 
-    /// Temporary green characterization of undesired current behavior.
-    /// Remove this test when adapter deletes carry a baseline revision precondition.
     #[test]
-    fn undesired_current_behavior_windows_delete_request_has_no_revision_precondition() {
+    fn windows_delete_request_contains_revision_precondition() {
         let (base_url, server, request_rx) = capture_single_http_request();
         let client = IronMeshClient::from_direct_base_url(base_url);
         let hydrator = ServerNodeHydrator::with_client(
@@ -397,35 +397,7 @@ mod tests {
             std::env::temp_dir().join(format!("ironmesh-delete-request-{}", uuid::Uuid::new_v4())),
         );
 
-        Uploader::delete_path(&hydrator, "photos/stale.jpg")
-            .expect("current unconditional delete request should be accepted by the test server");
-
-        let request = request_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("delete request should be captured");
-        server.join().expect("test server should stop cleanly");
-        let request_line = request.lines().next().unwrap_or_default();
-        assert!(request_line.starts_with("POST /api/v1/store/delete?"));
-        assert!(request_line.contains("key=photos%2Fstale.jpg"));
-        assert!(
-            !request_line.contains("expected_revision="),
-            "UNDESIRED CURRENT BEHAVIOR: the Windows adapter sends an unconditional server delete: {request_line}"
-        );
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "a remote delete must be conditional on the revision observed before the local disappearance"
-    )]
-    fn desired_behavior_windows_delete_request_contains_revision_precondition() {
-        let (base_url, server, request_rx) = capture_single_http_request();
-        let client = IronMeshClient::from_direct_base_url(base_url);
-        let hydrator = ServerNodeHydrator::with_client(
-            client,
-            std::env::temp_dir().join(format!("ironmesh-delete-request-{}", uuid::Uuid::new_v4())),
-        );
-
-        Uploader::delete_path(&hydrator, "photos/stale.jpg")
+        Uploader::delete_path(&hydrator, "photos/stale.jpg", "revision-42")
             .expect("delete request should be accepted by the test server");
 
         let request = request_rx
@@ -433,9 +405,6 @@ mod tests {
             .expect("delete request should be captured");
         server.join().expect("test server should stop cleanly");
         let request_line = request.lines().next().unwrap_or_default();
-        assert!(
-            request_line.contains("expected_revision="),
-            "a remote delete must be conditional on the revision observed before the local disappearance: {request_line}"
-        );
+        assert!(request_line.contains("expected_revision=revision-42"));
     }
 }

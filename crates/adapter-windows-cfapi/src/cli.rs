@@ -24,7 +24,9 @@ use crate::hydration_control::{is_active_hydration_marked, request_hydration_can
 use crate::live::ServerNodeHydrator;
 use crate::local_state::local_appdata_desktop_status_path;
 use crate::monitor::SyncRootMonitor;
-use crate::placeholder_metadata::{RemoteDeleteReconcileReport, reconcile_remote_delete_state};
+use crate::placeholder_metadata::{
+    RemoteDeleteReconcileReport, collect_provider_file_baselines, reconcile_remote_delete_state,
+};
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
     reconcile_sync_states, register_sync_root, unregister_sync_root,
@@ -429,10 +431,14 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             )),
             RemoteSnapshotScope::new(prefix.clone(), depth, None),
         );
-        let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
+        let startup_baselines = collect_provider_file_baselines(
+            &registration.root_path,
+            sync_root_identity.provider_instance_id,
+        );
+        let initial_update = fetcher.fetch_snapshot_update_blocking(&startup_baselines)?;
         let startup_delete_report = match reconcile_remote_delete_state(
             &registration.root_path,
-            &initial_snapshot,
+            &initial_update.deletions,
             sync_root_identity.provider_instance_id,
         ) {
             Ok(report) => {
@@ -444,7 +450,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                 RemoteDeleteReconcileReport::default()
             }
         };
-        let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
+        let action_plan = adapter.plan_actions(&initial_update.snapshot, &SyncPolicy::default());
         log_action_plan_summary("startup", &action_plan);
 
         if let Some(publisher) = status_publisher.as_ref() {
@@ -549,7 +555,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let refresh_status_publisher = status_publisher.clone();
         refresh_poller.spawn_fetcher_loop(
             refresh_running,
-            Some(initial_snapshot),
+            Some(initial_update.snapshot),
             fetcher,
             move |update| {
                 if let Some(publisher) = refresh_status_publisher.as_ref() {
@@ -570,7 +576,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let report = match reconcile_remote_delete_state(
                         &refresh_registration.root_path,
-                        &update.snapshot,
+                        &update.deletions,
                         refresh_provider_instance_id,
                     ) {
                         Ok(report) => report,
@@ -581,6 +587,9 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                             RemoteDeleteReconcileReport::default()
                         }
                     };
+                    for path in &report.deleted_paths {
+                        refresh_remote_applied_tracker.record_file_removal(path);
+                    }
                     if let Err(err) = apply_action_plan(
                         &refresh_registration.root_path,
                         &plan,

@@ -5,8 +5,7 @@ use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info_with_identity,
     cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_with_oplock,
     cf_update_placeholder_metadata_and_identity,
-    cf_update_placeholder_metadata_and_identity_with_oplock, describe_path_state, open_sync_path,
-    path_is_placeholder,
+    cf_update_placeholder_metadata_and_identity_with_oplock, open_sync_path, path_is_placeholder,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::content_fingerprint::file_content_fingerprint;
@@ -16,10 +15,11 @@ use crate::helpers::{
 };
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use anyhow::{Context, Result};
+use client_sdk::{RemoteDeletion, RemoteEntryBaseline};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use sync_core::{EntryKind, NamespaceMediaMetadata, SyncSnapshot};
+use sync_core::NamespaceMediaMetadata;
 use uuid::Uuid;
 use walkdir::WalkDir;
 use windows_sys::Win32::Storage::CloudFilters::CF_FS_METADATA;
@@ -89,6 +89,48 @@ pub fn record_in_sync_content_baseline(
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
         identity.set_in_sync_content_baseline(in_sync_content_fingerprint);
+    })
+}
+
+pub fn record_uploaded_remote_state(
+    sync_root_path: &Path,
+    relative_path: &str,
+    provider_instance_id: Uuid,
+    remote_version: Option<&str>,
+    remote_content_hash: Option<&str>,
+    in_sync_content_fingerprint: Option<&str>,
+) -> Result<()> {
+    let normalized = normalize_path(relative_path);
+    if normalized.is_empty() || is_internal_sync_root_relative_path(&normalized) {
+        return Ok(());
+    }
+
+    mutate_placeholder_identity_for_path(sync_root_path, &normalized, None, true, |identity| {
+        identity.path = normalized.clone();
+        identity.provider_instance_id = Some(provider_instance_id);
+        identity.remote_version = remote_version
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        identity.remote_content_hash = remote_content_hash
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        // Upload responses currently provide a version and manifest hash, not
+        // a remote timestamp, size, or media payload. Keeping those values
+        // from the predecessor would make a valid exact-version tombstone
+        // appear contradictory after a fast delete.
+        identity.remote_modified_at_unix = None;
+        identity.remote_size_bytes = None;
+        identity.remote_media = None;
+        identity.remote_media_absent = false;
+        if let Some(fingerprint) = in_sync_content_fingerprint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            identity.remote_content_fingerprint = Some(fingerprint.to_string());
+            identity.in_sync_content_fingerprint = Some(fingerprint.to_string());
+        }
     })
 }
 
@@ -248,16 +290,14 @@ fn remote_file_system_metadata_is_current(
     size_is_current && modified_at_is_current
 }
 
-pub fn reconcile_remote_delete_state(
+/// Collects persisted provider file identities before a remote refresh.  The
+/// fetcher uses these baselines to ask the server for a tombstone only when a
+/// path is absent from the newly fetched snapshot.
+pub fn collect_provider_file_baselines(
     sync_root_path: &Path,
-    current_snapshot: &SyncSnapshot,
     provider_instance_id: Uuid,
-) -> Result<RemoteDeleteReconcileReport> {
-    let current_remote_files = current_remote_file_paths(current_snapshot);
-    let current_remote_directories = current_remote_directory_paths(current_snapshot);
-    let mut report = RemoteDeleteReconcileReport::default();
-    let mut local_file_candidates = Vec::new();
-
+) -> Vec<RemoteEntryBaseline> {
+    let mut baselines = Vec::new();
     for entry in WalkDir::new(sync_root_path)
         .min_depth(1)
         .into_iter()
@@ -267,24 +307,61 @@ pub fn reconcile_remote_delete_state(
             continue;
         }
         let relative_path = path_to_relative(sync_root_path, &entry.path().to_string_lossy());
-        if relative_path.is_empty()
-            || is_internal_sync_root_relative_path(&relative_path)
-            || current_remote_files.contains(relative_path.as_str())
+        if relative_path.is_empty() || is_internal_sync_root_relative_path(&relative_path) {
+            continue;
+        }
+        let Ok(file) = open_sync_path(entry.path(), false) else {
+            continue;
+        };
+        let Ok(info) = cf_get_placeholder_standard_info_with_identity(&file) else {
+            continue;
+        };
+        let Some(identity) = decode_placeholder_file_identity(info.file_identity()) else {
+            continue;
+        };
+        if identity.path != relative_path
+            || identity.provider_instance_id != Some(provider_instance_id)
+            || !identity_has_remote_baseline(&identity)
         {
             continue;
         }
-        local_file_candidates.push((relative_path, entry.into_path()));
+        baselines.push(remote_entry_baseline(&identity));
     }
+    baselines.sort_by(|left, right| left.path.cmp(&right.path));
+    baselines
+}
 
-    local_file_candidates.sort_by(|(left, _), (right, _)| {
-        right
-            .matches('/')
-            .count()
-            .cmp(&left.matches('/').count())
-            .then_with(|| right.cmp(left))
-    });
+/// Applies only server-confirmed deletions.  A missing path in a snapshot is
+/// never enough: the tombstone must prove it supersedes the local identity.
+pub fn reconcile_remote_delete_state(
+    sync_root_path: &Path,
+    deletions: &[RemoteDeletion],
+    provider_instance_id: Uuid,
+) -> Result<RemoteDeleteReconcileReport> {
+    let mut report = RemoteDeleteReconcileReport::default();
+    let mut explicit_deletions = deletions.iter().collect::<Vec<_>>();
+    explicit_deletions.sort_by(|left, right| right.path.cmp(&left.path));
 
-    for (relative_path, full_path) in local_file_candidates {
+    for deletion in explicit_deletions {
+        let relative_path = normalize_path(&deletion.path);
+        if relative_path.is_empty() || is_internal_sync_root_relative_path(&relative_path) {
+            continue;
+        }
+        let full_path = sync_root_path.join(relative_path.replace('/', "\\"));
+        let metadata = match fs::metadata(&full_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                report.preserved_paths.insert(relative_path);
+                continue;
+            }
+        };
+        // Directory identities do not yet carry a deletion baseline.  Leave
+        // them in place unless and until we can prove a safe predecessor.
+        if metadata.is_dir() {
+            report.preserved_paths.insert(relative_path);
+            continue;
+        }
         let file = match open_sync_path(&full_path, false) {
             Ok(file) => file,
             Err(_) => {
@@ -306,7 +383,7 @@ pub fn reconcile_remote_delete_state(
         };
         if identity.path != relative_path
             || identity.provider_instance_id != Some(provider_instance_id)
-            || !identity_has_remote_baseline(&identity)
+            || !deletion.matches_baseline(&remote_entry_baseline(&identity))
         {
             report.preserved_paths.insert(relative_path);
             continue;
@@ -339,96 +416,16 @@ pub fn reconcile_remote_delete_state(
         }
     }
 
-    let mut local_directory_candidates = Vec::new();
-    for entry in WalkDir::new(sync_root_path)
-        .min_depth(1)
-        .into_iter()
-        .flatten()
-    {
-        if !entry.file_type().is_dir() {
-            continue;
-        }
-        let relative_path = path_to_relative(sync_root_path, &entry.path().to_string_lossy());
-        if relative_path.is_empty()
-            || is_internal_sync_root_relative_path(&relative_path)
-            || current_remote_directories.contains(relative_path.as_str())
-        {
-            continue;
-        }
-        local_directory_candidates.push((relative_path, entry.into_path()));
-    }
-
-    local_directory_candidates.sort_by(|(left, _), (right, _)| {
-        right
-            .matches('/')
-            .count()
-            .cmp(&left.matches('/').count())
-            .then_with(|| right.cmp(left))
-    });
-
-    for (relative_path, full_path) in local_directory_candidates {
-        let file = match open_sync_path(&full_path, false) {
-            Ok(file) => file,
-            Err(_) => {
-                report.preserved_paths.insert(relative_path);
-                continue;
-            }
-        };
-        let placeholder_info = match cf_get_placeholder_standard_info_with_identity(&file) {
-            Ok(info) => info,
-            Err(_) => {
-                report.preserved_paths.insert(relative_path);
-                continue;
-            }
-        };
-        let Some(identity) = decode_placeholder_file_identity(placeholder_info.file_identity())
-        else {
-            report.preserved_paths.insert(relative_path);
-            continue;
-        };
-        if identity.path != relative_path
-            || !matches!(
-                identity.provider_instance_id,
-                Some(identity_provider) if identity_provider == provider_instance_id
-            ) && identity.provider_instance_id.is_some()
-        {
-            report.preserved_paths.insert(relative_path);
-            continue;
-        }
-
-        let state_before = describe_path_state(&full_path);
-        match fs::remove_dir(&full_path) {
-            Ok(()) => {
-                tracing::info!(
-                    "remote-delete-reconcile: removed stale remote-managed directory {} state_before={}",
-                    full_path.display(),
-                    state_before
-                );
-                report.deleted_paths.insert(relative_path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-                tracing::info!(
-                    "remote-delete-reconcile: preserved non-empty stale directory {} error={} state={}",
-                    full_path.display(),
-                    error,
-                    state_before
-                );
-                report.preserved_paths.insert(relative_path);
-            }
-            Err(error) => {
-                tracing::info!(
-                    "remote-delete-reconcile: failed to remove stale remote-managed directory {} error={} state={}",
-                    full_path.display(),
-                    error,
-                    state_before
-                );
-                report.suppressed_startup_paths.insert(relative_path);
-            }
-        }
-    }
-
     Ok(report)
+}
+
+fn remote_entry_baseline(identity: &PlaceholderFileIdentity) -> RemoteEntryBaseline {
+    RemoteEntryBaseline {
+        path: identity.path.clone(),
+        version: identity.remote_version.clone(),
+        content_hash: identity.remote_content_hash.clone(),
+        modified_at_unix: identity.remote_modified_at_unix,
+    }
 }
 
 fn mutate_placeholder_identity_for_path(
@@ -495,44 +492,6 @@ fn mutate_placeholder_identity_for_path(
     }
 }
 
-fn current_remote_file_paths(snapshot: &SyncSnapshot) -> BTreeSet<String> {
-    snapshot
-        .remote
-        .iter()
-        .filter(|entry| entry.kind == EntryKind::File)
-        .map(|entry| normalize_path(&entry.path))
-        .collect()
-}
-
-fn current_remote_directory_paths(snapshot: &SyncSnapshot) -> BTreeSet<String> {
-    let mut directories = BTreeSet::new();
-
-    for entry in &snapshot.remote {
-        let normalized = normalize_path(&entry.path);
-        if normalized.is_empty() {
-            continue;
-        }
-
-        if entry.kind == EntryKind::Directory {
-            directories.insert(normalized.clone());
-        }
-
-        let segments = normalized
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        let limit = match entry.kind {
-            EntryKind::Directory => segments.len(),
-            EntryKind::File => segments.len().saturating_sub(1),
-        };
-        for depth in 1..=limit {
-            directories.insert(segments[..depth].join("/"));
-        }
-    }
-
-    directories
-}
-
 fn identity_has_remote_baseline(identity: &PlaceholderFileIdentity) -> bool {
     identity.remote_version.is_some()
         || identity.remote_content_hash.is_some()
@@ -559,7 +518,6 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
-    use sync_core::NamespaceEntry;
 
     /// Registers a real Windows CFAPI root so reconciliation sees the same
     /// provider-managed placeholders as it does in production.
@@ -627,17 +585,6 @@ mod tests {
         .expect("clean provider placeholder should be created");
     }
 
-    fn remote_snapshot_with_small_unrelated_change() -> SyncSnapshot {
-        SyncSnapshot {
-            local: Vec::new(),
-            remote: vec![NamespaceEntry::file(
-                "small-unrelated-change.txt",
-                "unrelated-revision",
-                "unrelated-hash",
-            )],
-        }
-    }
-
     #[test]
     fn conflict_refresh_preserves_local_file_metadata_and_sync_state() {
         assert!(
@@ -701,27 +648,17 @@ mod tests {
         let full_path = sync_root.join("notes.txt");
         fs::write(&full_path, b"offline local").expect("local file should exist");
 
-        let report = reconcile_remote_delete_state(
-            &sync_root,
-            &SyncSnapshot {
-                local: Vec::new(),
-                remote: vec![NamespaceEntry::file("other.txt", "v1", "h1")],
-            },
-            Uuid::now_v7(),
-        )
-        .expect("reconcile should succeed");
+        let report = reconcile_remote_delete_state(&sync_root, &[], Uuid::now_v7())
+            .expect("reconcile should succeed");
 
         assert!(report.deleted_paths.is_empty());
-        assert!(report.preserved_paths.contains("notes.txt"));
+        assert!(full_path.exists());
 
         let _ = fs::remove_dir_all(sync_root);
     }
 
-    /// Temporary green characterization of undesired current behavior.
-    /// Remove this test when deletions require a baseline-matching tombstone.
     #[test]
-    fn undesired_current_behavior_reconcile_remote_delete_removes_newer_clean_placeholder_from_stale_snapshot()
-     {
+    fn reconcile_remote_delete_requires_a_matching_tombstone_predecessor() {
         let (sync_root, provider_instance_id) =
             registered_test_sync_root("stale-snapshot-removes-newer-placeholder");
         let path = "holiday/newer-photo.jpg";
@@ -753,27 +690,29 @@ mod tests {
             Some(remote_modified_at_unix)
         );
 
-        // This models a remote listing fetched before the local upload created
-        // `path`. It has an unrelated current change, but no tombstone for this
-        // placeholder's revision, hash, or timestamp.
         let report = reconcile_remote_delete_state(
             &sync_root.root_path,
-            &remote_snapshot_with_small_unrelated_change(),
+            &[RemoteDeletion {
+                path: path.to_string(),
+                tombstone_version: "delete-revision".to_string(),
+                tombstone_created_at_unix: remote_modified_at_unix + 1,
+                predecessors: vec![RemoteEntryBaseline {
+                    path: path.to_string(),
+                    version: Some(remote_version.to_string()),
+                    content_hash: Some(remote_content_hash.to_string()),
+                    modified_at_unix: Some(remote_modified_at_unix),
+                }],
+            }],
             provider_instance_id,
         )
         .expect("current reconciliation should complete");
 
-        // Characterization only: this is the data-loss behavior to remove when
-        // the safe tombstone/revision validation is implemented.
         assert!(report.deleted_paths.contains(path));
         assert!(!full_path.exists());
     }
 
-    /// Temporary green characterization of undesired current behavior.
-    /// Remove this test when reconciliation is scoped to confirmed removals.
     #[test]
-    fn undesired_current_behavior_reconcile_remote_delete_scans_global_absence_for_small_unrelated_change()
-     {
+    fn reconcile_remote_delete_does_not_scan_paths_without_explicit_tombstones() {
         let (sync_root, provider_instance_id) =
             registered_test_sync_root("global-absence-deletes-unrelated-paths");
         let first_path = "holiday/first-newer-file.jpg";
@@ -795,26 +734,18 @@ mod tests {
             1_725_000_003,
         );
 
-        let report = reconcile_remote_delete_state(
-            &sync_root.root_path,
-            &remote_snapshot_with_small_unrelated_change(),
-            provider_instance_id,
-        )
-        .expect("current reconciliation should complete");
+        let report = reconcile_remote_delete_state(&sync_root.root_path, &[], provider_instance_id)
+            .expect("current reconciliation should complete");
 
-        // Characterization only: one unrelated entry in the supplied listing
-        // causes a full-root absence scan and removes both provider placeholders.
-        assert_eq!(report.deleted_paths.len(), 2);
-        assert!(report.deleted_paths.contains(first_path));
-        assert!(report.deleted_paths.contains(second_path));
+        assert!(report.deleted_paths.is_empty());
         assert!(
-            !sync_root
+            sync_root
                 .root_path
                 .join("holiday\\first-newer-file.jpg")
                 .exists()
         );
         assert!(
-            !sync_root
+            sync_root
                 .root_path
                 .join("holiday\\second-newer-file.mp4")
                 .exists()
@@ -822,9 +753,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "stale absence must preserve local data")]
-    fn desired_behavior_reconcile_remote_delete_preserves_newer_placeholder_when_stale_snapshot_has_no_tombstone()
-     {
+    fn reconcile_remote_delete_preserves_newer_placeholder_without_tombstone() {
         let (sync_root, provider_instance_id) =
             registered_test_sync_root("stale-snapshot-must-preserve-placeholder");
         let path = "holiday/newer-photo.jpg";
@@ -838,60 +767,10 @@ mod tests {
         );
         let full_path = sync_root.root_path.join("holiday\\newer-photo.jpg");
 
-        let report = reconcile_remote_delete_state(
-            &sync_root.root_path,
-            &remote_snapshot_with_small_unrelated_change(),
-            provider_instance_id,
-        )
-        .expect("reconciliation should complete");
+        let report = reconcile_remote_delete_state(&sync_root.root_path, &[], provider_instance_id)
+            .expect("reconciliation should complete");
 
         assert!(full_path.exists(), "stale absence must preserve local data");
         assert!(report.deleted_paths.is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "paths unrelated to a remote change must remain locally available")]
-    fn desired_behavior_reconcile_remote_delete_preserves_paths_unrelated_to_the_remote_change_set()
-    {
-        let (sync_root, provider_instance_id) =
-            registered_test_sync_root("small-change-set-must-not-delete-unrelated-paths");
-        let first_path = "holiday/first-newer-file.jpg";
-        let second_path = "holiday/second-newer-file.mp4";
-        create_clean_provider_placeholder(
-            &sync_root.root_path,
-            provider_instance_id,
-            first_path,
-            "first-revision",
-            "first-hash",
-            1_725_000_005,
-        );
-        create_clean_provider_placeholder(
-            &sync_root.root_path,
-            provider_instance_id,
-            second_path,
-            "second-revision",
-            "second-hash",
-            1_725_000_006,
-        );
-
-        let report = reconcile_remote_delete_state(
-            &sync_root.root_path,
-            &remote_snapshot_with_small_unrelated_change(),
-            provider_instance_id,
-        )
-        .expect("reconciliation should complete");
-
-        let first_path_exists = sync_root
-            .root_path
-            .join("holiday\\first-newer-file.jpg")
-            .exists();
-        let second_path_exists = sync_root
-            .root_path
-            .join("holiday\\second-newer-file.mp4")
-            .exists();
-        assert!(
-            first_path_exists && second_path_exists && report.deleted_paths.is_empty(),
-            "paths unrelated to a remote change must remain locally available"
-        );
     }
 }

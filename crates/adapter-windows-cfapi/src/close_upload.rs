@@ -2,7 +2,7 @@ use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info, cf_set_in_sync_with_usn,
     cf_set_not_in_sync, describe_path_state,
 };
-use crate::placeholder_metadata::record_in_sync_content_baseline;
+use crate::placeholder_metadata::record_uploaded_remote_state;
 use crate::runtime::{
     CfapiRuntime, UploadReceipt, Uploader, reconcile_ancestor_directory_sync_states,
 };
@@ -703,14 +703,14 @@ fn process_debounced_close_upload(
     }
 
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
-    if let Some(in_sync_content_fingerprint) = upload_receipt.in_sync_content_fingerprint.as_deref()
-        && let Err(err) = record_in_sync_content_baseline(
-            &worker.sync_root,
-            relative_path,
-            worker.provider_instance_id,
-            in_sync_content_fingerprint,
-        )
-    {
+    if let Err(err) = record_uploaded_remote_state(
+        &worker.sync_root,
+        relative_path,
+        worker.provider_instance_id,
+        upload_receipt.remote_version.as_deref(),
+        upload_receipt.remote_content_hash.as_deref(),
+        upload_receipt.in_sync_content_fingerprint.as_deref(),
+    ) {
         tracing::info!(
             "close-completion: failed to record in-sync content baseline for {}: {:#}",
             relative_path,
@@ -814,6 +814,7 @@ mod tests {
                 .push((path.to_string(), payload, length));
             Ok(UploadReceipt {
                 remote_version: Some(format!("version:size={length}")),
+                remote_content_hash: Some(format!("hash:size={length}")),
                 in_sync_content_fingerprint: Some(format!("cfp-upload-{length}")),
             })
         }
