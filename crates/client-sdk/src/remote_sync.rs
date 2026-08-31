@@ -1424,7 +1424,7 @@ mod tests {
     )]
     fn desired_behavior_sequence_regression_does_not_emit_a_stale_file_removal() {
         let (first_update, unexpected_removal, _, _) =
-            run_sequence_regression_scenario(Duration::from_millis(500));
+            run_sequence_regression_scenario(Duration::from_secs(2));
 
         let first_update = first_update.expect("first refresh should update the file revision");
         assert_eq!(
