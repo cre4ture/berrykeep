@@ -1735,6 +1735,34 @@ impl MetadataStore for TursoMetadataStore {
         Ok(indexes)
     }
 
+    async fn load_version_indexes_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>> {
+        let after_object_id = after_object_id.unwrap_or_default();
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT object_id, index_json
+                 FROM version_indexes
+                 WHERE object_id > ?1
+                 ORDER BY object_id
+                 LIMIT ?2",
+                (after_object_id, limit),
+            )
+            .await?;
+
+        let mut indexes = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let object_id = row_string(&row, 0, "version_indexes.object_id")?;
+            let payload = row_blob(&row, 1, "version_indexes.index_json")?;
+            indexes.push(decode_version_index(&object_id, &payload, "Turso")?);
+        }
+        Ok(indexes)
+    }
+
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>> {
         let mut rows = self
             .connection

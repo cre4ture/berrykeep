@@ -3699,6 +3699,34 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn load_version_indexes_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>> {
+        let after_object_id = after_object_id.unwrap_or_default().to_string();
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        self.read(move |db| {
+            let mut statement = db.prepare(
+                "SELECT object_id, index_json
+                 FROM version_indexes
+                 WHERE object_id > ?1
+                 ORDER BY object_id
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![after_object_id, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut indexes = Vec::new();
+            for row in rows {
+                let (object_id, payload) = row?;
+                indexes.push(decode_version_index(&object_id, &payload, "sqlite")?);
+            }
+            Ok(indexes)
+        })
+        .await
+    }
+
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>> {
         self.read(|db| {
             let mut stmt =

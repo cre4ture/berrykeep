@@ -931,6 +931,7 @@ run_on_all_metadata_backends!(
 
 #[tokio::test]
 async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
+    const LEGACY_OBJECT_ID: &str = "legacy-row-object-id";
     const LEGACY_PATH: &str = "legacy/file.txt";
     const LEGACY_MANIFEST: &str = "legacy-manifest";
 
@@ -988,7 +989,7 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
         database
             .execute(
                 "INSERT INTO version_indexes(object_id, index_json) VALUES(?1, ?2)",
-                rusqlite::params!["legacy-row-object-id", legacy_index],
+                rusqlite::params![LEGACY_OBJECT_ID, legacy_index],
             )
             .unwrap();
     }
@@ -997,18 +998,18 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
         .await
         .unwrap();
     let current = store.list_versions(LEGACY_PATH).await.unwrap().unwrap();
-    assert!(!current.object_id.is_empty());
+    assert_eq!(current.object_id, LEGACY_OBJECT_ID);
     let migrated_index = store
-        .load_version_index_by_object_id(&current.object_id)
+        .load_version_index_by_object_id(LEGACY_OBJECT_ID)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(migrated_index.object_id, current.object_id);
+    assert_eq!(migrated_index.object_id, LEGACY_OBJECT_ID);
     assert!(
         migrated_index
             .versions
             .values()
-            .all(|version| version.object_id == current.object_id)
+            .all(|version| version.object_id == LEGACY_OBJECT_ID)
     );
     drop(store);
 
@@ -1038,7 +1039,7 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
         let index_json: Vec<u8> = database
             .query_row(
                 "SELECT index_json FROM version_indexes WHERE object_id = ?1",
-                [&current.object_id],
+                [LEGACY_OBJECT_ID],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1046,8 +1047,8 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
 
         assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
         assert_eq!(backfill_status, "complete");
-        assert_eq!(current_object_id, current.object_id);
-        assert_eq!(persisted["object_id"], current.object_id);
+        assert_eq!(current_object_id, LEGACY_OBJECT_ID);
+        assert_eq!(persisted["object_id"], LEGACY_OBJECT_ID);
         assert_eq!(
             persisted["versions"]
                 .as_object()
@@ -1055,7 +1056,7 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
                 .values()
                 .next()
                 .unwrap()["object_id"],
-            current.object_id
+            LEGACY_OBJECT_ID
         );
     }
 
@@ -1069,7 +1070,7 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
             .unwrap()
             .unwrap()
             .object_id,
-        current.object_id
+        LEGACY_OBJECT_ID
     );
 
     drop(reopened);
@@ -1145,6 +1146,124 @@ async fn sqlite_migration_splits_duplicate_legacy_current_object_ids() {
     drop(store);
     let _ = fs::remove_dir_all(root).await;
 }
+
+#[tokio::test]
+async fn sqlite_migration_recovers_legacy_identity_from_manifest_when_path_is_stale() {
+    let root = test_store_dir("stale-legacy-object-id-migration");
+    let database_path = root.join("state/metadata.sqlite");
+    let path = "renamed/current.txt";
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    seeded
+        .put_object_versioned(path, Bytes::from_static(b"payload"), PutOptions::default())
+        .await
+        .unwrap();
+    let original = seeded.list_versions(path).await.unwrap().unwrap();
+    let object_id = original.object_id.clone();
+    let version_id = original.preferred_head_version_id.clone().unwrap();
+    let version_count = original.versions.len();
+    drop(seeded);
+
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+        database
+            .execute(
+                "UPDATE current_objects SET object_id = '' WHERE key = ?1",
+                [path],
+            )
+            .unwrap();
+        let index_json: Vec<u8> = database
+            .query_row(
+                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+                [&object_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut index: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
+        index["versions"][&version_id]["logical_path"] =
+            serde_json::Value::String("renamed/previous-name.txt".to_string());
+        database
+            .execute(
+                "UPDATE version_indexes SET index_json = ?1 WHERE object_id = ?2",
+                rusqlite::params![serde_json::to_vec(&index).unwrap(), object_id],
+            )
+            .unwrap();
+    }
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let migrated = reopened.list_versions(path).await.unwrap().unwrap();
+    assert_eq!(migrated.object_id, object_id);
+    assert_eq!(migrated.versions.len(), version_count);
+    assert_eq!(migrated.preferred_head_version_id, Some(version_id));
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+async fn synthetic_migration_version_extends_preferred_head_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("migration-version-parent").await;
+    store
+        .put_object_versioned(
+            "legacy/current.txt",
+            Bytes::from_static(b"original"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let original = store
+        .list_versions("legacy/current.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    let original_head = original.preferred_head_version_id.unwrap();
+
+    store
+        .ensure_migrated_object_version(
+            &original.object_id,
+            "legacy/current.txt",
+            "legacy-migrated-manifest",
+            unix_ts(),
+        )
+        .await
+        .unwrap();
+    let migrated = store
+        .load_version_index_by_object_id(&original.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let synthetic = migrated
+        .versions
+        .values()
+        .find(|record| record.manifest_hash == "legacy-migrated-manifest")
+        .unwrap();
+    assert_eq!(synthetic.parent_version_ids, vec![original_head]);
+    assert_eq!(
+        migrated.head_version_ids,
+        vec![synthetic.version_id.clone()]
+    );
+    assert_eq!(
+        migrated.preferred_head_version_id.as_deref(),
+        Some(synthetic.version_id.as_str())
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    synthetic_migration_version_extends_preferred_head_impl,
+    synthetic_migration_version_extends_preferred_head,
+    synthetic_migration_version_extends_preferred_head_turso
+);
 
 async fn write_storage_pool_config(root: &Path, config: &StoragePoolConfig) {
     fs::create_dir_all(root.join("state")).await.unwrap();

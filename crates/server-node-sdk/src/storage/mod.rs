@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
+const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 2;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
@@ -1018,6 +1019,13 @@ pub(super) struct CurrentState {
 pub(super) struct CurrentObjectEntry {
     pub(super) manifest_hash: String,
     pub(super) object_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct LegacyObjectIdCandidate {
+    object_id: String,
+    priority: u8,
+    created_at_unix: u64,
 }
 
 /// A persisted, current-state projection used to serve the paginated gallery without
@@ -2640,6 +2648,11 @@ trait MetadataStore: Send + Sync {
         index: &FileVersionIndex,
     ) -> Result<()>;
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>>;
+    async fn load_version_indexes_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>>;
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
@@ -3601,9 +3614,10 @@ impl PersistentStore {
 
     /// Backfills the live namespace written before object identity became mandatory.
     ///
-    /// Startup work is deliberately bounded by the number of current objects. Historical
-    /// version payloads and snapshots are normalized when they are read or rewritten,
-    /// rather than making startup scan every retained snapshot and version index.
+    /// Startup work is deliberately bounded: only the live namespace is backfilled, and
+    /// legacy version indexes are read in small pages to preserve their existing lineage.
+    /// Historical snapshots are normalized when they are read or rewritten instead of
+    /// making startup walk every retained snapshot.
     async fn migrate_legacy_object_ids(&self) -> Result<()> {
         if !self.metadata_store.object_id_backfill_needed().await? {
             return Ok(());
@@ -3612,17 +3626,46 @@ impl PersistentStore {
         let current_state = self.metadata_store.load_current_state().await?;
         let mut current_objects = current_state.objects.iter().collect::<Vec<_>>();
         current_objects.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let legacy_candidates = self
+            .legacy_object_id_candidates_for_current_state(&current_state)
+            .await?;
+        let mut object_ids_by_path = HashMap::with_capacity(current_objects.len());
         let mut claimed_object_ids = HashSet::with_capacity(current_objects.len());
 
-        for (path, manifest_hash) in current_objects {
-            let persisted = current_state
+        for (path, _) in &current_objects {
+            let Some(object_id) = current_state
                 .object_ids
-                .get(path)
+                .get(*path)
                 .filter(|object_id| !object_id.trim().is_empty())
                 .filter(|object_id| claimed_object_ids.insert(object_id.to_string()))
-                .cloned();
-            let object_id =
-                persisted.unwrap_or_else(|| generate_unclaimed_object_id(&mut claimed_object_ids));
+                .cloned()
+            else {
+                continue;
+            };
+            object_ids_by_path.insert((**path).clone(), object_id);
+        }
+
+        let mut candidates = legacy_candidates.into_iter().collect::<Vec<_>>();
+        candidates.sort_by(|(left_path, left), (right_path, right)| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| right.created_at_unix.cmp(&left.created_at_unix))
+                .then_with(|| left_path.cmp(right_path))
+        });
+        for (path, candidate) in candidates {
+            if object_ids_by_path.contains_key(&path)
+                || !claimed_object_ids.insert(candidate.object_id.clone())
+            {
+                continue;
+            }
+            object_ids_by_path.insert(path, candidate.object_id);
+        }
+
+        for (path, manifest_hash) in current_objects {
+            let object_id = object_ids_by_path
+                .remove(path)
+                .unwrap_or_else(|| generate_unclaimed_object_id(&mut claimed_object_ids));
 
             self.ensure_migrated_object_version(&object_id, path, manifest_hash, unix_ts())
                 .await?;
@@ -3642,6 +3685,115 @@ impl PersistentStore {
         self.metadata_store.mark_object_id_backfill_complete().await
     }
 
+    async fn legacy_object_id_candidates_for_current_state(
+        &self,
+        current_state: &CurrentState,
+    ) -> Result<HashMap<String, LegacyObjectIdCandidate>> {
+        let unresolved_bindings = current_state
+            .objects
+            .iter()
+            .filter(|(path, _)| {
+                current_state
+                    .object_ids
+                    .get(*path)
+                    .is_none_or(|object_id| object_id.trim().is_empty())
+            })
+            .map(|(path, manifest_hash)| (path.clone(), manifest_hash.clone()))
+            .collect::<HashSet<_>>();
+        if unresolved_bindings.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let unresolved_manifest_hashes = unresolved_bindings
+            .iter()
+            .map(|(_, manifest_hash)| manifest_hash.clone())
+            .collect::<HashSet<_>>();
+        let mut candidates_by_binding = HashMap::new();
+        let mut manifest_paths = HashMap::<String, Option<String>>::new();
+        let mut after_object_id = None;
+
+        loop {
+            let indexes = self
+                .metadata_store
+                .load_version_indexes_after(
+                    after_object_id.as_deref(),
+                    OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE,
+                )
+                .await?;
+            let Some(last_object_id) = indexes.last().map(|index| index.object_id.clone()) else {
+                break;
+            };
+
+            for index in indexes {
+                for record in index.versions.values() {
+                    if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                        continue;
+                    }
+                    let is_preferred_head = index.preferred_head_version_id.as_deref()
+                        == Some(record.version_id.as_str());
+                    let direct_priority = if is_preferred_head { 4 } else { 3 };
+                    let direct_match = record.logical_path.as_ref().is_some_and(|path| {
+                        unresolved_bindings.contains(&(path.clone(), record.manifest_hash.clone()))
+                    });
+                    if direct_match && let Some(path) = record.logical_path.as_ref() {
+                        update_legacy_object_id_candidate(
+                            &mut candidates_by_binding,
+                            path,
+                            &record.manifest_hash,
+                            &index.object_id,
+                            direct_priority,
+                            record.created_at_unix,
+                        );
+                    }
+
+                    if direct_match || !unresolved_manifest_hashes.contains(&record.manifest_hash) {
+                        continue;
+                    }
+                    let manifest_path = match manifest_paths.get(&record.manifest_hash) {
+                        Some(path) => path.clone(),
+                        None => {
+                            let path = match self.load_manifest_by_hash(&record.manifest_hash).await
+                            {
+                                Ok(manifest) => manifest.map(|manifest| manifest.key),
+                                Err(err) => {
+                                    warn!(
+                                        manifest_hash = %record.manifest_hash,
+                                        object_id = %index.object_id,
+                                        version_id = %record.version_id,
+                                        error = %err,
+                                        "manifest unreadable while resolving legacy object identity; skipping fallback"
+                                    );
+                                    None
+                                }
+                            };
+                            manifest_paths.insert(record.manifest_hash.clone(), path.clone());
+                            path
+                        }
+                    };
+                    let Some(path) = manifest_path else {
+                        continue;
+                    };
+                    if unresolved_bindings.contains(&(path.clone(), record.manifest_hash.clone())) {
+                        update_legacy_object_id_candidate(
+                            &mut candidates_by_binding,
+                            &path,
+                            &record.manifest_hash,
+                            &index.object_id,
+                            if is_preferred_head { 2 } else { 1 },
+                            record.created_at_unix,
+                        );
+                    }
+                }
+            }
+            after_object_id = Some(last_object_id);
+        }
+
+        Ok(candidates_by_binding
+            .into_iter()
+            .map(|((path, _), candidate)| (path, candidate))
+            .collect())
+    }
+
     async fn ensure_migrated_object_version(
         &self,
         object_id: &str,
@@ -3653,9 +3805,11 @@ impl PersistentStore {
             .load_version_index_by_object_id(object_id)
             .await?
             .unwrap_or_else(|| empty_version_index(object_id));
-        if index.versions.values().any(|record| {
-            record.manifest_hash == manifest_hash && record.logical_path.as_deref() == Some(path)
-        }) {
+        if index
+            .versions
+            .values()
+            .any(|record| record.manifest_hash == manifest_hash)
+        {
             // Loading an older payload normalizes omitted identity fields. Persist the
             // normalized index while it is already part of the bounded current-object
             // migration, so restart safety does not depend on a later write.
@@ -3665,6 +3819,11 @@ impl PersistentStore {
         }
 
         let version_id = format!("migration-{}", Uuid::now_v7());
+        let parent_version_ids = index
+            .preferred_head_version_id
+            .clone()
+            .into_iter()
+            .collect();
         index.versions.insert(
             version_id.clone(),
             FileVersionRecord {
@@ -3672,7 +3831,7 @@ impl PersistentStore {
                 object_id: object_id.to_string(),
                 manifest_hash: manifest_hash.to_string(),
                 logical_path: Some(path.to_string()),
-                parent_version_ids: Vec::new(),
+                parent_version_ids,
                 state: VersionConsistencyState::Confirmed,
                 created_at_unix,
                 copied_from_object_id: None,
@@ -10169,6 +10328,36 @@ fn generate_unclaimed_object_id(claimed_object_ids: &mut HashSet<String>) -> Str
         if claimed_object_ids.insert(object_id.clone()) {
             return object_id;
         }
+    }
+}
+
+fn update_legacy_object_id_candidate(
+    candidates_by_binding: &mut HashMap<(String, String), LegacyObjectIdCandidate>,
+    path: &str,
+    manifest_hash: &str,
+    object_id: &str,
+    priority: u8,
+    created_at_unix: u64,
+) {
+    let key = (path.to_string(), manifest_hash.to_string());
+    let candidate = LegacyObjectIdCandidate {
+        object_id: object_id.to_string(),
+        priority,
+        created_at_unix,
+    };
+    let replace = candidates_by_binding.get(&key).is_none_or(|existing| {
+        (
+            candidate.priority,
+            candidate.created_at_unix,
+            candidate.object_id.as_str(),
+        ) > (
+            existing.priority,
+            existing.created_at_unix,
+            existing.object_id.as_str(),
+        )
+    });
+    if replace {
+        candidates_by_binding.insert(key, candidate);
     }
 }
 

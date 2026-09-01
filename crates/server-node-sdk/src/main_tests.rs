@@ -14334,6 +14334,104 @@ run_on_main_metadata_backends!(
     object_id_api_serializes_and_mutates_by_identity_turso
 );
 
+async fn execute_public_object_id_transport_request(
+    state: &super::ServerState,
+    request: transport_sdk::BufferedTransportRequest,
+) -> transport_sdk::BufferedTransportResponse {
+    Box::pin(
+        super::transport_service::execute_buffered_transport_request(
+            state,
+            &super::transport_service::TransportExecutionScope::Public,
+            &request,
+        ),
+    )
+    .await
+    .unwrap()
+}
+
+async fn object_id_routes_reach_multiplex_transport_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-transport-create").await;
+        store
+            .put_object_versioned(
+                "object-id-transport.txt",
+                Bytes::from_static(b"created"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    let lookup = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "GET",
+            format!("/objects/{}", created.object_id),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .await;
+    assert_eq!(lookup.status, StatusCode::OK.as_u16());
+
+    let modified = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "PUT",
+            format!("/objects/{}", created.object_id),
+            Vec::new(),
+            b"modified".to_vec(),
+        ),
+    )
+    .await;
+    assert_eq!(modified.status, StatusCode::CREATED.as_u16());
+
+    let renamed = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "POST",
+            format!("/objects/{}/rename", created.object_id),
+            vec![transport_sdk::TransportHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            }],
+            serde_json::to_vec(&super::ObjectRenameRequest {
+                to_path: "object-id-transport-moved.txt".to_string(),
+                overwrite: false,
+                expected_revision: None,
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::NO_CONTENT.as_u16());
+
+    let deleted = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "DELETE",
+            format!("/objects/{}", created.object_id),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::CREATED.as_u16());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_routes_reach_multiplex_transport_impl,
+    object_id_routes_reach_multiplex_transport,
+    object_id_routes_reach_multiplex_transport_turso
+);
+
 async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
     backend: MainTestBackend,
 ) {
