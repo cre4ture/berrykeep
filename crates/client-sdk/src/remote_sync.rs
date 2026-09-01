@@ -1588,6 +1588,7 @@ mod tests {
                 entries: vec![crate::ironmesh_client::StoreIndexEntry {
                     path: "docs/readme.txt".to_string(),
                     entry_type: "key".to_string(),
+                    object_id: Some("obj-readme".to_string()),
                     labels: Vec::new(),
                     labels_resolved: false,
                     version: Some("v1".to_string()),

@@ -25,14 +25,15 @@ use super::{
     GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
     GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue,
     GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
-    GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
-    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
-    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
-    decode_gallery_labels, decompress_snapshot_json, effective_gallery_captured_at_unix,
+    GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, METADATA_SCHEMA_VERSION_OBJECT_ID,
+    ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
+    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
+    OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord,
+    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
+    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    compress_snapshot_json, current_media_cache_metadata, decode_gallery_labels,
+    decode_version_index, decompress_snapshot_json, effective_gallery_captured_at_unix,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
@@ -1423,9 +1424,19 @@ fn materialize_gallery_index_entry(
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
+    let object_id = version_index_payload
+        .as_deref()
+        .map(|payload| {
+            serde_json::from_slice::<FileVersionIndex>(payload)
+                .context("invalid version index while resolving gallery object identity")
+        })
+        .transpose()?
+        .map(|index| index.object_id)
+        .unwrap_or_default();
     let labels = decode_gallery_labels(&labels_json)?;
     Ok(GalleryIndexEntry {
         key,
+        object_id,
         manifest_hash,
         size_bytes,
         modified_at_unix,
@@ -1793,6 +1804,32 @@ fn map_tokio_rusqlite_error(error: tokio_rusqlite::Error) -> anyhow::Error {
 
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
+    async fn object_id_backfill_needed(&self) -> Result<bool> {
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![OBJECT_ID_BACKFILL_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_none())
+        })
+        .await
+    }
+
+    async fn mark_object_id_backfill_complete(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![OBJECT_ID_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
         self.read(|db| {
             Ok(db
@@ -3164,11 +3201,12 @@ impl MetadataStore for SqliteMetadataStore {
         object_id: &str,
     ) -> Result<Option<FileVersionIndex>> {
         let object_id = object_id.to_string();
+        let query_object_id = object_id.clone();
         let payload = self
             .read(move |db| {
                 db.query_row(
                     "SELECT index_json FROM version_indexes WHERE object_id = ?1",
-                    params![object_id],
+                    params![query_object_id],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .optional()
@@ -3177,9 +3215,7 @@ impl MetadataStore for SqliteMetadataStore {
             .await?;
 
         match payload {
-            Some(payload) => serde_json::from_slice::<FileVersionIndex>(&payload)
-                .map(Some)
-                .context("invalid version index in sqlite"),
+            Some(payload) => decode_version_index(&object_id, &payload, "sqlite").map(Some),
             None => Ok(None),
         }
     }
@@ -3613,18 +3649,17 @@ impl MetadataStore for SqliteMetadataStore {
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
         self.read(|db| {
             let mut stmt = db.prepare(
-                "SELECT index_json
+                "SELECT object_id, index_json
                  FROM version_indexes
                  ORDER BY object_id",
             )?;
-            let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
             let mut indexes = Vec::new();
             for row in rows {
-                let payload = row?;
-                indexes.push(
-                    serde_json::from_slice::<FileVersionIndex>(&payload)
-                        .context("invalid version index in sqlite")?,
-                );
+                let (object_id, payload) = row?;
+                indexes.push(decode_version_index(&object_id, &payload, "sqlite")?);
             }
             Ok(indexes)
         })
@@ -4491,8 +4526,6 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             PRIMARY KEY(source_node_id, key, source_version_id)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
-            ON current_objects(object_id);
         CREATE INDEX IF NOT EXISTS idx_gallery_objects_media_order
             ON gallery_objects(media_type, captured_at_unix DESC, key ASC);
         CREATE INDEX IF NOT EXISTS idx_gallery_objects_manifest_hash
@@ -4524,6 +4557,23 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_s3_object_versions_key
             ON s3_object_versions(bucket_name, ironmesh_key, created_at_unix DESC, version_id DESC);
         ",
+    )?;
+    add_sqlite_column_if_missing(
+        db,
+        "current_objects",
+        "object_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_sqlite_column_if_missing(
+        db,
+        "gallery_objects",
+        "object_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
+         ON current_objects(object_id)",
+        [],
     )?;
     add_sqlite_column_if_missing(db, "gallery_objects", "latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "longitude", "REAL")?;
@@ -4604,7 +4654,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         None => METADATA_SCHEMA_VERSION_CURRENT,
     };
 
-    if schema_version != METADATA_SCHEMA_VERSION_CURRENT {
+    if !(1..=METADATA_SCHEMA_VERSION_CURRENT).contains(&schema_version) {
         anyhow::bail!(
             "unsupported sqlite metadata schema version: {} (current={})",
             schema_version,
@@ -4621,6 +4671,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         ],
     )
     .context("failed to persist sqlite metadata schema version")?;
+
+    debug_assert!(METADATA_SCHEMA_VERSION_CURRENT >= METADATA_SCHEMA_VERSION_OBJECT_ID);
 
     Ok(())
 }

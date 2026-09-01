@@ -83,6 +83,13 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
             ",
         )
         .await?;
+    super::add_column_if_missing(
+        connection,
+        "gallery_objects",
+        "object_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
     add_gallery_projection_column(connection, "spatial_x", "REAL").await?;
     add_gallery_projection_column(connection, "spatial_y", "REAL").await?;
     connection
@@ -2039,9 +2046,19 @@ fn materialize_gallery_index_entry(
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
+    let object_id = version_index_payload
+        .as_deref()
+        .map(|payload| {
+            serde_json::from_slice::<FileVersionIndex>(payload)
+                .context("invalid version index while resolving gallery object identity")
+        })
+        .transpose()?
+        .map(|index| index.object_id)
+        .unwrap_or_default();
     let labels = decode_gallery_labels(&labels_json)?;
     Ok(GalleryIndexEntry {
         key,
+        object_id,
         manifest_hash,
         size_bytes,
         modified_at_unix,

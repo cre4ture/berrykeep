@@ -4,7 +4,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
-const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
+const METADATA_SCHEMA_VERSION_CURRENT: i64 = 2;
+const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
+pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
 
@@ -1142,6 +1144,7 @@ pub(crate) struct GalleryIndexMediaSummary {
 #[derive(Debug, Clone)]
 pub(crate) struct GalleryIndexEntry {
     pub(crate) key: String,
+    pub(crate) object_id: String,
     pub(crate) manifest_hash: String,
     pub(crate) size_bytes: Option<u64>,
     pub(crate) modified_at_unix: Option<u64>,
@@ -1273,6 +1276,7 @@ pub enum VersionConsistencyState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct FileVersionRecord {
     pub(super) version_id: String,
+    #[serde(default)]
     pub(super) object_id: String,
     pub(super) manifest_hash: String,
     #[serde(default)]
@@ -1287,6 +1291,7 @@ pub(super) struct FileVersionRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct FileVersionIndex {
+    #[serde(default)]
     pub(super) object_id: String,
     pub(super) versions: HashMap<String, FileVersionRecord>,
     pub(super) head_version_ids: Vec<String>,
@@ -1449,6 +1454,7 @@ pub enum SnapshotRestoreMutationResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TombstonePathResult {
     pub path: String,
+    pub object_id: String,
     pub version_id: String,
 }
 
@@ -2137,6 +2143,7 @@ pub struct RepairAttemptRecord {
 
 #[derive(Debug, Clone)]
 pub struct PutResult {
+    pub object_id: String,
     pub snapshot_id: String,
     pub version_id: String,
     pub manifest_hash: String,
@@ -2476,6 +2483,12 @@ struct ArchivedTombstoneIndexRecord {
 
 #[async_trait]
 trait MetadataStore: Send + Sync {
+    /// Whether legacy current rows, snapshots, and version payloads still need
+    /// their one-time stable object identity backfill.
+    async fn object_id_backfill_needed(&self) -> Result<bool>;
+    /// Marks the object identity backfill complete after every persisted
+    /// lineage has been migrated successfully.
+    async fn mark_object_id_backfill_complete(&self) -> Result<()>;
     /// Whether current XMP sidecars still need a one-time label projection
     /// backfill after this feature was introduced.
     async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool>;
@@ -3579,10 +3592,174 @@ impl PersistentStore {
             #[cfg(test)]
             data_scrub_run_test_hook: None,
         };
+        store.migrate_legacy_object_ids().await?;
         store
             .backfill_gallery_labels_from_current_sidecars()
             .await?;
         Ok(store)
+    }
+
+    /// Backfills persisted metadata written before object identity became mandatory.
+    ///
+    /// Current rows are migrated first. Snapshot history is then walked backwards from
+    /// the current namespace so uninterrupted path lineages inherit the same identity,
+    /// while a path that disappears and later reappears starts a new lineage.
+    async fn migrate_legacy_object_ids(&self) -> Result<()> {
+        if !self.metadata_store.object_id_backfill_needed().await? {
+            return Ok(());
+        }
+
+        let mut identity_by_binding = HashMap::<(String, String), String>::new();
+        for index in self.load_all_version_indexes().await? {
+            validate_version_index_identity(&index.object_id, &index)?;
+            // `decode_version_index` fills fields omitted by legacy JSON. Persisting the
+            // normalized payload makes the migration one-way and restart-safe.
+            self.persist_version_index_by_object_id(&index.object_id, &index)
+                .await?;
+            for record in index.versions.values() {
+                if let Some(path) = record.logical_path.as_ref() {
+                    identity_by_binding.insert(
+                        (path.clone(), record.manifest_hash.clone()),
+                        index.object_id.clone(),
+                    );
+                }
+            }
+        }
+
+        let current_state = self.metadata_store.load_current_state().await?;
+        let mut current_identity_by_path = HashMap::with_capacity(current_state.objects.len());
+        for (path, manifest_hash) in &current_state.objects {
+            let persisted = current_state
+                .object_ids
+                .get(path)
+                .filter(|object_id| !object_id.trim().is_empty())
+                .cloned();
+            let object_id = persisted
+                .or_else(|| {
+                    identity_by_binding
+                        .get(&(path.clone(), manifest_hash.clone()))
+                        .cloned()
+                })
+                .unwrap_or_else(generate_object_id);
+
+            self.ensure_migrated_object_version(&object_id, path, manifest_hash, unix_ts())
+                .await?;
+            identity_by_binding.insert((path.clone(), manifest_hash.clone()), object_id.clone());
+            current_identity_by_path.insert(path.clone(), object_id.clone());
+
+            if current_state.object_ids.get(path) != Some(&object_id) {
+                self.upsert_current_object(
+                    path,
+                    CurrentObjectEntry {
+                        manifest_hash: manifest_hash.clone(),
+                        object_id,
+                    },
+                )
+                .await?;
+            }
+        }
+
+        let mut snapshots = self.metadata_store.load_all_snapshots().await?;
+        snapshots.sort_by(|left, right| {
+            right
+                .created_at_unix
+                .cmp(&left.created_at_unix)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let mut next_identity_by_path = current_identity_by_path;
+        let mut next_paths = current_state
+            .objects
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        for mut snapshot in snapshots {
+            let mut changed = false;
+            let snapshot_paths = snapshot.objects.keys().cloned().collect::<HashSet<_>>();
+            for (path, manifest_hash) in &snapshot.objects {
+                let persisted = snapshot
+                    .object_ids
+                    .get(path)
+                    .filter(|object_id| !object_id.trim().is_empty())
+                    .cloned();
+                let object_id = persisted
+                    .or_else(|| {
+                        next_paths
+                            .contains(path)
+                            .then(|| next_identity_by_path.get(path).cloned())
+                            .flatten()
+                    })
+                    .or_else(|| {
+                        identity_by_binding
+                            .get(&(path.clone(), manifest_hash.clone()))
+                            .cloned()
+                    })
+                    .unwrap_or_else(generate_object_id);
+
+                self.ensure_migrated_object_version(
+                    &object_id,
+                    path,
+                    manifest_hash,
+                    snapshot.created_at_unix,
+                )
+                .await?;
+                identity_by_binding
+                    .insert((path.clone(), manifest_hash.clone()), object_id.clone());
+                next_identity_by_path.insert(path.clone(), object_id.clone());
+                if snapshot.object_ids.get(path) != Some(&object_id) {
+                    snapshot.object_ids.insert(path.clone(), object_id);
+                    changed = true;
+                }
+            }
+            next_identity_by_path.retain(|path, _| snapshot_paths.contains(path));
+            next_paths = snapshot_paths;
+            if changed {
+                self.metadata_store
+                    .persist_snapshot_manifest(&snapshot)
+                    .await?;
+            }
+        }
+
+        self.metadata_store.mark_object_id_backfill_complete().await
+    }
+
+    async fn ensure_migrated_object_version(
+        &self,
+        object_id: &str,
+        path: &str,
+        manifest_hash: &str,
+        created_at_unix: u64,
+    ) -> Result<()> {
+        let mut index = self
+            .load_version_index_by_object_id(object_id)
+            .await?
+            .unwrap_or_else(|| empty_version_index(object_id));
+        if index.versions.values().any(|record| {
+            record.manifest_hash == manifest_hash && record.logical_path.as_deref() == Some(path)
+        }) {
+            return Ok(());
+        }
+
+        let version_id = format!("migration-{}", Uuid::now_v7());
+        index.versions.insert(
+            version_id.clone(),
+            FileVersionRecord {
+                version_id,
+                object_id: object_id.to_string(),
+                manifest_hash: manifest_hash.to_string(),
+                logical_path: Some(path.to_string()),
+                parent_version_ids: Vec::new(),
+                state: VersionConsistencyState::Confirmed,
+                created_at_unix,
+                copied_from_object_id: None,
+                copied_from_version_id: None,
+                copied_from_path: None,
+            },
+        );
+        index.head_version_ids = recompute_head_version_ids(&index);
+        index.preferred_head_version_id = choose_preferred_head(&index);
+        self.persist_version_index_by_object_id(object_id, &index)
+            .await
     }
 
     /// Replays existing XMP sidecars into the gallery label projection once per
@@ -4818,6 +4995,7 @@ impl PersistentStore {
             };
 
             return Ok(PutResult {
+                object_id,
                 snapshot_id,
                 version_id,
                 manifest_hash: manifest_hash.to_string(),
@@ -4844,6 +5022,7 @@ impl PersistentStore {
                 && parent_context_matches
             {
                 return Ok(PutResult {
+                    object_id,
                     snapshot_id: format!("snap-skipped-{preferred_head_id}"),
                     version_id: preferred_head_id,
                     manifest_hash: preferred_head.manifest_hash.clone(),
@@ -4904,6 +5083,7 @@ impl PersistentStore {
         };
 
         Ok(PutResult {
+            object_id,
             snapshot_id,
             version_id,
             manifest_hash: manifest_hash.to_string(),
@@ -4970,6 +5150,42 @@ impl PersistentStore {
         };
         self.version_graph_summary_for_object_id(key, &object_id)
             .await
+    }
+
+    pub async fn list_versions_by_object_id(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<VersionGraphSummary>> {
+        if object_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
+            return Ok(None);
+        };
+        let Some(key) = self.resolve_key_for_version_index(&index).await? else {
+            return Ok(None);
+        };
+        self.version_graph_summary_for_object_id(&key, object_id)
+            .await
+    }
+
+    pub async fn current_path_for_object_id(&self, object_id: &str) -> Result<Option<String>> {
+        if object_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut paths = self
+            .metadata_store
+            .list_keys_for_object_id(object_id)
+            .await?;
+        paths.sort();
+        paths.dedup();
+        match paths.as_slice() {
+            [] => Ok(None),
+            [path] => Ok(Some(path.clone())),
+            _ => bail!(
+                "object identity is bound to multiple current paths: object_id={object_id} paths={paths:?}"
+            ),
+        }
     }
 
     async fn version_graph_summary_for_object_id(
@@ -7146,13 +7362,10 @@ impl PersistentStore {
         let mut per_path_options = options.clone();
         per_path_options.create_snapshot = false;
         for target in targets {
-            let version_id = self
-                .tombstone_object_single(&target, per_path_options.clone())
-                .await?;
-            results.push(TombstonePathResult {
-                path: target,
-                version_id,
-            });
+            results.push(
+                self.tombstone_object_single(&target, per_path_options.clone())
+                    .await?,
+            );
         }
 
         if options.create_snapshot && !results.is_empty() {
@@ -7166,6 +7379,17 @@ impl PersistentStore {
     }
 
     pub async fn tombstone_object(&mut self, key: &str, options: PutOptions) -> Result<String> {
+        Ok(self
+            .tombstone_object_with_identity(key, options)
+            .await?
+            .version_id)
+    }
+
+    pub async fn tombstone_object_with_identity(
+        &mut self,
+        key: &str,
+        options: PutOptions,
+    ) -> Result<TombstonePathResult> {
         self.tombstone_object_single(key, options).await
     }
 
@@ -7179,11 +7403,7 @@ impl PersistentStore {
         key: &str,
         options: PutOptions,
     ) -> Result<Vec<TombstonePathResult>> {
-        let version_id = self.tombstone_object_single(key, options.clone()).await?;
-        let mut deleted = vec![TombstonePathResult {
-            path: key.to_owned(),
-            version_id,
-        }];
+        let mut deleted = vec![self.tombstone_object_single(key, options.clone()).await?];
 
         if is_sidecar_key(key) {
             return Ok(deleted);
@@ -7197,16 +7417,15 @@ impl PersistentStore {
         let mut sidecar_options = options;
         sidecar_options.parent_version_ids.clear();
         sidecar_options.explicit_version_id = None;
-        let sidecar_version_id =
-            Box::pin(self.tombstone_object_single(&sidecar_key, sidecar_options)).await?;
-        deleted.push(TombstonePathResult {
-            path: sidecar_key,
-            version_id: sidecar_version_id,
-        });
+        deleted.push(Box::pin(self.tombstone_object_single(&sidecar_key, sidecar_options)).await?);
         Ok(deleted)
     }
 
-    async fn tombstone_object_single(&mut self, key: &str, options: PutOptions) -> Result<String> {
+    async fn tombstone_object_single(
+        &mut self,
+        key: &str,
+        options: PutOptions,
+    ) -> Result<TombstonePathResult> {
         let object_id = self
             .object_id_for_key(key)
             .await?
@@ -7274,7 +7493,11 @@ impl PersistentStore {
                 format!("snap-skipped-{version_id}")
             };
 
-            return Ok(existing.version_id.clone());
+            return Ok(TombstonePathResult {
+                path: key.to_string(),
+                object_id,
+                version_id: existing.version_id.clone(),
+            });
         }
 
         let record = FileVersionRecord {
@@ -7323,7 +7546,11 @@ impl PersistentStore {
         )
         .await?;
 
-        Ok(version_id)
+        Ok(TombstonePathResult {
+            path: key.to_string(),
+            object_id,
+            version_id,
+        })
     }
 
     pub async fn rename_object_path(
@@ -8732,6 +8959,7 @@ impl PersistentStore {
         object_id: &str,
         index: &FileVersionIndex,
     ) -> Result<()> {
+        validate_version_index_identity(object_id, index)?;
         self.metadata_store
             .persist_version_index_by_object_id(object_id, index)
             .await
@@ -9778,6 +10006,60 @@ fn empty_version_index(object_id: &str) -> FileVersionIndex {
         head_version_ids: Vec::new(),
         preferred_head_version_id: None,
     }
+}
+
+fn decode_version_index(
+    persisted_object_id: &str,
+    payload: &[u8],
+    backend: &str,
+) -> Result<FileVersionIndex> {
+    let mut index = serde_json::from_slice::<FileVersionIndex>(payload)
+        .with_context(|| format!("invalid version index in {backend}"))?;
+    if index.object_id.trim().is_empty() {
+        index.object_id = persisted_object_id.to_string();
+    } else if index.object_id != persisted_object_id {
+        bail!(
+            "version index identity mismatch in {backend}: row={persisted_object_id} payload={}",
+            index.object_id
+        );
+    }
+    for record in index.versions.values_mut() {
+        if record.object_id.trim().is_empty() {
+            record.object_id = index.object_id.clone();
+        } else if record.object_id != index.object_id {
+            bail!(
+                "version record identity mismatch in {backend}: index={} version={} record={}",
+                index.object_id,
+                record.version_id,
+                record.object_id
+            );
+        }
+    }
+    Ok(index)
+}
+
+fn validate_version_index_identity(object_id: &str, index: &FileVersionIndex) -> Result<()> {
+    if object_id.trim().is_empty() {
+        bail!("object_id must not be empty");
+    }
+    if index.object_id != object_id {
+        bail!(
+            "refusing to change object identity: expected={object_id} actual={}",
+            index.object_id
+        );
+    }
+    if let Some(record) = index
+        .versions
+        .values()
+        .find(|record| record.object_id != object_id)
+    {
+        bail!(
+            "refusing to persist version with a different object identity: object_id={object_id} version_id={} version_object_id={}",
+            record.version_id,
+            record.object_id
+        );
+    }
+    Ok(())
 }
 
 enum DeleteRecreateLoopCleanupCandidateOutcome {

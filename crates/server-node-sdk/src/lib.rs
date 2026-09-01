@@ -1035,6 +1035,7 @@ struct UploadSessionChunkResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadSessionCompleteResponse {
+    object_id: String,
     snapshot_id: String,
     version_id: String,
     manifest_hash: String,
@@ -7677,6 +7678,13 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/media/cache/retry", post(retry_media_cache))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
+        .route(
+            "/objects/{object_id}",
+            get(get_object_by_id)
+                .put(put_object_by_id)
+                .delete(delete_object_by_id),
+        )
+        .route("/objects/{object_id}/rename", post(rename_object_by_id))
         .route("/store/copy", post(copy_object_path))
         .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
@@ -7799,6 +7807,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             post(prepare_host_storage_directory),
         )
         .route("/auth/versions/{key}", get(list_versions_admin))
+        .route("/auth/objects/{object_id}", get(get_object_by_id_admin))
         .route(
             "/auth/versions/{key}/restore/{version_id}",
             post(restore_version_path),
@@ -8157,6 +8166,13 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
+        .route(
+            "/objects/{object_id}",
+            get(get_object_by_id)
+                .put(put_object_by_id)
+                .delete(delete_object_by_id),
+        )
+        .route("/objects/{object_id}/rename", post(rename_object_by_id))
         .route("/store/copy", post(copy_object_path))
         .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
@@ -13480,6 +13496,8 @@ struct StoreIndexEntry {
     path: String,
     entry_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_hash: Option<String>,
@@ -13855,6 +13873,8 @@ struct PutObjectQuery {
     parent: Vec<String>,
     #[serde(default)]
     expected_revision: Option<String>,
+    #[serde(default)]
+    object_id: Option<String>,
     version_id: Option<String>,
     #[serde(default)]
     internal_replication: bool,
@@ -13870,6 +13890,8 @@ struct DeleteObjectByQuery {
     parent: Vec<String>,
     #[serde(default)]
     expected_revision: Option<String>,
+    #[serde(default)]
+    object_id: Option<String>,
     version_id: Option<String>,
     #[serde(default)]
     internal_replication: bool,
@@ -13885,6 +13907,32 @@ struct PathMutationRequest {
     overwrite: bool,
     #[serde(default)]
     expected_revision: Option<String>,
+    #[serde(default)]
+    object_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObjectRenameRequest {
+    to_path: String,
+    #[serde(default)]
+    overwrite: bool,
+    #[serde(default)]
+    expected_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ObjectLookupResponse {
+    object_id: String,
+    path: String,
+    revision: Option<String>,
+    entry_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ObjectMutationResponse {
+    object_id: String,
+    path: String,
+    revision: String,
 }
 
 /// Replaces the labels of the media object at `path`.
@@ -14194,6 +14242,7 @@ async fn delete_object_by_query_response(
             state: query.state,
             parent: query.parent,
             expected_revision: query.expected_revision,
+            object_id: query.object_id,
             version_id: query.version_id,
             internal_replication: query.internal_replication,
             recursive: query.recursive,
@@ -14223,6 +14272,141 @@ async fn rename_object_path(
                 data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
             rename_object_path_response(&state_for_request, request, Some(actor)).await
         },
+    )
+    .await
+}
+
+async fn current_object_path_for_api(
+    state: &ServerState,
+    object_id: &str,
+) -> std::result::Result<String, StatusCode> {
+    let store = read_store(state, "object_identity.current_path").await;
+    match store.current_path_for_object_id(object_id).await {
+        Ok(Some(path)) => Ok(path),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(err) => {
+            tracing::error!(error = %err, object_id, "failed resolving current path by object identity");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn get_object_by_id(
+    State(state): State<ServerState>,
+    Path(object_id): Path<String>,
+) -> Response {
+    get_object_by_id_response(&state, &object_id).await
+}
+
+async fn get_object_by_id_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(object_id): Path<String>,
+) -> Response {
+    let action = "auth/objects/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "object_id": object_id.clone() }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    get_object_by_id_response(&state, &object_id).await
+}
+
+async fn get_object_by_id_response(state: &ServerState, object_id: &str) -> Response {
+    let store = read_store(state, "object_identity.lookup").await;
+    let summary = match store.list_versions_by_object_id(object_id).await {
+        Ok(Some(summary)) => summary,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, object_id, "failed looking up object identity");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let preferred = summary
+        .preferred_head_version_id
+        .as_deref()
+        .and_then(|revision| {
+            summary
+                .versions
+                .iter()
+                .find(|version| version.version_id == revision)
+        });
+    let entry_type =
+        if preferred.is_some_and(|version| version.manifest_hash == TOMBSTONE_MANIFEST_HASH) {
+            "tombstone"
+        } else {
+            "key"
+        };
+    (
+        StatusCode::OK,
+        Json(ObjectLookupResponse {
+            object_id: summary.object_id,
+            path: summary.key,
+            revision: summary.preferred_head_version_id,
+            entry_type: entry_type.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn put_object_by_id(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(object_id): Path<String>,
+    Query(mut query): Query<PutObjectQuery>,
+    payload: Bytes,
+) -> Response {
+    let key = match current_object_path_for_api(&state, &object_id).await {
+        Ok(key) => key,
+        Err(status) => return status.into_response(),
+    };
+    query.object_id = Some(object_id);
+    put_object(State(state), headers, Path(key), Query(query), payload).await
+}
+
+async fn delete_object_by_id(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(object_id): Path<String>,
+    Query(mut query): Query<PutObjectQuery>,
+) -> Response {
+    let key = match current_object_path_for_api(&state, &object_id).await {
+        Ok(key) => key,
+        Err(status) => return status.into_response(),
+    };
+    query.object_id = Some(object_id);
+    delete_object(State(state), headers, Path(key), Query(query))
+        .await
+        .into_response()
+}
+
+async fn rename_object_by_id(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(object_id): Path<String>,
+    Json(request): Json<ObjectRenameRequest>,
+) -> Response {
+    let from_path = match current_object_path_for_api(&state, &object_id).await {
+        Ok(path) => path,
+        Err(status) => return status.into_response(),
+    };
+    rename_object_path(
+        State(state),
+        headers,
+        Json(PathMutationRequest {
+            from_path,
+            to_path: request.to_path,
+            overwrite: request.overwrite,
+            expected_revision: request.expected_revision,
+            object_id: Some(object_id),
+        }),
     )
     .await
 }
@@ -14274,6 +14458,17 @@ async fn rename_object_path_response(
     let mut store = lock_store(state, "store_path.rename").await;
     let store_lock_wait_ms = store.waited_ms();
     let store_started = Instant::now();
+    if let Some(object_id) = request.object_id.as_deref() {
+        match store.current_path_for_object_id(object_id).await {
+            Ok(Some(path)) if path == request.from_path => {}
+            Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                tracing::error!(error = %err, object_id, "failed resolving object identity before rename");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
     if let Some(expected_revision) = request.expected_revision.as_deref() {
         let current_revision = match store.list_versions(&request.from_path).await {
             Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
@@ -14853,6 +15048,17 @@ async fn put_object_response(
     let total_size_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let mut store = lock_store(state, "store_object.put").await;
+    if let Some(object_id) = query.object_id.as_deref() {
+        match store.current_path_for_object_id(object_id).await {
+            Ok(Some(path)) if path == key => {}
+            Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                tracing::error!(error = %err, object_id, "failed resolving object identity before put");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
     if let Some(expected_revision) = query.expected_revision.as_deref() {
         let current_revision = match store.list_versions(&key).await {
             Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
@@ -14941,7 +15147,15 @@ async fn put_object_response(
                 dedup_reused_chunks = outcome.dedup_reused_chunks,
                 "stored object"
             );
-            StatusCode::CREATED.into_response()
+            (
+                StatusCode::CREATED,
+                Json(ObjectMutationResponse {
+                    object_id: outcome.object_id,
+                    path: key,
+                    revision: outcome.version_id,
+                }),
+            )
+                .into_response()
         }
         Err(err) => {
             tracing::error!(error = %err, key = %key, "failed to store object");
@@ -15518,6 +15732,7 @@ async fn complete_upload_session_response(
     .await;
 
     let response = UploadSessionCompleteResponse {
+        object_id: outcome.object_id.clone(),
         snapshot_id: outcome.snapshot_id.clone(),
         version_id: outcome.version_id.clone(),
         manifest_hash: outcome.manifest_hash.clone(),
@@ -15603,26 +15818,37 @@ async fn delete_object_response(
     key: String,
     query: PutObjectQuery,
     actor: Option<DataChangeActorContext>,
-) -> StatusCode {
+) -> Response {
     if key.trim().is_empty() {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
     if query.version_id.is_some() && !query.internal_replication {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     let version_state = match query.state.as_deref() {
         None | Some("confirmed") => VersionConsistencyState::Confirmed,
         Some("provisional") => VersionConsistencyState::Provisional,
-        Some(_) => return StatusCode::BAD_REQUEST,
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let recursive = query.recursive
         || (key.ends_with('/') && !query.internal_replication && query.version_id.is_none());
     if recursive && (!query.parent.is_empty() || query.version_id.is_some()) {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     let mut store = lock_store(state, "store_object.tombstone").await;
+    if let Some(object_id) = query.object_id.as_deref() {
+        match store.current_path_for_object_id(object_id).await {
+            Ok(Some(path)) if path == key => {}
+            Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                tracing::error!(error = %err, object_id, "failed resolving object identity before delete");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
     if let Some(expected_revision) = query.expected_revision.as_deref() {
         let current_revision = match store.list_versions(&key).await {
             Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
@@ -15632,11 +15858,11 @@ async fn delete_object_response(
                     path = %key,
                     "failed resolving preferred revision before delete"
                 );
-                return StatusCode::INTERNAL_SERVER_ERROR;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
         if current_revision.as_deref() != Some(expected_revision) {
-            return StatusCode::CONFLICT;
+            return StatusCode::CONFLICT.into_response();
         }
     }
     let tombstone_options = PutOptions {
@@ -15653,14 +15879,14 @@ async fn delete_object_response(
             .map(|results| {
                 results
                     .into_iter()
-                    .map(|entry| (entry.path, entry.version_id))
+                    .map(|entry| (entry.path, entry.object_id, entry.version_id))
                     .collect::<Vec<_>>()
             })
     } else if query.internal_replication {
         store
-            .tombstone_object(&key, tombstone_options)
+            .tombstone_object_with_identity(&key, tombstone_options)
             .await
-            .map(|version_id| vec![(key.clone(), version_id)])
+            .map(|entry| vec![(entry.path, entry.object_id, entry.version_id)])
     } else {
         store
             .tombstone_object_with_companions(&key, tombstone_options)
@@ -15668,7 +15894,7 @@ async fn delete_object_response(
             .map(|results| {
                 results
                     .into_iter()
-                    .map(|entry| (entry.path, entry.version_id))
+                    .map(|entry| (entry.path, entry.object_id, entry.version_id))
                     .collect::<Vec<_>>()
             })
     };
@@ -15679,7 +15905,7 @@ async fn delete_object_response(
             publish_namespace_change(state);
 
             let mut cluster = state.cluster.lock().await;
-            for (deleted_path, version_id) in &deleted_paths {
+            for (deleted_path, _, version_id) in &deleted_paths {
                 cluster.note_replica(deleted_path, state.node_id);
                 cluster.note_replica(format!("{}@{}", deleted_path, version_id), state.node_id);
             }
@@ -15694,7 +15920,7 @@ async fn delete_object_response(
                 query.internal_replication,
             ) {
                 let mut repair_subjects = BTreeSet::new();
-                for (deleted_path, version_id) in &deleted_paths {
+                for (deleted_path, _, version_id) in &deleted_paths {
                     append_autonomous_post_write_replication_subjects(
                         &mut repair_subjects,
                         deleted_path,
@@ -15707,8 +15933,8 @@ async fn delete_object_response(
             if !query.internal_replication {
                 let version_id = deleted_paths
                     .iter()
-                    .find(|(deleted_path, _)| deleted_path == &key)
-                    .map(|(_, version_id)| version_id.clone());
+                    .find(|(deleted_path, _, _)| deleted_path == &key)
+                    .map(|(_, _, version_id)| version_id.clone());
                 record_data_change_event(
                     state,
                     PendingDataChangeEvent {
@@ -15734,7 +15960,19 @@ async fn delete_object_response(
                 deleted_paths = deleted_paths.len(),
                 "tombstoned object path(s)"
             );
-            StatusCode::CREATED
+            let response = deleted_paths
+                .iter()
+                .find(|(deleted_path, _, _)| deleted_path == &key)
+                .or_else(|| deleted_paths.first())
+                .map(|(_, object_id, version_id)| ObjectMutationResponse {
+                    object_id: object_id.clone(),
+                    path: key,
+                    revision: version_id.clone(),
+                });
+            match response {
+                Some(response) => (StatusCode::CREATED, Json(response)).into_response(),
+                None => StatusCode::CREATED.into_response(),
+            }
         }
         Err(err) => {
             tracing::error!(
@@ -15743,7 +15981,7 @@ async fn delete_object_response(
                 recursive,
                 "failed to tombstone object path(s)"
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
@@ -16559,6 +16797,7 @@ fn store_index_entry_from_gallery_entry(
     StoreIndexEntry {
         path: entry.key,
         entry_type: "key".to_string(),
+        object_id: (!entry.object_id.is_empty()).then_some(entry.object_id),
         version: None,
         content_hash: Some(entry.manifest_hash),
         size_bytes: entry.size_bytes,
@@ -17002,6 +17241,7 @@ async fn list_store_index_response_attempt(
 
     let mut entries = build_store_index_entries_from_plan(
         &entry_plan,
+        Some(&visible_object_ids),
         Some(&visible_object_hashes),
         Some(&key_sizes),
         Some(&key_content_fingerprints),
@@ -17450,6 +17690,7 @@ async fn list_store_index_response_cursor_mode(
         .map(|entry| match entry.kind {
             listing::KeyListingEntryKind::Object => build_store_index_object_entry(
                 entry.path.clone(),
+                Some(&visible_object_ids),
                 Some(&visible_object_hashes),
                 Some(&key_sizes),
                 Some(&key_content_fingerprints),
@@ -17696,6 +17937,7 @@ fn collapse_store_index_entries_for_tree_view(
             .or_insert_with(|| StoreIndexEntry {
                 path: entry.path,
                 entry_type: "prefix".to_string(),
+                object_id: None,
                 version: None,
                 content_hash: None,
                 size_bytes: None,
@@ -18134,7 +18376,7 @@ fn media_type_for_path(path: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec<StoreIndexEntry> {
-    build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None, None)
+    build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None, None, None)
 }
 
 #[derive(Debug, Clone)]
@@ -18217,6 +18459,7 @@ fn build_store_index_entries_with_hashes(
     keys: &[String],
     prefix: &str,
     depth: usize,
+    object_ids_by_key: Option<&HashMap<String, String>>,
     hashes_by_key: Option<&HashMap<String, String>>,
     sizes_by_key: Option<&HashMap<String, u64>>,
     content_fingerprints_by_key: Option<&HashMap<String, String>>,
@@ -18225,6 +18468,7 @@ fn build_store_index_entries_with_hashes(
     let plan = plan_store_index_entries(keys, prefix, depth);
     build_store_index_entries_from_plan(
         &plan,
+        object_ids_by_key,
         hashes_by_key,
         sizes_by_key,
         content_fingerprints_by_key,
@@ -18234,6 +18478,7 @@ fn build_store_index_entries_with_hashes(
 
 fn build_store_index_entries_from_plan(
     plan: &StoreIndexEntryPlan,
+    object_ids_by_key: Option<&HashMap<String, String>>,
     hashes_by_key: Option<&HashMap<String, String>>,
     sizes_by_key: Option<&HashMap<String, u64>>,
     content_fingerprints_by_key: Option<&HashMap<String, String>>,
@@ -18246,6 +18491,7 @@ fn build_store_index_entries_from_plan(
     for path in &plan.file_entries {
         entries.push(build_store_index_object_entry(
             path.clone(),
+            object_ids_by_key,
             hashes_by_key,
             sizes_by_key,
             content_fingerprints_by_key,
@@ -18260,6 +18506,7 @@ fn build_store_index_prefix_entry(path: String) -> StoreIndexEntry {
     StoreIndexEntry {
         path,
         entry_type: "prefix".to_string(),
+        object_id: None,
         version: None,
         content_hash: None,
         size_bytes: None,
@@ -18275,11 +18522,15 @@ fn build_store_index_prefix_entry(path: String) -> StoreIndexEntry {
 
 fn build_store_index_object_entry(
     path: String,
+    object_ids_by_key: Option<&HashMap<String, String>>,
     hashes_by_key: Option<&HashMap<String, String>>,
     sizes_by_key: Option<&HashMap<String, u64>>,
     content_fingerprints_by_key: Option<&HashMap<String, String>>,
     modified_times_by_key: Option<&HashMap<String, u64>>,
 ) -> StoreIndexEntry {
+    let object_id = object_ids_by_key
+        .and_then(|values| values.get(path.as_str()))
+        .cloned();
     let content_hash = hashes_by_key
         .and_then(|values| values.get(path.as_str()))
         .cloned();
@@ -18295,6 +18546,7 @@ fn build_store_index_object_entry(
     StoreIndexEntry {
         path,
         entry_type: "key".to_string(),
+        object_id,
         version: None,
         content_hash,
         size_bytes,
