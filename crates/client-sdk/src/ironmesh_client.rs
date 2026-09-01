@@ -5236,9 +5236,22 @@ impl IronMeshClient {
         object_id: impl AsRef<str>,
         expected_revision: Option<&str>,
     ) -> Result<()> {
+        self.delete_object_by_id_with_recursive(object_id, expected_revision, false)
+            .await
+    }
+
+    pub async fn delete_object_by_id_with_recursive(
+        &self,
+        object_id: impl AsRef<str>,
+        expected_revision: Option<&str>,
+        recursive: bool,
+    ) -> Result<()> {
         let object_id = object_id.as_ref();
         let mut url = self.object_url(object_id)?;
         append_optional_query(&mut url, "expected_revision", expected_revision);
+        if recursive {
+            url.query_pairs_mut().append_pair("recursive", "true");
+        }
         let response = self
             .execute_buffered_request(Method::DELETE, url, Vec::new(), None)
             .await

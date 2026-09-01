@@ -14223,6 +14223,108 @@ async fn object_id_api_serializes_and_mutates_by_identity_impl(backend: MainTest
     );
     assert_eq!(tombstone_lookup.entry_type, "tombstone");
 
+    let directory_path = "object-id-directory/".to_string();
+    let child_path = "object-id-directory/child.txt".to_string();
+    let directory_response = super::put_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(directory_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(directory_response.status(), StatusCode::CREATED);
+    let directory: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(directory_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let child_response = super::put_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(child_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::from_static(b"child"),
+    )
+    .await
+    .into_response();
+    assert_eq!(child_response.status(), StatusCode::CREATED);
+
+    let rejected_directory_delete = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(directory.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(directory.revision.clone()),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(rejected_directory_delete.status(), StatusCode::BAD_REQUEST);
+    {
+        let store = lock_store(&state, "tests.object-id-directory-intact").await;
+        assert_eq!(
+            store
+                .get_object(
+                    &child_path,
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .unwrap(),
+            Bytes::from_static(b"child")
+        );
+    }
+
+    let recursive_directory_delete = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(directory.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(directory.revision),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: true,
+        }),
+    )
+    .await;
+    assert_eq!(recursive_directory_delete.status(), StatusCode::CREATED);
+    let recursive_deleted: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(recursive_directory_delete.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recursive_deleted.object_id, directory.object_id);
+    assert_eq!(recursive_deleted.path, directory_path);
+
     cleanup_test_state(&state).await;
 }
 

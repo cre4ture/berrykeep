@@ -931,7 +931,6 @@ run_on_all_metadata_backends!(
 
 #[tokio::test]
 async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
-    const LEGACY_OBJECT_ID: &str = "legacy-row-object-id";
     const LEGACY_PATH: &str = "legacy/file.txt";
     const LEGACY_MANIFEST: &str = "legacy-manifest";
 
@@ -989,7 +988,7 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
         database
             .execute(
                 "INSERT INTO version_indexes(object_id, index_json) VALUES(?1, ?2)",
-                rusqlite::params![LEGACY_OBJECT_ID, legacy_index],
+                rusqlite::params!["legacy-row-object-id", legacy_index],
             )
             .unwrap();
     }
@@ -998,18 +997,18 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
         .await
         .unwrap();
     let current = store.list_versions(LEGACY_PATH).await.unwrap().unwrap();
-    assert_eq!(current.object_id, LEGACY_OBJECT_ID);
+    assert!(!current.object_id.is_empty());
     let migrated_index = store
-        .load_version_index_by_object_id(LEGACY_OBJECT_ID)
+        .load_version_index_by_object_id(&current.object_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(migrated_index.object_id, LEGACY_OBJECT_ID);
+    assert_eq!(migrated_index.object_id, current.object_id);
     assert!(
         migrated_index
             .versions
             .values()
-            .all(|version| version.object_id == LEGACY_OBJECT_ID)
+            .all(|version| version.object_id == current.object_id)
     );
     drop(store);
 
@@ -1039,7 +1038,7 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
         let index_json: Vec<u8> = database
             .query_row(
                 "SELECT index_json FROM version_indexes WHERE object_id = ?1",
-                [LEGACY_OBJECT_ID],
+                [&current.object_id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1047,11 +1046,16 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
 
         assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
         assert_eq!(backfill_status, "complete");
-        assert_eq!(current_object_id, LEGACY_OBJECT_ID);
-        assert_eq!(persisted["object_id"], LEGACY_OBJECT_ID);
+        assert_eq!(current_object_id, current.object_id);
+        assert_eq!(persisted["object_id"], current.object_id);
         assert_eq!(
-            persisted["versions"]["legacy-version"]["object_id"],
-            LEGACY_OBJECT_ID
+            persisted["versions"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()["object_id"],
+            current.object_id
         );
     }
 
@@ -1065,10 +1069,80 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
             .unwrap()
             .unwrap()
             .object_id,
-        LEGACY_OBJECT_ID
+        current.object_id
     );
 
     drop(reopened);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn sqlite_migration_splits_duplicate_legacy_current_object_ids() {
+    let root = test_store_dir("duplicate-legacy-object-id-migration");
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).await.unwrap();
+    let database_path = state_dir.join("metadata.sqlite");
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(
+                r#"
+                CREATE TABLE metadata_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO metadata_meta(key, value) VALUES('schema_version', '1');
+
+                CREATE TABLE current_objects (
+                    key TEXT PRIMARY KEY,
+                    manifest_hash TEXT NOT NULL,
+                    object_id TEXT NOT NULL
+                );
+
+                CREATE TABLE version_indexes (
+                    object_id TEXT PRIMARY KEY,
+                    index_json BLOB NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO current_objects(key, manifest_hash, object_id) VALUES(?1, ?2, ?3)",
+                rusqlite::params!["legacy/a.txt", "manifest-a", "duplicate-object-id"],
+            )
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO current_objects(key, manifest_hash, object_id) VALUES(?1, ?2, ?3)",
+                rusqlite::params!["legacy/b.txt", "manifest-b", "duplicate-object-id"],
+            )
+            .unwrap();
+    }
+
+    let store = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let a = store.list_versions("legacy/a.txt").await.unwrap().unwrap();
+    let b = store.list_versions("legacy/b.txt").await.unwrap().unwrap();
+    assert_eq!(a.object_id, "duplicate-object-id");
+    assert_ne!(a.object_id, b.object_id);
+    assert_eq!(
+        store
+            .current_path_for_object_id(&a.object_id)
+            .await
+            .unwrap(),
+        Some("legacy/a.txt".to_string())
+    );
+    assert_eq!(
+        store
+            .current_path_for_object_id(&b.object_id)
+            .await
+            .unwrap(),
+        Some("legacy/b.txt".to_string())
+    );
+
+    drop(store);
     let _ = fs::remove_dir_all(root).await;
 }
 
@@ -2067,6 +2141,41 @@ async fn restore_tombstone_index_from_archive_recreates_deleted_index_impl(
     store.compact_tombstone_indexes(0, false).await.unwrap();
     assert!(!store.has_version_index(&object_id).await.unwrap());
 
+    // Archives written by older servers did not include identity fields inside
+    // their embedded version index. Restore must normalize those payloads before
+    // applying the modern persistence invariant.
+    let archive_path = PathBuf::from(
+        store
+            .list_tombstone_archives()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .path,
+    );
+    let mut archived: serde_json::Value =
+        serde_json::from_slice(&fs::read(&archive_path).await.unwrap()).unwrap();
+    let index = archived
+        .get_mut("index")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    index.remove("object_id");
+    for version in index
+        .get_mut("versions")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap()
+        .values_mut()
+    {
+        version.as_object_mut().unwrap().remove("object_id");
+    }
+    fs::write(
+        &archive_path,
+        format!("{}\n", serde_json::to_string(&archived).unwrap()),
+    )
+    .await
+    .unwrap();
+
     let dry_run = store
         .restore_tombstone_index_from_archive(&object_id, None, false, true)
         .await
@@ -2083,6 +2192,18 @@ async fn restore_tombstone_index_from_archive_recreates_deleted_index_impl(
     assert!(restored.found);
     assert!(restored.restored);
     assert!(store.has_version_index(&object_id).await.unwrap());
+    let restored_index = store
+        .load_version_index_by_object_id(&object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_index.object_id, object_id);
+    assert!(
+        restored_index
+            .versions
+            .values()
+            .all(|version| version.object_id == object_id)
+    );
 
     let skipped = store
         .restore_tombstone_index_from_archive(&object_id, None, false, false)

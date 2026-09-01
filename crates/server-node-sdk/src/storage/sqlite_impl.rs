@@ -894,6 +894,7 @@ fn query_gallery_index_in_transaction(
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
+             gallery_objects.object_id,
              gallery_objects.manifest_hash,
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
@@ -920,17 +921,19 @@ fn query_gallery_index_in_transaction(
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<Vec<u8>>>(5)?,
-            row.get::<_, String>(6)?,
+            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, String>(7)?,
         ))
     })?;
     let mut entries = Vec::new();
     for row in rows {
         let (
             key,
+            object_id,
             manifest_hash,
             size_bytes,
             content_fingerprint,
@@ -940,6 +943,7 @@ fn query_gallery_index_in_transaction(
         ) = row?;
         entries.push(materialize_gallery_index_entry(
             key,
+            object_id,
             manifest_hash,
             size_bytes,
             content_fingerprint,
@@ -1161,6 +1165,7 @@ fn gallery_map_cluster_cells_from_db(
                  MIN(gallery_objects.longitude),
                  MAX(gallery_objects.longitude),
                  MIN(gallery_objects.key),
+                 MIN(gallery_objects.object_id),
                  MIN(gallery_objects.manifest_hash),
                  MIN(manifest_summaries.total_size_bytes),
                  MIN(manifest_summaries.content_fingerprint),
@@ -1205,6 +1210,7 @@ fn gallery_map_cluster_cells_from_db(
                     row.get(13)?,
                     row.get(14)?,
                     row.get(15)?,
+                    row.get(16)?,
                 )?)
             } else {
                 None
@@ -1350,6 +1356,7 @@ fn query_gallery_map_cluster_entries_in_transaction(
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
+             gallery_objects.object_id,
              gallery_objects.manifest_hash,
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
@@ -1378,18 +1385,29 @@ fn query_gallery_map_cluster_entries_in_transaction(
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<Vec<u8>>>(5)?,
-            row.get::<_, String>(6)?,
+            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, String>(7)?,
         ))
     })?;
     let mut entries = Vec::new();
     for row in rows {
-        let (key, manifest_hash, size, fingerprint, metadata, version_index, labels_json) = row?;
+        let (
+            key,
+            object_id,
+            manifest_hash,
+            size,
+            fingerprint,
+            metadata,
+            version_index,
+            labels_json,
+        ) = row?;
         entries.push(materialize_gallery_index_entry(
             key,
+            object_id,
             manifest_hash,
             size,
             fingerprint,
@@ -1409,6 +1427,7 @@ fn query_gallery_map_cluster_entries_in_transaction(
 
 fn materialize_gallery_index_entry(
     key: String,
+    object_id: String,
     manifest_hash: String,
     size_bytes: Option<i64>,
     content_fingerprint: Option<String>,
@@ -1424,15 +1443,6 @@ fn materialize_gallery_index_entry(
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
-    let object_id = version_index_payload
-        .as_deref()
-        .map(|payload| {
-            serde_json::from_slice::<FileVersionIndex>(payload)
-                .context("invalid version index while resolving gallery object identity")
-        })
-        .transpose()?
-        .map(|index| index.object_id)
-        .unwrap_or_default();
     let labels = decode_gallery_labels(&labels_json)?;
     Ok(GalleryIndexEntry {
         key,
@@ -1462,6 +1472,7 @@ fn query_gallery_entry_from_db(
             &format!(
                 "SELECT
                  gallery_objects.key,
+                 gallery_objects.object_id,
                  gallery_objects.manifest_hash,
                  manifest_summaries.total_size_bytes,
                  manifest_summaries.content_fingerprint,
@@ -1486,25 +1497,47 @@ fn query_gallery_entry_from_db(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<Vec<u8>>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<f64>>(8)?,
-                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             },
         )
         .optional()?;
-    row.filter(|(key, _, _, _, _, _, media_type, latitude, longitude, _)| {
-        gallery_entry_matches_delta_scope(key, media_type.as_deref(), *latitude, *longitude, scope)
-    })
+    row.filter(
+        |(key, _, _, _, _, _, _, media_type, latitude, longitude, _)| {
+            gallery_entry_matches_delta_scope(
+                key,
+                media_type.as_deref(),
+                *latitude,
+                *longitude,
+                scope,
+            )
+        },
+    )
     .map(
-        |(key, manifest_hash, size, fingerprint, metadata, versions, _, _, _, labels_json)| {
+        |(
+            key,
+            object_id,
+            manifest_hash,
+            size,
+            fingerprint,
+            metadata,
+            versions,
+            _,
+            _,
+            _,
+            labels_json,
+        )| {
             materialize_gallery_index_entry(
                 key,
+                object_id,
                 manifest_hash,
                 size,
                 fingerprint,

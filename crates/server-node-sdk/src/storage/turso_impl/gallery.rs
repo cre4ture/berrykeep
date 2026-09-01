@@ -1253,6 +1253,7 @@ async fn query_gallery_index(
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
+             gallery_objects.object_id,
              gallery_objects.manifest_hash,
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
@@ -1285,12 +1286,13 @@ async fn query_gallery_index(
     while let Some(row) = rows.next().await? {
         entries.push(materialize_gallery_index_entry(
             row_string(&row, 0, "gallery_objects.key")?,
-            row_string(&row, 1, "gallery_objects.manifest_hash")?,
-            row_opt_i64(&row, 2, "manifest_summaries.total_size_bytes")?,
-            row_opt_string(&row, 3, "manifest_summaries.content_fingerprint")?,
-            row_opt_blob(&row, 4, "media_cache.metadata_json")?,
-            row_opt_blob(&row, 5, "version_indexes.index_json")?,
-            row_string(&row, 6, "gallery_objects.labels_json")?,
+            row_string(&row, 1, "gallery_objects.object_id")?,
+            row_string(&row, 2, "gallery_objects.manifest_hash")?,
+            row_opt_i64(&row, 3, "manifest_summaries.total_size_bytes")?,
+            row_opt_string(&row, 4, "manifest_summaries.content_fingerprint")?,
+            row_opt_blob(&row, 5, "media_cache.metadata_json")?,
+            row_opt_blob(&row, 6, "version_indexes.index_json")?,
+            row_string(&row, 7, "gallery_objects.labels_json")?,
         )?);
     }
     Ok(GalleryIndexPage {
@@ -1499,6 +1501,7 @@ async fn gallery_map_cluster_cells_query(
                  MIN(gallery_objects.longitude),
                  MAX(gallery_objects.longitude),
                  MIN(gallery_objects.key),
+                 MIN(gallery_objects.object_id),
                  MIN(gallery_objects.manifest_hash),
                  MIN(manifest_summaries.total_size_bytes),
                  MIN(manifest_summaries.content_fingerprint),
@@ -1536,12 +1539,13 @@ async fn gallery_map_cluster_cells_query(
             let entry = if cluster_count == 1 {
                 Some(materialize_gallery_index_entry(
                     row_string(&row, 9, "gallery_objects.key")?,
-                    row_string(&row, 10, "gallery_objects.manifest_hash")?,
-                    row_opt_i64(&row, 11, "manifest_summaries.total_size_bytes")?,
-                    row_opt_string(&row, 12, "manifest_summaries.content_fingerprint")?,
-                    row_opt_blob(&row, 13, "media_cache.metadata_json")?,
-                    row_opt_blob(&row, 14, "version_indexes.index_json")?,
-                    row_string(&row, 15, "gallery_objects.labels_json")?,
+                    row_string(&row, 10, "gallery_objects.object_id")?,
+                    row_string(&row, 11, "gallery_objects.manifest_hash")?,
+                    row_opt_i64(&row, 12, "manifest_summaries.total_size_bytes")?,
+                    row_opt_string(&row, 13, "manifest_summaries.content_fingerprint")?,
+                    row_opt_blob(&row, 14, "media_cache.metadata_json")?,
+                    row_opt_blob(&row, 15, "version_indexes.index_json")?,
+                    row_string(&row, 16, "gallery_objects.labels_json")?,
                 )?)
             } else {
                 None
@@ -1777,6 +1781,7 @@ async fn query_gallery_map_cluster_entries(
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
+             gallery_objects.object_id,
              gallery_objects.manifest_hash,
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
@@ -1805,12 +1810,13 @@ async fn query_gallery_map_cluster_entries(
     while let Some(row) = rows.next().await? {
         entries.push(materialize_gallery_index_entry(
             row_string(&row, 0, "gallery_objects.key")?,
-            row_string(&row, 1, "gallery_objects.manifest_hash")?,
-            row_opt_i64(&row, 2, "manifest_summaries.total_size_bytes")?,
-            row_opt_string(&row, 3, "manifest_summaries.content_fingerprint")?,
-            row_opt_blob(&row, 4, "media_cache.metadata_json")?,
-            row_opt_blob(&row, 5, "version_indexes.index_json")?,
-            row_string(&row, 6, "gallery_objects.labels_json")?,
+            row_string(&row, 1, "gallery_objects.object_id")?,
+            row_string(&row, 2, "gallery_objects.manifest_hash")?,
+            row_opt_i64(&row, 3, "manifest_summaries.total_size_bytes")?,
+            row_opt_string(&row, 4, "manifest_summaries.content_fingerprint")?,
+            row_opt_blob(&row, 5, "media_cache.metadata_json")?,
+            row_opt_blob(&row, 6, "version_indexes.index_json")?,
+            row_string(&row, 7, "gallery_objects.labels_json")?,
         )?);
     }
     Ok(GalleryIndexPage {
@@ -1956,6 +1962,7 @@ async fn query_gallery_entry(
             &format!(
                 "SELECT
                  gallery_objects.key,
+                 gallery_objects.object_id,
                  gallery_objects.manifest_hash,
                  manifest_summaries.total_size_bytes,
                  manifest_summaries.content_fingerprint,
@@ -1982,20 +1989,21 @@ async fn query_gallery_entry(
         return Ok(None);
     };
     let key = row_string(&row, 0, "gallery_objects.key")?;
-    let media_type = row_opt_string(&row, 6, "gallery_objects.media_type")?;
-    let latitude = row_opt_f64(&row, 7, "gallery_objects.latitude")?;
-    let longitude = row_opt_f64(&row, 8, "gallery_objects.longitude")?;
+    let media_type = row_opt_string(&row, 7, "gallery_objects.media_type")?;
+    let latitude = row_opt_f64(&row, 8, "gallery_objects.latitude")?;
+    let longitude = row_opt_f64(&row, 9, "gallery_objects.longitude")?;
     if !gallery_entry_matches_delta_scope(&key, media_type.as_deref(), latitude, longitude, scope) {
         return Ok(None);
     }
     Ok(Some(materialize_gallery_index_entry(
         key,
-        row_string(&row, 1, "gallery_objects.manifest_hash")?,
-        row_opt_i64(&row, 2, "manifest_summaries.total_size_bytes")?,
-        row_opt_string(&row, 3, "manifest_summaries.content_fingerprint")?,
-        row_opt_blob(&row, 4, "media_cache.metadata_json")?,
-        row_opt_blob(&row, 5, "version_indexes.index_json")?,
-        row_string(&row, 9, "gallery_objects.labels_json")?,
+        row_string(&row, 1, "gallery_objects.object_id")?,
+        row_string(&row, 2, "gallery_objects.manifest_hash")?,
+        row_opt_i64(&row, 3, "manifest_summaries.total_size_bytes")?,
+        row_opt_string(&row, 4, "manifest_summaries.content_fingerprint")?,
+        row_opt_blob(&row, 5, "media_cache.metadata_json")?,
+        row_opt_blob(&row, 6, "version_indexes.index_json")?,
+        row_string(&row, 10, "gallery_objects.labels_json")?,
     )?))
 }
 
@@ -2031,6 +2039,7 @@ fn gallery_scope_values(
 
 fn materialize_gallery_index_entry(
     key: String,
+    object_id: String,
     manifest_hash: String,
     size_bytes: Option<i64>,
     content_fingerprint: Option<String>,
@@ -2046,15 +2055,6 @@ fn materialize_gallery_index_entry(
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
-    let object_id = version_index_payload
-        .as_deref()
-        .map(|payload| {
-            serde_json::from_slice::<FileVersionIndex>(payload)
-                .context("invalid version index while resolving gallery object identity")
-        })
-        .transpose()?
-        .map(|index| index.object_id)
-        .unwrap_or_default();
     let labels = decode_gallery_labels(&labels_json)?;
     Ok(GalleryIndexEntry {
         key,

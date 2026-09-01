@@ -15825,6 +15825,9 @@ async fn delete_object_response(
     if query.version_id.is_some() && !query.internal_replication {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if query.object_id.is_some() && key.ends_with('/') && !query.recursive {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     let version_state = match query.state.as_deref() {
         None | Some("confirmed") => VersionConsistencyState::Confirmed,
@@ -15964,11 +15967,13 @@ async fn delete_object_response(
                 .iter()
                 .find(|(deleted_path, _, _)| deleted_path == &key)
                 .or_else(|| deleted_paths.first())
-                .map(|(_, object_id, version_id)| ObjectMutationResponse {
-                    object_id: object_id.clone(),
-                    path: key,
-                    revision: version_id.clone(),
-                });
+                .map(
+                    |(deleted_path, object_id, version_id)| ObjectMutationResponse {
+                        object_id: object_id.clone(),
+                        path: deleted_path.clone(),
+                        revision: version_id.clone(),
+                    },
+                );
             match response {
                 Some(response) => (StatusCode::CREATED, Json(response)).into_response(),
                 None => StatusCode::CREATED.into_response(),
