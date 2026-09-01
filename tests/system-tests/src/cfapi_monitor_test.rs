@@ -1712,6 +1712,7 @@ mod tests {
         key: &str,
         payload: &'static [u8],
         offline_local_payload: Option<&'static [u8]>,
+        intermediate_remote_payload: Option<&'static [u8]>,
     ) -> anyhow::Result<()> {
         let sync_root = fresh_data_dir("cfapi-remote-delete-restart-sync-root");
         std::fs::create_dir_all(&sync_root).context("failed to create sync root")?;
@@ -1757,6 +1758,26 @@ mod tests {
             .with_context(|| format!("failed to delete remote file {key} while adapter offline"))?;
         wait_for_remote_file_absence(&fixture.sdk, key, 220).await;
         wait_for_remote_store_index_file_absence(&fixture.sdk, key, 220).await;
+        if let Some(intermediate_remote_payload) = intermediate_remote_payload {
+            assert_ne!(
+                payload, intermediate_remote_payload,
+                "the intermediate remote re-upload must differ from the client's remembered v1"
+            );
+            fixture
+                .sdk
+                .put_large_aware(key, Bytes::from_static(intermediate_remote_payload))
+                .await
+                .with_context(|| {
+                    format!("failed to re-upload different remote content for {key} while adapter offline")
+                })?;
+            wait_for_remote_payload(&fixture.sdk, key, intermediate_remote_payload, 220).await;
+            fixture.sdk.delete_path(key).await.with_context(|| {
+                format!("failed to delete re-uploaded remote file {key} while adapter offline")
+            })?;
+            wait_for_remote_file_absence(&fixture.sdk, key, 220).await;
+            wait_for_remote_store_index_file_absence(&fixture.sdk, key, 220).await;
+        }
+        wait_for_hydrated_payload(&local_file, payload, 20).await;
         if let Some(offline_local_payload) = offline_local_payload {
             let mut file =
                 File::create(&local_file).context("failed to reopen local file while offline")?;
@@ -2155,6 +2176,7 @@ mod tests {
             "offline-delete/check.txt",
             b"remote delete restart payload",
             None,
+            None,
         )
         .await
         .expect("remote delete while offline should not resurrect clean file on restart");
@@ -2167,9 +2189,23 @@ mod tests {
             "offline-delete/local-change.txt",
             b"remote delete restart payload",
             Some(b"offline local-only payload"),
+            None,
         )
         .await
         .expect("remote delete while offline should preserve local-only file changes on restart");
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_remote_delete_reupload_delete_while_offline_removes_clean_v1_on_restart() {
+        run_cfapi_remote_delete_restart_case(
+            "127.0.0.1:19157",
+            "offline-delete/reuploaded-then-deleted.txt",
+            b"remote v1 remembered by the offline client",
+            None,
+            Some(b"different remote v2 that is also deleted before reconnect"),
+        )
+        .await
+        .expect("a clean offline v1 should be removed when the same remote path is deleted, re-uploaded with different bytes, and deleted again before restart");
     }
 
     #[tokio::test]
