@@ -14158,6 +14158,73 @@ run_on_main_metadata_backends!(
     copy_object_path_honors_object_id_and_expected_revision_turso
 );
 
+async fn object_id_rename_replays_same_operation_id_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-rename-idempotency-create").await;
+        store
+            .put_object_versioned(
+                "object-id-rename-idempotency-source.txt",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-object-id-rename"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-object-id-rename"),
+    );
+    let request = super::ObjectRenameRequest {
+        to_path: "object-id-rename-idempotency-target.txt".to_string(),
+        overwrite: false,
+        expected_revision: Some(created.version_id),
+    };
+
+    let first = super::rename_object_by_id(
+        State(state.clone()),
+        headers.clone(),
+        Path(created.object_id.clone()),
+        Json(request.clone()),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+    let replay = super::rename_object_by_id(
+        State(state.clone()),
+        headers,
+        Path(created.object_id.clone()),
+        Json(request),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::NO_CONTENT);
+
+    let current_path = {
+        let store = lock_store(&state, "tests.object-id-rename-idempotency-verify").await;
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        current_path.as_deref(),
+        Some("object-id-rename-idempotency-target.txt")
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_rename_replays_same_operation_id_impl,
+    object_id_rename_replays_same_operation_id,
+    object_id_rename_replays_same_operation_id_turso
+);
+
 async fn object_id_api_serializes_and_mutates_by_identity_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let original_path = "object-id-api.txt".to_string();

@@ -1310,6 +1310,8 @@ pub(super) struct FileVersionIndex {
     pub(super) versions: HashMap<String, FileVersionRecord>,
     pub(super) head_version_ids: Vec<String>,
     preferred_head_version_id: Option<String>,
+    #[serde(skip)]
+    identity_was_normalized: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3620,9 +3622,9 @@ impl PersistentStore {
 
     /// Backfills the live namespace written before object identity became mandatory.
     ///
-    /// Startup work is deliberately bounded: existing current bindings are trusted without
-    /// rewriting their version indexes, while legacy version indexes are read in small pages
-    /// only when a binding has no object ID.
+    /// Startup work is deliberately bounded: existing current bindings need only a read-only
+    /// version-index existence check, while legacy version indexes are read in small pages only
+    /// when a binding has no object ID.
     /// Historical snapshots are normalized when they are read or rewritten instead of
     /// making startup walk every retained snapshot.
     async fn migrate_legacy_object_ids(&self) -> Result<()> {
@@ -3690,7 +3692,16 @@ impl PersistentStore {
                         needs_version_backfill: true,
                     });
 
-            if assignment.needs_version_backfill {
+            let existing_index = if assignment.needs_version_backfill {
+                None
+            } else {
+                self.load_version_index_by_object_id(&assignment.object_id)
+                    .await?
+            };
+            let needs_version_backfill = assignment.needs_version_backfill
+                || existing_index.is_none()
+                || existing_index.is_some_and(|index| index.identity_was_normalized);
+            if needs_version_backfill {
                 self.ensure_migrated_object_version(
                     &assignment.object_id,
                     path,
@@ -5275,8 +5286,12 @@ impl PersistentStore {
         let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
             return Ok(None);
         };
-        let Some(key) = self.resolve_key_for_version_index(&index).await? else {
-            return Ok(None);
+        let key = match self.current_path_for_object_id(object_id).await? {
+            Some(path) => path,
+            None => match self.resolve_key_for_version_index(&index).await? {
+                Some(path) => path,
+                None => return Ok(None),
+            },
         };
         self.version_graph_summary_for_object_id(&key, object_id)
             .await
@@ -10119,6 +10134,7 @@ fn empty_version_index(object_id: &str) -> FileVersionIndex {
         versions: HashMap::new(),
         head_version_ids: Vec::new(),
         preferred_head_version_id: None,
+        identity_was_normalized: false,
     }
 }
 
@@ -10129,7 +10145,8 @@ fn decode_version_index(
 ) -> Result<FileVersionIndex> {
     let mut index = serde_json::from_slice::<FileVersionIndex>(payload)
         .with_context(|| format!("invalid version index in {backend}"))?;
-    normalize_version_index_identity(persisted_object_id, &mut index, backend)?;
+    index.identity_was_normalized =
+        normalize_version_index_identity(persisted_object_id, &mut index, backend)?;
     Ok(index)
 }
 
@@ -10137,9 +10154,11 @@ fn normalize_version_index_identity(
     persisted_object_id: &str,
     index: &mut FileVersionIndex,
     source: &str,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut normalized = false;
     if index.object_id.trim().is_empty() {
         index.object_id = persisted_object_id.to_string();
+        normalized = true;
     } else if index.object_id != persisted_object_id {
         bail!(
             "version index identity mismatch in {source}: row={persisted_object_id} payload={}",
@@ -10149,6 +10168,7 @@ fn normalize_version_index_identity(
     for record in index.versions.values_mut() {
         if record.object_id.trim().is_empty() {
             record.object_id = index.object_id.clone();
+            normalized = true;
         } else if record.object_id != index.object_id {
             bail!(
                 "version record identity mismatch in {source}: index={} version={} record={}",
@@ -10158,7 +10178,7 @@ fn normalize_version_index_identity(
             );
         }
     }
-    Ok(())
+    Ok(normalized)
 }
 
 fn validate_version_index_identity(object_id: &str, index: &FileVersionIndex) -> Result<()> {

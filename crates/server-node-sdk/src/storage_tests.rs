@@ -1333,6 +1333,15 @@ async fn sqlite_migration_recovers_legacy_identity_from_manifest_when_path_is_st
     assert_eq!(migrated.object_id, object_id);
     assert_eq!(migrated.versions.len(), version_count);
     assert_eq!(migrated.preferred_head_version_id, Some(version_id));
+    assert_eq!(
+        reopened
+            .list_versions_by_object_id(&object_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .key,
+        path
+    );
 
     drop(reopened);
     let _ = fs::remove_dir_all(root).await;

@@ -13920,6 +13920,14 @@ struct ObjectRenameRequest {
     expected_revision: Option<String>,
 }
 
+#[derive(Serialize)]
+struct ObjectIdRenameOperationFingerprint<'a> {
+    object_id: &'a str,
+    to_path: &'a str,
+    overwrite: bool,
+    expected_revision: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ObjectLookupResponse {
     object_id: String,
@@ -14259,12 +14267,21 @@ async fn rename_object_path(
     Json(request): Json<PathMutationRequest>,
 ) -> Response {
     let fingerprint = client_mutation_operation_fingerprint("rename_object_path", &request);
-    let requester_id = request_device_id(&headers);
+    rename_object_path_with_fingerprint(&state, &headers, request, fingerprint).await
+}
+
+async fn rename_object_path_with_fingerprint(
+    state: &ServerState,
+    headers: &HeaderMap,
+    request: PathMutationRequest,
+    fingerprint: String,
+) -> Response {
+    let requester_id = request_device_id(headers);
     let state_for_request = state.clone();
     let headers_for_actor = headers.clone();
     run_client_mutation_with_idempotency(
-        &state,
-        &headers,
+        state,
+        headers,
         requester_id,
         fingerprint,
         move || async move {
@@ -14397,16 +14414,26 @@ async fn rename_object_by_id(
         Ok(path) => path,
         Err(status) => return status.into_response(),
     };
-    rename_object_path(
-        State(state),
-        headers,
-        Json(PathMutationRequest {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "rename_object_by_id",
+        &ObjectIdRenameOperationFingerprint {
+            object_id: &object_id,
+            to_path: &request.to_path,
+            overwrite: request.overwrite,
+            expected_revision: request.expected_revision.as_deref(),
+        },
+    );
+    rename_object_path_with_fingerprint(
+        &state,
+        &headers,
+        PathMutationRequest {
             from_path,
             to_path: request.to_path,
             overwrite: request.overwrite,
             expected_revision: request.expected_revision,
             object_id: Some(object_id),
-        }),
+        },
+        fingerprint,
     )
     .await
 }
