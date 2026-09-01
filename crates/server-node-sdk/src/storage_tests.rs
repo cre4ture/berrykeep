@@ -1005,6 +1005,12 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
         .unwrap()
         .unwrap();
     assert_eq!(migrated_index.object_id, LEGACY_OBJECT_ID);
+    assert_eq!(migrated_index.versions.len(), 1);
+    assert!(migrated_index.versions.contains_key("legacy-version"));
+    assert_eq!(
+        migrated_index.preferred_head_version_id.as_deref(),
+        Some("legacy-version")
+    );
     assert!(
         migrated_index
             .versions
@@ -1072,6 +1078,61 @@ async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
             .object_id,
         LEGACY_OBJECT_ID
     );
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn sqlite_migration_keeps_existing_head_without_logical_path() {
+    let root = test_store_dir("legacy-object-id-missing-logical-path");
+    let database_path = root.join("state/metadata.sqlite");
+    let path = "legacy/current.txt";
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    seeded
+        .put_object_versioned(path, Bytes::from_static(b"payload"), PutOptions::default())
+        .await
+        .unwrap();
+    let original = seeded.list_versions(path).await.unwrap().unwrap();
+    let object_id = original.object_id.clone();
+    let version_id = original.preferred_head_version_id.clone().unwrap();
+    drop(seeded);
+
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+        let index_json: Vec<u8> = database
+            .query_row(
+                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+                [&object_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut index: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
+        index["versions"][&version_id]["logical_path"] = serde_json::Value::Null;
+        database
+            .execute(
+                "UPDATE version_indexes SET index_json = ?1 WHERE object_id = ?2",
+                rusqlite::params![serde_json::to_vec(&index).unwrap(), object_id],
+            )
+            .unwrap();
+    }
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let migrated = reopened.list_versions(path).await.unwrap().unwrap();
+    assert_eq!(migrated.object_id, object_id);
+    assert_eq!(migrated.versions.len(), 1);
+    assert_eq!(migrated.head_version_ids, vec![version_id.clone()]);
+    assert_eq!(migrated.preferred_head_version_id, Some(version_id));
 
     drop(reopened);
     let _ = fs::remove_dir_all(root).await;
