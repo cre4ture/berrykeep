@@ -18,6 +18,12 @@ For the fixed home-network target set, use the `update-home-network-nodes` workf
 clean worktree. A normal rollout must include the Strato telemetry collector; never pass
 `--skip-rendezvous` unless the user has explicitly authorized a LAN-only rollout.
 
+Before starting its package build, confirm that the operator can access the local terminal that
+will receive the one shared sudo-password prompt. Do not start the rollout from a client that
+cannot expose that terminal (for example, a mobile client without terminal input). Never ask for
+the password in chat or place it in a command, environment variable, file, or log. In that case,
+stop before building and have the operator resume from an accessible Codex desktop or CLI terminal.
+
 The telemetry deployment is mandatory on every full home-network rollout:
 
 1. Run the fixed rollout with `--repo <clean-origin-main-worktree> --apply`. It deploys the
