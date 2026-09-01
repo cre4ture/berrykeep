@@ -1139,6 +1139,74 @@ async fn sqlite_migration_keeps_existing_head_without_logical_path() {
 }
 
 #[tokio::test]
+async fn sqlite_migration_does_not_rewrite_indexes_with_persisted_object_ids() {
+    let root = test_store_dir("object-id-migration-already-persisted");
+    let database_path = root.join("state/metadata.sqlite");
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    seeded
+        .put_object_versioned(
+            "already-migrated.txt",
+            Bytes::from_static(b"payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let object_id = seeded
+        .list_versions("already-migrated.txt")
+        .await
+        .unwrap()
+        .unwrap()
+        .object_id;
+    drop(seeded);
+
+    let persisted_index: Vec<u8> = {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        let index_json = database
+            .query_row(
+                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+                [&object_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+        index_json
+    };
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .list_versions("already-migrated.txt")
+            .await
+            .unwrap()
+            .unwrap()
+            .object_id,
+        object_id
+    );
+    drop(reopened);
+
+    let database = rusqlite::Connection::open(&database_path).unwrap();
+    let index_after: Vec<u8> = database
+        .query_row(
+            "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+            [&object_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_after, persisted_index);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
 async fn sqlite_migration_splits_duplicate_legacy_current_object_ids() {
     let root = test_store_dir("duplicate-legacy-object-id-migration");
     let state_dir = root.join("state");

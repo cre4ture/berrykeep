@@ -1028,6 +1028,12 @@ struct LegacyObjectIdCandidate {
     created_at_unix: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ObjectIdMigrationAssignment {
+    object_id: String,
+    needs_version_backfill: bool,
+}
+
 /// A persisted, current-state projection used to serve the paginated gallery without
 /// first materializing every object in the namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3614,8 +3620,9 @@ impl PersistentStore {
 
     /// Backfills the live namespace written before object identity became mandatory.
     ///
-    /// Startup work is deliberately bounded: only the live namespace is backfilled, and
-    /// legacy version indexes are read in small pages to preserve their existing lineage.
+    /// Startup work is deliberately bounded: existing current bindings are trusted without
+    /// rewriting their version indexes, while legacy version indexes are read in small pages
+    /// only when a binding has no object ID.
     /// Historical snapshots are normalized when they are read or rewritten instead of
     /// making startup walk every retained snapshot.
     async fn migrate_legacy_object_ids(&self) -> Result<()> {
@@ -3629,7 +3636,7 @@ impl PersistentStore {
         let legacy_candidates = self
             .legacy_object_id_candidates_for_current_state(&current_state)
             .await?;
-        let mut object_ids_by_path = HashMap::with_capacity(current_objects.len());
+        let mut assignments = HashMap::with_capacity(current_objects.len());
         let mut claimed_object_ids = HashSet::with_capacity(current_objects.len());
 
         for (path, _) in &current_objects {
@@ -3642,7 +3649,13 @@ impl PersistentStore {
             else {
                 continue;
             };
-            object_ids_by_path.insert((**path).clone(), object_id);
+            assignments.insert(
+                (**path).clone(),
+                ObjectIdMigrationAssignment {
+                    object_id,
+                    needs_version_backfill: false,
+                },
+            );
         }
 
         let mut candidates = legacy_candidates.into_iter().collect::<Vec<_>>();
@@ -3654,28 +3667,45 @@ impl PersistentStore {
                 .then_with(|| left_path.cmp(right_path))
         });
         for (path, candidate) in candidates {
-            if object_ids_by_path.contains_key(&path)
+            if assignments.contains_key(&path)
                 || !claimed_object_ids.insert(candidate.object_id.clone())
             {
                 continue;
             }
-            object_ids_by_path.insert(path, candidate.object_id);
+            assignments.insert(
+                path,
+                ObjectIdMigrationAssignment {
+                    object_id: candidate.object_id,
+                    needs_version_backfill: true,
+                },
+            );
         }
 
         for (path, manifest_hash) in current_objects {
-            let object_id = object_ids_by_path
-                .remove(path)
-                .unwrap_or_else(|| generate_unclaimed_object_id(&mut claimed_object_ids));
+            let assignment =
+                assignments
+                    .remove(path)
+                    .unwrap_or_else(|| ObjectIdMigrationAssignment {
+                        object_id: generate_unclaimed_object_id(&mut claimed_object_ids),
+                        needs_version_backfill: true,
+                    });
 
-            self.ensure_migrated_object_version(&object_id, path, manifest_hash, unix_ts())
+            if assignment.needs_version_backfill {
+                self.ensure_migrated_object_version(
+                    &assignment.object_id,
+                    path,
+                    manifest_hash,
+                    unix_ts(),
+                )
                 .await?;
+            }
 
-            if current_state.object_ids.get(path) != Some(&object_id) {
+            if current_state.object_ids.get(path) != Some(&assignment.object_id) {
                 self.upsert_current_object(
                     path,
                     CurrentObjectEntry {
                         manifest_hash: manifest_hash.clone(),
-                        object_id,
+                        object_id: assignment.object_id,
                     },
                 )
                 .await?;

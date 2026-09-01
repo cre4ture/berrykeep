@@ -14046,6 +14046,118 @@ run_on_main_metadata_backends!(
     expected_revision_compare_and_swap_rejects_stale_put_and_delete_turso
 );
 
+async fn copy_object_path_honors_object_id_and_expected_revision_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let source_path = "copy-object-id-source.txt".to_string();
+    let target_path = "copy-object-id-target.txt".to_string();
+    let original = {
+        let mut store = lock_store(&state, "tests.copy-object-id-original").await;
+        store
+            .put_object_versioned(
+                &source_path,
+                Bytes::from_static(b"original"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    let deleted = super::delete_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(source_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(original.version_id.clone()),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(deleted.status(), StatusCode::CREATED);
+
+    let replacement = {
+        let mut store = lock_store(&state, "tests.copy-object-id-replacement").await;
+        store
+            .put_object_versioned(
+                &source_path,
+                Bytes::from_static(b"replacement"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    let wrong_identity = super::copy_object_path(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::PathMutationRequest {
+            from_path: source_path.clone(),
+            to_path: target_path.clone(),
+            overwrite: false,
+            expected_revision: None,
+            object_id: Some(original.object_id),
+        }),
+    )
+    .await;
+    assert_eq!(wrong_identity.status(), StatusCode::CONFLICT);
+
+    let stale_revision = super::copy_object_path(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::PathMutationRequest {
+            from_path: source_path.clone(),
+            to_path: target_path.clone(),
+            overwrite: false,
+            expected_revision: Some(original.version_id),
+            object_id: Some(replacement.object_id.clone()),
+        }),
+    )
+    .await;
+    assert_eq!(stale_revision.status(), StatusCode::CONFLICT);
+
+    let accepted = super::copy_object_path(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::PathMutationRequest {
+            from_path: source_path,
+            to_path: target_path.clone(),
+            overwrite: false,
+            expected_revision: Some(replacement.version_id),
+            object_id: Some(replacement.object_id),
+        }),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+    {
+        let store = lock_store(&state, "tests.copy-object-id-target").await;
+        assert_eq!(
+            store
+                .get_object(
+                    &target_path,
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .unwrap(),
+            Bytes::from_static(b"replacement")
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    copy_object_path_honors_object_id_and_expected_revision_impl,
+    copy_object_path_honors_object_id_and_expected_revision,
+    copy_object_path_honors_object_id_and_expected_revision_turso
+);
+
 async fn object_id_api_serializes_and_mutates_by_identity_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let original_path = "object-id-api.txt".to_string();

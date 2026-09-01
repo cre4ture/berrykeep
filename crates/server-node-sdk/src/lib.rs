@@ -14439,6 +14439,61 @@ async fn rename_object_path_admin(
     rename_object_path_response(&state, request, Some(actor)).await
 }
 
+async fn validate_path_mutation_preconditions(
+    store: &mut TracedRwLockWriteGuard<'_, PersistentStore>,
+    request: &PathMutationRequest,
+    operation: &'static str,
+) -> std::result::Result<(), StatusCode> {
+    if let Some(object_id) = request.object_id.as_deref() {
+        match store.current_path_for_object_id(object_id).await {
+            Ok(Some(path)) if path == request.from_path => {}
+            Ok(Some(_)) => return Err(StatusCode::CONFLICT),
+            Ok(None) => match store.list_versions_by_object_id(object_id).await {
+                Ok(Some(_)) => return Err(StatusCode::CONFLICT),
+                Ok(None) => return Err(StatusCode::NOT_FOUND),
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        object_id,
+                        operation,
+                        "failed resolving historical object identity before path mutation"
+                    );
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            },
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    object_id,
+                    operation,
+                    "failed resolving object identity before path mutation"
+                );
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
+    if let Some(expected_revision) = request.expected_revision.as_deref() {
+        let current_revision = match store.list_versions(&request.from_path).await {
+            Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    path = %request.from_path,
+                    operation,
+                    "failed resolving preferred revision before path mutation"
+                );
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        if current_revision.as_deref() != Some(expected_revision) {
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+
+    Ok(())
+}
+
 async fn rename_object_path_response(
     state: &ServerState,
     request: PathMutationRequest,
@@ -14458,32 +14513,9 @@ async fn rename_object_path_response(
     let mut store = lock_store(state, "store_path.rename").await;
     let store_lock_wait_ms = store.waited_ms();
     let store_started = Instant::now();
-    if let Some(object_id) = request.object_id.as_deref() {
-        match store.current_path_for_object_id(object_id).await {
-            Ok(Some(path)) if path == request.from_path => {}
-            Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(err) => {
-                tracing::error!(error = %err, object_id, "failed resolving object identity before rename");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        }
-    }
-    if let Some(expected_revision) = request.expected_revision.as_deref() {
-        let current_revision = match store.list_versions(&request.from_path).await {
-            Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    path = %request.from_path,
-                    "failed resolving preferred revision before rename"
-                );
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        if current_revision.as_deref() != Some(expected_revision) {
-            return StatusCode::CONFLICT.into_response();
-        }
+    if let Err(status) = validate_path_mutation_preconditions(&mut store, &request, "rename").await
+    {
+        return status.into_response();
     }
     match store
         .rename_object_path(&request.from_path, &request.to_path, request.overwrite)
@@ -14598,6 +14630,9 @@ async fn copy_object_path_response(
     }
 
     let mut store = lock_store(state, "store_path.copy").await;
+    if let Err(status) = validate_path_mutation_preconditions(&mut store, &request, "copy").await {
+        return status.into_response();
+    }
     match store
         .copy_object_path(&request.from_path, &request.to_path, request.overwrite)
         .await
