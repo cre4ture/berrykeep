@@ -6760,7 +6760,8 @@ impl PersistentStore {
                 index.preferred_head_version_id = choose_preferred_head(&index);
                 self.persist_version_index_by_object_id(&object_id, &index)
                     .await?;
-                self.sync_current_state_for_key_from_index(key, &index)
+                let mut changed_paths = self
+                    .sync_current_state_for_key_from_index(key, &index)
                     .await?;
                 if bundle.selected_is_preferred_head
                     && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH
@@ -6768,14 +6769,14 @@ impl PersistentStore {
                     self.apply_selected_replica_tombstone_current_state(key, bundle)
                         .await?;
                 } else if bundle.selected_is_preferred_head {
-                    self.promote_current_state_for_key_from_index(key, &index)
-                        .await?;
+                    changed_paths.extend(
+                        self.promote_current_state_for_key_from_index(key, &index)
+                            .await?,
+                    );
                 }
-                let changed_paths = if self.current_state_binding(key).await? != before_binding {
-                    touched_paths.clone()
-                } else {
-                    BTreeSet::new()
-                };
+                if self.current_state_binding(key).await? != before_binding {
+                    changed_paths.extend(touched_paths.clone());
+                }
                 self.persist_current_state_with_snapshot_batch(
                     changed_paths,
                     true,
@@ -6785,21 +6786,22 @@ impl PersistentStore {
                 return Ok(resolved_version_id);
             }
 
-            self.sync_current_state_for_key_from_index(key, &index)
+            let mut changed_paths = self
+                .sync_current_state_for_key_from_index(key, &index)
                 .await?;
             if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH
             {
                 self.apply_selected_replica_tombstone_current_state(key, bundle)
                     .await?;
             } else if bundle.selected_is_preferred_head {
-                self.promote_current_state_for_key_from_index(key, &index)
-                    .await?;
+                changed_paths.extend(
+                    self.promote_current_state_for_key_from_index(key, &index)
+                        .await?,
+                );
             }
-            let changed_paths = if self.current_state_binding(key).await? != before_binding {
-                touched_paths.clone()
-            } else {
-                BTreeSet::new()
-            };
+            if self.current_state_binding(key).await? != before_binding {
+                changed_paths.extend(touched_paths.clone());
+            }
             self.persist_current_state_with_snapshot_batch(changed_paths, true, created_at_unix)
                 .await?;
             return Ok(resolved_version_id);
@@ -6811,20 +6813,21 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
         if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
             self.apply_selected_replica_tombstone_current_state(key, bundle)
                 .await?;
         } else if bundle.selected_is_preferred_head {
-            self.promote_current_state_for_key_from_index(key, &index)
-                .await?;
+            changed_paths.extend(
+                self.promote_current_state_for_key_from_index(key, &index)
+                    .await?,
+            );
         }
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(changed_paths, true, created_at_unix)
             .await?;
 
@@ -9148,13 +9151,10 @@ impl PersistentStore {
         key: &str,
         index: &FileVersionIndex,
     ) -> Result<BTreeSet<String>> {
-        let current_object_id = self.object_id_for_key(key).await?;
         let Some(preferred_head) = &index.preferred_head_version_id else {
-            if current_object_id.as_deref() == Some(index.object_id.as_str()) {
-                self.remove_current_object(key).await?;
-                return Ok(BTreeSet::from([key.to_string()]));
-            }
-            return Ok(BTreeSet::new());
+            return self
+                .remove_current_state_bindings_for_object_id(&index.object_id)
+                .await;
         };
 
         let preferred_record = index.versions.get(preferred_head).with_context(|| {
@@ -9162,13 +9162,12 @@ impl PersistentStore {
         })?;
 
         if preferred_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            if current_object_id.as_deref() == Some(index.object_id.as_str()) {
-                self.remove_current_object(key).await?;
-                return Ok(BTreeSet::from([key.to_string()]));
-            }
-            return Ok(BTreeSet::new());
+            return self
+                .remove_current_state_bindings_for_object_id(&index.object_id)
+                .await;
         }
 
+        let current_object_id = self.object_id_for_key(key).await?;
         if current_object_id.is_none()
             || current_object_id.as_deref() == Some(index.object_id.as_str())
         {
@@ -9185,13 +9184,17 @@ impl PersistentStore {
         index: &FileVersionIndex,
     ) -> Result<BTreeSet<String>> {
         let Some(preferred_head) = &index.preferred_head_version_id else {
-            return Ok(BTreeSet::new());
+            return self
+                .remove_current_state_bindings_for_object_id(&index.object_id)
+                .await;
         };
         let preferred_record = index.versions.get(preferred_head).with_context(|| {
             format!("preferred head {preferred_head} missing in index for key={key}")
         })?;
         if preferred_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(BTreeSet::new());
+            return self
+                .remove_current_state_bindings_for_object_id(&index.object_id)
+                .await;
         }
 
         self.bind_current_state_to_preferred_index_record(key, index, preferred_record)
@@ -9238,6 +9241,25 @@ impl PersistentStore {
         if self.current_object_entry(key).await? != Some(expected_entry.clone()) {
             self.upsert_current_object(key, expected_entry).await?;
             changed_paths.insert(key.to_string());
+        }
+        Ok(changed_paths)
+    }
+
+    async fn remove_current_state_bindings_for_object_id(
+        &self,
+        object_id: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut bound_paths = self
+            .metadata_store
+            .list_keys_for_object_id(object_id)
+            .await?;
+        bound_paths.sort();
+        bound_paths.dedup();
+
+        let mut changed_paths = BTreeSet::new();
+        for bound_path in bound_paths {
+            self.remove_current_object(&bound_path).await?;
+            changed_paths.insert(bound_path);
         }
         Ok(changed_paths)
     }

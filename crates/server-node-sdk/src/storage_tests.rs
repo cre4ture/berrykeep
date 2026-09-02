@@ -1024,6 +1024,87 @@ run_on_all_metadata_backends!(
     object_id_current_binding_recovers_stale_replication_paths_turso
 );
 
+async fn object_id_tombstone_cleans_all_stale_current_bindings_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("object-id-tombstone-stale-current-bindings")
+        .await;
+    let preferred_path = "replication/preferred.txt";
+    let stale_path = "replication/stale.txt";
+
+    let created = store
+        .put_object_versioned(
+            preferred_path,
+            Bytes::from_static(b"replicated object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let entry = store
+        .current_object_entry(preferred_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let deleted = store
+        .tombstone_object_with_identity(preferred_path, PutOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted.object_id, created.object_id);
+
+    // Simulate stale replica rows that survived the tombstone arriving on a
+    // different node. The tombstone must unbind every current projection of
+    // its identity, not only its preferred logical path.
+    store
+        .upsert_current_object(preferred_path, entry.clone())
+        .await
+        .unwrap();
+    store
+        .upsert_current_object(stale_path, entry)
+        .await
+        .unwrap();
+    let index = store
+        .load_version_index_by_object_id(&created.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let changed_paths = store
+        .sync_current_state_for_key_from_index(preferred_path, &index)
+        .await
+        .unwrap();
+    assert!(changed_paths.contains(preferred_path));
+    assert!(changed_paths.contains(stale_path));
+    assert_eq!(changed_paths.len(), 2);
+    assert!(
+        store
+            .current_object_entry(preferred_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .current_object_entry(stale_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    object_id_tombstone_cleans_all_stale_current_bindings_impl,
+    object_id_tombstone_cleans_all_stale_current_bindings,
+    object_id_tombstone_cleans_all_stale_current_bindings_turso
+);
+
 async fn metadata_import_records_duplicate_object_id_binding_cleanup_impl(
     backend: StorageTestBackend,
 ) {
