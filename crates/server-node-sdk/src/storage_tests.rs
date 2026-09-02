@@ -1345,6 +1345,59 @@ run_on_all_metadata_backends!(
     metadata_import_pathless_preferred_head_cleans_all_current_bindings_turso
 );
 
+async fn metadata_import_replaces_empty_object_id_impl(backend: StorageTestBackend) {
+    let (source_root, mut source) = backend
+        .init_store("metadata-import-empty-object-id-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("metadata-import-empty-object-id-target")
+        .await;
+    let path = "replication/empty-object-id.txt";
+
+    let created = source
+        .put_object_versioned(
+            path,
+            Bytes::from_static(b"replicated object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut bundle = source
+        .export_metadata_bundle(path, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+    bundle.object_id = Some("  ".to_string());
+
+    assert!(target.import_metadata_bundle(&bundle).await.unwrap());
+    let imported = target.current_object_entry(path).await.unwrap().unwrap();
+    assert!(!imported.object_id.trim().is_empty());
+    assert_ne!(imported.object_id, created.object_id);
+    let imported_index = target
+        .load_version_index_by_object_id(&imported.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(imported_index.object_id, imported.object_id);
+    assert!(
+        imported_index
+            .versions
+            .values()
+            .all(|record| record.object_id == imported_index.object_id)
+    );
+
+    drop(source);
+    drop(target);
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_import_replaces_empty_object_id_impl,
+    metadata_import_replaces_empty_object_id,
+    metadata_import_replaces_empty_object_id_turso
+);
+
 #[tokio::test]
 async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
     const LEGACY_OBJECT_ID: &str = "legacy-row-object-id";
@@ -3681,6 +3734,61 @@ run_on_all_metadata_backends!(
     import_replication_bundle_preserves_source_object_id_for_repaired_key_impl,
     import_replication_bundle_preserves_source_object_id_for_repaired_key,
     import_replication_bundle_preserves_source_object_id_for_repaired_key_turso
+);
+
+async fn import_replication_bundle_replaces_empty_object_id_impl(backend: StorageTestBackend) {
+    let (source_root, mut source) = backend
+        .init_store("replica-import-empty-object-id-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("replica-import-empty-object-id-target")
+        .await;
+    let path = "docs/empty-object-id.txt";
+
+    let source_put = source
+        .put_object_versioned(
+            path,
+            Bytes::from_static(b"source-payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut bundle = source
+        .export_replication_bundle(
+            path,
+            Some(&source_put.version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("expected source replication bundle");
+    bundle.object_id = Some("\t".to_string());
+
+    for chunk in &bundle.manifest.chunks {
+        let payload = source
+            .read_chunk_payload(&chunk.hash)
+            .await
+            .unwrap()
+            .unwrap();
+        target
+            .ingest_chunk(&chunk.hash, payload.as_ref())
+            .await
+            .unwrap();
+    }
+    target.import_replication_bundle(&bundle).await.unwrap();
+
+    let imported = target.list_versions(path).await.unwrap().unwrap();
+    assert!(!imported.object_id.trim().is_empty());
+    assert_ne!(imported.object_id, source_put.object_id);
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    import_replication_bundle_replaces_empty_object_id_impl,
+    import_replication_bundle_replaces_empty_object_id,
+    import_replication_bundle_replaces_empty_object_id_turso
 );
 
 async fn replayed_replica_tombstone_does_not_remove_repaired_key_impl(backend: StorageTestBackend) {

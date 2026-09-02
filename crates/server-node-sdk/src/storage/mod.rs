@@ -6549,7 +6549,8 @@ impl PersistentStore {
         let mut current_state_changed = false;
 
         if !bundle.versions.is_empty() {
-            let object_id = bundle.object_id.clone().unwrap_or_else(generate_object_id);
+            let object_id =
+                nonempty_object_id(bundle.object_id.clone()).unwrap_or_else(generate_object_id);
             let mut index = self
                 .load_version_index_by_object_id(&object_id)
                 .await?
@@ -6635,7 +6636,8 @@ impl PersistentStore {
                 snapshot_changed_paths.extend(changed_current_paths);
             }
         } else if let Some(manifest_hash) = bundle.current_manifest_hash.as_ref() {
-            let object_id = bundle.object_id.clone().unwrap_or_else(generate_object_id);
+            let object_id =
+                nonempty_object_id(bundle.object_id.clone()).unwrap_or_else(generate_object_id);
             let expected_entry = CurrentObjectEntry {
                 manifest_hash: manifest_hash.clone(),
                 object_id: object_id.clone(),
@@ -9689,7 +9691,7 @@ impl PersistentStore {
         created_at_unix: u64,
     ) -> Result<ReplicationImportLineageChoice> {
         if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            if let Some(object_id) = bundle.object_id.clone() {
+            if let Some(object_id) = nonempty_object_id(bundle.object_id.clone()) {
                 return Ok(ReplicationImportLineageChoice::existing(object_id));
             }
             if let Some(version_id) = bundle.version_id.as_deref()
@@ -9707,7 +9709,7 @@ impl PersistentStore {
             ));
         }
 
-        if let Some(source_object_id) = bundle.object_id.clone() {
+        if let Some(source_object_id) = nonempty_object_id(bundle.object_id.clone()) {
             if !bundle.selected_is_preferred_head {
                 if let Some(version_id) = bundle.version_id.as_deref()
                     && let Some(object_id) = self
@@ -10529,6 +10531,10 @@ async fn directory_file_stats(root: &Path) -> Result<(usize, u64)> {
 
 fn generate_object_id() -> String {
     format!("obj-{}", Uuid::now_v7())
+}
+
+fn nonempty_object_id(object_id: Option<String>) -> Option<String> {
+    object_id.filter(|object_id| !object_id.trim().is_empty())
 }
 
 fn generate_unclaimed_object_id(claimed_object_ids: &mut HashSet<String>) -> String {
