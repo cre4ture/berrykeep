@@ -6622,12 +6622,13 @@ impl PersistentStore {
             let mut changed_current_paths = self
                 .sync_current_state_for_key_from_index(current_key, &index)
                 .await?;
-            if preferred_logical_path.is_none() {
-                changed_current_paths.extend(
-                    self.remove_current_state_bindings_for_object_id(&object_id)
-                        .await?,
-                );
-            }
+            changed_current_paths.extend(
+                self.remove_current_state_bindings_for_object_id_except(
+                    &object_id,
+                    preferred_logical_path,
+                )
+                .await?,
+            );
             if self.current_state_binding(current_key).await? != before_binding
                 || !changed_current_paths.is_empty()
             {
@@ -9293,12 +9294,22 @@ impl PersistentStore {
         &self,
         object_id: &str,
     ) -> Result<BTreeSet<String>> {
+        self.remove_current_state_bindings_for_object_id_except(object_id, None)
+            .await
+    }
+
+    async fn remove_current_state_bindings_for_object_id_except(
+        &self,
+        object_id: &str,
+        preserved_path: Option<&str>,
+    ) -> Result<BTreeSet<String>> {
         let mut bound_paths = self
             .metadata_store
             .list_keys_for_object_id(object_id)
             .await?;
         bound_paths.sort();
         bound_paths.dedup();
+        bound_paths.retain(|path| Some(path.as_str()) != preserved_path);
 
         let mut changed_paths = BTreeSet::new();
         for bound_path in bound_paths {

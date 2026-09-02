@@ -1257,6 +1257,88 @@ run_on_all_metadata_backends!(
     metadata_import_records_duplicate_object_id_binding_cleanup_turso
 );
 
+async fn metadata_import_prunes_stale_binding_when_preferred_path_taken_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend
+        .init_store("metadata-import-preferred-path-taken-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("metadata-import-preferred-path-taken-target")
+        .await;
+    let current_path = "replication/current.txt";
+    let stale_path = "replication/stale.txt";
+
+    let source_object = source
+        .put_object_versioned(
+            current_path,
+            Bytes::from_static(b"source object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let source_entry = source
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let bundle = source
+        .export_metadata_bundle(current_path, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let target_object = target
+        .put_object_versioned(
+            current_path,
+            Bytes::from_static(b"target object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let target_entry = target
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(target_object.object_id, source_object.object_id);
+    target
+        .upsert_current_object(stale_path, source_entry)
+        .await
+        .unwrap();
+
+    assert!(target.import_metadata_bundle(&bundle).await.unwrap());
+    assert_eq!(
+        target.current_object_entry(current_path).await.unwrap(),
+        Some(target_entry)
+    );
+    assert!(
+        target
+            .current_object_entry(stale_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        target
+            .current_path_for_object_id(&source_object.object_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    drop(source);
+    drop(target);
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_import_prunes_stale_binding_when_preferred_path_taken_impl,
+    metadata_import_prunes_stale_binding_when_preferred_path_taken,
+    metadata_import_prunes_stale_binding_when_preferred_path_taken_turso
+);
+
 async fn metadata_import_pathless_preferred_head_cleans_all_current_bindings_impl(
     backend: StorageTestBackend,
 ) {
