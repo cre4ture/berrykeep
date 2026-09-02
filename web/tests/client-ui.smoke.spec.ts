@@ -1699,6 +1699,34 @@ test("client-ui explorer restores selected deleted and moved entries in one batc
   await expect(page.getByText("Recoverable deleted and moved files")).toBeHidden();
 });
 
+test("client-ui explorer splits historical restores into supported batch sizes", async ({ page }) => {
+  const mockState = await installClientUiMocks(page, {
+    historyEntries: Array.from({ length: 101 }, (_, index) => {
+      const path = `deleted-${String(index + 1).padStart(3, "0")}.txt`;
+      return {
+        path,
+        entry_type: "historical",
+        restore_source_path: path,
+        restore_version_id: `version-deleted-${String(index + 1).padStart(3, "0")}`,
+        removed_at_unix: 1_712_345_600 + index
+      };
+    })
+  });
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted-001.txt", exact: true })).toBeVisible();
+
+  await page.getByLabel("Select all historical entries").check();
+  await expect(page.getByText("101 historical items selected", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Restore selected" }).click();
+
+  await expect
+    .poll(() => mockState.restoredHistoryEntries().map((entries) => entries.length))
+    .toEqual([100, 1]);
+});
+
 test("client-ui desktop navigation can collapse and scroll on short viewports", async ({ page }) => {
   test.setTimeout(45_000);
 

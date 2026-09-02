@@ -43,6 +43,7 @@ import {
 const DEFAULT_EXPLORER_PREVIEW_BYTES = 1024;
 const EXPLORER_RENAME_SCAN_DEPTH = 1024;
 const EXPLORER_PAGE_SIZE = 100;
+const HISTORY_RESTORE_BATCH_MAX_ENTRIES = 100;
 
 export type ExplorerSnapshot = {
   id: string;
@@ -98,6 +99,16 @@ export type ExplorerHistoryRestoreEntry = {
   restore_version_id: string;
 };
 
+export type ExplorerHistoryRestoreEntryResult = ExplorerHistoryRestoreEntry & {
+  status: "restored" | "source_missing" | "target_exists" | "failed";
+};
+
+export type ExplorerHistoryRestoreResponse = {
+  restored_count: number;
+  failed_count: number;
+  entries: ExplorerHistoryRestoreEntryResult[];
+};
+
 export type ExplorerHistoryListResponse = {
   prefix: string;
   depth: number;
@@ -145,7 +156,7 @@ export type ExplorerMutationConfig = {
   ) => Promise<unknown>;
   restoreHistoryEntries?: (
     entries: ExplorerHistoryRestoreEntry[]
-  ) => Promise<unknown>;
+  ) => Promise<ExplorerHistoryRestoreResponse>;
 };
 
 export type ExplorerQuickUploadConfig = {
@@ -195,6 +206,7 @@ type ExplorerMediaViewerState = {
   source: ExplorerMediaViewerSource;
   index: number;
 };
+type ExplorerHistoryLoadState = "idle" | "loading" | "loaded" | "failed";
 
 export function ExplorerSurface({
   intro,
@@ -219,6 +231,8 @@ export function ExplorerSurface({
   const [entriesPayload, setEntriesPayload] = useState<ExplorerListResponse | null>(null);
   const [historyEntriesPayload, setHistoryEntriesPayload] =
     useState<ExplorerHistoryListResponse | null>(null);
+  const [historyLoadState, setHistoryLoadState] = useState<ExplorerHistoryLoadState>("idle");
+  const [historyLoadError, setHistoryLoadError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedPayload, setSelectedPayload] = useState<unknown>({
     message: "Select an object or version to preview it."
@@ -295,32 +309,57 @@ export function ExplorerSurface({
     const includeHistorical =
       options?.includeHistorical ??
       (showHistoricalEntries && targetSnapshotId == null && loadHistoricalEntries != null);
+    if (includeHistorical) {
+      setHistoryLoadState("loading");
+      setHistoryLoadError(null);
+    } else {
+      setHistoryLoadState("idle");
+      setHistoryLoadError(null);
+    }
     try {
-      const [payload, historyPayload] = await Promise.all([
+      const historyRequest =
+        includeHistorical && loadHistoricalEntries
+          ? loadHistoricalEntries(targetPrefix.trim(), depth).then(
+              (payload) => ({ payload, error: null as string | null }),
+              (historyError) => ({
+                payload: null,
+                error:
+                  historyError instanceof Error
+                    ? historyError.message
+                    : "Unable to load recoverable historical entries."
+              })
+            )
+          : Promise.resolve({ payload: null, error: null as string | null });
+      const [payload, historyResult] = await Promise.all([
         loadEntries(targetPrefix.trim(), depth, targetSnapshotId, {
           view: "tree",
           offset: (targetPage - 1) * EXPLORER_PAGE_SIZE,
           limit: EXPLORER_PAGE_SIZE,
           sort: explorerServerSortOrder(targetSortField, targetSortDirection)
         }),
-        includeHistorical && loadHistoricalEntries
-          ? loadHistoricalEntries(targetPrefix.trim(), depth).catch((historyError) => {
-              setError(
-                historyError instanceof Error
-                  ? `Failed loading historical entries: ${historyError.message}`
-                  : "Failed loading historical entries"
-              );
-              return null;
-            })
-          : Promise.resolve(null)
+        historyRequest
       ]);
       setEntriesPayload(payload);
-      setHistoryEntriesPayload(historyPayload);
+      setHistoryEntriesPayload(historyResult.payload);
+      if (includeHistorical) {
+        if (historyResult.error) {
+          setHistoryLoadState("failed");
+          setHistoryLoadError(historyResult.error);
+          setError(`Failed loading historical entries: ${historyResult.error}`);
+        } else {
+          setHistoryLoadState("loaded");
+        }
+      }
       setCurrentPage(targetPage);
       if (typeof nextPrefix === "string") {
         setPrefix(nextPrefix);
       }
     } catch (nextError) {
+      if (includeHistorical) {
+        setHistoryEntriesPayload(null);
+        setHistoryLoadState("failed");
+        setHistoryLoadError("Current store entries could not be loaded.");
+      }
       setError(nextError instanceof Error ? nextError.message : "Failed to load store entries");
     } finally {
       setLoading(null);
@@ -475,16 +514,42 @@ export function ExplorerSurface({
     setLoading("restore-history");
     setError(null);
     try {
-      const response = await mutations.restoreHistoryEntries(restoreEntries);
+      const responses: ExplorerHistoryRestoreResponse[] = [];
+      for (
+        let offset = 0;
+        offset < restoreEntries.length;
+        offset += HISTORY_RESTORE_BATCH_MAX_ENTRIES
+      ) {
+        responses.push(
+          await mutations.restoreHistoryEntries(
+            restoreEntries.slice(offset, offset + HISTORY_RESTORE_BATCH_MAX_ENTRIES)
+          )
+        );
+      }
+      const restoredEntryKeys = new Set(
+        responses
+          .flatMap((response) => response.entries)
+          .filter((entry) => entry.status === "restored")
+          .map(historySelectionKey)
+      );
+      const failedCount = responses.reduce(
+        (count, response) => count + response.failed_count,
+        0
+      );
       setSelectedPayload({
         action: restoreEntries.length === 1 ? "restored_historical_entry" : "restored_historical_entries",
         requested_count: restoreEntries.length,
-        response
+        response: responses.length === 1 ? responses[0] : responses
       });
       setSelectedHistoricalEntries((current) =>
-        current.filter((key) => !restoreEntries.some((entry) => historySelectionKey(entry) === key))
+        current.filter((key) => !restoredEntryKeys.has(key))
       );
       await refreshEntries();
+      if (failedCount > 0) {
+        setError(
+          `${failedCount} historical ${failedCount === 1 ? "item could" : "items could"} not be restored. Items with conflicts remain selected.`
+        );
+      }
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed restoring historical entries");
     } finally {
@@ -1039,6 +1104,8 @@ export function ExplorerSurface({
                   if (nextSnapshotId != null) {
                     setShowHistoricalEntries(false);
                     setHistoryEntriesPayload(null);
+                    setHistoryLoadState("idle");
+                    setHistoryLoadError(null);
                     setSelectedHistoricalEntries([]);
                   }
                   setCurrentPage(1);
@@ -1077,6 +1144,8 @@ export function ExplorerSurface({
                   setSelectedHistoricalEntries([]);
                   if (!checked) {
                     setHistoryEntriesPayload(null);
+                    setHistoryLoadState("idle");
+                    setHistoryLoadError(null);
                   }
                   void refreshEntries(undefined, {
                     page: 1,
@@ -1156,7 +1225,11 @@ export function ExplorerSurface({
                   prefix to find older paths.
                 </Alert>
               ) : null}
-              {historyEntriesPayload == null ? (
+              {historyLoadState === "failed" ? (
+                <Alert color="red">
+                  {historyLoadError ?? "Unable to load recoverable historical entries."}
+                </Alert>
+              ) : historyLoadState !== "loaded" ? (
                 <Text c="dimmed" size="sm">
                   Loading historical entries…
                 </Text>
