@@ -1674,6 +1674,7 @@ test("client-ui explorer keeps loaded history while paging current entries", asy
 
   await page.locator('[data-explorer-pagination="true"]').getByRole("button", { name: "2" }).click();
   await expect(page.locator('[data-explorer-pagination="true"]')).toContainText("Showing 101–200 of");
+  await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
   await page.waitForTimeout(300);
   expect(historyRequestCount).toBe(1);
 });

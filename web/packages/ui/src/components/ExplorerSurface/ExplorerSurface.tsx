@@ -44,6 +44,7 @@ const DEFAULT_EXPLORER_PREVIEW_BYTES = 1024;
 const EXPLORER_RENAME_SCAN_DEPTH = 1024;
 const EXPLORER_PAGE_SIZE = 100;
 const HISTORY_RESTORE_BATCH_MAX_ENTRIES = 100;
+const EXPLORER_MAX_DEPTH = 64;
 
 export type ExplorerSnapshot = {
   id: string;
@@ -304,6 +305,7 @@ export function ExplorerSurface({
     const targetPrefix = nextPrefix ?? prefix;
     const targetPage = Math.max(1, options?.page ?? currentPage);
     const targetSnapshotId = options?.snapshotId === undefined ? snapshotId : options.snapshotId;
+    const targetDepth = Math.min(EXPLORER_MAX_DEPTH, Math.max(1, depth));
     const targetSortField = options?.sortField ?? sortField;
     const targetSortDirection = options?.sortDirection ?? sortDirection;
     const targetHistoryPrefix = targetPrefix.trim().replace(/^\/+|\/+$/g, "");
@@ -312,7 +314,8 @@ export function ExplorerSurface({
       targetSnapshotId == null &&
       loadHistoricalEntries != null;
     const historyMatchesTarget =
-      historyEntriesPayload?.prefix === targetHistoryPrefix && historyEntriesPayload.depth === depth;
+      historyEntriesPayload?.prefix === targetHistoryPrefix &&
+      historyEntriesPayload.depth === targetDepth;
     const includeHistorical =
       historicalEntriesEnabled && (options?.includeHistorical ?? !historyMatchesTarget);
     if (includeHistorical) {
@@ -325,7 +328,7 @@ export function ExplorerSurface({
     try {
       const historyRequest =
         includeHistorical && loadHistoricalEntries
-          ? loadHistoricalEntries(targetPrefix.trim(), depth).then(
+          ? loadHistoricalEntries(targetPrefix.trim(), targetDepth).then(
               (payload) => ({ payload, error: null as string | null }),
               (historyError) => ({
                 payload: null,
@@ -337,7 +340,7 @@ export function ExplorerSurface({
             )
           : Promise.resolve({ payload: null, error: null as string | null });
       const [payload, historyResult] = await Promise.all([
-        loadEntries(targetPrefix.trim(), depth, targetSnapshotId, {
+        loadEntries(targetPrefix.trim(), targetDepth, targetSnapshotId, {
           view: "tree",
           offset: (targetPage - 1) * EXPLORER_PAGE_SIZE,
           limit: EXPLORER_PAGE_SIZE,
@@ -346,8 +349,8 @@ export function ExplorerSurface({
         historyRequest
       ]);
       setEntriesPayload(payload);
-      setHistoryEntriesPayload(historyResult.payload);
       if (includeHistorical) {
+        setHistoryEntriesPayload(historyResult.payload);
         if (historyResult.error) {
           setHistoryLoadState("failed");
           setHistoryLoadError(historyResult.error);
@@ -1091,8 +1094,15 @@ export function ExplorerSurface({
               <NumberInput
                 label="Depth"
                 min={1}
+                max={EXPLORER_MAX_DEPTH}
                 value={depth}
-                onChange={(value) => setDepth(typeof value === "number" && value > 0 ? value : 1)}
+                onChange={(value) =>
+                  setDepth(
+                    typeof value === "number" && value > 0
+                      ? Math.min(EXPLORER_MAX_DEPTH, value)
+                      : 1
+                  )
+                }
               />
             </Grid.Col>
             <Grid.Col span={{ base: 12, md: 3 }}>
