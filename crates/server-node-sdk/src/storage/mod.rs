@@ -1015,6 +1015,17 @@ pub(super) struct CurrentState {
     pub(super) object_ids: HashMap<String, String>,
 }
 
+fn current_state_has_unique_object_id_bindings(current_state: &CurrentState) -> bool {
+    let mut object_ids = HashSet::with_capacity(current_state.objects.len());
+    current_state.objects.keys().all(|path| {
+        current_state
+            .object_ids
+            .get(path)
+            .filter(|object_id| !object_id.trim().is_empty())
+            .is_some_and(|object_id| object_ids.insert(object_id))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CurrentObjectEntry {
     pub(super) manifest_hash: String,
@@ -3622,10 +3633,11 @@ impl PersistentStore {
 
     /// Backfills the live namespace written before object identity became mandatory.
     ///
-    /// This is a one-time foreground migration: it scans the live namespace and legacy version
-    /// indexes before serving requests, so every current object has a durable identity from the
-    /// first post-upgrade request. The writes are idempotent; a restart before the completion
-    /// marker is recorded repeats the scan safely.
+    /// This is a one-time foreground migration. If the live namespace already has one non-empty
+    /// identity per current object, it records completion without reading version indexes.
+    /// Otherwise it scans legacy version indexes before serving requests, so every current object
+    /// has a durable identity from the first post-upgrade request. The writes are idempotent; a
+    /// restart before the completion marker is recorded repeats the scan safely.
     /// Historical snapshots are normalized when they are read or rewritten instead of
     /// making startup walk every retained snapshot.
     async fn migrate_legacy_object_ids(&self) -> Result<()> {
@@ -3634,6 +3646,9 @@ impl PersistentStore {
         }
 
         let current_state = self.metadata_store.load_current_state().await?;
+        if current_state_has_unique_object_id_bindings(&current_state) {
+            return self.metadata_store.mark_object_id_backfill_complete().await;
+        }
         let mut current_objects = current_state.objects.iter().collect::<Vec<_>>();
         current_objects.sort_by_key(|(path, _)| *path);
         let legacy_candidates = self
