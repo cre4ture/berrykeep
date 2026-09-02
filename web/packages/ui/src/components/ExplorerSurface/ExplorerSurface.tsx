@@ -1291,7 +1291,9 @@ export function ExplorerSurface({
                         const displayPath = explorerDisplayPath(entry, prefix);
                         const historicalRestoreEntry = historicalRestoreRequest(entry);
                         return (
-                          <Table.Tr key={entry.path}>
+                          <Table.Tr
+                            key={`${entry.entry_type}:${entry.path}:${entry.restore_version_id ?? ""}`}
+                          >
                             {canRestoreHistory ? (
                               <Table.Td>
                                 {isHistorical && historicalRestoreEntry ? (

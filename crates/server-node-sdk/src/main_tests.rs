@@ -54,6 +54,45 @@ fn reconciliation_object_paths_encode_store_keys_before_transport() {
 }
 
 #[test]
+fn recoverable_history_projection_keeps_folder_markers_and_child_rollups() {
+    let projection = super::project_recoverable_history_entries(
+        &[
+            super::storage::RecoverableHistoryEntry {
+                path: "docs/".to_string(),
+                restore_source_path: "docs/".to_string(),
+                restore_version_id: "version-folder".to_string(),
+                removed_at_unix: 10,
+                moved_to_path: None,
+            },
+            super::storage::RecoverableHistoryEntry {
+                path: "docs/a.txt".to_string(),
+                restore_source_path: "docs/a.txt".to_string(),
+                restore_version_id: "version-child".to_string(),
+                removed_at_unix: 11,
+                moved_to_path: None,
+            },
+        ],
+        "",
+        1,
+        100,
+    );
+
+    assert!(!projection.truncated);
+    assert!(
+        projection
+            .entries
+            .iter()
+            .any(|entry| entry.path == "docs/" && entry.entry_type == "historical")
+    );
+    assert!(
+        projection
+            .entries
+            .iter()
+            .any(|entry| entry.path == "docs/" && entry.entry_type == "prefix")
+    );
+}
+
+#[test]
 fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
     let tickets = HashMap::from([
         (

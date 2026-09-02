@@ -16082,7 +16082,7 @@ fn project_recoverable_history_entries(
     max_entries: usize,
 ) -> StoreHistoryProjection {
     let max_entries = max_entries.max(1);
-    let mut projected = BTreeMap::new();
+    let mut projected = BTreeMap::<(String, u8), StoreHistoryEntryResponse>::new();
     let mut truncated = false;
     let scoped_prefix = (!prefix.is_empty()).then(|| format!("{prefix}/"));
 
@@ -16110,9 +16110,10 @@ fn project_recoverable_history_entries(
             } else {
                 format!("{prefix}/{visible_path}/")
             };
-            if projected.len() < max_entries || projected.contains_key(&path) {
+            let projection_key = (path.clone(), 0);
+            if projected.len() < max_entries || projected.contains_key(&projection_key) {
                 projected
-                    .entry(path.clone())
+                    .entry(projection_key)
                     .or_insert(StoreHistoryEntryResponse {
                         path,
                         entry_type: "prefix",
@@ -16127,9 +16128,10 @@ fn project_recoverable_history_entries(
             continue;
         }
 
-        if projected.len() < max_entries || projected.contains_key(&entry.path) {
+        let projection_key = (entry.path.clone(), 1);
+        if projected.len() < max_entries || projected.contains_key(&projection_key) {
             projected.insert(
-                entry.path.clone(),
+                projection_key,
                 StoreHistoryEntryResponse {
                     path: entry.path.clone(),
                     entry_type: "historical",
