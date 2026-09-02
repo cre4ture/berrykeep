@@ -93,37 +93,16 @@ fn recoverable_history_projection_keeps_folder_markers_and_child_rollups() {
 }
 
 #[test]
-fn store_history_cache_scopes_entries_and_bounds_recent_prefixes() {
+fn store_history_cache_retains_and_clears_entries() {
     let mut cache = super::StoreHistoryCache::default();
-    let root = super::StoreHistoryCacheKey {
-        prefix: String::new(),
-        depth: 1,
-    };
-    let docs = super::StoreHistoryCacheKey {
-        prefix: "docs".to_string(),
-        depth: 1,
-    };
-    let media = super::StoreHistoryCacheKey {
-        prefix: "media".to_string(),
-        depth: 2,
-    };
-    let value = || {
-        Arc::new(super::StoreHistoryCacheValue {
-            entries: Vec::new(),
-            truncated: false,
-        })
-    };
+    cache.insert(Arc::new(super::StoreHistoryCacheValue {
+        entries: Vec::new(),
+    }));
 
-    cache.insert(root.clone(), value());
-    cache.insert(docs.clone(), value());
-    cache.insert(media.clone(), value());
-
-    assert!(cache.get(&root).is_none());
-    assert!(cache.get(&docs).is_some());
-    assert!(cache.get(&media).is_some());
+    assert!(cache.get().is_some());
 
     cache.clear();
-    assert!(cache.get(&docs).is_none());
+    assert!(cache.get().is_none());
 }
 
 #[test]

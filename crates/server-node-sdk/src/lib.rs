@@ -122,7 +122,7 @@ const STORE_INDEX_PAGE_CACHE_MAX_SCOPES: usize = 2;
 const STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
 const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
-const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 2;
+const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -906,6 +906,13 @@ pub(crate) fn publish_namespace_change(state: &ServerState) {
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
     let _ = state.storage.namespace_change_tx.send(sequence);
+}
+
+fn invalidate_store_history_cache(state: &ServerState) {
+    match state.storage.store_history_cache.lock() {
+        Ok(mut cache) => cache.clear(),
+        Err(poisoned) => poisoned.into_inner().clear(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -13876,53 +13883,43 @@ impl StoreIndexPageCache {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct StoreHistoryCacheKey {
-    prefix: String,
-    depth: usize,
-}
-
 #[derive(Debug)]
 struct StoreHistoryCacheValue {
-    entries: Vec<StoreHistoryEntryResponse>,
-    truncated: bool,
+    entries: Vec<RecoverableHistoryEntry>,
 }
 
 #[derive(Debug)]
 struct StoreHistoryCacheEntry {
-    key: StoreHistoryCacheKey,
     created_at: Instant,
     value: Arc<StoreHistoryCacheValue>,
 }
 
 #[derive(Debug, Default)]
 struct StoreHistoryCache {
-    entries: VecDeque<StoreHistoryCacheEntry>,
+    entry: Option<StoreHistoryCacheEntry>,
 }
 
 impl StoreHistoryCache {
-    fn get(&mut self, key: &StoreHistoryCacheKey) -> Option<Arc<StoreHistoryCacheValue>> {
-        let position = self.entries.iter().position(|entry| {
-            entry.key == *key && entry.created_at.elapsed() <= STORE_HISTORY_CACHE_TTL
-        })?;
-        let entry = self.entries.remove(position)?;
-        let value = Arc::clone(&entry.value);
-        self.entries.push_front(entry);
-        Some(value)
+    fn get(&self) -> Option<Arc<StoreHistoryCacheValue>> {
+        self.entry.as_ref().and_then(|entry| {
+            (entry.created_at.elapsed() <= STORE_HISTORY_CACHE_TTL)
+                .then(|| Arc::clone(&entry.value))
+        })
     }
 
-    fn insert(&mut self, key: StoreHistoryCacheKey, value: Arc<StoreHistoryCacheValue>) {
-        self.entries.retain(|entry| entry.key != key);
-        self.entries.push_front(StoreHistoryCacheEntry {
-            key,
+    fn insert(&mut self, value: Arc<StoreHistoryCacheValue>) {
+        if value.entries.len() > STORE_HISTORY_CACHE_MAX_ENTRY_COUNT {
+            self.entry = None;
+            return;
+        }
+        self.entry = Some(StoreHistoryCacheEntry {
             created_at: Instant::now(),
             value,
         });
-        self.entries.truncate(STORE_HISTORY_CACHE_MAX_SCOPES);
     }
 
     fn clear(&mut self) {
-        self.entries.clear();
+        self.entry = None;
     }
 }
 
@@ -14426,6 +14423,7 @@ async fn rename_object_path_response(
             );
             drop(store);
             publish_namespace_change(state);
+            invalidate_store_history_cache(state);
             request_local_availability_refresh(state);
             if request.from_path != request.to_path {
                 record_data_change_event(
@@ -15798,6 +15796,7 @@ async fn delete_object_response(
         Ok(deleted_paths) => {
             drop(store);
             publish_namespace_change(state);
+            invalidate_store_history_cache(state);
 
             let mut cluster = state.cluster.lock().await;
             for (deleted_path, version_id) in &deleted_paths {
@@ -16003,25 +16002,20 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
         .trim_matches('/')
         .to_string();
     let depth = query.depth.unwrap_or(1).clamp(1, 64);
-    let cache_key = StoreHistoryCacheKey {
-        prefix: prefix.clone(),
-        depth,
-    };
     let cached = match state.storage.store_history_cache.lock() {
-        Ok(mut cache) => cache.get(&cache_key),
-        Err(poisoned) => poisoned.into_inner().get(&cache_key),
+        Ok(cache) => cache.get(),
+        Err(poisoned) => poisoned.into_inner().get(),
     };
     let history = match cached {
         Some(cached) => cached,
         None => {
             // Coalesce cache misses without holding the store read guard. A
             // short TTL intentionally tolerates concurrent namespace writes,
-            // which keeps Explorer navigation from repeatedly scanning an
-            // actively synchronizing store.
+            // while retaining the prefix-independent scan for navigation.
             let _refresh_guard = state.storage.store_history_refresh_lock.lock().await;
             let cached = match state.storage.store_history_cache.lock() {
-                Ok(mut cache) => cache.get(&cache_key),
-                Err(poisoned) => poisoned.into_inner().get(&cache_key),
+                Ok(cache) => cache.get(),
+                Err(poisoned) => poisoned.into_inner().get(),
             };
             if let Some(cached) = cached {
                 cached
@@ -16037,30 +16031,27 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
-                let projection = project_recoverable_history_entries(
-                    &entries,
-                    &prefix,
-                    depth,
-                    STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT,
-                );
-                let value = Arc::new(StoreHistoryCacheValue {
-                    entries: projection.entries,
-                    truncated: projection.truncated,
-                });
+                let value = Arc::new(StoreHistoryCacheValue { entries });
                 match state.storage.store_history_cache.lock() {
-                    Ok(mut cache) => cache.insert(cache_key, Arc::clone(&value)),
-                    Err(poisoned) => poisoned.into_inner().insert(cache_key, Arc::clone(&value)),
+                    Ok(mut cache) => cache.insert(Arc::clone(&value)),
+                    Err(poisoned) => poisoned.into_inner().insert(Arc::clone(&value)),
                 }
                 value
             }
         }
     };
+    let projection = project_recoverable_history_entries(
+        &history.entries,
+        &prefix,
+        depth,
+        STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT,
+    );
     Json(StoreHistoryResponse {
         prefix: prefix.clone(),
         depth,
-        entry_count: history.entries.len(),
-        truncated: history.truncated,
-        entries: history.entries.clone(),
+        entry_count: projection.entries.len(),
+        truncated: projection.truncated,
+        entries: projection.entries,
     })
     .into_response()
 }
@@ -16202,19 +16193,43 @@ async fn restore_history_entries_response(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let mut restored_count = 0usize;
-    let mut responses = Vec::new();
+    let restore_entries = request
+        .entries
+        .into_iter()
+        .map(|entry| HistoryRestoreEntryRequest {
+            path: entry.path.trim().to_string(),
+            restore_source_path: entry.restore_source_path.trim().to_string(),
+            restore_version_id: entry.restore_version_id.trim().to_string(),
+        })
+        .collect::<Vec<_>>();
+    let restore_requests = restore_entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.restore_source_path.clone(),
+                entry.restore_version_id.clone(),
+                entry.path.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let restore_results = {
+        let mut store = lock_store(state, "store_history.restore_batch").await;
+        store.restore_version_paths_batch(&restore_requests).await
+    };
+    let restore_results: Vec<Result<PathMutationResult>> = match restore_results {
+        Ok(results) => results.into_iter().map(Ok).collect(),
+        Err(err) => {
+            tracing::warn!(error = %err, entry_count = restore_requests.len(), "failed resolving historical restore batch");
+            let error = err.to_string();
+            (0..restore_requests.len())
+                .map(|_| Err(anyhow!(error.clone())))
+                .collect()
+        }
+    };
 
-    for entry in request.entries {
-        let path = entry.path.trim().to_string();
-        let restore_source_path = entry.restore_source_path.trim().to_string();
-        let restore_version_id = entry.restore_version_id.trim().to_string();
-        let restore_result = {
-            let mut store = lock_store(state, "store_history.restore_entry").await;
-            store
-                .restore_version_path(&restore_source_path, &restore_version_id, &path, false)
-                .await
-        };
+    let mut restored_count = 0usize;
+    let mut responses = Vec::with_capacity(restore_entries.len());
+    for (entry, restore_result) in restore_entries.into_iter().zip(restore_results) {
         let status = match restore_result {
             Ok(PathMutationResult::Applied) => {
                 restored_count = restored_count.saturating_add(1);
@@ -16225,28 +16240,25 @@ async fn restore_history_entries_response(
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    path = %path,
-                    restore_source_path = %restore_source_path,
-                    restore_version_id = %restore_version_id,
+                    path = %entry.path,
+                    restore_source_path = %entry.restore_source_path,
+                    restore_version_id = %entry.restore_version_id,
                     "failed restoring historical entry"
                 );
                 "failed"
             }
         };
         responses.push(HistoryRestoreEntryResponse {
-            path,
-            restore_source_path,
-            restore_version_id,
+            path: entry.path,
+            restore_source_path: entry.restore_source_path,
+            restore_version_id: entry.restore_version_id,
             status,
         });
     }
 
     if restored_count > 0 {
         publish_namespace_change(state);
-        match state.storage.store_history_cache.lock() {
-            Ok(mut cache) => cache.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
-        }
+        invalidate_store_history_cache(state);
         request_local_availability_refresh(state);
     }
 

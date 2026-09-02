@@ -9188,6 +9188,35 @@ impl PersistentStore {
         }))
     }
 
+    async fn version_restore_source_from_indexes(
+        &self,
+        indexes: &[FileVersionIndex],
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<SnapshotRestoreSource>> {
+        for index in indexes {
+            let Some(record) = index.versions.get(version_id) else {
+                continue;
+            };
+            let Some(resolved_path) = self.resolve_key_for_version_record(index, record).await?
+            else {
+                continue;
+            };
+            if resolved_path != source_path || record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            return Ok(Some(SnapshotRestoreSource {
+                manifest_hash: record.manifest_hash.clone(),
+                object_id: Some(index.object_id.clone()),
+                version_id: Some(record.version_id.clone()),
+                state: record.state.clone(),
+            }));
+        }
+
+        Ok(None)
+    }
+
     pub async fn restore_version_path(
         &mut self,
         source_path: &str,
@@ -9201,6 +9230,39 @@ impl PersistentStore {
 
         self.restore_object_path_from_source(source, source_path, target_path, true, overwrite)
             .await
+    }
+
+    /// Restores multiple concrete historical versions after loading version
+    /// indexes once. This keeps batch restore from resolving each source by a
+    /// separate full index scan.
+    pub async fn restore_version_paths_batch(
+        &mut self,
+        restore_requests: &[(String, String, String)],
+    ) -> Result<Vec<PathMutationResult>> {
+        let indexes = self.load_all_version_indexes().await?;
+        let mut results = Vec::with_capacity(restore_requests.len());
+
+        for (source_path, version_id, target_path) in restore_requests {
+            let result = match self
+                .version_restore_source_from_indexes(&indexes, source_path, version_id)
+                .await?
+            {
+                Some(source) => {
+                    self.restore_object_path_from_source(
+                        source,
+                        source_path,
+                        target_path,
+                        true,
+                        false,
+                    )
+                    .await?
+                }
+                None => PathMutationResult::SourceMissing,
+            };
+            results.push(result);
+        }
+
+        Ok(results)
     }
 
     async fn resolve_object_id_for_key_history(&self, key: &str) -> Result<Option<String>> {
