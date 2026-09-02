@@ -3674,17 +3674,20 @@ impl PersistentStore {
 
         for (object_id, mut paths) in paths_by_existing_object_id {
             paths.sort();
-            let preferred_path = self
-                .load_version_index_by_object_id(&object_id)
-                .await?
-                .and_then(|index| {
-                    index
-                        .preferred_head_version_id
-                        .as_ref()
-                        .and_then(|version_id| index.versions.get(version_id))
-                        .and_then(|record| record.logical_path.clone())
-                })
-                .filter(|path| paths.binary_search(path).is_ok());
+            let preferred_path = if paths.len() > 1 {
+                self.load_version_index_by_object_id(&object_id)
+                    .await?
+                    .and_then(|index| {
+                        index
+                            .preferred_head_version_id
+                            .as_ref()
+                            .and_then(|version_id| index.versions.get(version_id))
+                            .and_then(|record| record.logical_path.clone())
+                    })
+                    .filter(|path| paths.binary_search(path).is_ok())
+            } else {
+                None
+            };
             let path = preferred_path.unwrap_or_else(|| paths[0].clone());
             claimed_object_ids.insert(object_id.clone());
             assignments.insert(
