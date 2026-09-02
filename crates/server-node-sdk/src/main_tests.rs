@@ -13253,11 +13253,13 @@ fn build_store_index_entries_with_hashes_propagates_content_fingerprints() {
         &keys,
         "",
         2,
-        None,
-        Some(&hashes),
-        Some(&sizes),
-        Some(&content_fingerprints),
-        None,
+        super::StoreIndexEntryTestMetadata {
+            object_ids_by_key: None,
+            hashes_by_key: Some(&hashes),
+            sizes_by_key: Some(&sizes),
+            content_fingerprints_by_key: Some(&content_fingerprints),
+            modified_times_by_key: None,
+        },
     );
 
     let file_entry = entries

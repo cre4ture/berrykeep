@@ -21,16 +21,15 @@ use super::{
     DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
     GalleryDeltaCursorError, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexPage,
     GalleryIndexQuery, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
-    GalleryMapClusterQuery, GallerySummaryCache, METADATA_SCHEMA_VERSION_CURRENT,
-    METADATA_SCHEMA_VERSION_OBJECT_ID, ManifestSummary, ManualRepairActionRunRecord,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
-    MetadataStore, OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
-    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, decode_gallery_labels,
-    decode_version_index, decompress_snapshot_json, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs,
+    GalleryMapClusterQuery, GallerySummaryCache, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
+    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
+    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
+    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    compress_snapshot_json, decode_gallery_labels, decode_version_index, decompress_snapshot_json,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -2730,7 +2729,6 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
         )
         .await
         .context("failed to persist Turso metadata schema version")?;
-    debug_assert!(METADATA_SCHEMA_VERSION_CURRENT >= METADATA_SCHEMA_VERSION_OBJECT_ID);
     Ok(())
 }
 

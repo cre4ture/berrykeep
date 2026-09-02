@@ -18443,7 +18443,12 @@ fn media_type_for_path(path: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec<StoreIndexEntry> {
-    build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None, None, None)
+    build_store_index_entries_with_hashes(
+        keys,
+        prefix,
+        depth,
+        StoreIndexEntryTestMetadata::default(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -18522,24 +18527,30 @@ fn filter_store_index_object_maps_for_prefix(
 }
 
 #[cfg(test)]
+#[derive(Default)]
+struct StoreIndexEntryTestMetadata<'a> {
+    object_ids_by_key: Option<&'a HashMap<String, String>>,
+    hashes_by_key: Option<&'a HashMap<String, String>>,
+    sizes_by_key: Option<&'a HashMap<String, u64>>,
+    content_fingerprints_by_key: Option<&'a HashMap<String, String>>,
+    modified_times_by_key: Option<&'a HashMap<String, u64>>,
+}
+
+#[cfg(test)]
 fn build_store_index_entries_with_hashes(
     keys: &[String],
     prefix: &str,
     depth: usize,
-    object_ids_by_key: Option<&HashMap<String, String>>,
-    hashes_by_key: Option<&HashMap<String, String>>,
-    sizes_by_key: Option<&HashMap<String, u64>>,
-    content_fingerprints_by_key: Option<&HashMap<String, String>>,
-    modified_times_by_key: Option<&HashMap<String, u64>>,
+    metadata: StoreIndexEntryTestMetadata<'_>,
 ) -> Vec<StoreIndexEntry> {
     let plan = plan_store_index_entries(keys, prefix, depth);
     build_store_index_entries_from_plan(
         &plan,
-        object_ids_by_key,
-        hashes_by_key,
-        sizes_by_key,
-        content_fingerprints_by_key,
-        modified_times_by_key,
+        metadata.object_ids_by_key,
+        metadata.hashes_by_key,
+        metadata.sizes_by_key,
+        metadata.content_fingerprints_by_key,
+        metadata.modified_times_by_key,
     )
 }
 

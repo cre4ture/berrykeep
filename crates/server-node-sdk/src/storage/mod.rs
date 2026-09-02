@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
-const METADATA_SCHEMA_VERSION_CURRENT: i64 = 2;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
+const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
@@ -3634,7 +3634,7 @@ impl PersistentStore {
 
         let current_state = self.metadata_store.load_current_state().await?;
         let mut current_objects = current_state.objects.iter().collect::<Vec<_>>();
-        current_objects.sort_by(|(left, _), (right, _)| left.cmp(right));
+        current_objects.sort_by_key(|(path, _)| *path);
         let legacy_candidates = self
             .legacy_object_id_candidates_for_current_state(&current_state)
             .await?;

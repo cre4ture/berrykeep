@@ -25,12 +25,12 @@ use super::{
     GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
     GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue,
     GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
-    GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, METADATA_SCHEMA_VERSION_OBJECT_ID,
-    ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
-    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
-    OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord,
-    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
-    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
+    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
+    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
+    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
     compress_snapshot_json, current_media_cache_metadata, decode_gallery_labels,
     decode_version_index, decompress_snapshot_json, effective_gallery_captured_at_unix,
@@ -941,7 +941,7 @@ fn query_gallery_index_in_transaction(
             version_index_payload,
             labels_json,
         ) = row?;
-        entries.push(materialize_gallery_index_entry(
+        entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
             key,
             object_id,
             manifest_hash,
@@ -950,7 +950,7 @@ fn query_gallery_index_in_transaction(
             metadata_payload,
             version_index_payload,
             labels_json,
-        )?);
+        })?);
     }
     Ok(GalleryIndexPage {
         history_id,
@@ -1202,16 +1202,16 @@ fn gallery_map_cluster_cells_from_db(
             let count = usize::try_from(row.get::<_, i64>(2)?)
                 .context("gallery map cluster count overflow")?;
             let entry = if count == 1 {
-                Some(materialize_gallery_index_entry(
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                    row.get(12)?,
-                    row.get(13)?,
-                    row.get(14)?,
-                    row.get(15)?,
-                    row.get(16)?,
-                )?)
+                Some(materialize_gallery_index_entry(GalleryIndexEntrySource {
+                    key: row.get(9)?,
+                    object_id: row.get(10)?,
+                    manifest_hash: row.get(11)?,
+                    size_bytes: row.get(12)?,
+                    content_fingerprint: row.get(13)?,
+                    metadata_payload: row.get(14)?,
+                    version_index_payload: row.get(15)?,
+                    labels_json: row.get(16)?,
+                })?)
             } else {
                 None
             };
@@ -1405,16 +1405,16 @@ fn query_gallery_map_cluster_entries_in_transaction(
             version_index,
             labels_json,
         ) = row?;
-        entries.push(materialize_gallery_index_entry(
+        entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
             key,
             object_id,
             manifest_hash,
-            size,
-            fingerprint,
-            metadata,
-            version_index,
+            size_bytes: size,
+            content_fingerprint: fingerprint,
+            metadata_payload: metadata,
+            version_index_payload: version_index,
             labels_json,
-        )?);
+        })?);
     }
     Ok(GalleryIndexPage {
         history_id,
@@ -1425,7 +1425,7 @@ fn query_gallery_map_cluster_entries_in_transaction(
     })
 }
 
-fn materialize_gallery_index_entry(
+struct GalleryIndexEntrySource {
     key: String,
     object_id: String,
     manifest_hash: String,
@@ -1434,6 +1434,19 @@ fn materialize_gallery_index_entry(
     metadata_payload: Option<Vec<u8>>,
     version_index_payload: Option<Vec<u8>>,
     labels_json: String,
+}
+
+fn materialize_gallery_index_entry(
+    GalleryIndexEntrySource {
+        key,
+        object_id,
+        manifest_hash,
+        size_bytes,
+        content_fingerprint,
+        metadata_payload,
+        version_index_payload,
+        labels_json,
+    }: GalleryIndexEntrySource,
 ) -> Result<GalleryIndexEntry> {
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in sqlite"))
@@ -1535,16 +1548,16 @@ fn query_gallery_entry_from_db(
             _,
             labels_json,
         )| {
-            materialize_gallery_index_entry(
+            materialize_gallery_index_entry(GalleryIndexEntrySource {
                 key,
                 object_id,
                 manifest_hash,
-                size,
-                fingerprint,
-                metadata,
-                versions,
+                size_bytes: size,
+                content_fingerprint: fingerprint,
+                metadata_payload: metadata,
+                version_index_payload: versions,
                 labels_json,
-            )
+            })
         },
     )
     .transpose()
@@ -4732,8 +4745,6 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         ],
     )
     .context("failed to persist sqlite metadata schema version")?;
-
-    debug_assert!(METADATA_SCHEMA_VERSION_CURRENT >= METADATA_SCHEMA_VERSION_OBJECT_ID);
 
     Ok(())
 }
