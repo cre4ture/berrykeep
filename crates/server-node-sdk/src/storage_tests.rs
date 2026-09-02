@@ -1105,6 +1105,88 @@ run_on_all_metadata_backends!(
     object_id_tombstone_cleans_all_stale_current_bindings_turso
 );
 
+async fn object_id_missing_logical_path_cleans_current_bindings_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("object-id-missing-logical-path-current-bindings")
+        .await;
+    let current_path = "replication/current.txt";
+    let stale_path = "replication/stale.txt";
+
+    let created = store
+        .put_object_versioned(
+            current_path,
+            Bytes::from_static(b"replicated legacy object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let current_entry = store
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut index = store
+        .load_version_index_by_object_id(&created.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let preferred_version_id = index.preferred_head_version_id.clone().unwrap();
+    index
+        .versions
+        .get_mut(&preferred_version_id)
+        .unwrap()
+        .logical_path = None;
+    store
+        .persist_version_index_by_object_id(&created.object_id, &index)
+        .await
+        .unwrap();
+
+    // Legacy replicated records can lack a canonical logical path. Keeping
+    // either binding would make identity-addressed mutations choose an
+    // arbitrary path, so reconciliation must remove every current projection.
+    store
+        .upsert_current_object(stale_path, current_entry)
+        .await
+        .unwrap();
+    let changed_paths = store
+        .sync_current_state_for_key_from_index(current_path, &index)
+        .await
+        .unwrap();
+    assert!(changed_paths.contains(current_path));
+    assert!(changed_paths.contains(stale_path));
+    assert_eq!(changed_paths.len(), 2);
+    assert!(
+        store
+            .current_object_entry(current_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .current_object_entry(stale_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    object_id_missing_logical_path_cleans_current_bindings_impl,
+    object_id_missing_logical_path_cleans_current_bindings,
+    object_id_missing_logical_path_cleans_current_bindings_turso
+);
+
 async fn metadata_import_records_duplicate_object_id_binding_cleanup_impl(
     backend: StorageTestBackend,
 ) {

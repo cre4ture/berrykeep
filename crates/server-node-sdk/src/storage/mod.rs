@@ -9239,6 +9239,11 @@ impl PersistentStore {
         index: &FileVersionIndex,
         preferred_record: &FileVersionRecord,
     ) -> Result<BTreeSet<String>> {
+        let Some(preferred_logical_path) = preferred_record.logical_path.as_deref() else {
+            return self
+                .remove_current_state_bindings_for_object_id(&index.object_id)
+                .await;
+        };
         let expected_entry = CurrentObjectEntry {
             manifest_hash: preferred_record.manifest_hash.clone(),
             object_id: index.object_id.clone(),
@@ -9253,11 +9258,11 @@ impl PersistentStore {
         bound_paths.retain(|path| path != key);
 
         if !bound_paths.is_empty() {
-            if preferred_record.logical_path.as_deref() != Some(key) {
+            if preferred_logical_path != key {
                 warn!(
                     key,
                     object_id = %index.object_id,
-                    preferred_logical_path = ?preferred_record.logical_path,
+                    preferred_logical_path,
                     bound_paths = ?bound_paths,
                     "skipping stale current-state binding for an already-bound object identity"
                 );
