@@ -929,6 +929,101 @@ run_on_all_metadata_backends!(
     stable_object_id_follows_logical_object_lifecycle_turso
 );
 
+async fn object_id_current_binding_recovers_stale_replication_paths_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("object-id-stale-replication-binding")
+        .await;
+    let previous_path = "replication/previous.txt";
+    let current_path = "replication/current.txt";
+
+    let created = store
+        .put_object_versioned(
+            previous_path,
+            Bytes::from_static(b"replicated object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rename_object_path(previous_path, current_path, false)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+
+    let index = store
+        .load_version_index_by_object_id(&created.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        index
+            .preferred_head_version_id
+            .as_ref()
+            .and_then(|version_id| index.versions.get(version_id))
+            .and_then(|record| record.logical_path.as_deref()),
+        Some(current_path)
+    );
+
+    // A stale replica for `previous_path` must not re-bind the same identity
+    // after the rename already made `current_path` canonical.
+    store
+        .sync_current_state_for_key_from_index(previous_path, &index)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .current_object_entry(previous_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Older stores can already have duplicate bindings. Identity-addressed
+    // routes must use the preferred head's path, and a later promotion repairs
+    // the obsolete binding instead of keeping both paths current.
+    let current_entry = store
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .upsert_current_object(previous_path, current_entry)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(current_path)
+    );
+    store
+        .promote_current_state_for_key_from_index(current_path, &index)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .current_object_entry(previous_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    object_id_current_binding_recovers_stale_replication_paths_impl,
+    object_id_current_binding_recovers_stale_replication_paths,
+    object_id_current_binding_recovers_stale_replication_paths_turso
+);
+
 #[tokio::test]
 async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
     const LEGACY_OBJECT_ID: &str = "legacy-row-object-id";

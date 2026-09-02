@@ -5310,9 +5310,31 @@ impl PersistentStore {
         match paths.as_slice() {
             [] => Ok(None),
             [path] => Ok(Some(path.clone())),
-            _ => bail!(
-                "object identity is bound to multiple current paths: object_id={object_id} paths={paths:?}"
-            ),
+            _ => {
+                let preferred_path = self
+                    .load_version_index_by_object_id(object_id)
+                    .await?
+                    .and_then(|index| {
+                        index
+                            .preferred_head_version_id
+                            .as_ref()
+                            .and_then(|version_id| {
+                                index
+                                    .versions
+                                    .get(version_id)
+                                    .and_then(|record| record.logical_path.clone())
+                            })
+                    })
+                    .filter(|path| paths.binary_search(path).is_ok());
+                let selected_path = preferred_path.unwrap_or_else(|| paths[0].clone());
+                warn!(
+                    object_id,
+                    selected_path,
+                    paths = ?paths,
+                    "object identity has duplicate current bindings; selecting a deterministic path"
+                );
+                Ok(Some(selected_path))
+            }
         }
     }
 
@@ -9121,14 +9143,8 @@ impl PersistentStore {
         if current_object_id.is_none()
             || current_object_id.as_deref() == Some(index.object_id.as_str())
         {
-            self.upsert_current_object(
-                key,
-                CurrentObjectEntry {
-                    manifest_hash: preferred_record.manifest_hash.clone(),
-                    object_id: index.object_id.clone(),
-                },
-            )
-            .await?;
+            self.bind_current_state_to_preferred_index_record(key, index, preferred_record)
+                .await?;
         }
         Ok(())
     }
@@ -9146,6 +9162,41 @@ impl PersistentStore {
         })?;
         if preferred_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
             return Ok(());
+        }
+
+        self.bind_current_state_to_preferred_index_record(key, index, preferred_record)
+            .await
+    }
+
+    async fn bind_current_state_to_preferred_index_record(
+        &self,
+        key: &str,
+        index: &FileVersionIndex,
+        preferred_record: &FileVersionRecord,
+    ) -> Result<()> {
+        let mut bound_paths = self
+            .metadata_store
+            .list_keys_for_object_id(&index.object_id)
+            .await?;
+        bound_paths.sort();
+        bound_paths.dedup();
+        bound_paths.retain(|path| path != key);
+
+        if !bound_paths.is_empty() {
+            if preferred_record.logical_path.as_deref() != Some(key) {
+                warn!(
+                    key,
+                    object_id = %index.object_id,
+                    preferred_logical_path = ?preferred_record.logical_path,
+                    bound_paths = ?bound_paths,
+                    "skipping stale current-state binding for an already-bound object identity"
+                );
+                return Ok(());
+            }
+
+            for bound_path in bound_paths {
+                self.remove_current_object(&bound_path).await?;
+            }
         }
 
         self.upsert_current_object(
