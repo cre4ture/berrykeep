@@ -247,20 +247,11 @@ export function ExplorerSurface({
     snapshotId == null &&
     loadHistoricalEntries != null &&
     mutations?.restoreHistoryEntries != null;
-  const canSelectHistoricalEntries = canRestoreHistory && showHistoricalEntries;
 
-  const sortedEntries = useMemo(() => {
-    const entriesByPath = new Map<string, ExplorerEntry>();
-    for (const entry of historyEntriesPayload?.entries ?? []) {
-      entriesByPath.set(entry.path, entry);
-    }
-    for (const entry of entriesPayload?.entries ?? []) {
-      entriesByPath.set(entry.path, entry);
-    }
-    return Array.from(entriesByPath.values())
-      .filter((entry) => shouldDisplayExplorerEntry(entry, prefix))
-      .sort((left, right) => compareExplorerEntries(left, right, sortField, sortDirection));
-  }, [entriesPayload, historyEntriesPayload, prefix, sortDirection, sortField]);
+  const sortedEntries = useMemo(
+    () => (entriesPayload?.entries ?? []).filter((entry) => shouldDisplayExplorerEntry(entry, prefix)),
+    [entriesPayload, prefix]
+  );
 
   useEffect(() => {
     void refreshSnapshots();
@@ -877,7 +868,13 @@ export function ExplorerSurface({
     });
   }
 
-  const historicalEntries = sortedEntries.filter(isHistoricalExplorerEntry);
+  const historicalEntries = useMemo(
+    () =>
+      (historyEntriesPayload?.entries ?? [])
+        .filter((entry) => shouldDisplayExplorerEntry(entry, prefix))
+        .sort((left, right) => compareExplorerEntries(left, right, sortField, sortDirection)),
+    [historyEntriesPayload, prefix, sortDirection, sortField]
+  );
   const historicalEntryKeys = new Set(
     historicalEntries
       .map(historicalRestoreRequest)
@@ -1136,6 +1133,129 @@ export function ExplorerSurface({
           <Text c="dimmed" size="sm">
             {helperText}
           </Text>
+          {showHistoricalEntries ? (
+            <Stack gap="xs">
+              <Text fw={600}>Recoverable deleted and moved files</Text>
+              {historyEntriesPayload == null ? (
+                <Text c="dimmed" size="sm">
+                  Loading historical entries…
+                </Text>
+              ) : historicalEntries.length === 0 ? (
+                <Text c="dimmed" size="sm">
+                  No recoverable deleted or moved files exist at this prefix.
+                </Text>
+              ) : (
+                <Table.ScrollContainer minWidth={640}>
+                  <Table striped highlightOnHover withTableBorder>
+                    <Table.Thead>
+                      <Table.Tr>
+                        {canRestoreHistory ? (
+                          <Table.Th>
+                            <Checkbox
+                              aria-label="Select all historical entries"
+                              checked={
+                                historicalEntryKeys.size > 0 &&
+                                selectedHistoricalEntryKeys.length === historicalEntryKeys.size
+                              }
+                              indeterminate={
+                                selectedHistoricalEntryKeys.length > 0 &&
+                                selectedHistoricalEntryKeys.length < historicalEntryKeys.size
+                              }
+                              disabled={historicalEntryKeys.size === 0}
+                              onChange={(event) => {
+                                setSelectedHistoricalEntries(
+                                  event.currentTarget.checked ? Array.from(historicalEntryKeys) : []
+                                );
+                              }}
+                            />
+                          </Table.Th>
+                        ) : null}
+                        <Table.Th>Path</Table.Th>
+                        <Table.Th>Type</Table.Th>
+                        <Table.Th>Removed</Table.Th>
+                        <Table.Th>Action</Table.Th>
+                      </Table.Tr>
+                    </Table.Thead>
+                    <Table.Tbody>
+                      {historicalEntries.map((entry) => {
+                        const isPrefix = isExplorerPrefix(entry);
+                        const isHistorical = isHistoricalExplorerEntry(entry);
+                        const displayPath = explorerDisplayPath(entry, prefix);
+                        const historicalRestoreEntry = historicalRestoreRequest(entry);
+                        return (
+                          <Table.Tr key={entry.path}>
+                            {canRestoreHistory ? (
+                              <Table.Td>
+                                {isHistorical && historicalRestoreEntry ? (
+                                  <Checkbox
+                                    aria-label={`Select historical entry ${displayPath}`}
+                                    checked={selectedHistoricalEntryKeySet.has(
+                                      historySelectionKey(historicalRestoreEntry)
+                                    )}
+                                    onChange={(event) =>
+                                      toggleHistoricalEntrySelection(
+                                        entry,
+                                        event.currentTarget.checked
+                                      )
+                                    }
+                                  />
+                                ) : null}
+                              </Table.Td>
+                            ) : null}
+                            <Table.Td>
+                              <Code>{displayPath}</Code>
+                            </Table.Td>
+                            <Table.Td>
+                              {isHistorical
+                                ? entry.moved_to_path
+                                  ? `moved to ${entry.moved_to_path}`
+                                  : "deleted"
+                                : "prefix"}
+                            </Table.Td>
+                            <Table.Td>
+                              {formatExplorerModifiedAt(entry.removed_at_unix)}
+                            </Table.Td>
+                            <Table.Td>
+                              {isPrefix ? (
+                                <Button
+                                  size="xs"
+                                  variant="light"
+                                  onClick={() => void readEntry(entry)}
+                                >
+                                  Open
+                                </Button>
+                              ) : (
+                                <Group gap="xs" wrap="nowrap">
+                                  <Button
+                                    size="xs"
+                                    variant="light"
+                                    loading={loading === `read-history:${entry.path}`}
+                                    onClick={() => void readHistoricalEntry(entry)}
+                                  >
+                                    Read
+                                  </Button>
+                                  {canRestoreHistory ? (
+                                    <Button
+                                      size="xs"
+                                      variant="default"
+                                      loading={loading === "restore-history"}
+                                      onClick={() => void restoreHistoricalEntries([entry])}
+                                    >
+                                      Restore
+                                    </Button>
+                                  ) : null}
+                                </Group>
+                              )}
+                            </Table.Td>
+                          </Table.Tr>
+                        );
+                      })}
+                    </Table.Tbody>
+                  </Table>
+                </Table.ScrollContainer>
+              )}
+            </Stack>
+          ) : null}
           {canRestoreHistory && selectedHistoricalEntryValues.length > 0 ? (
             <Group justify="space-between" align="center">
               <Text size="sm">
@@ -1164,27 +1284,6 @@ export function ExplorerSurface({
               <Table.Thead>
                 <Table.Tr>
                   {showThumbnails ? <Table.Th>Thumb</Table.Th> : null}
-                  {canSelectHistoricalEntries ? (
-                    <Table.Th>
-                      <Checkbox
-                        aria-label="Select all historical entries"
-                        checked={
-                          historicalEntryKeys.size > 0 &&
-                          selectedHistoricalEntryKeys.length === historicalEntryKeys.size
-                        }
-                        indeterminate={
-                          selectedHistoricalEntryKeys.length > 0 &&
-                          selectedHistoricalEntryKeys.length < historicalEntryKeys.size
-                        }
-                        disabled={historicalEntryKeys.size === 0}
-                        onChange={(event) => {
-                          setSelectedHistoricalEntries(
-                            event.currentTarget.checked ? Array.from(historicalEntryKeys) : []
-                          );
-                        }}
-                      />
-                    </Table.Th>
-                  ) : null}
                   <Table.Th>
                     {renderExplorerHeader("Path", "path", sortField, sortDirection, toggleSort)}
                   </Table.Th>
@@ -1209,10 +1308,8 @@ export function ExplorerSurface({
               <Table.Tbody>
                 {sortedEntries.map((entry) => {
                   const isPrefix = isExplorerPrefix(entry);
-                  const isHistorical = isHistoricalExplorerEntry(entry);
                   const displayPath = explorerDisplayPath(entry, prefix);
                   const historyTargetKey = normalizeExplorerPath(entry.path, isPrefix);
-                  const historicalRestoreEntry = historicalRestoreRequest(entry);
                   const browserMediaIndex = isPrefix ? null : browserMediaIndexByPath.get(entry.path) ?? null;
                   const browserMediaItem =
                     browserMediaIndex === null ? null : browserMediaItems[browserMediaIndex] ?? null;
@@ -1231,63 +1328,18 @@ export function ExplorerSurface({
                           />
                         </Table.Td>
                       ) : null}
-                      {canSelectHistoricalEntries ? (
-                        <Table.Td>
-                          {isHistorical && historicalRestoreEntry ? (
-                            <Checkbox
-                              aria-label={`Select historical entry ${displayPath}`}
-                              checked={selectedHistoricalEntryKeySet.has(
-                                historySelectionKey(historicalRestoreEntry)
-                              )}
-                              onChange={(event) =>
-                                toggleHistoricalEntrySelection(
-                                  entry,
-                                  event.currentTarget.checked
-                                )
-                              }
-                            />
-                          ) : null}
-                        </Table.Td>
-                      ) : null}
                       <Table.Td>
                         <Code>{displayPath}</Code>
                       </Table.Td>
                       <Table.Td>
-                        {isHistorical
-                          ? entry.moved_to_path
-                            ? `moved to ${entry.moved_to_path}`
-                            : "deleted"
-                          : isPrefix
-                            ? "prefix"
-                            : entry.entry_type}
+                        {isPrefix ? "prefix" : entry.entry_type}
                       </Table.Td>
                       <Table.Td>{formatExplorerSize(isPrefix ? null : entry.size_bytes)}</Table.Td>
                       <Table.Td>
-                        {formatExplorerModifiedAt(entry.modified_at_unix ?? entry.removed_at_unix)}
+                        {formatExplorerModifiedAt(entry.modified_at_unix)}
                       </Table.Td>
                       <Table.Td>
-                        {isHistorical ? (
-                          <Group gap="xs" wrap="nowrap">
-                            <Button
-                              size="xs"
-                              variant="light"
-                              loading={loading === `read-history:${entry.path}`}
-                              onClick={() => void readHistoricalEntry(entry)}
-                            >
-                              Read
-                            </Button>
-                            {canRestoreHistory ? (
-                              <Button
-                                size="xs"
-                                variant="default"
-                                loading={loading === "restore-history"}
-                                onClick={() => void restoreHistoricalEntries([entry])}
-                              >
-                                Restore
-                              </Button>
-                            ) : null}
-                          </Group>
-                        ) : isPrefix ? (
+                        {isPrefix ? (
                           <Group gap="xs" wrap="nowrap">
                             <Button size="xs" variant="light" onClick={() => void readEntry(entry)}>
                               Open
@@ -1600,7 +1652,10 @@ function explorerServerSortOrder(
 }
 
 function isExplorerPrefix(entry: ExplorerEntry): boolean {
-  return entry.entry_type === "prefix" || (!isHistoricalExplorerEntry(entry) && entry.path.endsWith("/"));
+  return (
+    entry.entry_type === "prefix" ||
+    (!isHistoricalExplorerEntry(entry) && entry.path.endsWith("/"))
+  );
 }
 
 function isHistoricalExplorerEntry(entry: ExplorerEntry): boolean {
