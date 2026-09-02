@@ -6618,9 +6618,15 @@ impl PersistentStore {
             );
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             let before_binding = self.current_state_binding(current_key).await?;
-            let changed_current_paths = self
+            let mut changed_current_paths = self
                 .sync_current_state_for_key_from_index(current_key, &index)
                 .await?;
+            if preferred_logical_path.is_none() {
+                changed_current_paths.extend(
+                    self.remove_current_state_bindings_for_object_id(&object_id)
+                        .await?,
+                );
+            }
             if self.current_state_binding(current_key).await? != before_binding
                 || !changed_current_paths.is_empty()
             {
@@ -9242,11 +9248,7 @@ impl PersistentStore {
         index: &FileVersionIndex,
         preferred_record: &FileVersionRecord,
     ) -> Result<BTreeSet<String>> {
-        let Some(preferred_logical_path) = preferred_record.logical_path.as_deref() else {
-            return self
-                .remove_current_state_bindings_for_object_id(&index.object_id)
-                .await;
-        };
+        let preferred_logical_path = preferred_record.logical_path.as_deref().unwrap_or(key);
         let expected_entry = CurrentObjectEntry {
             manifest_hash: preferred_record.manifest_hash.clone(),
             object_id: index.object_id.clone(),

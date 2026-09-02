@@ -1105,7 +1105,7 @@ run_on_all_metadata_backends!(
     object_id_tombstone_cleans_all_stale_current_bindings_turso
 );
 
-async fn object_id_missing_logical_path_cleans_current_bindings_impl(backend: StorageTestBackend) {
+async fn object_id_missing_logical_path_keeps_current_binding_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend
         .init_store("object-id-missing-logical-path-current-bindings")
         .await;
@@ -1141,9 +1141,9 @@ async fn object_id_missing_logical_path_cleans_current_bindings_impl(backend: St
         .await
         .unwrap();
 
-    // Legacy replicated records can lack a canonical logical path. Keeping
-    // either binding would make identity-addressed mutations choose an
-    // arbitrary path, so reconciliation must remove every current projection.
+    // A generic synchronization path must preserve the caller's current
+    // projection for legacy records without a logical path, while still
+    // removing duplicate bindings that would make identity lookup ambiguous.
     store
         .upsert_current_object(stale_path, current_entry)
         .await
@@ -1152,15 +1152,14 @@ async fn object_id_missing_logical_path_cleans_current_bindings_impl(backend: St
         .sync_current_state_for_key_from_index(current_path, &index)
         .await
         .unwrap();
-    assert!(changed_paths.contains(current_path));
     assert!(changed_paths.contains(stale_path));
-    assert_eq!(changed_paths.len(), 2);
+    assert_eq!(changed_paths.len(), 1);
     assert!(
         store
             .current_object_entry(current_path)
             .await
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert!(
         store
@@ -1169,12 +1168,13 @@ async fn object_id_missing_logical_path_cleans_current_bindings_impl(backend: St
             .unwrap()
             .is_none()
     );
-    assert!(
+    assert_eq!(
         store
             .current_path_for_object_id(&created.object_id)
             .await
             .unwrap()
-            .is_none()
+            .as_deref(),
+        Some(current_path)
     );
 
     drop(store);
@@ -1182,9 +1182,9 @@ async fn object_id_missing_logical_path_cleans_current_bindings_impl(backend: St
 }
 
 run_on_all_metadata_backends!(
-    object_id_missing_logical_path_cleans_current_bindings_impl,
-    object_id_missing_logical_path_cleans_current_bindings,
-    object_id_missing_logical_path_cleans_current_bindings_turso
+    object_id_missing_logical_path_keeps_current_binding_impl,
+    object_id_missing_logical_path_keeps_current_binding,
+    object_id_missing_logical_path_keeps_current_binding_turso
 );
 
 async fn metadata_import_records_duplicate_object_id_binding_cleanup_impl(
@@ -1255,6 +1255,94 @@ run_on_all_metadata_backends!(
     metadata_import_records_duplicate_object_id_binding_cleanup_impl,
     metadata_import_records_duplicate_object_id_binding_cleanup,
     metadata_import_records_duplicate_object_id_binding_cleanup_turso
+);
+
+async fn metadata_import_pathless_preferred_head_cleans_all_current_bindings_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend
+        .init_store("metadata-import-pathless-preferred-head-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("metadata-import-pathless-preferred-head-target")
+        .await;
+    let current_path = "replication/current.txt";
+    let stale_path = "replication/stale.txt";
+
+    let created = source
+        .put_object_versioned(
+            current_path,
+            Bytes::from_static(b"replicated legacy object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let current_entry = source
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut index = source
+        .load_version_index_by_object_id(&created.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let preferred_version_id = index.preferred_head_version_id.clone().unwrap();
+    index
+        .versions
+        .get_mut(&preferred_version_id)
+        .unwrap()
+        .logical_path = None;
+    source
+        .persist_version_index_by_object_id(&created.object_id, &index)
+        .await
+        .unwrap();
+    let bundle = source
+        .export_metadata_bundle(current_path, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Metadata import historically clears the projection when a replicated
+    // preferred head has no canonical path. Preserve that behavior even
+    // though generic synchronization now falls back to its caller's path.
+    target
+        .upsert_current_object(stale_path, current_entry)
+        .await
+        .unwrap();
+    assert!(target.import_metadata_bundle(&bundle).await.unwrap());
+    assert!(
+        target
+            .current_object_entry(current_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        target
+            .current_object_entry(stale_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        target
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    drop(source);
+    drop(target);
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_import_pathless_preferred_head_cleans_all_current_bindings_impl,
+    metadata_import_pathless_preferred_head_cleans_all_current_bindings,
+    metadata_import_pathless_preferred_head_cleans_all_current_bindings_turso
 );
 
 #[tokio::test]
