@@ -3622,9 +3622,10 @@ impl PersistentStore {
 
     /// Backfills the live namespace written before object identity became mandatory.
     ///
-    /// Startup work is deliberately bounded: existing current bindings need only a read-only
-    /// version-index existence check, while legacy version indexes are read in small pages only
-    /// when a binding has no object ID.
+    /// This is a one-time foreground migration: it scans the live namespace and legacy version
+    /// indexes before serving requests, so every current object has a durable identity from the
+    /// first post-upgrade request. The writes are idempotent; a restart before the completion
+    /// marker is recorded repeats the scan safely.
     /// Historical snapshots are normalized when they are read or rewritten instead of
     /// making startup walk every retained snapshot.
     async fn migrate_legacy_object_ids(&self) -> Result<()> {
