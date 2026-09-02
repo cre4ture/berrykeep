@@ -16183,7 +16183,7 @@ async fn restore_history_entries_response(
     }
 
     let mut restored_count = 0usize;
-    let mut responses = Vec::with_capacity(request.entries.len());
+    let mut responses = Vec::new();
 
     for entry in request.entries {
         let path = entry.path.trim().to_string();
@@ -20176,7 +20176,7 @@ async fn list_versions_admin(
 
 async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route: &str) -> Response {
     let store = read_store(state, "versions.list").await;
-    match store.list_versions_with_history(key).await {
+    match store.list_versions(key).await {
         Ok(Some(summary)) => {
             let store_index_inspector = match store.store_index_inspector().await {
                 Ok(inspector) => inspector,

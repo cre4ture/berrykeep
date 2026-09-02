@@ -1692,6 +1692,11 @@ test("client-ui explorer restores selected deleted and moved entries in one batc
     )
     .toEqual(["deleted.txt", "old-name.txt"]);
   await expect(page.getByText('"requested_count": 2')).toBeVisible();
+
+  await page.getByRole("textbox", { name: "Snapshot" }).click();
+  await page.getByRole("option", { name: "snapshot-001" }).click();
+  await page.getByRole("button", { name: "Load entries" }).click();
+  await expect(page.getByText("Recoverable deleted and moved files")).toBeHidden();
 });
 
 test("client-ui desktop navigation can collapse and scroll on short viewports", async ({ page }) => {

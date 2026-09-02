@@ -304,7 +304,14 @@ export function ExplorerSurface({
           sort: explorerServerSortOrder(targetSortField, targetSortDirection)
         }),
         includeHistorical && loadHistoricalEntries
-          ? loadHistoricalEntries(targetPrefix.trim(), depth)
+          ? loadHistoricalEntries(targetPrefix.trim(), depth).catch((historyError) => {
+              setError(
+                historyError instanceof Error
+                  ? `Failed loading historical entries: ${historyError.message}`
+                  : "Failed loading historical entries"
+              );
+              return null;
+            })
           : Promise.resolve(null)
       ]);
       setEntriesPayload(payload);
@@ -1027,7 +1034,13 @@ export function ExplorerSurface({
                 ]}
                 value={snapshotId ?? ""}
                 onChange={(value) => {
-                  setSnapshotId(value || null);
+                  const nextSnapshotId = value || null;
+                  setSnapshotId(nextSnapshotId);
+                  if (nextSnapshotId != null) {
+                    setShowHistoricalEntries(false);
+                    setHistoryEntriesPayload(null);
+                    setSelectedHistoricalEntries([]);
+                  }
                   setCurrentPage(1);
                 }}
               />
@@ -1056,7 +1069,7 @@ export function ExplorerSurface({
             {loadHistoricalEntries ? (
               <Switch
                 label="Show deleted or moved files"
-                checked={showHistoricalEntries}
+                checked={showHistoricalEntries && snapshotId == null}
                 disabled={snapshotId != null}
                 onChange={(event) => {
                   const checked = event.currentTarget.checked;
@@ -1134,7 +1147,7 @@ export function ExplorerSurface({
           <Text c="dimmed" size="sm">
             {helperText}
           </Text>
-          {showHistoricalEntries ? (
+          {showHistoricalEntries && snapshotId == null ? (
             <Stack gap="xs">
               <Text fw={600}>Recoverable deleted and moved files</Text>
               {historyEntriesPayload?.truncated ? (
