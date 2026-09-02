@@ -5001,7 +5001,7 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
 
     let moved = store
         .put_object_versioned(
-            "old-name.txt",
+            "moved/old-name.txt",
             Bytes::from_static(b"moved payload"),
             PutOptions::default(),
         )
@@ -5009,13 +5009,29 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         .unwrap();
     assert_eq!(
         store
-            .rename_object_path("old-name.txt", "new-name.txt", false)
+            .rename_object_path("moved/old-name.txt", "moved/new-name.txt", false)
             .await
             .unwrap(),
         PathMutationResult::Applied
     );
 
-    let history = store.list_recoverable_history_entries().await.unwrap();
+    let capped_history = store.list_recoverable_history_entries("", 1).await.unwrap();
+    assert!(capped_history.truncated);
+    assert_eq!(
+        capped_history
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["deleted.txt"]
+    );
+
+    let history = store
+        .list_recoverable_history_entries("", 100)
+        .await
+        .unwrap();
+    assert!(!history.truncated);
+    let history = history.entries;
     let deleted_entry = history
         .iter()
         .find(|entry| entry.path == "deleted.txt")
@@ -5026,11 +5042,20 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
 
     let moved_entry = history
         .iter()
-        .find(|entry| entry.path == "old-name.txt")
+        .find(|entry| entry.path == "moved/old-name.txt")
         .expect("old renamed path should remain recoverable");
-    assert_eq!(moved_entry.restore_source_path, "old-name.txt");
+    assert_eq!(moved_entry.restore_source_path, "moved/old-name.txt");
     assert_eq!(moved_entry.restore_version_id, moved.version_id);
-    assert_eq!(moved_entry.moved_to_path.as_deref(), Some("new-name.txt"));
+    assert_eq!(
+        moved_entry.moved_to_path.as_deref(),
+        Some("moved/new-name.txt")
+    );
+
+    let moved_history = store
+        .list_recoverable_history_entries("moved", 100)
+        .await
+        .unwrap();
+    assert_eq!(moved_history.entries, vec![moved_entry.clone()]);
 
     assert_eq!(
         store
@@ -5066,7 +5091,7 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
     );
     assert_eq!(
         store
-            .get_object("old-name.txt", None, None, ObjectReadMode::Preferred)
+            .get_object("moved/old-name.txt", None, None, ObjectReadMode::Preferred)
             .await
             .unwrap()
             .as_ref(),

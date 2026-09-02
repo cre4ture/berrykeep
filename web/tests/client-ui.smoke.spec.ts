@@ -2251,6 +2251,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         prefix: searchParams.get("prefix") ?? "",
         depth: Number(searchParams.get("depth") ?? "1"),
         entry_count: historyEntries.length,
+        truncated: false,
         entries: historyEntries
       });
     }

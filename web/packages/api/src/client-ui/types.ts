@@ -304,6 +304,7 @@ export type StoreHistoryResponse = {
   prefix: string;
   depth: number;
   entry_count: number;
+  truncated: boolean;
   entries: StoreHistoryEntry[];
 };
 

@@ -51,7 +51,6 @@ const WEB_LATENCY_PROBE_TIMEOUT_CONNECT_SLACK_MS: u64 = 3_000;
 const WEB_LATENCY_PROBE_TIMEOUT_PER_REQUEST_SLACK_MS: u64 = 3_000;
 const DEFAULT_DIAGNOSTIC_LOG_WINDOW_SECS: u64 = 3 * 60;
 const MAX_DIAGNOSTIC_LOG_WINDOW_SECS: u64 = 60 * 60;
-const HISTORY_RESTORE_BATCH_MAX_ENTRIES: usize = 100;
 const WEB_API_V1_PREFIX: &str = "/api/v1";
 const DIAGNOSTIC_CONTEXT_HEADER: &str = "x-ironmesh-diagnostic-context";
 pub const EMBEDDED_WEB_UI_SESSION_HEADER: &str = "x-ironmesh-web-ui-session";
@@ -851,14 +850,14 @@ struct WebStoreRestoreRequest {
     recursive: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct WebStoreHistoryRestoreEntry {
     path: String,
     restore_source_path: String,
     restore_version_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct WebStoreHistoryRestoreRequest {
     entries: Vec<WebStoreHistoryRestoreEntry>,
 }
@@ -3121,63 +3120,34 @@ async fn web_store_history_restore(
     State(state): State<WebState>,
     Json(request): Json<WebStoreHistoryRestoreRequest>,
 ) -> impl IntoResponse {
-    if request.entries.is_empty() || request.entries.len() > HISTORY_RESTORE_BATCH_MAX_ENTRIES {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            format!("entries must contain between 1 and {HISTORY_RESTORE_BATCH_MAX_ENTRIES} items"),
-        );
-    }
-    if request.entries.iter().any(|entry| {
-        entry.path.trim().is_empty()
-            || entry.restore_source_path.trim().is_empty()
-            || entry.restore_version_id.trim().is_empty()
-    }) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "path, restore_source_path, and restore_version_id must not be empty",
-        );
-    }
-
-    let client = current_client(&state).await;
-    let mut restored_count = 0usize;
-    let mut results = Vec::with_capacity(request.entries.len());
-
-    for entry in request.entries {
-        let path = entry.path.trim().to_string();
-        let restore_source_path = entry.restore_source_path.trim().to_string();
-        let restore_version_id = entry.restore_version_id.trim().to_string();
-        let status = match client
-            .restore_version_path(
-                restore_source_path.clone(),
-                restore_version_id.clone(),
-                path.clone(),
-                false,
-            )
-            .await
-        {
-            Ok(()) => {
-                restored_count = restored_count.saturating_add(1);
-                "restored"
+    let payload = match serde_json::to_vec(&request) {
+        Ok(payload) => payload,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    match current_sdk(&state)
+        .await
+        .request_relative_path(
+            Method::POST,
+            "/store/history/restore",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            Some(payload),
+        )
+        .await
+    {
+        Ok(response) => {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+                headers.insert(CONTENT_TYPE, value);
             }
-            Err(_) => "failed",
-        };
-        results.push(serde_json::json!({
-            "path": path,
-            "restore_source_path": restore_source_path,
-            "restore_version_id": restore_version_id,
-            "status": status,
-        }));
+            (response.status, headers, response.body).into_response()
+        }
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store history restore request failed",
+            err.to_string(),
+        ),
     }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "restored_count": restored_count,
-            "failed_count": results.len().saturating_sub(restored_count),
-            "entries": results,
-        })),
-    )
-        .into_response()
 }
 
 async fn web_gallery_map_clusters(

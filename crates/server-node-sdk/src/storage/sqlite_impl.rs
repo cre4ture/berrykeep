@@ -2015,6 +2015,42 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn list_keys_for_object_ids(
+        &self,
+        object_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
+        let object_ids = object_ids.to_vec();
+        self.read(move |db| {
+            let mut keys_by_object_id = HashMap::new();
+            for object_ids in object_ids.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
+                if object_ids.is_empty() {
+                    continue;
+                }
+                let placeholders = (1..=object_ids.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT object_id, key FROM current_objects WHERE object_id IN ({placeholders})"
+                );
+                let mut statement = db.prepare(&sql)?;
+                let rows = statement.query_map(params_from_iter(object_ids.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (object_id, key) = row?;
+                    keys_by_object_id
+                        .entry(object_id)
+                        .or_insert_with(Vec::new)
+                        .push(key);
+                }
+            }
+            Ok(keys_by_object_id)
+        })
+        .await
+    }
+
     async fn load_repair_attempts(
         &self,
     ) -> Result<std::collections::HashMap<String, RepairAttemptRecord>> {

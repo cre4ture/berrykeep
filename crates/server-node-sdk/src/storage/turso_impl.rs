@@ -363,6 +363,41 @@ impl MetadataStore for TursoMetadataStore {
         Ok(keys)
     }
 
+    async fn list_keys_for_object_ids(
+        &self,
+        object_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
+        let mut keys_by_object_id = HashMap::new();
+        for object_ids in object_ids.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
+            if object_ids.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=object_ids.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!(
+                        "SELECT object_id, key FROM current_objects WHERE object_id IN ({placeholders})"
+                    ),
+                    params_from_iter(object_ids.iter().cloned()),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let object_id = row_string(&row, 0, "current_objects.object_id")?;
+                let key = row_string(&row, 1, "current_objects.key")?;
+                keys_by_object_id
+                    .entry(object_id)
+                    .or_insert_with(Vec::new)
+                    .push(key);
+            }
+        }
+        Ok(keys_by_object_id)
+    }
+
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
         let mut rows = self
             .connection

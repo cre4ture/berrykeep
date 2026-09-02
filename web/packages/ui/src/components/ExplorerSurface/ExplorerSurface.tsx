@@ -102,6 +102,7 @@ export type ExplorerHistoryListResponse = {
   prefix: string;
   depth: number;
   entry_count: number;
+  truncated: boolean;
   entries: ExplorerEntry[];
 };
 
@@ -1136,6 +1137,12 @@ export function ExplorerSurface({
           {showHistoricalEntries ? (
             <Stack gap="xs">
               <Text fw={600}>Recoverable deleted and moved files</Text>
+              {historyEntriesPayload?.truncated ? (
+                <Alert color="yellow">
+                  Showing the first 1,000 recoverable entries for this prefix. Open a narrower
+                  prefix to find older paths.
+                </Alert>
+              ) : null}
               {historyEntriesPayload == null ? (
                 <Text c="dimmed" size="sm">
                   Loading historical entries…

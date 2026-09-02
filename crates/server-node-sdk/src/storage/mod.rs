@@ -1467,6 +1467,13 @@ pub struct RecoverableHistoryEntry {
     pub moved_to_path: Option<String>,
 }
 
+/// A bounded, prefix-scoped listing of recoverable history entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverableHistoryEntries {
+    pub entries: Vec<RecoverableHistoryEntry>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreferredHeadReason {
@@ -2534,6 +2541,10 @@ trait MetadataStore: Send + Sync {
     async fn count_current_objects(&self) -> Result<usize>;
     async fn list_current_object_keys(&self) -> Result<Vec<String>>;
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>>;
+    async fn list_keys_for_object_ids(
+        &self,
+        object_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>>;
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>>;
     async fn persist_repair_attempts(
         &self,
@@ -4987,15 +4998,28 @@ impl PersistentStore {
             .await
     }
 
-    /// Lists removed paths that still have a concrete non-tombstone version to
-    /// restore. A moved path is represented by its rename tombstone and links
-    /// back to the version that existed at the old path.
-    pub async fn list_recoverable_history_entries(&self) -> Result<Vec<RecoverableHistoryEntry>> {
-        let current_state = self.metadata_store.load_current_state().await?;
-        let current_paths: HashSet<String> = current_state.objects.into_keys().collect();
-        let mut entries = Vec::new();
+    /// Lists a bounded, prefix-scoped set of removed paths that still have a
+    /// concrete non-tombstone version to restore. A moved path is represented
+    /// by its rename tombstone and links back to the version at the old path.
+    ///
+    /// Version indexes do not yet have a dedicated tombstone projection, so
+    /// this walks their heads one at a time. Keeping the result prefix-scoped
+    /// and bounded prevents the interactive Explorer API from retaining the
+    /// complete version history in memory while it performs that scan.
+    pub async fn list_recoverable_history_entries(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryEntries> {
+        let prefix = prefix.trim().trim_matches('/');
+        let max_entries = max_entries.max(1);
+        let mut entries = BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
+        let mut truncated = false;
 
-        for index in self.load_all_version_indexes().await? {
+        for object_id in self.metadata_store.list_version_index_object_ids().await? {
+            let Some(index) = self.load_version_index_by_object_id(&object_id).await? else {
+                continue;
+            };
             let Some(preferred_head_id) = index
                 .preferred_head_version_id
                 .clone()
@@ -5019,7 +5043,13 @@ impl PersistentStore {
             else {
                 continue;
             };
-            if current_paths.contains(&path) {
+            if !recoverable_history_path_matches_prefix(&path, prefix)
+                || self
+                    .metadata_store
+                    .get_current_object(&path)
+                    .await?
+                    .is_some()
+            {
                 continue;
             }
 
@@ -5027,35 +5057,15 @@ impl PersistentStore {
                 tombstone.copied_from_object_id.as_deref(),
                 tombstone.copied_from_version_id.as_deref(),
             ) {
-                self.load_version_index_by_object_id(source_object_id)
-                    .await?
-                    .and_then(|source_index| {
-                        let source_record = source_index.versions.get(source_version_id)?;
-                        if source_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-                            return None;
-                        }
-
-                        let restore_source_path = source_record
-                            .logical_path
-                            .clone()
-                            .or_else(|| tombstone.copied_from_path.clone())
-                            .unwrap_or_else(|| path.clone());
-                        let moved_to_path = source_index
-                            .preferred_head_version_id
-                            .as_deref()
-                            .and_then(|version_id| source_index.versions.get(version_id))
-                            .filter(|record| record.manifest_hash != TOMBSTONE_MANIFEST_HASH)
-                            .and_then(|record| record.logical_path.clone())
-                            .filter(|candidate| {
-                                candidate != &path && current_paths.contains(candidate)
-                            });
-
-                        Some((
-                            restore_source_path,
-                            source_record.version_id.clone(),
-                            moved_to_path,
-                        ))
-                    })
+                let restore_source_path = tombstone
+                    .copied_from_path
+                    .clone()
+                    .unwrap_or_else(|| path.clone());
+                Some((
+                    restore_source_path,
+                    source_version_id.to_string(),
+                    Some(source_object_id.to_string()),
+                ))
             } else {
                 recoverable_tombstone_ancestor(&index, &tombstone).map(|record| {
                     (
@@ -5066,28 +5076,58 @@ impl PersistentStore {
                 })
             };
 
-            let Some((restore_source_path, restore_version_id, moved_to_path)) = restore_source
+            let Some((restore_source_path, restore_version_id, moved_source_object_id)) =
+                restore_source
             else {
                 continue;
             };
-
-            entries.push(RecoverableHistoryEntry {
-                path,
+            let entry = RecoverableHistoryEntry {
+                path: path.clone(),
                 restore_source_path,
                 restore_version_id,
                 removed_at_unix: tombstone.created_at_unix,
-                moved_to_path,
+                moved_to_path: None,
+            };
+            let should_replace = entries.get(&path).is_none_or(|(existing, _)| {
+                (entry.removed_at_unix, &entry.restore_version_id)
+                    > (existing.removed_at_unix, &existing.restore_version_id)
             });
+            if should_replace {
+                entries.insert(path, (entry, moved_source_object_id));
+            }
+            if entries.len() > max_entries {
+                entries.pop_last();
+                truncated = true;
+            }
         }
 
-        entries.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| right.removed_at_unix.cmp(&left.removed_at_unix))
-                .then_with(|| right.restore_version_id.cmp(&left.restore_version_id))
-        });
-        entries.dedup_by(|left, right| left.path == right.path);
-        Ok(entries)
+        let moved_source_object_ids = entries
+            .values()
+            .filter_map(|(_, object_id)| object_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let current_keys_by_object_id = self
+            .metadata_store
+            .list_keys_for_object_ids(&moved_source_object_ids)
+            .await?;
+        for (entry, moved_source_object_id) in entries.values_mut() {
+            let Some(moved_source_object_id) = moved_source_object_id else {
+                continue;
+            };
+            entry.moved_to_path = current_keys_by_object_id
+                .get(moved_source_object_id)
+                .into_iter()
+                .flatten()
+                .filter(|candidate| *candidate != &entry.path)
+                .min()
+                .cloned();
+        }
+
+        Ok(RecoverableHistoryEntries {
+            entries: entries.into_values().map(|(entry, _)| entry).collect(),
+            truncated,
+        })
     }
 
     async fn version_graph_summary_for_object_id(
@@ -10076,6 +10116,14 @@ fn recompute_head_version_ids(index: &FileVersionIndex) -> Vec<String> {
     let mut heads: Vec<String> = all_ids.into_iter().collect();
     heads.sort();
     heads
+}
+
+fn recoverable_history_path_matches_prefix(path: &str, prefix: &str) -> bool {
+    prefix.is_empty()
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|remainder| remainder.starts_with('/'))
 }
 
 fn recoverable_tombstone_ancestor(
