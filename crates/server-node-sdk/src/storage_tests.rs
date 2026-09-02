@@ -1024,6 +1024,76 @@ run_on_all_metadata_backends!(
     object_id_current_binding_recovers_stale_replication_paths_turso
 );
 
+async fn metadata_import_records_duplicate_object_id_binding_cleanup_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("metadata-import-duplicate-object-id-binding")
+        .await;
+    let stale_path = "replication/stale.txt";
+    let current_path = "replication/current.txt";
+
+    let created = store
+        .put_object_versioned(
+            stale_path,
+            Bytes::from_static(b"replicated object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rename_object_path(stale_path, current_path, false)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    let bundle = store
+        .export_metadata_bundle(current_path, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let current_entry = store
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .upsert_current_object(stale_path, current_entry)
+        .await
+        .unwrap();
+
+    // The bundle contains no new metadata. It must still report the duplicate
+    // binding cleanup as a change so replication publishes the namespace update.
+    assert!(store.import_metadata_bundle(&bundle).await.unwrap());
+    assert!(
+        store
+            .current_object_entry(stale_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(current_path)
+    );
+    assert!(!store.import_metadata_bundle(&bundle).await.unwrap());
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_import_records_duplicate_object_id_binding_cleanup_impl,
+    metadata_import_records_duplicate_object_id_binding_cleanup,
+    metadata_import_records_duplicate_object_id_binding_cleanup_turso
+);
+
 #[tokio::test]
 async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
     const LEGACY_OBJECT_ID: &str = "legacy-row-object-id";
@@ -1302,45 +1372,47 @@ async fn sqlite_migration_does_not_rewrite_indexes_with_persisted_object_ids() {
 }
 
 #[tokio::test]
-async fn sqlite_migration_splits_duplicate_legacy_current_object_ids() {
+async fn sqlite_migration_keeps_preferred_head_for_duplicate_legacy_current_object_ids() {
     let root = test_store_dir("duplicate-legacy-object-id-migration");
-    let state_dir = root.join("state");
-    fs::create_dir_all(&state_dir).await.unwrap();
-    let database_path = state_dir.join("metadata.sqlite");
+    let database_path = root.join("state/metadata.sqlite");
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let created = seeded
+        .put_object_versioned(
+            "legacy/a.txt",
+            Bytes::from_static(b"preferred history"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        seeded
+            .rename_object_path("legacy/a.txt", "legacy/b.txt", false)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    let original = seeded.list_versions("legacy/b.txt").await.unwrap().unwrap();
+    let original_version_count = original.versions.len();
+    let original_preferred_head = original.preferred_head_version_id.clone();
+    let current_entry = seeded
+        .current_object_entry("legacy/b.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    seeded
+        .upsert_current_object("legacy/a.txt", current_entry)
+        .await
+        .unwrap();
+    drop(seeded);
+
     {
         let database = rusqlite::Connection::open(&database_path).unwrap();
         database
-            .execute_batch(
-                r#"
-                CREATE TABLE metadata_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                INSERT INTO metadata_meta(key, value) VALUES('schema_version', '1');
-
-                CREATE TABLE current_objects (
-                    key TEXT PRIMARY KEY,
-                    manifest_hash TEXT NOT NULL,
-                    object_id TEXT NOT NULL
-                );
-
-                CREATE TABLE version_indexes (
-                    object_id TEXT PRIMARY KEY,
-                    index_json BLOB NOT NULL
-                );
-                "#,
-            )
-            .unwrap();
-        database
             .execute(
-                "INSERT INTO current_objects(key, manifest_hash, object_id) VALUES(?1, ?2, ?3)",
-                rusqlite::params!["legacy/a.txt", "manifest-a", "duplicate-object-id"],
-            )
-            .unwrap();
-        database
-            .execute(
-                "INSERT INTO current_objects(key, manifest_hash, object_id) VALUES(?1, ?2, ?3)",
-                rusqlite::params!["legacy/b.txt", "manifest-b", "duplicate-object-id"],
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
             )
             .unwrap();
     }
@@ -1350,21 +1422,23 @@ async fn sqlite_migration_splits_duplicate_legacy_current_object_ids() {
         .unwrap();
     let a = store.list_versions("legacy/a.txt").await.unwrap().unwrap();
     let b = store.list_versions("legacy/b.txt").await.unwrap().unwrap();
-    assert_eq!(a.object_id, "duplicate-object-id");
-    assert_ne!(a.object_id, b.object_id);
-    assert_eq!(
-        store
-            .current_path_for_object_id(&a.object_id)
-            .await
-            .unwrap(),
-        Some("legacy/a.txt".to_string())
-    );
+    assert_ne!(a.object_id, created.object_id);
+    assert_eq!(b.object_id, created.object_id);
+    assert_eq!(b.versions.len(), original_version_count);
+    assert_eq!(b.preferred_head_version_id, original_preferred_head);
     assert_eq!(
         store
             .current_path_for_object_id(&b.object_id)
             .await
             .unwrap(),
         Some("legacy/b.txt".to_string())
+    );
+    assert_eq!(
+        store
+            .current_path_for_object_id(&a.object_id)
+            .await
+            .unwrap(),
+        Some("legacy/a.txt".to_string())
     );
 
     drop(store);

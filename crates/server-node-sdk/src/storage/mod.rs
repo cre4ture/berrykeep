@@ -3642,18 +3642,38 @@ impl PersistentStore {
         let mut assignments = HashMap::with_capacity(current_objects.len());
         let mut claimed_object_ids = HashSet::with_capacity(current_objects.len());
 
+        let mut paths_by_existing_object_id = BTreeMap::<String, Vec<String>>::new();
         for (path, _) in &current_objects {
             let Some(object_id) = current_state
                 .object_ids
                 .get(*path)
                 .filter(|object_id| !object_id.trim().is_empty())
-                .filter(|object_id| claimed_object_ids.insert(object_id.to_string()))
-                .cloned()
             else {
                 continue;
             };
+            paths_by_existing_object_id
+                .entry(object_id.clone())
+                .or_default()
+                .push((**path).clone());
+        }
+
+        for (object_id, mut paths) in paths_by_existing_object_id {
+            paths.sort();
+            let preferred_path = self
+                .load_version_index_by_object_id(&object_id)
+                .await?
+                .and_then(|index| {
+                    index
+                        .preferred_head_version_id
+                        .as_ref()
+                        .and_then(|version_id| index.versions.get(version_id))
+                        .and_then(|record| record.logical_path.clone())
+                })
+                .filter(|path| paths.binary_search(path).is_ok());
+            let path = preferred_path.unwrap_or_else(|| paths[0].clone());
+            claimed_object_ids.insert(object_id.clone());
             assignments.insert(
-                (**path).clone(),
+                path,
                 ObjectIdMigrationAssignment {
                     object_id,
                     needs_version_backfill: false,
@@ -6576,24 +6596,15 @@ impl PersistentStore {
             );
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             let before_binding = self.current_state_binding(current_key).await?;
-            self.sync_current_state_for_key_from_index(current_key, &index)
+            let changed_current_paths = self
+                .sync_current_state_for_key_from_index(current_key, &index)
                 .await?;
-            let stale_keys: Vec<String> = self
-                .metadata_store
-                .list_keys_for_object_id(&object_id)
-                .await?
-                .into_iter()
-                .filter(|key| Some(key.as_str()) != preferred_logical_path)
-                .collect();
-            let removed_stale_keys = !stale_keys.is_empty();
-            for stale_key in stale_keys {
-                self.remove_current_object(&stale_key).await?;
-            }
             if self.current_state_binding(current_key).await? != before_binding
-                || removed_stale_keys
+                || !changed_current_paths.is_empty()
             {
                 current_state_changed = true;
                 snapshot_changed_paths.extend(touched_paths);
+                snapshot_changed_paths.extend(changed_current_paths);
             }
         } else if let Some(manifest_hash) = bundle.current_manifest_hash.as_ref() {
             let object_id = bundle.object_id.clone().unwrap_or_else(generate_object_id);
@@ -9121,13 +9132,14 @@ impl PersistentStore {
         &self,
         key: &str,
         index: &FileVersionIndex,
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<String>> {
         let current_object_id = self.object_id_for_key(key).await?;
         let Some(preferred_head) = &index.preferred_head_version_id else {
             if current_object_id.as_deref() == Some(index.object_id.as_str()) {
                 self.remove_current_object(key).await?;
+                return Ok(BTreeSet::from([key.to_string()]));
             }
-            return Ok(());
+            return Ok(BTreeSet::new());
         };
 
         let preferred_record = index.versions.get(preferred_head).with_context(|| {
@@ -9137,32 +9149,34 @@ impl PersistentStore {
         if preferred_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
             if current_object_id.as_deref() == Some(index.object_id.as_str()) {
                 self.remove_current_object(key).await?;
+                return Ok(BTreeSet::from([key.to_string()]));
             }
-            return Ok(());
+            return Ok(BTreeSet::new());
         }
 
         if current_object_id.is_none()
             || current_object_id.as_deref() == Some(index.object_id.as_str())
         {
-            self.bind_current_state_to_preferred_index_record(key, index, preferred_record)
-                .await?;
+            return self
+                .bind_current_state_to_preferred_index_record(key, index, preferred_record)
+                .await;
         }
-        Ok(())
+        Ok(BTreeSet::new())
     }
 
     async fn promote_current_state_for_key_from_index(
         &self,
         key: &str,
         index: &FileVersionIndex,
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<String>> {
         let Some(preferred_head) = &index.preferred_head_version_id else {
-            return Ok(());
+            return Ok(BTreeSet::new());
         };
         let preferred_record = index.versions.get(preferred_head).with_context(|| {
             format!("preferred head {preferred_head} missing in index for key={key}")
         })?;
         if preferred_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(());
+            return Ok(BTreeSet::new());
         }
 
         self.bind_current_state_to_preferred_index_record(key, index, preferred_record)
@@ -9174,7 +9188,12 @@ impl PersistentStore {
         key: &str,
         index: &FileVersionIndex,
         preferred_record: &FileVersionRecord,
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<String>> {
+        let expected_entry = CurrentObjectEntry {
+            manifest_hash: preferred_record.manifest_hash.clone(),
+            object_id: index.object_id.clone(),
+        };
+        let mut changed_paths = BTreeSet::new();
         let mut bound_paths = self
             .metadata_store
             .list_keys_for_object_id(&index.object_id)
@@ -9192,22 +9211,20 @@ impl PersistentStore {
                     bound_paths = ?bound_paths,
                     "skipping stale current-state binding for an already-bound object identity"
                 );
-                return Ok(());
+                return Ok(changed_paths);
             }
 
             for bound_path in bound_paths {
                 self.remove_current_object(&bound_path).await?;
+                changed_paths.insert(bound_path);
             }
         }
 
-        self.upsert_current_object(
-            key,
-            CurrentObjectEntry {
-                manifest_hash: preferred_record.manifest_hash.clone(),
-                object_id: index.object_id.clone(),
-            },
-        )
-        .await
+        if self.current_object_entry(key).await? != Some(expected_entry.clone()) {
+            self.upsert_current_object(key, expected_entry).await?;
+            changed_paths.insert(key.to_string());
+        }
+        Ok(changed_paths)
     }
 
     async fn apply_selected_replica_tombstone_current_state(
