@@ -5015,23 +5015,7 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         PathMutationResult::Applied
     );
 
-    let capped_history = store.list_recoverable_history_entries("", 1).await.unwrap();
-    assert!(capped_history.truncated);
-    assert_eq!(
-        capped_history
-            .entries
-            .iter()
-            .map(|entry| entry.path.as_str())
-            .collect::<Vec<_>>(),
-        vec!["deleted.txt"]
-    );
-
-    let history = store
-        .list_recoverable_history_entries("", 100)
-        .await
-        .unwrap();
-    assert!(!history.truncated);
-    let history = history.entries;
+    let history = store.list_recoverable_history_entries().await.unwrap();
     let deleted_entry = history
         .iter()
         .find(|entry| entry.path == "deleted.txt")
@@ -5050,12 +5034,6 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         moved_entry.moved_to_path.as_deref(),
         Some("moved/new-name.txt")
     );
-
-    let moved_history = store
-        .list_recoverable_history_entries("moved", 100)
-        .await
-        .unwrap();
-    assert_eq!(moved_history.entries, vec![moved_entry.clone()]);
 
     assert_eq!(
         store

@@ -1467,13 +1467,6 @@ pub struct RecoverableHistoryEntry {
     pub moved_to_path: Option<String>,
 }
 
-/// A bounded, prefix-scoped listing of recoverable history entries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoverableHistoryEntries {
-    pub entries: Vec<RecoverableHistoryEntry>,
-    pub truncated: bool,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreferredHeadReason {
@@ -4998,23 +4991,16 @@ impl PersistentStore {
             .await
     }
 
-    /// Lists a bounded, prefix-scoped set of removed paths that still have a
-    /// concrete non-tombstone version to restore. A moved path is represented
-    /// by its rename tombstone and links back to the version at the old path.
+    /// Lists removed paths that still have a concrete non-tombstone version to
+    /// restore. A moved path is represented by its rename tombstone and links
+    /// back to the version at the old path.
     ///
     /// Version indexes do not yet have a dedicated tombstone projection, so
-    /// this walks their heads one at a time. Keeping the result prefix-scoped
-    /// and bounded prevents the interactive Explorer API from retaining the
-    /// complete version history in memory while it performs that scan.
-    pub async fn list_recoverable_history_entries(
-        &self,
-        prefix: &str,
-        max_entries: usize,
-    ) -> Result<RecoverableHistoryEntries> {
-        let prefix = prefix.trim().trim_matches('/');
-        let max_entries = max_entries.max(1);
+    /// this walks their heads one at a time. The server caches this compact
+    /// tombstone summary once per namespace revision and applies Explorer
+    /// prefix/depth limits afterwards, avoiding a fresh store sweep per folder.
+    pub async fn list_recoverable_history_entries(&self) -> Result<Vec<RecoverableHistoryEntry>> {
         let mut entries = BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
-        let mut truncated = false;
 
         for object_id in self.metadata_store.list_version_index_object_ids().await? {
             let Some(index) = self.load_version_index_by_object_id(&object_id).await? else {
@@ -5043,12 +5029,11 @@ impl PersistentStore {
             else {
                 continue;
             };
-            if !recoverable_history_path_matches_prefix(&path, prefix)
-                || self
-                    .metadata_store
-                    .get_current_object(&path)
-                    .await?
-                    .is_some()
+            if self
+                .metadata_store
+                .get_current_object(&path)
+                .await?
+                .is_some()
             {
                 continue;
             }
@@ -5095,10 +5080,6 @@ impl PersistentStore {
             if should_replace {
                 entries.insert(path, (entry, moved_source_object_id));
             }
-            if entries.len() > max_entries {
-                entries.pop_last();
-                truncated = true;
-            }
         }
 
         let moved_source_object_ids = entries
@@ -5124,10 +5105,7 @@ impl PersistentStore {
                 .cloned();
         }
 
-        Ok(RecoverableHistoryEntries {
-            entries: entries.into_values().map(|(entry, _)| entry).collect(),
-            truncated,
-        })
+        Ok(entries.into_values().map(|(entry, _)| entry).collect())
     }
 
     async fn version_graph_summary_for_object_id(
@@ -10116,14 +10094,6 @@ fn recompute_head_version_ids(index: &FileVersionIndex) -> Vec<String> {
     let mut heads: Vec<String> = all_ids.into_iter().collect();
     heads.sort();
     heads
-}
-
-fn recoverable_history_path_matches_prefix(path: &str, prefix: &str) -> bool {
-    prefix.is_empty()
-        || path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|remainder| remainder.starts_with('/'))
 }
 
 fn recoverable_tombstone_ancestor(
