@@ -291,6 +291,37 @@ export type StoreEntry = StoreIndexEntry;
 
 export type StoreListResponse = StoreIndexResponse;
 
+export type StoreHistoryEntry = {
+  path: string;
+  entry_type: "prefix" | "historical";
+  restore_source_path?: string;
+  restore_version_id?: string;
+  removed_at_unix?: number;
+  moved_to_path?: string | null;
+};
+
+export type StoreHistoryResponse = {
+  prefix: string;
+  depth: number;
+  entry_count: number;
+  entries: StoreHistoryEntry[];
+};
+
+export type StoreHistoryRestoreEntry = Pick<
+  Required<StoreHistoryEntry>,
+  "path" | "restore_source_path" | "restore_version_id"
+>;
+
+export type StoreHistoryRestoreResponse = {
+  restored_count: number;
+  failed_count: number;
+  entries: Array<
+    StoreHistoryRestoreEntry & {
+      status: "restored" | "source_missing" | "target_exists" | "failed";
+    }
+  >;
+};
+
 export type {
   StoreIndexDeltaResponse,
   LogsResponse,

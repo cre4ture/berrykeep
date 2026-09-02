@@ -27,6 +27,9 @@ import type {
   LogsResponse,
   SnapshotSummary,
   StoreGetResponse,
+  StoreHistoryRestoreEntry,
+  StoreHistoryRestoreResponse,
+  StoreHistoryResponse,
   StoreListRequestOptions,
   StoreListResponse,
   StoreListView,
@@ -326,6 +329,29 @@ export async function listStoreEntries(
   appendLabelFilter(query, "require_labels", options.requireLabels);
   appendLabelFilter(query, "exclude_labels", options.excludeLabels);
   return fetchJson<StoreListResponse>(`${apiV1("/store/list")}?${query.toString()}`);
+}
+
+export async function listStoreHistoryEntries(
+  prefix?: string,
+  depth = 1
+): Promise<StoreHistoryResponse> {
+  const query = new URLSearchParams({
+    depth: String(Math.max(1, Math.floor(depth)))
+  });
+  if (prefix?.trim()) {
+    query.set("prefix", prefix.trim());
+  }
+  return fetchJson<StoreHistoryResponse>(`${apiV1("/store/history")}?${query.toString()}`);
+}
+
+export async function restoreStoreHistoryEntries(
+  entries: StoreHistoryRestoreEntry[]
+): Promise<StoreHistoryRestoreResponse> {
+  return fetchJson<StoreHistoryRestoreResponse>(apiV1("/store/history/restore"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ entries })
+  });
 }
 
 export async function setStoreMediaLabels(path: string, labels: string[]): Promise<void> {

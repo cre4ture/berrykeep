@@ -1452,6 +1452,21 @@ pub struct TombstonePathResult {
     pub version_id: String,
 }
 
+/// A removed path whose most recent recoverable version can still be restored.
+///
+/// Entries are derived from live tombstone indexes. They intentionally exclude
+/// paths that currently exist, so callers can safely present them as optional
+/// historical items instead of mixing them into the current object tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoverableHistoryEntry {
+    pub path: String,
+    pub restore_source_path: String,
+    pub restore_version_id: String,
+    pub removed_at_unix: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_to_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreferredHeadReason {
@@ -4970,6 +4985,109 @@ impl PersistentStore {
         };
         self.version_graph_summary_for_object_id(key, &object_id)
             .await
+    }
+
+    /// Lists removed paths that still have a concrete non-tombstone version to
+    /// restore. A moved path is represented by its rename tombstone and links
+    /// back to the version that existed at the old path.
+    pub async fn list_recoverable_history_entries(&self) -> Result<Vec<RecoverableHistoryEntry>> {
+        let current_state = self.metadata_store.load_current_state().await?;
+        let current_paths: HashSet<String> = current_state.objects.into_keys().collect();
+        let mut entries = Vec::new();
+
+        for index in self.load_all_version_indexes().await? {
+            let Some(preferred_head_id) = index
+                .preferred_head_version_id
+                .clone()
+                .or_else(|| choose_preferred_head(&index))
+            else {
+                continue;
+            };
+            let Some(tombstone) = index.versions.get(&preferred_head_id).cloned() else {
+                continue;
+            };
+            if tombstone.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            let Some(path) = tombstone
+                .logical_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            if current_paths.contains(&path) {
+                continue;
+            }
+
+            let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
+                tombstone.copied_from_object_id.as_deref(),
+                tombstone.copied_from_version_id.as_deref(),
+            ) {
+                self.load_version_index_by_object_id(source_object_id)
+                    .await?
+                    .and_then(|source_index| {
+                        let source_record = source_index.versions.get(source_version_id)?;
+                        if source_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                            return None;
+                        }
+
+                        let restore_source_path = source_record
+                            .logical_path
+                            .clone()
+                            .or_else(|| tombstone.copied_from_path.clone())
+                            .unwrap_or_else(|| path.clone());
+                        let moved_to_path = source_index
+                            .preferred_head_version_id
+                            .as_deref()
+                            .and_then(|version_id| source_index.versions.get(version_id))
+                            .filter(|record| record.manifest_hash != TOMBSTONE_MANIFEST_HASH)
+                            .and_then(|record| record.logical_path.clone())
+                            .filter(|candidate| {
+                                candidate != &path && current_paths.contains(candidate)
+                            });
+
+                        Some((
+                            restore_source_path,
+                            source_record.version_id.clone(),
+                            moved_to_path,
+                        ))
+                    })
+            } else {
+                recoverable_tombstone_ancestor(&index, &tombstone).map(|record| {
+                    (
+                        record.logical_path.unwrap_or_else(|| path.clone()),
+                        record.version_id,
+                        None,
+                    )
+                })
+            };
+
+            let Some((restore_source_path, restore_version_id, moved_to_path)) = restore_source
+            else {
+                continue;
+            };
+
+            entries.push(RecoverableHistoryEntry {
+                path,
+                restore_source_path,
+                restore_version_id,
+                removed_at_unix: tombstone.created_at_unix,
+                moved_to_path,
+            });
+        }
+
+        entries.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| right.removed_at_unix.cmp(&left.removed_at_unix))
+                .then_with(|| right.restore_version_id.cmp(&left.restore_version_id))
+        });
+        entries.dedup_by(|left, right| left.path == right.path);
+        Ok(entries)
     }
 
     async fn version_graph_summary_for_object_id(
@@ -9958,6 +10076,29 @@ fn recompute_head_version_ids(index: &FileVersionIndex) -> Vec<String> {
     let mut heads: Vec<String> = all_ids.into_iter().collect();
     heads.sort();
     heads
+}
+
+fn recoverable_tombstone_ancestor(
+    index: &FileVersionIndex,
+    tombstone: &FileVersionRecord,
+) -> Option<FileVersionRecord> {
+    let mut pending = tombstone.parent_version_ids.clone();
+    let mut visited = HashSet::new();
+
+    while let Some(version_id) = pending.pop() {
+        if !visited.insert(version_id.clone()) {
+            continue;
+        }
+        let Some(record) = index.versions.get(&version_id) else {
+            continue;
+        };
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            return Some(record.clone());
+        }
+        pending.extend(record.parent_version_ids.iter().cloned());
+    }
+
+    None
 }
 
 fn choose_preferred_head(index: &FileVersionIndex) -> Option<String> {

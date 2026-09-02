@@ -17,6 +17,9 @@ import type {
   AdminMediaCacheClearResponse,
   AdminStoreGetResponse,
   AdminSnapshotSummary,
+  AdminStoreHistoryRestoreEntry,
+  AdminStoreHistoryRestoreResponse,
+  AdminStoreHistoryResponse,
   AdminStoreListResponse,
   AdminVersionGraphResponse,
   AdminSessionStatus,
@@ -289,6 +292,37 @@ export async function listAdminStoreEntries(
   return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
     adminTokenOverride
   });
+}
+
+export async function listAdminStoreHistoryEntries(
+  prefix?: string,
+  depth = 1,
+  adminTokenOverride?: string
+): Promise<AdminStoreHistoryResponse> {
+  const query = new URLSearchParams({
+    depth: String(Math.max(1, Math.floor(depth)))
+  });
+  if (prefix?.trim()) {
+    query.set("prefix", prefix.trim());
+  }
+  return fetchAdminJson<AdminStoreHistoryResponse>(
+    `${apiV1("/auth/store/history")}?${query.toString()}`,
+    { adminTokenOverride }
+  );
+}
+
+export async function restoreAdminStoreHistoryEntries(
+  entries: AdminStoreHistoryRestoreEntry[],
+  adminTokenOverride?: string
+): Promise<AdminStoreHistoryRestoreResponse> {
+  return fetchAdminJson<AdminStoreHistoryRestoreResponse>(
+    apiV1("/auth/store/history/restore"),
+    {
+      method: "POST",
+      body: { entries },
+      adminTokenOverride
+    }
+  );
 }
 
 export async function setAdminStoreMediaLabels(

@@ -1168,6 +1168,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_ui_backend_lists_and_batch_restores_deleted_and_moved_paths() -> Result<()> {
+        let server_bind = "127.0.0.1:19424";
+        let web_bind = "127.0.0.1:19425";
+        let web_base = format!("http://{web_bind}");
+        let client = reqwest::Client::new();
+
+        let (mut server, mut web, _enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-history-server",
+            "web-ui-history-client",
+        )
+        .await?;
+
+        let result = async {
+            for (key, value) in [
+                ("deleted.txt", "deleted payload"),
+                ("old-name.txt", "moved payload"),
+            ] {
+                client
+                    .post(format!("{web_base}/api/store/put"))
+                    .json(&serde_json::json!({ "key": key, "value": value }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+
+            client
+                .delete(format!("{web_base}/api/store/delete"))
+                .query(&[("key", "deleted.txt")])
+                .send()
+                .await?
+                .error_for_status()?;
+            client
+                .post(format!("{web_base}/api/store/rename"))
+                .json(&serde_json::json!({
+                    "from_path": "old-name.txt",
+                    "to_path": "new-name.txt",
+                    "overwrite": false,
+                }))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let history: serde_json::Value = client
+                .get(format!("{web_base}/api/store/history"))
+                .query(&[("depth", 1)])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let entries = history
+                .get("entries")
+                .and_then(|value| value.as_array())
+                .context("history response should include entries")?;
+            let deleted = entries
+                .iter()
+                .find(|entry| entry.get("path").and_then(|value| value.as_str()) == Some("deleted.txt"))
+                .context("deleted entry should be listed")?;
+            let moved = entries
+                .iter()
+                .find(|entry| entry.get("path").and_then(|value| value.as_str()) == Some("old-name.txt"))
+                .context("moved entry should be listed")?;
+            assert_eq!(deleted.get("entry_type").and_then(|value| value.as_str()), Some("historical"));
+            assert_eq!(moved.get("moved_to_path").and_then(|value| value.as_str()), Some("new-name.txt"));
+
+            let batch_restore: serde_json::Value = client
+                .post(format!("{web_base}/api/store/history/restore"))
+                .json(&serde_json::json!({
+                    "entries": [
+                        {
+                            "path": deleted["path"],
+                            "restore_source_path": deleted["restore_source_path"],
+                            "restore_version_id": deleted["restore_version_id"],
+                        },
+                        {
+                            "path": moved["path"],
+                            "restore_source_path": moved["restore_source_path"],
+                            "restore_version_id": moved["restore_version_id"],
+                        },
+                    ],
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                batch_restore
+                    .get("restored_count")
+                    .and_then(|value| value.as_u64()),
+                Some(2)
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "deleted.txt").await?,
+                "deleted payload"
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "old-name.txt").await?,
+                "moved payload"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut web).await;
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
     async fn web_ui_backend_proxies_media_thumbnail_requests() -> Result<()> {
         let server_bind = "127.0.0.1:19386";
         let web_bind = "127.0.0.1:19387";

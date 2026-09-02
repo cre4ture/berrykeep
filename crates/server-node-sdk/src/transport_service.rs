@@ -20,16 +20,16 @@ use crate::{
     delete_upload_session, enroll_client_device, execute_replication_cleanup, get_media_thumbnail,
     get_media_thumbnail_response, get_object, get_object_response, get_store_index_delta,
     get_upload_session, head_object, health, latency_diagnostic, list_gallery_map_cluster_entries,
-    list_gallery_map_clusters, list_nodes, list_snapshots, list_store_index,
+    list_gallery_map_clusters, list_nodes, list_snapshots, list_store_history, list_store_index,
     list_store_index_response, list_tombstone_archives, list_versions, list_versions_response,
     placement_for_key, process_stats_current, process_stats_history, put_object,
     reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
     rendezvous_contact_config, renew_device_rendezvous_identity, replication, replication_plan,
     request_has_admin_auth, require_client_auth, require_client_or_admin_auth,
-    require_internal_caller, require_signed_client_auth, restore_snapshot_path,
-    restore_version_path, run_cleanup, run_tombstone_archive_purge, run_tombstone_archive_restore,
-    run_tombstone_compaction, s3_frontend, set_media_labels, start_upload_session,
-    storage_stats_current, storage_stats_history, store_index_delta_response,
+    require_internal_caller, require_signed_client_auth, restore_history_entries,
+    restore_snapshot_path, restore_version_path, run_cleanup, run_tombstone_archive_purge,
+    run_tombstone_archive_restore, run_tombstone_compaction, s3_frontend, set_media_labels,
+    start_upload_session, storage_stats_current, storage_stats_history, store_index_delta_response,
     transport_headers_from_response, trigger_replication_audit, upload_session_chunk,
     validate_client_auth_request, wait_for_store_index_change, web_maps, web_service_proxy,
 };
@@ -63,7 +63,11 @@ pub(super) fn normalize_public_api_v1_path_and_query(path_and_query: &str) -> Co
 fn is_reserved_store_api_path(path: &str) -> bool {
     matches!(
         path,
-        "/store/index" | "/store/index/delta" | "/store/index/changes/wait"
+        "/store/history"
+            | "/store/history/restore"
+            | "/store/index"
+            | "/store/index/delta"
+            | "/store/index/changes/wait"
     ) || path.starts_with("/store/uploads/")
 }
 
@@ -572,6 +576,8 @@ fn build_public_transport_router(state: ServerState) -> Router {
         )
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/history", get(list_store_history))
+        .route("/store/history/restore", post(restore_history_entries))
         .route("/store/index/delta", get(get_store_index_delta))
         .route("/gallery/map/clusters", get(list_gallery_map_clusters))
         .route(
@@ -846,6 +852,8 @@ mod tests {
         assert!(!is_streamed_object_read_path(
             "/store/index/changes/wait?since=1"
         ));
+        assert!(!is_streamed_object_read_path("/store/history"));
+        assert!(!is_streamed_object_read_path("/store/history/restore"));
         assert!(is_streamed_object_read_path(
             "/store/map/clusters?version=test"
         ));

@@ -1645,6 +1645,55 @@ test("client-ui explorer fetches result pages instead of the complete index", as
   expect(requestPages.every((request) => request.limit === "100")).toBe(true);
 });
 
+test("client-ui explorer restores selected deleted and moved entries in one batch", async ({
+  page
+}) => {
+  const mockState = await installClientUiMocks(page, {
+    historyEntries: [
+      {
+        path: "deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "deleted.txt",
+        restore_version_id: "version-deleted-001",
+        removed_at_unix: 1_712_345_600,
+        moved_to_path: null
+      },
+      {
+        path: "old-name.txt",
+        entry_type: "historical",
+        restore_source_path: "old-name.txt",
+        restore_version_id: "version-moved-001",
+        removed_at_unix: 1_712_345_601,
+        moved_to_path: "new-name.txt"
+      }
+    ]
+  });
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
+  await expect(page.getByRole("row", { name: /old-name\.txt/ })).toContainText(
+    "moved to new-name.txt"
+  );
+
+  await page.getByLabel("Select historical entry deleted.txt").check();
+  await page.getByLabel("Select historical entry old-name.txt").check();
+  await page.getByRole("button", { name: "Restore selected" }).click();
+
+  await expect
+    .poll(() =>
+      mockState
+        .restoredHistoryEntries()
+        .flat()
+        .map((entry) => entry.path)
+        .sort()
+    )
+    .toEqual(["deleted.txt", "old-name.txt"]);
+  await expect(page.getByText('"requested_count": 2')).toBeVisible();
+});
+
 test("client-ui desktop navigation can collapse and scroll on short viewports", async ({ page }) => {
   test.setTimeout(45_000);
 
@@ -1724,6 +1773,7 @@ test("client-ui mobile drawer reveals and navigates its menu items", async ({ pa
 
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
+  historyEntries?: MockHistoryEntry[];
   cacheScope?: string | null;
   mapMetadataStatus?: number;
   mapMetadataCenter?: [number, number, number];
@@ -1732,6 +1782,15 @@ type InstallClientUiMocksOptions = {
   mapClusterRefreshDelayMs?: number;
   mapClusterEntriesDelayMs?: number;
   legacyGalleryMapApiOnly?: boolean;
+};
+
+type MockHistoryEntry = {
+  path: string;
+  entry_type: "historical";
+  restore_source_path: string;
+  restore_version_id: string;
+  removed_at_unix: number;
+  moved_to_path?: string | null;
 };
 
 type MockGalleryMapConfiguration = {
@@ -1774,6 +1833,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const diagnosticContexts = new Set<string>();
   let diagnosticContextRequestCount = 0;
   const storeEntries = options?.storeEntries ?? createMockStoreEntries();
+  let historyEntries = options?.historyEntries?.slice() ?? [];
   let cacheScope = options?.cacheScope === undefined ? "a".repeat(64) : options.cacheScope;
   let galleryOffline = false;
   let galleryStoreListRequestCount = 0;
@@ -1782,6 +1842,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   let galleryStoreListDelayMs = 0;
   const galleryStoreListDelayByMediaFilter = new Map<string, number>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
+  const restoredHistoryEntries: MockHistoryEntry[][] = [];
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
   const connectionRoutesPayload = {
     generated_at_unix_ms: 1_712_345_600_000,
@@ -2185,6 +2246,37 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       });
     }
 
+    if (pathname === apiV1("/store/history") && method === "GET") {
+      return json(route, {
+        prefix: searchParams.get("prefix") ?? "",
+        depth: Number(searchParams.get("depth") ?? "1"),
+        entry_count: historyEntries.length,
+        entries: historyEntries
+      });
+    }
+
+    if (pathname === apiV1("/store/history/restore") && method === "POST") {
+      const body = route.request().postDataJSON() as {
+        entries: Array<{
+          path: string;
+          restore_source_path: string;
+          restore_version_id: string;
+        }>;
+      };
+      const restoredPaths = new Set(body.entries.map((entry) => entry.path));
+      const restored = historyEntries.filter((entry) => restoredPaths.has(entry.path));
+      restoredHistoryEntries.push(restored);
+      historyEntries = historyEntries.filter((entry) => !restoredPaths.has(entry.path));
+      return json(route, {
+        restored_count: restored.length,
+        failed_count: body.entries.length - restored.length,
+        entries: body.entries.map((entry) => ({
+          ...entry,
+          status: restoredPaths.has(entry.path) ? "restored" : "failed"
+        }))
+      });
+    }
+
     if (pathname === apiV1("/maps/logical-file")) {
       const rangeHeader = route.request().headers().range;
       const commonHeaders = {
@@ -2556,6 +2648,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     diagnosticContexts: () => Array.from(diagnosticContexts),
     diagnosticContextRequestCount: () => diagnosticContextRequestCount,
     restoredVersions: () => restoredVersions.slice(),
+    restoredHistoryEntries: () => restoredHistoryEntries.slice(),
     galleryStoreListRequestCount: () => galleryStoreListRequestCount,
     replaceStoreEntries: (entries: MockStoreEntry[]) => {
       storeEntries.splice(0, storeEntries.length, ...entries);

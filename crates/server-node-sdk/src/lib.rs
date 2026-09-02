@@ -194,6 +194,7 @@ const DATA_SCRUB_HISTORY_RETENTION_SECS: u64 = 12 * 30 * 24 * 60 * 60;
 const MAX_DATA_SCRUB_HISTORY_LIMIT: usize = 4_096;
 const REPAIR_RUN_HISTORY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 const STORE_INDEX_CURSOR_DEFAULT_PAGE_SIZE: usize = 1_000;
+const HISTORY_RESTORE_BATCH_MAX_ENTRIES: usize = 100;
 const MAX_REPAIR_RUN_HISTORY_LIMIT: usize = 4_096;
 const ACTIVE_REPAIR_LIVE_LOG_LIMIT: usize = 1_024;
 const UPLOAD_SESSION_PERSIST_COALESCE_SECS: u64 = 5;
@@ -274,13 +275,13 @@ use storage::{
     MetadataDbLogicalDistribution, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
     ObjectVersionMetadataRecord, PairingAuthorizationRecord, PathMutationResult, PersistentStore,
-    PreferredHeadReason, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult, StoragePathStats,
-    StoragePoolConfig, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef,
-    VersionConsistencyState, grid_thumbnail_profile, media_cache_retry_due,
-    metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
-    thumbnail_profile_from_query,
+    PreferredHeadReason, PutOptions, ReconcileVersionEntry, RecoverableHistoryEntry,
+    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord,
+    S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
+    StoragePathStats, StoragePoolConfig, StorageStatsSample, StoreReadError,
+    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, grid_thumbnail_profile,
+    media_cache_retry_due, metadata_db_logical_table_count,
+    promote_cached_media_metadata_to_incomplete, thumbnail_profile_from_query,
 };
 
 tokio::task_local! {
@@ -7639,6 +7640,8 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/history", get(list_store_history))
+        .route("/store/history/restore", post(restore_history_entries))
         .route("/store/index/delta", get(get_store_index_delta))
         .route("/gallery/map/clusters", get(list_gallery_map_clusters))
         .route(
@@ -7750,6 +7753,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/scrub/run", post(trigger_data_scrub_public))
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
+        .route("/auth/store/history", get(list_store_history_admin))
+        .route(
+            "/auth/store/history/restore",
+            post(restore_history_entries_admin),
+        )
         .route("/auth/store/index/delta", get(get_store_index_delta_admin))
         .route(
             "/auth/gallery/map/clusters",
@@ -13284,6 +13292,61 @@ struct StoreIndexQuery {
     exclude_labels: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct StoreHistoryQuery {
+    prefix: Option<String>,
+    depth: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StoreHistoryEntryResponse {
+    path: String,
+    entry_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_to_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StoreHistoryResponse {
+    prefix: String,
+    depth: usize,
+    entry_count: usize,
+    entries: Vec<StoreHistoryEntryResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HistoryRestoreEntryRequest {
+    path: String,
+    restore_source_path: String,
+    restore_version_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HistoryRestoreRequest {
+    entries: Vec<HistoryRestoreEntryRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryRestoreEntryResponse {
+    path: String,
+    restore_source_path: String,
+    restore_version_id: String,
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryRestoreResponse {
+    restored_count: usize,
+    failed_count: usize,
+    entries: Vec<HistoryRestoreEntryResponse>,
+}
+
 fn store_index_label_filter(
     query: &StoreIndexQuery,
 ) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
@@ -15839,6 +15902,241 @@ async fn list_store_index_admin(
     }
 
     list_store_index_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_store_history(
+    State(state): State<ServerState>,
+    Query(query): Query<StoreHistoryQuery>,
+) -> Response {
+    list_store_history_response(&state, query).await
+}
+
+async fn list_store_history_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<StoreHistoryQuery>,
+) -> Response {
+    let action = "auth/store/history/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "prefix": query.prefix.clone(),
+            "depth": query.depth,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    list_store_history_response(&state, query).await
+}
+
+async fn list_store_history_response(state: &ServerState, query: StoreHistoryQuery) -> Response {
+    let prefix = query
+        .prefix
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    let depth = query.depth.unwrap_or(1).clamp(1, 64);
+    let entries = {
+        let store = read_store(state, "store_history.list").await;
+        store.list_recoverable_history_entries().await
+    };
+
+    match entries {
+        Ok(entries) => {
+            let entries = project_recoverable_history_entries(entries, &prefix, depth);
+            Json(StoreHistoryResponse {
+                prefix: prefix.clone(),
+                depth,
+                entry_count: entries.len(),
+                entries,
+            })
+            .into_response()
+        }
+        Err(err) => {
+            tracing::error!(error = %err, prefix = %prefix, depth, "failed to list recoverable history entries");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn project_recoverable_history_entries(
+    entries: Vec<RecoverableHistoryEntry>,
+    prefix: &str,
+    depth: usize,
+) -> Vec<StoreHistoryEntryResponse> {
+    let mut projected = BTreeMap::new();
+    let scoped_prefix = (!prefix.is_empty()).then(|| format!("{prefix}/"));
+
+    for entry in entries {
+        let normalized_path = entry.path.trim_matches('/');
+        let relative_path = match scoped_prefix.as_deref() {
+            None => normalized_path,
+            Some(scoped_prefix) => match normalized_path.strip_prefix(scoped_prefix) {
+                Some(relative_path) => relative_path,
+                None => continue,
+            },
+        };
+        let segments = relative_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            continue;
+        }
+
+        if segments.len() > depth {
+            let visible_path = segments[..depth].join("/");
+            let path = if prefix.is_empty() {
+                format!("{visible_path}/")
+            } else {
+                format!("{prefix}/{visible_path}/")
+            };
+            projected
+                .entry(path.clone())
+                .or_insert(StoreHistoryEntryResponse {
+                    path,
+                    entry_type: "prefix",
+                    restore_source_path: None,
+                    restore_version_id: None,
+                    removed_at_unix: None,
+                    moved_to_path: None,
+                });
+            continue;
+        }
+
+        projected.insert(
+            entry.path.clone(),
+            StoreHistoryEntryResponse {
+                path: entry.path,
+                entry_type: "historical",
+                restore_source_path: Some(entry.restore_source_path),
+                restore_version_id: Some(entry.restore_version_id),
+                removed_at_unix: Some(entry.removed_at_unix),
+                moved_to_path: entry.moved_to_path,
+            },
+        );
+    }
+
+    projected.into_values().collect()
+}
+
+async fn restore_history_entries(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<HistoryRestoreRequest>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint("restore_history_entries", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move { restore_history_entries_response(&state_for_request, request).await },
+    )
+    .await
+}
+
+async fn restore_history_entries_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<HistoryRestoreRequest>,
+) -> Response {
+    let action = "auth/store/history/restore";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "entries": request.entries.clone() }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    restore_history_entries_response(&state, request).await
+}
+
+async fn restore_history_entries_response(
+    state: &ServerState,
+    request: HistoryRestoreRequest,
+) -> Response {
+    if request.entries.is_empty() || request.entries.len() > HISTORY_RESTORE_BATCH_MAX_ENTRIES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if request.entries.iter().any(|entry| {
+        entry.path.trim().is_empty()
+            || entry.restore_source_path.trim().is_empty()
+            || entry.restore_version_id.trim().is_empty()
+    }) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let mut store = lock_store(state, "store_history.restore_batch").await;
+    let mut restored_count = 0usize;
+    let mut responses = Vec::with_capacity(request.entries.len());
+
+    for entry in request.entries {
+        let path = entry.path.trim().to_string();
+        let restore_source_path = entry.restore_source_path.trim().to_string();
+        let restore_version_id = entry.restore_version_id.trim().to_string();
+        let status = match store
+            .restore_version_path(&restore_source_path, &restore_version_id, &path, false)
+            .await
+        {
+            Ok(PathMutationResult::Applied) => {
+                restored_count = restored_count.saturating_add(1);
+                "restored"
+            }
+            Ok(PathMutationResult::SourceMissing) => "source_missing",
+            Ok(PathMutationResult::TargetExists) => "target_exists",
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %path,
+                    restore_source_path = %restore_source_path,
+                    restore_version_id = %restore_version_id,
+                    "failed restoring historical entry"
+                );
+                "failed"
+            }
+        };
+        responses.push(HistoryRestoreEntryResponse {
+            path,
+            restore_source_path,
+            restore_version_id,
+            status,
+        });
+    }
+    drop(store);
+
+    if restored_count > 0 {
+        publish_namespace_change(state);
+        request_local_availability_refresh(state);
+    }
+
+    let failed_count = responses.len().saturating_sub(restored_count);
+    (
+        StatusCode::OK,
+        Json(HistoryRestoreResponse {
+            restored_count,
+            failed_count,
+            entries: responses,
+        }),
+    )
+        .into_response()
 }
 
 async fn list_gallery_map_clusters(
@@ -19779,7 +20077,7 @@ async fn list_versions_admin(
 
 async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route: &str) -> Response {
     let store = read_store(state, "versions.list").await;
-    match store.list_versions(key).await {
+    match store.list_versions_with_history(key).await {
         Ok(Some(summary)) => {
             let store_index_inspector = match store.store_index_inspector().await {
                 Ok(inspector) => inspector,

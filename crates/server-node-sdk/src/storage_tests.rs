@@ -4981,6 +4981,107 @@ run_on_all_metadata_backends!(
     restore_version_same_path_creates_new_head_turso
 );
 
+async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("recoverable-history-entries").await;
+
+    let deleted = store
+        .put_object_versioned(
+            "deleted.txt",
+            Bytes::from_static(b"deleted payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("deleted.txt", PutOptions::default())
+        .await
+        .unwrap();
+
+    let moved = store
+        .put_object_versioned(
+            "old-name.txt",
+            Bytes::from_static(b"moved payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rename_object_path("old-name.txt", "new-name.txt", false)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+
+    let history = store.list_recoverable_history_entries().await.unwrap();
+    let deleted_entry = history
+        .iter()
+        .find(|entry| entry.path == "deleted.txt")
+        .expect("deleted path should remain recoverable");
+    assert_eq!(deleted_entry.restore_source_path, "deleted.txt");
+    assert_eq!(deleted_entry.restore_version_id, deleted.version_id);
+    assert_eq!(deleted_entry.moved_to_path, None);
+
+    let moved_entry = history
+        .iter()
+        .find(|entry| entry.path == "old-name.txt")
+        .expect("old renamed path should remain recoverable");
+    assert_eq!(moved_entry.restore_source_path, "old-name.txt");
+    assert_eq!(moved_entry.restore_version_id, moved.version_id);
+    assert_eq!(moved_entry.moved_to_path.as_deref(), Some("new-name.txt"));
+
+    assert_eq!(
+        store
+            .restore_version_path(
+                &deleted_entry.restore_source_path,
+                &deleted_entry.restore_version_id,
+                &deleted_entry.path,
+                false,
+            )
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    assert_eq!(
+        store
+            .restore_version_path(
+                &moved_entry.restore_source_path,
+                &moved_entry.restore_version_id,
+                &moved_entry.path,
+                false,
+            )
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    assert_eq!(
+        store
+            .get_object("deleted.txt", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"deleted payload"
+    );
+    assert_eq!(
+        store
+            .get_object("old-name.txt", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"moved payload"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    recoverable_history_entries_include_deleted_and_moved_paths_impl,
+    recoverable_history_entries_include_deleted_and_moved_paths,
+    recoverable_history_entries_include_deleted_and_moved_paths_turso
+);
+
 async fn restore_version_to_custom_target_uses_metadata_copy_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("restore-version-custom-target").await;
 
