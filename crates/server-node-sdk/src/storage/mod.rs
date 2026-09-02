@@ -3624,7 +3624,20 @@ impl PersistentStore {
             #[cfg(test)]
             data_scrub_run_test_hook: None,
         };
-        store.migrate_legacy_object_ids().await?;
+        let object_id_migration_started = Instant::now();
+        info!("starting legacy object ID migration");
+        if let Err(error) = store.migrate_legacy_object_ids().await {
+            warn!(
+                error = %error,
+                elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+                "legacy object ID migration failed; refusing to start with inconsistent identity metadata"
+            );
+            return Err(error);
+        }
+        info!(
+            elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+            "completed legacy object ID migration"
+        );
         store
             .backfill_gallery_labels_from_current_sidecars()
             .await?;
