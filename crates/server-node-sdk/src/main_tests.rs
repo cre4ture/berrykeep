@@ -17949,6 +17949,7 @@ async fn build_test_state(
             store_history_cache: Arc::new(std::sync::Mutex::new(
                 super::StoreHistoryCache::default(),
             )),
+            store_history_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<

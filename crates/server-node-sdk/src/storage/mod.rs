@@ -2454,6 +2454,14 @@ pub(crate) struct StoreIndexInspector {
     metadata_store: Arc<dyn MetadataStore>,
 }
 
+/// Detached access to the version-index metadata needed by Explorer's
+/// recoverable-history listing. It intentionally owns only clonable metadata
+/// handles, so callers can release the main store lock before a full scan.
+#[derive(Clone)]
+pub(crate) struct StoreHistoryInspector {
+    metadata_store: Arc<dyn MetadataStore>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ClusterReplicasPersister {
     metadata_store: Arc<dyn MetadataStore>,
@@ -3002,6 +3010,127 @@ impl StorageStatsCollector {
         self.metadata_store
             .prune_storage_stats_history_before(collected_before_unix)
             .await
+    }
+}
+
+impl StoreHistoryInspector {
+    fn new(metadata_store: Arc<dyn MetadataStore>) -> Self {
+        Self { metadata_store }
+    }
+
+    pub(crate) async fn list_recoverable_history_entries(
+        &self,
+    ) -> Result<Vec<RecoverableHistoryEntry>> {
+        let mut entries = BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
+
+        for object_id in self.metadata_store.list_version_index_object_ids().await? {
+            let Some(index) = self
+                .metadata_store
+                .load_version_index_by_object_id(&object_id)
+                .await?
+            else {
+                continue;
+            };
+            let Some(preferred_head_id) = index
+                .preferred_head_version_id
+                .clone()
+                .or_else(|| choose_preferred_head(&index))
+            else {
+                continue;
+            };
+            let Some(tombstone) = index.versions.get(&preferred_head_id).cloned() else {
+                continue;
+            };
+            if tombstone.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            let Some(path) = tombstone
+                .logical_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            if self
+                .metadata_store
+                .get_current_object(&path)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+
+            let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
+                tombstone.copied_from_object_id.as_deref(),
+                tombstone.copied_from_version_id.as_deref(),
+            ) {
+                let restore_source_path = tombstone
+                    .copied_from_path
+                    .clone()
+                    .unwrap_or_else(|| path.clone());
+                Some((
+                    restore_source_path,
+                    source_version_id.to_string(),
+                    Some(source_object_id.to_string()),
+                ))
+            } else {
+                recoverable_tombstone_ancestor(&index, &tombstone).map(|record| {
+                    (
+                        record.logical_path.unwrap_or_else(|| path.clone()),
+                        record.version_id,
+                        None,
+                    )
+                })
+            };
+
+            let Some((restore_source_path, restore_version_id, moved_source_object_id)) =
+                restore_source
+            else {
+                continue;
+            };
+            let entry = RecoverableHistoryEntry {
+                path: path.clone(),
+                restore_source_path,
+                restore_version_id,
+                removed_at_unix: tombstone.created_at_unix,
+                moved_to_path: None,
+            };
+            let should_replace = entries.get(&path).is_none_or(|(existing, _)| {
+                (entry.removed_at_unix, &entry.restore_version_id)
+                    > (existing.removed_at_unix, &existing.restore_version_id)
+            });
+            if should_replace {
+                entries.insert(path, (entry, moved_source_object_id));
+            }
+        }
+
+        let moved_source_object_ids = entries
+            .values()
+            .filter_map(|(_, object_id)| object_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let current_keys_by_object_id = self
+            .metadata_store
+            .list_keys_for_object_ids(&moved_source_object_ids)
+            .await?;
+        for (entry, moved_source_object_id) in entries.values_mut() {
+            let Some(moved_source_object_id) = moved_source_object_id else {
+                continue;
+            };
+            entry.moved_to_path = current_keys_by_object_id
+                .get(moved_source_object_id)
+                .into_iter()
+                .flatten()
+                .filter(|candidate| *candidate != &entry.path)
+                .min()
+                .cloned();
+        }
+
+        Ok(entries.into_values().map(|(entry, _)| entry).collect())
     }
 }
 
@@ -3806,6 +3935,10 @@ impl PersistentStore {
             self.storage_pool.clone(),
             self.metadata_store.clone(),
         ))
+    }
+
+    pub(crate) fn store_history_inspector(&self) -> StoreHistoryInspector {
+        StoreHistoryInspector::new(self.metadata_store.clone())
     }
 
     pub(crate) async fn query_gallery_index(
@@ -4989,123 +5122,6 @@ impl PersistentStore {
         };
         self.version_graph_summary_for_object_id(key, &object_id)
             .await
-    }
-
-    /// Lists removed paths that still have a concrete non-tombstone version to
-    /// restore. A moved path is represented by its rename tombstone and links
-    /// back to the version at the old path.
-    ///
-    /// Version indexes do not yet have a dedicated tombstone projection, so
-    /// this walks their heads one at a time. The server caches this compact
-    /// tombstone summary once per namespace revision and applies Explorer
-    /// prefix/depth limits afterwards, avoiding a fresh store sweep per folder.
-    pub async fn list_recoverable_history_entries(&self) -> Result<Vec<RecoverableHistoryEntry>> {
-        let mut entries = BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
-
-        for object_id in self.metadata_store.list_version_index_object_ids().await? {
-            let Some(index) = self.load_version_index_by_object_id(&object_id).await? else {
-                continue;
-            };
-            let Some(preferred_head_id) = index
-                .preferred_head_version_id
-                .clone()
-                .or_else(|| choose_preferred_head(&index))
-            else {
-                continue;
-            };
-            let Some(tombstone) = index.versions.get(&preferred_head_id).cloned() else {
-                continue;
-            };
-            if tombstone.manifest_hash != TOMBSTONE_MANIFEST_HASH {
-                continue;
-            }
-
-            let Some(path) = tombstone
-                .logical_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(ToOwned::to_owned)
-            else {
-                continue;
-            };
-            if self
-                .metadata_store
-                .get_current_object(&path)
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-
-            let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
-                tombstone.copied_from_object_id.as_deref(),
-                tombstone.copied_from_version_id.as_deref(),
-            ) {
-                let restore_source_path = tombstone
-                    .copied_from_path
-                    .clone()
-                    .unwrap_or_else(|| path.clone());
-                Some((
-                    restore_source_path,
-                    source_version_id.to_string(),
-                    Some(source_object_id.to_string()),
-                ))
-            } else {
-                recoverable_tombstone_ancestor(&index, &tombstone).map(|record| {
-                    (
-                        record.logical_path.unwrap_or_else(|| path.clone()),
-                        record.version_id,
-                        None,
-                    )
-                })
-            };
-
-            let Some((restore_source_path, restore_version_id, moved_source_object_id)) =
-                restore_source
-            else {
-                continue;
-            };
-            let entry = RecoverableHistoryEntry {
-                path: path.clone(),
-                restore_source_path,
-                restore_version_id,
-                removed_at_unix: tombstone.created_at_unix,
-                moved_to_path: None,
-            };
-            let should_replace = entries.get(&path).is_none_or(|(existing, _)| {
-                (entry.removed_at_unix, &entry.restore_version_id)
-                    > (existing.removed_at_unix, &existing.restore_version_id)
-            });
-            if should_replace {
-                entries.insert(path, (entry, moved_source_object_id));
-            }
-        }
-
-        let moved_source_object_ids = entries
-            .values()
-            .filter_map(|(_, object_id)| object_id.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let current_keys_by_object_id = self
-            .metadata_store
-            .list_keys_for_object_ids(&moved_source_object_ids)
-            .await?;
-        for (entry, moved_source_object_id) in entries.values_mut() {
-            let Some(moved_source_object_id) = moved_source_object_id else {
-                continue;
-            };
-            entry.moved_to_path = current_keys_by_object_id
-                .get(moved_source_object_id)
-                .into_iter()
-                .flatten()
-                .filter(|candidate| *candidate != &entry.path)
-                .min()
-                .cloned();
-        }
-
-        Ok(entries.into_values().map(|(entry, _)| entry).collect())
     }
 
     async fn version_graph_summary_for_object_id(

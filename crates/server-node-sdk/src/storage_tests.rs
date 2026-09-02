@@ -5015,7 +5015,11 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         PathMutationResult::Applied
     );
 
-    let history = store.list_recoverable_history_entries().await.unwrap();
+    let history = store
+        .store_history_inspector()
+        .list_recoverable_history_entries()
+        .await
+        .unwrap();
     let deleted_entry = history
         .iter()
         .find(|entry| entry.path == "deleted.txt")

@@ -306,13 +306,19 @@ export function ExplorerSurface({
     const targetSnapshotId = options?.snapshotId === undefined ? snapshotId : options.snapshotId;
     const targetSortField = options?.sortField ?? sortField;
     const targetSortDirection = options?.sortDirection ?? sortDirection;
+    const targetHistoryPrefix = targetPrefix.trim().replace(/^\/+|\/+$/g, "");
+    const historicalEntriesEnabled =
+      (options?.includeHistorical ?? showHistoricalEntries) &&
+      targetSnapshotId == null &&
+      loadHistoricalEntries != null;
+    const historyMatchesTarget =
+      historyEntriesPayload?.prefix === targetHistoryPrefix && historyEntriesPayload.depth === depth;
     const includeHistorical =
-      options?.includeHistorical ??
-      (showHistoricalEntries && targetSnapshotId == null && loadHistoricalEntries != null);
+      historicalEntriesEnabled && (options?.includeHistorical ?? !historyMatchesTarget);
     if (includeHistorical) {
       setHistoryLoadState("loading");
       setHistoryLoadError(null);
-    } else {
+    } else if (!historicalEntriesEnabled) {
       setHistoryLoadState("idle");
       setHistoryLoadError(null);
     }
@@ -544,7 +550,7 @@ export function ExplorerSurface({
       setSelectedHistoricalEntries((current) =>
         current.filter((key) => !restoredEntryKeys.has(key))
       );
-      await refreshEntries();
+      await refreshEntries(undefined, { includeHistorical: true });
       if (failedCount > 0) {
         setError(
           `${failedCount} historical ${failedCount === 1 ? "item could" : "items could"} not be restored. Items with conflicts remain selected.`
@@ -595,7 +601,7 @@ export function ExplorerSurface({
         marker_key: markerKey,
         response: payload
       });
-      await refreshEntries();
+      await refreshEntries(undefined, { includeHistorical: showHistoricalEntries });
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed creating folder");
     } finally {
@@ -674,7 +680,7 @@ export function ExplorerSurface({
         recursive: isPrefix,
         response: payload
       });
-      await refreshEntries();
+      await refreshEntries(undefined, { includeHistorical: showHistoricalEntries });
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed deleting entry");
     } finally {
@@ -790,7 +796,7 @@ export function ExplorerSurface({
           response
         });
       }
-      await refreshEntries();
+      await refreshEntries(undefined, { includeHistorical: showHistoricalEntries });
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed renaming entry");
     } finally {
@@ -910,7 +916,7 @@ export function ExplorerSurface({
         target_path: targetPath,
         response
       });
-      await refreshEntries();
+      await refreshEntries(undefined, { includeHistorical: showHistoricalEntries });
       await loadVersionGraph(sourceKey);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed restoring version");
@@ -1064,7 +1070,9 @@ export function ExplorerSurface({
               <Button
                 leftSection={<IconRefresh size={16} />}
                 loading={loading === "entries"}
-                onClick={() => void refreshEntries()}
+                onClick={() =>
+                  void refreshEntries(undefined, { includeHistorical: showHistoricalEntries })
+                }
               >
                 Refresh entries
               </Button>
@@ -1115,7 +1123,14 @@ export function ExplorerSurface({
           </Grid>
           <Group justify="space-between" align="center">
             <Group gap="sm">
-              <Button onClick={() => void refreshEntries(undefined, { page: 1 })}>
+              <Button
+                onClick={() =>
+                  void refreshEntries(undefined, {
+                    page: 1,
+                    includeHistorical: showHistoricalEntries
+                  })
+                }
+              >
                 Load entries
               </Button>
               <Button

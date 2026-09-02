@@ -121,6 +121,7 @@ const STORE_INDEX_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_INDEX_PAGE_CACHE_MAX_SCOPES: usize = 2;
 const STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
+const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -343,6 +344,7 @@ struct ServerStorageRuntime {
     namespace_change_tx: watch::Sender<u64>,
     store_index_page_cache: Arc<StdMutex<StoreIndexPageCache>>,
     store_history_cache: Arc<StdMutex<StoreHistoryCache>>,
+    store_history_refresh_lock: Arc<Mutex<()>>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
@@ -7394,6 +7396,7 @@ async fn run_inner(
             namespace_change_tx: watch::channel(0).0,
             store_index_page_cache: Arc::new(StdMutex::new(StoreIndexPageCache::default())),
             store_history_cache: Arc::new(StdMutex::new(StoreHistoryCache::default())),
+            store_history_refresh_lock: Arc::new(Mutex::new(())),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
@@ -13897,6 +13900,9 @@ impl StoreHistoryCache {
     }
 
     fn insert(&mut self, namespace_change_sequence: u64, value: Arc<StoreHistoryCacheValue>) {
+        if value.entries.len() > STORE_HISTORY_CACHE_MAX_ENTRY_COUNT {
+            return;
+        }
         self.entry = Some(StoreHistoryCacheEntry {
             namespace_change_sequence,
             value,
@@ -15992,25 +15998,60 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
     let history = match cached {
         Some(cached) => cached,
         None => {
-            let result = {
-                let store = read_store(state, "store_history.list").await;
-                store.list_recoverable_history_entries().await
+            // Coalesce cache misses without holding the store read guard. The
+            // detached inspector owns the metadata handles required for the
+            // scan, allowing writes to progress while it traverses history.
+            let _refresh_guard = state.storage.store_history_refresh_lock.lock().await;
+            let namespace_change_sequence = state
+                .storage
+                .namespace_change_sequence
+                .load(Ordering::SeqCst);
+            let cached = match state.storage.store_history_cache.lock() {
+                Ok(cache) => cache.get(namespace_change_sequence),
+                Err(poisoned) => poisoned.into_inner().get(namespace_change_sequence),
             };
-            let result = match result {
-                Ok(result) => result,
-                Err(err) => {
-                    tracing::error!(error = %err, prefix = %prefix, depth, "failed to list recoverable history entries");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            if let Some(cached) = cached {
+                cached
+            } else {
+                let mut scanned_history = None;
+                for _ in 0..2 {
+                    let scan_change_sequence = state
+                        .storage
+                        .namespace_change_sequence
+                        .load(Ordering::SeqCst);
+                    let history_inspector = {
+                        let store = read_store(state, "store_history.clone_inspector").await;
+                        store.store_history_inspector()
+                    };
+                    let result = match history_inspector.list_recoverable_history_entries().await {
+                        Ok(result) => result,
+                        Err(err) => {
+                            tracing::error!(error = %err, prefix = %prefix, depth, "failed to list recoverable history entries");
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                    };
+                    let value = Arc::new(StoreHistoryCacheValue { entries: result });
+                    if state
+                        .storage
+                        .namespace_change_sequence
+                        .load(Ordering::SeqCst)
+                        == scan_change_sequence
+                    {
+                        match state.storage.store_history_cache.lock() {
+                            Ok(mut cache) => cache.insert(scan_change_sequence, Arc::clone(&value)),
+                            Err(poisoned) => poisoned
+                                .into_inner()
+                                .insert(scan_change_sequence, Arc::clone(&value)),
+                        }
+                        scanned_history = Some(value);
+                        break;
+                    }
+                    // A write raced this scan. Retry once so cache entries are
+                    // only published for a stable namespace revision.
+                    scanned_history = Some(value);
                 }
-            };
-            let cached = Arc::new(StoreHistoryCacheValue { entries: result });
-            match state.storage.store_history_cache.lock() {
-                Ok(mut cache) => cache.insert(namespace_change_sequence, Arc::clone(&cached)),
-                Err(poisoned) => poisoned
-                    .into_inner()
-                    .insert(namespace_change_sequence, Arc::clone(&cached)),
+                scanned_history.expect("history scan always records a result")
             }
-            cached
         }
     };
     let projection = project_recoverable_history_entries(
