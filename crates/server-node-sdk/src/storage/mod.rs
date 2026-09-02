@@ -4509,31 +4509,30 @@ impl PersistentStore {
             return Ok(None);
         };
 
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
         index.versions.remove(version_id);
-        if index.versions.is_empty() {
+        let mut changed_paths = if index.versions.is_empty() {
             self.delete_version_index_by_object_id(&object_id).await?;
-            if self.object_id_for_key(key).await?.as_deref() == Some(object_id.as_str()) {
-                self.remove_current_object(key).await?;
-            }
+            self.remove_current_state_bindings_for_object_id(&object_id)
+                .await?
         } else {
             index.head_version_ids = recompute_head_version_ids(&index);
             index.preferred_head_version_id = choose_preferred_head(&index);
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
             self.sync_current_state_for_key_from_index(key, &index)
-                .await?;
-        }
+                .await?
+        };
 
         self.delete_object_version_metadata(version_id).await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
             .await?;
 
@@ -5129,18 +5128,19 @@ impl PersistentStore {
                 );
             }
 
-            let touched_paths = BTreeSet::from([key.to_string()]);
+            let touched_paths = self
+                .current_state_touched_paths_for_object_id(&object_id, key)
+                .await?;
             let before_binding = self.current_state_binding(key).await?;
             if create_snapshot {
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             }
-            self.sync_current_state_for_key_from_index(key, &index)
+            let mut changed_paths = self
+                .sync_current_state_for_key_from_index(key, &index)
                 .await?;
-            let changed_paths = if self.current_state_binding(key).await? != before_binding {
-                touched_paths
-            } else {
-                BTreeSet::new()
-            };
+            if self.current_state_binding(key).await? != before_binding {
+                changed_paths.extend(touched_paths);
+            }
             let snapshot_id = if let Some(snapshot_id) = self
                 .persist_current_state_with_snapshot_batch(
                     changed_paths,
@@ -5206,7 +5206,9 @@ impl PersistentStore {
             copied_from_version_id: None,
             copied_from_path: None,
         };
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         if create_snapshot {
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
@@ -5226,13 +5228,12 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         let snapshot_id = if let Some(snapshot_id) = self
             .persist_current_state_with_snapshot_batch(changed_paths, create_snapshot, unix_ts())
             .await?
@@ -5272,7 +5273,9 @@ impl PersistentStore {
             return Ok(true);
         }
 
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         version.state = VersionConsistencyState::Confirmed;
@@ -5280,13 +5283,12 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
             .await?;
 
@@ -6362,7 +6364,9 @@ impl PersistentStore {
                 return Ok(resolved_version_id);
             }
 
-            let touched_paths = BTreeSet::from([key.to_string()]);
+            let touched_paths = self
+                .current_state_touched_paths_for_object_id(&object_id, key)
+                .await?;
             let before_binding = self.current_state_binding(key).await?;
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
@@ -6387,13 +6391,12 @@ impl PersistentStore {
 
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index)
+            let mut changed_paths = self
+                .sync_current_state_for_key_from_index(key, &index)
                 .await?;
-            let changed_paths = if self.current_state_binding(key).await? != before_binding {
-                touched_paths
-            } else {
-                BTreeSet::new()
-            };
+            if self.current_state_binding(key).await? != before_binding {
+                changed_paths.extend(touched_paths);
+            }
             self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
                 .await?;
 
@@ -6469,7 +6472,9 @@ impl PersistentStore {
             return Ok(resolved_version_id);
         }
 
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
@@ -6493,13 +6498,12 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
             .await?;
 
@@ -6747,9 +6751,13 @@ impl PersistentStore {
             copied_from_path: bundle.copied_from_path.clone(),
         };
 
-        self.prune_conflicting_replication_bundle_versions(key, &record)
+        let pruned_changed_paths = self
+            .prune_conflicting_replication_bundle_versions(key, &record)
             .await?;
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let mut touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
+        touched_paths.extend(pruned_changed_paths.iter().cloned());
         let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
@@ -6760,9 +6768,11 @@ impl PersistentStore {
                 index.preferred_head_version_id = choose_preferred_head(&index);
                 self.persist_version_index_by_object_id(&object_id, &index)
                     .await?;
-                let mut changed_paths = self
-                    .sync_current_state_for_key_from_index(key, &index)
-                    .await?;
+                let mut changed_paths = pruned_changed_paths.clone();
+                changed_paths.extend(
+                    self.sync_current_state_for_key_from_index(key, &index)
+                        .await?,
+                );
                 if bundle.selected_is_preferred_head
                     && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH
                 {
@@ -6786,9 +6796,11 @@ impl PersistentStore {
                 return Ok(resolved_version_id);
             }
 
-            let mut changed_paths = self
-                .sync_current_state_for_key_from_index(key, &index)
-                .await?;
+            let mut changed_paths = pruned_changed_paths.clone();
+            changed_paths.extend(
+                self.sync_current_state_for_key_from_index(key, &index)
+                    .await?,
+            );
             if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH
             {
                 self.apply_selected_replica_tombstone_current_state(key, bundle)
@@ -6813,9 +6825,11 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        let mut changed_paths = self
-            .sync_current_state_for_key_from_index(key, &index)
-            .await?;
+        let mut changed_paths = pruned_changed_paths;
+        changed_paths.extend(
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?,
+        );
         if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
             self.apply_selected_replica_tombstone_current_state(key, bundle)
                 .await?;
@@ -6855,7 +6869,9 @@ impl PersistentStore {
             return Ok(false);
         }
 
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         index.head_version_ids = recompute_head_version_ids(&index);
@@ -6863,13 +6879,12 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
             .await?;
 
@@ -7647,18 +7662,19 @@ impl PersistentStore {
                 );
             }
 
-            let touched_paths = BTreeSet::from([key.to_string()]);
+            let touched_paths = self
+                .current_state_touched_paths_for_object_id(&object_id, key)
+                .await?;
             let before_binding = self.current_state_binding(key).await?;
             if options.create_snapshot {
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             }
-            self.sync_current_state_for_key_from_index(key, &index)
+            let mut changed_paths = self
+                .sync_current_state_for_key_from_index(key, &index)
                 .await?;
-            let changed_paths = if self.current_state_binding(key).await? != before_binding {
-                touched_paths
-            } else {
-                BTreeSet::new()
-            };
+            if self.current_state_binding(key).await? != before_binding {
+                changed_paths.extend(touched_paths);
+            }
             let _snapshot_id = if self
                 .persist_current_state_with_snapshot_batch(
                     changed_paths,
@@ -7692,7 +7708,9 @@ impl PersistentStore {
             copied_from_version_id: None,
             copied_from_path: None,
         };
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         if options.create_snapshot {
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
@@ -7712,13 +7730,12 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(
             changed_paths,
             options.create_snapshot,
@@ -9113,6 +9130,21 @@ impl PersistentStore {
         })
     }
 
+    async fn current_state_touched_paths_for_object_id(
+        &self,
+        object_id: &str,
+        key: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut paths: BTreeSet<String> = self
+            .metadata_store
+            .list_keys_for_object_id(object_id)
+            .await?
+            .into_iter()
+            .collect();
+        paths.insert(key.to_string());
+        Ok(paths)
+    }
+
     async fn changed_paths_after_bindings(
         &self,
         before: &HashMap<String, (Option<String>, Option<String>)>,
@@ -9335,11 +9367,14 @@ impl PersistentStore {
         version_prefix: &str,
         create_snapshot: bool,
     ) -> Result<PathMutationResult> {
-        let touched_paths = BTreeSet::from([target_path.to_string()]);
         let target_object_id = self
             .object_id_for_key(target_path)
             .await?
             .unwrap_or_else(generate_object_id);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&target_object_id, target_path)
+            .await?;
+        let before_binding = self.current_state_binding(target_path).await?;
         let mut target_index = self
             .load_version_index_by_object_id(&target_object_id)
             .await?
@@ -9374,9 +9409,13 @@ impl PersistentStore {
         target_index.preferred_head_version_id = choose_preferred_head(&target_index);
         self.persist_version_index_by_object_id(&target_object_id, &target_index)
             .await?;
-        self.sync_current_state_for_key_from_index(target_path, &target_index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(target_path, &target_index)
             .await?;
-        self.persist_current_state_with_snapshot_batch(touched_paths, create_snapshot, unix_ts())
+        if self.current_state_binding(target_path).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
+        self.persist_current_state_with_snapshot_batch(changed_paths, create_snapshot, unix_ts())
             .await?;
 
         Ok(PathMutationResult::Applied)
@@ -9752,8 +9791,9 @@ impl PersistentStore {
         &mut self,
         key: &str,
         keep_record: &FileVersionRecord,
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<String>> {
         let mut indexes = self.load_all_version_indexes().await?;
+        let mut changed_paths = BTreeSet::new();
 
         for mut index in indexes.drain(..) {
             let Some(existing) = index.versions.get(&keep_record.version_id).cloned() else {
@@ -9775,19 +9815,22 @@ impl PersistentStore {
             if index.versions.is_empty() {
                 self.delete_version_index_by_object_id(&index.object_id)
                     .await?;
-                if self.object_id_for_key(key).await?.as_deref() == Some(index.object_id.as_str()) {
-                    self.remove_current_object(key).await?;
-                }
+                changed_paths.extend(
+                    self.remove_current_state_bindings_for_object_id(&index.object_id)
+                        .await?,
+                );
                 continue;
             }
 
             self.persist_version_index_by_object_id(&index.object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index)
-                .await?;
+            changed_paths.extend(
+                self.sync_current_state_for_key_from_index(key, &index)
+                    .await?,
+            );
         }
 
-        Ok(())
+        Ok(changed_paths)
     }
 
     async fn replica_tombstone_supersedes_current_key(
