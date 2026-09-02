@@ -1035,6 +1035,7 @@ struct UploadSessionChunkResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadSessionCompleteResponse {
+    #[serde(default)]
     object_id: String,
     snapshot_id: String,
     version_id: String,
@@ -14377,31 +14378,81 @@ async fn put_object_by_id(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(object_id): Path<String>,
-    Query(mut query): Query<PutObjectQuery>,
+    Query(query): Query<PutObjectQuery>,
     payload: Bytes,
 ) -> Response {
-    let key = match current_object_path_for_api(&state, &object_id).await {
-        Ok(key) => key,
-        Err(status) => return status.into_response(),
-    };
-    query.object_id = Some(object_id);
-    put_object(State(state), headers, Path(key), Query(query), payload).await
+    let fingerprint = client_mutation_operation_fingerprint(
+        "put_object_by_id",
+        &json!({
+            "object_id": object_id.clone(),
+            "query": query.clone(),
+            "payload_hash": client_mutation_operation_payload_hash(payload.as_ref()),
+        }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_request = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let key = match current_object_path_for_api(&state_for_request, &object_id).await {
+                Ok(key) => key,
+                Err(status) => return status.into_response(),
+            };
+            let mut query = query;
+            query.object_id = Some(object_id);
+            put_object_response(
+                &state_for_request,
+                &headers_for_request,
+                key,
+                query,
+                payload,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 async fn delete_object_by_id(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(object_id): Path<String>,
-    Query(mut query): Query<PutObjectQuery>,
+    Query(query): Query<PutObjectQuery>,
 ) -> Response {
-    let key = match current_object_path_for_api(&state, &object_id).await {
-        Ok(key) => key,
-        Err(status) => return status.into_response(),
-    };
-    query.object_id = Some(object_id);
-    delete_object(State(state), headers, Path(key), Query(query))
-        .await
-        .into_response()
+    let fingerprint = client_mutation_operation_fingerprint(
+        "delete_object_by_id",
+        &json!({
+            "object_id": object_id.clone(),
+            "query": query.clone(),
+        }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let key = match current_object_path_for_api(&state_for_request, &object_id).await {
+                Ok(key) => key,
+                Err(status) => return status.into_response(),
+            };
+            let mut query = query;
+            query.object_id = Some(object_id);
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            delete_object_response(&state_for_request, key, query, Some(actor))
+                .await
+                .into_response()
+        },
+    )
+    .await
 }
 
 async fn rename_object_by_id(

@@ -14227,6 +14227,170 @@ run_on_main_metadata_backends!(
     object_id_rename_replays_same_operation_id_turso
 );
 
+async fn object_id_delete_replays_same_operation_id_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-delete-idempotency-create").await;
+        store
+            .put_object_versioned(
+                "object-id-delete-idempotency.txt",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-object-id-delete"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-object-id-delete"),
+    );
+    let query = super::PutObjectQuery {
+        state: None,
+        parent: Vec::new(),
+        expected_revision: Some(created.version_id),
+        object_id: None,
+        version_id: None,
+        internal_replication: false,
+        recursive: false,
+    };
+
+    let first = super::delete_object_by_id(
+        State(state.clone()),
+        headers.clone(),
+        Path(created.object_id.clone()),
+        Query(query.clone()),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+
+    let replay = super::delete_object_by_id(
+        State(state.clone()),
+        headers,
+        Path(created.object_id),
+        Query(query),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_delete_replays_same_operation_id_impl,
+    object_id_delete_replays_same_operation_id,
+    object_id_delete_replays_same_operation_id_turso
+);
+
+async fn object_id_put_replays_same_operation_id_after_rename_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let source_path = "object-id-put-idempotency-source.txt";
+    let target_path = "object-id-put-idempotency-target.txt";
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-put-idempotency-create").await;
+        store
+            .put_object_versioned(
+                source_path,
+                Bytes::from_static(b"initial payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-object-id-put"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-object-id-put"),
+    );
+    let query = super::PutObjectQuery {
+        state: None,
+        parent: Vec::new(),
+        expected_revision: Some(created.version_id),
+        object_id: None,
+        version_id: None,
+        internal_replication: false,
+        recursive: false,
+    };
+
+    let first = super::put_object_by_id(
+        State(state.clone()),
+        headers.clone(),
+        Path(created.object_id.clone()),
+        Query(query.clone()),
+        Bytes::from_static(b"updated payload"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let updated: super::ObjectMutationResponse = serde_json::from_slice(&first_body).unwrap();
+
+    let rename_response = super::rename_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Json(super::ObjectRenameRequest {
+            to_path: target_path.to_string(),
+            overwrite: false,
+            expected_revision: Some(updated.revision),
+        }),
+    )
+    .await;
+    assert_eq!(rename_response.status(), StatusCode::NO_CONTENT);
+
+    let replay = super::put_object_by_id(
+        State(state.clone()),
+        headers,
+        Path(created.object_id),
+        Query(query),
+        Bytes::from_static(b"updated payload"),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_put_replays_same_operation_id_after_rename_impl,
+    object_id_put_replays_same_operation_id_after_rename,
+    object_id_put_replays_same_operation_id_after_rename_turso
+);
+
+#[test]
+fn upload_session_complete_response_accepts_legacy_payload_without_object_id() {
+    let response =
+        serde_json::from_value::<super::UploadSessionCompleteResponse>(serde_json::json!({
+            "snapshot_id": "snapshot-legacy",
+            "version_id": "version-legacy",
+            "manifest_hash": "manifest-legacy",
+            "state": "confirmed",
+            "new_chunks": 1,
+            "dedup_reused_chunks": 0,
+            "created_new_version": true,
+            "total_size_bytes": 1,
+        }))
+        .unwrap();
+    assert!(response.object_id.is_empty());
+    assert_eq!(response.version_id, "version-legacy");
+}
+
 async fn object_id_api_serializes_and_mutates_by_identity_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let original_path = "object-id-api.txt".to_string();
