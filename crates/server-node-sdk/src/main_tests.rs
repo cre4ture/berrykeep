@@ -101,6 +101,38 @@ fn store_history_cache_retains_entries() {
 }
 
 #[test]
+fn store_history_cache_removes_restored_entries() {
+    let mut cache = super::StoreHistoryCache::default();
+    cache.insert(Arc::new(super::StoreHistoryCacheValue::Entries(vec![
+        super::storage::RecoverableHistoryEntry {
+            path: "deleted.txt".to_string(),
+            restore_source_path: "deleted.txt".to_string(),
+            restore_version_id: "version-deleted".to_string(),
+            removed_at_unix: 1,
+            moved_to_path: None,
+        },
+        super::storage::RecoverableHistoryEntry {
+            path: "other.txt".to_string(),
+            restore_source_path: "other.txt".to_string(),
+            restore_version_id: "version-other".to_string(),
+            removed_at_unix: 2,
+            moved_to_path: None,
+        },
+    ])));
+
+    cache.remove_entries_for_paths(&std::collections::HashSet::from(
+        ["deleted.txt".to_string()],
+    ));
+
+    let cached = cache.get();
+    let Some(super::StoreHistoryCacheValue::Entries(entries)) = cached.as_deref() else {
+        panic!("history cache should retain the remaining entry");
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "other.txt");
+}
+
+#[test]
 fn store_history_cache_retains_an_oversized_history_marker() {
     let value = super::StoreHistoryCacheValue::Oversized {
         minimum_entry_count: super::STORE_HISTORY_CACHE_MAX_ENTRY_COUNT + 1,

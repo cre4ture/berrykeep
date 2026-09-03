@@ -13926,6 +13926,26 @@ impl StoreHistoryCache {
             value,
         });
     }
+
+    fn remove_entries_for_paths(&mut self, paths: &HashSet<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        let Some(entry) = self.entry.as_mut() else {
+            return;
+        };
+        let StoreHistoryCacheValue::Entries(entries) = Arc::make_mut(&mut entry.value) else {
+            return;
+        };
+        entries.retain(|entry| !paths.contains(&entry.path));
+    }
+}
+
+fn remove_restored_history_entries_from_cache(state: &ServerState, paths: &HashSet<String>) {
+    match state.storage.store_history_cache.lock() {
+        Ok(mut cache) => cache.remove_entries_for_paths(paths),
+        Err(poisoned) => poisoned.into_inner().remove_entries_for_paths(paths),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -16646,6 +16666,12 @@ async fn restore_history_entries_response(
     }
 
     if restored_count > 0 {
+        let restored_paths = responses
+            .iter()
+            .filter(|entry| entry.status == "restored")
+            .map(|entry| entry.path.clone())
+            .collect::<HashSet<_>>();
+        remove_restored_history_entries_from_cache(state, &restored_paths);
         publish_namespace_change(state);
         request_local_availability_refresh(state);
     }
