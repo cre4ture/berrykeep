@@ -14461,10 +14461,6 @@ async fn rename_object_by_id(
     Path(object_id): Path<String>,
     Json(request): Json<ObjectRenameRequest>,
 ) -> Response {
-    let from_path = match current_object_path_for_api(&state, &object_id).await {
-        Ok(path) => path,
-        Err(status) => return status.into_response(),
-    };
     let fingerprint = client_mutation_operation_fingerprint(
         "rename_object_by_id",
         &ObjectIdRenameOperationFingerprint {
@@ -14474,17 +14470,35 @@ async fn rename_object_by_id(
             expected_revision: request.expected_revision.as_deref(),
         },
     );
-    rename_object_path_with_fingerprint(
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
         &state,
         &headers,
-        PathMutationRequest {
-            from_path,
-            to_path: request.to_path,
-            overwrite: request.overwrite,
-            expected_revision: request.expected_revision,
-            object_id: Some(object_id),
-        },
+        requester_id,
         fingerprint,
+        move || async move {
+            let from_path = match current_object_path_for_api(&state_for_request, &object_id).await
+            {
+                Ok(path) => path,
+                Err(status) => return status.into_response(),
+            };
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            rename_object_path_response(
+                &state_for_request,
+                PathMutationRequest {
+                    from_path,
+                    to_path: request.to_path,
+                    overwrite: request.overwrite,
+                    expected_revision: request.expected_revision,
+                    object_id: Some(object_id),
+                },
+                Some(actor),
+            )
+            .await
+        },
     )
     .await
 }

@@ -14160,7 +14160,7 @@ run_on_main_metadata_backends!(
     copy_object_path_honors_object_id_and_expected_revision_turso
 );
 
-async fn object_id_rename_replays_same_operation_id_impl(backend: MainTestBackend) {
+async fn object_id_rename_replays_same_operation_id_after_delete_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let created = {
         let mut store = lock_store(&state, "tests.object-id-rename-idempotency-create").await;
@@ -14197,6 +14197,23 @@ async fn object_id_rename_replays_same_operation_id_impl(backend: MainTestBacken
     .await;
     assert_eq!(first.status(), StatusCode::NO_CONTENT);
 
+    let delete = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(delete.status(), StatusCode::CREATED);
+
     let replay = super::rename_object_by_id(
         State(state.clone()),
         headers,
@@ -14213,18 +14230,15 @@ async fn object_id_rename_replays_same_operation_id_impl(backend: MainTestBacken
             .await
             .unwrap()
     };
-    assert_eq!(
-        current_path.as_deref(),
-        Some("object-id-rename-idempotency-target.txt")
-    );
+    assert!(current_path.is_none());
 
     cleanup_test_state(&state).await;
 }
 
 run_on_main_metadata_backends!(
-    object_id_rename_replays_same_operation_id_impl,
-    object_id_rename_replays_same_operation_id,
-    object_id_rename_replays_same_operation_id_turso
+    object_id_rename_replays_same_operation_id_after_delete_impl,
+    object_id_rename_replays_same_operation_id_after_delete,
+    object_id_rename_replays_same_operation_id_after_delete_turso
 );
 
 async fn object_id_delete_replays_same_operation_id_impl(backend: MainTestBackend) {
