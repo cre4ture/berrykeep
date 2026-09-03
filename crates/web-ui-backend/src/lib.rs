@@ -3105,8 +3105,18 @@ async fn web_store_history(
         Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
     };
 
-    match current_sdk(&state).await.get_json_path(&request_path).await {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+    match current_sdk(&state)
+        .await
+        .request_relative_path(Method::GET, &request_path, Vec::new(), None)
+        .await
+    {
+        Ok(response) => {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+                headers.insert(CONTENT_TYPE, value);
+            }
+            (response.status, headers, response.body).into_response()
+        }
         Err(err) => logged_error_response(
             &state,
             StatusCode::BAD_GATEWAY,

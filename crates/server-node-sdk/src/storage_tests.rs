@@ -6925,7 +6925,7 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
 
     let history = match store
         .store_history_inspector()
-        .list_recoverable_history_entries_bounded(usize::MAX)
+        .list_recoverable_history_entries_bounded("", usize::MAX)
         .await
         .unwrap()
     {
@@ -6955,6 +6955,26 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
     assert_eq!(
         moved_entry.moved_to_path.as_deref(),
         Some("moved/new-name.txt")
+    );
+
+    let moved_history = match store
+        .store_history_inspector()
+        .list_recoverable_history_entries_bounded("moved", usize::MAX)
+        .await
+        .unwrap()
+    {
+        RecoverableHistoryEntries::Entries(entries) => entries,
+        RecoverableHistoryEntries::ExceedsLimit { .. } => {
+            panic!("unbounded recoverable history scan unexpectedly exceeded its limit")
+        }
+    };
+    assert_eq!(
+        moved_history
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["moved/old-name.txt"],
+        "history prefix scans must retain only their own subtree"
     );
 
     assert_eq!(

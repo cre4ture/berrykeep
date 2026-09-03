@@ -123,6 +123,7 @@ const STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
 const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
+const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -13903,41 +13904,47 @@ enum StoreHistoryCacheValue {
 
 #[derive(Debug)]
 struct StoreHistoryCacheEntry {
+    prefix: String,
     created_at: Instant,
     value: Arc<StoreHistoryCacheValue>,
 }
 
 #[derive(Debug, Default)]
 struct StoreHistoryCache {
-    entry: Option<StoreHistoryCacheEntry>,
+    entries: VecDeque<StoreHistoryCacheEntry>,
 }
 
 impl StoreHistoryCache {
-    fn get(&self) -> Option<Arc<StoreHistoryCacheValue>> {
-        self.entry.as_ref().and_then(|entry| {
-            (entry.created_at.elapsed() <= STORE_HISTORY_CACHE_TTL)
-                .then(|| Arc::clone(&entry.value))
-        })
+    fn get(&self, prefix: &str) -> Option<Arc<StoreHistoryCacheValue>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.prefix == prefix)
+            .and_then(|entry| {
+                (entry.created_at.elapsed() <= STORE_HISTORY_CACHE_TTL)
+                    .then(|| Arc::clone(&entry.value))
+            })
     }
 
-    fn insert(&mut self, value: Arc<StoreHistoryCacheValue>) {
-        self.entry = Some(StoreHistoryCacheEntry {
+    fn insert(&mut self, prefix: &str, value: Arc<StoreHistoryCacheValue>) {
+        self.entries.retain(|entry| entry.prefix != prefix);
+        self.entries.push_front(StoreHistoryCacheEntry {
+            prefix: prefix.to_string(),
             created_at: Instant::now(),
             value,
         });
+        self.entries.truncate(STORE_HISTORY_CACHE_MAX_SCOPES);
     }
 
     fn remove_entries_for_paths(&mut self, paths: &HashSet<String>) {
         if paths.is_empty() {
             return;
         }
-        let Some(entry) = self.entry.as_mut() else {
-            return;
-        };
-        let StoreHistoryCacheValue::Entries(entries) = Arc::make_mut(&mut entry.value) else {
-            return;
-        };
-        entries.retain(|entry| !paths.contains(&entry.path));
+        for entry in &mut self.entries {
+            let StoreHistoryCacheValue::Entries(entries) = Arc::make_mut(&mut entry.value) else {
+                continue;
+            };
+            entries.retain(|entry| !paths.contains(&entry.path));
+        }
     }
 }
 
@@ -16377,19 +16384,19 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
         .to_string();
     let depth = query.depth.unwrap_or(1).clamp(1, 64);
     let cached = match state.storage.store_history_cache.lock() {
-        Ok(cache) => cache.get(),
-        Err(poisoned) => poisoned.into_inner().get(),
+        Ok(cache) => cache.get(&prefix),
+        Err(poisoned) => poisoned.into_inner().get(&prefix),
     };
     let history = match cached {
         Some(cached) => cached,
         None => {
             // Coalesce cache misses without holding the store read guard. A
-            // short TTL intentionally tolerates concurrent namespace writes,
-            // while retaining the prefix-independent scan for navigation.
+            // short TTL intentionally tolerates concurrent namespace writes
+            // while retaining each recently visited prefix for navigation.
             let _refresh_guard = state.storage.store_history_refresh_lock.lock().await;
             let cached = match state.storage.store_history_cache.lock() {
-                Ok(cache) => cache.get(),
-                Err(poisoned) => poisoned.into_inner().get(),
+                Ok(cache) => cache.get(&prefix),
+                Err(poisoned) => poisoned.into_inner().get(&prefix),
             };
             if let Some(cached) = cached {
                 cached
@@ -16399,7 +16406,10 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                     store.store_history_inspector()
                 };
                 let value = match history_inspector
-                    .list_recoverable_history_entries_bounded(STORE_HISTORY_CACHE_MAX_ENTRY_COUNT)
+                    .list_recoverable_history_entries_bounded(
+                        &prefix,
+                        STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
+                    )
                     .await
                 {
                     Ok(RecoverableHistoryEntries::Entries(entries)) => {
@@ -16426,8 +16436,8 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                     );
                 }
                 match state.storage.store_history_cache.lock() {
-                    Ok(mut cache) => cache.insert(Arc::clone(&value)),
-                    Err(poisoned) => poisoned.into_inner().insert(Arc::clone(&value)),
+                    Ok(mut cache) => cache.insert(&prefix, Arc::clone(&value)),
+                    Err(poisoned) => poisoned.into_inner().insert(&prefix, Arc::clone(&value)),
                 }
                 value
             }

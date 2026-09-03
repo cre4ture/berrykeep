@@ -95,36 +95,43 @@ fn recoverable_history_projection_keeps_folder_markers_and_child_rollups() {
 #[test]
 fn store_history_cache_retains_entries() {
     let mut cache = super::StoreHistoryCache::default();
-    cache.insert(Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())));
+    cache.insert(
+        "docs",
+        Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())),
+    );
 
-    assert!(cache.get().is_some());
+    assert!(cache.get("docs").is_some());
+    assert!(cache.get("").is_none());
 }
 
 #[test]
 fn store_history_cache_removes_restored_entries() {
     let mut cache = super::StoreHistoryCache::default();
-    cache.insert(Arc::new(super::StoreHistoryCacheValue::Entries(vec![
-        super::storage::RecoverableHistoryEntry {
-            path: "deleted.txt".to_string(),
-            restore_source_path: "deleted.txt".to_string(),
-            restore_version_id: "version-deleted".to_string(),
-            removed_at_unix: 1,
-            moved_to_path: None,
-        },
-        super::storage::RecoverableHistoryEntry {
-            path: "other.txt".to_string(),
-            restore_source_path: "other.txt".to_string(),
-            restore_version_id: "version-other".to_string(),
-            removed_at_unix: 2,
-            moved_to_path: None,
-        },
-    ])));
+    cache.insert(
+        "",
+        Arc::new(super::StoreHistoryCacheValue::Entries(vec![
+            super::storage::RecoverableHistoryEntry {
+                path: "deleted.txt".to_string(),
+                restore_source_path: "deleted.txt".to_string(),
+                restore_version_id: "version-deleted".to_string(),
+                removed_at_unix: 1,
+                moved_to_path: None,
+            },
+            super::storage::RecoverableHistoryEntry {
+                path: "other.txt".to_string(),
+                restore_source_path: "other.txt".to_string(),
+                restore_version_id: "version-other".to_string(),
+                removed_at_unix: 2,
+                moved_to_path: None,
+            },
+        ])),
+    );
 
     cache.remove_entries_for_paths(&std::collections::HashSet::from(
         ["deleted.txt".to_string()],
     ));
 
-    let cached = cache.get();
+    let cached = cache.get("");
     let Some(super::StoreHistoryCacheValue::Entries(entries)) = cached.as_deref() else {
         panic!("history cache should retain the remaining entry");
     };
@@ -138,10 +145,10 @@ fn store_history_cache_retains_an_oversized_history_marker() {
         minimum_entry_count: super::STORE_HISTORY_CACHE_MAX_ENTRY_COUNT + 1,
     };
     let mut cache = super::StoreHistoryCache::default();
-    cache.insert(Arc::new(value));
+    cache.insert("", Arc::new(value));
 
     assert!(matches!(
-        cache.get().as_deref(),
+        cache.get("").as_deref(),
         Some(super::StoreHistoryCacheValue::Oversized { .. })
     ));
 }
@@ -16394,12 +16401,10 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         .unwrap()
         .get(&cached_key, cached_sequence)
         .expect("prepared page should be cached");
-    state
-        .storage
-        .store_history_cache
-        .lock()
-        .unwrap()
-        .insert(Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())));
+    state.storage.store_history_cache.lock().unwrap().insert(
+        "",
+        Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())),
+    );
     super::publish_namespace_change(&state);
     assert!(
         state
@@ -16407,7 +16412,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
             .store_history_cache
             .lock()
             .unwrap()
-            .get()
+            .get("")
             .is_some(),
         "ordinary namespace changes retain the short-lived recoverable-history cache"
     );

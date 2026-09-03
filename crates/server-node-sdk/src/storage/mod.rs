@@ -3127,8 +3127,10 @@ impl StoreHistoryInspector {
 
     pub(crate) async fn list_recoverable_history_entries_bounded(
         &self,
+        prefix: &str,
         max_entries: usize,
     ) -> Result<RecoverableHistoryEntries> {
+        let prefix = prefix.trim().trim_matches('/');
         let mut entries = BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
         let mut after_object_id = None;
 
@@ -3173,6 +3175,9 @@ impl StoreHistoryInspector {
                 else {
                     continue;
                 };
+                if !recoverable_history_path_matches_prefix(&path, prefix) {
+                    continue;
+                }
                 let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
                     tombstone.copied_from_object_id.as_deref(),
                     tombstone.copied_from_version_id.as_deref(),
@@ -3270,6 +3275,14 @@ impl StoreHistoryInspector {
             entries.into_values().map(|(entry, _)| entry).collect(),
         ))
     }
+}
+
+fn recoverable_history_path_matches_prefix(path: &str, prefix: &str) -> bool {
+    prefix.is_empty()
+        || path
+            .trim_matches('/')
+            .strip_prefix(prefix)
+            .is_some_and(|relative_path| relative_path.starts_with('/'))
 }
 
 impl StoreIndexInspector {
