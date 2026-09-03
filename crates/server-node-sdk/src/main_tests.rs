@@ -93,30 +93,18 @@ fn recoverable_history_projection_keeps_folder_markers_and_child_rollups() {
 }
 
 #[test]
-fn store_history_cache_retains_and_clears_entries() {
+fn store_history_cache_retains_entries() {
     let mut cache = super::StoreHistoryCache::default();
     cache.insert(Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())));
 
     assert!(cache.get().is_some());
-
-    cache.clear();
-    assert!(cache.get().is_none());
 }
 
 #[test]
 fn store_history_cache_retains_an_oversized_history_marker() {
-    let entry = super::storage::RecoverableHistoryEntry {
-        path: "deleted.txt".to_string(),
-        restore_source_path: "deleted.txt".to_string(),
-        restore_version_id: "version-1".to_string(),
-        removed_at_unix: 1,
-        moved_to_path: None,
+    let value = super::StoreHistoryCacheValue::Oversized {
+        minimum_entry_count: super::STORE_HISTORY_CACHE_MAX_ENTRY_COUNT + 1,
     };
-    let value = super::StoreHistoryCacheValue::from_entries(vec![
-        entry;
-        super::STORE_HISTORY_CACHE_MAX_ENTRY_COUNT
-            + 1
-    ]);
     let mut cache = super::StoreHistoryCache::default();
     cache.insert(Arc::new(value));
 
@@ -16403,17 +16391,6 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         .await
         .is_none(),
         "a mutation between cache lookup and response must reject the stale page"
-    );
-    super::publish_history_change(&state);
-    assert!(
-        state
-            .storage
-            .store_history_cache
-            .lock()
-            .unwrap()
-            .get()
-            .is_none(),
-        "history mutations must invalidate recoverable history"
     );
 
     {

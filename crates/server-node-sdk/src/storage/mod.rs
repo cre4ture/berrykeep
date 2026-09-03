@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
 const OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL: usize = 1_024;
+const STORE_HISTORY_VERSION_INDEX_BATCH_SIZE: usize = 256;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
@@ -3113,89 +3114,134 @@ impl StorageStatsCollector {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum RecoverableHistoryEntries {
+    Entries(Vec<RecoverableHistoryEntry>),
+    ExceedsLimit { minimum_entry_count: usize },
+}
+
 impl StoreHistoryInspector {
     fn new(metadata_store: Arc<dyn MetadataStore>) -> Self {
         Self { metadata_store }
     }
 
-    pub(crate) async fn list_recoverable_history_entries(
+    pub(crate) async fn list_recoverable_history_entries_bounded(
         &self,
-    ) -> Result<Vec<RecoverableHistoryEntry>> {
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryEntries> {
         let mut entries = BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
+        let mut after_object_id = None;
 
-        for index in self.metadata_store.load_all_version_indexes().await? {
-            let Some(preferred_head_id) = index
-                .preferred_head_version_id
-                .clone()
-                .or_else(|| choose_preferred_head(&index))
+        loop {
+            let indexes = self
+                .metadata_store
+                .load_version_indexes_after(
+                    after_object_id.as_deref(),
+                    STORE_HISTORY_VERSION_INDEX_BATCH_SIZE,
+                )
+                .await?;
+            let Some(last_object_id) = indexes
+                .last()
+                .map(|index| index.persisted_object_id.clone())
             else {
-                continue;
+                break;
             };
-            let Some(tombstone) = index.versions.get(&preferred_head_id).cloned() else {
-                continue;
-            };
-            if tombstone.manifest_hash != TOMBSTONE_MANIFEST_HASH {
-                continue;
-            }
+            let mut page_entries =
+                BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
 
-            let Some(path) = tombstone
-                .logical_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(ToOwned::to_owned)
-            else {
-                continue;
-            };
-            let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
-                tombstone.copied_from_object_id.as_deref(),
-                tombstone.copied_from_version_id.as_deref(),
-            ) {
-                let restore_source_path = tombstone
-                    .copied_from_path
+            for index in indexes {
+                let Some(preferred_head_id) = index
+                    .preferred_head_version_id
                     .clone()
-                    .unwrap_or_else(|| path.clone());
-                Some((
+                    .or_else(|| choose_preferred_head(&index))
+                else {
+                    continue;
+                };
+                let Some(tombstone) = index.versions.get(&preferred_head_id).cloned() else {
+                    continue;
+                };
+                if tombstone.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+                    continue;
+                }
+
+                let Some(path) = tombstone
+                    .logical_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(ToOwned::to_owned)
+                else {
+                    continue;
+                };
+                let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
+                    tombstone.copied_from_object_id.as_deref(),
+                    tombstone.copied_from_version_id.as_deref(),
+                ) {
+                    let restore_source_path = tombstone
+                        .copied_from_path
+                        .clone()
+                        .unwrap_or_else(|| path.clone());
+                    Some((
+                        restore_source_path,
+                        source_version_id.to_string(),
+                        Some(source_object_id.to_string()),
+                    ))
+                } else {
+                    recoverable_tombstone_ancestor(&index, &tombstone).map(|record| {
+                        (
+                            record.logical_path.unwrap_or_else(|| path.clone()),
+                            record.version_id,
+                            None,
+                        )
+                    })
+                };
+
+                let Some((restore_source_path, restore_version_id, moved_source_object_id)) =
+                    restore_source
+                else {
+                    continue;
+                };
+                let entry = RecoverableHistoryEntry {
+                    path: path.clone(),
                     restore_source_path,
-                    source_version_id.to_string(),
-                    Some(source_object_id.to_string()),
-                ))
-            } else {
-                recoverable_tombstone_ancestor(&index, &tombstone).map(|record| {
-                    (
-                        record.logical_path.unwrap_or_else(|| path.clone()),
-                        record.version_id,
-                        None,
-                    )
-                })
-            };
-
-            let Some((restore_source_path, restore_version_id, moved_source_object_id)) =
-                restore_source
-            else {
-                continue;
-            };
-            let entry = RecoverableHistoryEntry {
-                path: path.clone(),
-                restore_source_path,
-                restore_version_id,
-                removed_at_unix: tombstone.created_at_unix,
-                moved_to_path: None,
-            };
-            let should_replace = entries.get(&path).is_none_or(|(existing, _)| {
-                (entry.removed_at_unix, &entry.restore_version_id)
-                    > (existing.removed_at_unix, &existing.restore_version_id)
-            });
-            if should_replace {
-                entries.insert(path, (entry, moved_source_object_id));
+                    restore_version_id,
+                    removed_at_unix: tombstone.created_at_unix,
+                    moved_to_path: None,
+                };
+                let should_replace = page_entries.get(&path).is_none_or(|(existing, _)| {
+                    (entry.removed_at_unix, &entry.restore_version_id)
+                        > (existing.removed_at_unix, &existing.restore_version_id)
+                });
+                if should_replace {
+                    page_entries.insert(path, (entry, moved_source_object_id));
+                }
             }
-        }
 
-        let existing_paths = self
-            .metadata_store
-            .list_existing_current_object_keys(&entries.keys().cloned().collect::<Vec<_>>())
-            .await?;
-        entries.retain(|path, _| !existing_paths.contains(path));
+            let existing_paths = self
+                .metadata_store
+                .list_existing_current_object_keys(
+                    &page_entries.keys().cloned().collect::<Vec<_>>(),
+                )
+                .await?;
+            for (path, entry) in page_entries {
+                if existing_paths.contains(&path) {
+                    continue;
+                }
+                let should_replace = entries.get(&path).is_none_or(|(existing, _)| {
+                    (entry.0.removed_at_unix, &entry.0.restore_version_id)
+                        > (existing.removed_at_unix, &existing.restore_version_id)
+                });
+                if should_replace {
+                    entries.insert(path, entry);
+                }
+            }
+            if entries.len() > max_entries {
+                return Ok(RecoverableHistoryEntries::ExceedsLimit {
+                    minimum_entry_count: entries.len(),
+                });
+            }
+            after_object_id = Some(last_object_id);
+        }
 
         let moved_source_object_ids = entries
             .values()
@@ -3220,7 +3266,9 @@ impl StoreHistoryInspector {
                 .cloned();
         }
 
-        Ok(entries.into_values().map(|(entry, _)| entry).collect())
+        Ok(RecoverableHistoryEntries::Entries(
+            entries.into_values().map(|(entry, _)| entry).collect(),
+        ))
     }
 }
 

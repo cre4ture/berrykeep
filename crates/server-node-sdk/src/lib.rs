@@ -278,12 +278,12 @@ use storage::{
     MetadataDbLogicalDistribution, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
     ObjectVersionMetadataRecord, PairingAuthorizationRecord, PathMutationResult, PersistentStore,
-    PreferredHeadReason, PutOptions, ReconcileVersionEntry, RecoverableHistoryEntry,
-    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord,
-    S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
-    StoragePathStats, StoragePoolConfig, StorageStatsSample, StoreReadError,
-    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, grid_thumbnail_profile,
-    media_cache_retry_due, metadata_db_logical_table_count,
+    PreferredHeadReason, PutOptions, ReconcileVersionEntry, RecoverableHistoryEntries,
+    RecoverableHistoryEntry, RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
+    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
+    SnapshotRestoreMutationResult, StoragePathStats, StoragePoolConfig, StorageStatsSample,
+    StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState,
+    grid_thumbnail_profile, media_cache_retry_due, metadata_db_logical_table_count,
     promote_cached_media_metadata_to_incomplete, thumbnail_profile_from_query,
 };
 
@@ -906,18 +906,6 @@ pub(crate) fn publish_namespace_change(state: &ServerState) {
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
     let _ = state.storage.namespace_change_tx.send(sequence);
-}
-
-fn publish_history_change(state: &ServerState) {
-    invalidate_store_history_cache(state);
-    publish_namespace_change(state);
-}
-
-fn invalidate_store_history_cache(state: &ServerState) {
-    match state.storage.store_history_cache.lock() {
-        Ok(mut cache) => cache.clear(),
-        Err(poisoned) => poisoned.into_inner().clear(),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -13907,22 +13895,10 @@ impl StoreIndexPageCache {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum StoreHistoryCacheValue {
     Entries(Vec<RecoverableHistoryEntry>),
-    Oversized { entry_count: usize },
-}
-
-impl StoreHistoryCacheValue {
-    fn from_entries(entries: Vec<RecoverableHistoryEntry>) -> Self {
-        if entries.len() > STORE_HISTORY_CACHE_MAX_ENTRY_COUNT {
-            Self::Oversized {
-                entry_count: entries.len(),
-            }
-        } else {
-            Self::Entries(entries)
-        }
-    }
+    Oversized { minimum_entry_count: usize },
 }
 
 #[derive(Debug)]
@@ -13949,10 +13925,6 @@ impl StoreHistoryCache {
             created_at: Instant::now(),
             value,
         });
-    }
-
-    fn clear(&mut self) {
-        self.entry = None;
     }
 }
 
@@ -14755,7 +14727,7 @@ async fn rename_object_path_response(
                 "store path rename applied; publishing namespace change"
             );
             drop(store);
-            publish_history_change(state);
+            publish_namespace_change(state);
             request_local_availability_refresh(state);
             if request.from_path != request.to_path {
                 record_data_change_event(
@@ -15094,7 +15066,7 @@ async fn restore_snapshot_path_response(
                 "snapshot restore applied; publishing namespace change"
             );
             drop(store);
-            publish_history_change(state);
+            publish_namespace_change(state);
             request_local_availability_refresh(state);
             (StatusCode::OK, Json(report)).into_response()
         }
@@ -15206,7 +15178,7 @@ async fn restore_version_path_response(
                 "version restore applied; publishing namespace change"
             );
             drop(store);
-            publish_history_change(state);
+            publish_namespace_change(state);
             request_local_availability_refresh(state);
             StatusCode::NO_CONTENT.into_response()
         }
@@ -16164,7 +16136,7 @@ async fn delete_object_response(
     match delete_result {
         Ok(deleted_paths) => {
             drop(store);
-            publish_history_change(state);
+            publish_namespace_change(state);
 
             let mut cluster = state.cluster.lock().await;
             for (deleted_path, _, version_id) in &deleted_paths {
@@ -16406,17 +16378,29 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                     let store = read_store(state, "store_history.clone_inspector").await;
                     store.store_history_inspector()
                 };
-                let entries = match history_inspector.list_recoverable_history_entries().await {
-                    Ok(entries) => entries,
+                let value = match history_inspector
+                    .list_recoverable_history_entries_bounded(STORE_HISTORY_CACHE_MAX_ENTRY_COUNT)
+                    .await
+                {
+                    Ok(RecoverableHistoryEntries::Entries(entries)) => {
+                        Arc::new(StoreHistoryCacheValue::Entries(entries))
+                    }
+                    Ok(RecoverableHistoryEntries::ExceedsLimit {
+                        minimum_entry_count,
+                    }) => Arc::new(StoreHistoryCacheValue::Oversized {
+                        minimum_entry_count,
+                    }),
                     Err(err) => {
                         tracing::error!(error = %err, prefix = %prefix, depth, "failed to list recoverable history entries");
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
-                let value = Arc::new(StoreHistoryCacheValue::from_entries(entries));
-                if let StoreHistoryCacheValue::Oversized { entry_count } = value.as_ref() {
+                if let StoreHistoryCacheValue::Oversized {
+                    minimum_entry_count,
+                } = value.as_ref()
+                {
                     tracing::warn!(
-                        entry_count,
+                        minimum_entry_count,
                         cache_limit = STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
                         "recoverable history exceeds the interactive explorer cache limit"
                     );
@@ -16431,12 +16415,14 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
     };
     let entries = match history.as_ref() {
         StoreHistoryCacheValue::Entries(entries) => entries,
-        StoreHistoryCacheValue::Oversized { entry_count } => {
+        StoreHistoryCacheValue::Oversized {
+            minimum_entry_count,
+        } => {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(json!({
                     "error": "recoverable history exceeds the interactive explorer limit",
-                    "entry_count": entry_count,
+                    "minimum_entry_count": minimum_entry_count,
                     "max_entry_count": STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
                 })),
             )
@@ -16660,7 +16646,7 @@ async fn restore_history_entries_response(
     }
 
     if restored_count > 0 {
-        publish_history_change(state);
+        publish_namespace_change(state);
         request_local_availability_refresh(state);
     }
 

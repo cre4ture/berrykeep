@@ -6923,11 +6923,17 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         PathMutationResult::Applied
     );
 
-    let history = store
+    let history = match store
         .store_history_inspector()
-        .list_recoverable_history_entries()
+        .list_recoverable_history_entries_bounded(usize::MAX)
         .await
-        .unwrap();
+        .unwrap()
+    {
+        RecoverableHistoryEntries::Entries(entries) => entries,
+        RecoverableHistoryEntries::ExceedsLimit { .. } => {
+            panic!("unbounded recoverable history scan unexpectedly exceeded its limit")
+        }
+    };
     let deleted_entry = history
         .iter()
         .find(|entry| entry.path == "deleted.txt")
