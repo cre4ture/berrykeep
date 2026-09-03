@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +12,42 @@ const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
+
+fn object_id_migration_lock_path(metadata_db_path: &Path) -> PathBuf {
+    let mut file_name = metadata_db_path
+        .file_name()
+        .unwrap_or_default()
+        .to_os_string();
+    file_name.push(".object-id-migration.lock");
+    metadata_db_path.with_file_name(file_name)
+}
+
+async fn acquire_object_id_migration_lock(metadata_db_path: &Path) -> Result<std::fs::File> {
+    let lock_path = object_id_migration_lock_path(metadata_db_path);
+    tokio::task::spawn_blocking(move || {
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "failed to open object ID migration lock file {}",
+                    lock_path.display()
+                )
+            })?;
+        FileExt::lock_exclusive(&lock_file).with_context(|| {
+            format!(
+                "failed to acquire object ID migration lock {}",
+                lock_path.display()
+            )
+        })?;
+        Ok(lock_file)
+    })
+    .await
+    .context("object ID migration lock task failed")?
+}
 
 fn current_objects_cache_capacity() -> usize {
     std::env::var("IRONMESH_CURRENT_OBJECTS_CACHE_CAPACITY")
@@ -39,6 +76,7 @@ use common::NodeId;
 use common::content_fingerprint::content_fingerprint_from_chunk_refs;
 use common::range_chunk_cache::RangeChunkCache;
 use common::xmp::{XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -3640,6 +3678,22 @@ impl PersistentStore {
         };
         let object_id_migration_started = Instant::now();
         info!("starting legacy object ID migration");
+        let object_id_migration_lock =
+            match acquire_object_id_migration_lock(&store.metadata_db_path).await {
+                Ok(lock) => lock,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+                        "failed to acquire legacy object ID migration lock"
+                    );
+                    return Err(error);
+                }
+            };
+        info!(
+            elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+            "acquired legacy object ID migration lock"
+        );
         if let Err(error) = store.migrate_legacy_object_ids().await {
             warn!(
                 error = %error,
@@ -3652,6 +3706,7 @@ impl PersistentStore {
             elapsed_ms = object_id_migration_started.elapsed().as_millis(),
             "completed legacy object ID migration"
         );
+        drop(object_id_migration_lock);
         store
             .backfill_gallery_labels_from_current_sidecars()
             .await?;
@@ -3688,6 +3743,7 @@ impl PersistentStore {
             .await?;
         let mut assignments = HashMap::with_capacity(current_objects.len());
         let mut claimed_object_ids = HashSet::with_capacity(current_objects.len());
+        let mut fallback_object_id_assignment_count = 0;
 
         let mut paths_by_existing_object_id = BTreeMap::<String, Vec<String>>::new();
         for (path, _) in &current_objects {
@@ -3756,13 +3812,23 @@ impl PersistentStore {
 
         for (current_object_index, (path, manifest_hash)) in current_objects.into_iter().enumerate()
         {
-            let assignment =
-                assignments
-                    .remove(path)
-                    .unwrap_or_else(|| ObjectIdMigrationAssignment {
-                        object_id: generate_unclaimed_object_id(&mut claimed_object_ids),
+            let assignment = match assignments.remove(path) {
+                Some(assignment) => assignment,
+                None => {
+                    fallback_object_id_assignment_count += 1;
+                    let object_id = generate_unclaimed_object_id(&mut claimed_object_ids);
+                    warn!(
+                        path,
+                        manifest_hash,
+                        object_id,
+                        "legacy object ID migration could not recover prior history; assigning a new object ID"
+                    );
+                    ObjectIdMigrationAssignment {
+                        object_id,
                         needs_version_backfill: true,
-                    });
+                    }
+                }
+            };
 
             let existing_index = if assignment.needs_version_backfill {
                 None
@@ -3805,6 +3871,11 @@ impl PersistentStore {
             }
         }
 
+        info!(
+            current_object_count,
+            fallback_object_id_assignment_count,
+            "completed legacy current-object identity migration"
+        );
         self.metadata_store.mark_object_id_backfill_complete().await
     }
 

@@ -2,6 +2,7 @@ use super::*;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::time::Duration;
 use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 
 fn test_store_dir(name: &str) -> PathBuf {
@@ -77,6 +78,40 @@ fn sample_heic_bytes() -> Vec<u8> {
         .step_by(2)
         .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
         .collect()
+}
+
+#[tokio::test]
+async fn object_id_migration_lock_serializes_metadata_access() {
+    let root = test_store_dir("object-id-migration-lock");
+    let metadata_db_path = root.join("state/metadata.sqlite");
+    fs::create_dir_all(metadata_db_path.parent().unwrap())
+        .await
+        .unwrap();
+
+    let first_lock = acquire_object_id_migration_lock(&metadata_db_path)
+        .await
+        .unwrap();
+    let second_metadata_db_path = metadata_db_path.clone();
+    let mut second_lock =
+        tokio::spawn(
+            async move { acquire_object_id_migration_lock(&second_metadata_db_path).await },
+        );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut second_lock)
+            .await
+            .is_err(),
+        "the second migration must wait for the first lock holder"
+    );
+
+    drop(first_lock);
+    let second_lock = tokio::time::timeout(Duration::from_secs(5), second_lock)
+        .await
+        .expect("the second migration should acquire the released lock")
+        .expect("the lock task should not panic")
+        .expect("the second migration lock should acquire");
+    drop(second_lock);
+
+    let _ = fs::remove_dir_all(root).await;
 }
 
 #[test]
