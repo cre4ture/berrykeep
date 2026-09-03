@@ -3677,36 +3677,50 @@ impl PersistentStore {
             data_scrub_run_test_hook: None,
         };
         let object_id_migration_started = Instant::now();
-        info!("starting legacy object ID migration");
-        let object_id_migration_lock =
-            match acquire_object_id_migration_lock(&store.metadata_db_path).await {
-                Ok(lock) => lock,
+        let object_id_migration_needed =
+            match store.metadata_store.object_id_backfill_needed().await {
+                Ok(needed) => needed,
                 Err(error) => {
                     warn!(
                         error = %error,
                         elapsed_ms = object_id_migration_started.elapsed().as_millis(),
-                        "failed to acquire legacy object ID migration lock"
+                        "failed to check whether legacy object ID migration is needed"
                     );
                     return Err(error);
                 }
             };
-        info!(
-            elapsed_ms = object_id_migration_started.elapsed().as_millis(),
-            "acquired legacy object ID migration lock"
-        );
-        if let Err(error) = store.migrate_legacy_object_ids().await {
-            warn!(
-                error = %error,
+        if object_id_migration_needed {
+            info!("starting legacy object ID migration");
+            let object_id_migration_lock =
+                match acquire_object_id_migration_lock(&store.metadata_db_path).await {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+                            "failed to acquire legacy object ID migration lock"
+                        );
+                        return Err(error);
+                    }
+                };
+            info!(
                 elapsed_ms = object_id_migration_started.elapsed().as_millis(),
-                "legacy object ID migration failed; refusing to start with inconsistent identity metadata"
+                "acquired legacy object ID migration lock"
             );
-            return Err(error);
+            if let Err(error) = store.migrate_legacy_object_ids().await {
+                warn!(
+                    error = %error,
+                    elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+                    "legacy object ID migration failed; refusing to start with inconsistent identity metadata"
+                );
+                return Err(error);
+            }
+            info!(
+                elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+                "completed legacy object ID migration"
+            );
+            drop(object_id_migration_lock);
         }
-        info!(
-            elapsed_ms = object_id_migration_started.elapsed().as_millis(),
-            "completed legacy object ID migration"
-        );
-        drop(object_id_migration_lock);
         store
             .backfill_gallery_labels_from_current_sidecars()
             .await?;

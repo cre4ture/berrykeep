@@ -781,6 +781,14 @@ impl StorageTestBackend {
         }
     }
 
+    fn metadata_db_path(self, root: &Path) -> PathBuf {
+        match self {
+            Self::Sqlite => root.join("state/metadata.sqlite"),
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => root.join("state/metadata.turso.db"),
+        }
+    }
+
     fn supports_metadata_vacuum(self) -> bool {
         match self {
             Self::Sqlite => true,
@@ -840,6 +848,34 @@ macro_rules! run_on_all_metadata_backends {
         }
     };
 }
+
+async fn completed_object_id_migration_skips_lock_acquisition_impl(backend: StorageTestBackend) {
+    let (root, store) = backend
+        .init_store("completed-object-id-migration-skips-lock")
+        .await;
+    drop(store);
+
+    let metadata_db_path = backend.metadata_db_path(&root);
+    let lock_path = object_id_migration_lock_path(&metadata_db_path);
+    fs::remove_file(&lock_path)
+        .await
+        .expect("initial migration should have created its lock file");
+
+    let reloaded = backend.open_store(root.clone()).await;
+    assert!(
+        !fs::try_exists(&lock_path).await.unwrap(),
+        "a completed migration must not acquire its startup lock"
+    );
+    drop(reloaded);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    completed_object_id_migration_skips_lock_acquisition_impl,
+    completed_object_id_migration_skips_lock_acquisition,
+    completed_object_id_migration_skips_lock_acquisition_turso
+);
 
 async fn stable_object_id_follows_logical_object_lifecycle_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("stable-object-id-lifecycle").await;
