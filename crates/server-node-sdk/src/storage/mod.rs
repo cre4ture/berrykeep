@@ -3646,11 +3646,12 @@ impl PersistentStore {
 
     /// Backfills the live namespace written before object identity became mandatory.
     ///
-    /// This is a one-time foreground migration. If the live namespace already has one non-empty
-    /// identity per current object, it records completion without reading version indexes.
-    /// Otherwise it scans legacy version indexes before serving requests, so every current object
-    /// has a durable identity from the first post-upgrade request. The writes are idempotent; a
-    /// restart before the completion marker is recorded repeats the scan safely.
+    /// This is a one-time foreground migration. It first scans legacy version indexes in bounded
+    /// batches and repairs any payload identity that differs from the authoritative row identity.
+    /// If the live namespace already has one non-empty identity per current object, it then records
+    /// completion. Otherwise it inspects legacy version indexes to assign every current object a
+    /// durable identity before serving requests. The writes are idempotent; a restart before the
+    /// completion marker is recorded repeats the scan safely.
     /// Historical snapshots are normalized when they are read or rewritten instead of
     /// making startup walk every retained snapshot.
     async fn migrate_legacy_object_ids(&self) -> Result<()> {
@@ -3658,6 +3659,7 @@ impl PersistentStore {
             return Ok(());
         }
 
+        self.repair_legacy_version_index_identities().await?;
         let current_state = self.metadata_store.load_current_state().await?;
         if current_state_has_unique_object_id_bindings(&current_state) {
             return self.metadata_store.mark_object_id_backfill_complete().await;
@@ -3776,6 +3778,31 @@ impl PersistentStore {
         }
 
         self.metadata_store.mark_object_id_backfill_complete().await
+    }
+
+    async fn repair_legacy_version_index_identities(&self) -> Result<()> {
+        let mut after_object_id = None;
+        loop {
+            let indexes = self
+                .metadata_store
+                .load_version_indexes_after(
+                    after_object_id.as_deref(),
+                    OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE,
+                )
+                .await?;
+            let Some(last_object_id) = indexes.last().map(|index| index.object_id.clone()) else {
+                break;
+            };
+
+            for index in indexes {
+                if index.identity_was_normalized {
+                    self.persist_version_index_by_object_id(&index.object_id, &index)
+                        .await?;
+                }
+            }
+            after_object_id = Some(last_object_id);
+        }
+        Ok(())
     }
 
     async fn legacy_object_id_candidates_for_current_state(
@@ -10345,22 +10372,29 @@ fn normalize_version_index_identity(
         index.object_id = persisted_object_id.to_string();
         normalized = true;
     } else if index.object_id != persisted_object_id {
-        bail!(
-            "version index identity mismatch in {source}: row={persisted_object_id} payload={}",
-            index.object_id
+        warn!(
+            row_object_id = persisted_object_id,
+            payload_object_id = %index.object_id,
+            source,
+            "normalizing mismatched version index identity to the persisted row identity"
         );
+        index.object_id = persisted_object_id.to_string();
+        normalized = true;
     }
     for record in index.versions.values_mut() {
         if record.object_id.trim().is_empty() {
             record.object_id = index.object_id.clone();
             normalized = true;
         } else if record.object_id != index.object_id {
-            bail!(
-                "version record identity mismatch in {source}: index={} version={} record={}",
-                index.object_id,
-                record.version_id,
-                record.object_id
+            warn!(
+                index_object_id = %index.object_id,
+                version_id = %record.version_id,
+                record_object_id = %record.object_id,
+                source,
+                "normalizing mismatched version record identity to the persisted row identity"
             );
+            record.object_id = index.object_id.clone();
+            normalized = true;
         }
     }
     Ok(normalized)

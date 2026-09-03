@@ -1758,6 +1758,86 @@ async fn sqlite_migration_does_not_rewrite_indexes_with_persisted_object_ids() {
 }
 
 #[tokio::test]
+async fn sqlite_migration_repairs_mismatched_persisted_index_identities() {
+    let root = test_store_dir("object-id-migration-mismatched-persisted-index");
+    let database_path = root.join("state/metadata.sqlite");
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    seeded
+        .put_object_versioned(
+            "mismatched-persisted-index.txt",
+            Bytes::from_static(b"payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let versions = seeded
+        .list_versions("mismatched-persisted-index.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    let object_id = versions.object_id;
+    let version_id = versions.preferred_head_version_id.unwrap();
+    drop(seeded);
+
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+        let index_json: Vec<u8> = database
+            .query_row(
+                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+                [&object_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut index: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
+        index["object_id"] = serde_json::Value::String("payload-object-id".to_string());
+        index["versions"][&version_id]["object_id"] =
+            serde_json::Value::String("payload-version-object-id".to_string());
+        database
+            .execute(
+                "UPDATE version_indexes SET index_json = ?1 WHERE object_id = ?2",
+                rusqlite::params![serde_json::to_vec(&index).unwrap(), object_id],
+            )
+            .unwrap();
+    }
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .list_versions("mismatched-persisted-index.txt")
+            .await
+            .unwrap()
+            .unwrap()
+            .object_id,
+        object_id
+    );
+    drop(reopened);
+
+    let database = rusqlite::Connection::open(&database_path).unwrap();
+    let index_json: Vec<u8> = database
+        .query_row(
+            "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+            [&object_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let index: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
+    assert_eq!(index["object_id"], object_id);
+    assert_eq!(index["versions"][&version_id]["object_id"], object_id);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
 async fn sqlite_migration_keeps_preferred_head_for_duplicate_legacy_current_object_ids() {
     let root = test_store_dir("duplicate-legacy-object-id-migration");
     let database_path = root.join("state/metadata.sqlite");
