@@ -1092,6 +1092,7 @@ fn snapshot_conversion_maps_prefix_and_keys() {
         StoreIndexEntry {
             path: "docs/".to_string(),
             entry_type: "prefix".to_string(),
+            object_id: None,
             labels: Vec::new(),
             labels_resolved: false,
             version: None,
@@ -1104,6 +1105,7 @@ fn snapshot_conversion_maps_prefix_and_keys() {
         StoreIndexEntry {
             path: "docs/readme.txt".to_string(),
             entry_type: "key".to_string(),
+            object_id: Some("obj-readme".to_string()),
             labels: Vec::new(),
             labels_resolved: false,
             version: None,
@@ -1191,6 +1193,7 @@ fn undesired_current_behavior_snapshot_entries_without_revisions_share_server_he
     .map(|(path, content_hash, modified_at_unix)| StoreIndexEntry {
         path: path.to_string(),
         entry_type: "key".to_string(),
+        object_id: None,
         labels: Vec::new(),
         labels_resolved: false,
         version: None,
@@ -1222,6 +1225,7 @@ fn desired_behavior_snapshot_entries_never_use_server_head_as_a_revision_identit
     let snapshot = snapshot_from_store_index_entries(vec![StoreIndexEntry {
         path: "docs/readme.txt".to_string(),
         entry_type: "key".to_string(),
+        object_id: None,
         labels: Vec::new(),
         labels_resolved: false,
         version: None,
@@ -1241,6 +1245,7 @@ fn desired_behavior_snapshot_entries_never_use_server_head_as_a_revision_identit
 
 fn completed_upload_mapping_fixture() -> (UploadSessionView, UploadSessionCompleteResponse) {
     let completed = UploadSessionCompleteResponse {
+        object_id: "obj-upload".to_string(),
         snapshot_id: "snapshot-after-upload".to_string(),
         version_id: "revision-after-upload".to_string(),
         manifest_hash: "manifest-after-upload".to_string(),
@@ -1307,6 +1312,7 @@ fn ensure_missing_folder_markers_adds_nested_parents() {
     let mut entries = vec![StoreIndexEntry {
         path: "a/b/c.txt".to_string(),
         entry_type: "key".to_string(),
+        object_id: None,
         labels: Vec::new(),
         labels_resolved: false,
         version: None,
@@ -1332,6 +1338,7 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
         StoreIndexEntry {
             path: "docs/".to_string(),
             entry_type: "prefix".to_string(),
+            object_id: None,
             labels: Vec::new(),
             labels_resolved: false,
             version: None,
@@ -1344,6 +1351,7 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
         StoreIndexEntry {
             path: "docs/guides/readme.md".to_string(),
             entry_type: "key".to_string(),
+            object_id: None,
             labels: Vec::new(),
             labels_resolved: false,
             version: None,
@@ -1372,6 +1380,7 @@ fn ensure_missing_folder_markers_stays_within_the_requested_prefix() {
     let mut entries = vec![StoreIndexEntry {
         path: "devices/Oppo-uli/Fotos/image.jpg".to_string(),
         entry_type: "key".to_string(),
+        object_id: None,
         labels: Vec::new(),
         labels_resolved: false,
         version: None,
@@ -1493,6 +1502,7 @@ fn store_index_test_entry(path: &str) -> StoreIndexEntry {
     StoreIndexEntry {
         path: path.to_string(),
         entry_type: "key".to_string(),
+        object_id: None,
         labels: Vec::new(),
         labels_resolved: false,
         version: None,
@@ -2011,6 +2021,7 @@ fn snapshot_index_response_body(path: &str) -> Vec<u8> {
         entries: vec![StoreIndexEntry {
             path: path.to_string(),
             entry_type: "key".to_string(),
+            object_id: Some("obj-snapshot".to_string()),
             labels: Vec::new(),
             labels_resolved: false,
             version: Some("v1".to_string()),
@@ -2152,6 +2163,7 @@ async fn upload_session_http_complete(
     state.complete_hits.fetch_add(1, Ordering::SeqCst);
     session.completed = true;
     let response = UploadSessionCompleteResponse {
+        object_id: "obj-test".to_string(),
         snapshot_id: "snap-test".to_string(),
         version_id: "ver-test".to_string(),
         manifest_hash: "manifest-test".to_string(),
@@ -4121,6 +4133,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
                         entry_type: "key".to_string(),
+                        object_id: Some("obj-readme".to_string()),
                         labels: Vec::new(),
                         labels_resolved: false,
                         version: Some("v1".to_string()),
@@ -4151,6 +4164,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
+                object_id: Some("obj-readme".to_string()),
                 labels: Vec::new(),
                 labels_resolved: false,
                 version: Some("v1".to_string()),
@@ -5440,6 +5454,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
                         entry_type: "key".to_string(),
+                        object_id: Some("obj-readme".to_string()),
                         labels: Vec::new(),
                         labels_resolved: false,
                         version: Some("v1".to_string()),
@@ -5470,6 +5485,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
+                object_id: Some("obj-readme".to_string()),
                 labels: Vec::new(),
                 labels_resolved: false,
                 version: Some("v1".to_string()),

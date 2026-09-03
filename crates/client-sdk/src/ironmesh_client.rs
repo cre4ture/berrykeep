@@ -3488,6 +3488,8 @@ struct UploadSessionChunkResponse {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct UploadSessionCompleteResponse {
+    #[serde(default)]
+    object_id: String,
     snapshot_id: String,
     version_id: String,
     manifest_hash: String,
@@ -3531,6 +3533,8 @@ struct ResumableDownloadFileState {
 pub struct StoreIndexEntry {
     pub path: String,
     pub entry_type: String,
+    #[serde(default)]
+    pub object_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     /// True only when the response could authoritatively read the entry's
@@ -3924,6 +3928,31 @@ struct PathMutationRequest {
     overwrite: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     expected_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ObjectRenameRequest {
+    to_path: String,
+    overwrite: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectLookup {
+    pub object_id: String,
+    pub path: String,
+    pub revision: Option<String>,
+    pub entry_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ObjectMutationResponse {
+    object_id: String,
+    path: String,
+    revision: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -5100,10 +5129,139 @@ impl IronMeshClient {
             bail!("server rejected PUT for key={key}: {}", response.status);
         }
 
+        let object_id = if response.body.is_empty() {
+            None
+        } else {
+            let mutation = serde_json::from_slice::<ObjectMutationResponse>(&response.body)
+                .context("failed to parse PUT object identity response")?;
+            if mutation.path != key || mutation.revision.trim().is_empty() {
+                bail!("server returned an inconsistent PUT object identity response");
+            }
+            Some(mutation.object_id)
+        };
+
         Ok(StorageObjectMeta {
             key,
             size_bytes: data.len(),
+            object_id,
         })
+    }
+
+    pub async fn lookup_object_by_id(
+        &self,
+        object_id: impl AsRef<str>,
+    ) -> Result<Option<ObjectLookup>> {
+        let object_id = object_id.as_ref();
+        let url = self.object_url(object_id)?;
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to look up object_id={object_id}"))?;
+        match response.status {
+            StatusCode::OK => serde_json::from_slice::<ObjectLookup>(&response.body)
+                .map(Some)
+                .context("failed to parse object identity lookup response"),
+            StatusCode::NOT_FOUND => Ok(None),
+            status => Err(anyhow!(
+                "object identity lookup failed for {object_id}: {status}"
+            )),
+        }
+    }
+
+    pub async fn put_by_object_id(
+        &self,
+        object_id: impl AsRef<str>,
+        data: Bytes,
+        expected_revision: Option<&str>,
+    ) -> Result<StorageObjectMeta> {
+        let object_id = object_id.as_ref();
+        let mut url = self.object_url(object_id)?;
+        append_optional_query(&mut url, "expected_revision", expected_revision);
+        let response = self
+            .execute_buffered_request(Method::PUT, url, Vec::new(), Some(data.to_vec()))
+            .await
+            .with_context(|| format!("failed to PUT object_id={object_id}"))?;
+        if !response.status.is_success() {
+            bail!(
+                "server rejected PUT for object_id={object_id}: {}",
+                response.status
+            );
+        }
+        let mutation = serde_json::from_slice::<ObjectMutationResponse>(&response.body)
+            .context("failed to parse object-id PUT response")?;
+        if mutation.object_id != object_id || mutation.revision.trim().is_empty() {
+            bail!("server returned an inconsistent object-id PUT response");
+        }
+        Ok(StorageObjectMeta {
+            key: mutation.path,
+            size_bytes: data.len(),
+            object_id: Some(mutation.object_id),
+        })
+    }
+
+    pub async fn rename_object_by_id(
+        &self,
+        object_id: impl AsRef<str>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        let object_id = object_id.as_ref();
+        let to_path = to_path.into();
+        let payload = serde_json::to_vec(&ObjectRenameRequest {
+            to_path: to_path.clone(),
+            overwrite,
+            expected_revision: expected_revision.map(str::to_string),
+        })
+        .context("failed to encode object-id rename request")?;
+        let response = self
+            .execute_buffered_request(
+                Method::POST,
+                self.object_rename_url(object_id)?,
+                vec![json_content_type_header()],
+                Some(payload),
+            )
+            .await
+            .with_context(|| format!("failed to rename object_id={object_id} to {to_path}"))?;
+        match response.status {
+            StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::NOT_FOUND => bail!("object identity not found: {object_id}"),
+            StatusCode::CONFLICT => bail!("object-id rename conflict for target: {to_path}"),
+            status => Err(anyhow!("rename failed for object_id={object_id}: {status}")),
+        }
+    }
+
+    pub async fn delete_object_by_id(
+        &self,
+        object_id: impl AsRef<str>,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        self.delete_object_by_id_with_recursive(object_id, expected_revision, false)
+            .await
+    }
+
+    pub async fn delete_object_by_id_with_recursive(
+        &self,
+        object_id: impl AsRef<str>,
+        expected_revision: Option<&str>,
+        recursive: bool,
+    ) -> Result<()> {
+        let object_id = object_id.as_ref();
+        let mut url = self.object_url(object_id)?;
+        append_optional_query(&mut url, "expected_revision", expected_revision);
+        if recursive {
+            url.query_pairs_mut().append_pair("recursive", "true");
+        }
+        let response = self
+            .execute_buffered_request(Method::DELETE, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to delete object_id={object_id}"))?;
+        match response.status {
+            StatusCode::CREATED | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::NOT_FOUND => bail!("object identity not found: {object_id}"),
+            StatusCode::CONFLICT => bail!("object-id delete revision conflict: {object_id}"),
+            status => Err(anyhow!("delete failed for object_id={object_id}: {status}")),
+        }
     }
 
     pub async fn get(&self, key: impl AsRef<str>) -> Result<Bytes> {
@@ -5161,6 +5319,7 @@ impl IronMeshClient {
             to_path: to_path.clone(),
             overwrite,
             expected_revision: expected_revision.map(str::to_string),
+            object_id: None,
         })
         .context("failed to encode rename request")?;
 
@@ -5198,6 +5357,7 @@ impl IronMeshClient {
             to_path: to_path.clone(),
             overwrite,
             expected_revision: None,
+            object_id: None,
         })
         .context("failed to encode copy request")?;
 
@@ -7686,6 +7846,25 @@ impl IronMeshClient {
         Ok(url)
     }
 
+    fn object_url(&self, object_id: &str) -> Result<Url> {
+        let mut url = self.client_api_base_url()?;
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("server URL cannot be a base"))?;
+        segments.push("objects");
+        segments.push(object_id);
+        drop(segments);
+        Ok(url)
+    }
+
+    fn object_rename_url(&self, object_id: &str) -> Result<Url> {
+        let mut url = self.object_url(object_id)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("server URL cannot be a base"))?
+            .push("rename");
+        Ok(url)
+    }
+
     fn relative_url(&self, path: &str) -> Result<Url> {
         let path = path.trim();
         if path.is_empty() {
@@ -9045,6 +9224,7 @@ fn upload_result_from_session_complete(
         meta: StorageObjectMeta {
             key: key.to_string(),
             size_bytes: completed.total_size_bytes as usize,
+            object_id: (!completed.object_id.is_empty()).then(|| completed.object_id.clone()),
         },
         upload_mode: UploadMode::Chunked,
         chunk_size_bytes: Some(session.chunk_size_bytes),
@@ -9303,6 +9483,7 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>, scope_prefi
             entries.push(StoreIndexEntry {
                 path: marker,
                 entry_type: "prefix".to_string(),
+                object_id: None,
                 labels: Vec::new(),
                 labels_resolved: false,
                 version: None,

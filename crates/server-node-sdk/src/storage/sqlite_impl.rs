@@ -27,17 +27,18 @@ use super::{
     GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
     GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
     ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
-    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
-    decode_gallery_labels, decompress_snapshot_json, effective_gallery_captured_at_unix,
+    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
+    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
+    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
+    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    compress_snapshot_json, current_media_cache_metadata, decode_gallery_labels,
+    decode_version_index, decompress_snapshot_json, effective_gallery_captured_at_unix,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
-    version_created_at_unix_from_payload,
+    metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
+    sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
 };
 
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -893,6 +894,7 @@ fn query_gallery_index_in_transaction(
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
+             gallery_objects.object_id,
              gallery_objects.manifest_hash,
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
@@ -919,17 +921,19 @@ fn query_gallery_index_in_transaction(
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<Vec<u8>>>(5)?,
-            row.get::<_, String>(6)?,
+            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, String>(7)?,
         ))
     })?;
     let mut entries = Vec::new();
     for row in rows {
         let (
             key,
+            object_id,
             manifest_hash,
             size_bytes,
             content_fingerprint,
@@ -937,15 +941,16 @@ fn query_gallery_index_in_transaction(
             version_index_payload,
             labels_json,
         ) = row?;
-        entries.push(materialize_gallery_index_entry(
+        entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
             key,
+            object_id,
             manifest_hash,
             size_bytes,
             content_fingerprint,
             metadata_payload,
             version_index_payload,
             labels_json,
-        )?);
+        })?);
     }
     Ok(GalleryIndexPage {
         history_id,
@@ -1160,6 +1165,7 @@ fn gallery_map_cluster_cells_from_db(
                  MIN(gallery_objects.longitude),
                  MAX(gallery_objects.longitude),
                  MIN(gallery_objects.key),
+                 MIN(gallery_objects.object_id),
                  MIN(gallery_objects.manifest_hash),
                  MIN(manifest_summaries.total_size_bytes),
                  MIN(manifest_summaries.content_fingerprint),
@@ -1196,15 +1202,16 @@ fn gallery_map_cluster_cells_from_db(
             let count = usize::try_from(row.get::<_, i64>(2)?)
                 .context("gallery map cluster count overflow")?;
             let entry = if count == 1 {
-                Some(materialize_gallery_index_entry(
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                    row.get(12)?,
-                    row.get(13)?,
-                    row.get(14)?,
-                    row.get(15)?,
-                )?)
+                Some(materialize_gallery_index_entry(GalleryIndexEntrySource {
+                    key: row.get(9)?,
+                    object_id: row.get(10)?,
+                    manifest_hash: row.get(11)?,
+                    size_bytes: row.get(12)?,
+                    content_fingerprint: row.get(13)?,
+                    metadata_payload: row.get(14)?,
+                    version_index_payload: row.get(15)?,
+                    labels_json: row.get(16)?,
+                })?)
             } else {
                 None
             };
@@ -1349,6 +1356,7 @@ fn query_gallery_map_cluster_entries_in_transaction(
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
+             gallery_objects.object_id,
              gallery_objects.manifest_hash,
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
@@ -1377,25 +1385,36 @@ fn query_gallery_map_cluster_entries_in_transaction(
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<Vec<u8>>>(5)?,
-            row.get::<_, String>(6)?,
+            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, String>(7)?,
         ))
     })?;
     let mut entries = Vec::new();
     for row in rows {
-        let (key, manifest_hash, size, fingerprint, metadata, version_index, labels_json) = row?;
-        entries.push(materialize_gallery_index_entry(
+        let (
             key,
+            object_id,
             manifest_hash,
             size,
             fingerprint,
             metadata,
             version_index,
             labels_json,
-        )?);
+        ) = row?;
+        entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
+            key,
+            object_id,
+            manifest_hash,
+            size_bytes: size,
+            content_fingerprint: fingerprint,
+            metadata_payload: metadata,
+            version_index_payload: version_index,
+            labels_json,
+        })?);
     }
     Ok(GalleryIndexPage {
         history_id,
@@ -1406,14 +1425,28 @@ fn query_gallery_map_cluster_entries_in_transaction(
     })
 }
 
-fn materialize_gallery_index_entry(
+struct GalleryIndexEntrySource {
     key: String,
+    object_id: String,
     manifest_hash: String,
     size_bytes: Option<i64>,
     content_fingerprint: Option<String>,
     metadata_payload: Option<Vec<u8>>,
     version_index_payload: Option<Vec<u8>>,
     labels_json: String,
+}
+
+fn materialize_gallery_index_entry(
+    GalleryIndexEntrySource {
+        key,
+        object_id,
+        manifest_hash,
+        size_bytes,
+        content_fingerprint,
+        metadata_payload,
+        version_index_payload,
+        labels_json,
+    }: GalleryIndexEntrySource,
 ) -> Result<GalleryIndexEntry> {
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in sqlite"))
@@ -1426,6 +1459,7 @@ fn materialize_gallery_index_entry(
     let labels = decode_gallery_labels(&labels_json)?;
     Ok(GalleryIndexEntry {
         key,
+        object_id,
         manifest_hash,
         size_bytes,
         modified_at_unix,
@@ -1451,6 +1485,7 @@ fn query_gallery_entry_from_db(
             &format!(
                 "SELECT
                  gallery_objects.key,
+                 gallery_objects.object_id,
                  gallery_objects.manifest_hash,
                  manifest_summaries.total_size_bytes,
                  manifest_summaries.content_fingerprint,
@@ -1475,32 +1510,54 @@ fn query_gallery_entry_from_db(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<Vec<u8>>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<f64>>(8)?,
-                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             },
         )
         .optional()?;
-    row.filter(|(key, _, _, _, _, _, media_type, latitude, longitude, _)| {
-        gallery_entry_matches_delta_scope(key, media_type.as_deref(), *latitude, *longitude, scope)
-    })
-    .map(
-        |(key, manifest_hash, size, fingerprint, metadata, versions, _, _, _, labels_json)| {
-            materialize_gallery_index_entry(
+    row.filter(
+        |(key, _, _, _, _, _, _, media_type, latitude, longitude, _)| {
+            gallery_entry_matches_delta_scope(
                 key,
-                manifest_hash,
-                size,
-                fingerprint,
-                metadata,
-                versions,
-                labels_json,
+                media_type.as_deref(),
+                *latitude,
+                *longitude,
+                scope,
             )
+        },
+    )
+    .map(
+        |(
+            key,
+            object_id,
+            manifest_hash,
+            size,
+            fingerprint,
+            metadata,
+            versions,
+            _,
+            _,
+            _,
+            labels_json,
+        )| {
+            materialize_gallery_index_entry(GalleryIndexEntrySource {
+                key,
+                object_id,
+                manifest_hash,
+                size_bytes: size,
+                content_fingerprint: fingerprint,
+                metadata_payload: metadata,
+                version_index_payload: versions,
+                labels_json,
+            })
         },
     )
     .transpose()
@@ -1793,6 +1850,32 @@ fn map_tokio_rusqlite_error(error: tokio_rusqlite::Error) -> anyhow::Error {
 
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
+    async fn object_id_backfill_needed(&self) -> Result<bool> {
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![OBJECT_ID_BACKFILL_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_none())
+        })
+        .await
+    }
+
+    async fn mark_object_id_backfill_complete(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![OBJECT_ID_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
         self.read(|db| {
             Ok(db
@@ -2760,9 +2843,10 @@ impl MetadataStore for SqliteMetadataStore {
         match payload {
             Some(payload) => {
                 let payload = decompress_snapshot_json(&payload)?;
-                serde_json::from_slice::<SnapshotManifest>(&payload)
-                    .map(Some)
-                    .context("invalid snapshot manifest in sqlite")
+                let mut snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .context("invalid snapshot manifest in sqlite")?;
+                normalize_snapshot_manifest_object_ids(&mut snapshot);
+                Ok(Some(snapshot))
             }
             None => Ok(None),
         }
@@ -3164,11 +3248,12 @@ impl MetadataStore for SqliteMetadataStore {
         object_id: &str,
     ) -> Result<Option<FileVersionIndex>> {
         let object_id = object_id.to_string();
+        let query_object_id = object_id.clone();
         let payload = self
             .read(move |db| {
                 db.query_row(
                     "SELECT index_json FROM version_indexes WHERE object_id = ?1",
-                    params![object_id],
+                    params![query_object_id],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .optional()
@@ -3177,9 +3262,7 @@ impl MetadataStore for SqliteMetadataStore {
             .await?;
 
         match payload {
-            Some(payload) => serde_json::from_slice::<FileVersionIndex>(&payload)
-                .map(Some)
-                .context("invalid version index in sqlite"),
+            Some(payload) => decode_version_index(&object_id, &payload, "sqlite").map(Some),
             None => Ok(None),
         }
     }
@@ -3613,18 +3696,45 @@ impl MetadataStore for SqliteMetadataStore {
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
         self.read(|db| {
             let mut stmt = db.prepare(
-                "SELECT index_json
+                "SELECT object_id, index_json
                  FROM version_indexes
                  ORDER BY object_id",
             )?;
-            let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
             let mut indexes = Vec::new();
             for row in rows {
-                let payload = row?;
-                indexes.push(
-                    serde_json::from_slice::<FileVersionIndex>(&payload)
-                        .context("invalid version index in sqlite")?,
-                );
+                let (object_id, payload) = row?;
+                indexes.push(decode_version_index(&object_id, &payload, "sqlite")?);
+            }
+            Ok(indexes)
+        })
+        .await
+    }
+
+    async fn load_version_indexes_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>> {
+        let after_object_id = after_object_id.map(str::to_owned);
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        self.read(move |db| {
+            let mut statement = db.prepare(
+                "SELECT object_id, index_json
+                 FROM version_indexes
+                 WHERE ?1 IS NULL OR object_id > ?1
+                 ORDER BY object_id
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![after_object_id, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut indexes = Vec::new();
+            for row in rows {
+                let (object_id, payload) = row?;
+                indexes.push(decode_version_index(&object_id, &payload, "sqlite")?);
             }
             Ok(indexes)
         })
@@ -3682,10 +3792,10 @@ impl MetadataStore for SqliteMetadataStore {
             for row in rows {
                 let payload = row?;
                 let payload = decompress_snapshot_json(&payload)?;
-                snapshots.push(
-                    serde_json::from_slice::<SnapshotManifest>(&payload)
-                        .context("invalid snapshot manifest in sqlite")?,
-                );
+                let mut snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .context("invalid snapshot manifest in sqlite")?;
+                normalize_snapshot_manifest_object_ids(&mut snapshot);
+                snapshots.push(snapshot);
             }
             Ok(snapshots)
         })
@@ -3708,9 +3818,10 @@ impl MetadataStore for SqliteMetadataStore {
         match payload {
             Some(payload) => {
                 let payload = decompress_snapshot_json(&payload)?;
-                serde_json::from_slice::<SnapshotManifest>(&payload)
-                    .map(Some)
-                    .context("invalid snapshot manifest in sqlite")
+                let mut snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .context("invalid snapshot manifest in sqlite")?;
+                normalize_snapshot_manifest_object_ids(&mut snapshot);
+                Ok(Some(snapshot))
             }
             None => Ok(None),
         }
@@ -4491,8 +4602,6 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             PRIMARY KEY(source_node_id, key, source_version_id)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
-            ON current_objects(object_id);
         CREATE INDEX IF NOT EXISTS idx_gallery_objects_media_order
             ON gallery_objects(media_type, captured_at_unix DESC, key ASC);
         CREATE INDEX IF NOT EXISTS idx_gallery_objects_manifest_hash
@@ -4524,6 +4633,23 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_s3_object_versions_key
             ON s3_object_versions(bucket_name, ironmesh_key, created_at_unix DESC, version_id DESC);
         ",
+    )?;
+    add_sqlite_column_if_missing(
+        db,
+        "current_objects",
+        "object_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_sqlite_column_if_missing(
+        db,
+        "gallery_objects",
+        "object_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
+         ON current_objects(object_id)",
+        [],
     )?;
     add_sqlite_column_if_missing(db, "gallery_objects", "latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "longitude", "REAL")?;
@@ -4604,7 +4730,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         None => METADATA_SCHEMA_VERSION_CURRENT,
     };
 
-    if schema_version != METADATA_SCHEMA_VERSION_CURRENT {
+    if !(1..=METADATA_SCHEMA_VERSION_CURRENT).contains(&schema_version) {
         anyhow::bail!(
             "unsupported sqlite metadata schema version: {} (current={})",
             schema_version,

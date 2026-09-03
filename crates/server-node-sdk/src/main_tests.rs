@@ -12271,6 +12271,7 @@ async fn store_index_change_wait_unblocks_after_put_impl(backend: MainTestBacken
             state: None,
             parent: Vec::new(),
             expected_revision: None,
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -13187,6 +13188,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
         super::StoreIndexEntry {
             path: "images/".to_string(),
             entry_type: "prefix".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -13199,6 +13201,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
         super::StoreIndexEntry {
             path: "images/".to_string(),
             entry_type: "key".to_string(),
+            object_id: Some("obj-directory-marker".to_string()),
             version: None,
             content_hash: Some("marker".to_string()),
             size_bytes: Some(0),
@@ -13211,6 +13214,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
         super::StoreIndexEntry {
             path: "images/cat.png".to_string(),
             entry_type: "key".to_string(),
+            object_id: Some("obj-cat".to_string()),
             version: None,
             content_hash: Some("content".to_string()),
             size_bytes: Some(123),
@@ -13227,6 +13231,10 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
     assert_eq!(collapsed.len(), 2);
     assert_eq!(collapsed[0].path, "images/");
     assert_eq!(collapsed[0].entry_type, "prefix");
+    assert_eq!(
+        collapsed[0].object_id.as_deref(),
+        Some("obj-directory-marker")
+    );
     assert_eq!(collapsed[0].content_hash, None);
     assert_eq!(collapsed[1].path, "images/cat.png");
     assert_eq!(collapsed[1].entry_type, "key");
@@ -13249,10 +13257,13 @@ fn build_store_index_entries_with_hashes_propagates_content_fingerprints() {
         &keys,
         "",
         2,
-        Some(&hashes),
-        Some(&sizes),
-        Some(&content_fingerprints),
-        None,
+        super::StoreIndexEntryTestMetadata {
+            object_ids_by_key: None,
+            hashes_by_key: Some(&hashes),
+            sizes_by_key: Some(&sizes),
+            content_fingerprints_by_key: Some(&content_fingerprints),
+            modified_times_by_key: None,
+        },
     );
 
     let file_entry = entries
@@ -13838,6 +13849,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(original_revision.clone()),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -13856,6 +13868,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(original_revision),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -13882,6 +13895,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(current_revision),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -13910,6 +13924,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(accepted_revision),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -13940,6 +13955,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             to_path: "renamed-stale.txt".to_string(),
             overwrite: false,
             expected_revision: Some("stale-revision".to_string()),
+            object_id: None,
         }),
     )
     .await
@@ -13954,6 +13970,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             to_path: "renamed-current.txt".to_string(),
             overwrite: false,
             expected_revision: Some(rename_revision),
+            object_id: None,
         }),
     )
     .await
@@ -13998,6 +14015,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(stale_directory_revision),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: true,
@@ -14015,6 +14033,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(current_directory_revision),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: true,
@@ -14031,6 +14050,749 @@ run_on_main_metadata_backends!(
     expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl,
     expected_revision_compare_and_swap_rejects_stale_put_and_delete,
     expected_revision_compare_and_swap_rejects_stale_put_and_delete_turso
+);
+
+async fn copy_object_path_honors_object_id_and_expected_revision_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let source_path = "copy-object-id-source.txt".to_string();
+    let target_path = "copy-object-id-target.txt".to_string();
+    let original = {
+        let mut store = lock_store(&state, "tests.copy-object-id-original").await;
+        store
+            .put_object_versioned(
+                &source_path,
+                Bytes::from_static(b"original"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    let deleted = super::delete_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(source_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(original.version_id.clone()),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(deleted.status(), StatusCode::CREATED);
+
+    let replacement = {
+        let mut store = lock_store(&state, "tests.copy-object-id-replacement").await;
+        store
+            .put_object_versioned(
+                &source_path,
+                Bytes::from_static(b"replacement"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    let wrong_identity = super::copy_object_path(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::PathMutationRequest {
+            from_path: source_path.clone(),
+            to_path: target_path.clone(),
+            overwrite: false,
+            expected_revision: None,
+            object_id: Some(original.object_id),
+        }),
+    )
+    .await;
+    assert_eq!(wrong_identity.status(), StatusCode::CONFLICT);
+
+    let stale_revision = super::copy_object_path(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::PathMutationRequest {
+            from_path: source_path.clone(),
+            to_path: target_path.clone(),
+            overwrite: false,
+            expected_revision: Some(original.version_id),
+            object_id: Some(replacement.object_id.clone()),
+        }),
+    )
+    .await;
+    assert_eq!(stale_revision.status(), StatusCode::CONFLICT);
+
+    let accepted = super::copy_object_path(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::PathMutationRequest {
+            from_path: source_path,
+            to_path: target_path.clone(),
+            overwrite: false,
+            expected_revision: Some(replacement.version_id),
+            object_id: Some(replacement.object_id),
+        }),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+    {
+        let store = lock_store(&state, "tests.copy-object-id-target").await;
+        assert_eq!(
+            store
+                .get_object(
+                    &target_path,
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .unwrap(),
+            Bytes::from_static(b"replacement")
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    copy_object_path_honors_object_id_and_expected_revision_impl,
+    copy_object_path_honors_object_id_and_expected_revision,
+    copy_object_path_honors_object_id_and_expected_revision_turso
+);
+
+async fn object_id_rename_replays_same_operation_id_after_delete_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-rename-idempotency-create").await;
+        store
+            .put_object_versioned(
+                "object-id-rename-idempotency-source.txt",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-object-id-rename"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-object-id-rename"),
+    );
+    let request = super::ObjectRenameRequest {
+        to_path: "object-id-rename-idempotency-target.txt".to_string(),
+        overwrite: false,
+        expected_revision: Some(created.version_id),
+    };
+
+    let first = super::rename_object_by_id(
+        State(state.clone()),
+        headers.clone(),
+        Path(created.object_id.clone()),
+        Json(request.clone()),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+    let delete = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(delete.status(), StatusCode::CREATED);
+
+    let replay = super::rename_object_by_id(
+        State(state.clone()),
+        headers,
+        Path(created.object_id.clone()),
+        Json(request),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::NO_CONTENT);
+
+    let current_path = {
+        let store = lock_store(&state, "tests.object-id-rename-idempotency-verify").await;
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+    };
+    assert!(current_path.is_none());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_rename_replays_same_operation_id_after_delete_impl,
+    object_id_rename_replays_same_operation_id_after_delete,
+    object_id_rename_replays_same_operation_id_after_delete_turso
+);
+
+async fn object_id_delete_replays_same_operation_id_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-delete-idempotency-create").await;
+        store
+            .put_object_versioned(
+                "object-id-delete-idempotency.txt",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-object-id-delete"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-object-id-delete"),
+    );
+    let query = super::PutObjectQuery {
+        state: None,
+        parent: Vec::new(),
+        expected_revision: Some(created.version_id),
+        object_id: None,
+        version_id: None,
+        internal_replication: false,
+        recursive: false,
+    };
+
+    let first = super::delete_object_by_id(
+        State(state.clone()),
+        headers.clone(),
+        Path(created.object_id.clone()),
+        Query(query.clone()),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+
+    let replay = super::delete_object_by_id(
+        State(state.clone()),
+        headers,
+        Path(created.object_id),
+        Query(query),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_delete_replays_same_operation_id_impl,
+    object_id_delete_replays_same_operation_id,
+    object_id_delete_replays_same_operation_id_turso
+);
+
+async fn object_id_put_replays_same_operation_id_after_rename_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let source_path = "object-id-put-idempotency-source.txt";
+    let target_path = "object-id-put-idempotency-target.txt";
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-put-idempotency-create").await;
+        store
+            .put_object_versioned(
+                source_path,
+                Bytes::from_static(b"initial payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-object-id-put"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-object-id-put"),
+    );
+    let query = super::PutObjectQuery {
+        state: None,
+        parent: Vec::new(),
+        expected_revision: Some(created.version_id),
+        object_id: None,
+        version_id: None,
+        internal_replication: false,
+        recursive: false,
+    };
+
+    let first = super::put_object_by_id(
+        State(state.clone()),
+        headers.clone(),
+        Path(created.object_id.clone()),
+        Query(query.clone()),
+        Bytes::from_static(b"updated payload"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let updated: super::ObjectMutationResponse = serde_json::from_slice(&first_body).unwrap();
+
+    let rename_response = super::rename_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Json(super::ObjectRenameRequest {
+            to_path: target_path.to_string(),
+            overwrite: false,
+            expected_revision: Some(updated.revision),
+        }),
+    )
+    .await;
+    assert_eq!(rename_response.status(), StatusCode::NO_CONTENT);
+
+    let replay = super::put_object_by_id(
+        State(state.clone()),
+        headers,
+        Path(created.object_id),
+        Query(query),
+        Bytes::from_static(b"updated payload"),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_put_replays_same_operation_id_after_rename_impl,
+    object_id_put_replays_same_operation_id_after_rename,
+    object_id_put_replays_same_operation_id_after_rename_turso
+);
+
+#[test]
+fn upload_session_complete_response_accepts_legacy_payload_without_object_id() {
+    let response =
+        serde_json::from_value::<super::UploadSessionCompleteResponse>(serde_json::json!({
+            "snapshot_id": "snapshot-legacy",
+            "version_id": "version-legacy",
+            "manifest_hash": "manifest-legacy",
+            "state": "confirmed",
+            "new_chunks": 1,
+            "dedup_reused_chunks": 0,
+            "created_new_version": true,
+            "total_size_bytes": 1,
+        }))
+        .unwrap();
+    assert!(response.object_id.is_empty());
+    assert_eq!(response.version_id, "version-legacy");
+}
+
+async fn object_id_api_serializes_and_mutates_by_identity_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let original_path = "object-id-api.txt".to_string();
+    let moved_path = "object-id-api-moved.txt".to_string();
+
+    let created_response = super::put_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(original_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::from_static(b"created"),
+    )
+    .await
+    .into_response();
+    assert_eq!(created_response.status(), StatusCode::CREATED);
+    let created: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(created_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!created.object_id.is_empty());
+    assert_eq!(created.path, original_path);
+
+    let lookup_response = super::get_object_by_id_response(&state, &created.object_id).await;
+    assert_eq!(lookup_response.status(), StatusCode::OK);
+    let lookup: super::ObjectLookupResponse = serde_json::from_slice(
+        &to_bytes(lookup_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(lookup.object_id, created.object_id);
+    assert_eq!(lookup.path, original_path);
+    assert_eq!(lookup.revision.as_deref(), Some(created.revision.as_str()));
+    assert_eq!(lookup.entry_type, "key");
+
+    let index_response = super::list_store_index_response(
+        &state,
+        super::StoreIndexQuery {
+            prefix: None,
+            depth: Some(1),
+            snapshot: None,
+            view: Some(super::StoreIndexView::Raw),
+            cursor: None,
+            page_size: None,
+            offset: None,
+            limit: None,
+            sort: None,
+            media_filter: None,
+            south: None,
+            west: None,
+            north: None,
+            east: None,
+            require_labels: None,
+            exclude_labels: None,
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(index_response.status(), StatusCode::OK);
+    let index_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(index_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let indexed = index_json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == original_path)
+        .expect("store index should contain the created object");
+    assert_eq!(indexed["object_id"], created.object_id);
+
+    let modified_response = super::put_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(created.revision.clone()),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::from_static(b"modified"),
+    )
+    .await;
+    assert_eq!(modified_response.status(), StatusCode::CREATED);
+    let modified: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(modified_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(modified.object_id, created.object_id);
+    assert_eq!(modified.path, original_path);
+    assert_ne!(modified.revision, created.revision);
+
+    let rename_response = super::rename_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Json(super::ObjectRenameRequest {
+            to_path: moved_path.clone(),
+            overwrite: false,
+            expected_revision: Some(modified.revision.clone()),
+        }),
+    )
+    .await;
+    assert_eq!(rename_response.status(), StatusCode::NO_CONTENT);
+
+    let moved_lookup_response = super::get_object_by_id_response(&state, &created.object_id).await;
+    assert_eq!(moved_lookup_response.status(), StatusCode::OK);
+    let moved_lookup: super::ObjectLookupResponse = serde_json::from_slice(
+        &to_bytes(moved_lookup_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(moved_lookup.object_id, created.object_id);
+    assert_eq!(moved_lookup.path, moved_path);
+    assert_eq!(moved_lookup.entry_type, "key");
+
+    let deleted_response = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: moved_lookup.revision.clone(),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(deleted_response.status(), StatusCode::CREATED);
+    let deleted: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(deleted_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(deleted.object_id, created.object_id);
+    assert_eq!(deleted.path, moved_path);
+
+    let tombstone_lookup_response =
+        super::get_object_by_id_response(&state, &created.object_id).await;
+    assert_eq!(tombstone_lookup_response.status(), StatusCode::OK);
+    let tombstone_lookup: super::ObjectLookupResponse = serde_json::from_slice(
+        &to_bytes(tombstone_lookup_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(tombstone_lookup.object_id, created.object_id);
+    assert_eq!(tombstone_lookup.path, moved_path);
+    assert_eq!(
+        tombstone_lookup.revision.as_deref(),
+        Some(deleted.revision.as_str())
+    );
+    assert_eq!(tombstone_lookup.entry_type, "tombstone");
+
+    let directory_path = "object-id-directory/".to_string();
+    let child_path = "object-id-directory/child.txt".to_string();
+    let directory_response = super::put_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(directory_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(directory_response.status(), StatusCode::CREATED);
+    let directory: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(directory_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let child_response = super::put_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(child_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::from_static(b"child"),
+    )
+    .await
+    .into_response();
+    assert_eq!(child_response.status(), StatusCode::CREATED);
+
+    let rejected_directory_delete = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(directory.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(directory.revision.clone()),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(rejected_directory_delete.status(), StatusCode::BAD_REQUEST);
+    {
+        let store = lock_store(&state, "tests.object-id-directory-intact").await;
+        assert_eq!(
+            store
+                .get_object(
+                    &child_path,
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .unwrap(),
+            Bytes::from_static(b"child")
+        );
+    }
+
+    let recursive_directory_delete = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(directory.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(directory.revision),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: true,
+        }),
+    )
+    .await;
+    assert_eq!(recursive_directory_delete.status(), StatusCode::CREATED);
+    let recursive_deleted: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(recursive_directory_delete.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recursive_deleted.object_id, directory.object_id);
+    assert_eq!(recursive_deleted.path, directory_path);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_api_serializes_and_mutates_by_identity_impl,
+    object_id_api_serializes_and_mutates_by_identity,
+    object_id_api_serializes_and_mutates_by_identity_turso
+);
+
+async fn execute_public_object_id_transport_request(
+    state: &super::ServerState,
+    request: transport_sdk::BufferedTransportRequest,
+) -> transport_sdk::BufferedTransportResponse {
+    Box::pin(
+        super::transport_service::execute_buffered_transport_request(
+            state,
+            &super::transport_service::TransportExecutionScope::Public,
+            &request,
+        ),
+    )
+    .await
+    .unwrap()
+}
+
+async fn object_id_routes_reach_multiplex_transport_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-transport-create").await;
+        store
+            .put_object_versioned(
+                "object-id-transport.txt",
+                Bytes::from_static(b"created"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    let lookup = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "GET",
+            format!("/objects/{}", created.object_id),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .await;
+    assert_eq!(lookup.status, StatusCode::OK.as_u16());
+
+    let modified = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "PUT",
+            format!("/objects/{}", created.object_id),
+            Vec::new(),
+            b"modified".to_vec(),
+        ),
+    )
+    .await;
+    assert_eq!(modified.status, StatusCode::CREATED.as_u16());
+
+    let renamed = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "POST",
+            format!("/objects/{}/rename", created.object_id),
+            vec![transport_sdk::TransportHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            }],
+            serde_json::to_vec(&super::ObjectRenameRequest {
+                to_path: "object-id-transport-moved.txt".to_string(),
+                overwrite: false,
+                expected_revision: None,
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::NO_CONTENT.as_u16());
+
+    let deleted = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "DELETE",
+            format!("/objects/{}", created.object_id),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::CREATED.as_u16());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_routes_reach_multiplex_transport_impl,
+    object_id_routes_reach_multiplex_transport,
+    object_id_routes_reach_multiplex_transport_turso
 );
 
 async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
@@ -14057,6 +14819,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
         state: Some("confirmed".to_string()),
         parent: Vec::new(),
         expected_revision: None,
+        object_id: None,
         version_id: None,
         internal_replication: false,
         recursive: false,
@@ -14123,6 +14886,7 @@ async fn delete_object_handler_cascades_sidecars_only_for_public_deletes_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: None,
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -14173,6 +14937,7 @@ async fn delete_object_handler_cascades_sidecars_only_for_public_deletes_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: None,
+            object_id: None,
             version_id: Some("repl-media-delete".to_string()),
             internal_replication: true,
             recursive: false,
@@ -14400,6 +15165,7 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
         state: Some("confirmed".to_string()),
         parent: Vec::new(),
         expected_revision: None,
+        object_id: None,
         version_id: None,
         internal_replication: false,
         recursive: true,
@@ -14457,6 +15223,7 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
         state: Some("confirmed".to_string()),
         parent: Vec::new(),
         expected_revision: None,
+        object_id: None,
         version_id: Some("repl-tomb-docs-marker".to_string()),
         internal_replication: true,
         recursive: false,
@@ -16186,6 +16953,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
         super::StoreIndexEntry {
             path: "gallery/older.jpg".to_string(),
             entry_type: "key".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -16217,6 +16985,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
         super::StoreIndexEntry {
             path: "gallery/newer.jpg".to_string(),
             entry_type: "key".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -16251,6 +17020,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
         super::StoreIndexEntry {
             path: "gallery/clip.mp4".to_string(),
             entry_type: "key".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -16282,6 +17052,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
         super::StoreIndexEntry {
             path: "gallery/subdir/".to_string(),
             entry_type: "prefix".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -16373,6 +17144,7 @@ fn store_index_prepared_sort_materializes_only_requested_prefix() {
         .map(|index| super::StoreIndexEntry {
             path: format!("gallery/{index:03}.jpg"),
             entry_type: "key".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,

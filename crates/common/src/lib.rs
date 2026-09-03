@@ -133,6 +133,8 @@ mod tests {
 pub struct StorageObjectMeta {
     pub key: String,
     pub size_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
