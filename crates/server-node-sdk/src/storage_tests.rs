@@ -1761,6 +1761,127 @@ async fn sqlite_migration_keeps_existing_head_without_logical_path() {
 }
 
 #[tokio::test]
+async fn sqlite_migration_ignores_tombstoned_lineage_candidates() {
+    const STALE_OBJECT_ID: &str = "legacy-tombstoned-object-id";
+
+    let root = test_store_dir("legacy-object-id-tombstoned-lineage");
+    let database_path = root.join("state/metadata.sqlite");
+    let path = "legacy/current.txt";
+    let payload = Bytes::from_static(b"live payload");
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    seeded
+        .put_object_versioned(path, payload.clone(), PutOptions::default())
+        .await
+        .unwrap();
+    let live_index = seeded.list_versions(path).await.unwrap().unwrap();
+    let live_object_id = live_index.object_id.clone();
+    let live_version_id = live_index.preferred_head_version_id.clone().unwrap();
+    let manifest_hash = seeded
+        .current_object_entry(path)
+        .await
+        .unwrap()
+        .unwrap()
+        .manifest_hash;
+    drop(seeded);
+
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+        database
+            .execute(
+                "UPDATE current_objects SET object_id = '' WHERE key = ?1",
+                [path],
+            )
+            .unwrap();
+
+        // The live lineage has a head for the current manifest but predates
+        // logical_path, so it is only a manifest-to-key fallback candidate.
+        let live_index_json: Vec<u8> = database
+            .query_row(
+                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+                [&live_object_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut live_index_json: serde_json::Value =
+            serde_json::from_slice(&live_index_json).unwrap();
+        live_index_json["versions"][&live_version_id]["logical_path"] = serde_json::Value::Null;
+        database
+            .execute(
+                "UPDATE version_indexes SET index_json = ?1 WHERE object_id = ?2",
+                rusqlite::params![
+                    serde_json::to_vec(&live_index_json).unwrap(),
+                    live_object_id
+                ],
+            )
+            .unwrap();
+
+        // A stale lineage contains the same manifest and a direct path match, but
+        // its preferred head is a tombstone. It must not claim a live object.
+        let stale_index = serde_json::json!({
+            "object_id": STALE_OBJECT_ID,
+            "versions": {
+                "stale-current": {
+                    "version_id": "stale-current",
+                    "object_id": STALE_OBJECT_ID,
+                    "manifest_hash": manifest_hash,
+                    "logical_path": path,
+                    "parent_version_ids": [],
+                    "state": "confirmed",
+                    "created_at_unix": 1,
+                    "copied_from_object_id": null,
+                    "copied_from_version_id": null,
+                    "copied_from_path": null
+                },
+                "stale-tombstone": {
+                    "version_id": "stale-tombstone",
+                    "object_id": STALE_OBJECT_ID,
+                    "manifest_hash": TOMBSTONE_MANIFEST_HASH,
+                    "logical_path": path,
+                    "parent_version_ids": ["stale-current"],
+                    "state": "confirmed",
+                    "created_at_unix": 2,
+                    "copied_from_object_id": null,
+                    "copied_from_version_id": null,
+                    "copied_from_path": null
+                }
+            },
+            "head_version_ids": ["stale-tombstone"],
+            "preferred_head_version_id": "stale-tombstone"
+        });
+        database
+            .execute(
+                "INSERT INTO version_indexes(object_id, index_json) VALUES(?1, ?2)",
+                rusqlite::params![STALE_OBJECT_ID, serde_json::to_vec(&stale_index).unwrap()],
+            )
+            .unwrap();
+    }
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let migrated = reopened.list_versions(path).await.unwrap().unwrap();
+    assert_eq!(migrated.object_id, live_object_id);
+    assert_eq!(
+        reopened
+            .get_object(path, None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap(),
+        payload
+    );
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
 async fn sqlite_migration_does_not_rewrite_indexes_with_persisted_object_ids() {
     let root = test_store_dir("object-id-migration-already-persisted");
     let database_path = root.join("state/metadata.sqlite");
@@ -2187,6 +2308,88 @@ run_on_all_metadata_backends!(
     synthetic_migration_version_extends_preferred_head_impl,
     synthetic_migration_version_extends_preferred_head,
     synthetic_migration_version_extends_preferred_head_turso
+);
+
+async fn synthetic_migration_version_reconciles_nonpreferred_current_manifest_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("migration-version-reconciles-current-manifest")
+        .await;
+    let path = "legacy/current.txt";
+    store
+        .put_object_versioned(path, Bytes::from_static(b"current"), PutOptions::default())
+        .await
+        .unwrap();
+    let current = store.current_object_entry(path).await.unwrap().unwrap();
+    let mut index = store
+        .load_version_index_by_object_id(&current.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_head = index.preferred_head_version_id.clone().unwrap();
+    let original_created_at = index.versions[&original_head].created_at_unix;
+    let competing_head_id = "legacy-competing-head".to_string();
+    index.versions.insert(
+        competing_head_id.clone(),
+        FileVersionRecord {
+            version_id: competing_head_id.clone(),
+            object_id: current.object_id.clone(),
+            manifest_hash: "legacy-other-manifest".to_string(),
+            logical_path: Some(path.to_string()),
+            parent_version_ids: Vec::new(),
+            state: VersionConsistencyState::Confirmed,
+            created_at_unix: original_created_at.saturating_add(1),
+            copied_from_object_id: None,
+            copied_from_version_id: None,
+            copied_from_path: None,
+        },
+    );
+    index.head_version_ids = recompute_head_version_ids(&index);
+    index.preferred_head_version_id = choose_preferred_head(&index);
+    assert_eq!(
+        index.preferred_head_version_id.as_deref(),
+        Some(competing_head_id.as_str())
+    );
+    store
+        .persist_version_index_by_object_id(&current.object_id, &index)
+        .await
+        .unwrap();
+
+    store
+        .ensure_migrated_object_version(&current.object_id, path, &current.manifest_hash, unix_ts())
+        .await
+        .unwrap();
+    let migrated = store
+        .load_version_index_by_object_id(&current.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let preferred_head = migrated
+        .preferred_head_version_id
+        .as_ref()
+        .and_then(|version_id| migrated.versions.get(version_id))
+        .unwrap();
+    assert_eq!(preferred_head.manifest_hash, current.manifest_hash);
+    let synthetic = migrated
+        .versions
+        .values()
+        .find(|record| {
+            record.version_id.starts_with("migration-")
+                && record.manifest_hash == current.manifest_hash
+        })
+        .unwrap();
+    assert_eq!(synthetic.parent_version_ids, vec![competing_head_id]);
+    assert!(migrated.head_version_ids.contains(&synthetic.version_id));
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    synthetic_migration_version_reconciles_nonpreferred_current_manifest_impl,
+    synthetic_migration_version_reconciles_nonpreferred_current_manifest,
+    synthetic_migration_version_reconciles_nonpreferred_current_manifest_turso
 );
 
 async fn write_storage_pool_config(root: &Path, config: &StoragePoolConfig) {

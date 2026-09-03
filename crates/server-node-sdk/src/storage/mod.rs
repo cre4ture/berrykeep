@@ -3980,6 +3980,18 @@ impl PersistentStore {
             for mut index in indexes {
                 self.repair_normalized_version_index_identity(&mut index)
                     .await?;
+                let preferred_head_is_tombstone = index
+                    .preferred_head_version_id
+                    .as_deref()
+                    .and_then(|version_id| index.versions.get(version_id))
+                    .is_some_and(|record| record.manifest_hash == TOMBSTONE_MANIFEST_HASH);
+                if preferred_head_is_tombstone {
+                    // A deleted lineage cannot establish the identity of a live current
+                    // object. Its earlier records can share a manifest with a later
+                    // recreate, but preserving that ID would make the tombstone win
+                    // the preferred-head lookup after migration.
+                    continue;
+                }
                 for record in index.versions.values() {
                     if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
                         continue;
@@ -4066,11 +4078,12 @@ impl PersistentStore {
             .load_version_index_by_object_id(object_id)
             .await?
             .unwrap_or_else(|| empty_version_index(object_id));
-        if index
-            .versions
-            .values()
-            .any(|record| record.manifest_hash == manifest_hash)
-        {
+        let preferred_head_matches_current_manifest = index
+            .preferred_head_version_id
+            .as_deref()
+            .and_then(|version_id| index.versions.get(version_id))
+            .is_some_and(|record| record.manifest_hash == manifest_hash);
+        if preferred_head_matches_current_manifest {
             // Loading an older payload normalizes omitted identity fields. Persist the
             // normalized index while it is already part of the bounded current-object
             // migration, so restart safety does not depend on a later write.
