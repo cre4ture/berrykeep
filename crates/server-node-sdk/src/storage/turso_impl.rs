@@ -30,6 +30,7 @@ use super::{
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
     compress_snapshot_json, decode_gallery_labels, decode_version_index, decompress_snapshot_json,
     metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    normalize_snapshot_manifest_object_ids,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -1048,7 +1049,8 @@ impl MetadataStore for TursoMetadataStore {
 
         let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
         let payload = decompress_snapshot_json(&payload)?;
-        let snapshot = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        let mut snapshot = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        normalize_snapshot_manifest_object_ids(&mut snapshot);
         Ok(Some(snapshot))
     }
 
@@ -1826,7 +1828,10 @@ impl MetadataStore for TursoMetadataStore {
         while let Some(row) = rows.next().await? {
             let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
             let payload = decompress_snapshot_json(&payload)?;
-            snapshots.push(self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?);
+            let mut snapshot =
+                self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+            normalize_snapshot_manifest_object_ids(&mut snapshot);
+            snapshots.push(snapshot);
         }
         Ok(snapshots)
     }
@@ -1844,7 +1849,8 @@ impl MetadataStore for TursoMetadataStore {
         };
         let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
         let payload = decompress_snapshot_json(&payload)?;
-        let manifest = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        let mut manifest = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        normalize_snapshot_manifest_object_ids(&mut manifest);
         Ok(Some(manifest))
     }
 

@@ -6321,6 +6321,78 @@ run_on_all_metadata_backends!(
     restore_snapshot_to_custom_target_uses_metadata_copy_turso
 );
 
+async fn restore_legacy_snapshot_drops_empty_object_id_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("restore-legacy-snapshot-empty-object-id")
+        .await;
+
+    let first = store
+        .put_object_versioned(
+            "docs/source.txt",
+            Bytes::from_static(b"source-v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut snapshot = store
+        .metadata_store
+        .load_snapshot_manifest(&first.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    snapshot
+        .object_ids
+        .insert("docs/source.txt".to_string(), String::new());
+    store
+        .metadata_store
+        .persist_snapshot_manifest(&snapshot)
+        .await
+        .unwrap();
+
+    let normalized_snapshot = store
+        .metadata_store
+        .load_snapshot_manifest(&first.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !normalized_snapshot
+            .object_ids
+            .contains_key("docs/source.txt")
+    );
+
+    let restored = store
+        .restore_snapshot_path(
+            &first.snapshot_id,
+            "docs/source.txt",
+            "restored/copy.txt",
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        restored,
+        SnapshotRestoreMutationResult::Applied(_)
+    ));
+
+    let copy_versions = store
+        .list_versions("restored/copy.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(copy_versions.versions.len(), 1);
+    assert_eq!(copy_versions.versions[0].copied_from_object_id, None);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    restore_legacy_snapshot_drops_empty_object_id_impl,
+    restore_legacy_snapshot_drops_empty_object_id,
+    restore_legacy_snapshot_drops_empty_object_id_turso
+);
+
 async fn restore_version_same_path_creates_new_head_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("restore-version-same-path").await;
 

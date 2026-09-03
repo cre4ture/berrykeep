@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
+const OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL: usize = 1_024;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
@@ -997,6 +998,17 @@ struct SnapshotManifest {
     objects: HashMap<String, String>,
     #[serde(default)]
     object_ids: HashMap<String, String>,
+}
+
+/// Drops identity bindings that predate stable object IDs from a historical snapshot.
+///
+/// Old snapshot manifests have no trustworthy identity for these paths. Treating an empty value
+/// as absent keeps it from being exposed by snapshot reads or persisted as copied-from metadata
+/// when a snapshot is restored.
+fn normalize_snapshot_manifest_object_ids(snapshot: &mut SnapshotManifest) {
+    snapshot.object_ids.retain(|path, object_id| {
+        snapshot.objects.contains_key(path) && !object_id.trim().is_empty()
+    });
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3666,6 +3678,11 @@ impl PersistentStore {
         }
         let mut current_objects = current_state.objects.iter().collect::<Vec<_>>();
         current_objects.sort_by_key(|(path, _)| *path);
+        let current_object_count = current_objects.len();
+        info!(
+            current_object_count,
+            "resolving legacy object ID bindings for current namespace"
+        );
         let legacy_candidates = self
             .legacy_object_id_candidates_for_current_state(&current_state)
             .await?;
@@ -3737,7 +3754,8 @@ impl PersistentStore {
             );
         }
 
-        for (path, manifest_hash) in current_objects {
+        for (current_object_index, (path, manifest_hash)) in current_objects.into_iter().enumerate()
+        {
             let assignment =
                 assignments
                     .remove(path)
@@ -3774,6 +3792,16 @@ impl PersistentStore {
                     },
                 )
                 .await?;
+            }
+
+            let current_object_count_processed = current_object_index + 1;
+            if current_object_count_processed % OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL == 0
+                || current_object_count_processed == current_object_count
+            {
+                info!(
+                    current_object_count,
+                    current_object_count_processed, "legacy object ID migration progress"
+                );
             }
         }
 
@@ -3836,6 +3864,8 @@ impl PersistentStore {
         let mut candidates_by_binding = HashMap::new();
         let mut manifest_paths = HashMap::<String, Option<String>>::new();
         let mut after_object_id = None;
+        let scan_started = Instant::now();
+        let mut scanned_version_index_count = 0;
 
         loop {
             let indexes = self
@@ -3851,6 +3881,16 @@ impl PersistentStore {
             else {
                 break;
             };
+            scanned_version_index_count += indexes.len();
+            if scanned_version_index_count % OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL
+                < indexes.len()
+            {
+                info!(
+                    elapsed_ms = scan_started.elapsed().as_millis(),
+                    scanned_version_index_count,
+                    "scanning legacy version indexes for object ID migration"
+                );
+            }
 
             for mut index in indexes {
                 self.repair_normalized_version_index_identity(&mut index)
@@ -3917,6 +3957,12 @@ impl PersistentStore {
             }
             after_object_id = Some(last_object_id);
         }
+
+        info!(
+            elapsed_ms = scan_started.elapsed().as_millis(),
+            scanned_version_index_count,
+            "completed legacy version-index scan for object ID migration"
+        );
 
         Ok(candidates_by_binding
             .into_iter()

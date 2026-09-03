@@ -37,8 +37,8 @@ use super::{
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
-    version_created_at_unix_from_payload,
+    metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
+    sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
 };
 
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2843,9 +2843,10 @@ impl MetadataStore for SqliteMetadataStore {
         match payload {
             Some(payload) => {
                 let payload = decompress_snapshot_json(&payload)?;
-                serde_json::from_slice::<SnapshotManifest>(&payload)
-                    .map(Some)
-                    .context("invalid snapshot manifest in sqlite")
+                let mut snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .context("invalid snapshot manifest in sqlite")?;
+                normalize_snapshot_manifest_object_ids(&mut snapshot);
+                Ok(Some(snapshot))
             }
             None => Ok(None),
         }
@@ -3791,10 +3792,10 @@ impl MetadataStore for SqliteMetadataStore {
             for row in rows {
                 let payload = row?;
                 let payload = decompress_snapshot_json(&payload)?;
-                snapshots.push(
-                    serde_json::from_slice::<SnapshotManifest>(&payload)
-                        .context("invalid snapshot manifest in sqlite")?,
-                );
+                let mut snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .context("invalid snapshot manifest in sqlite")?;
+                normalize_snapshot_manifest_object_ids(&mut snapshot);
+                snapshots.push(snapshot);
             }
             Ok(snapshots)
         })
@@ -3817,9 +3818,10 @@ impl MetadataStore for SqliteMetadataStore {
         match payload {
             Some(payload) => {
                 let payload = decompress_snapshot_json(&payload)?;
-                serde_json::from_slice::<SnapshotManifest>(&payload)
-                    .map(Some)
-                    .context("invalid snapshot manifest in sqlite")
+                let mut snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .context("invalid snapshot manifest in sqlite")?;
+                normalize_snapshot_manifest_object_ids(&mut snapshot);
+                Ok(Some(snapshot))
             }
             None => Ok(None),
         }
