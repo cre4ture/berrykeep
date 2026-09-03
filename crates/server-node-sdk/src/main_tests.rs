@@ -13231,6 +13231,10 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
     assert_eq!(collapsed.len(), 2);
     assert_eq!(collapsed[0].path, "images/");
     assert_eq!(collapsed[0].entry_type, "prefix");
+    assert_eq!(
+        collapsed[0].object_id.as_deref(),
+        Some("obj-directory-marker")
+    );
     assert_eq!(collapsed[0].content_hash, None);
     assert_eq!(collapsed[1].path, "images/cat.png");
     assert_eq!(collapsed[1].entry_type, "key");

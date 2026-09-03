@@ -18064,21 +18064,28 @@ fn collapse_store_index_entries_for_tree_view(
             continue;
         }
 
-        collapsed
-            .entry(entry.path.clone())
-            .or_insert_with(|| StoreIndexEntry {
-                path: entry.path,
-                entry_type: "prefix".to_string(),
-                object_id: None,
-                version: None,
-                content_hash: None,
-                size_bytes: None,
-                modified_at_unix: None,
-                content_fingerprint: None,
-                media: None,
-                labels: Vec::new(),
-                labels_resolved: false,
-            });
+        let directory_marker_object_id = (entry.entry_type == "key" && entry.path.ends_with('/'))
+            .then(|| entry.object_id.clone())
+            .flatten();
+        let collapsed_entry =
+            collapsed
+                .entry(entry.path.clone())
+                .or_insert_with(|| StoreIndexEntry {
+                    path: entry.path,
+                    entry_type: "prefix".to_string(),
+                    object_id: None,
+                    version: None,
+                    content_hash: None,
+                    size_bytes: None,
+                    modified_at_unix: None,
+                    content_fingerprint: None,
+                    media: None,
+                    labels: Vec::new(),
+                    labels_resolved: false,
+                });
+        if directory_marker_object_id.is_some() {
+            collapsed_entry.object_id = directory_marker_object_id;
+        }
     }
 
     collapsed.into_values().collect()
