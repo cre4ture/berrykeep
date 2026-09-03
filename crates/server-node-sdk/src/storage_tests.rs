@@ -6767,12 +6767,18 @@ async fn restore_history_batch_preserves_recreated_target_impl(backend: StorageT
         .await
         .unwrap();
 
+    let restore_requests = [(
+        "docs/readme.txt".to_string(),
+        deleted.version_id,
+        "docs/readme.txt".to_string(),
+    )];
+    let sources = store
+        .store_history_inspector()
+        .resolve_version_restore_sources(&restore_requests)
+        .await
+        .unwrap();
     let results = store
-        .restore_version_paths_batch(&[(
-            "docs/readme.txt".to_string(),
-            deleted.version_id,
-            "docs/readme.txt".to_string(),
-        )])
+        .restore_resolved_version_paths_batch(&restore_requests, &sources)
         .await
         .unwrap();
     assert!(matches!(
@@ -6830,19 +6836,25 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
         .await
         .unwrap();
 
+    let restore_requests = [
+        (
+            "docs/restored.txt".to_string(),
+            restored.version_id,
+            "docs/restored.txt".to_string(),
+        ),
+        (
+            "docs/broken.txt".to_string(),
+            broken.version_id,
+            "docs/broken.txt".to_string(),
+        ),
+    ];
+    let sources = store
+        .store_history_inspector()
+        .resolve_version_restore_sources(&restore_requests)
+        .await
+        .unwrap();
     let results = store
-        .restore_version_paths_batch(&[
-            (
-                "docs/restored.txt".to_string(),
-                restored.version_id,
-                "docs/restored.txt".to_string(),
-            ),
-            (
-                "docs/broken.txt".to_string(),
-                broken.version_id,
-                "docs/broken.txt".to_string(),
-            ),
-        ])
+        .restore_resolved_version_paths_batch(&restore_requests, &sources)
         .await
         .unwrap();
     assert!(matches!(

@@ -1584,7 +1584,7 @@ pub struct SnapshotObjectState {
 }
 
 #[derive(Debug, Clone)]
-struct SnapshotRestoreSource {
+pub(crate) struct SnapshotRestoreSource {
     manifest_hash: String,
     object_id: Option<String>,
     version_id: Option<String>,
@@ -2542,10 +2542,12 @@ pub(crate) struct StoreIndexInspector {
 }
 
 /// Detached access to the version-index metadata needed by Explorer's
-/// recoverable-history listing. It intentionally owns only clonable metadata
-/// handles, so callers can release the main store lock before a full scan.
+/// recoverable-history listing and restore-source resolution. It intentionally
+/// owns only clonable handles, so callers can release the main store lock
+/// before a potentially long metadata scan.
 #[derive(Clone)]
 pub(crate) struct StoreHistoryInspector {
+    storage_pool: StoragePool,
     metadata_store: Arc<dyn MetadataStore>,
 }
 
@@ -3121,8 +3123,184 @@ pub(crate) enum RecoverableHistoryEntries {
 }
 
 impl StoreHistoryInspector {
-    fn new(metadata_store: Arc<dyn MetadataStore>) -> Self {
-        Self { metadata_store }
+    fn new(storage_pool: StoragePool, metadata_store: Arc<dyn MetadataStore>) -> Self {
+        Self {
+            storage_pool,
+            metadata_store,
+        }
+    }
+
+    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)?;
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&manifest_path).await?;
+        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+        Ok(Some(manifest))
+    }
+
+    async fn resolve_key_for_version_index(
+        &self,
+        index: &FileVersionIndex,
+    ) -> Result<Option<String>> {
+        if let Some(preferred_head) = index
+            .preferred_head_version_id
+            .as_ref()
+            .and_then(|version_id| index.versions.get(version_id))
+            .and_then(|record| record.logical_path.clone())
+        {
+            return Ok(Some(preferred_head));
+        }
+
+        if let Some(any_logical_path) = index
+            .versions
+            .values()
+            .find_map(|record| record.logical_path.clone())
+        {
+            return Ok(Some(any_logical_path));
+        }
+
+        for record in index.versions.values() {
+            if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving historical restore source key; skipping record"
+                    );
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve_key_for_version_record(
+        &self,
+        index: &FileVersionIndex,
+        record: &FileVersionRecord,
+    ) -> Result<Option<String>> {
+        if let Some(logical_path) = record.logical_path.clone() {
+            return Ok(Some(logical_path));
+        }
+
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving historical restore source key; falling back to index lookup"
+                    );
+                }
+            }
+        }
+
+        self.resolve_key_for_version_index(index).await
+    }
+
+    async fn version_restore_source_from_indexes(
+        &self,
+        indexes: &[FileVersionIndex],
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<SnapshotRestoreSource>> {
+        for index in indexes {
+            let Some(record) = index.versions.get(version_id) else {
+                continue;
+            };
+            let Some(resolved_path) = self.resolve_key_for_version_record(index, record).await?
+            else {
+                continue;
+            };
+            if resolved_path != source_path || record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            return Ok(Some(SnapshotRestoreSource {
+                manifest_hash: record.manifest_hash.clone(),
+                object_id: Some(index.object_id.clone()),
+                version_id: Some(record.version_id.clone()),
+                state: record.state.clone(),
+            }));
+        }
+
+        Ok(None)
+    }
+
+    /// Resolves a bounded restore batch without holding the main store lock.
+    /// Index pages are scanned once for all unresolved sources, keeping both
+    /// the database work and peak memory bounded on large stores.
+    pub(crate) async fn resolve_version_restore_sources(
+        &self,
+        restore_requests: &[(String, String, String)],
+    ) -> Result<Vec<Option<SnapshotRestoreSource>>> {
+        let mut unresolved = restore_requests
+            .iter()
+            .map(|(source_path, version_id, _)| (source_path.clone(), version_id.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut sources = HashMap::<(String, String), SnapshotRestoreSource>::new();
+        let mut after_object_id = None;
+
+        while !unresolved.is_empty() {
+            let indexes = self
+                .metadata_store
+                .load_version_indexes_after(
+                    after_object_id.as_deref(),
+                    STORE_HISTORY_VERSION_INDEX_BATCH_SIZE,
+                )
+                .await?;
+            let Some(last_object_id) = indexes
+                .last()
+                .map(|index| index.persisted_object_id.clone())
+            else {
+                break;
+            };
+
+            let candidates = unresolved.iter().cloned().collect::<Vec<_>>();
+            for (source_path, version_id) in candidates {
+                let Some(source) = self
+                    .version_restore_source_from_indexes(&indexes, &source_path, &version_id)
+                    .await?
+                else {
+                    continue;
+                };
+                unresolved.remove(&(source_path.clone(), version_id.clone()));
+                sources.insert((source_path, version_id), source);
+            }
+
+            after_object_id = Some(last_object_id);
+        }
+
+        Ok(restore_requests
+            .iter()
+            .map(|(source_path, version_id, _)| {
+                sources
+                    .get(&(source_path.clone(), version_id.clone()))
+                    .cloned()
+            })
+            .collect())
     }
 
     pub(crate) async fn list_recoverable_history_entries_bounded(
@@ -4526,7 +4704,7 @@ impl PersistentStore {
     }
 
     pub(crate) fn store_history_inspector(&self) -> StoreHistoryInspector {
-        StoreHistoryInspector::new(self.metadata_store.clone())
+        StoreHistoryInspector::new(self.storage_pool.clone(), self.metadata_store.clone())
     }
 
     pub(crate) async fn query_gallery_index(
@@ -9961,35 +10139,6 @@ impl PersistentStore {
         }))
     }
 
-    async fn version_restore_source_from_indexes(
-        &self,
-        indexes: &[FileVersionIndex],
-        source_path: &str,
-        version_id: &str,
-    ) -> Result<Option<SnapshotRestoreSource>> {
-        for index in indexes {
-            let Some(record) = index.versions.get(version_id) else {
-                continue;
-            };
-            let Some(resolved_path) = self.resolve_key_for_version_record(index, record).await?
-            else {
-                continue;
-            };
-            if resolved_path != source_path || record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-                continue;
-            }
-
-            return Ok(Some(SnapshotRestoreSource {
-                manifest_hash: record.manifest_hash.clone(),
-                object_id: Some(index.object_id.clone()),
-                version_id: Some(record.version_id.clone()),
-                state: record.state.clone(),
-            }));
-        }
-
-        Ok(None)
-    }
-
     pub async fn restore_version_path(
         &mut self,
         source_path: &str,
@@ -10005,18 +10154,25 @@ impl PersistentStore {
             .await
     }
 
-    /// Restores multiple concrete historical versions after loading version
-    /// indexes once. This keeps batch restore from resolving each source by a
-    /// separate full index scan. Per-entry failures are retained so successful
-    /// restores can still be published by the caller.
-    pub async fn restore_version_paths_batch(
+    /// Applies an already-resolved historical restore batch. Target existence
+    /// is deliberately checked here, immediately before each mutation.
+    pub(crate) async fn restore_resolved_version_paths_batch(
         &mut self,
         restore_requests: &[(String, String, String)],
+        sources: &[Option<SnapshotRestoreSource>],
     ) -> Result<Vec<Result<PathMutationResult>>> {
-        let indexes = self.load_all_version_indexes().await?;
+        if restore_requests.len() != sources.len() {
+            bail!(
+                "historical restore request/source count mismatch: {} requests, {} sources",
+                restore_requests.len(),
+                sources.len()
+            );
+        }
         let mut results = Vec::with_capacity(restore_requests.len());
 
-        for (source_path, version_id, target_path) in restore_requests {
+        for ((source_path, _version_id, target_path), source) in
+            restore_requests.iter().zip(sources)
+        {
             let target_exists = match self.current_object_entry(target_path).await {
                 Ok(entry) => entry.is_some(),
                 Err(err) => {
@@ -10028,13 +10184,10 @@ impl PersistentStore {
                 results.push(Ok(PathMutationResult::TargetExists));
                 continue;
             }
-            let result = match self
-                .version_restore_source_from_indexes(&indexes, source_path, version_id)
-                .await
-            {
-                Ok(Some(source)) => {
+            let result = match source {
+                Some(source) => {
                     self.restore_object_path_from_source(
-                        source,
+                        source.clone(),
                         source_path,
                         target_path,
                         true,
@@ -10042,8 +10195,7 @@ impl PersistentStore {
                     )
                     .await
                 }
-                Ok(None) => Ok(PathMutationResult::SourceMissing),
-                Err(err) => Err(err),
+                None => Ok(PathMutationResult::SourceMissing),
             };
             results.push(result);
         }

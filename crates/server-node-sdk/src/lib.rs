@@ -346,6 +346,7 @@ struct ServerStorageRuntime {
     namespace_change_tx: watch::Sender<u64>,
     store_index_page_cache: Arc<StdMutex<StoreIndexPageCache>>,
     store_history_cache: Arc<StdMutex<StoreHistoryCache>>,
+    store_history_cache_generation: Arc<AtomicU64>,
     store_history_refresh_lock: Arc<Mutex<()>>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
@@ -7400,6 +7401,7 @@ async fn run_inner(
             namespace_change_tx: watch::channel(0).0,
             store_index_page_cache: Arc::new(StdMutex::new(StoreIndexPageCache::default())),
             store_history_cache: Arc::new(StdMutex::new(StoreHistoryCache::default())),
+            store_history_cache_generation: Arc::new(AtomicU64::new(0)),
             store_history_refresh_lock: Arc::new(Mutex::new(())),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
@@ -16401,6 +16403,13 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
             if let Some(cached) = cached {
                 cached
             } else {
+                // A restore increments this generation before it changes the
+                // cache. Do not let a scan started before that mutation put
+                // obsolete historical entries back into the cache.
+                let cache_generation = state
+                    .storage
+                    .store_history_cache_generation
+                    .load(Ordering::SeqCst);
                 let history_inspector = {
                     let store = read_store(state, "store_history.clone_inspector").await;
                     store.store_history_inspector()
@@ -16436,8 +16445,27 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                     );
                 }
                 match state.storage.store_history_cache.lock() {
-                    Ok(mut cache) => cache.insert(&prefix, Arc::clone(&value)),
-                    Err(poisoned) => poisoned.into_inner().insert(&prefix, Arc::clone(&value)),
+                    Ok(mut cache) => {
+                        if state
+                            .storage
+                            .store_history_cache_generation
+                            .load(Ordering::SeqCst)
+                            == cache_generation
+                        {
+                            cache.insert(&prefix, Arc::clone(&value));
+                        }
+                    }
+                    Err(poisoned) => {
+                        let mut cache = poisoned.into_inner();
+                        if state
+                            .storage
+                            .store_history_cache_generation
+                            .load(Ordering::SeqCst)
+                            == cache_generation
+                        {
+                            cache.insert(&prefix, Arc::clone(&value));
+                        }
+                    }
                 }
                 value
             }
@@ -16631,9 +16659,23 @@ async fn restore_history_entries_response(
             )
         })
         .collect::<Vec<_>>();
-    let restore_results = {
-        let mut store = lock_store(state, "store_history.restore_batch").await;
-        store.restore_version_paths_batch(&restore_requests).await
+    let source_results = {
+        let history_inspector = {
+            let store = read_store(state, "store_history.clone_restore_inspector").await;
+            store.store_history_inspector()
+        };
+        history_inspector
+            .resolve_version_restore_sources(&restore_requests)
+            .await
+    };
+    let restore_results = match source_results {
+        Ok(sources) => {
+            let mut store = lock_store(state, "store_history.restore_batch").await;
+            store
+                .restore_resolved_version_paths_batch(&restore_requests, &sources)
+                .await
+        }
+        Err(err) => Err(err),
     };
     let restore_results: Vec<Result<PathMutationResult>> = match restore_results {
         Ok(results) => results,
@@ -16681,6 +16723,10 @@ async fn restore_history_entries_response(
             .filter(|entry| entry.status == "restored")
             .map(|entry| entry.path.clone())
             .collect::<HashSet<_>>();
+        state
+            .storage
+            .store_history_cache_generation
+            .fetch_add(1, Ordering::SeqCst);
         remove_restored_history_entries_from_cache(state, &restored_paths);
         publish_namespace_change(state);
         request_local_availability_refresh(state);
