@@ -6775,7 +6775,10 @@ async fn restore_history_batch_preserves_recreated_target_impl(backend: StorageT
         )])
         .await
         .unwrap();
-    assert_eq!(results, vec![PathMutationResult::TargetExists]);
+    assert!(matches!(
+        results.as_slice(),
+        [Ok(PathMutationResult::TargetExists)]
+    ));
     assert_eq!(
         store
             .get_object("docs/readme.txt", None, None, ObjectReadMode::Preferred)
@@ -6792,6 +6795,77 @@ run_on_all_metadata_backends!(
     restore_history_batch_preserves_recreated_target_impl,
     restore_history_batch_preserves_recreated_target,
     restore_history_batch_preserves_recreated_target_turso
+);
+
+async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("restore-history-batch-partial-success")
+        .await;
+
+    let restored = store
+        .put_object_versioned(
+            "docs/restored.txt",
+            Bytes::from_static(b"restored content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("docs/restored.txt", PutOptions::default())
+        .await
+        .unwrap();
+    let broken = store
+        .put_object_versioned(
+            "docs/broken.txt",
+            Bytes::from_static(b"broken content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("docs/broken.txt", PutOptions::default())
+        .await
+        .unwrap();
+    fs::remove_file(store.manifest_path_for_test(&broken.manifest_hash))
+        .await
+        .unwrap();
+
+    let results = store
+        .restore_version_paths_batch(&[
+            (
+                "docs/restored.txt".to_string(),
+                restored.version_id,
+                "docs/restored.txt".to_string(),
+            ),
+            (
+                "docs/broken.txt".to_string(),
+                broken.version_id,
+                "docs/broken.txt".to_string(),
+            ),
+        ])
+        .await
+        .unwrap();
+    assert!(matches!(
+        results.first(),
+        Some(Ok(PathMutationResult::Applied))
+    ));
+    assert!(results.get(1).is_some_and(Result::is_err));
+    assert_eq!(
+        store
+            .get_object("docs/restored.txt", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"restored content"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    restore_history_batch_keeps_partial_successes_impl,
+    restore_history_batch_keeps_partial_successes,
+    restore_history_batch_keeps_partial_successes_turso
 );
 
 async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(

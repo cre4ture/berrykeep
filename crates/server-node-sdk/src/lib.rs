@@ -16616,7 +16616,7 @@ async fn restore_history_entries_response(
         store.restore_version_paths_batch(&restore_requests).await
     };
     let restore_results: Vec<Result<PathMutationResult>> = match restore_results {
-        Ok(results) => results.into_iter().map(Ok).collect(),
+        Ok(results) => results,
         Err(err) => {
             tracing::warn!(error = %err, entry_count = restore_requests.len(), "failed resolving historical restore batch");
             let error = err.to_string();

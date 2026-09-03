@@ -9953,24 +9953,32 @@ impl PersistentStore {
 
     /// Restores multiple concrete historical versions after loading version
     /// indexes once. This keeps batch restore from resolving each source by a
-    /// separate full index scan.
+    /// separate full index scan. Per-entry failures are retained so successful
+    /// restores can still be published by the caller.
     pub async fn restore_version_paths_batch(
         &mut self,
         restore_requests: &[(String, String, String)],
-    ) -> Result<Vec<PathMutationResult>> {
+    ) -> Result<Vec<Result<PathMutationResult>>> {
         let indexes = self.load_all_version_indexes().await?;
         let mut results = Vec::with_capacity(restore_requests.len());
 
         for (source_path, version_id, target_path) in restore_requests {
-            if self.current_object_entry(target_path).await?.is_some() {
-                results.push(PathMutationResult::TargetExists);
+            let target_exists = match self.current_object_entry(target_path).await {
+                Ok(entry) => entry.is_some(),
+                Err(err) => {
+                    results.push(Err(err));
+                    continue;
+                }
+            };
+            if target_exists {
+                results.push(Ok(PathMutationResult::TargetExists));
                 continue;
             }
             let result = match self
                 .version_restore_source_from_indexes(&indexes, source_path, version_id)
-                .await?
+                .await
             {
-                Some(source) => {
+                Ok(Some(source)) => {
                     self.restore_object_path_from_source(
                         source,
                         source_path,
@@ -9978,9 +9986,10 @@ impl PersistentStore {
                         true,
                         false,
                     )
-                    .await?
+                    .await
                 }
-                None => PathMutationResult::SourceMissing,
+                Ok(None) => Ok(PathMutationResult::SourceMissing),
+                Err(err) => Err(err),
             };
             results.push(result);
         }
