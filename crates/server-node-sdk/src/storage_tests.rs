@@ -1758,22 +1758,22 @@ async fn sqlite_migration_does_not_rewrite_indexes_with_persisted_object_ids() {
 }
 
 #[tokio::test]
-async fn sqlite_migration_repairs_mismatched_persisted_index_identities() {
-    let root = test_store_dir("object-id-migration-mismatched-persisted-index");
+async fn sqlite_migration_repairs_empty_persisted_index_identity() {
+    let root = test_store_dir("object-id-migration-empty-persisted-index");
     let database_path = root.join("state/metadata.sqlite");
     let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
         .await
         .unwrap();
     seeded
         .put_object_versioned(
-            "mismatched-persisted-index.txt",
+            "empty-persisted-index.txt",
             Bytes::from_static(b"payload"),
             PutOptions::default(),
         )
         .await
         .unwrap();
     let versions = seeded
-        .list_versions("mismatched-persisted-index.txt")
+        .list_versions("empty-persisted-index.txt")
         .await
         .unwrap()
         .unwrap();
@@ -1789,21 +1789,16 @@ async fn sqlite_migration_repairs_mismatched_persisted_index_identities() {
                 [OBJECT_ID_BACKFILL_KEY],
             )
             .unwrap();
-        let index_json: Vec<u8> = database
-            .query_row(
-                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
-                [&object_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let mut index: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
-        index["object_id"] = serde_json::Value::String("payload-object-id".to_string());
-        index["versions"][&version_id]["object_id"] =
-            serde_json::Value::String("payload-version-object-id".to_string());
         database
             .execute(
-                "UPDATE version_indexes SET index_json = ?1 WHERE object_id = ?2",
-                rusqlite::params![serde_json::to_vec(&index).unwrap(), object_id],
+                "UPDATE current_objects SET object_id = '' WHERE key = ?1",
+                ["empty-persisted-index.txt"],
+            )
+            .unwrap();
+        database
+            .execute(
+                "UPDATE version_indexes SET object_id = '' WHERE object_id = ?1",
+                [&object_id],
             )
             .unwrap();
     }
@@ -1813,7 +1808,7 @@ async fn sqlite_migration_repairs_mismatched_persisted_index_identities() {
         .unwrap();
     assert_eq!(
         reopened
-            .list_versions("mismatched-persisted-index.txt")
+            .list_versions("empty-persisted-index.txt")
             .await
             .unwrap()
             .unwrap()
@@ -1833,9 +1828,94 @@ async fn sqlite_migration_repairs_mismatched_persisted_index_identities() {
     let index: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
     assert_eq!(index["object_id"], object_id);
     assert_eq!(index["versions"][&version_id]["object_id"], object_id);
+    let empty_row_count: i64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM version_indexes WHERE object_id = ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(empty_row_count, 0);
 
     let _ = fs::remove_dir_all(root).await;
 }
+
+#[test]
+fn version_index_decode_normalizes_mismatched_payload_identity() {
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "object_id": "payload-object-id",
+        "versions": {
+            "version": {
+                "version_id": "version",
+                "object_id": "payload-version-object-id",
+                "manifest_hash": "manifest",
+                "logical_path": "path",
+                "parent_version_ids": [],
+                "state": "confirmed",
+                "created_at_unix": 1,
+                "copied_from_object_id": null,
+                "copied_from_version_id": null,
+                "copied_from_path": null
+            }
+        },
+        "head_version_ids": ["version"],
+        "preferred_head_version_id": "version"
+    }))
+    .unwrap();
+
+    let index = decode_version_index("row-object-id", &payload, "test").unwrap();
+    assert!(index.identity_was_normalized);
+    assert_eq!(index.object_id, "row-object-id");
+    assert_eq!(index.versions["version"].object_id, "row-object-id");
+}
+
+async fn version_index_keyset_scan_includes_empty_persisted_object_id_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, store) = backend
+        .init_store("version-index-keyset-empty-persisted-object-id")
+        .await;
+    let index = empty_version_index("payload-object-id");
+    store
+        .metadata_store
+        .persist_version_index_by_object_id("", &index)
+        .await
+        .unwrap();
+    store
+        .metadata_store
+        .persist_version_index_by_object_id(
+            "later-object-id",
+            &empty_version_index("later-object-id"),
+        )
+        .await
+        .unwrap();
+
+    let first_page = store
+        .metadata_store
+        .load_version_indexes_after(None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].persisted_object_id, "");
+    assert_eq!(first_page[0].object_id, "payload-object-id");
+    assert!(first_page[0].identity_was_normalized);
+    let second_page = store
+        .metadata_store
+        .load_version_indexes_after(Some(""), 1)
+        .await
+        .unwrap();
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].persisted_object_id, "later-object-id");
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    version_index_keyset_scan_includes_empty_persisted_object_id_impl,
+    version_index_keyset_scan_includes_empty_persisted_object_id,
+    version_index_keyset_scan_includes_empty_persisted_object_id_turso
+);
 
 #[tokio::test]
 async fn sqlite_migration_keeps_preferred_head_for_duplicate_legacy_current_object_ids() {

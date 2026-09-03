@@ -1323,6 +1323,8 @@ pub(super) struct FileVersionIndex {
     preferred_head_version_id: Option<String>,
     #[serde(skip)]
     identity_was_normalized: bool,
+    #[serde(skip)]
+    persisted_object_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3646,12 +3648,11 @@ impl PersistentStore {
 
     /// Backfills the live namespace written before object identity became mandatory.
     ///
-    /// This is a one-time foreground migration. It first scans legacy version indexes in bounded
-    /// batches and repairs any payload identity that differs from the authoritative row identity.
-    /// If the live namespace already has one non-empty identity per current object, it then records
-    /// completion. Otherwise it inspects legacy version indexes to assign every current object a
-    /// durable identity before serving requests. The writes are idempotent; a restart before the
-    /// completion marker is recorded repeats the scan safely.
+    /// This is a one-time foreground migration. If the live namespace already has one non-empty
+    /// identity per current object, it records completion without reading historical version
+    /// indexes. Otherwise it scans legacy version indexes before serving requests, so every current
+    /// object has a durable identity from the first post-upgrade request. The writes are idempotent;
+    /// a restart before the completion marker is recorded repeats the scan safely.
     /// Historical snapshots are normalized when they are read or rewritten instead of
     /// making startup walk every retained snapshot.
     async fn migrate_legacy_object_ids(&self) -> Result<()> {
@@ -3659,7 +3660,6 @@ impl PersistentStore {
             return Ok(());
         }
 
-        self.repair_legacy_version_index_identities().await?;
         let current_state = self.metadata_store.load_current_state().await?;
         if current_state_has_unique_object_id_bindings(&current_state) {
             return self.metadata_store.mark_object_id_backfill_complete().await;
@@ -3780,28 +3780,33 @@ impl PersistentStore {
         self.metadata_store.mark_object_id_backfill_complete().await
     }
 
-    async fn repair_legacy_version_index_identities(&self) -> Result<()> {
-        let mut after_object_id = None;
-        loop {
-            let indexes = self
-                .metadata_store
-                .load_version_indexes_after(
-                    after_object_id.as_deref(),
-                    OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE,
-                )
-                .await?;
-            let Some(last_object_id) = indexes.last().map(|index| index.object_id.clone()) else {
-                break;
-            };
-
-            for index in indexes {
-                if index.identity_was_normalized {
-                    self.persist_version_index_by_object_id(&index.object_id, &index)
-                        .await?;
-                }
-            }
-            after_object_id = Some(last_object_id);
+    async fn repair_normalized_version_index_identity(
+        &self,
+        index: &mut FileVersionIndex,
+    ) -> Result<()> {
+        if !index.identity_was_normalized {
+            return Ok(());
         }
+
+        let persisted_object_id = index.persisted_object_id.clone();
+        if persisted_object_id != index.object_id
+            && self.has_version_index(&index.object_id).await?
+        {
+            let replacement_object_id = generate_object_id();
+            index.object_id = replacement_object_id.clone();
+            for record in index.versions.values_mut() {
+                record.object_id = replacement_object_id.clone();
+            }
+        }
+
+        self.persist_version_index_by_object_id(&index.object_id, index)
+            .await?;
+        if persisted_object_id != index.object_id {
+            self.delete_version_index_by_object_id(&persisted_object_id)
+                .await?;
+        }
+        index.persisted_object_id = index.object_id.clone();
+        index.identity_was_normalized = false;
         Ok(())
     }
 
@@ -3840,11 +3845,16 @@ impl PersistentStore {
                     OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE,
                 )
                 .await?;
-            let Some(last_object_id) = indexes.last().map(|index| index.object_id.clone()) else {
+            let Some(last_object_id) = indexes
+                .last()
+                .map(|index| index.persisted_object_id.clone())
+            else {
                 break;
             };
 
-            for index in indexes {
+            for mut index in indexes {
+                self.repair_normalized_version_index_identity(&mut index)
+                    .await?;
                 for record in index.versions.values() {
                     if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
                         continue;
@@ -8858,7 +8868,7 @@ impl PersistentStore {
             });
         }
 
-        normalize_version_index_identity(object_id, &mut record.index, "tombstone archive")?;
+        normalize_version_index_identity(object_id, &mut record.index, "tombstone archive", None);
         self.persist_version_index_by_object_id(object_id, &record.index)
             .await?;
         Ok(TombstoneRestoreReport {
@@ -10347,6 +10357,7 @@ fn empty_version_index(object_id: &str) -> FileVersionIndex {
         head_version_ids: Vec::new(),
         preferred_head_version_id: None,
         identity_was_normalized: false,
+        persisted_object_id: String::new(),
     }
 }
 
@@ -10357,8 +10368,9 @@ fn decode_version_index(
 ) -> Result<FileVersionIndex> {
     let mut index = serde_json::from_slice::<FileVersionIndex>(payload)
         .with_context(|| format!("invalid version index in {backend}"))?;
+    index.persisted_object_id = persisted_object_id.to_string();
     index.identity_was_normalized =
-        normalize_version_index_identity(persisted_object_id, &mut index, backend)?;
+        normalize_version_index_identity(persisted_object_id, &mut index, backend, Some(payload));
     Ok(index)
 }
 
@@ -10366,19 +10378,27 @@ fn normalize_version_index_identity(
     persisted_object_id: &str,
     index: &mut FileVersionIndex,
     source: &str,
-) -> Result<bool> {
-    let mut normalized = false;
-    if index.object_id.trim().is_empty() {
-        index.object_id = persisted_object_id.to_string();
-        normalized = true;
-    } else if index.object_id != persisted_object_id {
+    payload: Option<&[u8]>,
+) -> bool {
+    let canonical_object_id = if persisted_object_id.trim().is_empty() {
+        if index.object_id.trim().is_empty() {
+            let payload_hash = payload.map(hash_hex).unwrap_or_else(generate_object_id);
+            format!("legacy-empty-index-{payload_hash}")
+        } else {
+            index.object_id.clone()
+        }
+    } else {
+        persisted_object_id.to_string()
+    };
+    let mut normalized = persisted_object_id.trim().is_empty();
+    if index.object_id != canonical_object_id {
         warn!(
             row_object_id = persisted_object_id,
             payload_object_id = %index.object_id,
             source,
             "normalizing mismatched version index identity to the persisted row identity"
         );
-        index.object_id = persisted_object_id.to_string();
+        index.object_id = canonical_object_id;
         normalized = true;
     }
     for record in index.versions.values_mut() {
@@ -10397,7 +10417,7 @@ fn normalize_version_index_identity(
             normalized = true;
         }
     }
-    Ok(normalized)
+    normalized
 }
 
 fn validate_version_index_identity(object_id: &str, index: &FileVersionIndex) -> Result<()> {

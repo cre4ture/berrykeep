@@ -1739,19 +1739,29 @@ impl MetadataStore for TursoMetadataStore {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileVersionIndex>> {
-        let after_object_id = after_object_id.unwrap_or_default();
         let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT object_id, index_json
-                 FROM version_indexes
-                 WHERE object_id > ?1
-                 ORDER BY object_id
-                 LIMIT ?2",
-                (after_object_id, limit),
-            )
-            .await?;
+        let mut rows = if let Some(after_object_id) = after_object_id {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     WHERE object_id > ?1
+                     ORDER BY object_id
+                     LIMIT ?2",
+                    (after_object_id, limit),
+                )
+                .await?
+        } else {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     ORDER BY object_id
+                     LIMIT ?1",
+                    (limit,),
+                )
+                .await?
+        };
 
         let mut indexes = Vec::new();
         while let Some(row) = rows.next().await? {

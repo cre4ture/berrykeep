@@ -3717,13 +3717,13 @@ impl MetadataStore for SqliteMetadataStore {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileVersionIndex>> {
-        let after_object_id = after_object_id.unwrap_or_default().to_string();
+        let after_object_id = after_object_id.map(str::to_owned);
         let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
         self.read(move |db| {
             let mut statement = db.prepare(
                 "SELECT object_id, index_json
                  FROM version_indexes
-                 WHERE object_id > ?1
+                 WHERE ?1 IS NULL OR object_id > ?1
                  ORDER BY object_id
                  LIMIT ?2",
             )?;
