@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1921,6 +1921,32 @@ impl MetadataStore for SqliteMetadataStore {
             )
             .optional()
             .context("failed to query current object")
+        })
+        .await
+    }
+
+    async fn list_existing_current_object_keys(&self, keys: &[String]) -> Result<HashSet<String>> {
+        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
+        let keys = keys.to_vec();
+        self.read(move |db| {
+            let mut existing_keys = HashSet::new();
+            for keys in keys.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
+                if keys.is_empty() {
+                    continue;
+                }
+                let placeholders = (1..=keys.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!("SELECT key FROM current_objects WHERE key IN ({placeholders})");
+                let mut statement = db.prepare(&sql)?;
+                let rows = statement
+                    .query_map(params_from_iter(keys.iter()), |row| row.get::<_, String>(0))?;
+                for key in rows {
+                    existing_keys.insert(key?);
+                }
+            }
+            Ok(existing_keys)
         })
         .await
     }

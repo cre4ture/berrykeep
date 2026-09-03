@@ -6886,6 +6886,27 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         .await
         .unwrap();
 
+    store
+        .put_object_versioned(
+            "recreated.txt",
+            Bytes::from_static(b"original payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("recreated.txt", PutOptions::default())
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "recreated.txt",
+            Bytes::from_static(b"replacement payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
     let moved = store
         .put_object_versioned(
             "moved/old-name.txt",
@@ -6914,6 +6935,10 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
     assert_eq!(deleted_entry.restore_source_path, "deleted.txt");
     assert_eq!(deleted_entry.restore_version_id, deleted.version_id);
     assert_eq!(deleted_entry.moved_to_path, None);
+    assert!(
+        history.iter().all(|entry| entry.path != "recreated.txt"),
+        "current paths must not be exposed as recoverable history"
+    );
 
     let moved_entry = history
         .iter()

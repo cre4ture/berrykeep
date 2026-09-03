@@ -1761,6 +1761,40 @@ test("client-ui explorer splits historical restores into supported batch sizes",
     .toEqual([100, 1]);
 });
 
+test("client-ui explorer retains completed historical restore batches after a later request fails", async ({
+  page
+}) => {
+  const mockState = await installClientUiMocks(page, {
+    historyRestoreFailureAtCall: 2,
+    historyEntries: Array.from({ length: 101 }, (_, index) => {
+      const path = `deleted-${String(index + 1).padStart(3, "0")}.txt`;
+      return {
+        path,
+        entry_type: "historical",
+        restore_source_path: path,
+        restore_version_id: `version-deleted-${String(index + 1).padStart(3, "0")}`,
+        removed_at_unix: 1_712_345_600 + index
+      };
+    })
+  });
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted-001.txt", exact: true })).toBeVisible();
+
+  await page.getByLabel("Select all historical entries").check();
+  await page.getByRole("button", { name: "Restore selected" }).click();
+
+  await expect
+    .poll(() => mockState.restoredHistoryEntries().map((entries) => entries.length))
+    .toEqual([100]);
+  await expect(page.getByRole("cell", { name: "deleted-001.txt", exact: true })).toBeHidden();
+  await expect(page.getByRole("cell", { name: "deleted-101.txt", exact: true })).toBeVisible();
+  await expect(page.getByLabel("Select historical entry deleted-101.txt")).toBeChecked();
+  await expect(page.getByText(/restored before a later batch failed/)).toBeVisible();
+});
+
 test("client-ui desktop navigation can collapse and scroll on short viewports", async ({ page }) => {
   test.setTimeout(45_000);
 
@@ -1841,6 +1875,7 @@ test("client-ui mobile drawer reveals and navigates its menu items", async ({ pa
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
   historyEntries?: MockHistoryEntry[];
+  historyRestoreFailureAtCall?: number;
   cacheScope?: string | null;
   mapMetadataStatus?: number;
   mapMetadataCenter?: [number, number, number];
@@ -1910,6 +1945,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const galleryStoreListDelayByMediaFilter = new Map<string, number>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
   const restoredHistoryEntries: MockHistoryEntry[][] = [];
+  let historyRestoreRequestCount = 0;
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
   const connectionRoutesPayload = {
     generated_at_unix_ms: 1_712_345_600_000,
@@ -2324,6 +2360,14 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     }
 
     if (pathname === apiV1("/store/history/restore") && method === "POST") {
+      historyRestoreRequestCount += 1;
+      if (historyRestoreRequestCount === options?.historyRestoreFailureAtCall) {
+        return route.fulfill({
+          status: 502,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "simulated history restore failure" })
+        });
+      }
       const body = route.request().postDataJSON() as {
         entries: Array<{
           path: string;

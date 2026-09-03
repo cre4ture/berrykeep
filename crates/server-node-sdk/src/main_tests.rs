@@ -16388,8 +16388,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
             .lock()
             .unwrap()
             .get()
-            .is_none(),
-        "every published namespace change must invalidate recoverable history"
+            .is_some(),
+        "ordinary namespace changes retain the short-lived recoverable-history cache"
     );
     assert!(
         super::cached_store_index_page_response(
@@ -16403,6 +16403,17 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         .await
         .is_none(),
         "a mutation between cache lookup and response must reject the stale page"
+    );
+    super::publish_history_change(&state);
+    assert!(
+        state
+            .storage
+            .store_history_cache
+            .lock()
+            .unwrap()
+            .get()
+            .is_none(),
+        "history mutations must invalidate recoverable history"
     );
 
     {

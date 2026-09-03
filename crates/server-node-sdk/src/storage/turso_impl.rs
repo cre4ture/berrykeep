@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -269,6 +269,31 @@ impl MetadataStore for TursoMetadataStore {
             manifest_hash: row_string(&row, 0, "current_objects.manifest_hash")?,
             object_id: row_string(&row, 1, "current_objects.object_id")?,
         }))
+    }
+
+    async fn list_existing_current_object_keys(&self, keys: &[String]) -> Result<HashSet<String>> {
+        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
+        let mut existing_keys = HashSet::new();
+        for keys in keys.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
+            if keys.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=keys.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!("SELECT key FROM current_objects WHERE key IN ({placeholders})"),
+                    params_from_iter(keys.iter().cloned()),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                existing_keys.insert(row_string(&row, 0, "current_objects.key")?);
+            }
+        }
+        Ok(existing_keys)
     }
 
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()> {

@@ -2599,6 +2599,9 @@ trait MetadataStore: Send + Sync {
     async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()>;
     async fn load_current_state(&self) -> Result<CurrentState>;
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
+    /// Returns the requested keys that currently exist. Implementations batch
+    /// this lookup so history inspection does not issue one query per path.
+    async fn list_existing_current_object_keys(&self, keys: &[String]) -> Result<HashSet<String>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
     async fn remove_current_object(&self, key: &str) -> Result<()>;
     /// Replaces the user labels of a projected object. This is the entry point
@@ -3120,14 +3123,7 @@ impl StoreHistoryInspector {
     ) -> Result<Vec<RecoverableHistoryEntry>> {
         let mut entries = BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
 
-        for object_id in self.metadata_store.list_version_index_object_ids().await? {
-            let Some(index) = self
-                .metadata_store
-                .load_version_index_by_object_id(&object_id)
-                .await?
-            else {
-                continue;
-            };
+        for index in self.metadata_store.load_all_version_indexes().await? {
             let Some(preferred_head_id) = index
                 .preferred_head_version_id
                 .clone()
@@ -3151,15 +3147,6 @@ impl StoreHistoryInspector {
             else {
                 continue;
             };
-            if self
-                .metadata_store
-                .get_current_object(&path)
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-
             let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
                 tombstone.copied_from_object_id.as_deref(),
                 tombstone.copied_from_version_id.as_deref(),
@@ -3203,6 +3190,12 @@ impl StoreHistoryInspector {
                 entries.insert(path, (entry, moved_source_object_id));
             }
         }
+
+        let existing_paths = self
+            .metadata_store
+            .list_existing_current_object_keys(&entries.keys().cloned().collect::<Vec<_>>())
+            .await?;
+        entries.retain(|path, _| !existing_paths.contains(path));
 
         let moved_source_object_ids = entries
             .values()

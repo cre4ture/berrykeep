@@ -524,16 +524,22 @@ export function ExplorerSurface({
     setError(null);
     try {
       const responses: ExplorerHistoryRestoreResponse[] = [];
+      let requestError: unknown = null;
       for (
         let offset = 0;
         offset < restoreEntries.length;
         offset += HISTORY_RESTORE_BATCH_MAX_ENTRIES
       ) {
-        responses.push(
-          await mutations.restoreHistoryEntries(
-            restoreEntries.slice(offset, offset + HISTORY_RESTORE_BATCH_MAX_ENTRIES)
-          )
-        );
+        try {
+          responses.push(
+            await mutations.restoreHistoryEntries(
+              restoreEntries.slice(offset, offset + HISTORY_RESTORE_BATCH_MAX_ENTRIES)
+            )
+          );
+        } catch (nextError) {
+          requestError = nextError;
+          break;
+        }
       }
       const restoredEntryKeys = new Set(
         responses
@@ -545,16 +551,32 @@ export function ExplorerSurface({
         (count, response) => count + response.failed_count,
         0
       );
-      setSelectedPayload({
-        action: restoreEntries.length === 1 ? "restored_historical_entry" : "restored_historical_entries",
-        requested_count: restoreEntries.length,
-        response: responses.length === 1 ? responses[0] : responses
-      });
+      if (responses.length > 0) {
+        setSelectedPayload({
+          action:
+            restoreEntries.length === 1
+              ? "restored_historical_entry"
+              : "restored_historical_entries",
+          requested_count: restoreEntries.length,
+          response: responses.length === 1 ? responses[0] : responses
+        });
+      }
       setSelectedHistoricalEntries((current) =>
         current.filter((key) => !restoredEntryKeys.has(key))
       );
       await refreshEntries(undefined, { includeHistorical: true });
-      if (failedCount > 0) {
+      if (requestError) {
+        const message =
+          requestError instanceof Error
+            ? requestError.message
+            : "Failed restoring historical entries";
+        const restoredCount = restoredEntryKeys.size;
+        setError(
+          restoredCount > 0
+            ? `${restoredCount} historical ${restoredCount === 1 ? "item was" : "items were"} restored before a later batch failed. Remaining items stay selected: ${message}`
+            : message
+        );
+      } else if (failedCount > 0) {
         setError(
           `${failedCount} historical ${failedCount === 1 ? "item could" : "items could"} not be restored. Items with conflicts remain selected.`
         );
