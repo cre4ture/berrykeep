@@ -6741,6 +6741,59 @@ run_on_all_metadata_backends!(
     restore_version_same_path_creates_new_head_turso
 );
 
+async fn restore_history_batch_preserves_recreated_target_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("restore-history-batch-target-conflict")
+        .await;
+
+    let deleted = store
+        .put_object_versioned(
+            "docs/readme.txt",
+            Bytes::from_static(b"old content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("docs/readme.txt", PutOptions::default())
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "docs/readme.txt",
+            Bytes::from_static(b"new content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let results = store
+        .restore_version_paths_batch(&[(
+            "docs/readme.txt".to_string(),
+            deleted.version_id,
+            "docs/readme.txt".to_string(),
+        )])
+        .await
+        .unwrap();
+    assert_eq!(results, vec![PathMutationResult::TargetExists]);
+    assert_eq!(
+        store
+            .get_object("docs/readme.txt", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"new content"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    restore_history_batch_preserves_recreated_target_impl,
+    restore_history_batch_preserves_recreated_target,
+    restore_history_batch_preserves_recreated_target_turso
+);
+
 async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
     backend: StorageTestBackend,
 ) {

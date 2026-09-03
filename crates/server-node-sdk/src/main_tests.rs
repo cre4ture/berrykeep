@@ -95,14 +95,35 @@ fn recoverable_history_projection_keeps_folder_markers_and_child_rollups() {
 #[test]
 fn store_history_cache_retains_and_clears_entries() {
     let mut cache = super::StoreHistoryCache::default();
-    cache.insert(Arc::new(super::StoreHistoryCacheValue {
-        entries: Vec::new(),
-    }));
+    cache.insert(Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())));
 
     assert!(cache.get().is_some());
 
     cache.clear();
     assert!(cache.get().is_none());
+}
+
+#[test]
+fn store_history_cache_retains_an_oversized_history_marker() {
+    let entry = super::storage::RecoverableHistoryEntry {
+        path: "deleted.txt".to_string(),
+        restore_source_path: "deleted.txt".to_string(),
+        restore_version_id: "version-1".to_string(),
+        removed_at_unix: 1,
+        moved_to_path: None,
+    };
+    let value = super::StoreHistoryCacheValue::from_entries(vec![
+        entry;
+        super::STORE_HISTORY_CACHE_MAX_ENTRY_COUNT
+            + 1
+    ]);
+    let mut cache = super::StoreHistoryCache::default();
+    cache.insert(Arc::new(value));
+
+    assert!(matches!(
+        cache.get().as_deref(),
+        Some(super::StoreHistoryCacheValue::Oversized { .. })
+    ));
 }
 
 #[test]

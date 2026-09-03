@@ -9962,6 +9962,10 @@ impl PersistentStore {
         let mut results = Vec::with_capacity(restore_requests.len());
 
         for (source_path, version_id, target_path) in restore_requests {
+            if self.current_object_entry(target_path).await?.is_some() {
+                results.push(PathMutationResult::TargetExists);
+                continue;
+            }
             let result = match self
                 .version_restore_source_from_indexes(&indexes, source_path, version_id)
                 .await?

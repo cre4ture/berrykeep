@@ -13903,8 +13903,21 @@ impl StoreIndexPageCache {
 }
 
 #[derive(Debug)]
-struct StoreHistoryCacheValue {
-    entries: Vec<RecoverableHistoryEntry>,
+enum StoreHistoryCacheValue {
+    Entries(Vec<RecoverableHistoryEntry>),
+    Oversized { entry_count: usize },
+}
+
+impl StoreHistoryCacheValue {
+    fn from_entries(entries: Vec<RecoverableHistoryEntry>) -> Self {
+        if entries.len() > STORE_HISTORY_CACHE_MAX_ENTRY_COUNT {
+            Self::Oversized {
+                entry_count: entries.len(),
+            }
+        } else {
+            Self::Entries(entries)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -13927,10 +13940,6 @@ impl StoreHistoryCache {
     }
 
     fn insert(&mut self, value: Arc<StoreHistoryCacheValue>) {
-        if value.entries.len() > STORE_HISTORY_CACHE_MAX_ENTRY_COUNT {
-            self.entry = None;
-            return;
-        }
         self.entry = Some(StoreHistoryCacheEntry {
             created_at: Instant::now(),
             value,
@@ -16401,7 +16410,14 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
-                let value = Arc::new(StoreHistoryCacheValue { entries });
+                let value = Arc::new(StoreHistoryCacheValue::from_entries(entries));
+                if let StoreHistoryCacheValue::Oversized { entry_count } = value.as_ref() {
+                    tracing::warn!(
+                        entry_count,
+                        cache_limit = STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
+                        "recoverable history exceeds the interactive explorer cache limit"
+                    );
+                }
                 match state.storage.store_history_cache.lock() {
                     Ok(mut cache) => cache.insert(Arc::clone(&value)),
                     Err(poisoned) => poisoned.into_inner().insert(Arc::clone(&value)),
@@ -16410,8 +16426,22 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
             }
         }
     };
+    let entries = match history.as_ref() {
+        StoreHistoryCacheValue::Entries(entries) => entries,
+        StoreHistoryCacheValue::Oversized { entry_count } => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "error": "recoverable history exceeds the interactive explorer limit",
+                    "entry_count": entry_count,
+                    "max_entry_count": STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
+                })),
+            )
+                .into_response();
+        }
+    };
     let projection = project_recoverable_history_entries(
-        &history.entries,
+        entries,
         &prefix,
         depth,
         STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT,
