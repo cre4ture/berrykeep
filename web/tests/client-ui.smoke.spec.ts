@@ -1679,6 +1679,40 @@ test("client-ui explorer keeps loaded history while paging current entries", asy
   expect(historyRequestCount).toBe(1);
 });
 
+test("client-ui explorer only caps depth for historical entries", async ({ page }) => {
+  const currentDepths: string[] = [];
+  const historyDepths: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list")) {
+      currentDepths.push(url.searchParams.get("depth") ?? "");
+    }
+    if (url.pathname === apiV1("/store/history")) {
+      historyDepths.push(url.searchParams.get("depth") ?? "");
+    }
+  });
+
+  await installClientUiMocks(page, {
+    historyEntries: [
+      {
+        path: "deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "deleted.txt",
+        restore_version_id: "version-deleted",
+        removed_at_unix: 1_712_345_600
+      }
+    ]
+  });
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await page.getByLabel("Depth").fill("65");
+  await page.getByRole("button", { name: "Refresh entries" }).click();
+
+  await expect.poll(() => currentDepths.includes("65")).toBe(true);
+  await expect.poll(() => historyDepths.includes("64")).toBe(true);
+});
+
 test("client-ui explorer restores selected deleted and moved entries in one batch", async ({
   page
 }) => {

@@ -44,7 +44,7 @@ const DEFAULT_EXPLORER_PREVIEW_BYTES = 1024;
 const EXPLORER_RENAME_SCAN_DEPTH = 1024;
 const EXPLORER_PAGE_SIZE = 100;
 const HISTORY_RESTORE_BATCH_MAX_ENTRIES = 100;
-const EXPLORER_MAX_DEPTH = 64;
+const HISTORY_MAX_DEPTH = 64;
 
 export type ExplorerSnapshot = {
   id: string;
@@ -305,7 +305,8 @@ export function ExplorerSurface({
     const targetPrefix = nextPrefix ?? prefix;
     const targetPage = Math.max(1, options?.page ?? currentPage);
     const targetSnapshotId = options?.snapshotId === undefined ? snapshotId : options.snapshotId;
-    const targetDepth = Math.min(EXPLORER_MAX_DEPTH, Math.max(1, depth));
+    const targetDepth = Math.max(1, depth);
+    const targetHistoryDepth = Math.min(HISTORY_MAX_DEPTH, targetDepth);
     const targetSortField = options?.sortField ?? sortField;
     const targetSortDirection = options?.sortDirection ?? sortDirection;
     const targetHistoryPrefix = targetPrefix.trim().replace(/^\/+|\/+$/g, "");
@@ -315,7 +316,7 @@ export function ExplorerSurface({
       loadHistoricalEntries != null;
     const historyMatchesTarget =
       historyEntriesPayload?.prefix === targetHistoryPrefix &&
-      historyEntriesPayload.depth === targetDepth;
+      historyEntriesPayload.depth === targetHistoryDepth;
     const includeHistorical =
       historicalEntriesEnabled && (options?.includeHistorical ?? !historyMatchesTarget);
     if (includeHistorical) {
@@ -328,7 +329,7 @@ export function ExplorerSurface({
     try {
       const historyRequest =
         includeHistorical && loadHistoricalEntries
-          ? loadHistoricalEntries(targetPrefix.trim(), targetDepth).then(
+          ? loadHistoricalEntries(targetPrefix.trim(), targetHistoryDepth).then(
               (payload) => ({ payload, error: null as string | null }),
               (historyError) => ({
                 payload: null,
@@ -1116,15 +1117,11 @@ export function ExplorerSurface({
               <NumberInput
                 label="Depth"
                 min={1}
-                max={EXPLORER_MAX_DEPTH}
                 value={depth}
-                onChange={(value) =>
-                  setDepth(
-                    typeof value === "number" && value > 0
-                      ? Math.min(EXPLORER_MAX_DEPTH, value)
-                      : 1
-                  )
-                }
+                onChange={(value) => {
+                  const numericValue = typeof value === "number" ? value : Number(value);
+                  setDepth(Number.isFinite(numericValue) && numericValue > 0 ? numericValue : 1);
+                }}
               />
             </Grid.Col>
             <Grid.Col span={{ base: 12, md: 3 }}>
