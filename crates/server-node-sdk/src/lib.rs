@@ -900,6 +900,7 @@ struct InternalTlsRuntime {
 }
 
 pub(crate) fn publish_namespace_change(state: &ServerState) {
+    invalidate_store_history_cache(state);
     let sequence = state
         .storage
         .namespace_change_sequence
@@ -14751,7 +14752,6 @@ async fn rename_object_path_response(
             );
             drop(store);
             publish_namespace_change(state);
-            invalidate_store_history_cache(state);
             request_local_availability_refresh(state);
             if request.from_path != request.to_path {
                 record_data_change_event(
@@ -16161,7 +16161,6 @@ async fn delete_object_response(
         Ok(deleted_paths) => {
             drop(store);
             publish_namespace_change(state);
-            invalidate_store_history_cache(state);
 
             let mut cluster = state.cluster.lock().await;
             for (deleted_path, _, version_id) in &deleted_paths {
@@ -16658,7 +16657,6 @@ async fn restore_history_entries_response(
 
     if restored_count > 0 {
         publish_namespace_change(state);
-        invalidate_store_history_cache(state);
         request_local_availability_refresh(state);
     }
 

@@ -16374,7 +16374,23 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         .unwrap()
         .get(&cached_key, cached_sequence)
         .expect("prepared page should be cached");
+    state
+        .storage
+        .store_history_cache
+        .lock()
+        .unwrap()
+        .insert(Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())));
     super::publish_namespace_change(&state);
+    assert!(
+        state
+            .storage
+            .store_history_cache
+            .lock()
+            .unwrap()
+            .get()
+            .is_none(),
+        "every published namespace change must invalidate recoverable history"
+    );
     assert!(
         super::cached_store_index_page_response(
             &state,
