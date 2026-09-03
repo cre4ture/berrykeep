@@ -249,6 +249,7 @@ fn android_test_collapse_entries_for_tree_view(
         collapsed.push(StoreIndexEntry {
             path: entry.path,
             entry_type: "prefix".to_string(),
+            object_id: None,
             labels: Vec::new(),
             labels_resolved: false,
             version: None,
@@ -276,6 +277,7 @@ fn android_test_document_entry() -> StoreIndexEntry {
     StoreIndexEntry {
         path: TEST_DOCUMENT_PATH.to_string(),
         entry_type: "key".to_string(),
+        object_id: Some("obj-android-test-document".to_string()),
         labels: Vec::new(),
         labels_resolved: false,
         version: Some("v1".to_string()),
@@ -301,6 +303,7 @@ fn android_test_folder_entry(path: &str, entry_type: &str) -> StoreIndexEntry {
     StoreIndexEntry {
         path: path.to_string(),
         entry_type: entry_type.to_string(),
+        object_id: is_object.then(|| "obj-android-test-folder".to_string()),
         labels: Vec::new(),
         labels_resolved: false,
         version: None,

@@ -23,12 +23,14 @@ use super::{
     GalleryIndexQuery, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
     GalleryMapClusterQuery, GallerySummaryCache, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
     ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
-    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, decode_gallery_labels,
-    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
+    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
+    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
+    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    compress_snapshot_json, decode_gallery_labels, decode_version_index, decompress_snapshot_json,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    normalize_snapshot_manifest_object_ids,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -176,6 +178,29 @@ impl TursoMetadataStore {
 
 #[async_trait]
 impl MetadataStore for TursoMetadataStore {
+    async fn object_id_backfill_needed(&self) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (OBJECT_ID_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(rows.next().await?.is_none())
+    }
+
+    async fn mark_object_id_backfill_complete(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (OBJECT_ID_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
         let mut rows = self
             .connection
@@ -1059,7 +1084,8 @@ impl MetadataStore for TursoMetadataStore {
 
         let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
         let payload = decompress_snapshot_json(&payload)?;
-        let snapshot = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        let mut snapshot = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        normalize_snapshot_manifest_object_ids(&mut snapshot);
         Ok(Some(snapshot))
     }
 
@@ -1412,7 +1438,7 @@ impl MetadataStore for TursoMetadataStore {
         };
 
         let payload = row_blob(&row, 0, "version_indexes.index_json")?;
-        let index = self.decode_json::<FileVersionIndex>(payload, "version index")?;
+        let index = decode_version_index(object_id, &payload, "Turso")?;
         Ok(Some(index))
     }
 
@@ -1729,7 +1755,7 @@ impl MetadataStore for TursoMetadataStore {
         let mut rows = self
             .connection
             .query(
-                "SELECT index_json
+                "SELECT object_id, index_json
                  FROM version_indexes
                  ORDER BY object_id",
                 (),
@@ -1738,8 +1764,47 @@ impl MetadataStore for TursoMetadataStore {
 
         let mut indexes = Vec::new();
         while let Some(row) = rows.next().await? {
-            let payload = row_blob(&row, 0, "version_indexes.index_json")?;
-            indexes.push(self.decode_json::<FileVersionIndex>(payload, "version index")?);
+            let object_id = row_string(&row, 0, "version_indexes.object_id")?;
+            let payload = row_blob(&row, 1, "version_indexes.index_json")?;
+            indexes.push(decode_version_index(&object_id, &payload, "Turso")?);
+        }
+        Ok(indexes)
+    }
+
+    async fn load_version_indexes_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>> {
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        let mut rows = if let Some(after_object_id) = after_object_id {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     WHERE object_id > ?1
+                     ORDER BY object_id
+                     LIMIT ?2",
+                    (after_object_id, limit),
+                )
+                .await?
+        } else {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     ORDER BY object_id
+                     LIMIT ?1",
+                    (limit,),
+                )
+                .await?
+        };
+
+        let mut indexes = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let object_id = row_string(&row, 0, "version_indexes.object_id")?;
+            let payload = row_blob(&row, 1, "version_indexes.index_json")?;
+            indexes.push(decode_version_index(&object_id, &payload, "Turso")?);
         }
         Ok(indexes)
     }
@@ -1798,7 +1863,10 @@ impl MetadataStore for TursoMetadataStore {
         while let Some(row) = rows.next().await? {
             let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
             let payload = decompress_snapshot_json(&payload)?;
-            snapshots.push(self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?);
+            let mut snapshot =
+                self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+            normalize_snapshot_manifest_object_ids(&mut snapshot);
+            snapshots.push(snapshot);
         }
         Ok(snapshots)
     }
@@ -1816,7 +1884,8 @@ impl MetadataStore for TursoMetadataStore {
         };
         let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
         let payload = decompress_snapshot_json(&payload)?;
-        let manifest = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        let mut manifest = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        normalize_snapshot_manifest_object_ids(&mut manifest);
         Ok(Some(manifest))
     }
 
@@ -2623,8 +2692,6 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 PRIMARY KEY(source_node_id, key, source_version_id)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
-                ON current_objects(object_id);
             CREATE INDEX IF NOT EXISTS idx_snapshots_created
                 ON snapshots(created_at_unix DESC, snapshot_id DESC);
             CREATE INDEX IF NOT EXISTS idx_storage_stats_history_collected
@@ -2650,6 +2717,20 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_s3_object_versions_key
                 ON s3_object_versions(bucket_name, ironmesh_key, created_at_unix DESC, version_id DESC);
             ",
+        )
+        .await?;
+    add_column_if_missing(
+        connection,
+        "current_objects",
+        "object_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
+             ON current_objects(object_id)",
+            (),
         )
         .await?;
     add_column_if_missing(
@@ -2680,7 +2761,7 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             .with_context(|| format!("invalid Turso metadata schema version: {raw}"))?,
         None => METADATA_SCHEMA_VERSION_CURRENT,
     };
-    if schema_version != METADATA_SCHEMA_VERSION_CURRENT {
+    if !(1..=METADATA_SCHEMA_VERSION_CURRENT).contains(&schema_version) {
         bail!(
             "unsupported Turso metadata schema version: {} (current={})",
             schema_version,

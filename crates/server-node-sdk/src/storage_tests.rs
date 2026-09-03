@@ -2,6 +2,7 @@ use super::*;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::time::Duration;
 use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 
 fn test_store_dir(name: &str) -> PathBuf {
@@ -77,6 +78,40 @@ fn sample_heic_bytes() -> Vec<u8> {
         .step_by(2)
         .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
         .collect()
+}
+
+#[tokio::test]
+async fn object_id_migration_lock_serializes_metadata_access() {
+    let root = test_store_dir("object-id-migration-lock");
+    let metadata_db_path = root.join("state/metadata.sqlite");
+    fs::create_dir_all(metadata_db_path.parent().unwrap())
+        .await
+        .unwrap();
+
+    let first_lock = acquire_object_id_migration_lock(&metadata_db_path)
+        .await
+        .unwrap();
+    let second_metadata_db_path = metadata_db_path.clone();
+    let mut second_lock =
+        tokio::spawn(
+            async move { acquire_object_id_migration_lock(&second_metadata_db_path).await },
+        );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut second_lock)
+            .await
+            .is_err(),
+        "the second migration must wait for the first lock holder"
+    );
+
+    drop(first_lock);
+    let second_lock = tokio::time::timeout(Duration::from_secs(5), second_lock)
+        .await
+        .expect("the second migration should acquire the released lock")
+        .expect("the lock task should not panic")
+        .expect("the second migration lock should acquire");
+    drop(second_lock);
+
+    let _ = fs::remove_dir_all(root).await;
 }
 
 #[test]
@@ -746,6 +781,14 @@ impl StorageTestBackend {
         }
     }
 
+    fn metadata_db_path(self, root: &Path) -> PathBuf {
+        match self {
+            Self::Sqlite => root.join("state/metadata.sqlite"),
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => root.join("state/metadata.turso.db"),
+        }
+    }
+
     fn supports_metadata_vacuum(self) -> bool {
         match self {
             Self::Sqlite => true,
@@ -805,6 +848,1549 @@ macro_rules! run_on_all_metadata_backends {
         }
     };
 }
+
+async fn completed_object_id_migration_skips_lock_acquisition_impl(backend: StorageTestBackend) {
+    let (root, store) = backend
+        .init_store("completed-object-id-migration-skips-lock")
+        .await;
+    drop(store);
+
+    let metadata_db_path = backend.metadata_db_path(&root);
+    let lock_path = object_id_migration_lock_path(&metadata_db_path);
+    fs::remove_file(&lock_path)
+        .await
+        .expect("initial migration should have created its lock file");
+
+    let reloaded = backend.open_store(root.clone()).await;
+    assert!(
+        !fs::try_exists(&lock_path).await.unwrap(),
+        "a completed migration must not acquire its startup lock"
+    );
+    drop(reloaded);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    completed_object_id_migration_skips_lock_acquisition_impl,
+    completed_object_id_migration_skips_lock_acquisition,
+    completed_object_id_migration_skips_lock_acquisition_turso
+);
+
+async fn stable_object_id_follows_logical_object_lifecycle_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("stable-object-id-lifecycle").await;
+    let original_path = "docs/object.txt";
+    let moved_path = "archive/object.txt";
+
+    let created = store
+        .put_object_versioned(
+            original_path,
+            Bytes::from_static(b"version one"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!created.object_id.is_empty());
+
+    let modified = store
+        .put_object_versioned(
+            original_path,
+            Bytes::from_static(b"version two"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(modified.object_id, created.object_id);
+    assert_ne!(modified.version_id, created.version_id);
+
+    let before_move = store.list_versions(original_path).await.unwrap().unwrap();
+    assert_eq!(before_move.object_id, created.object_id);
+    assert_eq!(before_move.versions.len(), 2);
+
+    assert_eq!(
+        store
+            .rename_object_path(original_path, moved_path, false)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    let after_move = store.list_versions(moved_path).await.unwrap().unwrap();
+    assert_eq!(after_move.object_id, created.object_id);
+    assert_eq!(
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(moved_path)
+    );
+
+    let deleted = store
+        .tombstone_object_with_identity(moved_path, PutOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted.object_id, created.object_id);
+    assert_ne!(deleted.version_id, modified.version_id);
+    assert!(
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let tombstoned = store
+        .list_versions_by_object_id(&created.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tombstoned.object_id, created.object_id);
+    assert_eq!(
+        tombstoned.preferred_head_version_id.as_deref(),
+        Some(deleted.version_id.as_str())
+    );
+    let tombstone_index = store
+        .load_version_index_by_object_id(&created.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tombstone_index
+            .versions
+            .get(&deleted.version_id)
+            .unwrap()
+            .manifest_hash,
+        TOMBSTONE_MANIFEST_HASH
+    );
+
+    let recreated = store
+        .put_object_versioned(
+            moved_path,
+            Bytes::from_static(b"new logical object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(recreated.object_id, created.object_id);
+    assert_eq!(
+        store
+            .current_path_for_object_id(&recreated.object_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(moved_path)
+    );
+    assert_eq!(
+        store
+            .list_versions_by_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .object_id,
+        created.object_id
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    stable_object_id_follows_logical_object_lifecycle_impl,
+    stable_object_id_follows_logical_object_lifecycle,
+    stable_object_id_follows_logical_object_lifecycle_turso
+);
+
+async fn object_id_current_binding_recovers_stale_replication_paths_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("object-id-stale-replication-binding")
+        .await;
+    let previous_path = "replication/previous.txt";
+    let current_path = "replication/current.txt";
+
+    let created = store
+        .put_object_versioned(
+            previous_path,
+            Bytes::from_static(b"replicated object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rename_object_path(previous_path, current_path, false)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+
+    let index = store
+        .load_version_index_by_object_id(&created.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        index
+            .preferred_head_version_id
+            .as_ref()
+            .and_then(|version_id| index.versions.get(version_id))
+            .and_then(|record| record.logical_path.as_deref()),
+        Some(current_path)
+    );
+
+    // A stale replica for `previous_path` must not re-bind the same identity
+    // after the rename already made `current_path` canonical.
+    store
+        .sync_current_state_for_key_from_index(previous_path, &index)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .current_object_entry(previous_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Older stores can already have duplicate bindings. Identity-addressed
+    // routes must use the preferred head's path, and a later promotion repairs
+    // the obsolete binding instead of keeping both paths current.
+    let current_entry = store
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .upsert_current_object(previous_path, current_entry)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(current_path)
+    );
+    store
+        .promote_current_state_for_key_from_index(current_path, &index)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .current_object_entry(previous_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    object_id_current_binding_recovers_stale_replication_paths_impl,
+    object_id_current_binding_recovers_stale_replication_paths,
+    object_id_current_binding_recovers_stale_replication_paths_turso
+);
+
+async fn object_id_tombstone_cleans_all_stale_current_bindings_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("object-id-tombstone-stale-current-bindings")
+        .await;
+    let preferred_path = "replication/preferred.txt";
+    let stale_path = "replication/stale.txt";
+
+    let created = store
+        .put_object_versioned(
+            preferred_path,
+            Bytes::from_static(b"replicated object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let entry = store
+        .current_object_entry(preferred_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let deleted = store
+        .tombstone_object_with_identity(preferred_path, PutOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted.object_id, created.object_id);
+
+    // Simulate stale replica rows that survived the tombstone arriving on a
+    // different node. The tombstone must unbind every current projection of
+    // its identity, not only its preferred logical path.
+    store
+        .upsert_current_object(preferred_path, entry.clone())
+        .await
+        .unwrap();
+    store
+        .upsert_current_object(stale_path, entry)
+        .await
+        .unwrap();
+    let index = store
+        .load_version_index_by_object_id(&created.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let changed_paths = store
+        .sync_current_state_for_key_from_index(preferred_path, &index)
+        .await
+        .unwrap();
+    assert!(changed_paths.contains(preferred_path));
+    assert!(changed_paths.contains(stale_path));
+    assert_eq!(changed_paths.len(), 2);
+    assert!(
+        store
+            .current_object_entry(preferred_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .current_object_entry(stale_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    object_id_tombstone_cleans_all_stale_current_bindings_impl,
+    object_id_tombstone_cleans_all_stale_current_bindings,
+    object_id_tombstone_cleans_all_stale_current_bindings_turso
+);
+
+async fn object_id_missing_logical_path_keeps_current_binding_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("object-id-missing-logical-path-current-bindings")
+        .await;
+    let current_path = "replication/current.txt";
+    let stale_path = "replication/stale.txt";
+
+    let created = store
+        .put_object_versioned(
+            current_path,
+            Bytes::from_static(b"replicated legacy object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let current_entry = store
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut index = store
+        .load_version_index_by_object_id(&created.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let preferred_version_id = index.preferred_head_version_id.clone().unwrap();
+    index
+        .versions
+        .get_mut(&preferred_version_id)
+        .unwrap()
+        .logical_path = None;
+    store
+        .persist_version_index_by_object_id(&created.object_id, &index)
+        .await
+        .unwrap();
+
+    // A generic synchronization path must preserve the caller's current
+    // projection for legacy records without a logical path, while still
+    // removing duplicate bindings that would make identity lookup ambiguous.
+    store
+        .upsert_current_object(stale_path, current_entry)
+        .await
+        .unwrap();
+    let changed_paths = store
+        .sync_current_state_for_key_from_index(current_path, &index)
+        .await
+        .unwrap();
+    assert!(changed_paths.contains(stale_path));
+    assert_eq!(changed_paths.len(), 1);
+    assert!(
+        store
+            .current_object_entry(current_path)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .current_object_entry(stale_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(current_path)
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    object_id_missing_logical_path_keeps_current_binding_impl,
+    object_id_missing_logical_path_keeps_current_binding,
+    object_id_missing_logical_path_keeps_current_binding_turso
+);
+
+async fn metadata_import_records_duplicate_object_id_binding_cleanup_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("metadata-import-duplicate-object-id-binding")
+        .await;
+    let stale_path = "replication/stale.txt";
+    let current_path = "replication/current.txt";
+
+    let created = store
+        .put_object_versioned(
+            stale_path,
+            Bytes::from_static(b"replicated object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rename_object_path(stale_path, current_path, false)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    let bundle = store
+        .export_metadata_bundle(current_path, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let current_entry = store
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .upsert_current_object(stale_path, current_entry)
+        .await
+        .unwrap();
+
+    // The bundle contains no new metadata. It must still report the duplicate
+    // binding cleanup as a change so replication publishes the namespace update.
+    assert!(store.import_metadata_bundle(&bundle).await.unwrap());
+    assert!(
+        store
+            .current_object_entry(stale_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(current_path)
+    );
+    assert!(!store.import_metadata_bundle(&bundle).await.unwrap());
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_import_records_duplicate_object_id_binding_cleanup_impl,
+    metadata_import_records_duplicate_object_id_binding_cleanup,
+    metadata_import_records_duplicate_object_id_binding_cleanup_turso
+);
+
+async fn metadata_import_prunes_stale_binding_when_preferred_path_taken_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend
+        .init_store("metadata-import-preferred-path-taken-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("metadata-import-preferred-path-taken-target")
+        .await;
+    let current_path = "replication/current.txt";
+    let stale_path = "replication/stale.txt";
+
+    let source_object = source
+        .put_object_versioned(
+            current_path,
+            Bytes::from_static(b"source object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let source_entry = source
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let bundle = source
+        .export_metadata_bundle(current_path, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let target_object = target
+        .put_object_versioned(
+            current_path,
+            Bytes::from_static(b"target object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let target_entry = target
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(target_object.object_id, source_object.object_id);
+    target
+        .upsert_current_object(stale_path, source_entry)
+        .await
+        .unwrap();
+
+    assert!(target.import_metadata_bundle(&bundle).await.unwrap());
+    assert_eq!(
+        target.current_object_entry(current_path).await.unwrap(),
+        Some(target_entry)
+    );
+    assert!(
+        target
+            .current_object_entry(stale_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        target
+            .current_path_for_object_id(&source_object.object_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    drop(source);
+    drop(target);
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_import_prunes_stale_binding_when_preferred_path_taken_impl,
+    metadata_import_prunes_stale_binding_when_preferred_path_taken,
+    metadata_import_prunes_stale_binding_when_preferred_path_taken_turso
+);
+
+async fn metadata_import_pathless_preferred_head_cleans_all_current_bindings_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend
+        .init_store("metadata-import-pathless-preferred-head-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("metadata-import-pathless-preferred-head-target")
+        .await;
+    let current_path = "replication/current.txt";
+    let stale_path = "replication/stale.txt";
+
+    let created = source
+        .put_object_versioned(
+            current_path,
+            Bytes::from_static(b"replicated legacy object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let current_entry = source
+        .current_object_entry(current_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut index = source
+        .load_version_index_by_object_id(&created.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let preferred_version_id = index.preferred_head_version_id.clone().unwrap();
+    index
+        .versions
+        .get_mut(&preferred_version_id)
+        .unwrap()
+        .logical_path = None;
+    source
+        .persist_version_index_by_object_id(&created.object_id, &index)
+        .await
+        .unwrap();
+    let bundle = source
+        .export_metadata_bundle(current_path, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Metadata import historically clears the projection when a replicated
+    // preferred head has no canonical path. Preserve that behavior even
+    // though generic synchronization now falls back to its caller's path.
+    target
+        .upsert_current_object(stale_path, current_entry)
+        .await
+        .unwrap();
+    assert!(target.import_metadata_bundle(&bundle).await.unwrap());
+    assert!(
+        target
+            .current_object_entry(current_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        target
+            .current_object_entry(stale_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        target
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    drop(source);
+    drop(target);
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_import_pathless_preferred_head_cleans_all_current_bindings_impl,
+    metadata_import_pathless_preferred_head_cleans_all_current_bindings,
+    metadata_import_pathless_preferred_head_cleans_all_current_bindings_turso
+);
+
+async fn metadata_import_replaces_empty_object_id_impl(backend: StorageTestBackend) {
+    let (source_root, mut source) = backend
+        .init_store("metadata-import-empty-object-id-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("metadata-import-empty-object-id-target")
+        .await;
+    let path = "replication/empty-object-id.txt";
+
+    let created = source
+        .put_object_versioned(
+            path,
+            Bytes::from_static(b"replicated object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut bundle = source
+        .export_metadata_bundle(path, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+    bundle.object_id = Some("  ".to_string());
+
+    assert!(target.import_metadata_bundle(&bundle).await.unwrap());
+    let imported = target.current_object_entry(path).await.unwrap().unwrap();
+    assert!(!imported.object_id.trim().is_empty());
+    assert_ne!(imported.object_id, created.object_id);
+    let imported_index = target
+        .load_version_index_by_object_id(&imported.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(imported_index.object_id, imported.object_id);
+    assert!(
+        imported_index
+            .versions
+            .values()
+            .all(|record| record.object_id == imported_index.object_id)
+    );
+
+    drop(source);
+    drop(target);
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_import_replaces_empty_object_id_impl,
+    metadata_import_replaces_empty_object_id,
+    metadata_import_replaces_empty_object_id_turso
+);
+
+#[tokio::test]
+async fn sqlite_migrates_legacy_object_identity_and_keeps_it_across_restarts() {
+    const LEGACY_OBJECT_ID: &str = "legacy-row-object-id";
+    const LEGACY_PATH: &str = "legacy/file.txt";
+    const LEGACY_MANIFEST: &str = "legacy-manifest";
+
+    let root = test_store_dir("legacy-object-id-migration");
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).await.unwrap();
+    let database_path = state_dir.join("metadata.sqlite");
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(
+                r#"
+                CREATE TABLE metadata_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO metadata_meta(key, value) VALUES('schema_version', '1');
+
+                CREATE TABLE current_objects (
+                    key TEXT PRIMARY KEY,
+                    manifest_hash TEXT NOT NULL
+                );
+
+                CREATE TABLE version_indexes (
+                    object_id TEXT PRIMARY KEY,
+                    index_json BLOB NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO current_objects(key, manifest_hash) VALUES(?1, ?2)",
+                rusqlite::params![LEGACY_PATH, LEGACY_MANIFEST],
+            )
+            .unwrap();
+        let legacy_index = serde_json::to_vec(&serde_json::json!({
+            "versions": {
+                "legacy-version": {
+                    "version_id": "legacy-version",
+                    "manifest_hash": LEGACY_MANIFEST,
+                    "logical_path": LEGACY_PATH,
+                    "parent_version_ids": [],
+                    "state": "confirmed",
+                    "created_at_unix": 1,
+                    "copied_from_object_id": null,
+                    "copied_from_version_id": null,
+                    "copied_from_path": null
+                }
+            },
+            "head_version_ids": ["legacy-version"],
+            "preferred_head_version_id": "legacy-version"
+        }))
+        .unwrap();
+        database
+            .execute(
+                "INSERT INTO version_indexes(object_id, index_json) VALUES(?1, ?2)",
+                rusqlite::params![LEGACY_OBJECT_ID, legacy_index],
+            )
+            .unwrap();
+    }
+
+    let store = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let current = store.list_versions(LEGACY_PATH).await.unwrap().unwrap();
+    assert_eq!(current.object_id, LEGACY_OBJECT_ID);
+    let migrated_index = store
+        .load_version_index_by_object_id(LEGACY_OBJECT_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(migrated_index.object_id, LEGACY_OBJECT_ID);
+    assert_eq!(migrated_index.versions.len(), 1);
+    assert!(migrated_index.versions.contains_key("legacy-version"));
+    assert_eq!(
+        migrated_index.preferred_head_version_id.as_deref(),
+        Some("legacy-version")
+    );
+    assert!(
+        migrated_index
+            .versions
+            .values()
+            .all(|version| version.object_id == LEGACY_OBJECT_ID)
+    );
+    drop(store);
+
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        let schema_version: String = database
+            .query_row(
+                "SELECT value FROM metadata_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let backfill_status: String = database
+            .query_row(
+                "SELECT value FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let current_object_id: String = database
+            .query_row(
+                "SELECT object_id FROM current_objects WHERE key = ?1",
+                [LEGACY_PATH],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let index_json: Vec<u8> = database
+            .query_row(
+                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+                [LEGACY_OBJECT_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let persisted: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
+
+        assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
+        assert_eq!(backfill_status, "complete");
+        assert_eq!(current_object_id, LEGACY_OBJECT_ID);
+        assert_eq!(persisted["object_id"], LEGACY_OBJECT_ID);
+        assert_eq!(
+            persisted["versions"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()["object_id"],
+            LEGACY_OBJECT_ID
+        );
+    }
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .list_versions(LEGACY_PATH)
+            .await
+            .unwrap()
+            .unwrap()
+            .object_id,
+        LEGACY_OBJECT_ID
+    );
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn sqlite_migration_keeps_existing_head_without_logical_path() {
+    let root = test_store_dir("legacy-object-id-missing-logical-path");
+    let database_path = root.join("state/metadata.sqlite");
+    let path = "legacy/current.txt";
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    seeded
+        .put_object_versioned(path, Bytes::from_static(b"payload"), PutOptions::default())
+        .await
+        .unwrap();
+    let original = seeded.list_versions(path).await.unwrap().unwrap();
+    let object_id = original.object_id.clone();
+    let version_id = original.preferred_head_version_id.clone().unwrap();
+    drop(seeded);
+
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+        let index_json: Vec<u8> = database
+            .query_row(
+                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+                [&object_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut index: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
+        index["versions"][&version_id]["logical_path"] = serde_json::Value::Null;
+        database
+            .execute(
+                "UPDATE version_indexes SET index_json = ?1 WHERE object_id = ?2",
+                rusqlite::params![serde_json::to_vec(&index).unwrap(), object_id],
+            )
+            .unwrap();
+    }
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let migrated = reopened.list_versions(path).await.unwrap().unwrap();
+    assert_eq!(migrated.object_id, object_id);
+    assert_eq!(migrated.versions.len(), 1);
+    assert_eq!(migrated.head_version_ids, vec![version_id.clone()]);
+    assert_eq!(migrated.preferred_head_version_id, Some(version_id));
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn sqlite_migration_ignores_tombstoned_lineage_candidates() {
+    const STALE_OBJECT_ID: &str = "legacy-tombstoned-object-id";
+
+    let root = test_store_dir("legacy-object-id-tombstoned-lineage");
+    let database_path = root.join("state/metadata.sqlite");
+    let path = "legacy/current.txt";
+    let payload = Bytes::from_static(b"live payload");
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    seeded
+        .put_object_versioned(path, payload.clone(), PutOptions::default())
+        .await
+        .unwrap();
+    let live_index = seeded.list_versions(path).await.unwrap().unwrap();
+    let live_object_id = live_index.object_id.clone();
+    let live_version_id = live_index.preferred_head_version_id.clone().unwrap();
+    let manifest_hash = seeded
+        .current_object_entry(path)
+        .await
+        .unwrap()
+        .unwrap()
+        .manifest_hash;
+    drop(seeded);
+
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+        database
+            .execute(
+                "UPDATE current_objects SET object_id = '' WHERE key = ?1",
+                [path],
+            )
+            .unwrap();
+
+        // The live lineage has a head for the current manifest but predates
+        // logical_path, so it is only a manifest-to-key fallback candidate.
+        let live_index_json: Vec<u8> = database
+            .query_row(
+                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+                [&live_object_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut live_index_json: serde_json::Value =
+            serde_json::from_slice(&live_index_json).unwrap();
+        live_index_json["versions"][&live_version_id]["logical_path"] = serde_json::Value::Null;
+        database
+            .execute(
+                "UPDATE version_indexes SET index_json = ?1 WHERE object_id = ?2",
+                rusqlite::params![
+                    serde_json::to_vec(&live_index_json).unwrap(),
+                    live_object_id
+                ],
+            )
+            .unwrap();
+
+        // A stale lineage contains the same manifest and a direct path match, but
+        // its preferred head is a tombstone. It must not claim a live object.
+        let stale_index = serde_json::json!({
+            "object_id": STALE_OBJECT_ID,
+            "versions": {
+                "stale-current": {
+                    "version_id": "stale-current",
+                    "object_id": STALE_OBJECT_ID,
+                    "manifest_hash": manifest_hash,
+                    "logical_path": path,
+                    "parent_version_ids": [],
+                    "state": "confirmed",
+                    "created_at_unix": 1,
+                    "copied_from_object_id": null,
+                    "copied_from_version_id": null,
+                    "copied_from_path": null
+                },
+                "stale-tombstone": {
+                    "version_id": "stale-tombstone",
+                    "object_id": STALE_OBJECT_ID,
+                    "manifest_hash": TOMBSTONE_MANIFEST_HASH,
+                    "logical_path": path,
+                    "parent_version_ids": ["stale-current"],
+                    "state": "confirmed",
+                    "created_at_unix": 2,
+                    "copied_from_object_id": null,
+                    "copied_from_version_id": null,
+                    "copied_from_path": null
+                }
+            },
+            "head_version_ids": ["stale-tombstone"],
+            "preferred_head_version_id": "stale-tombstone"
+        });
+        database
+            .execute(
+                "INSERT INTO version_indexes(object_id, index_json) VALUES(?1, ?2)",
+                rusqlite::params![STALE_OBJECT_ID, serde_json::to_vec(&stale_index).unwrap()],
+            )
+            .unwrap();
+    }
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let migrated = reopened.list_versions(path).await.unwrap().unwrap();
+    assert_eq!(migrated.object_id, live_object_id);
+    assert_eq!(
+        reopened
+            .get_object(path, None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap(),
+        payload
+    );
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn sqlite_migration_does_not_rewrite_indexes_with_persisted_object_ids() {
+    let root = test_store_dir("object-id-migration-already-persisted");
+    let database_path = root.join("state/metadata.sqlite");
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    seeded
+        .put_object_versioned(
+            "already-migrated.txt",
+            Bytes::from_static(b"payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let object_id = seeded
+        .list_versions("already-migrated.txt")
+        .await
+        .unwrap()
+        .unwrap()
+        .object_id;
+    drop(seeded);
+
+    let persisted_index: Vec<u8> = {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        let index_json = database
+            .query_row(
+                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+                [&object_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+        index_json
+    };
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .list_versions("already-migrated.txt")
+            .await
+            .unwrap()
+            .unwrap()
+            .object_id,
+        object_id
+    );
+    drop(reopened);
+
+    let database = rusqlite::Connection::open(&database_path).unwrap();
+    let index_after: Vec<u8> = database
+        .query_row(
+            "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+            [&object_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_after, persisted_index);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn sqlite_migration_repairs_empty_persisted_index_identity() {
+    let root = test_store_dir("object-id-migration-empty-persisted-index");
+    let database_path = root.join("state/metadata.sqlite");
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    seeded
+        .put_object_versioned(
+            "empty-persisted-index.txt",
+            Bytes::from_static(b"payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let versions = seeded
+        .list_versions("empty-persisted-index.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    let object_id = versions.object_id;
+    let version_id = versions.preferred_head_version_id.unwrap();
+    drop(seeded);
+
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+        database
+            .execute(
+                "UPDATE current_objects SET object_id = '' WHERE key = ?1",
+                ["empty-persisted-index.txt"],
+            )
+            .unwrap();
+        database
+            .execute(
+                "UPDATE version_indexes SET object_id = '' WHERE object_id = ?1",
+                [&object_id],
+            )
+            .unwrap();
+    }
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .list_versions("empty-persisted-index.txt")
+            .await
+            .unwrap()
+            .unwrap()
+            .object_id,
+        object_id
+    );
+    drop(reopened);
+
+    let database = rusqlite::Connection::open(&database_path).unwrap();
+    let index_json: Vec<u8> = database
+        .query_row(
+            "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+            [&object_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let index: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
+    assert_eq!(index["object_id"], object_id);
+    assert_eq!(index["versions"][&version_id]["object_id"], object_id);
+    let empty_row_count: i64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM version_indexes WHERE object_id = ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(empty_row_count, 0);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[test]
+fn version_index_decode_normalizes_mismatched_payload_identity() {
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "object_id": "payload-object-id",
+        "versions": {
+            "version": {
+                "version_id": "version",
+                "object_id": "payload-version-object-id",
+                "manifest_hash": "manifest",
+                "logical_path": "path",
+                "parent_version_ids": [],
+                "state": "confirmed",
+                "created_at_unix": 1,
+                "copied_from_object_id": null,
+                "copied_from_version_id": null,
+                "copied_from_path": null
+            }
+        },
+        "head_version_ids": ["version"],
+        "preferred_head_version_id": "version"
+    }))
+    .unwrap();
+
+    let index = decode_version_index("row-object-id", &payload, "test").unwrap();
+    assert!(index.identity_was_normalized);
+    assert_eq!(index.object_id, "row-object-id");
+    assert_eq!(index.versions["version"].object_id, "row-object-id");
+}
+
+async fn version_index_keyset_scan_includes_empty_persisted_object_id_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, store) = backend
+        .init_store("version-index-keyset-empty-persisted-object-id")
+        .await;
+    let index = empty_version_index("payload-object-id");
+    store
+        .metadata_store
+        .persist_version_index_by_object_id("", &index)
+        .await
+        .unwrap();
+    store
+        .metadata_store
+        .persist_version_index_by_object_id(
+            "later-object-id",
+            &empty_version_index("later-object-id"),
+        )
+        .await
+        .unwrap();
+
+    let first_page = store
+        .metadata_store
+        .load_version_indexes_after(None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].persisted_object_id, "");
+    assert_eq!(first_page[0].object_id, "payload-object-id");
+    assert!(first_page[0].identity_was_normalized);
+    let second_page = store
+        .metadata_store
+        .load_version_indexes_after(Some(""), 1)
+        .await
+        .unwrap();
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].persisted_object_id, "later-object-id");
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    version_index_keyset_scan_includes_empty_persisted_object_id_impl,
+    version_index_keyset_scan_includes_empty_persisted_object_id,
+    version_index_keyset_scan_includes_empty_persisted_object_id_turso
+);
+
+#[tokio::test]
+async fn sqlite_migration_keeps_preferred_head_for_duplicate_legacy_current_object_ids() {
+    let root = test_store_dir("duplicate-legacy-object-id-migration");
+    let database_path = root.join("state/metadata.sqlite");
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let created = seeded
+        .put_object_versioned(
+            "legacy/a.txt",
+            Bytes::from_static(b"preferred history"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        seeded
+            .rename_object_path("legacy/a.txt", "legacy/b.txt", false)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    let original = seeded.list_versions("legacy/b.txt").await.unwrap().unwrap();
+    let original_version_count = original.versions.len();
+    let original_preferred_head = original.preferred_head_version_id.clone();
+    let current_entry = seeded
+        .current_object_entry("legacy/b.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    seeded
+        .upsert_current_object("legacy/a.txt", current_entry)
+        .await
+        .unwrap();
+    drop(seeded);
+
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+    }
+
+    let store = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let a = store.list_versions("legacy/a.txt").await.unwrap().unwrap();
+    let b = store.list_versions("legacy/b.txt").await.unwrap().unwrap();
+    assert_ne!(a.object_id, created.object_id);
+    assert_eq!(b.object_id, created.object_id);
+    assert_eq!(b.versions.len(), original_version_count);
+    assert_eq!(b.preferred_head_version_id, original_preferred_head);
+    assert_eq!(
+        store
+            .current_path_for_object_id(&b.object_id)
+            .await
+            .unwrap(),
+        Some("legacy/b.txt".to_string())
+    );
+    assert_eq!(
+        store
+            .current_path_for_object_id(&a.object_id)
+            .await
+            .unwrap(),
+        Some("legacy/a.txt".to_string())
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn sqlite_migration_recovers_legacy_identity_from_manifest_when_path_is_stale() {
+    let root = test_store_dir("stale-legacy-object-id-migration");
+    let database_path = root.join("state/metadata.sqlite");
+    let path = "renamed/current.txt";
+    let mut seeded = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    seeded
+        .put_object_versioned(path, Bytes::from_static(b"payload"), PutOptions::default())
+        .await
+        .unwrap();
+    let original = seeded.list_versions(path).await.unwrap().unwrap();
+    let object_id = original.object_id.clone();
+    let version_id = original.preferred_head_version_id.clone().unwrap();
+    let version_count = original.versions.len();
+    drop(seeded);
+
+    {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "DELETE FROM metadata_meta WHERE key = ?1",
+                [OBJECT_ID_BACKFILL_KEY],
+            )
+            .unwrap();
+        database
+            .execute(
+                "UPDATE current_objects SET object_id = '' WHERE key = ?1",
+                [path],
+            )
+            .unwrap();
+        let index_json: Vec<u8> = database
+            .query_row(
+                "SELECT index_json FROM version_indexes WHERE object_id = ?1",
+                [&object_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut index: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
+        index["versions"][&version_id]["logical_path"] =
+            serde_json::Value::String("renamed/previous-name.txt".to_string());
+        database
+            .execute(
+                "UPDATE version_indexes SET index_json = ?1 WHERE object_id = ?2",
+                rusqlite::params![serde_json::to_vec(&index).unwrap(), object_id],
+            )
+            .unwrap();
+    }
+
+    let reopened = PersistentStore::init_with_sqlite_metadata(root.clone())
+        .await
+        .unwrap();
+    let migrated = reopened.list_versions(path).await.unwrap().unwrap();
+    assert_eq!(migrated.object_id, object_id);
+    assert_eq!(migrated.versions.len(), version_count);
+    assert_eq!(migrated.preferred_head_version_id, Some(version_id));
+    assert_eq!(
+        reopened
+            .list_versions_by_object_id(&object_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .key,
+        path
+    );
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+async fn synthetic_migration_version_extends_preferred_head_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("migration-version-parent").await;
+    store
+        .put_object_versioned(
+            "legacy/current.txt",
+            Bytes::from_static(b"original"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let original = store
+        .list_versions("legacy/current.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    let original_head = original.preferred_head_version_id.unwrap();
+
+    store
+        .ensure_migrated_object_version(
+            &original.object_id,
+            "legacy/current.txt",
+            "legacy-migrated-manifest",
+            unix_ts(),
+        )
+        .await
+        .unwrap();
+    let migrated = store
+        .load_version_index_by_object_id(&original.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let synthetic = migrated
+        .versions
+        .values()
+        .find(|record| record.manifest_hash == "legacy-migrated-manifest")
+        .unwrap();
+    assert_eq!(synthetic.parent_version_ids, vec![original_head]);
+    assert_eq!(
+        migrated.head_version_ids,
+        vec![synthetic.version_id.clone()]
+    );
+    assert_eq!(
+        migrated.preferred_head_version_id.as_deref(),
+        Some(synthetic.version_id.as_str())
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    synthetic_migration_version_extends_preferred_head_impl,
+    synthetic_migration_version_extends_preferred_head,
+    synthetic_migration_version_extends_preferred_head_turso
+);
+
+async fn synthetic_migration_version_reconciles_nonpreferred_current_manifest_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("migration-version-reconciles-current-manifest")
+        .await;
+    let path = "legacy/current.txt";
+    store
+        .put_object_versioned(path, Bytes::from_static(b"current"), PutOptions::default())
+        .await
+        .unwrap();
+    let current = store.current_object_entry(path).await.unwrap().unwrap();
+    let mut index = store
+        .load_version_index_by_object_id(&current.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_head = index.preferred_head_version_id.clone().unwrap();
+    let original_created_at = index.versions[&original_head].created_at_unix;
+    let competing_head_id = "legacy-competing-head".to_string();
+    index.versions.insert(
+        competing_head_id.clone(),
+        FileVersionRecord {
+            version_id: competing_head_id.clone(),
+            object_id: current.object_id.clone(),
+            manifest_hash: "legacy-other-manifest".to_string(),
+            logical_path: Some(path.to_string()),
+            parent_version_ids: Vec::new(),
+            state: VersionConsistencyState::Confirmed,
+            created_at_unix: original_created_at.saturating_add(1),
+            copied_from_object_id: None,
+            copied_from_version_id: None,
+            copied_from_path: None,
+        },
+    );
+    index.head_version_ids = recompute_head_version_ids(&index);
+    index.preferred_head_version_id = choose_preferred_head(&index);
+    assert_eq!(
+        index.preferred_head_version_id.as_deref(),
+        Some(competing_head_id.as_str())
+    );
+    store
+        .persist_version_index_by_object_id(&current.object_id, &index)
+        .await
+        .unwrap();
+
+    store
+        .ensure_migrated_object_version(&current.object_id, path, &current.manifest_hash, unix_ts())
+        .await
+        .unwrap();
+    let migrated = store
+        .load_version_index_by_object_id(&current.object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let preferred_head = migrated
+        .preferred_head_version_id
+        .as_ref()
+        .and_then(|version_id| migrated.versions.get(version_id))
+        .unwrap();
+    assert_eq!(preferred_head.manifest_hash, current.manifest_hash);
+    let synthetic = migrated
+        .versions
+        .values()
+        .find(|record| {
+            record.version_id.starts_with("migration-")
+                && record.manifest_hash == current.manifest_hash
+        })
+        .unwrap();
+    assert_eq!(synthetic.parent_version_ids, vec![competing_head_id]);
+    assert!(migrated.head_version_ids.contains(&synthetic.version_id));
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    synthetic_migration_version_reconciles_nonpreferred_current_manifest_impl,
+    synthetic_migration_version_reconciles_nonpreferred_current_manifest,
+    synthetic_migration_version_reconciles_nonpreferred_current_manifest_turso
+);
 
 async fn write_storage_pool_config(root: &Path, config: &StoragePoolConfig) {
     fs::create_dir_all(root.join("state")).await.unwrap();
@@ -1801,6 +3387,41 @@ async fn restore_tombstone_index_from_archive_recreates_deleted_index_impl(
     store.compact_tombstone_indexes(0, false).await.unwrap();
     assert!(!store.has_version_index(&object_id).await.unwrap());
 
+    // Archives written by older servers did not include identity fields inside
+    // their embedded version index. Restore must normalize those payloads before
+    // applying the modern persistence invariant.
+    let archive_path = PathBuf::from(
+        store
+            .list_tombstone_archives()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .path,
+    );
+    let mut archived: serde_json::Value =
+        serde_json::from_slice(&fs::read(&archive_path).await.unwrap()).unwrap();
+    let index = archived
+        .get_mut("index")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    index.remove("object_id");
+    for version in index
+        .get_mut("versions")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap()
+        .values_mut()
+    {
+        version.as_object_mut().unwrap().remove("object_id");
+    }
+    fs::write(
+        &archive_path,
+        format!("{}\n", serde_json::to_string(&archived).unwrap()),
+    )
+    .await
+    .unwrap();
+
     let dry_run = store
         .restore_tombstone_index_from_archive(&object_id, None, false, true)
         .await
@@ -1817,6 +3438,18 @@ async fn restore_tombstone_index_from_archive_recreates_deleted_index_impl(
     assert!(restored.found);
     assert!(restored.restored);
     assert!(store.has_version_index(&object_id).await.unwrap());
+    let restored_index = store
+        .load_version_index_by_object_id(&object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_index.object_id, object_id);
+    assert!(
+        restored_index
+            .versions
+            .values()
+            .all(|version| version.object_id == object_id)
+    );
 
     let skipped = store
         .restore_tombstone_index_from_archive(&object_id, None, false, false)
@@ -2617,6 +4250,61 @@ run_on_all_metadata_backends!(
     import_replication_bundle_preserves_source_object_id_for_repaired_key_impl,
     import_replication_bundle_preserves_source_object_id_for_repaired_key,
     import_replication_bundle_preserves_source_object_id_for_repaired_key_turso
+);
+
+async fn import_replication_bundle_replaces_empty_object_id_impl(backend: StorageTestBackend) {
+    let (source_root, mut source) = backend
+        .init_store("replica-import-empty-object-id-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("replica-import-empty-object-id-target")
+        .await;
+    let path = "docs/empty-object-id.txt";
+
+    let source_put = source
+        .put_object_versioned(
+            path,
+            Bytes::from_static(b"source-payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut bundle = source
+        .export_replication_bundle(
+            path,
+            Some(&source_put.version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("expected source replication bundle");
+    bundle.object_id = Some("\t".to_string());
+
+    for chunk in &bundle.manifest.chunks {
+        let payload = source
+            .read_chunk_payload(&chunk.hash)
+            .await
+            .unwrap()
+            .unwrap();
+        target
+            .ingest_chunk(&chunk.hash, payload.as_ref())
+            .await
+            .unwrap();
+    }
+    target.import_replication_bundle(&bundle).await.unwrap();
+
+    let imported = target.list_versions(path).await.unwrap().unwrap();
+    assert!(!imported.object_id.trim().is_empty());
+    assert_ne!(imported.object_id, source_put.object_id);
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    import_replication_bundle_replaces_empty_object_id_impl,
+    import_replication_bundle_replaces_empty_object_id,
+    import_replication_bundle_replaces_empty_object_id_turso
 );
 
 async fn replayed_replica_tombstone_does_not_remove_repaired_key_impl(backend: StorageTestBackend) {
@@ -4905,6 +6593,78 @@ run_on_all_metadata_backends!(
     restore_snapshot_to_custom_target_uses_metadata_copy_impl,
     restore_snapshot_to_custom_target_uses_metadata_copy,
     restore_snapshot_to_custom_target_uses_metadata_copy_turso
+);
+
+async fn restore_legacy_snapshot_drops_empty_object_id_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("restore-legacy-snapshot-empty-object-id")
+        .await;
+
+    let first = store
+        .put_object_versioned(
+            "docs/source.txt",
+            Bytes::from_static(b"source-v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut snapshot = store
+        .metadata_store
+        .load_snapshot_manifest(&first.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    snapshot
+        .object_ids
+        .insert("docs/source.txt".to_string(), String::new());
+    store
+        .metadata_store
+        .persist_snapshot_manifest(&snapshot)
+        .await
+        .unwrap();
+
+    let normalized_snapshot = store
+        .metadata_store
+        .load_snapshot_manifest(&first.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !normalized_snapshot
+            .object_ids
+            .contains_key("docs/source.txt")
+    );
+
+    let restored = store
+        .restore_snapshot_path(
+            &first.snapshot_id,
+            "docs/source.txt",
+            "restored/copy.txt",
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        restored,
+        SnapshotRestoreMutationResult::Applied(_)
+    ));
+
+    let copy_versions = store
+        .list_versions("restored/copy.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(copy_versions.versions.len(), 1);
+    assert_eq!(copy_versions.versions[0].copied_from_object_id, None);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    restore_legacy_snapshot_drops_empty_object_id_impl,
+    restore_legacy_snapshot_drops_empty_object_id,
+    restore_legacy_snapshot_drops_empty_object_id_turso
 );
 
 async fn restore_version_same_path_creates_new_head_impl(backend: StorageTestBackend) {

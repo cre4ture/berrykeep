@@ -2227,6 +2227,7 @@ mod tests {
             entries.push(StoreIndexEntry {
                 path: key.clone(),
                 entry_type: "key".to_string(),
+                object_id: Some(object.object_id.clone()),
                 labels: Vec::new(),
                 labels_resolved: false,
                 version: None,
@@ -2242,6 +2243,7 @@ mod tests {
             entries.push(StoreIndexEntry {
                 path: prefix,
                 entry_type: "prefix".to_string(),
+                object_id: None,
                 labels: Vec::new(),
                 labels_resolved: false,
                 version: None,
