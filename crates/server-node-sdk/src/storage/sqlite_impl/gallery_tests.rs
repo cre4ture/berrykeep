@@ -248,6 +248,8 @@ fn gallery_index_token_precedes_concurrent_writes_replayed_by_delta() {
             depth: 2,
             media_filter: GalleryIndexMediaFilter::Image,
             captured_sort: GalleryIndexCapturedSort::Desc,
+            captured_from_unix: None,
+            captured_until_unix: None,
             offset: 0,
             limit: 10,
             viewport: None,
@@ -323,6 +325,8 @@ fn gallery_viewport_query_filters_and_wraps_antimeridian() {
         depth: 2,
         media_filter,
         captured_sort: GalleryIndexCapturedSort::Desc,
+        captured_from_unix: None,
+        captured_until_unix: None,
         offset: 0,
         limit: 10,
         viewport: Some(viewport),
@@ -375,6 +379,36 @@ fn gallery_viewport_query_filters_and_wraps_antimeridian() {
     assert_eq!(dateline.media_summary.geotagged_count, 2);
 }
 
+#[test]
+fn gallery_index_filters_capture_time_with_inclusive_start_and_exclusive_end() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    insert_gallery_fixture(&db, "gallery/older.jpg", "image", 10, None, None);
+    insert_gallery_fixture(&db, "gallery/in-range.jpg", "image", 20, None, None);
+    insert_gallery_fixture(&db, "gallery/upper-bound.jpg", "image", 30, None, None);
+
+    let page = query_gallery_index_from_db(
+        &db,
+        &GalleryIndexQuery {
+            prefix: "gallery".to_string(),
+            depth: 2,
+            media_filter: GalleryIndexMediaFilter::Image,
+            captured_sort: GalleryIndexCapturedSort::Desc,
+            captured_from_unix: Some(20),
+            captured_until_unix: Some(30),
+            offset: 0,
+            limit: 10,
+            viewport: None,
+            label_filter: Default::default(),
+        },
+    )
+    .expect("capture-time filtered gallery should load");
+
+    assert_eq!(page.total_entry_count, 1);
+    assert_eq!(page.media_summary.image_count, 1);
+    assert_eq!(page.entries[0].key, "gallery/in-range.jpg");
+}
+
 fn gallery_map_query(
     viewport: GalleryViewportBounds,
     requested_resolution: u32,
@@ -384,6 +418,8 @@ fn gallery_map_query(
         prefix: "gallery".to_string(),
         depth: 64,
         media_filter: GalleryIndexMediaFilter::Image,
+        captured_from_unix: None,
+        captured_until_unix: None,
         viewport,
         requested_resolution,
         max_clusters,
@@ -446,6 +482,74 @@ fn gallery_map_clusters_are_bounded_and_preserve_scope_summary() {
     assert!(page.resolution < 4096);
     assert_eq!(page.clusters[0].count, 3);
     assert!(page.clusters[0].entry.is_none());
+}
+
+#[test]
+fn gallery_map_filters_capture_time_in_clusters_summary_and_entries() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    insert_gallery_fixture(&db, "gallery/older.jpg", "image", 10, Some(47.4), Some(8.5));
+    insert_gallery_fixture(
+        &db,
+        "gallery/in-range.jpg",
+        "image",
+        20,
+        Some(47.4),
+        Some(8.5),
+    );
+    insert_gallery_fixture(
+        &db,
+        "gallery/upper-bound.jpg",
+        "image",
+        30,
+        Some(47.4),
+        Some(8.5),
+    );
+    let viewport = GalleryViewportBounds {
+        south: -90.0,
+        west: -180.0,
+        north: 90.0,
+        east: 180.0,
+    };
+    let mut query = gallery_map_query(viewport, 1, 10);
+    query.captured_from_unix = Some(20);
+    query.captured_until_unix = Some(30);
+
+    let clusters = query_gallery_map_clusters_from_db(&db, &query)
+        .expect("capture-time filtered gallery map should load");
+    assert_eq!(clusters.total_entry_count, 1);
+    assert_eq!(clusters.media_summary.image_count, 1);
+    assert_eq!(clusters.visible_geotagged_count, 1);
+    assert_eq!(clusters.clusters.len(), 1);
+    assert_eq!(
+        clusters.clusters[0]
+            .entry
+            .as_ref()
+            .map(|entry| entry.key.as_str()),
+        Some("gallery/in-range.jpg")
+    );
+
+    let cluster = &clusters.clusters[0];
+    let entries = query_gallery_map_cluster_entries_from_db(
+        &db,
+        &GalleryMapClusterEntriesQuery {
+            prefix: query.prefix,
+            depth: query.depth,
+            media_filter: query.media_filter,
+            captured_from_unix: query.captured_from_unix,
+            captured_until_unix: query.captured_until_unix,
+            viewport,
+            resolution: clusters.resolution,
+            cell_x: cluster.cell_x,
+            cell_y: cluster.cell_y,
+            offset: 0,
+            limit: 10,
+            label_filter: Default::default(),
+        },
+    )
+    .expect("capture-time filtered cluster entries should load");
+    assert_eq!(entries.total_entry_count, 1);
+    assert_eq!(entries.entries[0].key, "gallery/in-range.jpg");
 }
 
 #[tokio::test]
@@ -546,6 +650,8 @@ fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport,
             resolution: clusters.resolution,
             cell_x: cluster.cell_x,
@@ -566,6 +672,8 @@ fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport,
             resolution: clusters.resolution,
             cell_x: cluster.cell_x,
@@ -658,6 +766,8 @@ async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope() {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport,
             resolution: clusters.resolution,
             cell_x: cluster.cell_x,
@@ -688,6 +798,8 @@ async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope() {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport,
             resolution: clusters.resolution,
             cell_x: cluster.cell_x,

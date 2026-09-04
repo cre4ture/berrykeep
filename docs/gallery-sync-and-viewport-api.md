@@ -8,7 +8,7 @@ same admin authorization as the existing admin store index.
 
 Request a current, paginated gallery view through `GET /api/v1/store/index` (or
 `GET /api/v1/auth/store/index`). Gallery fast-path responses backed by persistent metadata include an opaque
-`sync_token`. Store the response and token atomically on the client. The token is versioned but
+`sync_token`, except for capture-date-filtered responses described below. Store the response and token atomically on the client. The token is versioned but
 must not be parsed by clients. It binds the persistent server history and the normalized query
 membership (`prefix`, `depth`, media filter, captured sort, optional viewport, and optional label
 filter). Offset and limit are intentionally excluded, so pages from the same bootstrap have
@@ -83,6 +83,29 @@ different local history) receive the same `409` reset response even when their n
 would otherwise be in range. On any reset response, discard incremental assumptions and repeat
 the full bootstrap against the selected endpoint. The `current_token` is diagnostic and is not a
 replacement for a token obtained with the new full response.
+
+## Capture-date filters
+
+Current store-index requests can restrict media by its effective capture timestamp:
+
+```text
+captured_from_unix=1709251200&captured_until_unix=1711929600
+```
+
+`captured_from_unix` is inclusive and `captured_until_unix` is exclusive. Either bound may be
+used alone; when both are present the lower bound must be earlier than the upper bound. Mobile
+clients convert the selected local calendar days to the start of the first day and the start of
+the day after the last day. This keeps an inclusive user-facing date range correct across daylight
+saving transitions.
+
+Capture-date-filtered responses intentionally omit `sync_token`: the retained delta log does not
+store an entry's previous effective capture timestamp, so it cannot faithfully emit every removal
+when an entry crosses a date boundary. Clients should reload these filtered pages instead of
+attempting incremental reconciliation.
+
+Gallery map-cluster requests accept the same bounds. The returned `query_token` carries the
+normalized capture range so paginated cluster-entry requests cannot escape the selected dates.
+Map summaries cache each capture range as part of its bounded LRU scope.
 
 ## Viewport queries
 

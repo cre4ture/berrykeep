@@ -139,6 +139,7 @@ class MainActivity : ComponentActivity() {
                     refresh = vm::refreshGallery,
                     updateViewMode = vm::updateGalleryViewMode,
                     updateSort = vm::updateGallerySort,
+                    updateCaptureDateRange = vm::updateGalleryCaptureDateRange,
                     updateShowSensitiveContent = vm::updateGalleryShowSensitiveContent,
                     navigateToRoot = vm::navigateGalleryToRoot,
                     navigateUp = vm::navigateGalleryUp,

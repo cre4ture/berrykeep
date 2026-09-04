@@ -63,6 +63,8 @@ object RustClientBridge {
         limit: Int,
         sort: String?,
         mediaFilter: String?,
+        capturedFromUnix: Long,
+        capturedUntilUnix: Long,
         excludeLabels: String?,
         serverCaPem: String?,
         clientIdentityJson: String?,

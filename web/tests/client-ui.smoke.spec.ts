@@ -820,6 +820,37 @@ test("client-ui gallery loads bounded server-side map clusters", async ({ page }
   ).toBe(true);
 });
 
+test("client-ui gallery sends capture-date bounds to grid and map queries", async ({ page }) => {
+  const gridRequests: URL[] = [];
+  const mapRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list")) {
+      gridRequests.push(url);
+    }
+    if (url.pathname === apiV1("/gallery/map/clusters")) {
+      mapRequests.push(url);
+    }
+  });
+
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await page.getByLabel("Captured from").fill("2024-04-05");
+  await page.getByLabel("Captured through").fill("2024-04-06");
+  const [capturedFromUnix, capturedUntilUnix] = await page.evaluate(() => [
+    Math.floor(new Date(2024, 3, 5).getTime() / 1_000),
+    Math.floor(new Date(2024, 3, 7).getTime() / 1_000)
+  ]);
+  const includesCaptureBounds = (request: URL) =>
+    request.searchParams.get("captured_from_unix") === String(capturedFromUnix) &&
+    request.searchParams.get("captured_until_unix") === String(capturedUntilUnix);
+
+  await expect.poll(() => gridRequests.some(includesCaptureBounds)).toBe(true);
+  await page.getByRole("button", { name: "Map" }).click();
+  await expect.poll(() => mapRequests.some(includesCaptureBounds)).toBe(true);
+});
+
 test("client-ui gallery falls back to an older map API", async ({ page }) => {
   const mapRequestPaths: string[] = [];
   page.on("request", (request) => {

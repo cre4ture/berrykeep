@@ -23,6 +23,24 @@ enum class GalleryViewMode {
     CURRENT_DIRECTORY,
 }
 
+@Immutable
+data class GalleryCaptureDateRange(
+    val startEpochDay: Long? = null,
+    val endEpochDay: Long? = null,
+) {
+    init {
+        require((startEpochDay == null) == (endEpochDay == null)) {
+            "Capture-date range must have both endpoints or neither endpoint"
+        }
+        require(startEpochDay == null || startEpochDay <= requireNotNull(endEpochDay)) {
+            "Capture-date range start must not be after its end"
+        }
+    }
+
+    val isActive: Boolean
+        get() = startEpochDay != null
+}
+
 enum class MainSection {
     HOME,
     CONNECTIVITY,
@@ -155,6 +173,7 @@ data class MainUiState(
     val galleryCurrentDirectoryDocumentId: String = "dir:",
     val galleryCurrentDirectoryPath: String = "/",
     val gallerySort: GallerySortOption = GallerySortOption.CREATION_TIME,
+    val galleryCaptureDateRange: GalleryCaptureDateRange = GalleryCaptureDateRange(),
     val galleryShowSensitiveContent: Boolean = false,
     val themeAccentColorHex: String = DEFAULT_IRONMESH_ACCENT_COLOR_HEX,
     val galleryLoading: Boolean = false,

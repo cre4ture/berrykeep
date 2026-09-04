@@ -13290,6 +13290,10 @@ struct StoreIndexQuery {
     limit: Option<usize>,
     sort: Option<StoreIndexSortOrder>,
     media_filter: Option<StoreIndexMediaFilter>,
+    /// Inclusive lower bound for the effective media capture timestamp.
+    captured_from_unix: Option<u64>,
+    /// Exclusive upper bound for the effective media capture timestamp.
+    captured_until_unix: Option<u64>,
     south: Option<f64>,
     west: Option<f64>,
     north: Option<f64>,
@@ -13345,6 +13349,8 @@ struct GalleryMapClustersQuery {
     prefix: Option<String>,
     depth: Option<usize>,
     media_filter: Option<StoreIndexMediaFilter>,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     south: Option<f64>,
     west: Option<f64>,
     north: Option<f64>,
@@ -13638,6 +13644,8 @@ struct StoreIndexPageCacheKey {
     view: Option<StoreIndexView>,
     sort: Option<StoreIndexSortOrder>,
     media_filter: Option<StoreIndexMediaFilter>,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     label_filter: storage::GalleryLabelFilter,
     thumbnail_route: String,
 }
@@ -16197,6 +16205,8 @@ async fn list_store_index_admin(
             "limit": query.limit,
             "sort": query.sort,
             "media_filter": query.media_filter,
+            "captured_from_unix": query.captured_from_unix,
+            "captured_until_unix": query.captured_until_unix,
             "south": query.south,
             "west": query.west,
             "north": query.north,
@@ -16233,6 +16243,8 @@ async fn list_gallery_map_clusters_admin(
             "prefix": query.prefix.clone(),
             "depth": query.depth,
             "media_filter": query.media_filter,
+            "captured_from_unix": query.captured_from_unix,
+            "captured_until_unix": query.captured_until_unix,
             "south": query.south,
             "west": query.west,
             "north": query.north,
@@ -16284,6 +16296,11 @@ async fn gallery_map_clusters_response(
     query: GalleryMapClustersQuery,
     thumbnail_route: &str,
 ) -> Response {
+    if let Err(message) =
+        validate_capture_range(query.captured_from_unix, query.captured_until_unix)
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+    }
     let label_filter = match label_filter_from_query_values(
         query.require_labels.as_deref(),
         query.exclude_labels.as_deref(),
@@ -16359,6 +16376,8 @@ async fn gallery_map_clusters_response(
                 prefix: prefix.clone(),
                 depth,
                 media_filter: gallery_map::storage_media_filter(media_filter),
+                captured_from_unix: query.captured_from_unix,
+                captured_until_unix: query.captured_until_unix,
                 viewport: storage_viewport,
                 requested_resolution,
                 max_clusters,
@@ -16389,6 +16408,8 @@ async fn gallery_map_clusters_response(
             prefix: prefix.clone(),
             depth,
             media_filter,
+            captured_from_unix: query.captured_from_unix,
+            captured_until_unix: query.captured_until_unix,
             viewport,
             resolution: page.resolution,
             label_filter,
@@ -16476,6 +16497,8 @@ async fn gallery_map_cluster_entries_response(
                 prefix: token.prefix.clone(),
                 depth: token.depth,
                 media_filter: gallery_map::storage_media_filter(token.media_filter),
+                captured_from_unix: token.captured_from_unix,
+                captured_until_unix: token.captured_until_unix,
                 viewport: gallery_map::storage_viewport(token.viewport),
                 resolution: token.resolution,
                 cell_x,
@@ -16785,6 +16808,8 @@ fn store_index_page_cache_key(
         view: query.view,
         sort: query.sort,
         media_filter: query.media_filter,
+        captured_from_unix: query.captured_from_unix,
+        captured_until_unix: query.captured_until_unix,
         label_filter: label_filter.clone(),
         thumbnail_route: thumbnail_route.to_string(),
     })
@@ -16792,6 +16817,32 @@ fn store_index_page_cache_key(
 
 fn store_index_has_viewport(query: &StoreIndexQuery) -> bool {
     query.south.is_some() || query.west.is_some() || query.north.is_some() || query.east.is_some()
+}
+
+fn validate_capture_range(
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
+) -> std::result::Result<(), &'static str> {
+    if captured_from_unix
+        .into_iter()
+        .chain(captured_until_unix)
+        .any(|timestamp| timestamp > i64::MAX as u64)
+    {
+        return Err("capture-time bounds exceed the supported Unix timestamp range");
+    }
+    if matches!(
+        (captured_from_unix, captured_until_unix),
+        (Some(from), Some(until)) if from >= until
+    ) {
+        return Err("captured_from_unix must be earlier than captured_until_unix");
+    }
+    Ok(())
+}
+
+fn validate_store_index_capture_range(
+    query: &StoreIndexQuery,
+) -> std::result::Result<(), &'static str> {
+    validate_capture_range(query.captured_from_unix, query.captured_until_unix)
 }
 
 fn store_index_viewport_bounds(
@@ -16853,6 +16904,8 @@ fn store_index_gallery_query(
         depth,
         media_filter,
         captured_sort,
+        captured_from_unix: query.captured_from_unix,
+        captured_until_unix: query.captured_until_unix,
         offset: query.offset.unwrap_or(0),
         limit: query.limit?.max(1),
         viewport: store_index_viewport_bounds(query).ok()?,
@@ -16868,12 +16921,19 @@ fn store_index_response_from_gallery_index_page(
     depth: usize,
     thumbnail_route: &str,
 ) -> StoreIndexResponse {
-    let sync_token = encode_gallery_sync_token(&GallerySyncTokenPayload {
-        history_id: page.history_id,
-        revision: page.revision,
-        scope: gallery_sync_scope_from_query(gallery_query),
-    });
-    let consistency_token = format!("gallery:{sync_token}");
+    // The delta change log does not retain an entry's previous capture time. Avoid issuing a
+    // token whose later removals could not faithfully preserve a date-filtered result set.
+    let sync_token = (query.captured_from_unix.is_none() && query.captured_until_unix.is_none())
+        .then(|| {
+            encode_gallery_sync_token(&GallerySyncTokenPayload {
+                history_id: page.history_id,
+                revision: page.revision,
+                scope: gallery_sync_scope_from_query(gallery_query),
+            })
+        });
+    let consistency_token = sync_token
+        .as_ref()
+        .map(|sync_token| format!("gallery:{sync_token}"));
     let total_entry_count = page.total_entry_count;
     let offset = query.offset.unwrap_or(0).min(total_entry_count);
     let limit = query.limit.map(|value| value.max(1));
@@ -16893,8 +16953,8 @@ fn store_index_response_from_gallery_index_page(
             .map(|limit| offset.saturating_add(limit) < total_entry_count)
             .unwrap_or(false),
         next_cursor: None,
-        sync_token: Some(sync_token),
-        consistency_token: Some(consistency_token),
+        sync_token,
+        consistency_token,
         media_summary: StoreIndexMediaSummary {
             ready_count: page.media_summary.ready_count,
             pending_count: page.media_summary.pending_count,
@@ -17092,6 +17152,9 @@ async fn list_store_index_response_attempt(
     thumbnail_route: &str,
     allow_namespace_retry: bool,
 ) -> Response {
+    if let Err(message) = validate_store_index_capture_range(&query) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+    }
     let viewport = match store_index_viewport_bounds(&query) {
         Ok(viewport) => viewport,
         Err(message) => {
@@ -17505,6 +17568,17 @@ async fn list_store_index_response_attempt(
     if let Some(media_filter) = query.media_filter {
         entries.retain(|entry| matches_store_index_media_filter(entry, media_filter));
     }
+    if query.captured_from_unix.is_some() || query.captured_until_unix.is_some() {
+        entries.retain(|entry| {
+            let captured_at = store_index_entry_captured_at(entry);
+            query
+                .captured_from_unix
+                .is_none_or(|from| captured_at >= from)
+                && query
+                    .captured_until_unix
+                    .is_none_or(|until| captured_at < until)
+        });
+    }
     if label_filter_requested {
         entries.retain(|entry| {
             entry.entry_type != "key"
@@ -17708,6 +17782,8 @@ async fn list_store_index_response_cursor_mode(
         || query.offset.is_some()
         || query.limit.is_some()
         || query.media_filter.is_some()
+        || query.captured_from_unix.is_some()
+        || query.captured_until_unix.is_some()
         || matches!(
             query.sort,
             Some(

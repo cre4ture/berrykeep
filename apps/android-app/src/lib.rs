@@ -2991,6 +2991,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
     limit: jint,
     sort: jstring,
     media_filter: jstring,
+    captured_from_unix: jlong,
+    captured_until_unix: jlong,
     exclude_labels: jstring,
     server_ca_pem: jstring,
     client_identity_json: jstring,
@@ -3022,6 +3024,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
             limit: usize::try_from(limit).ok(),
             sort: parse_store_index_sort_order(sort.as_deref())?,
             media_filter: parse_store_index_media_filter(media_filter.as_deref())?,
+            captured_from_unix: u64::try_from(captured_from_unix).ok(),
+            captured_until_unix: u64::try_from(captured_until_unix).ok(),
             exclude_labels,
             ..StoreIndexRequestOptions::default()
         };

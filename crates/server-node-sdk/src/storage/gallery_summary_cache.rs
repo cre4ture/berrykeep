@@ -12,6 +12,8 @@ pub(crate) struct GallerySummaryScope {
     pub(crate) prefix: String,
     pub(crate) depth: usize,
     pub(crate) media_filter: GalleryIndexMediaFilter,
+    pub(crate) captured_from_unix: Option<u64>,
+    pub(crate) captured_until_unix: Option<u64>,
     /// The label filter is part of the aggregate's identity: a cached
     /// unfiltered summary must never be reused for a restricted map view.
     pub(crate) label_filter: GalleryLabelFilter,
@@ -77,9 +79,10 @@ pub(crate) struct GallerySummaryCache {
     trackers: Mutex<HashMap<GallerySummaryScope, Arc<GallerySummaryRefreshTracker>>>,
 }
 
-/// The gallery controls expose one scope at a time and only offer a fixed vocabulary of media
-/// and privacy-label filters. This LRU prevents request parameters from growing the process
-/// memory without bound while retaining the scopes a user is most likely to revisit.
+/// The gallery controls expose one scope at a time. Media and privacy-label filters have a fixed
+/// vocabulary, while capture-date ranges are user-selected. This LRU prevents those ranges from
+/// growing process memory without bound while retaining the scopes a user is most likely to
+/// revisit.
 const GALLERY_SUMMARY_CACHE_MAX_SCOPES: usize = 64;
 
 #[derive(Default)]
@@ -180,6 +183,8 @@ mod tests {
             prefix: format!("gallery/{index}"),
             depth: 1,
             media_filter: GalleryIndexMediaFilter::All,
+            captured_from_unix: None,
+            captured_until_unix: None,
             label_filter: GalleryLabelFilter::default(),
         }
     }

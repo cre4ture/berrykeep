@@ -667,6 +667,8 @@ impl TursoMetadataStore {
             prefix: query.prefix.trim().trim_matches('/').to_string(),
             depth: query.depth,
             media_filter: query.media_filter,
+            captured_from_unix: query.captured_from_unix,
+            captured_until_unix: query.captured_until_unix,
             label_filter: query.label_filter.clone(),
         };
         let (total_entry_count, media_summary, summary_status) = self
@@ -1204,8 +1206,10 @@ async fn query_gallery_index(
                     OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
                 )
             )
-        )";
-    let params = gallery_scope_values(&prefix, &prefix_pattern, depth, query);
+        )
+        AND (?9 IS NULL OR gallery_objects.captured_at_unix >= ?9)
+        AND (?10 IS NULL OR gallery_objects.captured_at_unix < ?10)";
+    let params = gallery_scope_values(&prefix, &prefix_pattern, depth, query)?;
     let (summary_label_sql, summary_label_values) =
         gallery_label_predicates(&query.label_filter, params.len() + 1)?;
     let summary_sql = format!(
@@ -1250,6 +1254,8 @@ async fn query_gallery_index(
     // placeholders continue after those two.
     let (page_label_sql, page_label_values) =
         gallery_label_predicates(&query.label_filter, params.len() + 3)?;
+    let limit_parameter = params.len() + 1;
+    let offset_parameter = limit_parameter + 1;
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
@@ -1269,7 +1275,7 @@ async fn query_gallery_index(
            ON version_indexes.object_id = gallery_objects.object_id
          WHERE {scope}{page_label_sql}
          ORDER BY gallery_objects.captured_at_unix {sort_direction}, gallery_objects.key ASC
-         LIMIT ?9 OFFSET ?10"
+         LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
     );
     let mut page_params = params;
     page_params.push(Value::from(
@@ -1317,18 +1323,20 @@ const GALLERY_MAP_SCOPE_SQL: &str = "
              - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
     END <= ?3
     AND gallery_objects.inferred_media_type IS NOT NULL
-    AND (?4 IS NULL OR gallery_objects.media_type = ?4)";
+    AND (?4 IS NULL OR gallery_objects.media_type = ?4)
+    AND (?5 IS NULL OR gallery_objects.captured_at_unix >= ?5)
+    AND (?6 IS NULL OR gallery_objects.captured_at_unix < ?6)";
 
 const GALLERY_MAP_VIEWPORT_SQL: &str = "
-    gallery_objects.latitude BETWEEN ?5 AND ?6
+    gallery_objects.latitude BETWEEN ?7 AND ?8
     AND (
-        (?7 <= ?8 AND gallery_objects.longitude BETWEEN ?7 AND ?8)
-        OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
+        (?9 <= ?10 AND gallery_objects.longitude BETWEEN ?9 AND ?10)
+        OR (?9 > ?10 AND (gallery_objects.longitude >= ?9 OR gallery_objects.longitude <= ?10))
     )
-    AND gallery_objects.spatial_y BETWEEN ?9 AND ?10
+    AND gallery_objects.spatial_y BETWEEN ?11 AND ?12
     AND (
-        (?11 <= ?12 AND gallery_objects.spatial_x BETWEEN ?11 AND ?12)
-        OR (?11 > ?12 AND (gallery_objects.spatial_x >= ?11 OR gallery_objects.spatial_x <= ?12))
+        (?13 <= ?14 AND gallery_objects.spatial_x BETWEEN ?13 AND ?14)
+        OR (?13 > ?14 AND (gallery_objects.spatial_x >= ?13 OR gallery_objects.spatial_x <= ?14))
     )";
 
 fn turso_gallery_map_scope_values(
@@ -1336,6 +1344,8 @@ fn turso_gallery_map_scope_values(
     prefix_pattern: &str,
     depth: usize,
     media_filter: GalleryIndexMediaFilter,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     viewport: GalleryViewportBounds,
 ) -> Result<Vec<Value>> {
     let (spatial_west, spatial_south) =
@@ -1349,6 +1359,8 @@ fn turso_gallery_map_scope_values(
         Value::from(prefix_pattern),
         Value::from(i64::try_from(depth).context("gallery map depth overflow")?),
         optional_text_value(media_filter.media_type()),
+        optional_integer_value(captured_from_unix, "gallery map capture-time lower bound")?,
+        optional_integer_value(captured_until_unix, "gallery map capture-time upper bound")?,
         Value::from(viewport.south),
         Value::from(viewport.north),
         Value::from(viewport.west),
@@ -1486,13 +1498,14 @@ async fn gallery_map_cluster_cells_query(
     let max_clusters = max_clusters.max(1);
     let mut resolution = requested_resolution.max(1);
     let clusters = loop {
+        let resolution_parameter = base_values.len() + 1;
         let (label_sql, label_values) =
             gallery_label_predicates(label_filter, base_values.len() + 2)?;
         let limit_parameter = base_values.len() + 2 + label_values.len();
         let sql = format!(
             "SELECT
-                 CAST(gallery_objects.spatial_x * ?13 AS INTEGER),
-                 CAST(gallery_objects.spatial_y * ?13 AS INTEGER),
+                 CAST(gallery_objects.spatial_x * ?{resolution_parameter} AS INTEGER),
+                 CAST(gallery_objects.spatial_y * ?{resolution_parameter} AS INTEGER),
                  COUNT(*),
                  AVG(gallery_objects.latitude),
                  AVG(gallery_objects.longitude),
@@ -1599,10 +1612,12 @@ async fn query_gallery_map_clusters(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
     let (total_entry_count, media_summary) =
-        gallery_map_summary_query(connection, &base_values[..4], &query.label_filter).await?;
+        gallery_map_summary_query(connection, &base_values[..6], &query.label_filter).await?;
     let (resolution, clusters) = gallery_map_cluster_cells_query(
         connection,
         &base_values,
@@ -1646,6 +1661,8 @@ pub(super) async fn query_gallery_map_cluster_cells(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
     let (resolution, clusters) = gallery_map_cluster_cells_query(
@@ -1690,6 +1707,14 @@ pub(super) async fn query_gallery_map_summary(
             Value::from(prefix_pattern.as_str()),
             Value::from(depth),
             optional_text_value(scope.media_filter.media_type()),
+            optional_integer_value(
+                scope.captured_from_unix,
+                "gallery map capture-time lower bound",
+            )?,
+            optional_integer_value(
+                scope.captured_until_unix,
+                "gallery map capture-time upper bound",
+            )?,
         ];
         let (total_entry_count, media_summary) = match progress {
             Some(progress) => {
@@ -1734,8 +1759,13 @@ async fn query_gallery_map_cluster_entries(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
+    let resolution_parameter = values.len() + 1;
+    let cell_x_parameter = resolution_parameter + 1;
+    let cell_y_parameter = resolution_parameter + 2;
     values.push(Value::from(i64::from(query.resolution.max(1))));
     values.push(Value::from(i64::from(query.cell_x)));
     values.push(Value::from(i64::from(query.cell_y)));
@@ -1746,8 +1776,8 @@ async fn query_gallery_map_cluster_entries(
     let offset_parameter = limit_parameter + 1;
     let cell_scope = format!(
         "{GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
-         AND CAST(gallery_objects.spatial_x * ?13 AS INTEGER) = ?14
-         AND CAST(gallery_objects.spatial_y * ?13 AS INTEGER) = ?15{label_sql}"
+         AND CAST(gallery_objects.spatial_x * ?{resolution_parameter} AS INTEGER) = ?{cell_x_parameter}
+         AND CAST(gallery_objects.spatial_y * ?{resolution_parameter} AS INTEGER) = ?{cell_y_parameter}{label_sql}"
     );
     let summary_sql = format!(
         "SELECT
@@ -2018,7 +2048,7 @@ fn gallery_scope_values(
     prefix_pattern: &str,
     depth: i64,
     query: &GalleryIndexQuery,
-) -> Vec<Value> {
+) -> Result<Vec<Value>> {
     let media_type = query.media_filter.media_type();
     let (south, north, west, east) = query
         .viewport
@@ -2031,7 +2061,7 @@ fn gallery_scope_values(
             )
         })
         .unwrap_or((None, None, None, None));
-    vec![
+    Ok(vec![
         Value::from(prefix),
         Value::from(prefix_pattern),
         Value::from(depth),
@@ -2040,7 +2070,12 @@ fn gallery_scope_values(
         optional_real_value(north),
         optional_real_value(west),
         optional_real_value(east),
-    ]
+        optional_integer_value(query.captured_from_unix, "gallery capture-time lower bound")?,
+        optional_integer_value(
+            query.captured_until_unix,
+            "gallery capture-time upper bound",
+        )?,
+    ])
 }
 
 struct GalleryIndexEntrySource {
@@ -2220,6 +2255,15 @@ fn optional_real_value(value: Option<f64>) -> Value {
     value.map(Value::from).unwrap_or(Value::Null)
 }
 
+fn optional_integer_value(value: Option<u64>, label: &str) -> Result<Value> {
+    match value {
+        Some(value) => Ok(Value::from(
+            i64::try_from(value).with_context(|| format!("{label} overflow"))?,
+        )),
+        None => Ok(Value::Null),
+    }
+}
+
 fn row_opt_string(row: &turso::Row, idx: usize, label: &str) -> Result<Option<String>> {
     match row.get_value(idx)? {
         Value::Null => Ok(None),
@@ -2333,6 +2377,8 @@ mod tests {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport,
             requested_resolution,
             max_clusters,
@@ -2541,6 +2587,8 @@ mod tests {
                 prefix: "gallery".to_string(),
                 depth: 64,
                 media_filter: GalleryIndexMediaFilter::Image,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 viewport,
                 resolution: clusters.resolution,
                 cell_x: cluster.cell_x,
@@ -2675,6 +2723,8 @@ mod tests {
                 prefix: "gallery".to_string(),
                 depth: 64,
                 media_filter: GalleryIndexMediaFilter::Image,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 viewport,
                 resolution: clusters.resolution,
                 cell_x: cluster.cell_x,
@@ -2702,6 +2752,8 @@ mod tests {
                 prefix: "gallery".to_string(),
                 depth: 64,
                 media_filter: GalleryIndexMediaFilter::Image,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 viewport,
                 resolution: clusters.resolution,
                 cell_x: cluster.cell_x,
@@ -3029,6 +3081,8 @@ mod tests {
             depth: 64,
             media_filter: GalleryIndexMediaFilter::All,
             captured_sort: GalleryIndexCapturedSort::Desc,
+            captured_from_unix: None,
+            captured_until_unix: None,
             offset: 0,
             limit: 10,
             viewport: None,
@@ -3075,6 +3129,8 @@ mod tests {
             depth: 64,
             media_filter: GalleryIndexMediaFilter::All,
             captured_sort: GalleryIndexCapturedSort::Desc,
+            captured_from_unix: None,
+            captured_until_unix: None,
             offset: 0,
             limit: 10,
             viewport: None,

@@ -3712,6 +3712,10 @@ pub struct StoreIndexRequestOptions {
     pub limit: Option<usize>,
     pub sort: Option<StoreIndexSortOrder>,
     pub media_filter: Option<StoreIndexMediaFilter>,
+    /// Inclusive lower bound for the effective media capture timestamp.
+    pub captured_from_unix: Option<u64>,
+    /// Exclusive upper bound for the effective media capture timestamp.
+    pub captured_until_unix: Option<u64>,
     pub viewport: Option<StoreIndexViewport>,
     /// Labels that must all be present on an entry.
     pub require_labels: Vec<String>,
@@ -3730,6 +3734,8 @@ impl Default for StoreIndexRequestOptions {
             limit: None,
             sort: None,
             media_filter: None,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport: None,
             require_labels: Vec::new(),
             exclude_labels: Vec::new(),
@@ -5643,6 +5649,14 @@ impl IronMeshClient {
         if let Some(media_filter) = options.media_filter {
             url.query_pairs_mut()
                 .append_pair("media_filter", media_filter.as_query_value());
+        }
+        if let Some(captured_from_unix) = options.captured_from_unix {
+            url.query_pairs_mut()
+                .append_pair("captured_from_unix", &captured_from_unix.to_string());
+        }
+        if let Some(captured_until_unix) = options.captured_until_unix {
+            url.query_pairs_mut()
+                .append_pair("captured_until_unix", &captured_until_unix.to_string());
         }
         if let Some(viewport) = options.viewport {
             url.query_pairs_mut()

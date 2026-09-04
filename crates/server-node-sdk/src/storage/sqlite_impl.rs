@@ -670,6 +670,8 @@ fn query_gallery_map_cluster_cells_from_db(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
     let (resolution, clusters) = gallery_map_cluster_cells_from_db(
@@ -723,6 +725,8 @@ fn query_gallery_map_summary_from_db(
             .media_type()
             .map(|value| Value::Text(value.to_string()))
             .unwrap_or(Value::Null),
+        optional_gallery_map_timestamp(scope.captured_from_unix, "lower")?,
+        optional_gallery_map_timestamp(scope.captured_until_unix, "upper")?,
     ];
     let (total_entry_count, media_summary) = match progress {
         Some(progress) => gallery_map_summary_chunked_from_db(
@@ -769,6 +773,8 @@ fn gallery_scope_values(
     depth: i64,
     media_type: Option<&str>,
     viewport: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+    captured_from_unix: Option<i64>,
+    captured_until_unix: Option<i64>,
 ) -> Vec<Value> {
     let (south, north, west, east) = viewport;
     let real = |value: Option<f64>| value.map_or(Value::Null, Value::Real);
@@ -781,6 +787,8 @@ fn gallery_scope_values(
         real(north),
         real(west),
         real(east),
+        captured_from_unix.map_or(Value::Null, Value::Integer),
+        captured_until_unix.map_or(Value::Null, Value::Integer),
     ]
 }
 
@@ -821,7 +829,9 @@ fn query_gallery_index_in_transaction(
                     OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
                 )
             )
-        )";
+        )
+        AND (?9 IS NULL OR gallery_objects.captured_at_unix >= ?9)
+        AND (?10 IS NULL OR gallery_objects.captured_at_unix < ?10)";
     let (south, north, west, east) = query
         .viewport
         .map(|bounds| {
@@ -839,6 +849,16 @@ fn query_gallery_index_in_transaction(
         depth,
         media_type,
         (south, north, west, east),
+        query
+            .captured_from_unix
+            .map(i64::try_from)
+            .transpose()
+            .context("gallery capture-time lower bound overflow")?,
+        query
+            .captured_until_unix
+            .map(i64::try_from)
+            .transpose()
+            .context("gallery capture-time upper bound overflow")?,
     );
     let (summary_label_sql, summary_label_values) =
         gallery_label_predicates(&query.label_filter, scope_values.len() + 1)?;
@@ -891,6 +911,8 @@ fn query_gallery_index_in_transaction(
     // placeholders continue after those two.
     let (page_label_sql, page_label_values) =
         gallery_label_predicates(&query.label_filter, scope_values.len() + 3)?;
+    let limit_parameter = scope_values.len() + 1;
+    let offset_parameter = limit_parameter + 1;
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
@@ -910,7 +932,7 @@ fn query_gallery_index_in_transaction(
            ON version_indexes.object_id = gallery_objects.object_id
          WHERE {scope}{page_label_sql}
          ORDER BY gallery_objects.captured_at_unix {sort_direction}, gallery_objects.key ASC
-         LIMIT ?9 OFFSET ?10"
+         LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
     );
     let mut statement = db.prepare(&page_sql)?;
     let mut page_values = scope_values;
@@ -974,18 +996,20 @@ const GALLERY_MAP_SCOPE_SQL: &str = "
              - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
     END <= ?3
     AND gallery_objects.inferred_media_type IS NOT NULL
-    AND (?4 IS NULL OR gallery_objects.media_type = ?4)";
+    AND (?4 IS NULL OR gallery_objects.media_type = ?4)
+    AND (?5 IS NULL OR gallery_objects.captured_at_unix >= ?5)
+    AND (?6 IS NULL OR gallery_objects.captured_at_unix < ?6)";
 
 const GALLERY_MAP_VIEWPORT_SQL: &str = "
-    gallery_objects.latitude BETWEEN ?5 AND ?6
+    gallery_objects.latitude BETWEEN ?7 AND ?8
     AND (
-        (?7 <= ?8 AND gallery_objects.longitude BETWEEN ?7 AND ?8)
-        OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
+        (?9 <= ?10 AND gallery_objects.longitude BETWEEN ?9 AND ?10)
+        OR (?9 > ?10 AND (gallery_objects.longitude >= ?9 OR gallery_objects.longitude <= ?10))
     )
-    AND gallery_objects.spatial_y BETWEEN ?9 AND ?10
+    AND gallery_objects.spatial_y BETWEEN ?11 AND ?12
     AND (
-        (?11 <= ?12 AND gallery_objects.spatial_x BETWEEN ?11 AND ?12)
-        OR (?11 > ?12 AND (gallery_objects.spatial_x >= ?11 OR gallery_objects.spatial_x <= ?12))
+        (?13 <= ?14 AND gallery_objects.spatial_x BETWEEN ?13 AND ?14)
+        OR (?13 > ?14 AND (gallery_objects.spatial_x >= ?13 OR gallery_objects.spatial_x <= ?14))
     )";
 
 fn sqlite_gallery_map_scope_values(
@@ -993,6 +1017,8 @@ fn sqlite_gallery_map_scope_values(
     prefix_pattern: &str,
     depth: usize,
     media_filter: super::GalleryIndexMediaFilter,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     viewport: GalleryViewportBounds,
 ) -> Result<Vec<Value>> {
     let (spatial_west, spatial_south) =
@@ -1009,6 +1035,8 @@ fn sqlite_gallery_map_scope_values(
             .media_type()
             .map(|value| Value::Text(value.to_string()))
             .unwrap_or(Value::Null),
+        optional_gallery_map_timestamp(captured_from_unix, "lower")?,
+        optional_gallery_map_timestamp(captured_until_unix, "upper")?,
         Value::Real(viewport.south),
         Value::Real(viewport.north),
         Value::Real(viewport.west),
@@ -1018,6 +1046,14 @@ fn sqlite_gallery_map_scope_values(
         Value::Real(spatial_west),
         Value::Real(spatial_east),
     ])
+}
+
+fn optional_gallery_map_timestamp(value: Option<u64>, bound: &str) -> Result<Value> {
+    value
+        .map(i64::try_from)
+        .transpose()
+        .with_context(|| format!("gallery map capture-time {bound} bound overflow"))
+        .map(|value| value.map_or(Value::Null, Value::Integer))
 }
 
 fn gallery_map_summary_from_db(
@@ -1150,13 +1186,14 @@ fn gallery_map_cluster_cells_from_db(
     let max_clusters = max_clusters.max(1);
     let mut resolution = requested_resolution.max(1);
     let clusters = loop {
+        let resolution_parameter = base_values.len() + 1;
         let (label_sql, label_values) =
             gallery_label_predicates(label_filter, base_values.len() + 2)?;
         let limit_parameter = base_values.len() + 2 + label_values.len();
         let sql = format!(
             "SELECT
-                 CAST(gallery_objects.spatial_x * ?13 AS INTEGER),
-                 CAST(gallery_objects.spatial_y * ?13 AS INTEGER),
+                 CAST(gallery_objects.spatial_x * ?{resolution_parameter} AS INTEGER),
+                 CAST(gallery_objects.spatial_y * ?{resolution_parameter} AS INTEGER),
                  COUNT(*),
                  AVG(gallery_objects.latitude),
                  AVG(gallery_objects.longitude),
@@ -1256,10 +1293,12 @@ fn query_gallery_map_clusters_in_transaction(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
     let (total_entry_count, media_summary) =
-        gallery_map_summary_from_db(db, &base_values[..4], &query.label_filter)?;
+        gallery_map_summary_from_db(db, &base_values[..6], &query.label_filter)?;
     let (resolution, clusters) = gallery_map_cluster_cells_from_db(
         db,
         &base_values,
@@ -1301,8 +1340,13 @@ fn query_gallery_map_cluster_entries_in_transaction(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
+    let resolution_parameter = values.len() + 1;
+    let cell_x_parameter = resolution_parameter + 1;
+    let cell_y_parameter = resolution_parameter + 2;
     values.push(Value::Integer(i64::from(query.resolution.max(1))));
     values.push(Value::Integer(i64::from(query.cell_x)));
     values.push(Value::Integer(i64::from(query.cell_y)));
@@ -1313,8 +1357,8 @@ fn query_gallery_map_cluster_entries_in_transaction(
     let offset_parameter = limit_parameter + 1;
     let cell_scope = format!(
         "{GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
-         AND CAST(gallery_objects.spatial_x * ?13 AS INTEGER) = ?14
-         AND CAST(gallery_objects.spatial_y * ?13 AS INTEGER) = ?15{label_sql}"
+         AND CAST(gallery_objects.spatial_x * ?{resolution_parameter} AS INTEGER) = ?{cell_x_parameter}
+         AND CAST(gallery_objects.spatial_y * ?{resolution_parameter} AS INTEGER) = ?{cell_y_parameter}{label_sql}"
     );
     let summary_sql = format!(
         "SELECT
@@ -2020,6 +2064,8 @@ impl MetadataStore for SqliteMetadataStore {
             prefix: query.prefix.trim().trim_matches('/').to_string(),
             depth: query.depth,
             media_filter: query.media_filter,
+            captured_from_unix: query.captured_from_unix,
+            captured_until_unix: query.captured_until_unix,
             label_filter: query.label_filter.clone(),
         };
         let (total_entry_count, media_summary, summary_status) = self

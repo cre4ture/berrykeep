@@ -841,6 +841,8 @@ fn store_index_with_options_json(
     limit: Option<usize>,
     sort: Option<&str>,
     media_filter: Option<&str>,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     exclude_labels: Vec<String>,
 ) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
@@ -852,6 +854,8 @@ fn store_index_with_options_json(
         limit,
         sort: parse_store_index_sort_order(sort)?,
         media_filter: parse_store_index_media_filter(media_filter)?,
+        captured_from_unix,
+        captured_until_unix,
         viewport: None,
         require_labels: Vec::new(),
         exclude_labels,
@@ -1182,6 +1186,8 @@ pub extern "C" fn ironmesh_ios_facade_store_index_with_options_json(
     limit: isize,
     sort: *const c_char,
     media_filter: *const c_char,
+    captured_from_unix: u64,
+    captured_until_unix: u64,
     exclude_labels: *const c_char,
     out_json: *mut *mut c_char,
     out_error: *mut *mut c_char,
@@ -1224,6 +1230,8 @@ pub extern "C" fn ironmesh_ios_facade_store_index_with_options_json(
             limit,
             sort.as_deref(),
             media_filter.as_deref(),
+            (captured_from_unix != u64::MAX).then_some(captured_from_unix),
+            (captured_until_unix != u64::MAX).then_some(captured_until_unix),
             exclude_labels,
         )
     })
@@ -2575,6 +2583,8 @@ mod tests {
             32,
             sort.as_ptr(),
             media_filter.as_ptr(),
+            1_700_000_000,
+            1_700_086_400,
             ptr::null(),
             &mut json_out,
             &mut index_error,
@@ -2592,7 +2602,7 @@ mod tests {
                 .expect("lock poisoned")
                 .as_deref(),
             Some(
-                "depth=64&prefix=photos&view=raw&offset=32&limit=32&sort=captured_desc&media_filter=image"
+                "depth=64&prefix=photos&view=raw&offset=32&limit=32&sort=captured_desc&media_filter=image&captured_from_unix=1700000000&captured_until_unix=1700086400"
             )
         );
 

@@ -29,6 +29,7 @@ data class LibraryScreenActions(
     val refresh: () -> Unit,
     val updateViewMode: (GalleryViewMode) -> Unit,
     val updateSort: (GallerySortOption) -> Unit,
+    val updateCaptureDateRange: (GalleryCaptureDateRange) -> Unit,
     val updateShowSensitiveContent: (Boolean) -> Unit,
     val navigateToRoot: () -> Unit,
     val navigateUp: () -> Unit,
