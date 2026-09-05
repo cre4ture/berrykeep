@@ -1,4 +1,5 @@
 import { defineConfig, devices } from "@playwright/test";
+import { playwrightWebGlLaunchOptions } from "./tests/playwright-webgl";
 
 export default defineConfig({
   testDir: "./tests",
@@ -8,7 +9,8 @@ export default defineConfig({
   },
   use: {
     baseURL: "http://127.0.0.1:4173",
-    trace: "retain-on-failure"
+    trace: "retain-on-failure",
+    launchOptions: playwrightWebGlLaunchOptions
   },
   webServer: {
     command:
