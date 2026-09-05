@@ -1961,15 +1961,15 @@ fn apply_exif_orientation(image: &mut DynamicImage, orientation: Option<u16>) {
     image.apply_orientation(orientation);
 }
 
-fn extract_exif_fields_from_reader<R: BufRead + Seek>(
-    reader: &mut R,
-) -> (
+type ExifExtraction = (
     Option<u16>,
     Option<MediaGpsCoordinates>,
     Option<u64>,
     Option<bool>,
     Option<CachedPhotoMetadata>,
-) {
+);
+
+fn extract_exif_fields_from_reader<R: BufRead + Seek>(reader: &mut R) -> ExifExtraction {
     if reader.seek(SeekFrom::Start(0)).is_err() {
         return (None, None, None, None, None);
     }

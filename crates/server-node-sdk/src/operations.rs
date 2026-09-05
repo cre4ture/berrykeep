@@ -1327,13 +1327,13 @@ async fn apply_one_geo_proposal(
         proposal_id: proposal.id.clone(),
         media_path: proposal.media_path.clone(),
         outcome: GeoApplyItemOutcome::SkippedStale,
-        detail: Some(detail.into()),
+        detail: Some(detail),
     };
     let failure = |detail: String| GeoApplyItemResult {
         proposal_id: proposal.id.clone(),
         media_path: proposal.media_path.clone(),
         outcome: GeoApplyItemOutcome::Failed,
-        detail: Some(detail.into()),
+        detail: Some(detail),
     };
 
     let identity = {
