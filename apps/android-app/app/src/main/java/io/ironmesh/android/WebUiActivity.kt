@@ -15,6 +15,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.data.EmbeddedWebUiSessionRegistry
+import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.ui.components.IronmeshEmbeddedWebUi
 
 class WebUiActivity : ComponentActivity() {
@@ -49,6 +50,7 @@ class WebUiActivity : ComponentActivity() {
                     IronmeshEmbeddedWebUi(
                         modifier = Modifier.fillMaxSize(),
                         session = session,
+                        accentColorHex = IronmeshPreferences.getThemeAccentColor(this),
                         onCreated = { hostedWebView = it },
                     )
                 }
