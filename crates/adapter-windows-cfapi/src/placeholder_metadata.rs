@@ -33,6 +33,10 @@ pub struct RemoteObjectReconcileReport {
     pub conflicted_paths: BTreeSet<String>,
     pub preserved_paths: BTreeSet<String>,
     pub suppressed_startup_paths: BTreeSet<String>,
+    /// Stable object IDs observed before this reconciliation pass. Runtime
+    /// action application reuses this inventory instead of opening every
+    /// placeholder again solely to check for object-ID collisions.
+    pub observed_placeholder_paths_by_object_id: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,8 +471,31 @@ pub fn reconcile_remote_object_state(
     provider_instance_id: Uuid,
     resolver: Option<&dyn RemoteObjectResolver>,
 ) -> Result<RemoteObjectReconcileReport> {
+    Ok(reconcile_remote_object_state_best_effort(
+        sync_root_path,
+        current_snapshot,
+        object_changes,
+        provider_instance_id,
+        resolver,
+    ))
+}
+
+/// Applies each independently safe remote reconciliation action and returns
+/// its complete report. Per-path filesystem failures are represented as
+/// preserved conflicts in the report so callers can retain monitor suppression
+/// for mutations that already completed earlier in the same pass.
+pub(crate) fn reconcile_remote_object_state_best_effort(
+    sync_root_path: &Path,
+    current_snapshot: &SyncSnapshot,
+    object_changes: &[RemoteObjectChange],
+    provider_instance_id: Uuid,
+    resolver: Option<&dyn RemoteObjectResolver>,
+) -> RemoteObjectReconcileReport {
     let mut report = RemoteObjectReconcileReport::default();
     let mut local_placeholders = scan_local_placeholders(sync_root_path);
+    report
+        .preserved_paths
+        .extend(local_placeholders.undecodable_paths.iter().cloned());
     // A rename delta is authoritative for this pass. If it cannot be safely
     // applied, restart reconciliation must not reinterpret the snapshot and
     // bypass the delta's resolver/revision guards.
@@ -615,13 +642,26 @@ pub fn reconcile_remote_object_state(
             report.preserved_paths.insert(local.relative_path.clone());
             continue;
         }
-        if move_remote_placeholder(sync_root_path, &local, current, provider_instance_id)? {
-            report
-                .renamed_paths
-                .insert(local.relative_path.clone(), normalize_path(&current.path));
-        } else {
-            report.conflicted_paths.insert(local.relative_path.clone());
-            report.preserved_paths.insert(local.relative_path.clone());
+        match move_remote_placeholder(sync_root_path, &local, current, provider_instance_id) {
+            Ok(true) => {
+                report
+                    .renamed_paths
+                    .insert(local.relative_path.clone(), normalize_path(&current.path));
+            }
+            Ok(false) => {
+                report.conflicted_paths.insert(local.relative_path.clone());
+                report.preserved_paths.insert(local.relative_path.clone());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    object_id,
+                    source_path = %local.relative_path,
+                    target_path = %current.path,
+                    "failed to apply confirmed remote rename; preserving the local placeholder and its reconciliation report: {error:#}"
+                );
+                report.conflicted_paths.insert(local.relative_path.clone());
+                report.preserved_paths.insert(local.relative_path.clone());
+            }
         }
     }
 
@@ -629,12 +669,14 @@ pub fn reconcile_remote_object_state(
         sync_root_path,
         current_snapshot,
         provider_instance_id,
+        &local_placeholders.placeholders(),
         &renamed_object_ids,
         &renamed_directory_subtrees,
         &mut report,
-    )?;
+    );
 
-    Ok(report)
+    report.observed_placeholder_paths_by_object_id = local_placeholders.paths_by_object_id();
+    report
 }
 
 fn path_depth(path: &str) -> usize {
@@ -746,10 +788,17 @@ fn detach_confirmed_tombstoned_identity(
 struct LocalPlaceholderIndex {
     unique: HashMap<String, LocalPlaceholder>,
     ambiguous: HashMap<String, Vec<LocalPlaceholder>>,
+    unbound: Vec<LocalPlaceholder>,
+    undecodable_paths: BTreeSet<String>,
 }
 
 impl LocalPlaceholderIndex {
-    fn insert(&mut self, object_id: String, placeholder: LocalPlaceholder) {
+    fn insert(&mut self, placeholder: LocalPlaceholder) {
+        let Some(object_id) = nonempty(placeholder.identity.object_id.as_deref()) else {
+            self.unbound.push(placeholder);
+            return;
+        };
+        let object_id = object_id.to_string();
         if let Some(duplicates) = self.ambiguous.get_mut(&object_id) {
             duplicates.push(placeholder);
         } else if let Some(first) = self.unique.remove(&object_id) {
@@ -795,6 +844,13 @@ impl LocalPlaceholderIndex {
         }
         paths
     }
+
+    fn placeholders(&self) -> Vec<LocalPlaceholder> {
+        let mut placeholders = self.unbound.clone();
+        placeholders.extend(self.unique.values().cloned());
+        placeholders.extend(self.ambiguous.values().flatten().cloned());
+        placeholders
+    }
 }
 
 fn scan_local_placeholders(sync_root_path: &Path) -> LocalPlaceholderIndex {
@@ -818,22 +874,17 @@ fn scan_local_placeholders(sync_root_path: &Path) -> LocalPlaceholderIndex {
             continue;
         };
         let Some(identity) = decode_placeholder_file_identity(info.file_identity()) else {
+            placeholders.undecodable_paths.insert(relative_path);
             continue;
         };
-        let Some(object_id) = nonempty(identity.object_id.as_deref()) else {
-            continue;
-        };
-        placeholders.insert(
-            object_id.to_string(),
-            LocalPlaceholder {
-                relative_path,
-                full_path: entry.into_path(),
-                identity,
-                on_disk_data_size: info.info().OnDiskDataSize,
-                modified_data_size: info.info().ModifiedDataSize,
-                in_sync_state: info.info().InSyncState,
-            },
-        );
+        placeholders.insert(LocalPlaceholder {
+            relative_path,
+            full_path: entry.into_path(),
+            identity,
+            on_disk_data_size: info.info().OnDiskDataSize,
+            modified_data_size: info.info().ModifiedDataSize,
+            in_sync_state: info.info().InSyncState,
+        });
     }
     placeholders
 }
@@ -848,10 +899,11 @@ fn reconcile_restart_placeholders(
     sync_root_path: &Path,
     current_snapshot: &SyncSnapshot,
     provider_instance_id: Uuid,
+    local_placeholders: &[LocalPlaceholder],
     renamed_object_ids: &BTreeSet<String>,
     renamed_directory_subtrees: &[(String, String)],
     report: &mut RemoteObjectReconcileReport,
-) -> Result<()> {
+) {
     let remote_by_object_id = unique_remote_files_by_object_id(current_snapshot);
     let remote_by_path = current_snapshot
         .remote
@@ -859,36 +911,9 @@ fn reconcile_restart_placeholders(
         .map(|entry| (normalize_path(&entry.path), entry))
         .collect::<HashMap<_, _>>();
 
-    for entry in WalkDir::new(sync_root_path)
-        .min_depth(1)
-        .into_iter()
-        .flatten()
-    {
-        if !entry.file_type().is_file() && !entry.file_type().is_dir() {
-            continue;
-        }
-        let relative_path = path_to_relative(sync_root_path, &entry.path().to_string_lossy());
-        if relative_path.is_empty() || is_internal_sync_root_relative_path(&relative_path) {
-            continue;
-        }
-        let Ok(file) = open_sync_path(entry.path(), false) else {
-            continue;
-        };
-        let Ok(info) = cf_get_placeholder_standard_info_with_identity(&file) else {
-            continue;
-        };
-        let Some(identity) = decode_placeholder_file_identity(info.file_identity()) else {
-            report.preserved_paths.insert(relative_path);
-            continue;
-        };
-        let local = LocalPlaceholder {
-            relative_path: relative_path.clone(),
-            full_path: entry.into_path(),
-            identity: identity.clone(),
-            on_disk_data_size: info.info().OnDiskDataSize,
-            modified_data_size: info.info().ModifiedDataSize,
-            in_sync_state: info.info().InSyncState,
-        };
+    for local in local_placeholders {
+        let relative_path = local.relative_path.clone();
+        let identity = &local.identity;
 
         if renamed_directory_subtrees
             .iter()
@@ -925,18 +950,33 @@ fn reconcile_restart_placeholders(
                     nonempty(remote.version.as_deref()).is_some_and(|remote_revision| {
                         nonempty(identity.remote_version.as_deref()) != Some(remote_revision)
                     });
-                if local.is_clean(provider_instance_id)
-                    && remote_rename_is_newer
-                    && move_remote_placeholder(
+                if local.is_clean(provider_instance_id) && remote_rename_is_newer {
+                    match move_remote_placeholder(
                         sync_root_path,
-                        &local,
+                        local,
                         remote,
                         provider_instance_id,
-                    )?
-                {
-                    report
-                        .renamed_paths
-                        .insert(relative_path, normalize_path(&remote.path));
+                    ) {
+                        Ok(true) => {
+                            report
+                                .renamed_paths
+                                .insert(relative_path, normalize_path(&remote.path));
+                        }
+                        Ok(false) => {
+                            report.conflicted_paths.insert(relative_path.clone());
+                            report.preserved_paths.insert(relative_path);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                object_id,
+                                source_path = %relative_path,
+                                target_path = %remote.path,
+                                "failed to apply restart remote rename; preserving the local placeholder and its reconciliation report: {error:#}"
+                            );
+                            report.conflicted_paths.insert(relative_path.clone());
+                            report.preserved_paths.insert(relative_path);
+                        }
+                    }
                 } else {
                     report.conflicted_paths.insert(relative_path.clone());
                     report.preserved_paths.insert(relative_path);
@@ -952,7 +992,7 @@ fn reconcile_restart_placeholders(
         let safe_legacy_match = local.is_clean(provider_instance_id)
             && nonempty(remote.object_id.as_deref()).is_some()
             && legacy_identity_matches_remote_baseline(
-                &identity,
+                identity,
                 remote.version.as_deref(),
                 remote.content_hash.as_deref(),
                 remote.content_fingerprint.as_deref(),
@@ -962,15 +1002,22 @@ fn reconcile_restart_placeholders(
             report.preserved_paths.insert(relative_path);
             continue;
         }
-        refresh_remote_placeholder_state(
+        if let Err(error) = refresh_remote_placeholder_state(
             sync_root_path,
             &relative_path,
             provider_instance_id,
             remote_placeholder_state(remote),
-        )?;
-        report.migrated_paths.insert(relative_path);
+        ) {
+            tracing::warn!(
+                path = %relative_path,
+                "failed to migrate the legacy placeholder; preserving the local placeholder and its reconciliation report: {error:#}"
+            );
+            report.conflicted_paths.insert(relative_path.clone());
+            report.preserved_paths.insert(relative_path);
+        } else {
+            report.migrated_paths.insert(relative_path);
+        }
     }
-    Ok(())
 }
 
 fn path_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
@@ -1026,13 +1073,6 @@ fn move_remote_placeholder(
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    write_remote_move_identity(
-        sync_root_path,
-        &local.relative_path,
-        &target_relative_path,
-        provider_instance_id,
-        remote,
-    )?;
     fs::rename(&local.full_path, &target_path).with_context(|| {
         format!(
             "failed to move remote placeholder {} -> {}",
@@ -1040,6 +1080,24 @@ fn move_remote_placeholder(
             target_path.display()
         )
     })?;
+    if let Err(error) = write_remote_move_identity(
+        sync_root_path,
+        &target_relative_path,
+        provider_instance_id,
+        remote,
+    ) {
+        return match fs::rename(&target_path, &local.full_path) {
+            Ok(()) => Err(error.context(format!(
+                "failed to update remote move identity after moving {}; restored the source path",
+                target_path.display()
+            ))),
+            Err(rollback_error) => Err(error.context(format!(
+                "failed to update remote move identity after moving {}; rollback to {} also failed: {rollback_error}",
+                target_path.display(),
+                local.full_path.display()
+            ))),
+        };
+    }
     let moved_file = open_sync_path(&target_path, true)?;
     cf_set_in_sync(&moved_file)?;
     Ok(true)
@@ -1047,7 +1105,6 @@ fn move_remote_placeholder(
 
 fn write_remote_move_identity(
     sync_root_path: &Path,
-    source_relative_path: &str,
     target_relative_path: &str,
     provider_instance_id: Uuid,
     remote: &sync_core::NamespaceEntry,
@@ -1055,7 +1112,7 @@ fn write_remote_move_identity(
     let target_relative_path = normalize_path(target_relative_path);
     mutate_placeholder_identity_for_path(
         sync_root_path,
-        source_relative_path,
+        &target_relative_path,
         None,
         true,
         |identity| {
@@ -1065,7 +1122,7 @@ fn write_remote_move_identity(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string);
-            identity.path = target_relative_path;
+            identity.path = target_relative_path.clone();
             identity.provider_instance_id = Some(provider_instance_id);
             identity.remote_version = remote
                 .version

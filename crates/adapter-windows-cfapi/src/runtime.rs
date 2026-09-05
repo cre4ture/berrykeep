@@ -1043,8 +1043,30 @@ pub fn apply_action_plan(
     provider_instance_id: uuid::Uuid,
     allow_empty_directories: bool,
 ) -> Result<()> {
+    apply_action_plan_with_observed_placeholder_paths(
+        root_path,
+        plan,
+        provider_instance_id,
+        allow_empty_directories,
+        None,
+    )
+}
+
+/// Applies a remote action plan using an inventory captured by the immediately
+/// preceding reconciliation pass when one is available. The inventory is used
+/// only for collision detection; path existence and identity checks remain in
+/// place before any mutation.
+pub(crate) fn apply_action_plan_with_observed_placeholder_paths(
+    root_path: &Path,
+    plan: &CfapiActionPlan,
+    provider_instance_id: uuid::Uuid,
+    allow_empty_directories: bool,
+    observed_placeholder_paths_by_object_id: Option<&BTreeMap<String, BTreeSet<String>>>,
+) -> Result<()> {
     std::fs::create_dir_all(root_path)?;
-    let existing_placeholder_paths = local_placeholder_paths_by_object_id(root_path);
+    let existing_placeholder_paths = observed_placeholder_paths_by_object_id
+        .cloned()
+        .unwrap_or_else(|| local_placeholder_paths_by_object_id(root_path));
     let mut planned_paths_by_object_id = BTreeMap::<String, BTreeSet<String>>::new();
     for action in &plan.actions {
         let (object_id, path) = match action {

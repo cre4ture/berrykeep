@@ -26,11 +26,11 @@ use crate::local_state::local_appdata_desktop_status_path;
 use crate::monitor::SyncRootMonitor;
 use crate::placeholder_metadata::{
     RemoteObjectReconcileReport, reconcile_existing_placeholders_with_resolver,
-    reconcile_remote_object_state,
+    reconcile_remote_object_state_best_effort,
 };
 use crate::runtime::{
-    CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
-    reconcile_sync_states, register_sync_root, unregister_sync_root,
+    CfapiRuntime, SyncRootRegistration, apply_action_plan_with_observed_placeholder_paths,
+    connect_sync_root, reconcile_sync_states, register_sync_root, unregister_sync_root,
 };
 use crate::windows_status::{
     WindowsStatusOptions, WindowsStatusPublisher, WindowsTrayIconHandle, spawn_remote_status_thread,
@@ -59,22 +59,54 @@ fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
     let mut hydrate_on_demand = 0usize;
     let mut queue_uploads = 0usize;
     let mut conflicts = 0usize;
+    let mut deferred_remote_objects = 0usize;
     let mut hydrate_sample = Vec::new();
     let mut dirty_sample = Vec::new();
     let mut conflict_sample = Vec::new();
+    let mut deferred_remote_sample = Vec::new();
 
     for action in &plan.actions {
         match action {
             CfapiAction::EnsureDirectory { .. } => {
                 ensure_directories += 1;
             }
-            CfapiAction::EnsurePlaceholder { .. } => {
+            CfapiAction::EnsurePlaceholder {
+                object_id,
+                path,
+                remote_version,
+                ..
+            } => {
                 ensure_placeholders += 1;
+                if object_id
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                    || remote_version.trim().is_empty()
+                {
+                    deferred_remote_objects += 1;
+                    if deferred_remote_sample.len() < 8 {
+                        deferred_remote_sample.push(path.clone());
+                    }
+                }
             }
-            CfapiAction::HydrateOnDemand { path, .. } => {
+            CfapiAction::HydrateOnDemand {
+                object_id,
+                path,
+                remote_version,
+                ..
+            } => {
                 hydrate_on_demand += 1;
                 if hydrate_sample.len() < 8 {
                     hydrate_sample.push(path.clone());
+                }
+                if object_id
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                    || remote_version.trim().is_empty()
+                {
+                    deferred_remote_objects += 1;
+                    if deferred_remote_sample.len() < 8 {
+                        deferred_remote_sample.push(path.clone());
+                    }
                 }
             }
             CfapiAction::QueueUploadOnClose { path, .. } => {
@@ -93,22 +125,28 @@ fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
     }
 
     tracing::info!(
-        "plan-summary: {} total={} directories={} placeholders={} hydrate_on_demand={} queue_uploads={} conflicts={}",
+        "plan-summary: {} total={} directories={} placeholders={} hydrate_on_demand={} queue_uploads={} conflicts={} deferred_unbound_remote_objects={}",
         label,
         plan.actions.len(),
         ensure_directories,
         ensure_placeholders,
         hydrate_on_demand,
         queue_uploads,
-        conflicts
+        conflicts,
+        deferred_remote_objects
     );
-    if !hydrate_sample.is_empty() || !dirty_sample.is_empty() || !conflict_sample.is_empty() {
+    if !hydrate_sample.is_empty()
+        || !dirty_sample.is_empty()
+        || !conflict_sample.is_empty()
+        || !deferred_remote_sample.is_empty()
+    {
         tracing::info!(
-            "plan-summary: {} hydrate_sample={:?} dirty_sample={:?} conflict_sample={:?}",
+            "plan-summary: {} hydrate_sample={:?} dirty_sample={:?} conflict_sample={:?} deferred_unbound_remote_sample={:?}",
             label,
             hydrate_sample,
             dirty_sample,
-            conflict_sample
+            conflict_sample,
+            deferred_remote_sample
         );
     }
 }
@@ -514,11 +552,12 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             uploader.clone(),
         )?;
 
-        apply_action_plan(
+        apply_action_plan_with_observed_placeholder_paths(
             &registration.root_path,
             &action_plan,
             sync_root_identity.provider_instance_id,
             true,
+            Some(&startup_reconcile_report.observed_placeholder_paths_by_object_id),
         )?;
         let _ = runtime.sync_from_action_plan(&action_plan);
         let sync_state_stats = reconcile_sync_states(&registration.root_path, &action_plan);
@@ -598,26 +637,19 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                     let _monitor_gate = refresh_monitor_gate
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let report = match reconcile_remote_object_state(
+                    let report = reconcile_remote_object_state_best_effort(
                         &refresh_registration.root_path,
                         &update.snapshot,
                         &update.object_changes,
                         refresh_provider_instance_id,
                         Some(uploader.as_ref()),
-                    ) {
-                        Ok(report) => report,
-                        Err(err) => {
-                            tracing::warn!(
-                                "remote-refresh: remote-object reconciliation failed: {err:#}"
-                            );
-                            RemoteObjectReconcileReport::default()
-                        }
-                    };
-                    if let Err(err) = apply_action_plan(
+                    );
+                    if let Err(err) = apply_action_plan_with_observed_placeholder_paths(
                         &refresh_registration.root_path,
                         &plan,
                         refresh_provider_instance_id,
                         false,
+                        Some(&report.observed_placeholder_paths_by_object_id),
                     ) {
                         tracing::info!("remote-refresh: apply_action_plan error: {err}");
                         return;

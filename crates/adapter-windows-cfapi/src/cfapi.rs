@@ -275,7 +275,7 @@ pub fn cf_dehydrate_placeholder_with_oplock(path: &Path, relative_path: &str) ->
                     .is_none_or(|revision| revision.trim().is_empty())
             {
                 anyhow::bail!(
-                    "refusing to dehydrate {} before object_id and revision are reconciled",
+                    "cannot dehydrate legacy or unbound placeholder {} until reconciliation binds object_id and expected_revision; keeping local data hydrated to avoid losing an unresolved remote baseline",
                     relative_path
                 );
             }
