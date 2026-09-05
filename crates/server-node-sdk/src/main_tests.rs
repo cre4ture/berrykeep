@@ -12758,6 +12758,8 @@ async fn multiplex_transport_get_upload_session_routes_to_handler_impl(backend: 
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                object_id: None,
+                expected_revision: None,
                 assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
                 multipart_parts: std::collections::BTreeMap::new(),
@@ -12826,6 +12828,8 @@ async fn start_upload_session_prefills_existing_chunk_refs_impl(backend: MainTes
             state: None,
             parent: Vec::new(),
             version_id: None,
+            object_id: None,
+            expected_revision: None,
             chunk_refs: vec![
                 super::UploadChunkRef {
                     hash: first_chunk_hash,
@@ -12932,6 +12936,8 @@ async fn start_upload_session_replays_same_response_for_same_operation_id_impl(
         state: None,
         parent: Vec::new(),
         version_id: None,
+        object_id: None,
+        expected_revision: None,
         chunk_refs: Vec::new(),
     };
     let mut headers = HeaderMap::new();
@@ -13005,6 +13011,8 @@ async fn start_upload_session_conflicts_on_operation_id_payload_mismatch_impl(
             state: None,
             parent: Vec::new(),
             version_id: None,
+            object_id: None,
+            expected_revision: None,
             chunk_refs: Vec::new(),
         }),
     )
@@ -13021,6 +13029,8 @@ async fn start_upload_session_conflicts_on_operation_id_payload_mismatch_impl(
             state: None,
             parent: Vec::new(),
             version_id: None,
+            object_id: None,
+            expected_revision: None,
             chunk_refs: Vec::new(),
         }),
     )
@@ -13216,7 +13226,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             path: "images/".to_string(),
             entry_type: "key".to_string(),
             object_id: Some("obj-directory-marker".to_string()),
-            version: None,
+            version: Some("revision-directory-marker".to_string()),
             content_hash: Some("marker".to_string()),
             size_bytes: Some(0),
             modified_at_unix: None,
@@ -13249,7 +13259,11 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
         collapsed[0].object_id.as_deref(),
         Some("obj-directory-marker")
     );
-    assert_eq!(collapsed[0].content_hash, None);
+    assert_eq!(
+        collapsed[0].version.as_deref(),
+        Some("revision-directory-marker")
+    );
+    assert_eq!(collapsed[0].content_hash.as_deref(), Some("marker"));
     assert_eq!(collapsed[1].path, "images/cat.png");
     assert_eq!(collapsed[1].entry_type, "key");
 }
@@ -19084,6 +19098,8 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                object_id: None,
+                expected_revision: None,
                 assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
                 multipart_parts: std::collections::BTreeMap::new(),
@@ -19178,6 +19194,8 @@ async fn process_stats_memory_reports_current_objects_uploads_and_last_gc_pass()
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                object_id: None,
+                expected_revision: None,
                 assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
                 multipart_parts: std::collections::BTreeMap::new(),

@@ -3459,6 +3459,10 @@ struct UploadSessionStartRequest {
     parent: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     chunk_refs: Vec<UploadSessionChunkRef>,
 }
@@ -6683,6 +6687,18 @@ impl IronMeshClient {
         total_size_bytes: u64,
         chunk_refs: Vec<UploadSessionChunkRef>,
     ) -> Result<UploadSessionView> {
+        self.start_upload_session_with_mutation(key, total_size_bytes, chunk_refs, None, None)
+            .await
+    }
+
+    async fn start_upload_session_with_mutation(
+        &self,
+        key: &str,
+        total_size_bytes: u64,
+        chunk_refs: Vec<UploadSessionChunkRef>,
+        object_id: Option<&str>,
+        expected_revision: Option<&str>,
+    ) -> Result<UploadSessionView> {
         let url = self.store_upload_session_start_url()?;
         let payload = serde_json::to_vec(&UploadSessionStartRequest {
             key: key.to_string(),
@@ -6690,6 +6706,8 @@ impl IronMeshClient {
             state: None,
             parent: Vec::new(),
             version_id: None,
+            object_id: object_id.map(ToString::to_string),
+            expected_revision: expected_revision.map(ToString::to_string),
             chunk_refs,
         })
         .context("failed to encode upload session start payload")?;
@@ -7509,6 +7527,72 @@ impl IronMeshClient {
         ))
     }
 
+    fn put_sized_reader_via_upload_session_with_identity(
+        &self,
+        path: &str,
+        object_id: Option<&str>,
+        expected_revision: Option<&str>,
+        reader: &mut dyn Read,
+        total_size_bytes: u64,
+    ) -> Result<ObjectMutationUploadResult> {
+        let runtime = blocking_runtime()?;
+        let session = runtime.block_on(self.start_upload_session_with_mutation(
+            path,
+            total_size_bytes,
+            Vec::new(),
+            object_id,
+            expected_revision,
+        ))?;
+        let mut buffer = vec![0_u8; session.chunk_size_bytes];
+
+        for index in 0..session.chunk_count {
+            let expected_size = expected_chunk_size(
+                total_size_bytes,
+                session.chunk_size_bytes,
+                session.chunk_count,
+                index,
+            )
+            .context("failed to determine expected upload chunk size")?;
+            reader
+                .read_exact(&mut buffer[..expected_size])
+                .with_context(|| {
+                    format!("failed reading upload chunk index={index} for key={path}")
+                })?;
+            let response = runtime.block_on(self.upload_session_chunk(
+                &session.upload_id,
+                index,
+                buffer[..expected_size].to_vec(),
+            ))?;
+            if response.received_index != index {
+                bail!(
+                    "server acknowledged unexpected upload chunk index={} expected={index}",
+                    response.received_index
+                );
+            }
+        }
+
+        let completed = runtime.block_on(self.complete_upload_session(&session.upload_id))?;
+        self.clear_upload_session_affinity(&session.upload_id);
+        let returned_object_id = completed.object_id.trim();
+        if returned_object_id.is_empty() {
+            bail!("server did not return object identity for chunked upload path={path}");
+        }
+        if let Some(expected_object_id) = object_id
+            && returned_object_id != expected_object_id
+        {
+            bail!(
+                "server returned a different object identity for chunked upload path={path}: expected={expected_object_id} actual={returned_object_id}"
+            );
+        }
+        Ok(ObjectMutationUploadResult {
+            object_id: returned_object_id.to_string(),
+            path: path.to_string(),
+            revision: completed.version_id,
+            size_bytes: usize::try_from(total_size_bytes)
+                .context("chunked upload size exceeds this platform's addressable range")?,
+        })
+    }
+
     pub fn download_file_resumable(
         &self,
         key: impl AsRef<str>,
@@ -7754,6 +7838,16 @@ impl IronMeshClient {
         length: u64,
     ) -> Result<ObjectMutationUploadResult> {
         let path = path.into();
+        let object_id = object_id.map(str::trim).filter(|value| !value.is_empty());
+        if length > LARGE_UPLOAD_THRESHOLD_BYTES as u64 {
+            return self.put_sized_reader_via_upload_session_with_identity(
+                &path,
+                object_id,
+                expected_revision,
+                reader,
+                length,
+            );
+        }
         let initial_capacity = usize::try_from(length)
             .unwrap_or(8_192)
             .min(LARGE_UPLOAD_THRESHOLD_BYTES);
@@ -7769,7 +7863,7 @@ impl IronMeshClient {
             );
         }
         let runtime = blocking_runtime()?;
-        match object_id.map(str::trim).filter(|value| !value.is_empty()) {
+        match object_id {
             Some(object_id) => runtime.block_on(self.put_by_object_id_with_result(
                 object_id,
                 Bytes::from(payload),
@@ -9782,7 +9876,15 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
         if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
             let directory_path = entry.path.trim_end_matches('/').to_string();
             if !directory_path.is_empty() {
-                remote.push(NamespaceEntry::directory(directory_path));
+                let mut directory = NamespaceEntry::directory(directory_path);
+                directory.object_id = entry.object_id;
+                directory.version = entry.version;
+                directory.content_hash = entry.content_hash;
+                directory.content_fingerprint = entry.content_fingerprint;
+                directory.size_bytes = entry.size_bytes;
+                directory.modified_at_unix = entry.modified_at_unix;
+                directory.media = entry.media.map(namespace_media_metadata);
+                remote.push(directory);
             }
             continue;
         }

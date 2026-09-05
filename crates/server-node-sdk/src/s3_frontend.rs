@@ -1903,6 +1903,8 @@ async fn create_multipart_upload_response(
         state: VersionConsistencyState::Confirmed,
         parent_version_ids: Vec::new(),
         explicit_version_id: None,
+        object_id: None,
+        expected_revision: None,
         assembly_mode: UploadAssemblyMode::Multipart,
         received_chunks: Vec::new(),
         multipart_parts: BTreeMap::new(),

@@ -262,7 +262,17 @@ where
             let directory_path = entry.path.trim_end_matches('/').to_string();
             if !directory_path.is_empty() {
                 directory_count += 1;
-                remote.push(NamespaceEntry::directory(directory_path));
+                let mut directory = NamespaceEntry::directory(directory_path);
+                directory.object_id = entry.object_id;
+                directory.version = entry.version;
+                directory.content_hash = entry.content_hash;
+                directory.content_fingerprint = entry.content_fingerprint;
+                directory.size_bytes = entry.size_bytes;
+                directory.modified_at_unix = entry.modified_at_unix;
+                directory.media = entry
+                    .media
+                    .map(crate::ironmesh_client::namespace_media_metadata);
+                remote.push(directory);
             }
         } else {
             let version = entry.version.unwrap_or_else(|| "server-head".to_string());
@@ -579,13 +589,9 @@ pub fn object_changes_between(
 fn remote_files_by_object_id(
     snapshot: &SyncSnapshot,
 ) -> (BTreeMap<String, &NamespaceEntry>, BTreeSet<String>) {
-    let mut unique = BTreeMap::new();
+    let mut unique = BTreeMap::<String, &NamespaceEntry>::new();
     let mut ambiguous = BTreeSet::new();
-    for entry in snapshot
-        .remote
-        .iter()
-        .filter(|entry| entry.kind == EntryKind::File)
-    {
+    for entry in &snapshot.remote {
         let Some(object_id) = entry
             .object_id
             .as_deref()
@@ -595,6 +601,15 @@ fn remote_files_by_object_id(
             continue;
         };
         if ambiguous.contains(object_id) {
+            continue;
+        }
+        if unique
+            .get(object_id)
+            .is_some_and(|existing| existing.path == entry.path)
+        {
+            // Tree listings can expose the directory marker and the matching
+            // common-prefix projection together. They describe the same
+            // namespace entry, not an object-id collision.
             continue;
         }
         if unique.insert(object_id.to_string(), entry).is_some() {
@@ -952,6 +967,64 @@ mod tests {
     }
 
     #[test]
+    fn object_changes_recognize_directory_rename_by_stable_identity() {
+        let mut previous_entry = NamespaceEntry::directory("docs");
+        previous_entry.object_id = Some("obj-directory".to_string());
+        previous_entry.version = Some("revision-1".to_string());
+        let mut current_entry = NamespaceEntry::directory("archive");
+        current_entry.object_id = Some("obj-directory".to_string());
+        current_entry.version = Some("revision-2".to_string());
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous_entry.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![current_entry.clone()],
+            },
+        );
+
+        assert_eq!(
+            changes,
+            vec![RemoteObjectChange::Renamed {
+                previous: previous_entry,
+                current: current_entry,
+            }]
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_directory_marker_identity_and_revision() {
+        let snapshot = snapshot_from_store_index_entries_with_progress(
+            vec![crate::ironmesh_client::StoreIndexEntry {
+                path: "docs/".to_string(),
+                entry_type: "prefix".to_string(),
+                object_id: Some("obj-directory".to_string()),
+                version: Some("revision-7".to_string()),
+                content_hash: Some("directory-marker".to_string()),
+                size_bytes: Some(5),
+                modified_at_unix: Some(1_725_000_000),
+                content_fingerprint: Some("fingerprint-directory".to_string()),
+                media: None,
+                labels: Vec::new(),
+                labels_resolved: false,
+            }],
+            |_| {},
+        );
+
+        let directory = snapshot
+            .remote
+            .first()
+            .expect("directory should be present");
+        assert_eq!(directory.kind, EntryKind::Directory);
+        assert_eq!(directory.path, "docs");
+        assert_eq!(directory.object_id.as_deref(), Some("obj-directory"));
+        assert_eq!(directory.version.as_deref(), Some("revision-7"));
+    }
+
+    #[test]
     fn same_path_with_new_object_id_is_delete_and_recreate() {
         let deleted = NamespaceEntry::file("docs/readme.md", "revision-1", "hash-1")
             .with_object_id("obj-old");
@@ -995,6 +1068,32 @@ mod tests {
         );
 
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn duplicate_directory_projection_at_same_path_keeps_rename_identity() {
+        let mut previous = NamespaceEntry::directory("docs");
+        previous.object_id = Some("obj-directory".to_string());
+        previous.version = Some("revision-1".to_string());
+        let mut current = NamespaceEntry::directory("archive");
+        current.object_id = Some("obj-directory".to_string());
+        current.version = Some("revision-2".to_string());
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![current.clone(), current.clone()],
+            },
+        );
+
+        assert_eq!(
+            changes,
+            vec![RemoteObjectChange::Renamed { previous, current }]
+        );
     }
 
     #[test]

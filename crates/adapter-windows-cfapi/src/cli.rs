@@ -25,7 +25,8 @@ use crate::live::ServerNodeHydrator;
 use crate::local_state::local_appdata_desktop_status_path;
 use crate::monitor::SyncRootMonitor;
 use crate::placeholder_metadata::{
-    RemoteObjectReconcileReport, reconcile_existing_placeholders, reconcile_remote_object_state,
+    RemoteObjectReconcileReport, reconcile_existing_placeholders_with_resolver,
+    reconcile_remote_object_state,
 };
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
@@ -451,10 +452,20 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             RemoteSnapshotScope::new(prefix.clone(), depth, None),
         );
         let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
-        let startup_reconcile_report = match reconcile_existing_placeholders(
+        let download_stage_root =
+            crate::live::windows_download_stage_root_for_sync_root(&registration.root_path)?;
+        let startup_resolver = ServerNodeHydrator::with_client(
+            client.clone().with_connection_name(windows_connection_name(
+                "startup-resolver",
+                &registration.display_name,
+            )),
+            download_stage_root.clone(),
+        );
+        let startup_reconcile_report = match reconcile_existing_placeholders_with_resolver(
             &registration.root_path,
             &initial_snapshot,
             sync_root_identity.provider_instance_id,
+            &startup_resolver,
         ) {
             Ok(report) => {
                 log_remote_object_reconcile_summary("startup", &report);
@@ -481,8 +492,6 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         }
 
         let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
-        let download_stage_root =
-            crate::live::windows_download_stage_root_for_sync_root(&registration.root_path)?;
         let hydrator = Box::new(ServerNodeHydrator::with_client(
             client.clone().with_connection_name(windows_connection_name(
                 "hydrator",

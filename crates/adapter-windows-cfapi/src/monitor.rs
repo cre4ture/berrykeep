@@ -16,7 +16,7 @@ use crate::cfapi_safe_wrap::local_file_identity_for_path;
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{
     PlaceholderFileIdentity, decode_placeholder_file_identity, error_chain_has_win32_hresult,
-    path_to_relative,
+    normalize_path, path_to_relative,
 };
 use crate::hydration_control::is_active_hydration_marked;
 use crate::placeholder_metadata::{
@@ -296,7 +296,7 @@ impl RemoteAppliedTracker {
 
         for action in &plan.actions {
             match action {
-                CfapiAction::EnsureDirectory { path } => {
+                CfapiAction::EnsureDirectory { path, .. } => {
                     record_remote_applied_directory(path, &mut directories);
                 }
                 CfapiAction::EnsurePlaceholder { path, .. }
@@ -399,7 +399,7 @@ impl SyncRootMonitor {
         let mut seeded = HashMap::new();
         for action in &plan.actions {
             match action {
-                CfapiAction::EnsureDirectory { path } => {
+                CfapiAction::EnsureDirectory { path, .. } => {
                     self.seed_existing_entry(&mut seeded, path, true);
                 }
                 CfapiAction::EnsurePlaceholder { path, .. }
@@ -432,7 +432,7 @@ impl SyncRootMonitor {
             walk_error_samples,
         } = self.snapshot_entries();
         let mut current = current;
-        let handled_renames = self.handle_local_file_renames(&current);
+        let handled_renames = self.handle_local_object_renames(&current);
         let dehydrate_summary = summarize_dehydrate_scan(&current);
         let paths = current.keys().cloned().collect::<Vec<_>>();
         for rel_path in paths {
@@ -462,11 +462,11 @@ impl SyncRootMonitor {
         self.seen = current;
     }
 
-    fn handle_local_file_renames(
+    fn handle_local_object_renames(
         &self,
         current: &HashMap<String, SeenEntry>,
     ) -> std::collections::HashSet<String> {
-        let rename_pairs = detect_local_file_renames(&self.seen, current);
+        let rename_pairs = detect_local_object_renames(&self.seen, current);
         let mut handled_paths = std::collections::HashSet::new();
 
         for rename in rename_pairs {
@@ -476,7 +476,7 @@ impl SyncRootMonitor {
                     .replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()),
             );
             tracing::info!(
-                "{}: detected local file rename {} -> {} detection={} state_before={} state_after={}",
+                "{}: detected local object rename {} -> {} detection={} state_before={} state_after={}",
                 self.name,
                 rename.from_path,
                 rename.to_path,
@@ -491,16 +491,20 @@ impl SyncRootMonitor {
                     .unwrap_or_else(|| String::from("<missing>")),
             );
 
+            let entry = current
+                .get(&rename.to_path)
+                .expect("object-id rename candidates must exist in the current snapshot");
+            let remote_destination = remote_rename_destination(&rename.to_path, entry.is_dir);
             match self.uploader.rename_object(
-                current
-                    .get(&rename.to_path)
-                    .and_then(|entry| entry.placeholder_object_id.as_deref())
+                entry
+                    .placeholder_object_id
+                    .as_deref()
                     .expect("object-id rename candidates must carry object_id"),
-                current
-                    .get(&rename.to_path)
-                    .and_then(|entry| entry.placeholder_revision.as_deref())
+                entry
+                    .placeholder_revision
+                    .as_deref()
                     .expect("object-id rename candidates must carry a revision"),
-                &rename.to_path,
+                &remote_destination,
             ) {
                 Ok(true) => {
                     handled_paths.insert(rename.from_path.clone());
@@ -513,7 +517,7 @@ impl SyncRootMonitor {
                         describe_path_state(&full_path)
                     );
                     if let Some(entry) = current.get(&rename.to_path)
-                        && let Err(err) = repair_locally_renamed_materialized_file(
+                        && let Err(err) = repair_locally_renamed_object(
                             &self.sync_root,
                             &full_path,
                             &rename.to_path,
@@ -757,17 +761,61 @@ impl SyncRootMonitor {
             tracing::info!("{}: detected new directory {}", self.name, rel_path);
             let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
             let remote_path = directory_marker_path(&rel_path);
-            if let Err(err) =
-                self.uploader
-                    .upload_reader(&remote_path, &mut cursor, b"<DIR>".len() as u64)
-            {
-                tracing::info!(
-                    "{}: failed to upload directory marker {}: {}",
+            if entry.placeholder_object_id.is_some() != entry.placeholder_revision.is_some() {
+                tracing::warn!(
+                    "{}: refusing ambiguous directory upload for {}; object_id and expected_revision are incomplete",
                     self.name,
-                    rel_path,
-                    err
+                    rel_path
                 );
-                self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                return;
+            }
+            match self.uploader.upload_reader_for_object(
+                &remote_path,
+                entry.placeholder_object_id.as_deref(),
+                entry.placeholder_revision.as_deref(),
+                &mut cursor,
+                b"<DIR>".len() as u64,
+            ) {
+                Ok(receipt) => {
+                    let Some((object_id, revision)) = receipt
+                        .object_id
+                        .as_deref()
+                        .zip(receipt.remote_version.as_deref())
+                    else {
+                        tracing::warn!(
+                            "{}: directory upload returned no stable object identity/revision for {}",
+                            self.name,
+                            rel_path
+                        );
+                        self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                        return;
+                    };
+                    if let Err(err) = record_uploaded_object_state(
+                        &self.sync_root,
+                        &rel_path,
+                        self.provider_instance_id,
+                        object_id,
+                        revision,
+                        None,
+                    ) {
+                        tracing::info!(
+                            "{}: failed to record uploaded directory state for {}: {:#}",
+                            self.name,
+                            rel_path,
+                            err
+                        );
+                        self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                    }
+                }
+                Err(err) => {
+                    tracing::info!(
+                        "{}: failed to upload directory marker {}: {}",
+                        self.name,
+                        rel_path,
+                        err
+                    );
+                    self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                }
             }
         } else {
             let metadata = match std::fs::metadata(path) {
@@ -1274,10 +1322,9 @@ impl SyncRootMonitor {
                 );
                 continue;
             }
-            if !entry.is_dir
-                && self
-                    .remote_applied_tracker
-                    .take_file_removal_suppression(path)
+            if self
+                .remote_applied_tracker
+                .take_file_removal_suppression(path)
             {
                 tracing::info!(
                     "{}: suppressing remote-applied local removal for {}",
@@ -1286,40 +1333,35 @@ impl SyncRootMonitor {
                 );
                 continue;
             }
-            if entry.is_dir {
-                tracing::info!(
-                    "{}: preserving deleted directory {} because no stable object identity is available",
+            let (Some(object_id), Some(expected_revision)) = (
+                entry.placeholder_object_id.as_deref(),
+                entry.placeholder_revision.as_deref(),
+            ) else {
+                tracing::warn!(
+                    "{}: refusing path-only remote delete for {}; placeholder identity is incomplete",
                     self.name,
                     path
                 );
-            } else {
-                let (Some(object_id), Some(expected_revision)) = (
-                    entry.placeholder_object_id.as_deref(),
-                    entry.placeholder_revision.as_deref(),
-                ) else {
-                    tracing::warn!(
-                        "{}: refusing path-only remote delete for {}; placeholder identity is incomplete",
-                        self.name,
-                        path
-                    );
-                    continue;
-                };
+                continue;
+            };
+            let object_kind = if entry.is_dir { "directory" } else { "file" };
+            tracing::info!(
+                "{}: detected deleted {} {} object_id={} expected_revision={}",
+                self.name,
+                object_kind,
+                path,
+                object_id,
+                expected_revision
+            );
+            if let Err(err) = self.uploader.delete_object(object_id, expected_revision) {
                 tracing::info!(
-                    "{}: detected deleted file {} object_id={} expected_revision={}",
+                    "{}: failed to delete remote {} {} object_id={}: {}",
                     self.name,
+                    object_kind,
                     path,
                     object_id,
-                    expected_revision
+                    err
                 );
-                if let Err(err) = self.uploader.delete_object(object_id, expected_revision) {
-                    tracing::info!(
-                        "{}: failed to delete remote file {} object_id={}: {}",
-                        self.name,
-                        path,
-                        object_id,
-                        err
-                    );
-                }
             }
         }
     }
@@ -1368,20 +1410,16 @@ fn placeholder_identity_for_entry(
     decode_placeholder_file_identity(file_identity)
 }
 
-fn repair_locally_renamed_materialized_file(
+fn repair_locally_renamed_object(
     sync_root: &std::path::Path,
     path: &std::path::Path,
     rel_path: &str,
     provider_instance_id: uuid::Uuid,
     entry: &SeenEntry,
 ) -> anyhow::Result<()> {
-    if entry.is_dir {
-        return Ok(());
-    }
-
     let is_placeholder = path_is_placeholder(path);
     tracing::info!(
-        "monitor: repairing local renamed file {} mode={} entry_snapshot={} state_before={}",
+        "monitor: repairing local renamed object {} mode={} entry_snapshot={} state_before={}",
         rel_path,
         if is_placeholder {
             "placeholder-metadata-only"
@@ -1392,6 +1430,13 @@ fn repair_locally_renamed_materialized_file(
         describe_path_state(path)
     );
 
+    if entry.is_dir {
+        promote_remote_to_in_sync_content_baseline(sync_root, rel_path, provider_instance_id)?;
+        let file = open_sync_path(path, true)?;
+        cf_set_in_sync(&file)?;
+        return Ok(());
+    }
+
     if is_placeholder {
         // Renamed placeholders must be repaired without reading file content, or the
         // fingerprinting path will implicitly hydrate them. Repoint the stored
@@ -1401,7 +1446,7 @@ fn repair_locally_renamed_materialized_file(
         let file = open_sync_path(path, true)?;
         cf_set_in_sync(&file)?;
         tracing::info!(
-            "monitor: repaired local renamed file {} mode=placeholder-metadata-only state_after={}",
+            "monitor: repaired local renamed object {} mode=placeholder-metadata-only state_after={}",
             rel_path,
             describe_path_state(path)
         );
@@ -1436,7 +1481,7 @@ fn mark_local_rename_conflict(path: &std::path::Path) {
     }
 }
 
-fn detect_local_file_renames(
+fn detect_local_object_renames(
     previous: &HashMap<String, SeenEntry>,
     current: &HashMap<String, SeenEntry>,
 ) -> Vec<LocalRenamePair> {
@@ -1445,7 +1490,7 @@ fn detect_local_file_renames(
     let mut matched_destinations = std::collections::HashSet::new();
 
     for (to_path, entry) in current {
-        if previous.contains_key(to_path) || entry.is_dir {
+        if previous.contains_key(to_path) {
             continue;
         }
         let Some(from_path) = entry.placeholder_identity_path.as_deref() else {
@@ -1465,7 +1510,8 @@ fn detect_local_file_renames(
             continue;
         }
         if previous.get(from_path).is_some_and(|candidate| {
-            !candidate.is_dir && candidate.placeholder_object_id.as_deref() == Some(object_id)
+            candidate.is_dir == entry.is_dir
+                && candidate.placeholder_object_id.as_deref() == Some(object_id)
         }) {
             matched_sources.insert(from_path.to_string());
             matched_destinations.insert(to_path.clone());
@@ -1481,6 +1527,20 @@ fn detect_local_file_renames(
     pairs
 }
 
+fn remote_rename_destination(relative_path: &str, is_directory: bool) -> String {
+    let normalized = normalize_path(relative_path);
+    if is_directory {
+        let marker_path = normalized.trim_end_matches('/');
+        if marker_path.is_empty() {
+            String::new()
+        } else {
+            format!("{marker_path}/")
+        }
+    } else {
+        normalized
+    }
+}
+
 fn snapshot_entry(
     sync_root: &std::path::Path,
     rel_path: &str,
@@ -1492,7 +1552,7 @@ fn snapshot_entry(
         .as_ref()
         .map(|metadata| metadata.file_attributes())
         .unwrap_or_default();
-    let is_placeholder = !is_dir && path_is_placeholder(path);
+    let is_placeholder = path_is_placeholder(path);
     let placeholder_identity = placeholder_identity_for_entry(path, is_placeholder);
     let should_probe = !is_dir
         && ((file_attributes & FILE_ATTRIBUTE_UNPINNED) != 0
@@ -1905,7 +1965,9 @@ mod tests {
         std::fs::create_dir_all(sync_root.join("docs")).expect("failed to create remote directory");
         remote_applied.record_plan(&CfapiActionPlan {
             actions: vec![CfapiAction::EnsureDirectory {
+                object_id: None,
                 path: "docs".to_string(),
+                remote_version: None,
             }],
         });
         monitor.walk();
@@ -2071,7 +2133,7 @@ mod tests {
         previous_entry.placeholder_revision = Some("revision-3".to_string());
         let current_entry = previous_entry.clone();
 
-        let pairs = detect_local_file_renames(
+        let pairs = detect_local_object_renames(
             &HashMap::from([("docs/old.txt".to_string(), previous_entry)]),
             &HashMap::from([("archive/new.txt".to_string(), current_entry)]),
         );
@@ -2083,6 +2145,34 @@ mod tests {
     }
 
     #[test]
+    fn local_directory_rename_detection_requires_same_placeholder_object_id() {
+        let mut previous_entry = seen_entry(true);
+        previous_entry.placeholder_identity_path = Some("docs".to_string());
+        previous_entry.placeholder_object_id = Some("obj-directory".to_string());
+        previous_entry.placeholder_revision = Some("revision-3".to_string());
+        let current_entry = previous_entry.clone();
+
+        let pairs = detect_local_object_renames(
+            &HashMap::from([("docs".to_string(), previous_entry)]),
+            &HashMap::from([("archive".to_string(), current_entry)]),
+        );
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].from_path, "docs");
+        assert_eq!(pairs[0].to_path, "archive");
+    }
+
+    #[test]
+    fn remote_directory_rename_destination_retains_marker_suffix() {
+        assert_eq!(remote_rename_destination("archive", true), "archive/");
+        assert_eq!(remote_rename_destination("archive/", true), "archive/");
+        assert_eq!(
+            remote_rename_destination("archive/readme.txt", false),
+            "archive/readme.txt"
+        );
+    }
+
+    #[test]
     fn local_rename_detection_rejects_path_history_with_different_object_id() {
         let mut previous_entry = seen_entry(false);
         previous_entry.placeholder_identity_path = Some("docs/old.txt".to_string());
@@ -2091,7 +2181,7 @@ mod tests {
         let mut current_entry = previous_entry.clone();
         current_entry.placeholder_object_id = Some("obj-new".to_string());
 
-        let pairs = detect_local_file_renames(
+        let pairs = detect_local_object_renames(
             &HashMap::from([("docs/old.txt".to_string(), previous_entry)]),
             &HashMap::from([("archive/new.txt".to_string(), current_entry)]),
         );
