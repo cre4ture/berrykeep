@@ -140,6 +140,10 @@ export type GalleryMapClustersRequest = {
   zoom: number;
   /** Desired cluster-cell width in CSS pixels; the server bounds and quantizes it. */
   clusterCellSizePx?: number;
+  /** Inclusive effective media capture timestamp. */
+  capturedFromUnix?: number;
+  /** Exclusive effective media capture timestamp. */
+  capturedUntilUnix?: number;
   /** Labels every mapped entry must contain. */
   requireLabels?: string[];
   /** Labels excluded from map totals, clusters, and cluster entries. */
@@ -190,6 +194,10 @@ export type StoreListRequestOptions = {
   limit?: number;
   sort?: StoreListSortOrder;
   mediaFilter?: StoreListMediaFilter;
+  /** Inclusive effective media capture timestamp. */
+  capturedFromUnix?: number;
+  /** Exclusive effective media capture timestamp. */
+  capturedUntilUnix?: number;
   viewport?: StoreIndexViewport;
   requireLabels?: string[];
   excludeLabels?: string[];

@@ -1,5 +1,8 @@
 use super::*;
-use crate::storage::{GalleryIndexMediaFilter, GalleryViewportBounds, MediaCacheStatus};
+use crate::storage::{
+    GalleryCaptureSummaryBusyError, GalleryIndexMediaFilter, GallerySummaryMiss,
+    GalleryViewportBounds, MediaCacheStatus,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn sqlite_test_db_path(name: &str) -> PathBuf {
@@ -248,6 +251,8 @@ fn gallery_index_token_precedes_concurrent_writes_replayed_by_delta() {
             depth: 2,
             media_filter: GalleryIndexMediaFilter::Image,
             captured_sort: GalleryIndexCapturedSort::Desc,
+            captured_from_unix: None,
+            captured_until_unix: None,
             offset: 0,
             limit: 10,
             viewport: None,
@@ -323,6 +328,8 @@ fn gallery_viewport_query_filters_and_wraps_antimeridian() {
         depth: 2,
         media_filter,
         captured_sort: GalleryIndexCapturedSort::Desc,
+        captured_from_unix: None,
+        captured_until_unix: None,
         offset: 0,
         limit: 10,
         viewport: Some(viewport),
@@ -375,6 +382,45 @@ fn gallery_viewport_query_filters_and_wraps_antimeridian() {
     assert_eq!(dateline.media_summary.geotagged_count, 2);
 }
 
+#[test]
+fn gallery_index_filters_capture_time_with_inclusive_start_and_exclusive_end() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    insert_gallery_fixture(&db, "gallery/older.jpg", "image", 10, None, None);
+    insert_gallery_fixture(&db, "gallery/in-range.jpg", "image", 20, None, None);
+    insert_gallery_fixture(&db, "gallery/upper-bound.jpg", "image", 30, None, None);
+
+    let query = GalleryIndexQuery {
+        prefix: "gallery".to_string(),
+        depth: 2,
+        media_filter: GalleryIndexMediaFilter::Image,
+        captured_sort: GalleryIndexCapturedSort::Desc,
+        captured_from_unix: Some(20),
+        captured_until_unix: Some(30),
+        offset: 0,
+        limit: 10,
+        viewport: None,
+        label_filter: Default::default(),
+    };
+    let page = query_gallery_index_from_db(&db, &query)
+        .expect("capture-time filtered gallery should load");
+
+    assert_eq!(page.total_entry_count, 1);
+    assert_eq!(page.media_summary.image_count, 1);
+    assert_eq!(page.entries[0].key, "gallery/in-range.jpg");
+
+    let empty_page = query_gallery_index_from_db(
+        &db,
+        &GalleryIndexQuery {
+            captured_until_unix: Some(20),
+            ..query
+        },
+    )
+    .expect("empty capture-time interval should load");
+    assert_eq!(empty_page.total_entry_count, 0);
+    assert!(empty_page.entries.is_empty());
+}
+
 fn gallery_map_query(
     viewport: GalleryViewportBounds,
     requested_resolution: u32,
@@ -384,6 +430,8 @@ fn gallery_map_query(
         prefix: "gallery".to_string(),
         depth: 64,
         media_filter: GalleryIndexMediaFilter::Image,
+        captured_from_unix: None,
+        captured_until_unix: None,
         viewport,
         requested_resolution,
         max_clusters,
@@ -446,6 +494,162 @@ fn gallery_map_clusters_are_bounded_and_preserve_scope_summary() {
     assert!(page.resolution < 4096);
     assert_eq!(page.clusters[0].count, 3);
     assert!(page.clusters[0].entry.is_none());
+}
+
+#[test]
+fn gallery_map_filters_capture_time_in_clusters_summary_and_entries() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    insert_gallery_fixture(&db, "gallery/older.jpg", "image", 10, Some(47.4), Some(8.5));
+    insert_gallery_fixture(
+        &db,
+        "gallery/in-range.jpg",
+        "image",
+        20,
+        Some(47.4),
+        Some(8.5),
+    );
+    insert_gallery_fixture(
+        &db,
+        "gallery/upper-bound.jpg",
+        "image",
+        30,
+        Some(47.4),
+        Some(8.5),
+    );
+    let viewport = GalleryViewportBounds {
+        south: -90.0,
+        west: -180.0,
+        north: 90.0,
+        east: 180.0,
+    };
+    let mut query = gallery_map_query(viewport, 1, 10);
+    query.captured_from_unix = Some(20);
+    query.captured_until_unix = Some(30);
+
+    let clusters = query_gallery_map_clusters_from_db(&db, &query)
+        .expect("capture-time filtered gallery map should load");
+    assert_eq!(clusters.total_entry_count, 1);
+    assert_eq!(clusters.media_summary.image_count, 1);
+    assert_eq!(clusters.visible_geotagged_count, 1);
+    assert_eq!(clusters.clusters.len(), 1);
+    assert_eq!(
+        clusters.clusters[0]
+            .entry
+            .as_ref()
+            .map(|entry| entry.key.as_str()),
+        Some("gallery/in-range.jpg")
+    );
+
+    let cluster = &clusters.clusters[0];
+    let entries = query_gallery_map_cluster_entries_from_db(
+        &db,
+        &GalleryMapClusterEntriesQuery {
+            prefix: query.prefix.clone(),
+            depth: query.depth,
+            media_filter: query.media_filter,
+            captured_from_unix: query.captured_from_unix,
+            captured_until_unix: query.captured_until_unix,
+            viewport,
+            resolution: clusters.resolution,
+            cell_x: cluster.cell_x,
+            cell_y: cluster.cell_y,
+            offset: 0,
+            limit: 10,
+            label_filter: Default::default(),
+        },
+    )
+    .expect("capture-time filtered cluster entries should load");
+    assert_eq!(entries.total_entry_count, 1);
+    assert_eq!(entries.entries[0].key, "gallery/in-range.jpg");
+
+    query.captured_from_unix = Some(0);
+    query.captured_until_unix = Some(0);
+    let empty_clusters = query_gallery_map_clusters_from_db(&db, &query)
+        .expect("empty capture-time interval should load");
+    assert_eq!(empty_clusters.total_entry_count, 0);
+    assert_eq!(empty_clusters.visible_geotagged_count, 0);
+    assert!(empty_clusters.clusters.is_empty());
+}
+
+#[test]
+fn gallery_map_capture_summary_uses_the_capture_time_index() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    let scope_values = vec![
+        Value::Text(String::new()),
+        Value::Text("%".to_string()),
+        Value::Integer(64),
+        Value::Null,
+        Value::Integer(20),
+        Value::Integer(30),
+    ];
+    let sql = format!(
+        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM gallery_objects
+         WHERE {GALLERY_MAP_SCOPE_SQL}{GALLERY_MAP_CAPTURE_RANGE_SQL}"
+    );
+    let mut statement = db.prepare(&sql).expect("query plan should prepare");
+    let plan = statement
+        .query_map(params_from_iter(scope_values), |row| {
+            row.get::<_, String>(3)
+        })
+        .expect("query plan should execute")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("query plan rows should decode");
+
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("idx_gallery_objects_capture_summary")),
+        "capture-filtered summary should use capture index: {plan:?}"
+    );
+}
+
+#[test]
+fn unfiltered_gallery_map_viewport_does_not_use_the_capture_summary_index() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    let viewport = GalleryViewportBounds {
+        south: 40.0,
+        west: 0.0,
+        north: 60.0,
+        east: 20.0,
+    };
+    let scope_values = sqlite_gallery_map_scope_values(
+        "",
+        "%",
+        64,
+        GalleryIndexMediaFilter::All,
+        None,
+        None,
+        viewport,
+    )
+    .expect("unfiltered gallery map values should build");
+    let sql = format!(
+        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM gallery_objects
+         WHERE {GALLERY_MAP_SCOPE_SQL}{GALLERY_MAP_OPTIONAL_CAPTURE_SQL}
+           AND {GALLERY_MAP_VIEWPORT_SQL}"
+    );
+    let mut statement = db.prepare(&sql).expect("query plan should prepare");
+    let plan = statement
+        .query_map(params_from_iter(scope_values), |row| {
+            row.get::<_, String>(3)
+        })
+        .expect("query plan should execute")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("query plan rows should decode");
+
+    assert!(
+        plan.iter()
+            .all(|step| !step.contains("idx_gallery_objects_capture_summary")),
+        "unfiltered viewport must not use the capture-summary index: {plan:?}"
+    );
+    assert!(
+        plan.iter().any(|step| {
+            step.contains("idx_gallery_objects_spatial")
+                || step.contains("idx_gallery_objects_viewport")
+        }),
+        "unfiltered viewport should retain a viewport-bounded plan: {plan:?}"
+    );
 }
 
 #[tokio::test]
@@ -520,6 +724,67 @@ async fn gallery_map_summary_cache_serves_stale_value_and_refreshes_in_backgroun
     let _ = std::fs::remove_file(metadata_db_path);
 }
 
+#[tokio::test]
+async fn gallery_map_reads_viewport_before_rejecting_excess_capture_summary_misses() {
+    let metadata_db_path = sqlite_test_db_path("gallery-map-summary-early-shed");
+    let store = SqliteMetadataStore::open(&metadata_db_path)
+        .await
+        .expect("sqlite metadata store should open");
+
+    let capture_scope = |captured_from_unix| GallerySummaryScope {
+        prefix: "gallery".to_string(),
+        depth: 64,
+        media_filter: GalleryIndexMediaFilter::All,
+        captured_from_unix: Some(captured_from_unix),
+        captured_until_unix: None,
+        label_filter: Default::default(),
+    };
+    let _first_permit = match store
+        .gallery_map_summary_cache
+        .try_start_summary_miss(&capture_scope(1))
+        .unwrap()
+    {
+        GallerySummaryMiss::Leader(permit) => permit,
+        GallerySummaryMiss::Follower(_) => panic!("first capture miss should be admitted"),
+    };
+    let _second_permit = match store
+        .gallery_map_summary_cache
+        .try_start_summary_miss(&capture_scope(2))
+        .unwrap()
+    {
+        GallerySummaryMiss::Leader(permit) => permit,
+        GallerySummaryMiss::Follower(_) => panic!("second capture miss should be admitted"),
+    };
+
+    let viewport = GalleryViewportBounds {
+        south: -90.0,
+        west: -180.0,
+        north: 90.0,
+        east: 180.0,
+    };
+    let mut query = gallery_map_query(viewport, 1024, 512);
+    query.captured_from_unix = Some(3);
+    let next_reader_before = store.next_reader.load(std::sync::atomic::Ordering::Relaxed);
+    let error = store
+        .query_gallery_map_clusters(&query)
+        .await
+        .expect_err("a third concurrent capture miss should be rejected");
+
+    assert!(
+        error
+            .downcast_ref::<GalleryCaptureSummaryBusyError>()
+            .is_some()
+    );
+    assert_eq!(
+        store.next_reader.load(std::sync::atomic::Ordering::Relaxed),
+        next_reader_before + 1,
+        "the capture-summary admission check must run after the viewport query"
+    );
+
+    drop(store);
+    let _ = std::fs::remove_file(metadata_db_path);
+}
+
 #[test]
 fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
     let db = Connection::open_in_memory().expect("in-memory sqlite should open");
@@ -546,6 +811,8 @@ fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport,
             resolution: clusters.resolution,
             cell_x: cluster.cell_x,
@@ -566,6 +833,8 @@ fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport,
             resolution: clusters.resolution,
             cell_x: cluster.cell_x,
@@ -658,6 +927,8 @@ async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope() {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport,
             resolution: clusters.resolution,
             cell_x: cluster.cell_x,
@@ -688,6 +959,8 @@ async fn gallery_map_cluster_tokens_ignore_changes_outside_their_scope() {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport,
             resolution: clusters.resolution,
             cell_x: cluster.cell_x,

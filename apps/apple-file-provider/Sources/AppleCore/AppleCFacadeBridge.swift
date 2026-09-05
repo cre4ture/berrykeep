@@ -40,6 +40,20 @@ public protocol AppleManualCBridgeFFI: Sendable {
         mediaFilter: String?,
         excludeLabels: String?
     ) throws -> String
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?,
+        capturedFromUnix: UInt64?,
+        capturedUntilUnix: UInt64?,
+        excludeLabels: String?
+    ) throws -> String
     func setMediaLabels(handle: AppleRustHandle, key: String, labelsJSON: String) throws
     func metadataJSON(handle: AppleRustHandle, key: String) throws -> String
     func fetchBytes(handle: AppleRustHandle, key: String) throws -> Data
@@ -309,6 +323,8 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
                 limit: request.options.limit,
                 sort: request.options.sort?.rawValue,
                 mediaFilter: request.options.mediaFilter?.rawValue,
+                capturedFromUnix: request.options.capturedFromUnix,
+                capturedUntilUnix: request.options.capturedUntilUnix,
                 excludeLabels: request.options.excludeLabels.isEmpty
                     ? nil
                     : request.options.excludeLabels.joined(separator: ",")

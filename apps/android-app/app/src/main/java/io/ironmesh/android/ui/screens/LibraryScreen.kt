@@ -40,12 +40,15 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DatePickerDialog
+import androidx.compose.material3.DateRangePicker
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -79,6 +82,7 @@ import androidx.compose.ui.window.DialogProperties
 import io.ironmesh.android.DocumentBitmapLoader
 import io.ironmesh.android.R
 import io.ironmesh.android.saf.MOBILE_VIEWER_THUMBNAIL_MAX_DIMENSION_PX
+import io.ironmesh.android.ui.GalleryCaptureDateRange
 import io.ironmesh.android.ui.GalleryCollectionState
 import io.ironmesh.android.ui.GalleryImageItem
 import io.ironmesh.android.ui.GalleryLoadError
@@ -91,9 +95,14 @@ import io.ironmesh.android.ui.LibraryScreenActions
 import io.ironmesh.android.ui.LibraryUiState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
+import java.util.Locale
 import kotlin.math.abs
 
 private const val GALLERY_PAGE_KEY_PREFIX = "gallery-page:"
+private const val MILLIS_PER_DAY = 86_400_000L
 
 internal enum class GalleryContentPresentation {
     LOADING,
@@ -114,13 +123,14 @@ internal fun galleryContentPresentation(state: LibraryUiState): GalleryContentPr
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun LibraryScreen(
     state: LibraryUiState,
     actions: LibraryScreenActions,
 ) {
     val totalGalleryItems = state.collection?.totalItemCount ?: 0
+    var showCaptureDatePicker by rememberSaveable { mutableStateOf(false) }
     var fullscreenIndex by remember(state.mode, state.currentDirectoryPath, totalGalleryItems) {
         mutableStateOf<Int?>(null)
     }
@@ -219,6 +229,20 @@ fun LibraryScreen(
                         label = { Text("Name") },
                     )
                     FilterChip(
+                        selected = state.captureDateRange.isActive,
+                        onClick = { showCaptureDatePicker = true },
+                        label = { Text(galleryCaptureDateRangeLabel(state.captureDateRange)) },
+                    )
+                    if (state.captureDateRange.isActive) {
+                        OutlinedButton(
+                            onClick = {
+                                actions.updateCaptureDateRange(GalleryCaptureDateRange())
+                            },
+                        ) {
+                            Text("Clear date")
+                        }
+                    }
+                    FilterChip(
                         selected = state.showSensitiveContent,
                         onClick = {
                             actions.updateShowSensitiveContent(!state.showSensitiveContent)
@@ -312,7 +336,9 @@ fun LibraryScreen(
                 GalleryContentPresentation.EMPTY -> {
                     item(key = "gallery-empty") {
                         Text(
-                            if (state.mode == GalleryViewMode.FLATTENED_ALL_IMAGES) {
+                            if (state.captureDateRange.isActive) {
+                                "No images match the selected capture dates."
+                            } else if (state.mode == GalleryViewMode.FLATTENED_ALL_IMAGES) {
                                 "No images loaded from the gallery index."
                             } else {
                                 "No images or nested folders found in the current directory."
@@ -322,7 +348,13 @@ fun LibraryScreen(
                 }
                 GalleryContentPresentation.EMPTY_CURRENT_DIRECTORY -> {
                     item(key = "gallery-empty-directory") {
-                        Text("No images in the current directory.")
+                        Text(
+                            if (state.captureDateRange.isActive) {
+                                "No images in this directory match the selected capture dates."
+                            } else {
+                                "No images in the current directory."
+                            },
+                        )
                     }
                 }
                 GalleryContentPresentation.CONTENT -> {
@@ -359,6 +391,75 @@ fun LibraryScreen(
             onDismiss = { fullscreenIndex = null },
         )
     }
+    if (showCaptureDatePicker) {
+        GalleryCaptureDateRangeDialog(
+            currentRange = state.captureDateRange,
+            onApply = { range ->
+                showCaptureDatePicker = false
+                actions.updateCaptureDateRange(range)
+            },
+            onDismiss = { showCaptureDatePicker = false },
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun GalleryCaptureDateRangeDialog(
+    currentRange: GalleryCaptureDateRange,
+    onApply: (GalleryCaptureDateRange) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val pickerState = androidx.compose.material3.rememberDateRangePickerState(
+        initialSelectedStartDateMillis = currentRange.startEpochDay?.times(MILLIS_PER_DAY),
+        initialSelectedEndDateMillis = currentRange.endEpochDay?.times(MILLIS_PER_DAY),
+    )
+    DatePickerDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(
+                enabled = pickerState.selectedStartDateMillis != null,
+                onClick = {
+                    val startMillis = requireNotNull(pickerState.selectedStartDateMillis)
+                    val startEpochDay = Math.floorDiv(startMillis, MILLIS_PER_DAY)
+                    val endEpochDay = Math.floorDiv(
+                        pickerState.selectedEndDateMillis ?: startMillis,
+                        MILLIS_PER_DAY,
+                    )
+                    onApply(GalleryCaptureDateRange(startEpochDay, endEpochDay))
+                },
+            ) {
+                Text("Apply")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        DateRangePicker(
+            state = pickerState,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(560.dp),
+        )
+    }
+}
+
+internal fun galleryCaptureDateRangeLabel(range: GalleryCaptureDateRange): String {
+    val startEpochDay = range.startEpochDay ?: return "Capture date"
+    val endEpochDay = requireNotNull(range.endEpochDay)
+    val formatter = DateTimeFormatter
+        .ofLocalizedDate(FormatStyle.MEDIUM)
+        .withLocale(Locale.getDefault())
+    val start = LocalDate.ofEpochDay(startEpochDay).format(formatter)
+    if (startEpochDay == endEpochDay) {
+        return "Date: $start"
+    }
+    val end = LocalDate.ofEpochDay(endEpochDay).format(formatter)
+    return "Date: $start – $end"
 }
 
 @Composable

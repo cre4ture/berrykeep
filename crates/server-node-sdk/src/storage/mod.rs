@@ -100,8 +100,8 @@ mod turso_impl;
 
 use self::gallery_summary_cache::GallerySummaryCache;
 pub(crate) use self::gallery_summary_cache::{
-    GallerySummaryCacheValue, GallerySummaryProgress, GallerySummaryRefreshStatus,
-    GallerySummaryScope,
+    GalleryCaptureSummaryBusyError, GallerySummaryCacheValue, GallerySummaryMiss,
+    GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
 };
 use self::sqlite_impl::SqliteMetadataStore;
 #[cfg(feature = "turso-metadata")]
@@ -1128,6 +1128,8 @@ pub(crate) struct GalleryIndexQuery {
     pub(crate) depth: usize,
     pub(crate) media_filter: GalleryIndexMediaFilter,
     pub(crate) captured_sort: GalleryIndexCapturedSort,
+    pub(crate) captured_from_unix: Option<u64>,
+    pub(crate) captured_until_unix: Option<u64>,
     pub(crate) offset: usize,
     pub(crate) limit: usize,
     pub(crate) viewport: Option<GalleryViewportBounds>,
@@ -1246,6 +1248,8 @@ pub(crate) struct GalleryMapClusterQuery {
     pub(crate) prefix: String,
     pub(crate) depth: usize,
     pub(crate) media_filter: GalleryIndexMediaFilter,
+    pub(crate) captured_from_unix: Option<u64>,
+    pub(crate) captured_until_unix: Option<u64>,
     pub(crate) viewport: GalleryViewportBounds,
     pub(crate) requested_resolution: u32,
     pub(crate) max_clusters: usize,
@@ -1286,6 +1290,8 @@ pub(crate) struct GalleryMapClusterEntriesQuery {
     pub(crate) prefix: String,
     pub(crate) depth: usize,
     pub(crate) media_filter: GalleryIndexMediaFilter,
+    pub(crate) captured_from_unix: Option<u64>,
+    pub(crate) captured_until_unix: Option<u64>,
     pub(crate) viewport: GalleryViewportBounds,
     pub(crate) resolution: u32,
     pub(crate) cell_x: u32,

@@ -23,6 +23,10 @@ pub(super) struct GalleryMapQueryTokenPayload {
     pub(super) prefix: String,
     pub(super) depth: usize,
     pub(super) media_filter: StoreIndexMediaFilter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) captured_from_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) captured_until_unix: Option<u64>,
     pub(super) viewport: GalleryMapViewport,
     pub(super) resolution: u32,
     #[serde(default, skip_serializing_if = "storage::GalleryLabelFilter::is_empty")]
@@ -59,6 +63,8 @@ pub(super) fn decode_gallery_map_query_token(token: &str) -> Option<GalleryMapQu
         || payload.resolution > MAX_GALLERY_MAP_RESOLUTION
         || !super::gallery_label_filter_is_within_limit(&payload.label_filter)
         || !super::gallery_map_label_filter_is_supported(&payload.label_filter)
+        || super::validate_capture_range(payload.captured_from_unix, payload.captured_until_unix)
+            .is_err()
         || !gallery_map_viewport_is_valid(payload.viewport)
     {
         return None;
@@ -232,6 +238,8 @@ mod tests {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: StoreIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport: GalleryMapViewport {
                 south: -85.0,
                 west: 170.0,

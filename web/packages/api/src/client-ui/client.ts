@@ -320,6 +320,12 @@ export async function listStoreEntries(
   if (options.mediaFilter) {
     query.set("media_filter", options.mediaFilter);
   }
+  if (options.capturedFromUnix !== undefined) {
+    query.set("captured_from_unix", String(options.capturedFromUnix));
+  }
+  if (options.capturedUntilUnix !== undefined) {
+    query.set("captured_until_unix", String(options.capturedUntilUnix));
+  }
   if (options.viewport) {
     query.set("south", String(options.viewport.south));
     query.set("west", String(options.viewport.west));
@@ -408,6 +414,12 @@ function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchPa
   }
   if (cellSizePx !== null) {
     query.set("cluster_cell_size_px", String(cellSizePx));
+  }
+  if (request.capturedFromUnix !== undefined) {
+    query.set("captured_from_unix", String(request.capturedFromUnix));
+  }
+  if (request.capturedUntilUnix !== undefined) {
+    query.set("captured_until_unix", String(request.capturedUntilUnix));
   }
   appendLabelFilter(query, "require_labels", request.requireLabels);
   appendLabelFilter(query, "exclude_labels", request.excludeLabels);

@@ -2991,6 +2991,10 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
     limit: jint,
     sort: jstring,
     media_filter: jstring,
+    captured_from_unix_present: jboolean,
+    captured_from_unix: jlong,
+    captured_until_unix_present: jboolean,
+    captured_until_unix: jlong,
     exclude_labels: jstring,
     server_ca_pem: jstring,
     client_identity_json: jstring,
@@ -3014,6 +3018,22 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
             .unwrap_or_default();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        let captured_from_unix = if captured_from_unix_present == 0 {
+            None
+        } else {
+            Some(
+                u64::try_from(captured_from_unix)
+                    .context("capturedFromUnix must be non-negative")?,
+            )
+        };
+        let captured_until_unix = if captured_until_unix_present == 0 {
+            None
+        } else {
+            Some(
+                u64::try_from(captured_until_unix)
+                    .context("capturedUntilUnix must be non-negative")?,
+            )
+        };
         initialize_android_preferences_bridge(&mut env)?;
         let sdk = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
         let options = StoreIndexRequestOptions {
@@ -3022,6 +3042,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
             limit: usize::try_from(limit).ok(),
             sort: parse_store_index_sort_order(sort.as_deref())?,
             media_filter: parse_store_index_media_filter(media_filter.as_deref())?,
+            captured_from_unix,
+            captured_until_unix,
             exclude_labels,
             ..StoreIndexRequestOptions::default()
         };

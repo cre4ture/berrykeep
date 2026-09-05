@@ -802,6 +802,18 @@ class MainViewModel(
         refreshGallery()
     }
 
+    fun updateGalleryCaptureDateRange(captureDateRange: GalleryCaptureDateRange) {
+        if (uiState.value.galleryCaptureDateRange == captureDateRange) {
+            return
+        }
+        uiState.value = uiState.value.copy(
+            galleryCaptureDateRange = captureDateRange,
+            galleryCollection = null,
+            galleryPages = emptyMap(),
+        )
+        refreshGallery()
+    }
+
     fun updateGalleryShowSensitiveContent(showSensitiveContent: Boolean) {
         if (uiState.value.galleryShowSensitiveContent == showSensitiveContent) {
             return
@@ -1751,6 +1763,7 @@ class MainViewModel(
         val currentDirectoryPath: String,
         val breadcrumbs: List<GalleryBreadcrumbItem>,
         val sort: GallerySortOption,
+        val captureTimestampRange: GalleryCaptureTimestampRange,
         val showSensitiveContent: Boolean,
         val pageSize: Int,
     )
@@ -1773,6 +1786,7 @@ class MainViewModel(
             currentDirectoryPath = current.galleryCurrentDirectoryPath,
             breadcrumbs = current.galleryBreadcrumbs,
             sort = current.gallerySort,
+            captureTimestampRange = current.galleryCaptureDateRange.toTimestampRange(),
             showSensitiveContent = current.galleryShowSensitiveContent,
             pageSize = pageSize.coerceAtLeast(1),
         )
@@ -1801,6 +1815,8 @@ class MainViewModel(
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            capturedFromUnix = request.captureTimestampRange.fromUnix,
+            capturedUntilUnix = request.captureTimestampRange.untilUnix,
             excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
             clientIdentityJson = deviceAuth.toClientIdentityJson(),
@@ -1844,6 +1860,8 @@ class MainViewModel(
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            capturedFromUnix = request.captureTimestampRange.fromUnix,
+            capturedUntilUnix = request.captureTimestampRange.untilUnix,
             excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = serverCaPem,
             clientIdentityJson = clientIdentityJson,
@@ -1890,6 +1908,8 @@ class MainViewModel(
             offset = offset,
             limit = pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            capturedFromUnix = request.captureTimestampRange.fromUnix,
+            capturedUntilUnix = request.captureTimestampRange.untilUnix,
             excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
             clientIdentityJson = deviceAuth.toClientIdentityJson(),

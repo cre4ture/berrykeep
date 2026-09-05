@@ -2153,6 +2153,8 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
         prefix: Some("gallery".to_string()),
         depth: Some(64),
         media_filter: Some(super::StoreIndexMediaFilter::Image),
+        captured_from_unix: None,
+        captured_until_unix: None,
         south: Some(46.5),
         west: Some(7.5),
         north: Some(48.5),
@@ -2281,6 +2283,12 @@ fn gallery_sync_token_is_opaque_versioned_and_rejects_malformed_values() {
 }
 
 #[test]
+fn capture_time_range_accepts_empty_intervals_and_rejects_reversed_bounds() {
+    assert_eq!(super::validate_capture_range(Some(0), Some(0)), Ok(()));
+    assert!(super::validate_capture_range(Some(1), Some(0)).is_err());
+}
+
+#[test]
 fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
     let query = |south, west, north, east| super::StoreIndexQuery {
         prefix: Some("gallery".to_string()),
@@ -2293,6 +2301,8 @@ fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
         limit: Some(100),
         sort: Some(super::StoreIndexSortOrder::CapturedDesc),
         media_filter: Some(super::StoreIndexMediaFilter::Image),
+        captured_from_unix: None,
+        captured_until_unix: None,
         south,
         west,
         north,
@@ -2358,6 +2368,8 @@ async fn gallery_label_filter_limit_returns_bad_request() {
                 limit: Some(100),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -2421,6 +2433,8 @@ async fn turso_gallery_projection_supports_viewport_and_delta() {
                 limit: Some(100),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: Some(45.0),
                 west: Some(5.0),
                 north: Some(49.0),
@@ -14598,6 +14612,8 @@ async fn object_id_api_serializes_and_mutates_by_identity_impl(backend: MainTest
             limit: None,
             sort: None,
             media_filter: None,
+            captured_from_unix: None,
+            captured_until_unix: None,
             south: None,
             west: None,
             north: None,
@@ -15425,6 +15441,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15496,6 +15514,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 limit: Some(100),
                 sort: Some(super::StoreIndexSortOrder::PathAsc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15529,6 +15549,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 limit: Some(100),
                 sort: Some(super::StoreIndexSortOrder::PathAsc),
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15580,6 +15602,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 limit: Some(100),
                 sort: Some(super::StoreIndexSortOrder::PathAsc),
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15652,6 +15676,8 @@ async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15731,6 +15757,8 @@ async fn list_store_index_keeps_batch_media_lookup_failures_best_effort_impl(
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15806,6 +15834,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15886,6 +15916,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15968,6 +16000,8 @@ async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16044,6 +16078,8 @@ async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTest
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16116,6 +16152,8 @@ async fn list_store_index_sets_timing_headers_impl(backend: MainTestBackend) {
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16198,6 +16236,8 @@ async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBa
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16236,6 +16276,8 @@ async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBa
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16302,6 +16344,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16350,6 +16394,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16408,6 +16454,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         limit: Some(1),
         sort: Some(super::StoreIndexSortOrder::CapturedDesc),
         media_filter: None,
+        captured_from_unix: None,
+        captured_until_unix: None,
         south: None,
         west: None,
         north: None,
@@ -16488,6 +16536,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16588,27 +16638,32 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
         (older, newer)
     };
 
+    let gallery_page_query =
+        |offset, captured_from_unix, captured_until_unix| super::StoreIndexQuery {
+            prefix: Some("gallery".to_string()),
+            depth: Some(64),
+            snapshot: None,
+            view: Some(super::StoreIndexView::Tree),
+            cursor: None,
+            page_size: None,
+            offset: Some(offset),
+            limit: Some(1),
+            sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+            media_filter: Some(super::StoreIndexMediaFilter::Image),
+            captured_from_unix,
+            captured_until_unix,
+            south: None,
+            west: None,
+            north: None,
+            east: None,
+            require_labels: None,
+            exclude_labels: None,
+        };
+
     let first_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
             axum::extract::State(state.clone()),
-            axum::extract::Query(super::StoreIndexQuery {
-                prefix: Some("gallery".to_string()),
-                depth: Some(64),
-                snapshot: None,
-                view: Some(super::StoreIndexView::Tree),
-                cursor: None,
-                page_size: None,
-                offset: Some(0),
-                limit: Some(1),
-                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-                media_filter: Some(super::StoreIndexMediaFilter::Image),
-                south: None,
-                west: None,
-                north: None,
-                east: None,
-                require_labels: None,
-                exclude_labels: None,
-            }),
+            axum::extract::Query(gallery_page_query(0, None, None)),
         )
         .await,
     );
@@ -16643,28 +16698,13 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
     );
     assert_eq!(first_payload["total_entry_count"], 2);
     assert_eq!(first_payload["media_summary"]["ready_count"], 2);
+    assert!(first_payload["sync_token"].as_str().is_some());
+    assert!(first_payload["consistency_token"].as_str().is_some());
 
     let second_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
             axum::extract::State(state.clone()),
-            axum::extract::Query(super::StoreIndexQuery {
-                prefix: Some("gallery".to_string()),
-                depth: Some(64),
-                snapshot: None,
-                view: Some(super::StoreIndexView::Tree),
-                cursor: None,
-                page_size: None,
-                offset: Some(1),
-                limit: Some(1),
-                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-                media_filter: Some(super::StoreIndexMediaFilter::Image),
-                south: None,
-                west: None,
-                north: None,
-                east: None,
-                require_labels: None,
-                exclude_labels: None,
-            }),
+            axum::extract::Query(gallery_page_query(1, None, None)),
         )
         .await,
     );
@@ -16688,6 +16728,96 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
     assert_eq!(
         first_payload["media_summary"], second_payload["media_summary"],
         "media summaries cover the whole filtered scope on every page"
+    );
+
+    let captured_first_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(gallery_page_query(0, Some(50), Some(250))),
+        )
+        .await,
+    );
+    assert_eq!(captured_first_response.status(), StatusCode::OK);
+    let captured_first_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(captured_first_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        captured_first_payload["entries"][0]["path"],
+        "gallery/newer.png"
+    );
+    assert!(captured_first_payload["sync_token"].is_null());
+    assert!(
+        captured_first_payload["consistency_token"]
+            .as_str()
+            .is_some()
+    );
+
+    let captured_second_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(gallery_page_query(1, Some(50), Some(250))),
+        )
+        .await,
+    );
+    assert_eq!(captured_second_response.status(), StatusCode::OK);
+    let captured_second_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(captured_second_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        captured_second_payload["entries"][0]["path"],
+        "gallery/older.png"
+    );
+    assert!(captured_second_payload["sync_token"].is_null());
+    assert_eq!(
+        captured_first_payload["consistency_token"], captured_second_payload["consistency_token"],
+        "captured-sort pages must identify the same gallery revision"
+    );
+    assert_eq!(
+        captured_first_payload["media_summary"], captured_second_payload["media_summary"],
+        "media summaries cover the whole capture-filtered scope on every page"
+    );
+
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let added = locked
+            .put_object_versioned(
+                "gallery/middle.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut metadata = locked
+            .ensure_media_metadata(&added.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        metadata.taken_at_unix = Some(150);
+        locked.persist_media_cache_record(&metadata).await.unwrap();
+    }
+    let invalidated_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(gallery_page_query(0, Some(50), Some(250))),
+        )
+        .await,
+    );
+    assert_eq!(invalidated_response.status(), StatusCode::OK);
+    let invalidated_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(invalidated_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        captured_first_payload["consistency_token"], invalidated_payload["consistency_token"],
+        "a gallery revision must invalidate capture-filtered offset pages"
     );
 
     assert_ne!(older.manifest_hash, newer.manifest_hash);
@@ -16783,6 +16913,8 @@ async fn list_store_index_uses_filename_capture_fallback_after_extraction_impl(
                     limit: Some(3),
                     sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                     media_filter: Some(super::StoreIndexMediaFilter::Image),
+                    captured_from_unix: None,
+                    captured_until_unix: None,
                     south: None,
                     west: None,
                     north: None,
@@ -16848,6 +16980,8 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::PathAsc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16880,6 +17014,8 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16997,6 +17133,8 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
                 limit: Some(10),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -17029,6 +17167,8 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
                 limit: Some(10),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -17254,6 +17394,46 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
 }
 
 #[test]
+fn store_index_capture_range_preserves_prefix_entries() {
+    let entry = |path: &str, entry_type: &str, modified_at_unix| super::StoreIndexEntry {
+        path: path.to_string(),
+        entry_type: entry_type.to_string(),
+        object_id: None,
+        version: None,
+        content_hash: None,
+        size_bytes: None,
+        modified_at_unix,
+        content_fingerprint: None,
+        media: None,
+        labels: Vec::new(),
+        labels_resolved: false,
+    };
+    let prefix = entry("gallery/trip/", "prefix", None);
+    let key = entry("gallery/trip/photo.jpg", "key", Some(50));
+
+    assert!(super::matches_store_index_capture_range(
+        &prefix,
+        Some(100),
+        Some(200)
+    ));
+    assert!(super::matches_store_index_capture_range(
+        &key,
+        Some(50),
+        Some(51)
+    ));
+    assert!(!super::matches_store_index_capture_range(
+        &key,
+        Some(51),
+        None
+    ));
+    assert!(!super::matches_store_index_capture_range(
+        &key,
+        None,
+        Some(50)
+    ));
+}
+
+#[test]
 fn store_index_media_filter_prefilters_metadata_lookup_plan() {
     let keys = vec![
         "gallery/a.jpg".to_string(),
@@ -17475,6 +17655,8 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -17924,6 +18106,8 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,

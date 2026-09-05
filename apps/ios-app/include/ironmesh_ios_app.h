@@ -60,6 +60,8 @@ int ironmesh_ios_facade_store_index_with_options_json(void *handle,
                                                       intptr_t limit,
                                                       const char *sort,
                                                       const char *media_filter,
+                                                      uint64_t captured_from_unix,
+                                                      uint64_t captured_until_unix,
                                                       const char *exclude_labels,
                                                       char **out_json,
                                                       char **out_error);

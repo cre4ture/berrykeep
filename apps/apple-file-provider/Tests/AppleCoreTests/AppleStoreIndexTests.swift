@@ -139,6 +139,49 @@ final class AppleStoreIndexTests: XCTestCase {
         XCTAssertEqual(currentFolder.options.sort, .pathAscending)
     }
 
+    func testGalleryCaptureDateRangeUsesInclusiveLocalDays() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Europe/Berlin")!
+        let start = calendar.date(from: DateComponents(year: 2026, month: 3, day: 28))!
+        let end = calendar.date(from: DateComponents(year: 2026, month: 3, day: 29))!
+        let range = AppleGalleryCaptureDateRange(
+            startDate: start,
+            endDate: end,
+            calendar: calendar
+        )
+
+        let request = AppleGalleryQuery(
+            mode: .allImages,
+            currentPath: "",
+            sort: .newest,
+            captureDateRange: range
+        ).request(offset: 0)
+
+        XCTAssertEqual(
+            request.options.capturedFromUnix,
+            UInt64(calendar.startOfDay(for: start).timeIntervalSince1970)
+        )
+        XCTAssertEqual(
+            request.options.capturedUntilUnix,
+            UInt64(calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: end))!.timeIntervalSince1970)
+        )
+    }
+
+    func testGalleryCaptureDateRangeUsesEmptyIntervalBeforeUnixEpoch() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let date = calendar.date(from: DateComponents(year: 1965, month: 4, day: 1))!
+
+        let range = AppleGalleryCaptureDateRange(
+            startDate: date,
+            endDate: date,
+            calendar: calendar
+        )
+
+        XCTAssertEqual(range.capturedFromUnix, 0)
+        XCTAssertEqual(range.capturedUntilUnix, 0)
+    }
+
     func testGalleryPaginationAdvancesByServerPageWithoutLoadingWholeCollection() throws {
         var pagination = AppleGalleryPagination()
         let response = try decodeResponse(

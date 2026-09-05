@@ -840,6 +840,170 @@ test("client-ui gallery loads bounded server-side map clusters", async ({ page }
   ).toBe(true);
 });
 
+test("client-ui gallery sends capture-date bounds to grid and map queries", async ({ page }) => {
+  const gridRequests: URL[] = [];
+  const mapRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list")) {
+      gridRequests.push(url);
+    }
+    if (url.pathname === apiV1("/gallery/map/clusters")) {
+      mapRequests.push(url);
+    }
+  });
+
+  const mocks = await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  await expect.poll(() => mocks.galleryStoreListRequestCount()).toBe(2);
+  const [capturedFromUnix, capturedUntilUnix] = await page.evaluate(() => [
+    Math.floor(new Date(2024, 3, 5).getTime() / 1_000),
+    Math.floor(new Date(2024, 3, 7).getTime() / 1_000)
+  ]);
+  const includesCaptureBounds = (request: URL) =>
+    request.searchParams.get("captured_from_unix") === String(capturedFromUnix) &&
+    request.searchParams.get("captured_until_unix") === String(capturedUntilUnix);
+
+  mocks.setGalleryStoreListDelay(750);
+  const fromOnlyRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return (
+      url.pathname === apiV1("/store/list") &&
+      url.searchParams.get("captured_from_unix") === String(capturedFromUnix) &&
+      !url.searchParams.has("captured_until_unix")
+    );
+  });
+  await page.getByLabel("Captured from").fill("2024-04-05");
+  await fromOnlyRequest;
+  const completedRangeResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === apiV1("/store/list") && includesCaptureBounds(url);
+  });
+  await page.getByLabel("Captured through").fill("2024-04-06");
+  await completedRangeResponse;
+  mocks.setGalleryStoreListDelay(0);
+
+  await page.getByLabel("Captured from").fill("1965-04-05");
+  await page.getByLabel("Captured through").fill("1965-04-06");
+  const includesEmptyPreEpochBounds = (request: URL) =>
+    request.searchParams.get("captured_from_unix") === "0" &&
+    request.searchParams.get("captured_until_unix") === "0";
+  await expect.poll(() => gridRequests.some(includesEmptyPreEpochBounds)).toBe(true);
+
+  await page.getByLabel("Captured from").fill("2024-04-05");
+  await page.getByLabel("Captured through").fill("2024-04-06");
+  await page.getByRole("button", { name: "Map" }).click();
+  await expect.poll(() => mapRequests.some(includesCaptureBounds)).toBe(true);
+});
+
+test("client-ui gallery preserves the lower capture date while editing the upper date", async ({
+  page
+}) => {
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  const capturedFrom = page.getByLabel("Captured from");
+  const capturedThrough = page.getByLabel("Captured through");
+  await capturedFrom.fill("2024-04-05");
+
+  // Chromium emits a change event for intermediate year values while a native date input is
+  // edited by keyboard. Such values must not move the lower bound before the upper date has
+  // been committed.
+  await capturedThrough.fill("0002-04-06");
+  await expect(capturedFrom).toHaveValue("2024-04-05");
+  await capturedThrough.fill("2024-04-06");
+  await expect(capturedFrom).toHaveValue("2024-04-05");
+});
+
+test("client-ui gallery retains its applied range while a date range is reversed", async ({
+  page
+}) => {
+  const gridRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list")) {
+      gridRequests.push(url);
+    }
+  });
+
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  const capturedFrom = page.getByLabel("Captured from");
+  const capturedThrough = page.getByLabel("Captured through");
+  await capturedFrom.fill("2024-04-05");
+  await capturedThrough.fill("2024-04-06");
+  await expect
+    .poll(() =>
+      gridRequests.some(
+        (request) =>
+          request.searchParams.has("captured_from_unix") &&
+          request.searchParams.has("captured_until_unix")
+      )
+    )
+    .toBe(true);
+  gridRequests.length = 0;
+
+  await capturedFrom.fill("2030-01-01");
+  await page.waitForTimeout(500);
+  expect(gridRequests).toHaveLength(0);
+
+  await capturedThrough.focus();
+  await expect(capturedThrough).toHaveValue("2030-01-01");
+  const [capturedFromUnix, capturedUntilUnix] = await page.evaluate(() => [
+    Math.floor(new Date(2030, 0, 1).getTime() / 1_000),
+    Math.floor(new Date(2030, 0, 2).getTime() / 1_000)
+  ]);
+  await expect
+    .poll(() =>
+      gridRequests.some(
+        (request) =>
+          request.searchParams.get("captured_from_unix") === String(capturedFromUnix) &&
+          request.searchParams.get("captured_until_unix") === String(capturedUntilUnix)
+      )
+    )
+    .toBe(true);
+});
+
+test("client-ui gallery debounces automatic capture-date reloads", async ({ page }) => {
+  const filteredGridRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list") && url.searchParams.has("captured_from_unix")) {
+      filteredGridRequests.push(url);
+    }
+  });
+
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  await page.getByLabel("Captured from").fill("2024-04-03");
+  await page.getByLabel("Captured from").fill("2024-04-04");
+  await page.getByLabel("Captured from").fill("2024-04-05");
+
+  const capturedFromUnix = await page.evaluate(() =>
+    Math.floor(new Date(2024, 3, 5).getTime() / 1_000)
+  );
+  await expect
+    .poll(() =>
+      filteredGridRequests.filter(
+        (request) =>
+          request.searchParams.get("captured_from_unix") === String(capturedFromUnix)
+      ).length
+    )
+    .toBe(1);
+  await page.waitForTimeout(500);
+  expect(filteredGridRequests).toHaveLength(1);
+});
+
 test("client-ui gallery falls back to an older map API", async ({ page }) => {
   const mapRequestPaths: string[] = [];
   page.on("request", (request) => {
