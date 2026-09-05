@@ -17407,8 +17407,8 @@ async fn list_store_index_response_attempt(
     };
     let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
     let modified_time_lookup_started_at = Instant::now();
-    let key_modified_times = match store_index_inspector
-        .object_modified_at_by_key(
+    let (key_modified_times, key_revisions) = match store_index_inspector
+        .object_modified_at_and_revisions_by_key(
             &visible_object_hashes,
             &visible_object_ids,
             snapshot_created_at_limit,
@@ -17421,31 +17421,16 @@ async fn list_store_index_response_attempt(
                 tracing::error!(
                     snapshot = snapshot_label,
                     error = %err,
-                    "failed to compute snapshot key modified times"
+                "failed to compute snapshot key modified times and revisions"
                 );
             } else {
-                tracing::error!(error = %err, "failed to compute current key modified times");
+                tracing::error!(error = %err, "failed to compute current key modified times and revisions");
             }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
     let modified_time_lookup_ms = modified_time_lookup_started_at.elapsed().as_millis();
     let metadata_lookup_ms = content_summary_lookup_ms + modified_time_lookup_ms;
-    let key_revisions = match store_index_inspector
-        .object_revisions_by_key(
-            &visible_object_hashes,
-            &visible_object_ids,
-            snapshot_created_at_limit,
-        )
-        .await
-    {
-        Ok(revisions) => revisions,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to compute store index revisions");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
     let mut entries = build_store_index_entries_from_plan(
         &entry_plan,
         Some(&visible_object_ids),
@@ -17869,8 +17854,8 @@ async fn list_store_index_response_cursor_mode(
     };
     let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
     let modified_time_lookup_started_at = Instant::now();
-    let key_modified_times = match store_index_inspector
-        .object_modified_at_by_key(
+    let (key_modified_times, key_revisions) = match store_index_inspector
+        .object_modified_at_and_revisions_by_key(
             &visible_object_hashes,
             &visible_object_ids,
             snapshot_created_at_limit,
@@ -17883,31 +17868,16 @@ async fn list_store_index_response_cursor_mode(
                 tracing::error!(
                     snapshot = snapshot_label,
                     error = %err,
-                    "failed to compute snapshot key modified times"
+                "failed to compute snapshot key modified times and revisions"
                 );
             } else {
-                tracing::error!(error = %err, "failed to compute current key modified times");
+                tracing::error!(error = %err, "failed to compute current key modified times and revisions");
             }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
     let modified_time_lookup_ms = modified_time_lookup_started_at.elapsed().as_millis();
     let metadata_lookup_ms = content_summary_lookup_ms + modified_time_lookup_ms;
-    let key_revisions = match store_index_inspector
-        .object_revisions_by_key(
-            &visible_object_hashes,
-            &visible_object_ids,
-            snapshot_created_at_limit,
-        )
-        .await
-    {
-        Ok(revisions) => revisions,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to compute store index revisions");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
     let mut entries = page
         .entries
         .iter()

@@ -258,6 +258,7 @@ pub struct SyncRootMonitor {
     provider_instance_id: uuid::Uuid,
     uploader: Arc<dyn Uploader>,
     seen: HashMap<String, SeenEntry>,
+    pending_object_renames: Vec<LocalRenamePair>,
     dehydrations_in_flight: Arc<Mutex<HashSet<String>>>,
     hydrations_in_flight: Arc<Mutex<HashSet<String>>>,
     remote_applied_tracker: RemoteAppliedTracker,
@@ -352,6 +353,7 @@ impl SyncRootMonitor {
             provider_instance_id,
             uploader,
             seen: HashMap::new(),
+            pending_object_renames: Vec::new(),
             dehydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
             hydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
             remote_applied_tracker: RemoteAppliedTracker::default(),
@@ -432,7 +434,7 @@ impl SyncRootMonitor {
             walk_error_samples,
         } = self.snapshot_entries();
         let mut current = current;
-        let handled_renames = self.handle_local_object_renames(&current);
+        let handled_renames = self.handle_local_object_renames(&mut current);
         let dehydrate_summary = summarize_dehydrate_scan(&current);
         let paths = current.keys().cloned().collect::<Vec<_>>();
         for rel_path in paths {
@@ -463,10 +465,31 @@ impl SyncRootMonitor {
     }
 
     fn handle_local_object_renames(
-        &self,
-        current: &HashMap<String, SeenEntry>,
+        &mut self,
+        current: &mut HashMap<String, SeenEntry>,
     ) -> std::collections::HashSet<String> {
-        let rename_pairs = detect_local_object_renames(&self.seen, current);
+        let mut rename_pairs = detect_local_object_renames(&self.seen, current);
+        let detected_pairs = rename_pairs
+            .iter()
+            .map(|rename| (rename.from_path.clone(), rename.to_path.clone()))
+            .collect::<std::collections::HashSet<_>>();
+        for mut pending in std::mem::take(&mut self.pending_object_renames) {
+            let key = (pending.from_path.clone(), pending.to_path.clone());
+            if detected_pairs.contains(&key) {
+                continue;
+            }
+            let retry_is_still_safe = !current.contains_key(&pending.from_path)
+                && current.get(&pending.to_path).is_some_and(|entry| {
+                    entry.placeholder_identity_path.as_deref() == Some(pending.from_path.as_str())
+                        && entry.placeholder_object_id.is_some()
+                        && entry.placeholder_revision.is_some()
+                });
+            if retry_is_still_safe {
+                pending.detection = "retry-after-transient-error";
+                rename_pairs.push(pending);
+            }
+        }
+        rename_pairs.sort_by(|left, right| left.from_path.cmp(&right.from_path));
         let mut handled_paths = std::collections::HashSet::new();
 
         for rename in rename_pairs {
@@ -546,17 +569,34 @@ impl SyncRootMonitor {
                     );
                     mark_local_rename_conflict(&full_path);
                 }
-                Err(err) => {
+                Err(err) if is_remote_mutation_conflict(&err) => {
                     handled_paths.insert(rename.from_path.clone());
                     handled_paths.insert(rename.to_path.clone());
                     tracing::info!(
-                        "{}: remote rename failed {} -> {}: {:#}; preserving the local move without upload/delete fallback",
+                        "{}: remote rename conflicted {} -> {}: {:#}; preserving the local move without upload/delete fallback",
                         self.name,
                         rename.from_path,
                         rename.to_path,
                         err
                     );
                     mark_local_rename_conflict(&full_path);
+                }
+                Err(err) => {
+                    // A transport failure says nothing about the remote object
+                    // state. Keep the pre-rename entry in the next baseline so
+                    // this same object-id rename is detected and retried on
+                    // the next scan, while suppressing path-based delete or
+                    // upload fallbacks for the current pass.
+                    self.pending_object_renames.push(rename.clone());
+                    handled_paths.insert(rename.from_path.clone());
+                    handled_paths.insert(rename.to_path.clone());
+                    tracing::warn!(
+                        "{}: transient remote rename failure {} -> {}: {:#}; retaining the object-id rename for retry",
+                        self.name,
+                        rename.from_path,
+                        rename.to_path,
+                        err
+                    );
                 }
             }
         }
@@ -1658,6 +1698,11 @@ mod tests {
         uploads: Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct TransientRenameUploader {
+        rename_attempts: Mutex<usize>,
+    }
+
     /// A real Windows CFAPI registration so the monitor observes the same placeholder kind that
     /// remote reconciliation removes in production.
     struct RegisteredMonitorTestSyncRoot {
@@ -1731,6 +1776,30 @@ mod tests {
                 remote_version: Some("revision-uploaded".to_string()),
                 in_sync_content_fingerprint: None,
             })
+        }
+    }
+
+    impl Uploader for TransientRenameUploader {
+        fn upload_reader(
+            &self,
+            _path: &str,
+            _reader: &mut dyn Read,
+            _length: u64,
+        ) -> anyhow::Result<UploadReceipt> {
+            anyhow::bail!("unexpected upload while testing rename retry")
+        }
+
+        fn rename_object(
+            &self,
+            _object_id: &str,
+            _expected_revision: &str,
+            _to_path: &str,
+        ) -> anyhow::Result<bool> {
+            *self
+                .rename_attempts
+                .lock()
+                .expect("rename_attempts lock poisoned") += 1;
+            anyhow::bail!("injected transient rename transport failure")
         }
     }
 
@@ -2160,6 +2229,50 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].from_path, "docs");
         assert_eq!(pairs[0].to_path, "archive");
+    }
+
+    #[test]
+    fn transient_object_id_rename_failure_is_retried_after_seen_advances() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-monitor-rename-retry-{unique}"));
+        let uploader = Arc::new(TransientRenameUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root,
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+
+        let mut old_entry = seen_entry(false);
+        old_entry.placeholder_identity_path = Some("docs/old.txt".to_string());
+        old_entry.placeholder_object_id = Some("obj-document".to_string());
+        old_entry.placeholder_revision = Some("revision-3".to_string());
+        let current_entry = old_entry.clone();
+        monitor.seen.insert("docs/old.txt".to_string(), old_entry);
+        let mut current = HashMap::from([("archive/new.txt".to_string(), current_entry)]);
+
+        let first_handled = monitor.handle_local_object_renames(&mut current);
+        assert!(first_handled.contains("docs/old.txt"));
+        assert!(first_handled.contains("archive/new.txt"));
+        assert_eq!(monitor.pending_object_renames.len(), 1);
+
+        // This models the end of a scan: only the destination remains in the
+        // baseline, so a retry cannot rely on the removed source path.
+        monitor.seen = current.clone();
+        let second_handled = monitor.handle_local_object_renames(&mut current);
+
+        assert!(second_handled.contains("docs/old.txt"));
+        assert!(second_handled.contains("archive/new.txt"));
+        assert_eq!(monitor.pending_object_renames.len(), 1);
+        assert_eq!(
+            *uploader
+                .rename_attempts
+                .lock()
+                .expect("rename_attempts lock poisoned"),
+            2,
+            "the pending object-id rename must be retried rather than falling back to path operations"
+        );
     }
 
     #[test]

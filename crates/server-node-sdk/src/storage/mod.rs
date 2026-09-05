@@ -3220,57 +3220,16 @@ impl StoreIndexInspector {
         Ok((sizes, content_fingerprints))
     }
 
-    pub(crate) async fn object_modified_at_by_key(
+    /// Returns both the timestamp and concrete preferred revision for each
+    /// indexed path.  They are derived from the same version index so store
+    /// index listing does not load that per-object metadata twice.
+    pub(crate) async fn object_modified_at_and_revisions_by_key(
         &self,
         object_hashes: &HashMap<String, String>,
         object_ids: &HashMap<String, String>,
         max_created_at_unix: Option<u64>,
-    ) -> Result<HashMap<String, u64>> {
+    ) -> Result<(HashMap<String, u64>, HashMap<String, String>)> {
         let mut modified = HashMap::with_capacity(object_hashes.len());
-        for (key, manifest_hash) in object_hashes {
-            let Some(object_id) = object_ids.get(key) else {
-                continue;
-            };
-            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
-                continue;
-            };
-
-            let matching_created_at = index
-                .versions
-                .values()
-                .filter(|record| record.manifest_hash == *manifest_hash)
-                .filter(|record| {
-                    max_created_at_unix
-                        .map(|limit| record.created_at_unix <= limit)
-                        .unwrap_or(true)
-                })
-                .map(|record| record.created_at_unix)
-                .max()
-                .or_else(|| {
-                    index
-                        .versions
-                        .values()
-                        .filter(|record| record.manifest_hash == *manifest_hash)
-                        .map(|record| record.created_at_unix)
-                        .max()
-                });
-
-            if let Some(created_at_unix) = matching_created_at {
-                modified.insert(key.clone(), created_at_unix);
-            }
-        }
-        Ok(modified)
-    }
-
-    /// Returns the current (or snapshot-bounded) preferred revision for each
-    /// indexed path. Consumers use this as an optimistic-concurrency token;
-    /// it must not be inferred from content hashes or paths.
-    pub(crate) async fn object_revisions_by_key(
-        &self,
-        object_hashes: &HashMap<String, String>,
-        object_ids: &HashMap<String, String>,
-        max_created_at_unix: Option<u64>,
-    ) -> Result<HashMap<String, String>> {
         let mut revisions = HashMap::with_capacity(object_hashes.len());
         for (key, manifest_hash) in object_hashes {
             let Some(object_id) = object_ids.get(key) else {
@@ -3279,6 +3238,35 @@ impl StoreIndexInspector {
             let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
                 continue;
             };
+
+            let matching_versions = index
+                .versions
+                .values()
+                .filter(|record| record.manifest_hash == *manifest_hash)
+                .collect::<Vec<_>>();
+            let snapshot_matching_versions = matching_versions
+                .iter()
+                .copied()
+                .filter(|record| {
+                    max_created_at_unix
+                        .map(|limit| record.created_at_unix <= limit)
+                        .unwrap_or(true)
+                })
+                .collect::<Vec<_>>();
+            let versions_for_snapshot =
+                if max_created_at_unix.is_some() && !snapshot_matching_versions.is_empty() {
+                    &snapshot_matching_versions
+                } else {
+                    &matching_versions
+                };
+
+            if let Some(created_at_unix) = versions_for_snapshot
+                .iter()
+                .map(|record| record.created_at_unix)
+                .max()
+            {
+                modified.insert(key.clone(), created_at_unix);
+            }
             let revision = if max_created_at_unix.is_none() {
                 index
                     .preferred_head_version_id
@@ -3286,37 +3274,17 @@ impl StoreIndexInspector {
                     .and_then(|version_id| index.versions.get(version_id))
                     .filter(|record| record.manifest_hash == *manifest_hash)
             } else {
-                index
-                    .versions
-                    .values()
-                    .filter(|record| record.manifest_hash == *manifest_hash)
-                    .filter(|record| {
-                        max_created_at_unix
-                            .map(|limit| record.created_at_unix <= limit)
-                            .unwrap_or(true)
-                    })
-                    .max_by(|left, right| {
-                        left.created_at_unix
-                            .cmp(&right.created_at_unix)
-                            .then_with(|| left.version_id.cmp(&right.version_id))
-                    })
-                    .or_else(|| {
-                        index
-                            .versions
-                            .values()
-                            .filter(|record| record.manifest_hash == *manifest_hash)
-                            .max_by(|left, right| {
-                                left.created_at_unix
-                                    .cmp(&right.created_at_unix)
-                                    .then_with(|| left.version_id.cmp(&right.version_id))
-                            })
-                    })
+                versions_for_snapshot.iter().copied().max_by(|left, right| {
+                    left.created_at_unix
+                        .cmp(&right.created_at_unix)
+                        .then_with(|| left.version_id.cmp(&right.version_id))
+                })
             };
             if let Some(revision) = revision {
                 revisions.insert(key.clone(), revision.version_id.clone());
             }
         }
-        Ok(revisions)
+        Ok((modified, revisions))
     }
 
     pub(crate) async fn lookup_media_cache(
