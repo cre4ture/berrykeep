@@ -832,6 +832,44 @@ impl StorageTestBackend {
             }
         }
     }
+
+    /// Simulates an instance that completed the older label-only sidecar
+    /// backfill before GPS overlays were added.
+    async fn reset_gallery_sidecar_gps_backfill(self, root: &Path) {
+        match self {
+            Self::Sqlite => {
+                let database = rusqlite::Connection::open(root.join("state/metadata.sqlite"))
+                    .expect("sqlite metadata database should open");
+                database
+                    .execute_batch(
+                        "UPDATE gallery_objects
+                            SET sidecar_latitude = NULL, sidecar_longitude = NULL;
+                         DELETE FROM metadata_meta
+                          WHERE key = 'gallery_sidecar_gps_v1';",
+                    )
+                    .expect("legacy sqlite GPS projection should persist");
+            }
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => {
+                let database = turso::Builder::new_local(
+                    &root.join("state/metadata.turso.db").to_string_lossy(),
+                )
+                .build()
+                .await
+                .expect("turso metadata database should open");
+                let connection = database.connect().expect("turso metadata should connect");
+                connection
+                    .execute_batch(
+                        "UPDATE gallery_objects
+                            SET sidecar_latitude = NULL, sidecar_longitude = NULL;
+                         DELETE FROM metadata_meta
+                          WHERE key = 'gallery_sidecar_gps_v1';",
+                    )
+                    .await
+                    .expect("legacy Turso GPS projection should persist");
+            }
+        }
+    }
 }
 
 macro_rules! run_on_all_metadata_backends {
@@ -10801,6 +10839,58 @@ run_on_all_metadata_backends!(
     gallery_gps_follows_a_geolocation_sidecar_write_impl,
     gallery_gps_follows_a_geolocation_sidecar_write,
     gallery_gps_follows_a_geolocation_sidecar_write_turso
+);
+
+async fn gallery_gps_backfill_replays_existing_sidecars_after_label_backfill_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-gps-backfill").await;
+    let media_key = "album/photo.jpg";
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+            },
+        )
+        .await
+        .expect("sidecar GPS should persist");
+    assert!(gallery_gps_for_key(&store, media_key).await.is_some());
+    drop(store);
+
+    backend.reset_gallery_sidecar_gps_backfill(&root).await;
+    let store = backend.open_store(root.clone()).await;
+
+    let location = gallery_gps_for_key(&store, media_key)
+        .await
+        .expect("the dedicated GPS marker must replay existing sidecars");
+    assert!((location.latitude - 47.3769).abs() < 0.000_001);
+    assert!((location.longitude - 8.5417).abs() < 0.000_001);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_gps_backfill_replays_existing_sidecars_after_label_backfill_impl,
+    gallery_gps_backfill_replays_existing_sidecars_after_label_backfill,
+    gallery_gps_backfill_replays_existing_sidecars_after_label_backfill_turso
 );
 
 async fn unparseable_sidecar_gps_blocks_inferred_overwrite_impl(backend: StorageTestBackend) {

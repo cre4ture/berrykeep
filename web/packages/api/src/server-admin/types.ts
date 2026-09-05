@@ -1334,6 +1334,7 @@ export type OperationCatalogResponse = {
 };
 
 export type OperationRunStartRequest = {
+  approve?: boolean;
   prefix?: string;
   max_anchor_time_delta_seconds?: number;
   segment_gap_seconds?: number;

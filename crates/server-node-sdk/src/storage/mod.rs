@@ -15,6 +15,7 @@ const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_HISTORY_HEA
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
+pub(super) const GALLERY_SIDECAR_GPS_BACKFILL_KEY: &str = "gallery_sidecar_gps_v1";
 pub(super) const HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY: &str =
     "history_head_projection_backfill_cursor_v1";
 pub(super) const HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY: &str =
@@ -2785,6 +2786,12 @@ trait MetadataStore: Send + Sync {
     /// Marks the sidecar label projection backfill complete only after every
     /// current sidecar has been considered successfully.
     async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()>;
+    /// Whether current XMP sidecars still need a one-time GPS overlay
+    /// projection backfill after sidecar geolocation support was introduced.
+    async fn gallery_sidecar_gps_backfill_needed(&self) -> Result<bool>;
+    /// Marks the sidecar GPS projection backfill complete only after every
+    /// current sidecar has been considered successfully.
+    async fn mark_gallery_sidecar_gps_backfill_complete(&self) -> Result<()>;
     async fn load_current_state(&self) -> Result<CurrentState>;
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
@@ -4405,7 +4412,7 @@ impl PersistentStore {
             drop(object_id_migration_lock);
         }
         store
-            .backfill_gallery_labels_from_current_sidecars()
+            .backfill_gallery_metadata_from_current_sidecars()
             .await?;
         Ok(store)
     }
@@ -4802,16 +4809,20 @@ impl PersistentStore {
             .await
     }
 
-    /// Replays existing XMP sidecars into the gallery label projection once per
-    /// metadata database. New uploads are handled by the normal ingest hooks;
-    /// this covers sidecars that already existed when the label column was
-    /// introduced.
-    async fn backfill_gallery_labels_from_current_sidecars(&self) -> Result<()> {
-        if !self
+    /// Replays existing XMP sidecars into gallery projections once per metadata
+    /// database. New uploads are handled by the normal ingest hooks; separate
+    /// completion markers let a newly introduced projection backfill existing
+    /// sidecars even when an older projection was already migrated.
+    async fn backfill_gallery_metadata_from_current_sidecars(&self) -> Result<()> {
+        let labels_needed = self
             .metadata_store
             .gallery_sidecar_labels_backfill_needed()
-            .await?
-        {
+            .await?;
+        let gps_needed = self
+            .metadata_store
+            .gallery_sidecar_gps_backfill_needed()
+            .await?;
+        if !labels_needed && !gps_needed {
             return Ok(());
         }
 
@@ -4829,9 +4840,17 @@ impl PersistentStore {
                 .await?;
         }
 
-        self.metadata_store
-            .mark_gallery_sidecar_labels_backfill_complete()
-            .await
+        if labels_needed {
+            self.metadata_store
+                .mark_gallery_sidecar_labels_backfill_complete()
+                .await?;
+        }
+        if gps_needed {
+            self.metadata_store
+                .mark_gallery_sidecar_gps_backfill_complete()
+                .await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn chunk_ingestor(&self) -> ChunkIngestor {

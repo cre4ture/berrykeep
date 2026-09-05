@@ -394,20 +394,44 @@ fn nearest_anchor_indexes(
     segment: &[GeoAnalysisMedia],
 ) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
     let mut previous_anchor_indexes = vec![None; segment.len()];
-    let mut last_anchor = None;
+    let mut previous_time_anchor = None;
+    let mut current_time = None;
+    let mut current_time_anchor = None;
     for (index, item) in segment.iter().enumerate() {
-        previous_anchor_indexes[index] = last_anchor;
+        let capture_time = item
+            .capture_time
+            .expect("all media are grouped by capture time");
+        if current_time != Some(capture_time.unix) {
+            if current_time_anchor.is_some() {
+                previous_time_anchor = current_time_anchor;
+            }
+            current_time = Some(capture_time.unix);
+            current_time_anchor = None;
+        }
+        previous_anchor_indexes[index] = previous_time_anchor;
         if valid_anchor(item).is_some() {
-            last_anchor = Some(index);
+            current_time_anchor = Some(index);
         }
     }
 
     let mut next_anchor_indexes = vec![None; segment.len()];
-    let mut next_anchor = None;
+    let mut next_time_anchor = None;
+    let mut current_time = None;
+    let mut current_time_anchor = None;
     for (index, item) in segment.iter().enumerate().rev() {
-        next_anchor_indexes[index] = next_anchor;
+        let capture_time = item
+            .capture_time
+            .expect("all media are grouped by capture time");
+        if current_time != Some(capture_time.unix) {
+            if current_time_anchor.is_some() {
+                next_time_anchor = current_time_anchor;
+            }
+            current_time = Some(capture_time.unix);
+            current_time_anchor = None;
+        }
+        next_anchor_indexes[index] = next_time_anchor;
         if valid_anchor(item).is_some() {
-            next_anchor = Some(index);
+            current_time_anchor = Some(index);
         }
     }
     (previous_anchor_indexes, next_anchor_indexes)
@@ -705,6 +729,8 @@ const OPERATION_RESULT_TYPE_GEO_APPLY_ITEM: &str = "multimedia.geolocation.apply
 #[derive(Debug, Deserialize)]
 pub(super) struct OperationRunStartRequest {
     #[serde(default)]
+    approve: Option<bool>,
+    #[serde(default)]
     prefix: Option<String>,
     #[serde(default)]
     max_anchor_time_delta_seconds: Option<u64>,
@@ -831,8 +857,12 @@ pub(super) async fn start_operation_run(
         &headers,
         "auth/operations/run",
         !start_is_apply,
-        true,
-        json!({ "operation_id": operation_id, "prefix": request.prefix }),
+        !start_is_apply || request.approve.unwrap_or(false),
+        json!({
+            "operation_id": operation_id,
+            "prefix": request.prefix,
+            "approve": request.approve.unwrap_or(false),
+        }),
     )
     .await;
     if let Err(status) = authorization {
@@ -2127,6 +2157,36 @@ mod tests {
             GeoInferenceConfig::default(),
         );
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn same_timestamp_anchor_does_not_hide_usable_neighbouring_anchors() {
+        let result = proposals(
+            vec![
+                media("trip/a.jpg", Some(0), Some((0.0, 0.0))),
+                media("trip/same-time-anchor.jpg", Some(60), Some((0.0, 0.005))),
+                media("trip/target.jpg", Some(60), None),
+                media("trip/b.jpg", Some(120), Some((0.0, 0.01))),
+            ],
+            GeoInferenceConfig::default(),
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].method, GeoInferenceMethod::Interpolation);
+        assert_eq!(
+            result[0]
+                .previous_anchor
+                .as_ref()
+                .map(|anchor| anchor.path.as_str()),
+            Some("trip/a.jpg")
+        );
+        assert_eq!(
+            result[0]
+                .next_anchor
+                .as_ref()
+                .map(|anchor| anchor.path.as_str()),
+            Some("trip/b.jpg")
+        );
     }
 
     #[test]

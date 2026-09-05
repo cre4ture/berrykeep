@@ -237,13 +237,14 @@ export function MultimediaOperationsPage() {
     }
   });
   const applyMutation = useMutation({
-    mutationFn: () => {
+    mutationFn: (approve: boolean) => {
       if (!selectedAnalysisRun) {
         throw new Error("Choose an analysis run first.");
       }
       return startOperationRun(
         APPLY_OPERATION_ID,
         {
+          approve,
           analysis_run_id: selectedAnalysisRun.run_id,
           proposal_chunk_ids: [...selectedChunkIds],
           proposal_ids: [...selectedProposalIds]
@@ -422,7 +423,14 @@ export function MultimediaOperationsPage() {
               color="teal"
               disabled={!selectedAnalysisRun || selectedCount === 0 || applySlotOccupied}
               loading={applyMutation.isPending}
-              onClick={() => applyMutation.mutate()}
+              onClick={() => {
+                const confirmed = window.confirm(
+                  `Apply the selected ${selectedCount} location proposal${selectedCount === 1 ? "" : "s"}? This writes GPS metadata to XMP sidecars and cannot be undone automatically.`
+                );
+                if (confirmed) {
+                  applyMutation.mutate(true);
+                }
+              }}
             >
               Start apply job
             </Button>

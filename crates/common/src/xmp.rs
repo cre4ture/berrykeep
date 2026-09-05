@@ -892,34 +892,54 @@ fn qualified_name(prefix: &str, local_name: &str) -> String {
     format!("{prefix}:{local_name}")
 }
 
+#[derive(Debug, Default)]
+struct DescriptionGeoState {
+    coordinates: (Option<f64>, Option<f64>),
+    inferred_by_berrykeep: bool,
+}
+
 fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
-    let inferred_by_berrykeep = has_berrykeep_inference_marker(events);
     let mut location = None;
     // XMP permits nested `rdf:Description` values (for example Camera Raw's
     // `crs:Look`). Keep each Description's coordinates independent so an
-    // inner structured value cannot consume the enclosing media description.
-    let mut description_coordinates = Vec::<(Option<f64>, Option<f64>)>::new();
+    // inner structured value cannot consume or supersede the enclosing media
+    // description. Only a top-level Description represents the media item.
+    let mut descriptions = Vec::<DescriptionGeoState>::new();
     let mut element_property = None;
     for event in events {
         match &event.event {
             Event::Start(element) | Event::Empty(element) => {
                 if is_element(event, RDF_NAMESPACE, b"Description") {
-                    let coordinates = geo_attributes(event, element);
-                    if matches!(&event.event, Event::Empty(_)) {
-                        set_first_geo_location(&mut location, coordinates);
-                    } else {
-                        description_coordinates.push(coordinates);
-                    }
-                } else if matches!(&event.event, Event::Start(_))
-                    && !description_coordinates.is_empty()
-                {
-                    element_property = if is_element(event, EXIF_NAMESPACE, b"GPSLatitude") {
-                        Some(true)
-                    } else if is_element(event, EXIF_NAMESPACE, b"GPSLongitude") {
-                        Some(false)
-                    } else {
-                        None
+                    let state = DescriptionGeoState {
+                        coordinates: geo_attributes(event, element),
+                        inferred_by_berrykeep: has_berrykeep_inference_marker(event),
                     };
+                    if matches!(&event.event, Event::Empty(_)) {
+                        // An empty Description nested inside a structured XMP
+                        // value is not the media's Description. It must not
+                        // win over its enclosing top-level coordinates.
+                        if descriptions.is_empty() {
+                            set_first_geo_location(&mut location, state);
+                        }
+                    } else {
+                        descriptions.push(state);
+                    }
+                } else if !descriptions.is_empty() {
+                    if has_berrykeep_inference_marker(event) {
+                        descriptions
+                            .last_mut()
+                            .expect("non-empty descriptions stack")
+                            .inferred_by_berrykeep = true;
+                    }
+                    if matches!(&event.event, Event::Start(_)) {
+                        element_property = if is_element(event, EXIF_NAMESPACE, b"GPSLatitude") {
+                            Some(true)
+                        } else if is_element(event, EXIF_NAMESPACE, b"GPSLongitude") {
+                            Some(false)
+                        } else {
+                            None
+                        };
+                    }
                 }
             }
             Event::Text(text) => {
@@ -929,7 +949,8 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
                 let Ok(value) = text.xml10_content() else {
                     continue;
                 };
-                if let Some((latitude, longitude)) = description_coordinates.last_mut() {
+                if let Some(description) = descriptions.last_mut() {
+                    let (latitude, longitude) = &mut description.coordinates;
                     if is_latitude {
                         *latitude = parse_xmp_coordinate(&value, true);
                     } else {
@@ -944,7 +965,8 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
                 let Ok(value) = std::str::from_utf8(text.as_ref()) else {
                     continue;
                 };
-                if let Some((latitude, longitude)) = description_coordinates.last_mut() {
+                if let Some(description) = descriptions.last_mut() {
+                    let (latitude, longitude) = &mut description.coordinates;
                     if is_latitude {
                         *latitude = parse_xmp_coordinate(value, true);
                     } else {
@@ -960,20 +982,16 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
                     element_property = None;
                 }
                 if is_element(event, RDF_NAMESPACE, b"Description") {
-                    set_first_geo_location(
-                        &mut location,
-                        description_coordinates.pop().unwrap_or_default(),
-                    );
+                    let state = descriptions.pop().unwrap_or_default();
+                    if descriptions.is_empty() {
+                        set_first_geo_location(&mut location, state);
+                    }
                 }
             }
             _ => {}
         }
     }
-    location.map(|(latitude, longitude)| XmpGeoLocation {
-        latitude,
-        longitude,
-        inferred_by_berrykeep,
-    })
+    location
 }
 
 fn geo_attributes(
@@ -1007,18 +1025,19 @@ fn geo_attributes(
     (latitude, longitude)
 }
 
-fn set_first_geo_location(
-    location: &mut Option<(f64, f64)>,
-    coordinates: (Option<f64>, Option<f64>),
-) {
+fn set_first_geo_location(location: &mut Option<XmpGeoLocation>, state: DescriptionGeoState) {
     if location.is_some() {
         return;
     }
-    match coordinates {
+    match state.coordinates {
         (Some(latitude), Some(longitude))
             if (-90.0..=90.0).contains(&latitude) && (-180.0..=180.0).contains(&longitude) =>
         {
-            *location = Some((latitude, longitude));
+            *location = Some(XmpGeoLocation {
+                latitude,
+                longitude,
+                inferred_by_berrykeep: state.inferred_by_berrykeep,
+            });
         }
         _ => {}
     }
@@ -1038,19 +1057,16 @@ fn has_geo_location_properties(events: &[ResolvedEvent]) -> bool {
     })
 }
 
-/// Detects the provenance written by [`XmpSidecar::set_geo_inference`].
-/// Attribute prefixes are resolved from declarations in the packet so a
-/// third-party writer may use a prefix other than `berrykeep`.
-fn has_berrykeep_inference_marker(events: &[ResolvedEvent]) -> bool {
-    events.iter().any(|resolved| {
-        if is_element(resolved, BERRYKEEP_NAMESPACE, b"GeoInferenceMethod") {
-            return true;
-        }
-        resolved.attributes.iter().any(|attribute| {
+/// Detects the provenance written by [`XmpSidecar::set_geo_inference`] on one
+/// Description or one of its child properties. Attribute prefixes are resolved
+/// from declarations in the packet so a third-party writer may use a prefix
+/// other than `berrykeep`.
+fn has_berrykeep_inference_marker(event: &ResolvedEvent) -> bool {
+    is_element(event, BERRYKEEP_NAMESPACE, b"GeoInferenceMethod")
+        || event.attributes.iter().any(|attribute| {
             attribute.namespace.as_deref() == Some(BERRYKEEP_NAMESPACE)
                 && attribute.local_name == b"GeoInferenceMethod"
         })
-    })
 }
 
 fn parse_xmp_coordinate(value: &str, latitude: bool) -> Option<f64> {
@@ -1417,6 +1433,45 @@ mod tests {
             .expect("outer Description GPS must survive nested descriptions");
         assert!((location.latitude - 47.376_666_666_7).abs() < 0.000_001);
         assert!((location.longitude - 8.541_666_666_7).abs() < 0.000_001);
+        Ok(())
+    }
+
+    #[test]
+    fn nested_empty_description_does_not_override_outer_media_gps() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
+            "exif:GPSLatitude=\"47,22,36N\" exif:GPSLongitude=\"8,32,30E\">",
+            "<crs:Look><rdf:Description crs:Name=\"Adobe Color\" ",
+            "exif:GPSLatitude=\"0,0,0N\" exif:GPSLongitude=\"0,0,0E\"/>",
+            "</crs:Look></rdf:Description></rdf:RDF></x:xmpmeta>"
+        );
+        let location = XmpSidecar::parse(packet.as_bytes())?
+            .geo_location()
+            .expect("outer Description GPS must be read");
+        assert!((location.latitude - 47.376_666_666_7).abs() < 0.000_001);
+        assert!((location.longitude - 8.541_666_666_7).abs() < 0.000_001);
+        assert!(!location.inferred_by_berrykeep);
+        Ok(())
+    }
+
+    #[test]
+    fn provenance_is_scoped_to_the_description_that_provides_gps() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "exif:GPSLatitude=\"47,22,36N\" exif:GPSLongitude=\"8,32,30E\"/>",
+            "<rdf:Description xmlns:berrykeep=\"https://berrykeep.app/ns/1.0/\" ",
+            "berrykeep:GeoInferenceMethod=\"nearest-anchor\"/>",
+            "</rdf:RDF></x:xmpmeta>"
+        );
+        let location = XmpSidecar::parse(packet.as_bytes())?
+            .geo_location()
+            .expect("real GPS must be read");
+        assert!(!location.inferred_by_berrykeep);
         Ok(())
     }
 

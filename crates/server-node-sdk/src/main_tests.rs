@@ -713,6 +713,26 @@ async fn multimedia_operation_admission_reserves_one_slot_per_kind() {
     cleanup_test_state(&state).await;
 }
 
+#[tokio::test]
+async fn geolocation_apply_requires_explicit_approval() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::operations::start_operation_run(
+        State(state.clone()),
+        headers,
+        Path(super::operations::GEOLOCATION_APPLY_OPERATION_ID.to_string()),
+        Json(serde_json::from_value(serde_json::json!({})).unwrap()),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    cleanup_test_state(&state).await;
+}
+
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()

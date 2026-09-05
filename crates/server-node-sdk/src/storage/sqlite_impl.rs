@@ -22,7 +22,8 @@ use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
-    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
+    GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
     GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
     GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
     GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
@@ -2162,6 +2163,32 @@ impl MetadataStore for SqliteMetadataStore {
                 "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![GALLERY_SIDECAR_LABEL_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn gallery_sidecar_gps_backfill_needed(&self) -> Result<bool> {
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![GALLERY_SIDECAR_GPS_BACKFILL_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_none())
+        })
+        .await
+    }
+
+    async fn mark_gallery_sidecar_gps_backfill_complete(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![GALLERY_SIDECAR_GPS_BACKFILL_KEY],
             )?;
             Ok(())
         })

@@ -21,7 +21,8 @@ const DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT: usize = 1;
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
+    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
+    GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
     GalleryDeltaCursorError, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexPage,
     GalleryIndexQuery, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
     GalleryMapClusterQuery, GallerySummaryCache, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
@@ -226,6 +227,29 @@ impl MetadataStore for TursoMetadataStore {
                 "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (GALLERY_SIDECAR_LABEL_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn gallery_sidecar_gps_backfill_needed(&self) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (GALLERY_SIDECAR_GPS_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(rows.next().await?.is_none())
+    }
+
+    async fn mark_gallery_sidecar_gps_backfill_complete(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (GALLERY_SIDECAR_GPS_BACKFILL_KEY,),
             )
             .await?;
         Ok(())
