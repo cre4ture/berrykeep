@@ -6770,6 +6770,7 @@ async fn restore_history_batch_preserves_recreated_target_impl(backend: StorageT
     let restore_requests = [(
         "docs/readme.txt".to_string(),
         deleted.version_id,
+        None,
         "docs/readme.txt".to_string(),
     )];
     let sources = store
@@ -6840,11 +6841,13 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
         (
             "docs/restored.txt".to_string(),
             restored.version_id,
+            None,
             "docs/restored.txt".to_string(),
         ),
         (
             "docs/broken.txt".to_string(),
             broken.version_id,
+            None,
             "docs/broken.txt".to_string(),
         ),
     ];
@@ -6945,6 +6948,9 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         RecoverableHistoryEntries::ExceedsLimit { .. } => {
             panic!("unbounded recoverable history scan unexpectedly exceeded its limit")
         }
+        RecoverableHistoryEntries::ScanLimitExceeded { .. } => {
+            panic!("small recoverable history scan unexpectedly exceeded its scan budget")
+        }
     };
     let deleted_entry = history
         .iter()
@@ -6978,6 +6984,9 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         RecoverableHistoryEntries::Entries(entries) => entries,
         RecoverableHistoryEntries::ExceedsLimit { .. } => {
             panic!("unbounded recoverable history scan unexpectedly exceeded its limit")
+        }
+        RecoverableHistoryEntries::ScanLimitExceeded { .. } => {
+            panic!("small recoverable history scan unexpectedly exceeded its scan budget")
         }
     };
     assert_eq!(

@@ -60,6 +60,7 @@ fn recoverable_history_projection_keeps_folder_markers_and_child_rollups() {
             super::storage::RecoverableHistoryEntry {
                 path: "docs/".to_string(),
                 restore_source_path: "docs/".to_string(),
+                restore_source_object_id: "object-folder".to_string(),
                 restore_version_id: "version-folder".to_string(),
                 removed_at_unix: 10,
                 moved_to_path: None,
@@ -67,6 +68,7 @@ fn recoverable_history_projection_keeps_folder_markers_and_child_rollups() {
             super::storage::RecoverableHistoryEntry {
                 path: "docs/a.txt".to_string(),
                 restore_source_path: "docs/a.txt".to_string(),
+                restore_source_object_id: "object-child".to_string(),
                 restore_version_id: "version-child".to_string(),
                 removed_at_unix: 11,
                 moved_to_path: None,
@@ -113,6 +115,7 @@ fn store_history_cache_removes_restored_entries() {
             super::storage::RecoverableHistoryEntry {
                 path: "deleted.txt".to_string(),
                 restore_source_path: "deleted.txt".to_string(),
+                restore_source_object_id: "object-deleted".to_string(),
                 restore_version_id: "version-deleted".to_string(),
                 removed_at_unix: 1,
                 moved_to_path: None,
@@ -120,6 +123,7 @@ fn store_history_cache_removes_restored_entries() {
             super::storage::RecoverableHistoryEntry {
                 path: "other.txt".to_string(),
                 restore_source_path: "other.txt".to_string(),
+                restore_source_object_id: "object-other".to_string(),
                 restore_version_id: "version-other".to_string(),
                 removed_at_unix: 2,
                 moved_to_path: None,
@@ -18836,7 +18840,12 @@ async fn build_test_state(
                 super::StoreHistoryCache::default(),
             )),
             store_history_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            store_history_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            store_history_refresh_locks: Arc::new(std::sync::Mutex::new(
+                super::StoreHistoryRefreshLocks::default(),
+            )),
+            store_history_restore_fallback_permits: Arc::new(tokio::sync::Semaphore::new(
+                super::STORE_HISTORY_RESTORE_FALLBACK_MAX_CONCURRENCY,
+            )),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<

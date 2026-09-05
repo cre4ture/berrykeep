@@ -854,6 +854,8 @@ struct WebStoreRestoreRequest {
 struct WebStoreHistoryRestoreEntry {
     path: String,
     restore_source_path: String,
+    #[serde(default)]
+    restore_source_object_id: Option<String>,
     restore_version_id: String,
 }
 

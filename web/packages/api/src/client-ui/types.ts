@@ -295,6 +295,7 @@ export type StoreHistoryEntry = {
   path: string;
   entry_type: "prefix" | "historical";
   restore_source_path?: string;
+  restore_source_object_id?: string;
   restore_version_id?: string;
   removed_at_unix?: number;
   moved_to_path?: string | null;
@@ -308,10 +309,12 @@ export type StoreHistoryResponse = {
   entries: StoreHistoryEntry[];
 };
 
-export type StoreHistoryRestoreEntry = Pick<
-  Required<StoreHistoryEntry>,
-  "path" | "restore_source_path" | "restore_version_id"
->;
+export type StoreHistoryRestoreEntry = {
+  path: string;
+  restore_source_path: string;
+  restore_source_object_id?: string;
+  restore_version_id: string;
+};
 
 export type StoreHistoryRestoreResponse = {
   restored_count: number;

@@ -60,6 +60,7 @@ export type ExplorerEntry = {
   content_fingerprint?: string | null;
   media?: Record<string, unknown> | null;
   restore_source_path?: string | null;
+  restore_source_object_id?: string | null;
   restore_version_id?: string | null;
   removed_at_unix?: number | null;
   moved_to_path?: string | null;
@@ -97,6 +98,7 @@ export type ExplorerListResponse = {
 export type ExplorerHistoryRestoreEntry = {
   path: string;
   restore_source_path: string;
+  restore_source_object_id?: string;
   restore_version_id: string;
 };
 
@@ -495,6 +497,7 @@ export function ExplorerSurface({
 
   function historicalRestoreRequest(entry: ExplorerEntry): ExplorerHistoryRestoreEntry | null {
     const restoreSourcePath = entry.restore_source_path?.trim();
+    const restoreSourceObjectId = entry.restore_source_object_id?.trim();
     const restoreVersionId = entry.restore_version_id?.trim();
     const path = entry.path.trim();
     if (!path || !restoreSourcePath || !restoreVersionId) {
@@ -503,6 +506,7 @@ export function ExplorerSurface({
     return {
       path,
       restore_source_path: restoreSourcePath,
+      ...(restoreSourceObjectId ? { restore_source_object_id: restoreSourceObjectId } : {}),
       restore_version_id: restoreVersionId
     };
   }

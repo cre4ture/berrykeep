@@ -124,6 +124,7 @@ const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
 const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
+const STORE_HISTORY_RESTORE_FALLBACK_MAX_CONCURRENCY: usize = 2;
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -347,7 +348,8 @@ struct ServerStorageRuntime {
     store_index_page_cache: Arc<StdMutex<StoreIndexPageCache>>,
     store_history_cache: Arc<StdMutex<StoreHistoryCache>>,
     store_history_cache_generation: Arc<AtomicU64>,
-    store_history_refresh_lock: Arc<Mutex<()>>,
+    store_history_refresh_locks: Arc<StdMutex<StoreHistoryRefreshLocks>>,
+    store_history_restore_fallback_permits: Arc<Semaphore>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
@@ -7402,7 +7404,12 @@ async fn run_inner(
             store_index_page_cache: Arc::new(StdMutex::new(StoreIndexPageCache::default())),
             store_history_cache: Arc::new(StdMutex::new(StoreHistoryCache::default())),
             store_history_cache_generation: Arc::new(AtomicU64::new(0)),
-            store_history_refresh_lock: Arc::new(Mutex::new(())),
+            store_history_refresh_locks: Arc::new(StdMutex::new(
+                StoreHistoryRefreshLocks::default(),
+            )),
+            store_history_restore_fallback_permits: Arc::new(Semaphore::new(
+                STORE_HISTORY_RESTORE_FALLBACK_MAX_CONCURRENCY,
+            )),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
@@ -13332,6 +13339,8 @@ struct StoreHistoryEntryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     restore_source_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    restore_source_object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     restore_version_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     removed_at_unix: Option<u64>,
@@ -13352,6 +13361,8 @@ struct StoreHistoryResponse {
 struct HistoryRestoreEntryRequest {
     path: String,
     restore_source_path: String,
+    #[serde(default)]
+    restore_source_object_id: Option<String>,
     restore_version_id: String,
 }
 
@@ -13914,6 +13925,25 @@ struct StoreHistoryCacheEntry {
 #[derive(Debug, Default)]
 struct StoreHistoryCache {
     entries: VecDeque<StoreHistoryCacheEntry>,
+}
+
+#[derive(Default)]
+struct StoreHistoryRefreshLocks {
+    by_prefix: HashMap<String, Arc<Mutex<()>>>,
+}
+
+impl StoreHistoryRefreshLocks {
+    fn lock_for_prefix(&mut self, prefix: &str) -> Arc<Mutex<()>> {
+        if let Some(lock) = self.by_prefix.get(prefix) {
+            return Arc::clone(lock);
+        }
+        if self.by_prefix.len() >= STORE_HISTORY_CACHE_MAX_SCOPES {
+            self.by_prefix.clear();
+        }
+        let lock = Arc::new(Mutex::new(()));
+        self.by_prefix.insert(prefix.to_string(), Arc::clone(&lock));
+        lock
+    }
 }
 
 impl StoreHistoryCache {
@@ -16395,7 +16425,11 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
             // Coalesce cache misses without holding the store read guard. A
             // short TTL intentionally tolerates concurrent namespace writes
             // while retaining each recently visited prefix for navigation.
-            let _refresh_guard = state.storage.store_history_refresh_lock.lock().await;
+            let refresh_lock = match state.storage.store_history_refresh_locks.lock() {
+                Ok(mut locks) => locks.lock_for_prefix(&prefix),
+                Err(poisoned) => poisoned.into_inner().lock_for_prefix(&prefix),
+            };
+            let _refresh_guard = refresh_lock.lock().await;
             let cached = match state.storage.store_history_cache.lock() {
                 Ok(cache) => cache.get(&prefix),
                 Err(poisoned) => poisoned.into_inner().get(&prefix),
@@ -16429,6 +16463,18 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                     }) => Arc::new(StoreHistoryCacheValue::Oversized {
                         minimum_entry_count,
                     }),
+                    Ok(RecoverableHistoryEntries::ScanLimitExceeded {
+                        scanned_index_count,
+                    }) => {
+                        return (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            Json(json!({
+                                "error": "recoverable history scan exceeds the interactive explorer limit",
+                                "scanned_index_count": scanned_index_count,
+                            })),
+                        )
+                            .into_response();
+                    }
                     Err(err) => {
                         tracing::error!(error = %err, prefix = %prefix, depth, "failed to list recoverable history entries");
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -16551,6 +16597,7 @@ fn project_recoverable_history_entries(
                         path,
                         entry_type: "prefix",
                         restore_source_path: None,
+                        restore_source_object_id: None,
                         restore_version_id: None,
                         removed_at_unix: None,
                         moved_to_path: None,
@@ -16569,6 +16616,7 @@ fn project_recoverable_history_entries(
                     path: entry.path.clone(),
                     entry_type: "historical",
                     restore_source_path: Some(entry.restore_source_path.clone()),
+                    restore_source_object_id: Some(entry.restore_source_object_id.clone()),
                     restore_version_id: Some(entry.restore_version_id.clone()),
                     removed_at_unix: Some(entry.removed_at_unix),
                     moved_to_path: entry.moved_to_path.clone(),
@@ -16646,6 +16694,12 @@ async fn restore_history_entries_response(
         .map(|entry| HistoryRestoreEntryRequest {
             path: entry.path.trim().to_string(),
             restore_source_path: entry.restore_source_path.trim().to_string(),
+            restore_source_object_id: entry
+                .restore_source_object_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|object_id| !object_id.is_empty())
+                .map(ToOwned::to_owned),
             restore_version_id: entry.restore_version_id.trim().to_string(),
         })
         .collect::<Vec<_>>();
@@ -16655,11 +16709,29 @@ async fn restore_history_entries_response(
             (
                 entry.restore_source_path.clone(),
                 entry.restore_version_id.clone(),
+                entry.restore_source_object_id.clone(),
                 entry.path.clone(),
             )
         })
         .collect::<Vec<_>>();
+    let requires_fallback_resolution = restore_entries
+        .iter()
+        .any(|entry| entry.restore_source_object_id.is_none());
     let source_results = {
+        let _fallback_resolution_permit = if requires_fallback_resolution {
+            match state
+                .storage
+                .store_history_restore_fallback_permits
+                .clone()
+                .acquire_owned()
+                .await
+            {
+                Ok(permit) => Some(permit),
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        } else {
+            None
+        };
         let history_inspector = {
             let store = read_store(state, "store_history.clone_restore_inspector").await;
             store.store_history_inspector()
