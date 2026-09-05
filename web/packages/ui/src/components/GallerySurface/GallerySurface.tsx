@@ -619,7 +619,9 @@ export function GallerySurface({
     mediaFilter
   );
   const captureDateBounds = galleryCaptureDateBounds(captureDateFrom, captureDateThrough);
-  const captureDateFilterActive = Boolean(captureDateFrom || captureDateThrough);
+  const captureDateFilterActive =
+    captureDateBounds.capturedFromUnix !== undefined ||
+    captureDateBounds.capturedUntilUnix !== undefined;
   const currentGalleryReloadSignature = galleryReloadSignature(
     viewMode,
     sortOrder,
