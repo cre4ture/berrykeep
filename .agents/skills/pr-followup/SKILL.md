@@ -14,7 +14,7 @@ Read [references/ironmesh-pr-facts.md](references/ironmesh-pr-facts.md) before t
 
    `python3 <pr-followup-skill-dir>/scripts/watch_pr.py [PR] --base <target-branch> --no-notify`
 
-   Let the watcher own polling. While it runs, do not issue parallel GitHub/`gh` status queries or periodic terminal reads. Use `--help` for PR selectors, timeouts, ignore rules, and state-file options.
+   Let the watcher own polling. While it runs, do not issue parallel GitHub/`gh` status queries or periodic terminal reads. Use `--help` for the full CLI. Common options are `--repo [HOST/]OWNER/REPO`, `--timeout <duration>` (default `20m`; bare numbers mean minutes), `--no-timeout`, repeatable `--ignore-check <glob>`, `--ignore-existing-failures`, and `--state-file <path>`.
 3. Treat its exit code as control flow:
    - `1`: investigate the failed CI check, fix and push, then restart the watcher.
    - `2`: address new review feedback; if it is ambiguous, conflicting, or changes product direction, ask the user.
