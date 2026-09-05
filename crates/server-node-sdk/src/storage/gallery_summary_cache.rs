@@ -77,7 +77,7 @@ impl GallerySummaryRefreshTracker {
 #[derive(Debug)]
 pub(crate) struct GallerySummaryProgress {
     tracker: Arc<GallerySummaryRefreshTracker>,
-    _capture_computation_permit: Option<OwnedSemaphorePermit>,
+    _capture_refresh_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl GallerySummaryProgress {
@@ -105,7 +105,8 @@ pub(crate) struct GallerySummaryComputationPermit {
 pub(crate) struct GallerySummaryCache {
     values: Mutex<GallerySummaryCacheValues>,
     trackers: Mutex<HashMap<GallerySummaryScope, Arc<GallerySummaryRefreshTracker>>>,
-    capture_computation_permits: Arc<Semaphore>,
+    capture_miss_permits: Arc<Semaphore>,
+    capture_refresh_permits: Arc<Semaphore>,
 }
 
 /// The gallery controls expose one scope at a time. Media and privacy-label filters have a fixed
@@ -113,7 +114,8 @@ pub(crate) struct GallerySummaryCache {
 /// partitions so walking many arbitrary date ranges cannot evict hot unfiltered scopes.
 const GALLERY_SUMMARY_CACHE_MAX_FIXED_SCOPES: usize = 64;
 const GALLERY_SUMMARY_CACHE_MAX_CAPTURE_SCOPES: usize = 64;
-const GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS: usize = 2;
+const GALLERY_SUMMARY_MAX_CAPTURE_MISSES: usize = 2;
+const GALLERY_SUMMARY_MAX_CAPTURE_REFRESHES: usize = 1;
 
 #[derive(Default)]
 struct GallerySummaryCacheValues {
@@ -162,8 +164,9 @@ impl GallerySummaryCache {
         Self {
             values: Mutex::new(GallerySummaryCacheValues::default()),
             trackers: Mutex::new(HashMap::new()),
-            capture_computation_permits: Arc::new(Semaphore::new(
-                GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS,
+            capture_miss_permits: Arc::new(Semaphore::new(GALLERY_SUMMARY_MAX_CAPTURE_MISSES)),
+            capture_refresh_permits: Arc::new(Semaphore::new(
+                GALLERY_SUMMARY_MAX_CAPTURE_REFRESHES,
             )),
         }
     }
@@ -203,7 +206,7 @@ impl GallerySummaryCache {
         if !scope.is_capture_filtered() {
             return Ok(None);
         }
-        self.capture_computation_permits
+        self.capture_miss_permits
             .clone()
             .try_acquire_owned()
             .map(|permit| Some(GallerySummaryComputationPermit { _permit: permit }))
@@ -223,9 +226,9 @@ impl GallerySummaryCache {
         {
             return None;
         }
-        let capture_computation_permit = if scope.is_capture_filtered() {
+        let capture_refresh_permit = if scope.is_capture_filtered() {
             Some(
-                self.capture_computation_permits
+                self.capture_refresh_permits
                     .clone()
                     .try_acquire_owned()
                     .ok()?,
@@ -238,7 +241,7 @@ impl GallerySummaryCache {
         trackers.insert(scope.clone(), tracker.clone());
         Some(GallerySummaryProgress {
             tracker,
-            _capture_computation_permit: capture_computation_permit,
+            _capture_refresh_permit: capture_refresh_permit,
         })
     }
 
@@ -317,9 +320,9 @@ mod tests {
     }
 
     #[test]
-    fn bounds_capture_summary_computations_without_blocking_fixed_scopes() {
+    fn independently_bounds_capture_misses_and_background_refreshes() {
         let cache = GallerySummaryCache::new();
-        let mut permits = (0..GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS)
+        let miss_permits = (0..GALLERY_SUMMARY_MAX_CAPTURE_MISSES)
             .map(|index| {
                 cache
                     .try_capture_miss_permit(&capture_scope(index))
@@ -330,27 +333,33 @@ mod tests {
 
         assert!(
             cache
-                .try_capture_miss_permit(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS))
+                .try_capture_miss_permit(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_MISSES))
                 .is_err()
         );
+        let capture_refresh = cache
+            .try_start_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_MISSES))
+            .expect("background work must not consume foreground miss permits");
         assert!(
             cache
-                .try_start_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS))
+                .try_start_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_MISSES + 1))
                 .is_none()
         );
+        cache.finish_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_MISSES));
+        drop(capture_refresh);
+
+        let next_refresh = cache
+            .try_start_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_MISSES + 1))
+            .expect("released background permit should admit the next refresh");
+        cache.finish_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_MISSES + 1));
+        drop(next_refresh);
+
         assert!(cache.try_capture_miss_permit(&scope(99)).unwrap().is_none());
         let fixed_refresh = cache
             .try_start_refresh(&scope(99))
             .expect("fixed-scope refreshes should not use capture permits");
         cache.finish_refresh(&scope(99));
         drop(fixed_refresh);
-
-        permits.pop();
-        let capture_refresh = cache
-            .try_start_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS))
-            .expect("released capture permit should admit the next refresh");
-        cache.finish_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS));
-        drop(capture_refresh);
+        drop(miss_permits);
     }
 
     #[test]

@@ -98,8 +98,8 @@ mod turso_impl;
 
 use self::gallery_summary_cache::GallerySummaryCache;
 pub(crate) use self::gallery_summary_cache::{
-    GalleryCaptureSummaryBusyError, GallerySummaryCacheValue, GallerySummaryProgress,
-    GallerySummaryRefreshStatus, GallerySummaryScope,
+    GalleryCaptureSummaryBusyError, GallerySummaryCacheValue, GallerySummaryComputationPermit,
+    GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
 };
 use self::sqlite_impl::SqliteMetadataStore;
 #[cfg(feature = "turso-metadata")]

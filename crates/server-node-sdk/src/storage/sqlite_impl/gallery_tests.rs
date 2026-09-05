@@ -1,5 +1,8 @@
 use super::*;
-use crate::storage::{GalleryIndexMediaFilter, GalleryViewportBounds, MediaCacheStatus};
+use crate::storage::{
+    GalleryCaptureSummaryBusyError, GalleryIndexMediaFilter, GalleryViewportBounds,
+    MediaCacheStatus,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn sqlite_test_db_path(name: &str) -> PathBuf {
@@ -716,6 +719,61 @@ async fn gallery_map_summary_cache_serves_stale_value_and_refreshes_in_backgroun
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+
+    drop(store);
+    let _ = std::fs::remove_file(metadata_db_path);
+}
+
+#[tokio::test]
+async fn gallery_map_rejects_excess_capture_summary_misses_before_reading_the_viewport() {
+    let metadata_db_path = sqlite_test_db_path("gallery-map-summary-early-shed");
+    let store = SqliteMetadataStore::open(&metadata_db_path)
+        .await
+        .expect("sqlite metadata store should open");
+
+    let capture_scope = |captured_from_unix| GallerySummaryScope {
+        prefix: "gallery".to_string(),
+        depth: 64,
+        media_filter: GalleryIndexMediaFilter::All,
+        captured_from_unix: Some(captured_from_unix),
+        captured_until_unix: None,
+        label_filter: Default::default(),
+    };
+    let _first_permit = store
+        .gallery_map_summary_cache
+        .try_capture_miss_permit(&capture_scope(1))
+        .unwrap()
+        .expect("first capture miss should be admitted");
+    let _second_permit = store
+        .gallery_map_summary_cache
+        .try_capture_miss_permit(&capture_scope(2))
+        .unwrap()
+        .expect("second capture miss should be admitted");
+
+    let viewport = GalleryViewportBounds {
+        south: -90.0,
+        west: -180.0,
+        north: 90.0,
+        east: 180.0,
+    };
+    let mut query = gallery_map_query(viewport, 1024, 512);
+    query.captured_from_unix = Some(3);
+    let next_reader_before = store.next_reader.load(std::sync::atomic::Ordering::Relaxed);
+    let error = store
+        .query_gallery_map_clusters(&query)
+        .await
+        .expect_err("a third concurrent capture miss should be rejected");
+
+    assert!(
+        error
+            .downcast_ref::<GalleryCaptureSummaryBusyError>()
+            .is_some()
+    );
+    assert_eq!(
+        store.next_reader.load(std::sync::atomic::Ordering::Relaxed),
+        next_reader_before,
+        "the viewport query must not run after capture-summary admission is rejected"
+    );
 
     drop(store);
     let _ = std::fs::remove_file(metadata_db_path);

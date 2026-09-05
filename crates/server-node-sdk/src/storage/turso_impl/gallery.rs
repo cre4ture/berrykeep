@@ -13,10 +13,10 @@ use super::super::{
     GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaFilter,
     GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster,
     GalleryMapClusterEntriesQuery, GalleryMapClusterPage, GalleryMapClusterQuery,
-    GallerySummaryCacheValue, GallerySummaryProgress, GallerySummaryRefreshStatus,
-    GallerySummaryScope, GalleryViewportBounds, ManifestSummary, current_media_cache_metadata,
-    decode_gallery_labels, effective_gallery_captured_at_unix, encode_gallery_labels,
-    gallery_index_media_status, gallery_index_media_type_from_metadata,
+    GallerySummaryCacheValue, GallerySummaryComputationPermit, GallerySummaryProgress,
+    GallerySummaryRefreshStatus, GallerySummaryScope, GalleryViewportBounds, ManifestSummary,
+    current_media_cache_metadata, decode_gallery_labels, effective_gallery_captured_at_unix,
+    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload,
@@ -650,6 +650,21 @@ impl TursoMetadataStore {
         &self,
         query: &GalleryMapClusterQuery,
     ) -> Result<GalleryMapClusterPage> {
+        let scope = GallerySummaryScope {
+            prefix: query.prefix.trim().trim_matches('/').to_string(),
+            depth: query.depth,
+            media_filter: query.media_filter,
+            captured_from_unix: query.captured_from_unix,
+            captured_until_unix: query.captured_until_unix,
+            label_filter: query.label_filter.clone(),
+        };
+        let cached_summary = self.gallery_map_summary_cache.cached(&scope);
+        let capture_miss_permit = if cached_summary.is_none() {
+            self.gallery_map_summary_cache
+                .try_capture_miss_permit(&scope)?
+        } else {
+            None
+        };
         let (history_id, cache_revision, revision, resolution, visible_geotagged_count, clusters) = {
             let connection = self.gallery_read_connection().await?;
             let transaction =
@@ -678,16 +693,14 @@ impl TursoMetadataStore {
             finish_gallery_read_transaction(transaction, result).await?
         };
 
-        let scope = GallerySummaryScope {
-            prefix: query.prefix.trim().trim_matches('/').to_string(),
-            depth: query.depth,
-            media_filter: query.media_filter,
-            captured_from_unix: query.captured_from_unix,
-            captured_until_unix: query.captured_until_unix,
-            label_filter: query.label_filter.clone(),
-        };
         let (total_entry_count, media_summary, summary_status) = self
-            .gallery_map_summary(scope, &history_id, cache_revision)
+            .gallery_map_summary(
+                scope,
+                &history_id,
+                cache_revision,
+                cached_summary,
+                capture_miss_permit,
+            )
             .await?;
 
         Ok(GalleryMapClusterPage {
@@ -711,8 +724,13 @@ impl TursoMetadataStore {
         scope: GallerySummaryScope,
         history_id: &str,
         revision: u64,
+        cached: Option<GallerySummaryCacheValue>,
+        _capture_miss_permit: Option<GallerySummaryComputationPermit>,
     ) -> Result<(usize, GalleryIndexMediaSummary, GallerySummaryRefreshStatus)> {
-        if let Some(cached) = self.gallery_map_summary_cache.cached(&scope) {
+        // Prefer a value populated while the viewport query was running, but retain the
+        // preflight snapshot in case that scope was evicted in the meantime.
+        let cached = self.gallery_map_summary_cache.cached(&scope).or(cached);
+        if let Some(cached) = cached {
             if cached.history_id == history_id && cached.revision == revision {
                 return Ok((
                     cached.total_entry_count,
@@ -753,13 +771,7 @@ impl TursoMetadataStore {
             return Ok((cached.total_entry_count, cached.media_summary, status));
         }
 
-        let _capture_summary_permit = self
-            .gallery_map_summary_cache
-            .try_capture_miss_permit(&scope)?;
-        let connection = self
-            .gallery_summary_read_connection_factory()
-            .open()
-            .await?;
+        let connection = self.gallery_read_connection().await?;
         let value = query_gallery_map_summary(&connection, &scope, None, None).await?;
         drop(connection);
         self.gallery_map_summary_cache.store(scope, value.clone());

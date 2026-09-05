@@ -24,8 +24,8 @@ use super::{
     GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
     GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
     GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue,
-    GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
-    GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    GallerySummaryComputationPermit, GallerySummaryProgress, GallerySummaryRefreshStatus,
+    GallerySummaryScope, GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
     ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
     ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
@@ -119,8 +119,13 @@ impl SqliteMetadataStore {
         scope: GallerySummaryScope,
         history_id: &str,
         revision: u64,
+        cached: Option<GallerySummaryCacheValue>,
+        _capture_miss_permit: Option<GallerySummaryComputationPermit>,
     ) -> Result<(usize, GalleryIndexMediaSummary, GallerySummaryRefreshStatus)> {
-        if let Some(cached) = self.gallery_map_summary_cache.cached(&scope) {
+        // Prefer a value populated while the viewport query was running, but retain the
+        // preflight snapshot in case that scope was evicted in the meantime.
+        let cached = self.gallery_map_summary_cache.cached(&scope).or(cached);
+        if let Some(cached) = cached {
             if cached.history_id == history_id && cached.revision == revision {
                 return Ok((
                     cached.total_entry_count,
@@ -160,23 +165,10 @@ impl SqliteMetadataStore {
             return Ok((cached.total_entry_count, cached.media_summary, status));
         }
 
-        let _capture_summary_permit = self
-            .gallery_map_summary_cache
-            .try_capture_miss_permit(&scope)?;
         let compute_scope = scope.clone();
         let value = self
-            .gallery_summary_reader
-            .call(move |db| {
-                Ok(query_gallery_map_summary_from_db(
-                    db,
-                    &compute_scope,
-                    None,
-                    None,
-                ))
-            })
-            .await
-            .map_err(map_tokio_rusqlite_error)
-            .and_then(|value| value)?;
+            .read(move |db| query_gallery_map_summary_from_db(db, &compute_scope, None, None))
+            .await?;
         self.gallery_map_summary_cache.store(scope, value.clone());
         Ok((
             value.total_entry_count,
@@ -2113,11 +2105,6 @@ impl MetadataStore for SqliteMetadataStore {
         &self,
         query: &GalleryMapClusterQuery,
     ) -> Result<Option<GalleryMapClusterPage>> {
-        let cluster_query = query.clone();
-        let (history_id, cache_revision, revision, resolution, visible_geotagged_count, clusters) =
-            self.read(move |db| query_gallery_map_cluster_cells_from_db(db, &cluster_query))
-                .await?;
-
         let scope = GallerySummaryScope {
             prefix: query.prefix.trim().trim_matches('/').to_string(),
             depth: query.depth,
@@ -2126,8 +2113,26 @@ impl MetadataStore for SqliteMetadataStore {
             captured_until_unix: query.captured_until_unix,
             label_filter: query.label_filter.clone(),
         };
+        let cached_summary = self.gallery_map_summary_cache.cached(&scope);
+        let capture_miss_permit = if cached_summary.is_none() {
+            self.gallery_map_summary_cache
+                .try_capture_miss_permit(&scope)?
+        } else {
+            None
+        };
+        let cluster_query = query.clone();
+        let (history_id, cache_revision, revision, resolution, visible_geotagged_count, clusters) =
+            self.read(move |db| query_gallery_map_cluster_cells_from_db(db, &cluster_query))
+                .await?;
+
         let (total_entry_count, media_summary, summary_status) = self
-            .gallery_map_summary(scope, &history_id, cache_revision)
+            .gallery_map_summary(
+                scope,
+                &history_id,
+                cache_revision,
+                cached_summary,
+                capture_miss_permit,
+            )
             .await?;
 
         Ok(Some(GalleryMapClusterPage {
