@@ -1578,11 +1578,15 @@ private func ironmeshAccentColorHex(from color: Color) -> String? {
         return nil
     }
 
+    func colorChannel(_ value: CGFloat) -> Int {
+        Int((min(max(value, 0), 1) * 255).rounded())
+    }
+
     return String(
         format: "#%02X%02X%02X",
-        Int((red * 255).rounded()),
-        Int((green * 255).rounded()),
-        Int((blue * 255).rounded())
+        colorChannel(red),
+        colorChannel(green),
+        colorChannel(blue)
     )
 }
 

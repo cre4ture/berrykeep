@@ -49,8 +49,9 @@ export function normalizeIronmeshAccentColor(value: string | null | undefined): 
 /**
  * Returns the native host's accent color for embedded Android and iOS Web UIs.
  *
- * The query parameter is intentionally ignored outside an app-owned WebView, so a
- * normal browser retains its locally selected accent color.
+ * A native host explicitly opts into host-managed color with `embedded_client`.
+ * This URL contract is also useful for browser-based previews and automated tests;
+ * it is not an authenticity signal for a native WebView.
  */
 export function readIronmeshHostAccentColor(
   search = typeof window === "undefined" ? "" : window.location.search
