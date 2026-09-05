@@ -120,10 +120,9 @@ impl SqliteMetadataStore {
         history_id: &str,
         revision: u64,
         cached: Option<GallerySummaryCacheValue>,
-        summary_miss: Option<GallerySummaryMiss>,
     ) -> Result<(usize, GalleryIndexMediaSummary, GallerySummaryRefreshStatus)> {
         let mut cached_snapshot = cached;
-        let mut summary_miss = summary_miss;
+        let mut summary_miss = None;
         loop {
             // Prefer a value populated while the viewport query was running, but retain the
             // preflight snapshot in case that scope was evicted in the meantime.
@@ -2138,27 +2137,13 @@ impl MetadataStore for SqliteMetadataStore {
             label_filter: query.label_filter.clone(),
         };
         let cached_summary = self.gallery_map_summary_cache.cached(&scope);
-        let summary_miss = if cached_summary.is_none() {
-            Some(
-                self.gallery_map_summary_cache
-                    .try_start_summary_miss(&scope)?,
-            )
-        } else {
-            None
-        };
         let cluster_query = query.clone();
         let (history_id, cache_revision, revision, resolution, visible_geotagged_count, clusters) =
             self.read(move |db| query_gallery_map_cluster_cells_from_db(db, &cluster_query))
                 .await?;
 
         let (total_entry_count, media_summary, summary_status) = self
-            .gallery_map_summary(
-                scope,
-                &history_id,
-                cache_revision,
-                cached_summary,
-                summary_miss,
-            )
+            .gallery_map_summary(scope, &history_id, cache_revision, cached_summary)
             .await?;
 
         Ok(Some(GalleryMapClusterPage {

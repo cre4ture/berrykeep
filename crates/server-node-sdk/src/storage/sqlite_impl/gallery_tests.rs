@@ -725,7 +725,7 @@ async fn gallery_map_summary_cache_serves_stale_value_and_refreshes_in_backgroun
 }
 
 #[tokio::test]
-async fn gallery_map_rejects_excess_capture_summary_misses_before_reading_the_viewport() {
+async fn gallery_map_reads_viewport_before_rejecting_excess_capture_summary_misses() {
     let metadata_db_path = sqlite_test_db_path("gallery-map-summary-early-shed");
     let store = SqliteMetadataStore::open(&metadata_db_path)
         .await
@@ -777,8 +777,8 @@ async fn gallery_map_rejects_excess_capture_summary_misses_before_reading_the_vi
     );
     assert_eq!(
         store.next_reader.load(std::sync::atomic::Ordering::Relaxed),
-        next_reader_before,
-        "the viewport query must not run after capture-summary admission is rejected"
+        next_reader_before + 1,
+        "the capture-summary admission check must run after the viewport query"
     );
 
     drop(store);
