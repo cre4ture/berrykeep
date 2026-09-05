@@ -41,6 +41,7 @@ final class IronmeshGalleryModel: ObservableObject {
         currentPath: String,
         configuration: AppleConnectionConfiguration?,
         showSensitiveContent: Bool = false,
+        captureDateRange: AppleGalleryCaptureDateRange = AppleGalleryCaptureDateRange(),
         force: Bool = false
     ) {
         guard let configuration else {
@@ -54,7 +55,8 @@ final class IronmeshGalleryModel: ObservableObject {
                 mode: mode,
                 currentPath: currentPath,
                 sort: sort,
-                showSensitiveContent: showSensitiveContent
+                showSensitiveContent: showSensitiveContent,
+                captureDateRange: captureDateRange
             )
         )
         guard force || context != activeContext else {
@@ -83,6 +85,7 @@ final class IronmeshGalleryModel: ObservableObject {
             currentPath: activeContext.query.currentPath,
             configuration: activeContext.configuration,
             showSensitiveContent: activeContext.query.showSensitiveContent,
+            captureDateRange: activeContext.query.captureDateRange,
             force: true
         )
     }

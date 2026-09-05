@@ -94,6 +94,8 @@ public struct AppleStoreIndexRequestOptions: Equatable, Sendable {
     public var limit: Int?
     public var sort: AppleStoreIndexSortOrder?
     public var mediaFilter: AppleStoreIndexMediaFilter?
+    public var capturedFromUnix: UInt64?
+    public var capturedUntilUnix: UInt64?
     public var excludeLabels: [String]
 
     public init(
@@ -102,6 +104,8 @@ public struct AppleStoreIndexRequestOptions: Equatable, Sendable {
         limit: Int? = nil,
         sort: AppleStoreIndexSortOrder? = nil,
         mediaFilter: AppleStoreIndexMediaFilter? = nil,
+        capturedFromUnix: UInt64? = nil,
+        capturedUntilUnix: UInt64? = nil,
         excludeLabels: [String] = []
     ) {
         self.view = view
@@ -109,6 +113,8 @@ public struct AppleStoreIndexRequestOptions: Equatable, Sendable {
         self.limit = limit.map { max(1, $0) }
         self.sort = sort
         self.mediaFilter = mediaFilter
+        self.capturedFromUnix = capturedFromUnix
+        self.capturedUntilUnix = capturedUntilUnix
         self.excludeLabels = excludeLabels
     }
 }
@@ -275,6 +281,43 @@ public enum AppleGallerySort: String, CaseIterable, Equatable, Sendable {
     }
 }
 
+public struct AppleGalleryCaptureDateRange: Equatable, Sendable {
+    public let startDate: Date?
+    public let endDate: Date?
+    public let capturedFromUnix: UInt64?
+    public let capturedUntilUnix: UInt64?
+
+    public init(
+        startDate: Date? = nil,
+        endDate: Date? = nil,
+        calendar: Calendar = .current
+    ) {
+        guard let startDate, let endDate else {
+            self.startDate = nil
+            self.endDate = nil
+            capturedFromUnix = nil
+            capturedUntilUnix = nil
+            return
+        }
+        let earlierDate = min(startDate, endDate)
+        let laterDate = max(startDate, endDate)
+        let normalizedStart = calendar.startOfDay(for: earlierDate)
+        let normalizedEnd = calendar.startOfDay(for: laterDate)
+        let exclusiveEnd = calendar.date(byAdding: .day, value: 1, to: normalizedEnd)
+            ?? normalizedEnd.addingTimeInterval(86_400)
+        self.startDate = normalizedStart
+        self.endDate = normalizedEnd
+        // The server stores capture timestamps as unsigned Unix seconds. A fully
+        // pre-epoch selection becomes the valid empty interval [0, 0).
+        capturedFromUnix = UInt64(max(0, normalizedStart.timeIntervalSince1970))
+        capturedUntilUnix = UInt64(max(0, exclusiveEnd.timeIntervalSince1970))
+    }
+
+    public var isActive: Bool {
+        capturedFromUnix != nil
+    }
+}
+
 public struct AppleGalleryQuery: Equatable, Sendable {
     public static let defaultPageSize = 32
     public static let flattenedDepth = 64
@@ -284,19 +327,22 @@ public struct AppleGalleryQuery: Equatable, Sendable {
     public var sort: AppleGallerySort
     public var pageSize: Int
     public var showSensitiveContent: Bool
+    public var captureDateRange: AppleGalleryCaptureDateRange
 
     public init(
         mode: AppleGalleryMode,
         currentPath: String,
         sort: AppleGallerySort,
         pageSize: Int = defaultPageSize,
-        showSensitiveContent: Bool = false
+        showSensitiveContent: Bool = false,
+        captureDateRange: AppleGalleryCaptureDateRange = AppleGalleryCaptureDateRange()
     ) {
         self.mode = mode
         self.currentPath = normalizedPath(currentPath)
         self.sort = sort
         self.pageSize = max(1, pageSize)
         self.showSensitiveContent = showSensitiveContent
+        self.captureDateRange = captureDateRange
     }
 
     public func request(offset: Int) -> AppleStoreIndexRequest {
@@ -309,6 +355,8 @@ public struct AppleGalleryQuery: Equatable, Sendable {
                 limit: pageSize,
                 sort: sort.storeIndexOrder,
                 mediaFilter: .image,
+                capturedFromUnix: captureDateRange.capturedFromUnix,
+                capturedUntilUnix: captureDateRange.capturedUntilUnix,
                 excludeLabels: showSensitiveContent ? [] : ["private", "nsfw"]
             )
         )

@@ -143,6 +143,8 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
             limit: limit,
             sort: sort,
             mediaFilter: mediaFilter,
+            capturedFromUnix: nil,
+            capturedUntilUnix: nil,
             excludeLabels: nil
         )
     }
@@ -157,6 +159,36 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         limit: Int?,
         sort: String?,
         mediaFilter: String?,
+        excludeLabels: String?
+    ) throws -> String {
+        try storeIndexJSON(
+            handle: handle,
+            prefix: prefix,
+            depth: depth,
+            snapshot: snapshot,
+            view: view,
+            offset: offset,
+            limit: limit,
+            sort: sort,
+            mediaFilter: mediaFilter,
+            capturedFromUnix: nil,
+            capturedUntilUnix: nil,
+            excludeLabels: excludeLabels
+        )
+    }
+
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?,
+        capturedFromUnix: UInt64?,
+        capturedUntilUnix: UInt64?,
         excludeLabels: String?
     ) throws -> String {
         var jsonPointer: UnsafeMutablePointer<CChar>?
@@ -177,6 +209,8 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
                                     limit ?? -1,
                                     sortPointer,
                                     mediaFilterPointer,
+                                    capturedFromUnix ?? UInt64.max,
+                                    capturedUntilUnix ?? UInt64.max,
                                     excludeLabelsPointer,
                                     &jsonPointer,
                                     &errorPointer

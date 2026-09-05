@@ -756,6 +756,8 @@ struct WebStoreListQuery {
     limit: Option<usize>,
     sort: Option<String>,
     media_filter: Option<String>,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     require_labels: Option<String>,
     exclude_labels: Option<String>,
     south: Option<f64>,
@@ -775,6 +777,8 @@ struct WebGalleryMapClustersQuery {
     prefix: Option<String>,
     depth: Option<usize>,
     media_filter: Option<String>,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     south: f64,
     west: f64,
     north: f64,
@@ -3035,6 +3039,8 @@ async fn web_store_list(
                 limit: query.limit,
                 sort,
                 media_filter,
+                captured_from_unix: query.captured_from_unix,
+                captured_until_unix: query.captured_until_unix,
                 viewport,
                 require_labels,
                 exclude_labels,
@@ -3110,6 +3116,12 @@ async fn web_gallery_map_clusters(
             .append_pair("zoom", &zoom.to_string());
         if let Some(zoom_precise) = zoom_precise {
             params.append_pair("zoom_precise", &zoom_precise.to_string());
+        }
+        if let Some(captured_from_unix) = query.captured_from_unix {
+            params.append_pair("captured_from_unix", &captured_from_unix.to_string());
+        }
+        if let Some(captured_until_unix) = query.captured_until_unix {
+            params.append_pair("captured_until_unix", &captured_until_unix.to_string());
         }
         if let Some(require_labels) = query
             .require_labels
@@ -4458,6 +4470,64 @@ mod tests {
                 .await
                 .expect("stale response should remain JSON"),
             serde_json::json!({ "code": "gallery_map_cluster_stale", "reset": true })
+        );
+
+        web.abort();
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn gallery_map_clusters_forward_the_capture_time_range_upstream() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream listener should have an address");
+        let upstream = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/v1/gallery/map/clusters",
+                axum::routing::get(|Query(query): Query<HashMap<String, String>>| async move {
+                    axum::Json(query)
+                }),
+            );
+            let _ = axum::serve(upstream_listener, app).await;
+        });
+
+        let web_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web listener should bind");
+        let web_address = web_listener
+            .local_addr()
+            .expect("web listener should have an address");
+        let app = router(WebUiConfig::from_client(
+            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}")),
+        ));
+        let web = tokio::spawn(async move {
+            let _ = axum::serve(web_listener, app).await;
+        });
+
+        let response = reqwest::get(format!(
+            "http://{web_address}/api/v1/gallery/map/clusters?depth=1&media_filter=all&captured_from_unix=20&captured_until_unix=30&south=-90&west=-180&north=90&east=180&zoom=1"
+        ))
+        .await
+        .expect("web proxy clusters request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let forwarded_query = response
+            .json::<HashMap<String, String>>()
+            .await
+            .expect("upstream query should remain JSON");
+        assert_eq!(
+            forwarded_query
+                .get("captured_from_unix")
+                .map(String::as_str),
+            Some("20")
+        );
+        assert_eq!(
+            forwarded_query
+                .get("captured_until_unix")
+                .map(String::as_str),
+            Some("30")
         );
 
         web.abort();

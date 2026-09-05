@@ -41,6 +41,8 @@ data class StoreIndexRequestOptions(
     val limit: Int? = null,
     val sort: StoreIndexSortOrder? = null,
     val mediaFilter: StoreIndexMediaFilter? = null,
+    val capturedFromUnix: Long? = null,
+    val capturedUntilUnix: Long? = null,
     val excludeLabels: List<String> = emptyList(),
 )
 

@@ -28,6 +28,8 @@ type ResourceDescriptor =
       limit: number | null;
       sort: GalleryLoadEntriesOptions["sort"] | null;
       mediaFilter: GalleryLoadEntriesOptions["mediaFilter"] | null;
+      capturedFromUnix: number | null;
+      capturedUntilUnix: number | null;
       requireLabels: string[];
       excludeLabels: string[];
     };
@@ -211,6 +213,12 @@ function galleryDataUpdate(
       ...(descriptor.limit === null ? {} : { limit: descriptor.limit }),
       ...(descriptor.sort === null ? {} : { sort: descriptor.sort }),
       ...(descriptor.mediaFilter === null ? {} : { mediaFilter: descriptor.mediaFilter }),
+      ...(descriptor.capturedFromUnix === null
+        ? {}
+        : { capturedFromUnix: descriptor.capturedFromUnix }),
+      ...(descriptor.capturedUntilUnix === null
+        ? {}
+        : { capturedUntilUnix: descriptor.capturedUntilUnix }),
       ...(descriptor.requireLabels.length === 0
         ? {}
         : { requireLabels: descriptor.requireLabels }),
@@ -256,9 +264,17 @@ function entryDescriptor(
         : null,
     sort: options.sort ?? null,
     mediaFilter: options.mediaFilter ?? null,
+    capturedFromUnix: normalizedUnixTimestamp(options.capturedFromUnix),
+    capturedUntilUnix: normalizedUnixTimestamp(options.capturedUntilUnix),
     requireLabels: options.requireLabels ?? [],
     excludeLabels: options.excludeLabels ?? []
   };
+}
+
+function normalizedUnixTimestamp(value: number | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : null;
 }
 
 function isGallerySnapshotList(payload: unknown): payload is GallerySnapshot[] {
