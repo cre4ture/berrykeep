@@ -7107,6 +7107,90 @@ run_on_all_metadata_backends!(
     recoverable_history_entries_include_deleted_and_moved_paths_turso
 );
 
+async fn recoverable_history_head_projection_backfill_rebuilds_legacy_indexes_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("recoverable-history-head-projection-backfill")
+        .await;
+    let original = store
+        .put_object_versioned(
+            "legacy/old-name.txt",
+            Bytes::from_static(b"legacy payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rename_object_path("legacy/old-name.txt", "legacy/new-name.txt", false)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+
+    store
+        .metadata_store
+        .clear_history_head_projections_for_test()
+        .await
+        .unwrap();
+    let inspector = store.store_history_inspector();
+    assert!(matches!(
+        inspector
+            .history_head_projection_backfill_state()
+            .await
+            .unwrap(),
+        HistoryHeadProjectionBackfillState::Pending { .. }
+    ));
+
+    let mut processed_index_count = 0usize;
+    loop {
+        let progress = inspector
+            .backfill_history_head_projection_batch()
+            .await
+            .unwrap();
+        processed_index_count =
+            processed_index_count.saturating_add(progress.processed_index_count);
+        if progress.complete {
+            break;
+        }
+    }
+    assert!(processed_index_count > 0);
+    assert_eq!(
+        inspector
+            .history_head_projection_backfill_state()
+            .await
+            .unwrap(),
+        HistoryHeadProjectionBackfillState::Complete
+    );
+
+    let history = match inspector
+        .list_recoverable_history_entries_bounded("legacy", usize::MAX)
+        .await
+        .unwrap()
+    {
+        RecoverableHistoryEntries::Entries(entries) => entries,
+        RecoverableHistoryEntries::ExceedsLimit { .. } => {
+            panic!("unbounded recoverable history projection unexpectedly exceeded its limit")
+        }
+    };
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].path, "legacy/old-name.txt");
+    assert_eq!(history[0].restore_version_id, original.version_id);
+    assert_eq!(
+        history[0].moved_to_path.as_deref(),
+        Some("legacy/new-name.txt")
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    recoverable_history_head_projection_backfill_rebuilds_legacy_indexes_impl,
+    recoverable_history_head_projection_backfill_rebuilds_legacy_indexes,
+    recoverable_history_head_projection_backfill_rebuilds_legacy_indexes_turso
+);
+
 async fn restore_version_to_custom_target_uses_metadata_copy_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("restore-version-custom-target").await;
 
@@ -8861,6 +8945,14 @@ async fn metadata_db_logical_distribution_reports_table_content_impl(backend: St
         .expect("missing version_indexes breakdown");
     assert!(version_indexes.row_count > 0);
     assert!(version_indexes.tracked_value_bytes > 0);
+
+    let version_index_heads = distribution
+        .tables
+        .iter()
+        .find(|table| table.table == "version_index_heads")
+        .expect("missing version_index_heads breakdown");
+    assert!(version_index_heads.row_count > 0);
+    assert!(version_index_heads.tracked_value_bytes > 0);
 
     let snapshots = distribution
         .tables

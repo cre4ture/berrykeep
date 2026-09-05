@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,15 +21,18 @@ use super::{
     DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
     GalleryDeltaCursorError, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexPage,
     GalleryIndexQuery, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
-    GalleryMapClusterQuery, GallerySummaryCache, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
-    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
-    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
+    GalleryMapClusterQuery, GallerySummaryCache, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
+    METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
+    MetadataStore, OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker,
+    RecoverableHistoryEntries, RecoverableHistoryEntry, RepairAttemptRecord, RepairRunRecord,
     S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
     S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
-    TOMBSTONE_MANIFEST_HASH, compress_snapshot_json, decode_gallery_labels, decode_version_index,
-    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
+    decode_gallery_labels, decode_version_index, decompress_snapshot_json,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
     normalize_snapshot_manifest_object_ids,
 };
 
@@ -271,31 +274,6 @@ impl MetadataStore for TursoMetadataStore {
         }))
     }
 
-    async fn list_existing_current_object_keys(&self, keys: &[String]) -> Result<HashSet<String>> {
-        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
-        let mut existing_keys = HashSet::new();
-        for keys in keys.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
-            if keys.is_empty() {
-                continue;
-            }
-            let placeholders = (1..=keys.len())
-                .map(|index| format!("?{index}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut rows = self
-                .connection
-                .query(
-                    format!("SELECT key FROM current_objects WHERE key IN ({placeholders})"),
-                    params_from_iter(keys.iter().cloned()),
-                )
-                .await?;
-            while let Some(row) = rows.next().await? {
-                existing_keys.insert(row_string(&row, 0, "current_objects.key")?);
-            }
-        }
-        Ok(existing_keys)
-    }
-
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()> {
         self.upsert_current_object_with_gallery(key, entry).await
     }
@@ -411,41 +389,6 @@ impl MetadataStore for TursoMetadataStore {
             keys.push(row_string(&row, 0, "current_objects.key")?);
         }
         Ok(keys)
-    }
-
-    async fn list_keys_for_object_ids(
-        &self,
-        object_ids: &[String],
-    ) -> Result<HashMap<String, Vec<String>>> {
-        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
-        let mut keys_by_object_id = HashMap::new();
-        for object_ids in object_ids.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
-            if object_ids.is_empty() {
-                continue;
-            }
-            let placeholders = (1..=object_ids.len())
-                .map(|index| format!("?{index}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut rows = self
-                .connection
-                .query(
-                    format!(
-                        "SELECT object_id, key FROM current_objects WHERE object_id IN ({placeholders})"
-                    ),
-                    params_from_iter(object_ids.iter().cloned()),
-                )
-                .await?;
-            while let Some(row) = rows.next().await? {
-                let object_id = row_string(&row, 0, "current_objects.object_id")?;
-                let key = row_string(&row, 1, "current_objects.key")?;
-                keys_by_object_id
-                    .entry(object_id)
-                    .or_insert_with(Vec::new)
-                    .push(key);
-            }
-        }
-        Ok(keys_by_object_id)
     }
 
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
@@ -1834,47 +1777,71 @@ impl MetadataStore for TursoMetadataStore {
         Ok(indexes)
     }
 
-    async fn load_recoverable_history_version_indexes_after(
+    async fn list_recoverable_history_entries_bounded(
         &self,
         prefix: &str,
-        after_object_id: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<FileVersionIndex>> {
-        let prefix_pattern = if prefix.is_empty() {
-            "%".to_string()
-        } else {
-            super::sqlite_like_prefix_pattern(&format!("{prefix}/"))
-        };
-        let limit = i64::try_from(limit.max(1)).context("history index page limit overflow")?;
-        let mut rows = if let Some(after_object_id) = after_object_id {
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryEntries> {
+        let prefix = prefix.trim().trim_matches('/').to_string();
+        let limit = max_entries
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or(i64::MAX);
+        let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
+        // Every descendant begins with `<prefix>/`; this bytewise range is
+        // indexable and keeps the query outside `version_indexes.index_json`.
+        let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
+        let mut rows = if let (Some(path_lower_bound), Some(path_upper_bound)) =
+            (path_lower_bound.as_deref(), path_upper_bound.as_deref())
+        {
             self.connection
                 .query(
-                    "SELECT version_indexes.object_id, version_indexes.index_json
-                     FROM version_indexes
-                     WHERE version_indexes.object_id > ?1
-                       AND EXISTS (
-                         SELECT 1
-                         FROM json_each(CAST(version_indexes.index_json AS TEXT), '$.versions') AS version
-                         WHERE json_extract(version.value, '$.manifest_hash') = ?2
-                           AND json_extract(version.value, '$.logical_path') IS NOT NULL
-                           AND (
-                             ?3 = ''
-                             OR json_extract(version.value, '$.logical_path') = ?3
-                             OR json_extract(version.value, '$.logical_path') LIKE ?4 ESCAPE '\\'
-                           )
+                    "WITH latest AS (
+                         SELECT
+                             history.logical_path,
+                             history.restore_source_path,
+                             history.restore_source_object_id,
+                             history.restore_version_id,
+                             history.removed_at_unix,
+                             history.moved_source_object_id,
+                             ROW_NUMBER() OVER (
+                                 PARTITION BY history.logical_path
+                                 ORDER BY history.removed_at_unix DESC,
+                                          history.restore_version_id DESC,
+                                          history.object_id DESC
+                             ) AS path_rank
+                         FROM version_index_heads AS history
+                         WHERE history.head_manifest_hash = ?1
+                           AND history.restore_source_path IS NOT NULL
+                           AND history.restore_source_object_id IS NOT NULL
+                           AND history.restore_version_id IS NOT NULL
+                           AND history.logical_path >= ?2
+                           AND history.logical_path < ?3
                            AND NOT EXISTS (
-                             SELECT 1
-                             FROM current_objects
-                             WHERE current_objects.key = json_extract(version.value, '$.logical_path')
+                               SELECT 1 FROM current_objects
+                               WHERE current_objects.key = history.logical_path
                            )
-                       )
-                     ORDER BY version_indexes.object_id
-                     LIMIT ?5",
+                     )
+                     SELECT
+                         latest.logical_path,
+                         latest.restore_source_path,
+                         latest.restore_source_object_id,
+                         latest.restore_version_id,
+                         latest.removed_at_unix,
+                         (
+                             SELECT MIN(current_objects.key)
+                             FROM current_objects
+                             WHERE current_objects.object_id = latest.moved_source_object_id
+                               AND current_objects.key != latest.logical_path
+                         ) AS moved_to_path
+                     FROM latest
+                     WHERE latest.path_rank = 1
+                     ORDER BY latest.logical_path
+                     LIMIT ?4",
                     (
-                        after_object_id,
                         TOMBSTONE_MANIFEST_HASH,
-                        prefix,
-                        prefix_pattern.as_str(),
+                        path_lower_bound,
+                        path_upper_bound,
                         limit,
                     ),
                 )
@@ -1882,38 +1849,164 @@ impl MetadataStore for TursoMetadataStore {
         } else {
             self.connection
                 .query(
-                    "SELECT version_indexes.object_id, version_indexes.index_json
-                     FROM version_indexes
-                     WHERE EXISTS (
-                         SELECT 1
-                         FROM json_each(CAST(version_indexes.index_json AS TEXT), '$.versions') AS version
-                         WHERE json_extract(version.value, '$.manifest_hash') = ?1
-                           AND json_extract(version.value, '$.logical_path') IS NOT NULL
-                           AND (
-                             ?2 = ''
-                             OR json_extract(version.value, '$.logical_path') = ?2
-                             OR json_extract(version.value, '$.logical_path') LIKE ?3 ESCAPE '\\'
-                           )
+                    "WITH latest AS (
+                         SELECT
+                             history.logical_path,
+                             history.restore_source_path,
+                             history.restore_source_object_id,
+                             history.restore_version_id,
+                             history.removed_at_unix,
+                             history.moved_source_object_id,
+                             ROW_NUMBER() OVER (
+                                 PARTITION BY history.logical_path
+                                 ORDER BY history.removed_at_unix DESC,
+                                          history.restore_version_id DESC,
+                                          history.object_id DESC
+                             ) AS path_rank
+                         FROM version_index_heads AS history
+                         WHERE history.head_manifest_hash = ?1
+                           AND history.restore_source_path IS NOT NULL
+                           AND history.restore_source_object_id IS NOT NULL
+                           AND history.restore_version_id IS NOT NULL
                            AND NOT EXISTS (
-                             SELECT 1
-                             FROM current_objects
-                             WHERE current_objects.key = json_extract(version.value, '$.logical_path')
+                               SELECT 1 FROM current_objects
+                               WHERE current_objects.key = history.logical_path
                            )
-                       )
-                     ORDER BY version_indexes.object_id
-                     LIMIT ?4",
-                    (TOMBSTONE_MANIFEST_HASH, prefix, prefix_pattern.as_str(), limit),
+                     )
+                     SELECT
+                         latest.logical_path,
+                         latest.restore_source_path,
+                         latest.restore_source_object_id,
+                         latest.restore_version_id,
+                         latest.removed_at_unix,
+                         (
+                             SELECT MIN(current_objects.key)
+                             FROM current_objects
+                             WHERE current_objects.object_id = latest.moved_source_object_id
+                               AND current_objects.key != latest.logical_path
+                         ) AS moved_to_path
+                     FROM latest
+                     WHERE latest.path_rank = 1
+                     ORDER BY latest.logical_path
+                     LIMIT ?2",
+                    (TOMBSTONE_MANIFEST_HASH, limit),
                 )
                 .await?
         };
 
-        let mut indexes = Vec::new();
+        let mut entries = Vec::new();
         while let Some(row) = rows.next().await? {
-            let object_id = row_string(&row, 0, "version_indexes.object_id")?;
-            let payload = row_blob(&row, 1, "version_indexes.index_json")?;
-            indexes.push(decode_version_index(&object_id, &payload, "Turso")?);
+            entries.push(RecoverableHistoryEntry {
+                path: row_string(&row, 0, "version_index_heads.logical_path")?,
+                restore_source_path: row_string(
+                    &row,
+                    1,
+                    "version_index_heads.restore_source_path",
+                )?,
+                restore_source_object_id: row_string(
+                    &row,
+                    2,
+                    "version_index_heads.restore_source_object_id",
+                )?,
+                restore_version_id: row_string(&row, 3, "version_index_heads.restore_version_id")?,
+                removed_at_unix: row_u64(&row, 4, "version_index_heads.removed_at_unix")?,
+                moved_to_path: row_opt_string(&row, 5, "version_index_heads.moved_to_path")?,
+            });
         }
-        Ok(indexes)
+        if entries.len() > max_entries {
+            return Ok(RecoverableHistoryEntries::ExceedsLimit {
+                minimum_entry_count: entries.len(),
+            });
+        }
+        Ok(RecoverableHistoryEntries::Entries(entries))
+    }
+
+    async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,),
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(HistoryHeadProjectionBackfillState::Complete);
+        }
+        drop(rows);
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT value FROM metadata_meta WHERE key = ?1",
+                (HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,),
+            )
+            .await?;
+        let after_object_id = match rows.next().await? {
+            Some(row) => Some(row_string(
+                &row,
+                0,
+                "metadata_meta.history_head_projection_backfill_cursor",
+            )?),
+            None => None,
+        };
+        Ok(HistoryHeadProjectionBackfillState::Pending { after_object_id })
+    }
+
+    async fn persist_history_head_projection_backfill_batch(
+        &self,
+        projections: &[VersionIndexHeadProjection],
+        next_after_object_id: Option<&str>,
+        complete: bool,
+    ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        for projection in projections {
+            insert_version_index_head_projection_if_missing(&self.connection, projection).await?;
+        }
+        if complete {
+            self.connection
+                .execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,),
+                )
+                .await?;
+            self.connection
+                .execute(
+                    "DELETE FROM metadata_meta WHERE key = ?1",
+                    (HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,),
+                )
+                .await?;
+        } else {
+            let after_object_id = next_after_object_id
+                .context("history head projection backfill has no next cursor")?;
+            self.connection
+                .execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, after_object_id),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn clear_history_head_projections_for_test(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute("DELETE FROM version_index_heads", ())
+            .await?;
+        self.connection
+            .execute(
+                "DELETE FROM metadata_meta WHERE key IN (?1, ?2)",
+                (
+                    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
+                    HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+                ),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>> {
@@ -2513,6 +2606,12 @@ impl MetadataStore for TursoMetadataStore {
                 (object_id,),
             )
             .await?;
+        self.connection
+            .execute(
+                "DELETE FROM version_index_heads WHERE object_id = ?1",
+                (object_id,),
+            )
+            .await?;
         Ok(())
     }
 
@@ -2602,6 +2701,97 @@ pub(super) async fn add_column_if_missing(
     Ok(())
 }
 
+pub(super) async fn upsert_version_index_head_projection(
+    connection: &turso::Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    connection
+        .execute(
+            "INSERT INTO version_index_heads (
+                 object_id,
+                 head_version_id,
+                 head_manifest_hash,
+                 logical_path,
+                 removed_at_unix,
+                 restore_source_path,
+                 restore_source_object_id,
+                 restore_version_id,
+                 moved_source_object_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(object_id) DO UPDATE SET
+                 head_version_id = excluded.head_version_id,
+                 head_manifest_hash = excluded.head_manifest_hash,
+                 logical_path = excluded.logical_path,
+                 removed_at_unix = excluded.removed_at_unix,
+                 restore_source_path = excluded.restore_source_path,
+                 restore_source_object_id = excluded.restore_source_object_id,
+                 restore_version_id = excluded.restore_version_id,
+                 moved_source_object_id = excluded.moved_source_object_id",
+            (
+                projection.object_id.as_str(),
+                projection.head_version_id.as_deref(),
+                projection.head_manifest_hash.as_deref(),
+                projection.logical_path.as_deref(),
+                projection
+                    .removed_at_unix
+                    .map(i64::try_from)
+                    .transpose()
+                    .context("history head removal timestamp overflow")?,
+                projection.restore_source_path.as_deref(),
+                projection.restore_source_object_id.as_deref(),
+                projection.restore_version_id.as_deref(),
+                projection.moved_source_object_id.as_deref(),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn insert_version_index_head_projection_if_missing(
+    connection: &turso::Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    // A normal write is authoritative. This migration-only insert deliberately
+    // cannot resurrect an index that was deleted while a backfill page was
+    // being decoded, nor can it overwrite a concurrent write.
+    connection
+        .execute(
+            "INSERT INTO version_index_heads (
+                 object_id,
+                 head_version_id,
+                 head_manifest_hash,
+                 logical_path,
+                 removed_at_unix,
+                 restore_source_path,
+                 restore_source_object_id,
+                 restore_version_id,
+                 moved_source_object_id
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+             WHERE EXISTS (
+                 SELECT 1 FROM version_indexes WHERE object_id = ?1
+             )
+             ON CONFLICT(object_id) DO NOTHING",
+            (
+                projection.object_id.as_str(),
+                projection.head_version_id.as_deref(),
+                projection.head_manifest_hash.as_deref(),
+                projection.logical_path.as_deref(),
+                projection
+                    .removed_at_unix
+                    .map(i64::try_from)
+                    .transpose()
+                    .context("history head removal timestamp overflow")?,
+                projection.restore_source_path.as_deref(),
+                projection.restore_source_object_id.as_deref(),
+                projection.restore_version_id.as_deref(),
+                projection.moved_source_object_id.as_deref(),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
     connection
         .execute_batch(
@@ -2620,6 +2810,18 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS version_indexes (
                 object_id TEXT PRIMARY KEY,
                 index_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS version_index_heads (
+                object_id TEXT PRIMARY KEY,
+                head_version_id TEXT,
+                head_manifest_hash TEXT,
+                logical_path TEXT,
+                removed_at_unix INTEGER,
+                restore_source_path TEXT,
+                restore_source_object_id TEXT,
+                restore_version_id TEXT,
+                moved_source_object_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -2803,6 +3005,14 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 ON snapshots(created_at_unix DESC, snapshot_id DESC);
             CREATE INDEX IF NOT EXISTS idx_storage_stats_history_collected
                 ON storage_stats_history(collected_at_unix DESC);
+            CREATE INDEX IF NOT EXISTS idx_version_index_heads_history_path
+                ON version_index_heads(
+                    head_manifest_hash,
+                    logical_path,
+                    removed_at_unix DESC,
+                    restore_version_id DESC,
+                    object_id DESC
+                );
             CREATE INDEX IF NOT EXISTS idx_repair_run_history_finished
                 ON repair_run_history(finished_at_unix DESC, run_id DESC);
             CREATE INDEX IF NOT EXISTS idx_manual_repair_action_run_history_finished

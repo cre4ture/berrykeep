@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,21 +25,24 @@ use super::{
     GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
     GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue,
     GallerySummaryMiss, GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
-    GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
-    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
-    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
+    GalleryViewportBounds, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
+    METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
+    MetadataStore, OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker,
+    RecoverableHistoryEntries, RecoverableHistoryEntry, RepairAttemptRecord, RepairRunRecord,
     S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
     S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
-    TOMBSTONE_MANIFEST_HASH, compress_snapshot_json, current_media_cache_metadata,
-    decode_gallery_labels, decode_version_index, decompress_snapshot_json,
-    effective_gallery_captured_at_unix, encode_gallery_labels, gallery_index_media_status,
-    gallery_index_media_type_from_metadata, gallery_label_filter_matches_json,
-    gallery_label_predicates, gallery_map_bounded_resolution, gallery_media_type_for_path,
-    gallery_web_mercator_position, metadata_db_logical_summary_query,
+    TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
+    current_media_cache_metadata, decode_gallery_labels, decode_version_index,
+    decompress_snapshot_json, effective_gallery_captured_at_unix, encode_gallery_labels,
+    gallery_index_media_status, gallery_index_media_type_from_metadata,
+    gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
+    gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
     sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
+    version_index_head_projection,
 };
 
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1966,6 +1969,85 @@ fn map_tokio_rusqlite_error(error: tokio_rusqlite::Error) -> anyhow::Error {
     }
 }
 
+fn upsert_version_index_head_projection(
+    db: &Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    db.execute(
+        "INSERT INTO version_index_heads (
+             object_id,
+             head_version_id,
+             head_manifest_hash,
+             logical_path,
+             removed_at_unix,
+             restore_source_path,
+             restore_source_object_id,
+             restore_version_id,
+             moved_source_object_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(object_id) DO UPDATE SET
+             head_version_id = excluded.head_version_id,
+             head_manifest_hash = excluded.head_manifest_hash,
+             logical_path = excluded.logical_path,
+             removed_at_unix = excluded.removed_at_unix,
+             restore_source_path = excluded.restore_source_path,
+             restore_source_object_id = excluded.restore_source_object_id,
+             restore_version_id = excluded.restore_version_id,
+             moved_source_object_id = excluded.moved_source_object_id",
+        params![
+            projection.object_id.as_str(),
+            projection.head_version_id.as_deref(),
+            projection.head_manifest_hash.as_deref(),
+            projection.logical_path.as_deref(),
+            projection.removed_at_unix.map(u64_to_i64).transpose()?,
+            projection.restore_source_path.as_deref(),
+            projection.restore_source_object_id.as_deref(),
+            projection.restore_version_id.as_deref(),
+            projection.moved_source_object_id.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_version_index_head_projection_if_missing(
+    db: &Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    // The backfill may race a normal version-index write or a deletion. Only
+    // insert while the source index still exists and never replace a row a
+    // normal write has already brought up to date.
+    db.execute(
+        "INSERT INTO version_index_heads (
+             object_id,
+             head_version_id,
+             head_manifest_hash,
+             logical_path,
+             removed_at_unix,
+             restore_source_path,
+             restore_source_object_id,
+             restore_version_id,
+             moved_source_object_id
+         )
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+         WHERE EXISTS (
+             SELECT 1 FROM version_indexes WHERE object_id = ?1
+         )
+         ON CONFLICT(object_id) DO NOTHING",
+        params![
+            projection.object_id.as_str(),
+            projection.head_version_id.as_deref(),
+            projection.head_manifest_hash.as_deref(),
+            projection.logical_path.as_deref(),
+            projection.removed_at_unix.map(u64_to_i64).transpose()?,
+            projection.restore_source_path.as_deref(),
+            projection.restore_source_object_id.as_deref(),
+            projection.restore_version_id.as_deref(),
+            projection.moved_source_object_id.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
     async fn object_id_backfill_needed(&self) -> Result<bool> {
@@ -2039,32 +2121,6 @@ impl MetadataStore for SqliteMetadataStore {
             )
             .optional()
             .context("failed to query current object")
-        })
-        .await
-    }
-
-    async fn list_existing_current_object_keys(&self, keys: &[String]) -> Result<HashSet<String>> {
-        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
-        let keys = keys.to_vec();
-        self.read(move |db| {
-            let mut existing_keys = HashSet::new();
-            for keys in keys.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
-                if keys.is_empty() {
-                    continue;
-                }
-                let placeholders = (1..=keys.len())
-                    .map(|index| format!("?{index}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!("SELECT key FROM current_objects WHERE key IN ({placeholders})");
-                let mut statement = db.prepare(&sql)?;
-                let rows = statement
-                    .query_map(params_from_iter(keys.iter()), |row| row.get::<_, String>(0))?;
-                for key in rows {
-                    existing_keys.insert(key?);
-                }
-            }
-            Ok(existing_keys)
         })
         .await
     }
@@ -2241,42 +2297,6 @@ impl MetadataStore for SqliteMetadataStore {
                 keys.push(row?);
             }
             Ok(keys)
-        })
-        .await
-    }
-
-    async fn list_keys_for_object_ids(
-        &self,
-        object_ids: &[String],
-    ) -> Result<HashMap<String, Vec<String>>> {
-        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
-        let object_ids = object_ids.to_vec();
-        self.read(move |db| {
-            let mut keys_by_object_id = HashMap::new();
-            for object_ids in object_ids.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
-                if object_ids.is_empty() {
-                    continue;
-                }
-                let placeholders = (1..=object_ids.len())
-                    .map(|index| format!("?{index}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    "SELECT object_id, key FROM current_objects WHERE object_id IN ({placeholders})"
-                );
-                let mut statement = db.prepare(&sql)?;
-                let rows = statement.query_map(params_from_iter(object_ids.iter()), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
-                for row in rows {
-                    let (object_id, key) = row?;
-                    keys_by_object_id
-                        .entry(object_id)
-                        .or_insert_with(Vec::new)
-                        .push(key);
-                }
-            }
-            Ok(keys_by_object_id)
         })
         .await
     }
@@ -3856,6 +3876,7 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
         let object_id = object_id.to_string();
+        let head_projection = version_index_head_projection(&object_id, index);
         self.write_tx(move |db| {
             let changed = db.execute(
                 "INSERT INTO version_indexes (object_id, index_json)
@@ -3864,6 +3885,7 @@ impl MetadataStore for SqliteMetadataStore {
                  WHERE version_indexes.index_json != excluded.index_json",
                 params![object_id, payload],
             )?;
+            upsert_version_index_head_projection(db, &head_projection)?;
             if changed > 0 {
                 let unchanged_projection_keys =
                     refresh_gallery_objects_for_object_id_and_collect_unchanged_keys(
@@ -3924,60 +3946,217 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
-    async fn load_recoverable_history_version_indexes_after(
+    async fn list_recoverable_history_entries_bounded(
         &self,
         prefix: &str,
-        after_object_id: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<FileVersionIndex>> {
-        let prefix = prefix.to_string();
-        let prefix_pattern = if prefix.is_empty() {
-            "%".to_string()
-        } else {
-            sqlite_like_prefix_pattern(&format!("{prefix}/"))
-        };
-        let after_object_id = after_object_id.map(str::to_owned);
-        let limit = i64::try_from(limit.max(1)).context("history index page limit overflow")?;
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryEntries> {
+        let prefix = prefix.trim().trim_matches('/').to_string();
+        let limit = max_entries
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or(i64::MAX);
+        let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
+        // Every descendant begins with `<prefix>/`; the byte after `/` sorts
+        // before `0`, so this is an indexable range without a JSON or LIKE
+        // predicate. Logical paths do not retain a trailing slash here.
+        let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
         self.read(move |db| {
-            let mut statement = db.prepare(
-                "SELECT version_indexes.object_id, version_indexes.index_json
-                 FROM version_indexes
-                 WHERE (?1 IS NULL OR version_indexes.object_id > ?1)
-                   AND EXISTS (
-                     SELECT 1
-                     FROM json_each(CAST(version_indexes.index_json AS TEXT), '$.versions') AS version
-                     WHERE json_extract(version.value, '$.manifest_hash') = ?2
-                       AND json_extract(version.value, '$.logical_path') IS NOT NULL
-                       AND (
-                         ?3 = ''
-                         OR json_extract(version.value, '$.logical_path') = ?3
-                         OR json_extract(version.value, '$.logical_path') LIKE ?4 ESCAPE '\\'
-                       )
+            let statement = if path_lower_bound.is_some() {
+                "WITH latest AS (
+                     SELECT
+                         history.logical_path,
+                         history.restore_source_path,
+                         history.restore_source_object_id,
+                         history.restore_version_id,
+                         history.removed_at_unix,
+                         history.moved_source_object_id,
+                         ROW_NUMBER() OVER (
+                             PARTITION BY history.logical_path
+                             ORDER BY history.removed_at_unix DESC,
+                                      history.restore_version_id DESC,
+                                      history.object_id DESC
+                         ) AS path_rank
+                     FROM version_index_heads AS history
+                     WHERE history.head_manifest_hash = ?1
+                       AND history.restore_source_path IS NOT NULL
+                       AND history.restore_source_object_id IS NOT NULL
+                       AND history.restore_version_id IS NOT NULL
+                       AND history.logical_path >= ?2
+                       AND history.logical_path < ?3
                        AND NOT EXISTS (
-                         SELECT 1
-                         FROM current_objects
-                         WHERE current_objects.key = json_extract(version.value, '$.logical_path')
+                           SELECT 1 FROM current_objects
+                           WHERE current_objects.key = history.logical_path
                        )
-                   )
-                 ORDER BY version_indexes.object_id
-                 LIMIT ?5",
-            )?;
-            let rows = statement.query_map(
-                params![
-                    after_object_id,
+                 )
+                 SELECT
+                     latest.logical_path,
+                     latest.restore_source_path,
+                     latest.restore_source_object_id,
+                     latest.restore_version_id,
+                     latest.removed_at_unix,
+                     (
+                         SELECT MIN(current_objects.key)
+                         FROM current_objects
+                         WHERE current_objects.object_id = latest.moved_source_object_id
+                           AND current_objects.key != latest.logical_path
+                     ) AS moved_to_path
+                 FROM latest
+                 WHERE latest.path_rank = 1
+                 ORDER BY latest.logical_path
+                 LIMIT ?4"
+            } else {
+                "WITH latest AS (
+                     SELECT
+                         history.logical_path,
+                         history.restore_source_path,
+                         history.restore_source_object_id,
+                         history.restore_version_id,
+                         history.removed_at_unix,
+                         history.moved_source_object_id,
+                         ROW_NUMBER() OVER (
+                             PARTITION BY history.logical_path
+                             ORDER BY history.removed_at_unix DESC,
+                                      history.restore_version_id DESC,
+                                      history.object_id DESC
+                         ) AS path_rank
+                     FROM version_index_heads AS history
+                     WHERE history.head_manifest_hash = ?1
+                       AND history.restore_source_path IS NOT NULL
+                       AND history.restore_source_object_id IS NOT NULL
+                       AND history.restore_version_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM current_objects
+                           WHERE current_objects.key = history.logical_path
+                       )
+                 )
+                 SELECT
+                     latest.logical_path,
+                     latest.restore_source_path,
+                     latest.restore_source_object_id,
+                     latest.restore_version_id,
+                     latest.removed_at_unix,
+                     (
+                         SELECT MIN(current_objects.key)
+                         FROM current_objects
+                         WHERE current_objects.object_id = latest.moved_source_object_id
+                           AND current_objects.key != latest.logical_path
+                     ) AS moved_to_path
+                 FROM latest
+                 WHERE latest.path_rank = 1
+                 ORDER BY latest.logical_path
+                 LIMIT ?2"
+            };
+            let mut statement = db.prepare(statement)?;
+            let mut rows = if let (Some(path_lower_bound), Some(path_upper_bound)) =
+                (path_lower_bound.as_deref(), path_upper_bound.as_deref())
+            {
+                statement.query(params![
                     TOMBSTONE_MANIFEST_HASH,
-                    prefix,
-                    prefix_pattern,
-                    limit
-                ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )?;
-            let mut indexes = Vec::new();
-            for row in rows {
-                let (object_id, payload) = row?;
-                indexes.push(decode_version_index(&object_id, &payload, "sqlite")?);
+                    path_lower_bound,
+                    path_upper_bound,
+                    limit,
+                ])?
+            } else {
+                statement.query(params![TOMBSTONE_MANIFEST_HASH, limit])?
+            };
+            let mut entries = Vec::new();
+            while let Some(row) = rows.next()? {
+                entries.push(RecoverableHistoryEntry {
+                    path: row.get(0)?,
+                    restore_source_path: row.get(1)?,
+                    restore_source_object_id: row.get(2)?,
+                    restore_version_id: row.get(3)?,
+                    removed_at_unix: row.get(4)?,
+                    moved_to_path: row.get(5)?,
+                });
             }
-            Ok(indexes)
+            if entries.len() > max_entries {
+                return Ok(RecoverableHistoryEntries::ExceedsLimit {
+                    minimum_entry_count: entries.len(),
+                });
+            }
+            Ok(RecoverableHistoryEntries::Entries(entries))
+        })
+        .await
+    }
+
+    async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState> {
+        self.read(|db| {
+            let complete = db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if complete {
+                return Ok(HistoryHeadProjectionBackfillState::Complete);
+            }
+            let after_object_id = db
+                .query_row(
+                    "SELECT value FROM metadata_meta WHERE key = ?1",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(HistoryHeadProjectionBackfillState::Pending { after_object_id })
+        })
+        .await
+    }
+
+    async fn persist_history_head_projection_backfill_batch(
+        &self,
+        projections: &[VersionIndexHeadProjection],
+        next_after_object_id: Option<&str>,
+        complete: bool,
+    ) -> Result<()> {
+        let projections = projections.to_vec();
+        let next_after_object_id = next_after_object_id.map(str::to_owned);
+        self.write_tx(move |db| {
+            for projection in &projections {
+                insert_version_index_head_projection_if_missing(db, projection)?;
+            }
+            if complete {
+                db.execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY],
+                )?;
+                db.execute(
+                    "DELETE FROM metadata_meta WHERE key = ?1",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY],
+                )?;
+            } else {
+                let after_object_id = next_after_object_id.as_deref().ok_or_else(|| {
+                    anyhow!("history head projection backfill has no next cursor")
+                })?;
+                db.execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, after_object_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn clear_history_head_projections_for_test(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute("DELETE FROM version_index_heads", [])?;
+            db.execute(
+                "DELETE FROM metadata_meta WHERE key IN (?1, ?2)",
+                params![
+                    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
+                    HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+                ],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -4515,9 +4694,13 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()> {
         let object_id = object_id.to_string();
-        self.write(move |db| {
+        self.write_tx(move |db| {
             db.execute(
                 "DELETE FROM version_indexes WHERE object_id = ?1",
+                params![object_id],
+            )?;
+            db.execute(
+                "DELETE FROM version_index_heads WHERE object_id = ?1",
                 params![object_id],
             )?;
             Ok(())
@@ -4664,6 +4847,18 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS version_indexes (
             object_id TEXT PRIMARY KEY,
             index_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS version_index_heads (
+            object_id TEXT PRIMARY KEY,
+            head_version_id TEXT,
+            head_manifest_hash TEXT,
+            logical_path TEXT,
+            removed_at_unix INTEGER,
+            restore_source_path TEXT,
+            restore_source_object_id TEXT,
+            restore_version_id TEXT,
+            moved_source_object_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS snapshots (
@@ -4849,6 +5044,14 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON gallery_objects(manifest_hash);
         CREATE INDEX IF NOT EXISTS idx_manifest_summaries_content_fingerprint
             ON manifest_summaries(content_fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_version_index_heads_history_path
+            ON version_index_heads(
+                head_manifest_hash,
+                logical_path,
+                removed_at_unix DESC,
+                restore_version_id DESC,
+                object_id DESC
+            );
         CREATE INDEX IF NOT EXISTS idx_snapshots_created
             ON snapshots(created_at_unix DESC, snapshot_id DESC);
         CREATE INDEX IF NOT EXISTS idx_storage_stats_history_collected

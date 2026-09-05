@@ -7,13 +7,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
 const OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL: usize = 1_024;
-const STORE_HISTORY_VERSION_INDEX_BATCH_SIZE: usize = 256;
+const STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE: usize = 256;
 const STORE_INDEX_VERSION_LOOKUP_CONCURRENCY: usize = 32;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
-const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
+const METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID + 1;
+const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
+pub(super) const HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY: &str =
+    "history_head_projection_backfill_cursor_v1";
+pub(super) const HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY: &str =
+    "history_head_projection_backfill_complete_v1";
 
 fn object_id_migration_lock_path(metadata_db_path: &Path) -> PathBuf {
     let mut file_name = metadata_db_path
@@ -1562,6 +1567,115 @@ pub struct RecoverableHistoryEntry {
     pub moved_to_path: Option<String>,
 }
 
+/// The queryable preferred-head projection of one version index.
+///
+/// Version indexes intentionally retain their complete lineage as JSON. Explorer's
+/// recoverable-history view only needs the preferred head plus the resolved
+/// restore source, so keeping that small, relational projection avoids parsing
+/// every historical JSON payload for each directory request.
+#[derive(Debug, Clone)]
+pub(super) struct VersionIndexHeadProjection {
+    pub(super) object_id: String,
+    pub(super) head_version_id: Option<String>,
+    pub(super) head_manifest_hash: Option<String>,
+    pub(super) logical_path: Option<String>,
+    pub(super) removed_at_unix: Option<u64>,
+    pub(super) restore_source_path: Option<String>,
+    pub(super) restore_source_object_id: Option<String>,
+    pub(super) restore_version_id: Option<String>,
+    pub(super) moved_source_object_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistoryHeadProjectionBackfillState {
+    Pending { after_object_id: Option<String> },
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryHeadProjectionBackfillProgress {
+    pub processed_index_count: usize,
+    pub complete: bool,
+}
+
+pub(super) fn version_index_head_projection(
+    object_id: &str,
+    index: &FileVersionIndex,
+) -> VersionIndexHeadProjection {
+    let mut projection = VersionIndexHeadProjection {
+        object_id: object_id.to_string(),
+        head_version_id: None,
+        head_manifest_hash: None,
+        logical_path: None,
+        removed_at_unix: None,
+        restore_source_path: None,
+        restore_source_object_id: None,
+        restore_version_id: None,
+        moved_source_object_id: None,
+    };
+
+    let Some(head_version_id) = index
+        .preferred_head_version_id
+        .clone()
+        .or_else(|| choose_preferred_head(index))
+    else {
+        return projection;
+    };
+    let Some(head) = index.versions.get(&head_version_id) else {
+        return projection;
+    };
+
+    projection.head_version_id = Some(head_version_id);
+    projection.head_manifest_hash = Some(head.manifest_hash.clone());
+    projection.logical_path = head
+        .logical_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned);
+
+    if head.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+        return projection;
+    }
+    let Some(path) = projection.logical_path.clone() else {
+        return projection;
+    };
+
+    projection.removed_at_unix = Some(head.created_at_unix);
+    let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
+        head.copied_from_object_id.as_deref(),
+        head.copied_from_version_id.as_deref(),
+    ) {
+        Some((
+            head.copied_from_path
+                .clone()
+                .unwrap_or_else(|| path.clone()),
+            source_object_id.to_string(),
+            source_version_id.to_string(),
+            Some(source_object_id.to_string()),
+        ))
+    } else {
+        recoverable_tombstone_ancestor(index, head).map(|record| {
+            (
+                record.logical_path.unwrap_or_else(|| path.clone()),
+                object_id.to_string(),
+                record.version_id,
+                None,
+            )
+        })
+    };
+
+    if let Some((source_path, source_object_id, source_version_id, moved_source_object_id)) =
+        restore_source
+    {
+        projection.restore_source_path = Some(source_path);
+        projection.restore_source_object_id = Some(source_object_id);
+        projection.restore_version_id = Some(source_version_id);
+        projection.moved_source_object_id = moved_source_object_id;
+    }
+    projection
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreferredHeadReason {
@@ -2344,6 +2458,20 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["object_id", "index_json"],
     },
     MetadataDbLogicalTableSpec {
+        table: "version_index_heads",
+        tracked_columns: &[
+            "object_id",
+            "head_version_id",
+            "head_manifest_hash",
+            "logical_path",
+            "removed_at_unix",
+            "restore_source_path",
+            "restore_source_object_id",
+            "restore_version_id",
+            "moved_source_object_id",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
         table: "snapshots",
         tracked_columns: &["snapshot_id", "snapshot_json"],
     },
@@ -2611,9 +2739,6 @@ trait MetadataStore: Send + Sync {
     async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()>;
     async fn load_current_state(&self) -> Result<CurrentState>;
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
-    /// Returns the requested keys that currently exist. Implementations batch
-    /// this lookup so history inspection does not issue one query per path.
-    async fn list_existing_current_object_keys(&self, keys: &[String]) -> Result<HashSet<String>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
     async fn remove_current_object(&self, key: &str) -> Result<()>;
     /// Replaces the user labels of a projected object. This is the entry point
@@ -2649,10 +2774,6 @@ trait MetadataStore: Send + Sync {
     async fn count_current_objects(&self) -> Result<usize>;
     async fn list_current_object_keys(&self) -> Result<Vec<String>>;
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>>;
-    async fn list_keys_for_object_ids(
-        &self,
-        object_ids: &[String],
-    ) -> Result<HashMap<String, Vec<String>>>;
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>>;
     async fn persist_repair_attempts(
         &self,
@@ -2766,16 +2887,25 @@ trait MetadataStore: Send + Sync {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileVersionIndex>>;
-    /// Lists recoverable-history candidate indexes under `prefix`. The
-    /// metadata backend applies tombstone, prefix, and current-path filters
-    /// before deserializing indexes; legacy indexes without a preferred head
-    /// are confirmed by the caller.
-    async fn load_recoverable_history_version_indexes_after(
+    /// Reads the indexed preferred-head projection for Explorer history. The
+    /// result contains at most `max_entries + 1` distinct paths so callers can
+    /// enforce a response bound without materializing the complete namespace.
+    async fn list_recoverable_history_entries_bounded(
         &self,
         prefix: &str,
-        after_object_id: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<FileVersionIndex>>;
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryEntries>;
+    async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState>;
+    async fn persist_history_head_projection_backfill_batch(
+        &self,
+        projections: &[VersionIndexHeadProjection],
+        next_after_object_id: Option<&str>,
+        complete: bool,
+    ) -> Result<()>;
+    #[cfg(test)]
+    async fn clear_history_head_projections_for_test(&self) -> Result<()>;
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
@@ -3317,167 +3447,66 @@ impl StoreHistoryInspector {
         prefix: &str,
         max_entries: usize,
     ) -> Result<RecoverableHistoryEntries> {
-        let prefix = prefix.trim().trim_matches('/');
-        let mut entries = BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
-        let mut after_object_id = None;
-
-        loop {
-            let indexes = self
-                .metadata_store
-                .load_recoverable_history_version_indexes_after(
-                    prefix,
-                    after_object_id.as_deref(),
-                    STORE_HISTORY_VERSION_INDEX_BATCH_SIZE,
-                )
-                .await?;
-            let Some(last_object_id) = indexes
-                .last()
-                .map(|index| index.persisted_object_id.clone())
-            else {
-                break;
-            };
-            let mut page_entries =
-                BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
-
-            for index in indexes {
-                let Some(preferred_head_id) = index
-                    .preferred_head_version_id
-                    .clone()
-                    .or_else(|| choose_preferred_head(&index))
-                else {
-                    continue;
-                };
-                let Some(tombstone) = index.versions.get(&preferred_head_id).cloned() else {
-                    continue;
-                };
-                if tombstone.manifest_hash != TOMBSTONE_MANIFEST_HASH {
-                    continue;
-                }
-
-                let Some(path) = tombstone
-                    .logical_path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|path| !path.is_empty())
-                    .map(ToOwned::to_owned)
-                else {
-                    continue;
-                };
-                if !recoverable_history_path_matches_prefix(&path, prefix) {
-                    continue;
-                }
-                let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
-                    tombstone.copied_from_object_id.as_deref(),
-                    tombstone.copied_from_version_id.as_deref(),
-                ) {
-                    let restore_source_path = tombstone
-                        .copied_from_path
-                        .clone()
-                        .unwrap_or_else(|| path.clone());
-                    Some((
-                        restore_source_path,
-                        source_version_id.to_string(),
-                        source_object_id.to_string(),
-                        Some(source_object_id.to_string()),
-                    ))
-                } else {
-                    recoverable_tombstone_ancestor(&index, &tombstone).map(|record| {
-                        (
-                            record.logical_path.unwrap_or_else(|| path.clone()),
-                            record.version_id,
-                            index.object_id.clone(),
-                            None,
-                        )
-                    })
-                };
-
-                let Some((
-                    restore_source_path,
-                    restore_version_id,
-                    restore_source_object_id,
-                    moved_source_object_id,
-                )) = restore_source
-                else {
-                    continue;
-                };
-                let entry = RecoverableHistoryEntry {
-                    path: path.clone(),
-                    restore_source_path,
-                    restore_source_object_id,
-                    restore_version_id,
-                    removed_at_unix: tombstone.created_at_unix,
-                    moved_to_path: None,
-                };
-                let should_replace = page_entries.get(&path).is_none_or(|(existing, _)| {
-                    (entry.removed_at_unix, &entry.restore_version_id)
-                        > (existing.removed_at_unix, &existing.restore_version_id)
-                });
-                if should_replace {
-                    page_entries.insert(path, (entry, moved_source_object_id));
-                }
-            }
-
-            let existing_paths = self
-                .metadata_store
-                .list_existing_current_object_keys(
-                    &page_entries.keys().cloned().collect::<Vec<_>>(),
-                )
-                .await?;
-            for (path, entry) in page_entries {
-                if existing_paths.contains(&path) {
-                    continue;
-                }
-                let should_replace = entries.get(&path).is_none_or(|(existing, _)| {
-                    (entry.0.removed_at_unix, &entry.0.restore_version_id)
-                        > (existing.removed_at_unix, &existing.restore_version_id)
-                });
-                if should_replace {
-                    entries.insert(path, entry);
-                }
-            }
-            if entries.len() > max_entries {
-                return Ok(RecoverableHistoryEntries::ExceedsLimit {
-                    minimum_entry_count: entries.len(),
-                });
-            }
-            after_object_id = Some(last_object_id);
-        }
-
-        let moved_source_object_ids = entries
-            .values()
-            .filter_map(|(_, object_id)| object_id.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let current_keys_by_object_id = self
-            .metadata_store
-            .list_keys_for_object_ids(&moved_source_object_ids)
-            .await?;
-        for (entry, moved_source_object_id) in entries.values_mut() {
-            let Some(moved_source_object_id) = moved_source_object_id else {
-                continue;
-            };
-            entry.moved_to_path = current_keys_by_object_id
-                .get(moved_source_object_id)
-                .into_iter()
-                .flatten()
-                .filter(|candidate| *candidate != &entry.path)
-                .min()
-                .cloned();
-        }
-
-        Ok(RecoverableHistoryEntries::Entries(
-            entries.into_values().map(|(entry, _)| entry).collect(),
-        ))
+        self.metadata_store
+            .list_recoverable_history_entries_bounded(prefix, max_entries)
+            .await
     }
-}
 
-fn recoverable_history_path_matches_prefix(path: &str, prefix: &str) -> bool {
-    prefix.is_empty()
-        || path
-            .trim_matches('/')
-            .strip_prefix(prefix)
-            .is_some_and(|relative_path| relative_path.starts_with('/'))
+    pub(crate) async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState> {
+        self.metadata_store
+            .history_head_projection_backfill_state()
+            .await
+    }
+
+    /// Advances the one-time projection migration without running it on an
+    /// Explorer request. Replaying a completed page is safe: the backend only
+    /// inserts missing projection rows, while normal version-index writes
+    /// always win with their current projection.
+    pub(crate) async fn backfill_history_head_projection_batch(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillProgress> {
+        let HistoryHeadProjectionBackfillState::Pending { after_object_id } = self
+            .metadata_store
+            .history_head_projection_backfill_state()
+            .await?
+        else {
+            return Ok(HistoryHeadProjectionBackfillProgress {
+                processed_index_count: 0,
+                complete: true,
+            });
+        };
+
+        let indexes = self
+            .metadata_store
+            .load_version_indexes_after(
+                after_object_id.as_deref(),
+                STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE,
+            )
+            .await?;
+        let processed_index_count = indexes.len();
+        let next_after_object_id = indexes
+            .last()
+            .map(|index| index.persisted_object_id.clone());
+        let complete = processed_index_count < STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE;
+        let projections = indexes
+            .iter()
+            .map(|index| version_index_head_projection(&index.persisted_object_id, index))
+            .collect::<Vec<_>>();
+        self.metadata_store
+            .persist_history_head_projection_backfill_batch(
+                &projections,
+                next_after_object_id.as_deref(),
+                complete,
+            )
+            .await?;
+
+        Ok(HistoryHeadProjectionBackfillProgress {
+            processed_index_count,
+            complete,
+        })
+    }
 }
 
 impl StoreIndexInspector {

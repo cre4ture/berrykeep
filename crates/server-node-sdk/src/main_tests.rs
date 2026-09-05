@@ -19189,7 +19189,6 @@ async fn build_test_state(
             store_history_refresh_permits: Arc::new(tokio::sync::Semaphore::new(
                 super::STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
             )),
-            store_history_last_refresh: Arc::new(std::sync::Mutex::new(None)),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<

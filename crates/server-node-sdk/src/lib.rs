@@ -125,7 +125,7 @@ const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
 const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
-const STORE_HISTORY_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(15);
+const HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE: Duration = Duration::from_millis(25);
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -276,17 +276,18 @@ use storage::{
     AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, CleanupReport, ClientBootstrapClaimRecord,
     ClientCredentialRecord, ClientCredentialState, CurrentObjectsCacheStats, DataChangeAction,
     DataChangeActorKind, DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery,
-    DataChangeUploadMode, DataScrubReport, HostDependencyReport, HostDependencyStatus,
-    MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
-    MetadataDbLogicalDistribution, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
-    ObjectVersionMetadataRecord, PairingAuthorizationRecord, PathMutationResult, PersistentStore,
-    PreferredHeadReason, PutOptions, ReconcileVersionEntry, RecoverableHistoryEntries,
-    RecoverableHistoryEntry, RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
-    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
-    SnapshotRestoreMutationResult, StoragePathStats, StoragePoolConfig, StorageStatsSample,
-    StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState,
-    grid_thumbnail_profile, media_cache_retry_due, metadata_db_logical_table_count,
+    DataChangeUploadMode, DataScrubReport, HistoryHeadProjectionBackfillState,
+    HostDependencyReport, HostDependencyStatus, MediaCacheLookup, MediaCacheStatus,
+    MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
+    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, ObjectVersionMetadataRecord,
+    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
+    PutOptions, ReconcileVersionEntry, RecoverableHistoryEntries, RecoverableHistoryEntry,
+    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord,
+    S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
+    StoragePathStats, StoragePoolConfig, StorageStatsSample, StoreReadError,
+    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, grid_thumbnail_profile,
+    media_cache_retry_due, metadata_db_logical_table_count,
     promote_cached_media_metadata_to_incomplete, thumbnail_profile_from_query,
 };
 
@@ -351,7 +352,6 @@ struct ServerStorageRuntime {
     store_history_cache_generation: Arc<AtomicU64>,
     store_history_refresh_locks: Arc<StdMutex<StoreHistoryRefreshLocks>>,
     store_history_refresh_permits: Arc<Semaphore>,
-    store_history_last_refresh: Arc<StdMutex<Option<Instant>>>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
@@ -7431,7 +7431,6 @@ async fn run_inner(
             store_history_refresh_permits: Arc::new(Semaphore::new(
                 STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
             )),
-            store_history_last_refresh: Arc::new(StdMutex::new(None)),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
@@ -7588,6 +7587,7 @@ async fn start_background_runtimes(
     reliability_telemetry::spawn_reliability_telemetry_sender(state.clone());
     spawn_data_scrubber(state.clone());
     spawn_media_metadata_backfill(state.clone(), "startup");
+    spawn_history_head_projection_backfill(state.clone());
     spawn_direct_quic_multiplex_agent(state.clone());
 
     let load_repair_attempts_phase_started_at =
@@ -14382,6 +14382,44 @@ fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
     });
 }
 
+fn spawn_history_head_projection_backfill(state: ServerState) {
+    tokio::spawn(async move {
+        let inspector = {
+            let store = read_store(&state, "history_head_projection_backfill.snapshot").await;
+            store.store_history_inspector()
+        };
+        let started_at = Instant::now();
+        let mut processed_index_count = 0usize;
+
+        info!("starting recoverable history head projection backfill");
+        loop {
+            match inspector.backfill_history_head_projection_batch().await {
+                Ok(progress) => {
+                    processed_index_count =
+                        processed_index_count.saturating_add(progress.processed_index_count);
+                    if progress.complete {
+                        info!(
+                            processed_index_count,
+                            elapsed_ms = started_at.elapsed().as_millis(),
+                            "completed recoverable history head projection backfill"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE).await;
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        processed_index_count,
+                        "recoverable history head projection backfill failed; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+}
+
 async fn delete_object_by_query(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -16562,10 +16600,33 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
     let history = match cached {
         Some(cached) => cached,
         None => {
+            let history_inspector = {
+                let store = read_store(state, "store_history.clone_inspector").await;
+                store.store_history_inspector()
+            };
+            match history_inspector
+                .history_head_projection_backfill_state()
+                .await
+            {
+                Ok(HistoryHeadProjectionBackfillState::Complete) => {}
+                Ok(HistoryHeadProjectionBackfillState::Pending { .. }) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({
+                            "error": "recoverable history index is being built; retry shortly",
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to read recoverable history projection state");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
             // Coalesce cache misses without holding the store read guard, and
-            // admit only a small number of distinct prefix scans at once. A
-            // short TTL intentionally tolerates concurrent namespace writes
-            // while retaining each recently visited prefix for navigation.
+            // admit only a small number of distinct projection reads at once.
+            // The short TTL intentionally tolerates concurrent namespace
+            // writes while retaining each recently visited prefix for navigation.
             let _refresh_permit = match state
                 .storage
                 .store_history_refresh_permits
@@ -16576,31 +16637,6 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                 Ok(permit) => permit,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
-            let refresh_started = Instant::now();
-            let refresh_allowed = match state.storage.store_history_last_refresh.lock() {
-                Ok(mut last_refresh) => {
-                    let allowed = last_refresh.is_none_or(|last| {
-                        refresh_started.duration_since(last) >= STORE_HISTORY_REFRESH_MIN_INTERVAL
-                    });
-                    if allowed {
-                        *last_refresh = Some(refresh_started);
-                    }
-                    allowed
-                }
-                Err(poisoned) => {
-                    let mut last_refresh = poisoned.into_inner();
-                    let allowed = last_refresh.is_none_or(|last| {
-                        refresh_started.duration_since(last) >= STORE_HISTORY_REFRESH_MIN_INTERVAL
-                    });
-                    if allowed {
-                        *last_refresh = Some(refresh_started);
-                    }
-                    allowed
-                }
-            };
-            if !refresh_allowed {
-                return StatusCode::TOO_MANY_REQUESTS.into_response();
-            }
             let refresh_lock = match state.storage.store_history_refresh_locks.lock() {
                 Ok(mut locks) => locks.lock_for_prefix(&prefix),
                 Err(poisoned) => poisoned.into_inner().lock_for_prefix(&prefix),
@@ -16620,10 +16656,6 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                     .storage
                     .store_history_cache_generation
                     .load(Ordering::SeqCst);
-                let history_inspector = {
-                    let store = read_store(state, "store_history.clone_inspector").await;
-                    store.store_history_inspector()
-                };
                 let value = match history_inspector
                     .list_recoverable_history_entries_bounded(
                         &prefix,
