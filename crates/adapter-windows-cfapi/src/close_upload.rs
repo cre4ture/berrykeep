@@ -529,7 +529,7 @@ fn process_debounced_close_upload(
         return UploadAttemptOutcome::Settled;
     }
 
-    let file = match std::fs::OpenOptions::new()
+    let mut file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&full_path)
@@ -620,7 +620,7 @@ fn process_debounced_close_upload(
         relative_path,
         &object_context,
         snapshot_before.len,
-        file,
+        &mut file,
     ) {
         Ok(receipt) => receipt,
         Err(err) => {
@@ -660,6 +660,18 @@ fn process_debounced_close_upload(
                 relative_path,
                 err
             );
+            if let Err(receipt_error) = record_placeholder_upload_receipt(
+                &file,
+                relative_path,
+                &upload_receipt,
+                worker.provider_instance_id,
+                false,
+            ) {
+                tracing::warn!(
+                    "close-completion: failed recording the accepted server revision after a snapshot error for {}: {receipt_error:#}",
+                    relative_path
+                );
+            }
             close_upload_trace_event(format!(
                 "snapshot-after-error path={} error={}",
                 relative_path, err
@@ -670,7 +682,7 @@ fn process_debounced_close_upload(
 
     if snapshot_after != snapshot_before {
         if let Err(err) = record_upload_receipt_after_concurrent_change(
-            &full_path,
+            &file,
             relative_path,
             &upload_receipt,
             worker.provider_instance_id,
@@ -701,43 +713,23 @@ fn process_debounced_close_upload(
         describe_path_state(&full_path)
     );
 
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&full_path)
-    {
-        Ok(file_for_sync) => {
-            if let Err(err) = finalize_placeholder_after_upload(
-                &file_for_sync,
-                relative_path,
-                &upload_receipt,
-                worker.provider_instance_id,
-                &mut upload_usn,
-            ) {
-                tracing::info!(
-                    "close-completion: failed to mark {} in sync after upload: {:#}",
-                    relative_path,
-                    err
-                );
-                close_upload_trace_event(format!(
-                    "mark-in-sync-error path={} error={:#}",
-                    relative_path, err
-                ));
-                return UploadAttemptOutcome::Retry;
-            }
-        }
-        Err(err) => {
-            tracing::info!(
-                "close-completion: failed to reopen {} for in-sync update: {}",
-                relative_path,
-                err
-            );
-            close_upload_trace_event(format!(
-                "reopen-for-sync-error path={} error={}",
-                relative_path, err
-            ));
-            return UploadAttemptOutcome::Retry;
-        }
+    if let Err(err) = finalize_placeholder_after_upload(
+        &file,
+        relative_path,
+        &upload_receipt,
+        worker.provider_instance_id,
+        &mut upload_usn,
+    ) {
+        tracing::info!(
+            "close-completion: failed to mark {} in sync after upload: {:#}",
+            relative_path,
+            err
+        );
+        close_upload_trace_event(format!(
+            "mark-in-sync-error path={} error={:#}",
+            relative_path, err
+        ));
+        return UploadAttemptOutcome::Retry;
     }
 
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
@@ -839,16 +831,12 @@ fn record_placeholder_upload_receipt(
 }
 
 fn record_upload_receipt_after_concurrent_change(
-    full_path: &Path,
+    file: &std::fs::File,
     relative_path: &str,
     receipt: &UploadReceipt,
     provider_instance_id: uuid::Uuid,
 ) -> Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(full_path)?;
-    record_placeholder_upload_receipt(&file, relative_path, receipt, provider_instance_id, false)
+    record_placeholder_upload_receipt(file, relative_path, receipt, provider_instance_id, false)
 }
 
 fn capture_file_snapshot(file: &std::fs::File) -> Result<LocalFileSnapshot> {
@@ -872,7 +860,7 @@ fn upload_file_on_close(
     relative_path: &str,
     object_context: &UploadObjectContext,
     metadata_len: u64,
-    file: std::fs::File,
+    file: &mut std::fs::File,
 ) -> Result<UploadReceipt> {
     tracing::info!(
         "close-completion: uploading {} ({} bytes)",
@@ -880,12 +868,11 @@ fn upload_file_on_close(
         metadata_len
     );
 
-    let mut reader = file;
     let upload_receipt = worker.uploader.upload_reader_for_object(
         relative_path,
         object_context.object_id.as_deref(),
         object_context.expected_revision.as_deref(),
-        &mut reader,
+        file,
         metadata_len,
     )?;
     if let Some(version) = upload_receipt.remote_version.clone() {
@@ -961,7 +948,7 @@ mod tests {
         let uploader = Arc::new(RecordingUploader::default());
         let worker = test_upload_worker_context(uploader.clone());
         let payload = b"cfapi-upload-payload";
-        let (path, file) = make_test_file(payload);
+        let (path, mut file) = make_test_file(payload);
 
         let receipt = upload_file_on_close(
             &worker,
@@ -971,7 +958,7 @@ mod tests {
                 expected_revision: None,
             },
             payload.len() as u64,
-            file,
+            &mut file,
         )
         .expect("upload should succeed");
 
