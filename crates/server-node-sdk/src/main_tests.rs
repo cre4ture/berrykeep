@@ -23216,6 +23216,30 @@ fn rendezvous_relay_accept_retry_delay_backs_off_and_caps() {
 }
 
 #[test]
+fn history_head_projection_backfill_retry_delay_backs_off_and_caps() {
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(1),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(2),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(9),
+        Duration::from_secs(256)
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(10),
+        super::HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(u32::MAX),
+        super::HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY
+    );
+}
+
+#[test]
 fn embedded_rendezvous_restart_delay_backs_off_and_caps() {
     assert_eq!(
         super::embedded_rendezvous_restart_delay(0),

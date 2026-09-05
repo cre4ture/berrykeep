@@ -126,7 +126,7 @@ const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
 const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
 const HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE: Duration = Duration::from_millis(25);
-const HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_ATTEMPTS: u32 = 5;
+const HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -14412,30 +14412,25 @@ fn spawn_history_head_projection_backfill(state: ServerState) {
                 }
                 Err(err) => {
                     consecutive_failure_count = consecutive_failure_count.saturating_add(1);
-                    if consecutive_failure_count
-                        >= HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_ATTEMPTS
-                    {
-                        tracing::error!(
-                            error = %err,
-                            processed_index_count,
-                            consecutive_failure_count,
-                            "recoverable history head projection backfill stopped after repeated failures"
-                        );
-                        break;
-                    }
-                    let retry_delay_secs = 1_u64 << (consecutive_failure_count - 1);
+                    let retry_delay =
+                        history_head_projection_backfill_retry_delay(consecutive_failure_count);
                     warn!(
                         error = %err,
                         processed_index_count,
                         consecutive_failure_count,
-                        retry_delay_secs,
+                        retry_delay_secs = retry_delay.as_secs(),
                         "recoverable history head projection backfill failed; retrying"
                     );
-                    tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
+                    tokio::time::sleep(retry_delay).await;
                 }
             }
         }
     });
+}
+
+fn history_head_projection_backfill_retry_delay(consecutive_failures: u32) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(63);
+    Duration::from_secs(1_u64 << exponent).min(HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY)
 }
 
 async fn delete_object_by_query(
